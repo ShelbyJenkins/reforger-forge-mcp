@@ -106,21 +106,11 @@ node (Join-Path $Root "scripts\list-tools.mjs")
 
 # Optional global Cursor config
 Write-Host ""
-$answer = Read-Host "Add reforger-forge to global Cursor MCP config? (y/n)"
-if ($answer -eq "y" -or $answer -eq "Y") {
-    $cursorMcp = Join-Path $env:USERPROFILE ".cursor\mcp.json"
-    if (Test-Path $cursorMcp) {
-        $existing = Get-Content $cursorMcp -Raw | ConvertFrom-Json
-    } else {
-        $existing = [PSCustomObject]@{ mcpServers = [PSCustomObject]@{} }
-    }
-    if (-not $existing.mcpServers) {
-        $existing | Add-Member -NotePropertyName mcpServers -NotePropertyValue ([PSCustomObject]@{})
-    }
-    $existing.mcpServers | Add-Member -NotePropertyName "reforger-forge" -NotePropertyValue $mcpEntry -Force
-    $existing | ConvertTo-Json -Depth 10 | Set-Content $cursorMcp -Encoding UTF8
-    Write-Host "Updated $cursorMcp" -ForegroundColor Green
-    Write-Host "Restart Cursor: MCP: Restart Servers" -ForegroundColor Yellow
+$answer = Read-Host "Install into AI agents? (all/cursor/antigravity/claude/windsurf/vscode/continue/kiro/n)"
+if ($answer -eq "all") {
+    & (Join-Path $Root "scripts\install-agents.ps1") -All
+} elseif ($answer -ne "n" -and $answer -ne "N" -and $answer -ne "") {
+    & (Join-Path $Root "scripts\install-agents.ps1") -Agent $answer
 }
 
 Write-Host ""

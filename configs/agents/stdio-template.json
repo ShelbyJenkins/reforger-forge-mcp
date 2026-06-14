@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "reforger-forge": {
+      "command": "node",
+      "args": ["REPLACE_WITH_ABSOLUTE_PATH/dist/index.js"],
+      "env": {
+        "ENFUSION_WORKBENCH_PATH": "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Arma Reforger Tools",
+        "ENFUSION_GAME_PATH": "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Arma Reforger",
+        "ENFUSION_PROJECT_PATH": "C:\\Users\\YOU\\Documents\\My Games\\ArmaReforgerWorkbench\\addons",
+        "ENFUSION_WORKBENCH_HOST": "127.0.0.1",
+        "ENFUSION_WORKBENCH_PORT": "5775"
+      }
+    }
+  }
+}

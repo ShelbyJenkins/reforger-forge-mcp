@@ -1,20 +1,20 @@
 ﻿{
     "mcpServers":  {
                        "reforger-forge":  {
-                                              "args":  [
-                                                           "C:\\Users\\goatb\\OneDrive\\Desktop\\arm took mcp\\ARETB\\dist\\index.js"
-                                                       ],
-                                              "env":  {
-                                                          "ENFUSION_WORKBENCH_PORT":  "5775",
-                                                          "ENFUSION_WORKBENCH_HOST":  "127.0.0.1",
-                                                          "ENFUSION_WORKBENCH_PATH":  "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Arma Reforger Tools",
-                                                          "ENFUSION_GAME_PATH":  "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Arma Reforger",
-                                                          "ENFUSION_PROJECT_PATH":  "C:\\Users\\goatb\\OneDrive\\Documents\\My Games\\ArmaReforgerWorkbench\\addons"
-                                                      },
-                                              "command":  "node",
                                               "autoApprove":  [
 
                                                               ],
+                                              "command":  "node",
+                                              "env":  {
+                                                          "ENFUSION_WORKBENCH_PATH":  "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Arma Reforger Tools",
+                                                          "ENFUSION_GAME_PATH":  "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Arma Reforger",
+                                                          "ENFUSION_PROJECT_PATH":  "C:\\Users\\goatb\\OneDrive\\Documents\\My Games\\ArmaReforgerWorkbench\\addons",
+                                                          "ENFUSION_WORKBENCH_HOST":  "127.0.0.1",
+                                                          "ENFUSION_WORKBENCH_PORT":  "5775"
+                                                      },
+                                              "args":  [
+                                                           "C:\\Users\\goatb\\OneDrive\\Desktop\\arm took mcp\\ARETB\\dist\\index.js"
+                                                       ],
                                               "disabled":  false
                                           }
                    }

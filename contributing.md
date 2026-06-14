@@ -2,14 +2,16 @@
 
 Thanks for helping improve ReforgerForge MCP!
 
-## Getting Started
+## Agent Setup
 
-```bash
-git clone https://github.com/goatboynz/reforger-forge-mcp.git
-cd reforger-forge-mcp
-npm install
-npm test
+See [README.md](README.md#agent-setup) for full instructions. Quick install:
+
+```powershell
+.\scripts\install-agents.ps1 -All          # all supported agents
+.\scripts\install-agents.ps1 -Agent antigravity   # Google Antigravity only
 ```
+
+Supported agents: Cursor, Google Antigravity, Claude Desktop, Windsurf, VS Code Copilot, Continue.dev, Kiro.
 
 ## Making Changes
 
