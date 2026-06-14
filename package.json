@@ -1,0 +1,66 @@
+{
+  "name": "reforger-forge-mcp",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Universal MCP server for Arma Reforger modding — works with any AI agent (Cursor, Claude, Kiro, VS Code)",
+  "bin": {
+    "reforger-forge-mcp": "./dist/index.js"
+  },
+  "scripts": {
+    "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\"",
+    "build": "npm run clean && tsc -p tsconfig.build.json",
+    "dev": "tsx src/index.ts",
+    "scrape": "tsx scripts/scrape.ts",
+    "scrape:remote": "tsx scripts/scrape.ts --source remote",
+    "scrape:local": "tsx scripts/scrape.ts --source local",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "prepare": "npm run build"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.26.0",
+    "adm-zip": "^0.5.16",
+    "cheerio": "^1.0.0",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@types/adm-zip": "^0.5.7",
+    "@types/node": "^22.0.0",
+    "playwright": "^1.58.2",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0",
+    "vitest": "^3.0.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "files": [
+    "dist",
+    "data",
+    "mod",
+    "README.md",
+    "LICENSE"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/goatboynz/reforger-forge-mcp.git"
+  },
+  "homepage": "https://github.com/goatboynz/reforger-forge-mcp",
+  "bugs": {
+    "url": "https://github.com/goatboynz/reforger-forge-mcp/issues"
+  },
+  "author": "Goatboy",
+  "license": "MIT",
+  "keywords": [
+    "mcp",
+    "arma-reforger",
+    "enfusion",
+    "modding",
+    "model-context-protocol",
+    "workbench",
+    "cursor",
+    "claude",
+    "ai-agent",
+    "reforger-forge"
+  ]
+}

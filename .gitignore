@@ -1,0 +1,12 @@
+node_modules/
+dist/
+*.js.map
+.env
+reforger-forge.config.json
+enfusion-mcp.config.json
+.scraper-cache/
+*.tsbuildinfo
+*.pdf
+.claude/
+nul
+mcp server/
