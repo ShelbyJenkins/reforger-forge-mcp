@@ -43,11 +43,11 @@
   ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/kiwidabman/reforger-forge-mcp.git"
+    "url": "https://github.com/wastelandgoats/reforger-forge-mcp.git"
   },
-  "homepage": "https://github.com/kiwidabman/reforger-forge-mcp",
+  "homepage": "https://github.com/wastelandgoats/reforger-forge-mcp",
   "bugs": {
-    "url": "https://github.com/kiwidabman/reforger-forge-mcp/issues"
+    "url": "https://github.com/wastelandgoats/reforger-forge-mcp/issues"
   },
   "author": "Goatboy",
   "license": "MIT",
