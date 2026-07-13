@@ -1,7 +1,7 @@
 # State Machine & Transition Guide
 
 Condensed from the full teaching guide at:
-`C:\Users\Steffen\Documents\A_documents\Arma_Reforger_RAG_Hybrid_Optimized\Documentation\Character_And_Animation\Arma_Reforger_Animation_Editor_State_Machine_Teaching_Guide.md`
+`<source-docs>/Character_And_Animation/Arma_Reforger_Animation_Editor_State_Machine_Teaching_Guide.md`
 
 Read that file when you need full detail. This file covers the critical rules and quick reference.
 

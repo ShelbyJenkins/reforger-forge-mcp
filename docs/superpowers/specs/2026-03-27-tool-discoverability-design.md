@@ -65,7 +65,7 @@ Merge `mod_build`, `mod_create`, `mod_validate` into `mod` with `action: "build"
 
 ### Location
 
-`C:\Users\Steffen\.claude\arma-knowledge\tools-routing.md`
+`$ARMA_KNOWLEDGE_ROOT/tools-routing.md`
 
 Added as a pointer in `INDEX.md` under a new "MCP Tools" section so Claude reads it at every session start alongside the patterns index.
 
@@ -180,7 +180,7 @@ Disambiguation notes where tool names are similar (e.g. game_duplicate vs wb_ent
 | Merge scenario_create_base + objective into `scenario_create` | `wb-scenario.ts` (already in one file) |
 | Update `server.ts` registrations | `server.ts` |
 
-### Arma knowledge (`C:\Users\Steffen\.claude\arma-knowledge\`)
+### Arma knowledge (`$ARMA_KNOWLEDGE_ROOT/`)
 
 | Change | File |
 |---|---|

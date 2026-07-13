@@ -82,7 +82,7 @@ export function registerScenarioTools(server: McpServer, client: WorkbenchClient
 **Step 2: Verify it compiles**
 
 ```
-cd c:/Users/Steffen/Documents/A_documents/Github/enfusion-mcp-BK
+# Run from the reforger-forge-mcp repository root.
 npm run build
 ```
 
@@ -442,7 +442,7 @@ wb_prefabs(action: "getGuid", path: "Prefabs/Systems/ScenarioFramework/Component
 **Step 1: Update version**
 
 ```bash
-cd c:/Users/Steffen/Documents/A_documents/Github/enfusion-mcp-BK
+# From the reforger-forge-mcp repository root, edit package.json:
 # edit package.json: "version": "0.7.0"
 ```
 

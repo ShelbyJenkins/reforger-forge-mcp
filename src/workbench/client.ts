@@ -10,7 +10,7 @@
  */
 
 import { Socket } from "node:net";
-import { existsSync, mkdirSync, copyFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, copyFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join, resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn, execSync } from "node:child_process";
@@ -77,6 +77,86 @@ export class WorkbenchError extends Error {
     super(message);
     this.name = "WorkbenchError";
   }
+}
+
+/**
+ * Build Workbench command-line arguments from explicit launch configuration.
+ *
+ * Workbench expects all addon roots in one comma-separated -addonsDir value;
+ * repeated flags are not merged reliably. Node's spawn receives each entry in
+ * this returned array as one argument, so paths containing spaces remain intact.
+ */
+export function buildWorkbenchLaunchArgs(
+  gprojPath?: string | null,
+  configuredAddonDirs?: readonly string[],
+  scriptAuthorizeAll = false
+): string[] {
+  const args: string[] = [];
+  const addonDirs: string[] = [];
+  const seen = new Set<string>();
+  const invalid: string[] = [];
+
+  if (configuredAddonDirs !== undefined && !Array.isArray(configuredAddonDirs)) {
+    throw new WorkbenchError(
+      "Workbench addon directories must be configured as an array of paths.",
+      "LAUNCH_FAILED"
+    );
+  }
+
+  for (const configuredDir of configuredAddonDirs ?? []) {
+    if (typeof configuredDir !== "string" || configuredDir.trim().length === 0) {
+      throw new WorkbenchError(
+        "Workbench addon directories must be non-empty paths.",
+        "LAUNCH_FAILED"
+      );
+    }
+    const configuredPath = configuredDir.trim();
+    if (configuredPath.includes(",")) {
+      throw new WorkbenchError(
+        `Workbench addon directory cannot contain a comma: ${configuredPath}`,
+        "LAUNCH_FAILED"
+      );
+    }
+
+    const addonDir = resolve(configuredPath);
+    const dedupeKey = process.platform === "win32" ? addonDir.toLowerCase() : addonDir;
+    if (seen.has(dedupeKey)) continue;
+    seen.add(dedupeKey);
+
+    try {
+      if (!statSync(addonDir).isDirectory()) {
+        invalid.push(addonDir);
+        continue;
+      }
+    } catch {
+      invalid.push(addonDir);
+      continue;
+    }
+    addonDirs.push(addonDir);
+  }
+
+  if (invalid.length > 0) {
+    const message = invalid.length === 1
+      ? "Configured Workbench addon path is not a directory:\n"
+      : "Configured Workbench addon paths are not directories:\n";
+    throw new WorkbenchError(
+      message +
+        invalid.map((path) => `  - ${path}`).join("\n"),
+      "LAUNCH_FAILED"
+    );
+  }
+
+  if (addonDirs.length > 0) {
+    args.push("-addonsDir", addonDirs.join(","));
+  }
+  if (gprojPath) {
+    args.push("-gproj", gprojPath);
+  }
+  if (scriptAuthorizeAll) {
+    args.push("-scriptAuthorizeAll");
+  }
+
+  return args;
 }
 
 export class WorkbenchClient {
@@ -474,14 +554,16 @@ export class WorkbenchClient {
       );
     }
 
-    // 4. Spawn with -gproj to skip the launcher
-    const args: string[] = [];
-    if (resolvedGproj) {
-      args.push("-gproj", resolvedGproj);
-    }
+    // 4. Build dependency-aware launch arguments. Explicit addon roots make
+    //    base-game and Workshop dependencies available before the project loads.
+    const args = buildWorkbenchLaunchArgs(
+      resolvedGproj,
+      this.config?.workbenchAddonDirs,
+      this.config?.workbenchScriptAuthorizeAll === true
+    );
 
-    // Use the game install directory as CWD so Workbench finds base game addons
-    // (data/ArmaReforger.gproj with GUID 58D0FB3206B6F859) via ./addons resolution.
+    // Retain the game install directory as a backward-compatible CWD fallback
+    // for configurations that do not provide explicit addon roots.
     const cwd = this.findGameDir() || dirname(exePath);
 
     logger.info(`Launching Workbench: ${exePath}${args.length ? ` ${args.join(" ")}` : ""} (cwd: ${cwd})`);

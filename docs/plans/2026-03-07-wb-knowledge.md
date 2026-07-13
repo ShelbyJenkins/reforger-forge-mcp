@@ -14,15 +14,15 @@
 
 **Files:**
 - Create: `data/kb/patterns/` (directory tree)
-- Source: `C:\Users\Steffen\.claude\arma-knowledge\patterns\` (all `.md` files)
+- Source: `$ARMA_KNOWLEDGE_ROOT/patterns/` (all `.md` files)
 
 **Step 1: Create the kb directory and copy all pattern files**
 
-Run this from the repo root (`C:\Users\Steffen\Documents\A_documents\Github\enfusion-mcp-BK`):
+Set `ARMA_KNOWLEDGE_ROOT` to the local knowledge-base directory, then run this from the repo root:
 
 ```bash
 mkdir -p data/kb/patterns
-cp -r "C:/Users/Steffen/.claude/arma-knowledge/patterns/." data/kb/patterns/
+cp -r "$ARMA_KNOWLEDGE_ROOT/patterns/." data/kb/patterns/
 ```
 
 **Step 2: Verify the copy**

@@ -5,14 +5,12 @@
 
 .DESCRIPTION
   - Installs npm dependencies and builds the server
-  - Writes agent config files with correct absolute paths
   - Verifies all 50 tools register
-  - Optionally adds reforger-forge to global Cursor MCP config
+  - Optionally installs reforger-forge into supported MCP clients
 #>
 
 $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $PSScriptRoot
-$ServerEntry = Join-Path $Root "dist\index.js"
 
 Write-Host "ReforgerForge MCP Setup" -ForegroundColor Cyan
 Write-Host "=======================" -ForegroundColor Cyan
@@ -20,9 +18,19 @@ Write-Host ""
 Write-Host "Repo: $Root"
 
 # Check Node.js
-$nodeVersion = node --version 2>$null
-if (-not $nodeVersion) {
+$nodeCommand = Get-Command node -ErrorAction SilentlyContinue
+if (-not $nodeCommand) {
     Write-Host "ERROR: Node.js 20+ is required. Install from https://nodejs.org" -ForegroundColor Red
+    exit 1
+}
+$nodeVersion = & $nodeCommand.Source --version 2>$null
+if ($LASTEXITCODE -ne 0 -or -not $nodeVersion -or $nodeVersion -notmatch '^v?(?<major>\d+)(?:\.|$)') {
+    Write-Host "ERROR: Could not determine the installed Node.js version." -ForegroundColor Red
+    exit 1
+}
+$nodeMajor = [int]$Matches.major
+if ($nodeMajor -lt 20) {
+    Write-Host "ERROR: Node.js 20+ is required (found $nodeVersion)." -ForegroundColor Red
     exit 1
 }
 Write-Host "Node.js: $nodeVersion"
@@ -33,60 +41,6 @@ if (-not (Test-Path $configPath)) {
     Copy-Item (Join-Path $Root "reforger-forge.config.example.json") $configPath
     Write-Host "Created reforger-forge.config.json - edit your projectPath if needed." -ForegroundColor Yellow
 }
-
-# Read config for env vars
-$config = Get-Content $configPath -Raw | ConvertFrom-Json
-$envBlock = @{
-    ENFUSION_WORKBENCH_PATH = $config.workbenchPath
-    ENFUSION_GAME_PATH       = $config.gamePath
-    ENFUSION_PROJECT_PATH    = $config.projectPath
-    ENFUSION_WORKBENCH_HOST  = $config.workbenchHost
-    ENFUSION_WORKBENCH_PORT  = "$($config.workbenchPort)"
-}
-
-$mcpEntry = @{
-    command = "node"
-    args    = @($ServerEntry)
-    env     = $envBlock
-}
-
-# Write agent configs
-$cursorDir = Join-Path $Root ".cursor"
-$kiroDir   = Join-Path $Root ".kiro\settings"
-New-Item -ItemType Directory -Force -Path $cursorDir | Out-Null
-New-Item -ItemType Directory -Force -Path $kiroDir   | Out-Null
-
-@{
-    mcpServers = @{ "reforger-forge" = $mcpEntry }
-} | ConvertTo-Json -Depth 10 | Set-Content (Join-Path $cursorDir "mcp.json") -Encoding UTF8
-
-@{
-    mcpServers = @{
-        "reforger-forge" = @{
-            command  = "node"
-            args     = @($ServerEntry)
-            env      = $envBlock
-            disabled = $false
-            autoApprove = @()
-        }
-    }
-} | ConvertTo-Json -Depth 10 | Set-Content (Join-Path $kiroDir "mcp.json") -Encoding UTF8
-
-@{
-    mcpServers = @{ "reforger-forge" = $mcpEntry }
-} | ConvertTo-Json -Depth 10 | Set-Content (Join-Path $Root "configs\cursor-global.json") -Encoding UTF8
-
-@{
-    mcpServers = @{
-        "reforger-forge" = @{
-            command = "cmd"
-            args    = @("/c", "node", $ServerEntry)
-            env     = $envBlock
-        }
-    }
-} | ConvertTo-Json -Depth 10 | Set-Content (Join-Path $Root "configs\claude-desktop.json") -Encoding UTF8
-
-Write-Host "Agent configs written." -ForegroundColor Green
 
 # Build
 Write-Host ""

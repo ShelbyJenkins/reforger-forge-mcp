@@ -17,7 +17,7 @@ Describe what you want to build — your AI agent handles API research, code gen
 ## Quick Start
 
 ```bash
-git clone https://github.com/goatboynz/reforger-forge-mcp.git
+git clone https://github.com/wastelandgoats/reforger-forge-mcp.git
 cd reforger-forge-mcp
 npm install
 npm run build
@@ -55,8 +55,21 @@ cp reforger-forge.config.example.json reforger-forge.config.json
 | `workbenchPath` | Arma Reforger Tools (Steam) install |
 | `gamePath` | Arma Reforger game install |
 | `projectPath` | Where your mods are saved |
+| `workbenchAddonDirs` | Ordered base-game and Workshop addon roots passed to Workbench as one `-addonsDir` value |
+| `workbenchScriptAuthorizeAll` | Opt in to Workbench's `-scriptAuthorizeAll` flag for trusted local projects; defaults to `false` |
+
+`workbenchScriptAuthorizeAll` suppresses prompts for protected `RunCmd`,
+`RunProcess`, `KillProcess`, and out-of-profile `FileIO` operations. Leave it
+disabled unless you trust the active project and all of its dependencies.
 
 Re-run `.\scripts\install-agents.ps1` after changing paths so all agents get updated env vars.
+
+### Add workspace instructions
+
+Copy [the starter `AGENTS.md`](docs/AGENTS.md) into the root of your modding
+workspace and replace its placeholders. It gives coding agents a practical
+setup checklist, MCP tool-routing guide, Workbench workflow, resource-safety
+rules, validation steps, and troubleshooting reference.
 
 ---
 
@@ -102,7 +115,10 @@ Manual config (if needed):
 
 ### Cursor
 
-Workspace config: `.cursor/mcp.json` (included). Global: run install script or merge `configs/cursor-global.json`.
+For a global install, run the install script or merge
+`configs/cursor-global.json`. For a workspace-only install, copy
+`configs/agents/stdio-template.json` to `.cursor/mcp.json` and replace the
+placeholder path. Generated workspace config is intentionally ignored by Git.
 
 Restart → **MCP: Restart Servers**
 
@@ -173,14 +189,18 @@ Legend: **Offline** = no Workbench needed | **Live** = requires Workbench runnin
 | `wiki_read` | Read the full content of a wiki page by title, including code examples (up to 100k chars, no truncation). |
 | `wb_knowledge` | Search the bundled modding knowledge base — scripting, audio, weapons, vehicles, AI, UI, game modes, animation, and more. Use `query='index'` to list all topics. |
 
-### Game Assets (Offline)
+### Game Assets
+
+Search and read operations are offline. `game_duplicate` is offline only with
+`register=false`; its default registration step requires Workbench and may
+auto-launch it.
 
 | Tool | What it does |
 |------|-------------|
 | `game_browse` | Browse base game files (scripts, prefabs, configs) from loose files and `.pak` archives. Do not use filesystem tools on the game install directly. |
 | `game_read` | Read a specific base game file — vanilla `.c` scripts, `.et` prefabs, `.conf` configs from loose files or `.pak`. |
-| `asset_search` | Search game assets (prefabs, models, textures, scripts, configs) by name across loose files and `.pak` archives. Returns paths and GUIDs. |
-| `game_duplicate` | Duplicate a base game prefab/config into your mod folder with full ancestor chain resolved. Optionally `flatten=true` to bake all inherited components. Registers with Workbench for a new GUID. |
+| `asset_search` | Search game assets (prefabs, models, textures, scripts, configs) by name across loose files and `.pak` archives. Returns paths and indexed GUIDs when available. |
+| `game_duplicate` | Duplicate a base game prefab/config into your mod folder with full ancestor chain resolved. Optionally `flatten=true` to bake all inherited components. By default, registers with Workbench for a new GUID; set `register=false` for an unregistered offline copy. |
 | `workshop_info` | Read Workshop metadata from a mod's `.gproj` — mod ID, GUID, title, dependencies, configurations. |
 
 ### Project & Mod Management
@@ -214,7 +234,7 @@ Legend: **Offline** = no Workbench needed | **Live** = requires Workbench runnin
 
 | Tool | What it does |
 |------|-------------|
-| `wb_launch` | Start Arma Reforger Workbench, install handler scripts into mod, wait for NET API. Auto-called by other `wb_*` tools when needed. Call `wb_cleanup` before publishing mod. |
+| `wb_launch` | Start Arma Reforger Workbench with configured addon roots and script-authorization policy, install handler scripts into the mod, and wait for NET API. Auto-called by other `wb_*` tools when needed. Call `wb_cleanup` before publishing mod. |
 | `wb_connect` | Test connection to Workbench NET API. Returns connection status and editor mode. |
 | `wb_diagnose` | Full diagnostic — config, handler script locations, NET API status. Use when `wb_launch` or `wb_connect` fails. |
 | `wb_cleanup` | Remove temporary EnfusionMCP handler scripts from mod before publishing. Safe even if never installed. |
@@ -290,16 +310,20 @@ Environment variables override config files:
 | `REFORGER_FORGE_DEBUG` | Enable debug logging | off |
 
 Config file search order:
-1. `reforger-forge.config.json` (project root)
-2. `~/.reforger-forge/config.json` (user home)
-3. Legacy `enfusion-mcp.config.json` paths (backward compatible)
+1. `reforger-forge.config.json` in the package root, falling back to the local
+   legacy `enfusion-mcp.config.json`
+2. `~/.reforger-forge/config.json` in the user home, falling back to the home
+   legacy `~/.enfusion-mcp/config.json`
+
+Package-local values override user-home values; environment variables override
+both.
 
 ---
 
 ## Requirements
 
 - **Node.js 20+**
-- **Arma Reforger Tools** (Steam) — for `mod` build and all `wb_*` tools
+- **Arma Reforger Tools** (Steam) — for `mod` build, registration, and live editor-control tools
 - **Arma Reforger** (Steam) — for game asset browsing
 
 ---
@@ -321,22 +345,24 @@ reforger-forge-mcp/
 ├── src/                         # TypeScript source
 ├── data/                        # API index, wiki, patterns, knowledge base
 ├── mod/                         # Workbench NET API handler scripts
+├── docs/AGENTS.md               # Copy-ready modding workspace instructions
 ├── configs/agents/              # Manual install templates
 ├── scripts/
 │   ├── setup.ps1                # Build + configure
 │   ├── install-agents.ps1       # Install into any AI agent
 │   └── list-tools.mjs           # Verify tool registration
-├── .cursor/mcp.json             # Cursor workspace
-├── .vscode/mcp.json             # VS Code workspace
-├── .kiro/settings/mcp.json      # Kiro workspace
 └── dist/                        # Built server (generated)
 ```
 
-## Publishing to GitHub
+## Contributing via a fork
+
+The canonical repository is
+[wastelandgoats/reforger-forge-mcp](https://github.com/wastelandgoats/reforger-forge-mcp).
+After cloning your GitHub fork, keep the canonical repository as `upstream`:
 
 ```bash
-git remote add origin https://github.com/goatboynz/reforger-forge-mcp.git
-git push -u origin main
+git remote add upstream https://github.com/wastelandgoats/reforger-forge-mcp.git
+git fetch upstream
 ```
 
 ## Credits & Attribution

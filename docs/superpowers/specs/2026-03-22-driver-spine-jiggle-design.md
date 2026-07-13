@@ -13,7 +13,7 @@ Add an exaggerated, suspension-driven vertical translation to the M151A2 driver 
 
 ## Scope
 
-- File modified: `Testanims2M151A2.agf` (Body sheet only)
+- File modified: `ExampleM151A2.agf` (Body sheet only)
 - No changes to `.agr`, `.ast`, `.asi`, prefab, or Main sheet
 - Driver seat only (`driver_idle` socket bone)
 - No new variables required — uses existing `suspension_0..3` declared in the AGR

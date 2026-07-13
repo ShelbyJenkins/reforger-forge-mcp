@@ -15,10 +15,10 @@
 
 ## File Structure
 
-### New Files (Blender plugin - `C:\Users\Steffen\Documents\A_documents\Github\Arma-Reforger-Addons\plugins\bk_building_tools\`)
+### New Files (Blender plugin - `<blender-addons-root>/bk_building_tools/`)
 - `operators/destruction.py` -- 4 new operators for the destruction workflow
 
-### New Files (MCP - `C:\Users\Steffen\Documents\A_documents\Github\enfusion-mcp-BK\`)
+### New Files (MCP - `reforger-forge-mcp` repository root)
 - `src/tools/building-setup.ts` -- MCP tool: reads manifest, creates prefabs
 - `tests/tools/building-setup.test.ts` -- Tests for the MCP tool
 
@@ -1253,7 +1253,7 @@ registerBuildingSetup(server, config);
 - [ ] **Step 1: Run MCP tests**
 
 ```bash
-cd enfusion-mcp-BK && npm test
+npm test
 ```
 
 - [ ] **Step 2: Build MCP project**

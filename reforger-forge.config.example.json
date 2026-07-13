@@ -2,6 +2,8 @@
   "workbenchPath": "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Arma Reforger Tools",
   "gamePath": "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Arma Reforger",
   "projectPath": "",
+  "workbenchAddonDirs": [],
+  "workbenchScriptAuthorizeAll": false,
   "workbenchHost": "127.0.0.1",
   "workbenchPort": 5775
 }

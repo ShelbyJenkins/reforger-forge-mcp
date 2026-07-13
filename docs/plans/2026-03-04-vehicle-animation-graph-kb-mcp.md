@@ -4,32 +4,32 @@
 
 **Goal:** Build a comprehensive vehicle animation graph knowledge base in the arma-knowledge patterns folder and add three MCP tools (`animation_graph_inspect`, `animation_graph_author`, `animation_graph_setup`) to the enfusion-mcp server.
 
-**Architecture:** Knowledge base lives at `C:\Users\Steffen\.claude\arma-knowledge\patterns\Character_And_Animation\animation\` as six focused Markdown files. MCP tools live in `src/tools/animation-graph-*.ts` and are registered in `src/server.ts`. Tools parse Enfusion text serialization format directly — no Workbench connection required.
+**Architecture:** Knowledge base lives at `<knowledge-base>/patterns/Character_And_Animation/animation/` as six focused Markdown files. MCP tools live in `src/tools/animation-graph-*.ts` and are registered in `src/server.ts`. Tools parse Enfusion text serialization format directly — no Workbench connection required.
 
-**Tech Stack:** TypeScript, Node.js, Zod (already used throughout codebase). Source data: LAV25/S105 `.agr`/`.agf`/`.ast` files in `E:\Arma reforger data\Data004\Assets\Vehicles\Wheeled\`. Teaching guides in `C:\Users\Steffen\Documents\A_documents\Arma_Reforger_RAG_Hybrid_Optimized\Documentation\Character_And_Animation\`.
+**Tech Stack:** TypeScript, Node.js, Zod (already used throughout codebase). Source data: LAV25/S105 `.agr`/`.agf`/`.ast` files under `<extracted-game-data>/Assets/Vehicles/Wheeled/`. Teaching guides under `<source-docs>/Character_And_Animation/`.
 
 ---
 
 ## Context You Need
 
 ### Key paths
-- Knowledge base root: `C:/Users/Steffen/.claude/arma-knowledge/`
-- Main INDEX: `C:/Users/Steffen/.claude/arma-knowledge/INDEX.md`
-- Old animation file to delete: `C:/Users/Steffen/.claude/arma-knowledge/patterns/Character_And_Animation/animation-graph.md`
-- New animation subfolder: `C:/Users/Steffen/.claude/arma-knowledge/patterns/Character_And_Animation/animation/`
-- MCP repo root: `C:/Users/Steffen/Documents/A_documents/Github/enfusion-mcp-BK/`
-- MCP tools dir: `C:/Users/Steffen/Documents/A_documents/Github/enfusion-mcp-BK/src/tools/`
-- MCP server registration: `C:/Users/Steffen/Documents/A_documents/Github/enfusion-mcp-BK/src/server.ts`
+- Knowledge base root: `<knowledge-base>/`
+- Main INDEX: `<knowledge-base>/INDEX.md`
+- Old animation file to delete: `<knowledge-base>/patterns/Character_And_Animation/animation-graph.md`
+- New animation subfolder: `<knowledge-base>/patterns/Character_And_Animation/animation/`
+- MCP repo root: the `reforger-forge-mcp` repository root
+- MCP tools dir: `src/tools/`
+- MCP server registration: `src/server.ts`
 
 ### Source files to distill
-- `C:/Users/Steffen/Documents/A_documents/Arma_Reforger_RAG_Hybrid_Optimized/Documentation/Character_And_Animation/Arma_Reforger_Animation_Nodes_Teaching_Guide.md` (1392 lines) — AGF nodes
-- `C:/Users/Steffen/Documents/A_documents/Arma_Reforger_RAG_Hybrid_Optimized/Documentation/Character_And_Animation/Arma_Reforger_Procedural_Animation_Nodes_Teaching_Guide.md` (1229 lines) — PAP/SIGA nodes
-- `E:/Arma reforger data/Data004/Assets/Vehicles/Wheeled/LAV25/workspaces/LAV25.agr` — complex vehicle AGR
-- `E:/Arma reforger data/Data004/Assets/Vehicles/Wheeled/LAV25/workspaces/LAV25.agf` — complex vehicle AGF
-- `E:/Arma reforger data/Data004/Assets/Vehicles/Wheeled/LAV25/workspaces/LAV25.ast` — complex vehicle AST
-- `E:/Arma reforger data/Data004/Assets/Vehicles/Wheeled/S105/workspace/S105.agr` — simple vehicle AGR
-- `E:/Arma reforger data/Data004/Assets/Vehicles/Wheeled/S105/workspace/S105.agf` — simple vehicle AGF
-- `E:/Arma reforger data/Data004/Assets/Vehicles/Wheeled/S105/workspace/S105.ast` — simple vehicle AST
+- `<source-docs>/Character_And_Animation/Arma_Reforger_Animation_Nodes_Teaching_Guide.md` (1392 lines) — AGF nodes
+- `<source-docs>/Character_And_Animation/Arma_Reforger_Procedural_Animation_Nodes_Teaching_Guide.md` (1229 lines) — PAP/SIGA nodes
+- `<extracted-game-data>/Assets/Vehicles/Wheeled/LAV25/workspaces/LAV25.agr` — complex vehicle AGR
+- `<extracted-game-data>/Assets/Vehicles/Wheeled/LAV25/workspaces/LAV25.agf` — complex vehicle AGF
+- `<extracted-game-data>/Assets/Vehicles/Wheeled/LAV25/workspaces/LAV25.ast` — complex vehicle AST
+- `<extracted-game-data>/Assets/Vehicles/Wheeled/S105/workspace/S105.agr` — simple vehicle AGR
+- `<extracted-game-data>/Assets/Vehicles/Wheeled/S105/workspace/S105.agf` — simple vehicle AGF
+- `<extracted-game-data>/Assets/Vehicles/Wheeled/S105/workspace/S105.ast` — simple vehicle AST
 
 ### Enfusion text serialization format (for parser)
 Files use a brace-block format:
@@ -82,7 +82,7 @@ registerMyTool(server, config);
 ## Task 1: Write `animation/INDEX.md`
 
 **Files:**
-- Create: `C:/Users/Steffen/.claude/arma-knowledge/patterns/Character_And_Animation/animation/INDEX.md`
+- Create: `<knowledge-base>/patterns/Character_And_Animation/animation/INDEX.md`
 
 **Step 1: Create the routing index**
 
@@ -115,7 +115,7 @@ Read this first. Find your task below and read only the listed file(s).
 
 **Step 2: Commit**
 ```bash
-cd "C:/Users/Steffen/.claude/arma-knowledge"
+cd "<knowledge-base>"
 git add patterns/Character_And_Animation/animation/INDEX.md
 git commit -m "feat: add animation subfolder index"
 ```
@@ -125,9 +125,9 @@ git commit -m "feat: add animation subfolder index"
 ## Task 2: Write `animation/core-concepts.md`
 
 **Files:**
-- Read first: `C:/Users/Steffen/Documents/A_documents/Arma_Reforger_RAG_Hybrid_Optimized/Documentation/Character_And_Animation/Arma_Reforger_Animation_Nodes_Teaching_Guide.md` (sections 1-4)
-- Read first: `C:/Users/Steffen/.claude/arma-knowledge/patterns/Character_And_Animation/animation-graph.md` (existing content to migrate)
-- Create: `C:/Users/Steffen/.claude/arma-knowledge/patterns/Character_And_Animation/animation/core-concepts.md`
+- Read first: `<source-docs>/Character_And_Animation/Arma_Reforger_Animation_Nodes_Teaching_Guide.md` (sections 1-4)
+- Read first: `<knowledge-base>/patterns/Character_And_Animation/animation-graph.md` (existing content to migrate)
+- Create: `<knowledge-base>/patterns/Character_And_Animation/animation/core-concepts.md`
 
 **Step 1: Read source material**
 
@@ -146,7 +146,7 @@ The file must cover ALL of these sections — distill from source, do not just s
 
 **Step 3: Commit**
 ```bash
-cd "C:/Users/Steffen/.claude/arma-knowledge"
+cd "<knowledge-base>"
 git add patterns/Character_And_Animation/animation/core-concepts.md
 git commit -m "feat: add animation core-concepts"
 ```
@@ -156,8 +156,8 @@ git commit -m "feat: add animation core-concepts"
 ## Task 3: Write `animation/node-reference.md`
 
 **Files:**
-- Read first: `C:/Users/Steffen/Documents/A_documents/Arma_Reforger_RAG_Hybrid_Optimized/Documentation/Character_And_Animation/Arma_Reforger_Animation_Nodes_Teaching_Guide.md` (sections 5-9 — the full node reference)
-- Create: `C:/Users/Steffen/.claude/arma-knowledge/patterns/Character_And_Animation/animation/node-reference.md`
+- Read first: `<source-docs>/Character_And_Animation/Arma_Reforger_Animation_Nodes_Teaching_Guide.md` (sections 5-9 — the full node reference)
+- Create: `<knowledge-base>/patterns/Character_And_Animation/animation/node-reference.md`
 
 **Step 1: Read source material**
 
@@ -197,7 +197,7 @@ For each node type include: **Purpose** (one line), **Key properties** (name + w
 
 **Step 3: Commit**
 ```bash
-cd "C:/Users/Steffen/.claude/arma-knowledge"
+cd "<knowledge-base>"
 git add patterns/Character_And_Animation/animation/node-reference.md
 git commit -m "feat: add animation node-reference"
 ```
@@ -207,12 +207,12 @@ git commit -m "feat: add animation node-reference"
 ## Task 4: Write `animation/vehicle-animation.md`
 
 **Files:**
-- Read first: `E:/Arma reforger data/Data004/Assets/Vehicles/Wheeled/LAV25/workspaces/LAV25.agr`
-- Read first: `E:/Arma reforger data/Data004/Assets/Vehicles/Wheeled/LAV25/workspaces/LAV25.ast`
-- Read first: `E:/Arma reforger data/Data004/Assets/Vehicles/Wheeled/S105/workspace/S105.agr`
-- Read first: `E:/Arma reforger data/Data004/Assets/Vehicles/Wheeled/S105/workspace/S105.ast`
-- Read first (first 200 lines): `E:/Arma reforger data/Data004/Assets/Vehicles/Wheeled/S105/workspace/S105.agf`
-- Create: `C:/Users/Steffen/.claude/arma-knowledge/patterns/Character_And_Animation/animation/vehicle-animation.md`
+- Read first: `<extracted-game-data>/Assets/Vehicles/Wheeled/LAV25/workspaces/LAV25.agr`
+- Read first: `<extracted-game-data>/Assets/Vehicles/Wheeled/LAV25/workspaces/LAV25.ast`
+- Read first: `<extracted-game-data>/Assets/Vehicles/Wheeled/S105/workspace/S105.agr`
+- Read first: `<extracted-game-data>/Assets/Vehicles/Wheeled/S105/workspace/S105.ast`
+- Read first (first 200 lines): `<extracted-game-data>/Assets/Vehicles/Wheeled/S105/workspace/S105.agf`
+- Create: `<knowledge-base>/patterns/Character_And_Animation/animation/vehicle-animation.md`
 
 **Step 1: Read all source files above**
 
@@ -285,7 +285,7 @@ Show Chassis / Body / Turret / Turret_Pose bone masks with real bone name exampl
 
 **Step 3: Commit**
 ```bash
-cd "C:/Users/Steffen/.claude/arma-knowledge"
+cd "<knowledge-base>"
 git add patterns/Character_And_Animation/animation/vehicle-animation.md
 git commit -m "feat: add vehicle-animation patterns"
 ```
@@ -295,9 +295,9 @@ git commit -m "feat: add vehicle-animation patterns"
 ## Task 5: Write `animation/procedural-pap-siga.md`
 
 **Files:**
-- Read first: `C:/Users/Steffen/Documents/A_documents/Arma_Reforger_RAG_Hybrid_Optimized/Documentation/Character_And_Animation/Arma_Reforger_Procedural_Animation_Nodes_Teaching_Guide.md` (full file)
-- Read first: existing `C:/Users/Steffen/.claude/arma-knowledge/patterns/Character_And_Animation/animation-graph.md` (PAP/SIGA section)
-- Create: `C:/Users/Steffen/.claude/arma-knowledge/patterns/Character_And_Animation/animation/procedural-pap-siga.md`
+- Read first: `<source-docs>/Character_And_Animation/Arma_Reforger_Procedural_Animation_Nodes_Teaching_Guide.md` (full file)
+- Read first: existing `<knowledge-base>/patterns/Character_And_Animation/animation-graph.md` (PAP/SIGA section)
+- Create: `<knowledge-base>/patterns/Character_And_Animation/animation/procedural-pap-siga.md`
 
 **Step 1: Read source material**
 
@@ -338,7 +338,7 @@ Distill all node types with: purpose, key properties, gotchas. Do not omit any n
 
 **Step 3: Commit**
 ```bash
-cd "C:/Users/Steffen/.claude/arma-knowledge"
+cd "<knowledge-base>"
 git add patterns/Character_And_Animation/animation/procedural-pap-siga.md
 git commit -m "feat: add procedural-pap-siga patterns"
 ```
@@ -348,8 +348,8 @@ git commit -m "feat: add procedural-pap-siga patterns"
 ## Task 6: Write `animation/script-integration.md`
 
 **Files:**
-- Read first: existing `C:/Users/Steffen/.claude/arma-knowledge/patterns/Character_And_Animation/animation-graph.md` (script-driven float section)
-- Create: `C:/Users/Steffen/.claude/arma-knowledge/patterns/Character_And_Animation/animation/script-integration.md`
+- Read first: existing `<knowledge-base>/patterns/Character_And_Animation/animation-graph.md` (script-driven float section)
+- Create: `<knowledge-base>/patterns/Character_And_Animation/animation/script-integration.md`
 
 **Step 1: Write the file**
 
@@ -400,7 +400,7 @@ Note that VehicleAnimationComponent handles suspension_N automatically via the p
 
 **Step 2: Commit**
 ```bash
-cd "C:/Users/Steffen/.claude/arma-knowledge"
+cd "<knowledge-base>"
 git add patterns/Character_And_Animation/animation/script-integration.md
 git commit -m "feat: add script-integration patterns"
 ```
@@ -410,8 +410,8 @@ git commit -m "feat: add script-integration patterns"
 ## Task 7: Update Main INDEX.md and Delete Old File
 
 **Files:**
-- Modify: `C:/Users/Steffen/.claude/arma-knowledge/INDEX.md`
-- Delete: `C:/Users/Steffen/.claude/arma-knowledge/patterns/Character_And_Animation/animation-graph.md`
+- Modify: `<knowledge-base>/INDEX.md`
+- Delete: `<knowledge-base>/patterns/Character_And_Animation/animation-graph.md`
 
 **Step 1: Read the main INDEX.md**
 
@@ -429,12 +429,12 @@ Replace with:
 
 **Step 3: Delete old file**
 ```bash
-rm "C:/Users/Steffen/.claude/arma-knowledge/patterns/Character_And_Animation/animation-graph.md"
+rm "<knowledge-base>/patterns/Character_And_Animation/animation-graph.md"
 ```
 
 **Step 4: Commit**
 ```bash
-cd "C:/Users/Steffen/.claude/arma-knowledge"
+cd "<knowledge-base>"
 git add -A
 git commit -m "refactor: replace animation-graph.md with animation/ subfolder"
 ```
@@ -444,8 +444,8 @@ git commit -m "refactor: replace animation-graph.md with animation/ subfolder"
 ## Task 8: Implement `animation_graph_inspect` Tool
 
 **Files:**
-- Create: `C:/Users/Steffen/Documents/A_documents/Github/enfusion-mcp-BK/src/tools/animation-graph-inspect.ts`
-- Modify: `C:/Users/Steffen/Documents/A_documents/Github/enfusion-mcp-BK/src/server.ts`
+- Create: `src/tools/animation-graph-inspect.ts`
+- Modify: `src/server.ts`
 
 **Step 1: Read reference tools**
 
@@ -535,7 +535,7 @@ registerAnimationGraphInspect(server, config);
 
 **Step 5: Build and verify no TypeScript errors**
 ```bash
-cd "C:/Users/Steffen/Documents/A_documents/Github/enfusion-mcp-BK"
+# Run from the reforger-forge-mcp repository root.
 npm run build 2>&1
 ```
 Expected: no errors.
@@ -551,8 +551,8 @@ git commit -m "feat: add animation_graph_inspect tool"
 ## Task 9: Implement `animation_graph_author` Tool
 
 **Files:**
-- Create: `C:/Users/Steffen/Documents/A_documents/Github/enfusion-mcp-BK/src/tools/animation-graph-author.ts`
-- Modify: `C:/Users/Steffen/Documents/A_documents/Github/enfusion-mcp-BK/src/server.ts`
+- Create: `src/tools/animation-graph-author.ts`
+- Modify: `src/server.ts`
 
 **Step 1: Read reference files**
 
@@ -635,7 +635,7 @@ registerAnimationGraphAuthor(server, config);
 
 **Step 6: Build**
 ```bash
-cd "C:/Users/Steffen/Documents/A_documents/Github/enfusion-mcp-BK"
+# Run from the reforger-forge-mcp repository root.
 npm run build 2>&1
 ```
 Expected: no errors.
@@ -651,8 +651,8 @@ git commit -m "feat: add animation_graph_author tool"
 ## Task 10: Implement `animation_graph_setup` Tool
 
 **Files:**
-- Create: `C:/Users/Steffen/Documents/A_documents/Github/enfusion-mcp-BK/src/tools/animation-graph-setup.ts`
-- Modify: `C:/Users/Steffen/Documents/A_documents/Github/enfusion-mcp-BK/src/server.ts`
+- Create: `src/tools/animation-graph-setup.ts`
+- Modify: `src/server.ts`
 
 **Step 1: Read vehicle-animation.md** (written in Task 4) for node hierarchy patterns and step-by-step instructions to embed in the tool output.
 
@@ -746,7 +746,7 @@ registerAnimationGraphSetup(server, config);
 
 **Step 7: Build**
 ```bash
-cd "C:/Users/Steffen/Documents/A_documents/Github/enfusion-mcp-BK"
+# Run from the reforger-forge-mcp repository root.
 npm run build 2>&1
 ```
 Expected: no errors.
@@ -762,12 +762,12 @@ git commit -m "feat: add animation_graph_setup tool"
 ## Task 11: Update MCP Server Guidance
 
 **Files:**
-- Read first: `C:/Users/Steffen/Documents/A_documents/Github/enfusion-mcp-BK/src/server.ts`
+- Read first: `src/server.ts`
 - Check if there is an MCP server instructions/prompt file — look in `src/prompts/` for any system prompt or instructions file
 
 **Step 1: Check for system-level instructions**
 ```bash
-ls "C:/Users/Steffen/Documents/A_documents/Github/enfusion-mcp-BK/src/prompts/" 2>/dev/null
+ls "src/prompts/" 2>/dev/null
 ```
 
 **Step 2: If a system prompt or instructions file exists**, add routing note:
@@ -779,7 +779,7 @@ Use animation_graph_setup as the primary entry point for new vehicle animation g
 
 **Step 3: Build final time**
 ```bash
-cd "C:/Users/Steffen/Documents/A_documents/Github/enfusion-mcp-BK"
+# Run from the reforger-forge-mcp repository root.
 npm run build 2>&1
 ```
 
@@ -794,7 +794,7 @@ git commit -m "feat: update MCP guidance for animation graph tools"
 ## Done
 
 All tasks complete when:
-- `C:/Users/Steffen/.claude/arma-knowledge/patterns/Character_And_Animation/animation/` contains all 6 files
+- `<knowledge-base>/patterns/Character_And_Animation/animation/` contains all 6 files
 - Old `animation-graph.md` is deleted
 - Main `INDEX.md` points to `animation/INDEX.md`
 - `npm run build` passes with 3 new tools registered

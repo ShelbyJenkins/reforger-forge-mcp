@@ -242,7 +242,7 @@ export function mergeAncestryComponents(levels: AncestorLevel[]): Map<string, Me
 - [ ] **Step 2: Build to verify types compile**
 
 ```bash
-cd "c:/Users/Steffen/Documents/A_documents/Github/enfusion-mcp-BK" && npm run build 2>&1 | tail -20
+npm run build 2>&1 | tail -20
 ```
 
 Expected: no TypeScript errors. The file is purely additive so nothing should break.
@@ -376,7 +376,7 @@ describe("mergeAncestryComponents", () => {
 - [ ] **Step 2: Run tests to verify they pass**
 
 ```bash
-cd "c:/Users/Steffen/Documents/A_documents/Github/enfusion-mcp-BK" && npx vitest run tests/utils/prefab-ancestry.test.ts
+npx vitest run tests/utils/prefab-ancestry.test.ts
 ```
 
 Expected: all tests PASS.
@@ -521,7 +521,7 @@ export function registerPrefabInspect(server: McpServer, config: Config): void {
 - [ ] **Step 2: Build and verify no errors**
 
 ```bash
-cd "c:/Users/Steffen/Documents/A_documents/Github/enfusion-mcp-BK" && npm run build 2>&1 | tail -20
+npm run build 2>&1 | tail -20
 ```
 
 Expected: clean build, no TypeScript errors.
@@ -529,7 +529,7 @@ Expected: clean build, no TypeScript errors.
 - [ ] **Step 3: Run full test suite to confirm no regressions**
 
 ```bash
-cd "c:/Users/Steffen/Documents/A_documents/Github/enfusion-mcp-BK" && npx vitest run
+npx vitest run
 ```
 
 Expected: all tests pass (same count as before this task).
@@ -621,7 +621,7 @@ export interface ComponentDef {
 - [ ] **Step 2: Build to verify**
 
 ```bash
-cd "c:/Users/Steffen/Documents/A_documents/Github/enfusion-mcp-BK" && npm run build 2>&1 | tail -20
+npm run build 2>&1 | tail -20
 ```
 
 Expected: clean build.
@@ -673,7 +673,7 @@ In `tests/templates/prefab.test.ts`, add at the end of the `generatePrefab` desc
 - [ ] **Step 4: Run template tests**
 
 ```bash
-cd "c:/Users/Steffen/Documents/A_documents/Github/enfusion-mcp-BK" && npx vitest run tests/templates/prefab.test.ts
+npx vitest run tests/templates/prefab.test.ts
 ```
 
 Expected: all tests pass including the two new ones.
@@ -873,7 +873,7 @@ export function registerPrefabCreate(server: McpServer, config: Config): void {
 - [ ] **Step 2: Build to verify**
 
 ```bash
-cd "c:/Users/Steffen/Documents/A_documents/Github/enfusion-mcp-BK" && npm run build 2>&1 | tail -20
+npm run build 2>&1 | tail -20
 ```
 
 Expected: clean build.
@@ -881,7 +881,7 @@ Expected: clean build.
 - [ ] **Step 3: Run full test suite**
 
 ```bash
-cd "c:/Users/Steffen/Documents/A_documents/Github/enfusion-mcp-BK" && npx vitest run
+npx vitest run
 ```
 
 Expected: all tests pass.
@@ -1215,7 +1215,7 @@ export function registerGameDuplicate(
 - [ ] **Step 2: Build to verify**
 
 ```bash
-cd "c:/Users/Steffen/Documents/A_documents/Github/enfusion-mcp-BK" && npm run build 2>&1 | tail -20
+npm run build 2>&1 | tail -20
 ```
 
 Expected: clean build.
@@ -1223,7 +1223,7 @@ Expected: clean build.
 - [ ] **Step 3: Run full test suite**
 
 ```bash
-cd "c:/Users/Steffen/Documents/A_documents/Github/enfusion-mcp-BK" && npx vitest run
+npx vitest run
 ```
 
 Expected: all tests pass.
@@ -1242,7 +1242,7 @@ git commit -m "feat: game_duplicate injects ancestor components and supports fla
 - [ ] **Step 1: Full clean build**
 
 ```bash
-cd "c:/Users/Steffen/Documents/A_documents/Github/enfusion-mcp-BK" && npm run build 2>&1
+npm run build 2>&1
 ```
 
 Expected: zero TypeScript errors.
@@ -1250,7 +1250,7 @@ Expected: zero TypeScript errors.
 - [ ] **Step 2: Full test run with verbose output**
 
 ```bash
-cd "c:/Users/Steffen/Documents/A_documents/Github/enfusion-mcp-BK" && npx vitest run --reporter=verbose
+npx vitest run --reporter=verbose
 ```
 
 Expected: all tests pass. Note the total pass count.
