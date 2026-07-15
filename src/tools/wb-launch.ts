@@ -17,7 +17,10 @@ export function registerWbLaunch(
       description:
         "Launch Arma Reforger Workbench (Arma Reforger Tools). Automatically copies handler scripts " +
         "into the target mod's Scripts/WorkbenchGame/ directory (so NET API handlers compile as part " +
-        "of the mod), starts the Workbench executable, and waits for the NET API to become available. " +
+        "of the mod), starts Workbench with unattended assertion handling, tracks the exact child PID, " +
+        "persists a random-token process identity, and waits for the NET API to become available. Only " +
+        "a process whose durable PID/executable/start-time/token proof still matches can later be cleanly " +
+        "recompiled with wb_restart, including after this MCP server restarts. " +
         "All other wb_* tools call this automatically if Workbench is not running, so you rarely need to " +
         "call this directly. IMPORTANT: When done working with Workbench, call wb_cleanup to remove the " +
         "handler scripts from the mod before the user publishes.",
@@ -41,6 +44,19 @@ export function registerWbLaunch(
 
         const alreadyRunning = await client.ping();
         if (alreadyRunning) {
+          const owned = await client.hasOwnedWorkbench();
+          if (!owned) {
+            return {
+              content: [{
+                type: "text" as const,
+                text:
+                  `**Workbench Not Owned** — NET API is responding, but this editor has no valid MCP owner marker. ` +
+                  `It will not be restarted or terminated. Close it yourself before requesting an automated session.` +
+                  formatConnectionStatus(client),
+              }],
+              isError: true,
+            };
+          }
           return {
             content: [
               {

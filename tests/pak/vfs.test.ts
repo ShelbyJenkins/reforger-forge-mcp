@@ -2,7 +2,7 @@ import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { writeFileSync, mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { deflateRawSync } from "node:zlib";
+import { deflateSync } from "node:zlib";
 import { PakVirtualFS } from "../../src/pak/vfs.js";
 
 /**
@@ -13,12 +13,14 @@ function buildTestPak(files: Array<{ path: string; content: string; compress: bo
   interface TreeDir { name: string; children: Map<string, TreeDir | TreeFile> }
 
   const dataChunks: Buffer[] = [];
-  let dataOffset = 0;
+  const headLen = 0x1c;
+  const dataStart = 12 + 8 + headLen + 8;
+  let dataOffset = dataStart;
   const root: TreeDir = { name: "", children: new Map() };
 
   for (const file of files) {
     const raw = Buffer.from(file.content, "utf-8");
-    const stored = file.compress ? deflateRawSync(raw) : raw;
+    const stored = file.compress ? deflateSync(raw) : raw;
 
     const parts = file.path.split("/");
     const fileName = parts.pop()!;
@@ -76,7 +78,6 @@ function buildTestPak(files: Array<{ path: string; content: string; compress: bo
 
   const fileTreeBuf = serializeEntry(root);
   const dataPayload = Buffer.concat(dataChunks);
-  const headLen = 0x1c;
   const headPayload = Buffer.alloc(headLen);
 
   const totalPayload = 4 + 8 + headLen + 8 + dataPayload.length + 8 + fileTreeBuf.length;
@@ -143,6 +144,24 @@ describe("PakVirtualFS", () => {
     const vfs = PakVirtualFS.get(GAME_DIR);
     expect(vfs).not.toBeNull();
     expect(vfs!.fileCount).toBe(4);
+  });
+
+  it("builds an independent VFS from an explicit PAK set", () => {
+    const pakPath = join(ADDONS_DIR, "data.pak");
+    const vfs = PakVirtualFS.fromPakFiles([pakPath]);
+    expect(vfs.pakPaths).toEqual([pakPath]);
+    expect(vfs.diagnostics).toEqual([]);
+    expect(vfs.readTextFile("Scripts/Game/player.c")).toBe("class Player {}");
+    expect(vfs.exists("Scripts/Game/vehicle.c")).toBe(false);
+  });
+
+  it("exposes explicit-set indexing failures for fail-closed callers", () => {
+    const invalidPak = join(TEST_DIR, "invalid.pak");
+    writeFileSync(invalidPak, "not a PAC1 archive");
+    const vfs = PakVirtualFS.fromPakFiles([invalidPak]);
+    expect(vfs.fileCount).toBe(0);
+    expect(vfs.diagnostics).toHaveLength(1);
+    expect(vfs.diagnostics[0].pakPath).toBe(invalidPak);
   });
 
   it("lists root directory", () => {

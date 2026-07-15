@@ -62,6 +62,7 @@ Use placeholders rather than real local paths in committed documentation:
     "<USER_OR_WORKSHOP_ADDONS_DIRECTORY>"
   ],
   "workbenchScriptAuthorizeAll": false,
+  "workbenchNoThrow": true,
   "workbenchHost": "127.0.0.1",
   "workbenchPort": 5775
 }
@@ -74,8 +75,9 @@ inside one addon require the target addon root explicitly: pass
 `projectPath: "<ABSOLUTE_WORKSPACE_PATH>/addons/<MOD_NAME>"` to `project`, `prefab`,
 `script_create`, `layout_create`, `config_create`, `server_config`,
 `scenario_create_conflict`, and `animation_graph`, and to `mod` when
-validating. For `mod` builds, pass the target `gprojPath`. Pass an explicit
-target `outputDir` to `building_setup`.
+validating. Generic `mod(action=build)` is retired because it cannot guarantee
+bounded, attributable, modal-free execution; use the target project's reviewed
+build wrapper. Pass an explicit target `outputDir` to `building_setup`.
 
 `workbenchAddonDirs` must include the base-game addon root and every local or
 Workshop root needed to resolve the target project's direct and transitive
@@ -87,6 +89,11 @@ Leave `workbenchScriptAuthorizeAll` disabled unless the active project and all
 of its dependencies are trusted. Enabling it suppresses authorization prompts
 for protected `RunCmd`, `RunProcess`, `KillProcess`, and out-of-profile `FileIO`
 operations.
+
+Agent-launched Workbench sessions always enforce `-noThrow`, even if a legacy
+config sets `workbenchNoThrow` false. It sends assertions to the log instead of
+displaying modal dialogs, which keeps unattended validation from waiting
+forever for a person to click a button.
 
 Avoid putting a Workbench project in a cloud-synchronized or read-only
 directory. Sync clients can change attributes or lock files in ways that stop
@@ -105,8 +112,13 @@ Workbench from loading or saving resources.
 `Scripts/WorkbenchGame/EnfusionMCP`. Those handlers must compile as part of the
 target project. For the most reliable first connection, close an unrelated or
 stale Workbench session and call `wb_launch` with the target `gprojPath`.
-Handler changes can require a full Workbench restart; a resource or script
-reload is not always sufficient for `NetApiHandler` subclasses.
+Every launch refreshes a versioned handler bundle. Handler and game-script
+changes require a full Workbench restart because every in-process script reload
+is disabled. Use `wb_restart` for a clean compile only when the durable PID,
+executable, start time, and random command-line token all verify. It retains the
+target `.gproj`, waits for the NET API port to release, launches with `-noThrow`,
+and refuses user-owned Workbench sessions. Durable ownership can be recovered
+after the MCP restarts; PID reuse or inaccessible identity data fails closed.
 
 Keep the handlers while live automation is in use. Call `wb_cleanup` with the
 mod root before publishing or packaging the mod.
@@ -148,12 +160,12 @@ name below.
 | Generate a destructible-building prefab set | `building_setup` |
 | Place Scenario Framework entities in the open world | `scenario_create` (live) |
 | Generate Conflict scenario files | `scenario_create_conflict` (offline) |
-| Create, validate, or build an addon | `mod` |
+| Create or validate an addon | `mod` (`action=build` is retired) |
 | Inspect Workbench and troubleshoot the connection | `wb_state`, `wb_connect`, `wb_diagnose` |
 | Inspect or edit placed entities | `wb_entity_list`, `wb_entity_inspect`, `wb_entity_modify`, `wb_component` |
 | Duplicate an entity already placed in a scene | `wb_entity_duplicate` |
 | Register a new resource or inspect resource metadata | `wb_resources` |
-| Save, play, stop, reload, undo, or redo | `wb_save`, `wb_play`, `wb_stop`, `wb_reload`, `wb_undo_redo` |
+| Stop Play, clean-restart, reload plugins, undo, or redo | `wb_stop`, `wb_restart`, `wb_reload`, `wb_undo_redo` |
 
 Use the lookup tools before inventing class names, method signatures, prefab
 paths, component properties, or GUIDs. Prefer an exact resource path over a
@@ -173,15 +185,23 @@ For live editor work:
 
 1. Call `wb_launch` with the target `.gproj` path.
 2. Confirm the connection with `wb_connect` or inspect it with `wb_state`.
-3. If Workbench is in Play mode, call `wb_stop` before mutating or saving the
+3. If Workbench is already in Play mode, call `wb_stop` before mutating the
    scene.
 4. Inspect the target entity, component, prefab, layer, or resource before
    changing it.
 5. Make the smallest scoped change and inspect the result.
-6. Save in edit mode with `wb_save`.
-7. Compile and enter Play with `wb_play`, then manually inspect the Workbench
-   Log Console; ReforgerForge does not provide a general log-reading tool.
-8. Return to edit mode before further edits.
+6. Save intentional editor changes manually while a person is attending the
+   editor; `wb_save`/Save As are disabled because they may open modal UI.
+7. After script changes, use verified owner-scoped `wb_restart` for a clean
+   compile. Never use `wb_reload` or a generic menu action for scripts.
+8. Run gameplay acceptance through a bounded standalone diagnostic/autotest
+   launcher. `wb_play` is disabled because it can compile inside the live
+   editor process.
+
+After changing `.c` files in a session that has loaded a world, save intentional
+editor changes manually and use `wb_restart`. Do not route a script compile
+through `wb_reload` or `wb_execute_action`; generic menu execution is disabled
+entirely, including in the direct NET API handler.
 
 Most scene mutations only work in edit mode. Do not assume an operation failed
 or succeeded without reading its tool result and re-inspecting the saved state.
@@ -256,7 +276,7 @@ remaining validation gap. Do not describe an unrun check as passed.
 | Symptom | Check |
 |---|---|
 | `wb_connect` cannot reach Workbench | Confirm the NET API is enabled, host/port match, the correct `.gproj` is loaded, then run `wb_diagnose`. |
-| `Undefined API func` from a `wb_*` tool | The temporary handler scripts are missing or stale. Launch the target `.gproj` through `wb_launch`, compile, and fully restart Workbench if needed. |
+| `Undefined API func` from a `wb_*` tool | The temporary handlers are missing or stale. Do not inject or reload them in a live user session. Close that Workbench, launch the target `.gproj` through `wb_launch`, then use owner-scoped `wb_restart` if another clean compile is needed. |
 | A component appears as `Unknown` | Its script did not compile in the loaded project. Fix compile errors and reload or restart before setting properties. |
 | Workbench opens without the target mod | Close any stale session and call `wb_launch` with the exact `gprojPath`; if it still fails, check direct/transitive dependencies and every configured addon root. |
 | A path is truncated near `Arma Reforger` | Preserve quoting around paths with spaces and around the full comma-separated `-addonsDir` value. |

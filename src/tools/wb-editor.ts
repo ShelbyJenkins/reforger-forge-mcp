@@ -1,7 +1,7 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { WorkbenchClient } from "../workbench/client.js";
-import { formatConnectionStatus, requireEditMode, requirePlayMode } from "../workbench/status.js";
+import { formatConnectionStatus, requirePlayMode } from "../workbench/status.js";
 
 export function registerWbEditorTools(server: McpServer, client: WorkbenchClient): void {
   // wb_play — Switch to game mode (Play in Editor)
@@ -9,7 +9,7 @@ export function registerWbEditorTools(server: McpServer, client: WorkbenchClient
     "wb_play",
     {
       description:
-        "Switch Workbench to game (play) mode. Compiles scripts and launches the world for testing. Equivalent to pressing Play in the World Editor. Requires edit mode.",
+        "Report that in-editor Play is disabled for unattended automation because it can compile scripts in a live editor process.",
       inputSchema: {
         debugMode: z
           .boolean()
@@ -21,33 +21,17 @@ export function registerWbEditorTools(server: McpServer, client: WorkbenchClient
           .describe("Launch in full-screen mode instead of windowed"),
       },
     },
-    async ({ debugMode, fullScreen }) => {
-      const modeErr = requireEditMode(client, "start play mode");
-      if (modeErr) {
-        return { content: [{ type: "text" as const, text: modeErr + formatConnectionStatus(client) }] };
-      }
-      try {
-        const params: Record<string, unknown> = { action: "play" };
-        if (debugMode !== undefined) params.debugMode = debugMode;
-        if (fullScreen !== undefined) params.fullScreen = fullScreen;
-
-        const result = await client.call<Record<string, unknown>>("EMCP_WB_EditorControl", params);
-
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `**Play Mode Started**\n\nWorkbench is now compiling and entering game mode.${result.message ? `\n${result.message}` : ""}${formatConnectionStatus(client)}`,
-            },
-          ],
-        };
-      } catch (e) {
-        const msg = e instanceof Error ? e.message : String(e);
-        return {
-          content: [{ type: "text" as const, text: `Error starting play mode: ${msg}${formatConnectionStatus(client)}` }],
+    async () => {
+      return {
+        content: [{
+          type: "text" as const,
+          text:
+            "**Play Refused** — in-editor Play can compile scripts in a live Workbench process. " +
+            "Use a standalone diagnostic/autotest runtime launcher instead." +
+            formatConnectionStatus(client),
+        }],
         isError: true,
-        };
-      }
+      };
     }
   );
 
@@ -92,7 +76,7 @@ export function registerWbEditorTools(server: McpServer, client: WorkbenchClient
     "wb_save",
     {
       description:
-        "Save the current world in the World Editor. Optionally save to a new path (Save As). Only works in edit mode.",
+        "Report that unattended save is disabled because Workbench may open a modal dialog. Save manually before restart.",
       inputSchema: {
         path: z
           .string()
@@ -101,49 +85,16 @@ export function registerWbEditorTools(server: McpServer, client: WorkbenchClient
       },
     },
     async ({ path }) => {
-      const modeErr = requireEditMode(client, "save");
-      if (modeErr) {
-        return { content: [{ type: "text" as const, text: modeErr + formatConnectionStatus(client) }] };
-      }
-      try {
-        const params: Record<string, unknown> = {
-          action: path ? "saveAs" : "save",
-        };
-        if (path) params.path = path;
-
-        // Save can open a modal dialog for unsaved worlds — use longer timeout
-        const result = await client.call<Record<string, unknown>>(
-          "EMCP_WB_EditorControl",
-          params,
-          { timeout: 30_000 }
-        );
-
-        const label = path ? `Saved as: ${path}` : "World saved.";
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `**Save Complete**\n\n${label}${result.message ? `\n${result.message}` : ""}${formatConnectionStatus(client)}`,
-            },
-          ],
-        };
-      } catch (e) {
-        const msg = e instanceof Error ? e.message : String(e);
-        if (msg.includes("timed out")) {
-          return {
-            content: [
-              {
-                type: "text" as const,
-                text: `**Save Pending** — Workbench opened a save dialog that requires user confirmation. The world will be saved once the user clicks OK in Workbench. This is normal for worlds that haven't been saved before.${formatConnectionStatus(client)}`,
-              },
-            ],
-          };
-        }
-        return {
-          content: [{ type: "text" as const, text: `Error saving: ${msg}${formatConnectionStatus(client)}` }],
+      return {
+        content: [{
+          type: "text" as const,
+          text:
+            `**Save Refused** — unattended save${path ? "-as" : ""} is disabled because Workbench may open a modal dialog. ` +
+            `Save intentional editor changes manually before owner-scoped restart.` +
+            formatConnectionStatus(client),
+        }],
         isError: true,
-        };
-      }
+      };
     }
   );
 

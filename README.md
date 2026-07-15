@@ -40,7 +40,7 @@ Then install into your agent(s):
 .\scripts\install-agents.ps1 -Agent cursor
 ```
 
-Restart your agent and verify **reforger-forge** shows **50 tools**.
+Restart your agent and verify **reforger-forge** shows **51 tools**.
 
 ### Configure paths
 
@@ -57,10 +57,16 @@ cp reforger-forge.config.example.json reforger-forge.config.json
 | `projectPath` | Where your mods are saved |
 | `workbenchAddonDirs` | Ordered base-game and Workshop addon roots passed to Workbench as one `-addonsDir` value |
 | `workbenchScriptAuthorizeAll` | Opt in to Workbench's `-scriptAuthorizeAll` flag for trusted local projects; defaults to `false` |
+| `workbenchNoThrow` | Legacy compatibility setting; automated Workbench launches always enforce `-noThrow` so assertions cannot open modal dialogs |
 
 `workbenchScriptAuthorizeAll` suppresses prompts for protected `RunCmd`,
 `RunProcess`, `KillProcess`, and out-of-profile `FileIO` operations. Leave it
 disabled unless you trust the active project and all of its dependencies.
+
+Automated launches enforce `-noThrow` even if a legacy config sets
+`workbenchNoThrow` false. Assertions remain in the Workbench log and can still
+fail a validation gate, but they cannot block the agent behind a dialog that
+requires a person to dismiss it.
 
 Re-run `.\scripts\install-agents.ps1` after changing paths so all agents get updated env vars.
 
@@ -175,7 +181,7 @@ Use the stdio template at `configs/agents/stdio-template.json`. Replace `REPLACE
 
 ---
 
-## Complete Tool Reference (50 tools)
+## Complete Tool Reference (51 tools)
 
 Legend: **Offline** = no Workbench needed | **Live** = requires Workbench running (`wb_launch`)
 
@@ -208,7 +214,7 @@ auto-launch it.
 | Tool | Workbench? | What it does |
 |------|-----------|-------------|
 | `project` | No | Browse, read, or write files in your mod project directory (`action`: browse / read / write). |
-| `mod` | Build only | Manage addons: `action=create` scaffold new addon, `action=validate` check structure, `action=build` compile with Workbench CLI. |
+| `mod` | No | Manage addons: `action=create` scaffolds a new addon and `action=validate` checks structure. Unsafe generic `action=build` is retired; use a project-owned bounded build wrapper. |
 | `workshop_info` | No | Read `.gproj` Workshop publish metadata. |
 
 ### Code Generation (Offline)
@@ -234,23 +240,24 @@ auto-launch it.
 
 | Tool | What it does |
 |------|-------------|
-| `wb_launch` | Start Arma Reforger Workbench with configured addon roots and script-authorization policy, install handler scripts into the mod, and wait for NET API. Auto-called by other `wb_*` tools when needed. Call `wb_cleanup` before publishing mod. |
+| `wb_launch` | Start one atomically guarded `-noThrow` Workbench, refresh the versioned handler bundle, persist random-token process ownership, and wait for NET API. It refuses pre-existing/unowned Workbench processes and cleans up the exact child on failure. Call `wb_cleanup` before publishing mod. |
 | `wb_connect` | Test connection to Workbench NET API. Returns connection status and editor mode. |
 | `wb_diagnose` | Full diagnostic — config, handler script locations, NET API status. Use when `wb_launch` or `wb_connect` fails. |
 | `wb_cleanup` | Remove temporary EnfusionMCP handler scripts from mod before publishing. Safe even if never installed. |
+| `wb_restart` | Cleanly recompile by restarting only a Workbench whose durable PID/executable/start-time/random-token identity verifies, including after an MCP restart. Retains the `.gproj`, waits for NET API port release, and refuses user-owned sessions. |
 | `wb_state` | Full Workbench snapshot — mode (edit/play), entity count, selection, terrain bounds, sub-scene, prefab edit status. |
-| `wb_reload` | Reload scripts or plugins without restarting Workbench. |
+| `wb_reload` | Reload plugins only. Every in-process game-script reload is refused; use verified owner-scoped `wb_restart` for clean compilation. |
 
 ### Workbench Editor Control (Live)
 
 | Tool | What it does |
 |------|-------------|
-| `wb_play` | Enter play mode (Play in Editor). Compiles scripts and launches world for testing. |
+| `wb_play` | Refused for unattended automation because Play can compile scripts inside the live editor. Use a bounded standalone diagnostic/autotest launcher. |
 | `wb_stop` | Exit play mode, return to World Editor. |
-| `wb_save` | Save current world. Optionally Save As to new path. Edit mode only. |
+| `wb_save` | Refused for unattended automation because Save/Save As can open modal UI. Save intentional editor changes manually while attended. |
 | `wb_undo_redo` | Undo or redo the last World Editor action. |
 | `wb_open_resource` | Open a resource in its editor (.et → Prefab Editor, .c → Script Editor, etc.). |
-| `wb_execute_action` | Run any Workbench menu action by path (e.g. `Tools,Reload Scripts`). Destructive actions blocked. |
+| `wb_execute_action` | Generic menu execution is disabled in both the MCP tool and direct handler; use a purpose-built, reviewed tool instead. |
 
 ### Workbench Entities (Live)
 
@@ -279,7 +286,7 @@ auto-launch it.
 | `wb_script_editor` | Read/write lines in the open Script Editor file — get file, read/write/insert/remove lines, line count. |
 | `wb_validate` | Validate material or texture resources using Workbench built-in validators. Returns errors and warnings. |
 
-Run `node scripts/list-tools.mjs` anytime to verify all 50 tools register on your machine.
+Run `node scripts/list-tools.mjs` anytime to verify all 51 tools register on your machine.
 
 ---
 
@@ -289,7 +296,7 @@ Run `node scripts/list-tools.mjs` anytime to verify all 50 tools register on you
 Create a HUD widget that shows player health and stamina
 Make a zombie survival game mode with wave spawning
 Search the API for all vehicle damage components
-Launch Workbench, load my mod, and enter play mode
+Launch Workbench and inspect my mod without entering Play mode
 Generate a Conflict scenario for Everon with 3 bases
 Inspect the inheritance chain for Rifle_M16A2.et
 ```
@@ -323,7 +330,7 @@ both.
 ## Requirements
 
 - **Node.js 20+**
-- **Arma Reforger Tools** (Steam) — for `mod` build, registration, and live editor-control tools
+- **Arma Reforger Tools** (Steam) — for resource registration and reviewed live editor-control tools
 - **Arma Reforger** (Steam) — for game asset browsing
 
 ---
@@ -334,7 +341,7 @@ both.
 npm run build                  # Compile TypeScript
 npm test                       # Run test suite (446 tests)
 npm run dev                    # Run server in dev mode
-node scripts/list-tools.mjs    # Verify all 50 tools register
+node scripts/list-tools.mjs    # Verify all 51 tools register
 .\scripts\install-agents.ps1 -All   # Push config to all agents
 ```
 

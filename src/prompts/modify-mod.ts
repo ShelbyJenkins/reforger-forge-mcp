@@ -57,9 +57,9 @@ Follow this workflow — every step is mandatory:
 
 7. **Workbench Setup** (MANDATORY — do not skip, do not tell the user to do this):
    a. **wb_launch** with \`gprojPath\` set to the addon's .gproj file — this copies handler scripts into the mod, skips the launcher, and opens the project in the World Editor with full NET API access
-   b. **wb_play** — This compiles ALL scripts (including the handler scripts) and enters game mode. This is the FIRST compilation step and MUST happen before wb_reload will work.
+   b. **wb_play** — After the clean startup compilation, enter game mode and verify the world launches successfully.
    c. **wb_stop** — Return to the World Editor after verifying the game launched successfully
-   d. If compilation failed, fix with **project_write**, then use **wb_reload** (target: "scripts") to recompile, and try **wb_play** again
+   d. If compilation failed, fix with **project_write**, then use **wb_restart** to recompile from a clean owner-scoped session, and try **wb_play** again. Do not hot-reload scripts while a world is loaded.
    e. **wb_resources** (action: "register") — Register any new prefabs, configs, or layouts
 
 8. **wb_play** again if needed for further testing. Use **wb_stop** to return to editor.

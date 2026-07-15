@@ -13,11 +13,15 @@ import { Socket } from "node:net";
 import { existsSync, mkdirSync, copyFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join, resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { spawn, execSync } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { encodeRequest, decodeResponse } from "./protocol.js";
 import { logger } from "../utils/logger.js";
 import type { Config } from "../config.js";
 import { generateGproj } from "../templates/gproj.js";
+import {
+  WorkbenchProcessGuard,
+  type WorkbenchOwnerMarker,
+} from "./process-guard.js";
 
 const DEFAULT_CLIENT_ID = "EnfusionMCP";
 const DEFAULT_TIMEOUT_MS = 10_000;
@@ -28,12 +32,11 @@ const WORKBENCH_SUBDIR = "Workbench";
 const HANDLER_FOLDER = "EnfusionMCP";
 const LAUNCH_POLL_INTERVAL_MS = 3_000;
 const LAUNCH_TIMEOUT_MS = 90_000;
-/** Delay after killing Workbench before relaunching, to let the port release. */
-const KILL_SETTLE_MS = 3_000;
-/** How long to wait for Workbench to recompile handler scripts after installation. */
-const HANDLER_RECOMPILE_TIMEOUT_MS = 30_000;
-/** Interval between polls while waiting for handler script recompilation. */
-const HANDLER_RECOMPILE_POLL_MS = 2_000;
+/** Maximum time to wait for an MCP-owned Workbench process to exit. */
+const OWNED_PROCESS_EXIT_TIMEOUT_MS = 15_000;
+/** Maximum time to wait for the NET API port to be released before relaunch. */
+const PORT_RELEASE_TIMEOUT_MS = 15_000;
+const PORT_RELEASE_POLL_MS = 200;
 
 export type WorkbenchMode = "edit" | "play" | "unknown";
 
@@ -64,6 +67,20 @@ export interface WorkbenchCallOptions {
   skipAutoLaunch?: boolean;
 }
 
+export interface WorkbenchRestartResult {
+  previousPid: number;
+  pid: number;
+  gprojPath: string | null;
+}
+
+interface OwnedWorkbenchLaunch {
+  process: ChildProcess | null;
+  pid: number;
+  gprojPath: string | null;
+  marker: WorkbenchOwnerMarker | null;
+  spawnError?: Error;
+}
+
 export class WorkbenchError extends Error {
   constructor(
     message: string,
@@ -89,7 +106,9 @@ export class WorkbenchError extends Error {
 export function buildWorkbenchLaunchArgs(
   gprojPath?: string | null,
   configuredAddonDirs?: readonly string[],
-  scriptAuthorizeAll = false
+  scriptAuthorizeAll = false,
+  noThrow = false,
+  ownerArgument?: string
 ): string[] {
   const args: string[] = [];
   const addonDirs: string[] = [];
@@ -155,12 +174,20 @@ export function buildWorkbenchLaunchArgs(
   if (scriptAuthorizeAll) {
     args.push("-scriptAuthorizeAll");
   }
+  if (noThrow) {
+    args.push("-noThrow");
+  }
+  if (ownerArgument) {
+    args.push(ownerArgument);
+  }
 
   return args;
 }
 
 export class WorkbenchClient {
   private launchPromise: Promise<void> | null = null;
+  private restartPromise: Promise<WorkbenchRestartResult> | null = null;
+  private ownedWorkbench: OwnedWorkbenchLaunch | null = null;
   private _state: WorkbenchState = { connected: false, mode: "unknown", lastUpdated: 0 };
 
   /** Current cached connection state. Updated after every successful call. */
@@ -172,7 +199,8 @@ export class WorkbenchClient {
     private readonly host: string,
     private readonly port: number,
     private readonly config?: Config,
-    private readonly clientId: string = DEFAULT_CLIENT_ID
+    private readonly clientId: string = DEFAULT_CLIENT_ID,
+    private readonly processGuard: WorkbenchProcessGuard = new WorkbenchProcessGuard()
   ) {}
 
   /**
@@ -207,11 +235,18 @@ export class WorkbenchClient {
             return result;
           }
           if (err.code === "API_ERROR" && err.message.includes("Undefined API func")) {
-            // Workbench is running but our custom handler scripts aren't compiled.
-            // This happens when the user opened Workbench manually, or when handlers
-            // were cleaned up but Workbench kept running.
-            logger.info(`Handler scripts not loaded in Workbench, recovering...`);
-            await this.recoverMissingHandlers();
+            // Installing handlers into a live user session can hot-reload all
+            // scripts while a world is loaded. Only an MCP-owned process may be
+            // recovered, and recovery is a clean restart rather than a live reload.
+            if (!(await this.recoverOwnedWorkbench())) {
+              throw new WorkbenchError(
+                "Handler recovery refused: the running Workbench was not launched by this MCP instance. " +
+                  "Close it yourself, then use wb_launch to start an owner-scoped automation session.",
+                "LAUNCH_FAILED"
+              );
+            }
+            logger.info("Handler scripts not loaded in MCP-owned Workbench; restarting cleanly...");
+            await this.restartOwnedWorkbench();
             const result = await this.rawCall<T>(apiFunc, params, options);
             this._state.connected = true;
             this._state.lastUpdated = Date.now();
@@ -261,6 +296,36 @@ export class WorkbenchClient {
 
     this.launchPromise = promise;
     return promise;
+  }
+
+  /**
+   * Restart the exact Workbench process launched by this client instance.
+   *
+   * This deliberately fails closed when the connected Workbench was started by
+   * the user or another MCP process. It never searches for or terminates a
+   * process by executable name. The original resolved .gproj is retained so a
+   * clean startup recompiles the same project with the automated launch flags.
+   */
+  async restartOwnedWorkbench(): Promise<WorkbenchRestartResult> {
+    if (this.restartPromise) return this.restartPromise;
+
+    const promise = this.performOwnedRestart().finally(() => {
+      if (this.restartPromise === promise) {
+        this.restartPromise = null;
+      }
+    });
+    this.restartPromise = promise;
+    return promise;
+  }
+
+  /**
+   * Recover a process launched by an earlier instance of this MCP server.
+   * Adoption requires the persisted random command-line token, executable path,
+   * PID, and OS process creation time to match. It never adopts a merely
+   * responsive user-launched Workbench.
+   */
+  async hasOwnedWorkbench(): Promise<boolean> {
+    return (await this.recoverOwnedWorkbench()) !== null;
   }
 
   /**
@@ -451,69 +516,284 @@ export class WorkbenchClient {
     }
   }
 
-  /**
-   * Recover from "not existing Net API function" errors.
-   * Workbench is running but our custom handler scripts aren't compiled.
-   * Installs handlers into the mod directory and waits for Workbench to
-   * auto-recompile them — without killing the running Workbench process.
-   *
-   * Previous behaviour killed Workbench with taskkill, which broke other
-   * tools (e.g. the Enfusion Blender plugin) that share the same NET API.
-   */
-  private async recoverMissingHandlers(): Promise<void> {
-    if (!this.config) {
-      throw new WorkbenchError("No config provided — cannot recover handlers.", "LAUNCH_FAILED");
-    }
-
-    // Inject into the currently-open mod (same logic as launchWorkbench).
-    const recoveryGproj = this.findFallbackGproj();
-    if (recoveryGproj) {
-      this.installHandlerScripts(dirname(recoveryGproj), true);
-      this.cleanupStandaloneAddon();
-    } else {
-      this.installHandlerScripts(undefined, true);
-    }
-
-    // Wait for Workbench to detect the new files and recompile scripts.
-    // Workbench watches its script directories and recompiles automatically.
-    // Poll with our custom EMCP_WB_Ping handler — it only succeeds once
-    // the handler scripts are compiled and registered.
-    logger.info("Handler scripts installed. Waiting for Workbench to recompile...");
-    const deadline = Date.now() + HANDLER_RECOMPILE_TIMEOUT_MS;
-    while (Date.now() < deadline) {
-      await new Promise((r) => setTimeout(r, HANDLER_RECOMPILE_POLL_MS));
-      if (await this.ping()) {
-        logger.info("Handler scripts compiled and loaded.");
-        return;
+  private async recoverOwnedWorkbench(): Promise<OwnedWorkbenchLaunch | null> {
+    const current = this.ownedWorkbench;
+    if (current) {
+      if (current.process && current.process.exitCode === null && !current.process.killed) {
+        return current;
       }
+      if (current.marker) {
+        const recovered = await this.processGuard.recoverOwnerMarker();
+        if (recovered && recovered.token === current.marker.token) {
+          const adopted: OwnedWorkbenchLaunch = {
+            process: null,
+            pid: recovered.pid,
+            gprojPath: recovered.gprojPath,
+            marker: recovered,
+          };
+          this.ownedWorkbench = adopted;
+          return adopted;
+        }
+      }
+      this.ownedWorkbench = null;
+    }
+
+    const marker = await this.processGuard.recoverOwnerMarker();
+    if (!marker) return null;
+    const adopted: OwnedWorkbenchLaunch = {
+      process: null,
+      pid: marker.pid,
+      gprojPath: marker.gprojPath,
+      marker,
+    };
+    this.ownedWorkbench = adopted;
+    logger.info(`Recovered durable ownership of Workbench PID ${marker.pid}.`);
+    return adopted;
+  }
+
+  private async performOwnedRestart(): Promise<WorkbenchRestartResult> {
+    if (!this.config) {
+      throw new WorkbenchError("No config provided — cannot restart Workbench.", "LAUNCH_FAILED");
+    }
+
+    // Do not race a launch already in progress. It may establish the ownership
+    // record needed below, and no other lifecycle operation should overlap it.
+    if (this.launchPromise) await this.launchPromise;
+
+    const owned = await this.recoverOwnedWorkbench();
+    if (!owned) {
+      throw new WorkbenchError(
+        "Restart refused: this MCP instance does not own the running Workbench process. " +
+          "Close the pre-existing Workbench yourself, then use wb_launch so future clean restarts are owner-scoped.",
+        "LAUNCH_FAILED"
+      );
+    }
+
+    const previousPid = owned.pid;
+    const retainedGproj = owned.gprojPath ?? undefined;
+    await this.terminateOwnedWorkbench(owned);
+
+    const launch = this.launchWorkbench(retainedGproj, true, true);
+    this.launchPromise = launch;
+    try {
+      await launch;
+    } finally {
+      if (this.launchPromise === launch) this.launchPromise = null;
+    }
+
+    const restarted = this.ownedWorkbench;
+    if (!restarted || (restarted.process && restarted.process.exitCode !== null)) {
+      throw new WorkbenchError(
+        "Workbench restart did not establish ownership of the replacement process.",
+        "LAUNCH_FAILED"
+      );
+    }
+
+    return {
+      previousPid,
+      pid: restarted.pid,
+      gprojPath: restarted.gprojPath,
+    };
+  }
+
+  private async terminateOwnedWorkbench(owned: OwnedWorkbenchLaunch): Promise<void> {
+    // Re-check object identity immediately before termination. If the child
+    // exited and a user launched another Workbench, that process is not ours.
+    if (this.ownedWorkbench !== owned) {
+      throw new WorkbenchError(
+        "Restart refused: ownership of the Workbench process was lost before termination.",
+        "LAUNCH_FAILED"
+      );
+    }
+
+    if (owned.marker) {
+      try {
+        await this.processGuard.terminateVerifiedOwner(owned.marker, OWNED_PROCESS_EXIT_TIMEOUT_MS);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        throw new WorkbenchError(message, "LAUNCH_FAILED");
+      }
+    } else if (owned.process) {
+      // Legacy/in-memory test seam. Production launches always persist a marker
+      // before they can be considered owned.
+      let signalled = false;
+      try {
+        signalled = owned.process.kill();
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        throw new WorkbenchError(
+          `Could not terminate MCP-owned Workbench process ${owned.pid}: ${message}`,
+          "LAUNCH_FAILED"
+        );
+      }
+      if (!signalled) {
+        throw new WorkbenchError(
+          `Could not terminate MCP-owned Workbench process ${owned.pid}; restart aborted.`,
+          "LAUNCH_FAILED"
+        );
+      }
+      await this.waitForOwnedProcessExit(owned);
+    } else {
+      throw new WorkbenchError("Owned Workbench has no verifiable process identity.", "LAUNCH_FAILED");
+    }
+    if (this.ownedWorkbench === owned) this.ownedWorkbench = null;
+    this._state = { connected: false, mode: "unknown", lastUpdated: Date.now() };
+    await this.waitForPortRelease();
+  }
+
+  private async terminateSpawnedChild(owned: OwnedWorkbenchLaunch): Promise<void> {
+    const child = owned.process;
+    if (!child || child.exitCode !== null) {
+      if (owned.marker) this.processGuard.clearOwnerMarker(owned.marker.token);
+      if (this.ownedWorkbench === owned) this.ownedWorkbench = null;
+      return;
+    }
+
+    if (owned.marker) {
+      try {
+        await this.processGuard.terminateVerifiedOwner(owned.marker, OWNED_PROCESS_EXIT_TIMEOUT_MS);
+      } catch (error) {
+        throw new WorkbenchError(
+          `Launch failed and exact-child cleanup could not be proven: ${error instanceof Error ? error.message : String(error)}`,
+          "LAUNCH_FAILED"
+        );
+      }
+    } else {
+      let signalled = false;
+      try {
+        signalled = child.kill();
+      } catch (error) {
+        throw new WorkbenchError(
+          `Launch failed and spawned child ${owned.pid} could not be terminated: ${error instanceof Error ? error.message : String(error)}`,
+          "LAUNCH_FAILED"
+        );
+      }
+      if (!signalled) {
+        throw new WorkbenchError(
+          `Launch failed and spawned child ${owned.pid} rejected termination.`,
+          "LAUNCH_FAILED"
+        );
+      }
+      await this.waitForOwnedProcessExit(owned);
+    }
+    if (this.ownedWorkbench === owned) this.ownedWorkbench = null;
+    this._state = { connected: false, mode: "unknown", lastUpdated: Date.now() };
+  }
+
+  private waitForOwnedProcessExit(owned: OwnedWorkbenchLaunch): Promise<void> {
+    const ownedProcess = owned.process;
+    if (!ownedProcess || ownedProcess.exitCode !== null) return Promise.resolve();
+
+    return new Promise((resolvePromise, reject) => {
+      const timeout = setTimeout(() => {
+        cleanup();
+        reject(new WorkbenchError(
+          `MCP-owned Workbench process ${owned.pid} did not exit within ` +
+            `${OWNED_PROCESS_EXIT_TIMEOUT_MS / 1000}s; restart aborted without terminating any other process.`,
+          "LAUNCH_FAILED"
+        ));
+      }, OWNED_PROCESS_EXIT_TIMEOUT_MS);
+
+      const onExit = (): void => {
+        cleanup();
+        resolvePromise();
+      };
+      const onError = (error: Error): void => {
+        cleanup();
+        reject(new WorkbenchError(
+          `MCP-owned Workbench process ${owned.pid} failed while exiting: ${error.message}`,
+          "LAUNCH_FAILED"
+        ));
+      };
+      const cleanup = (): void => {
+        clearTimeout(timeout);
+        ownedProcess.off("exit", onExit);
+        ownedProcess.off("error", onError);
+      };
+
+      ownedProcess.once("exit", onExit);
+      ownedProcess.once("error", onError);
+
+      // The child can exit after the status check above but before the event
+      // listeners are attached. Re-check after attachment so that race cannot
+      // turn a confirmed exit into a false 15-second cleanup timeout.
+      if (ownedProcess.exitCode !== null) onExit();
+    });
+  }
+
+  private async waitForPortRelease(): Promise<void> {
+    const deadline = Date.now() + PORT_RELEASE_TIMEOUT_MS;
+    while (Date.now() < deadline) {
+      if (!(await this.isPortListening())) return;
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, PORT_RELEASE_POLL_MS));
     }
 
     throw new WorkbenchError(
-      `Handler scripts were installed but Workbench did not recompile them within ` +
-        `${HANDLER_RECOMPILE_TIMEOUT_MS / 1000}s. Try recompiling scripts manually in ` +
-        `Workbench (Plugins > Reload Scripts) or restart Workbench.`,
+      `Workbench NET API port ${this.host}:${this.port} remained occupied after the MCP-owned process exited. ` +
+        "A different Workbench may now own it; restart aborted.",
       "LAUNCH_FAILED"
     );
   }
 
-  /**
-   * Kill any running Workbench process. Windows-only (taskkill).
-   * Safe to call even if Workbench isn't running.
-   */
-  private killWorkbench(): void {
-    try {
-      execSync(`taskkill /IM ${WORKBENCH_EXE} /F`, { stdio: "ignore" });
-      logger.info("Killed running Workbench process.");
-    } catch {
-      // Process might not be running — ignore
-    }
+  private isPortListening(timeoutMs = 500): Promise<boolean> {
+    return new Promise((resolvePromise) => {
+      const socket = new Socket();
+      let settled = false;
+      const finish = (listening: boolean): void => {
+        if (settled) return;
+        settled = true;
+        socket.destroy();
+        resolvePromise(listening);
+      };
+
+      socket.setTimeout(timeoutMs);
+      socket.once("connect", () => finish(true));
+      socket.once("timeout", () => finish(false));
+      socket.once("error", () => finish(false));
+      socket.connect(this.port, this.host);
+    });
   }
 
-  private async launchWorkbench(gprojPath?: string): Promise<void> {
-    // 1. Check if already running (maybe it came up between the failed call and now)
-    if (await this.ping()) {
-      logger.info("Workbench is already running.");
-      return;
+  private async launchWorkbench(
+    gprojPath?: string,
+    requireVacantPort = false,
+    forceNoThrow = false
+  ): Promise<void> {
+    return this.processGuard.withLaunchLock(
+      () => this.launchWorkbenchLocked(gprojPath, requireVacantPort, forceNoThrow)
+    );
+  }
+
+  private async launchWorkbenchLocked(
+    gprojPath?: string,
+    requireVacantPort = false,
+    forceNoThrow = false
+  ): Promise<void> {
+    // A responsive port is not ownership proof. Recover only a process whose
+    // executable, creation time, PID, and random command-line token all match.
+    const recovered = await this.recoverOwnedWorkbench();
+    if (recovered) {
+      if (!requireVacantPort && await this.ping()) {
+        logger.info(`Workbench PID ${recovered.pid} is already running and durably MCP-owned.`);
+        return;
+      }
+      throw new WorkbenchError(
+        `MCP-owned Workbench PID ${recovered.pid} is still running but its NET API is unavailable. ` +
+          "Refusing to spawn a duplicate; restart the verified owner or inspect its logs.",
+        "LAUNCH_FAILED"
+      );
+    }
+    if (await this.isPortListening()) {
+      throw new WorkbenchError(
+        `Workbench NET API port ${this.host}:${this.port} is already occupied. ` +
+          "Refusing to launch or replace a process this MCP instance does not own.",
+        "LAUNCH_FAILED"
+      );
+    }
+    try {
+      await this.processGuard.assertNoWorkbenchProcesses();
+    } catch (error) {
+      throw new WorkbenchError(error instanceof Error ? error.message : String(error), "LAUNCH_FAILED");
     }
 
     // 2. Resolve the target .gproj and inject handler scripts into that mod.
@@ -556,10 +836,15 @@ export class WorkbenchClient {
 
     // 4. Build dependency-aware launch arguments. Explicit addon roots make
     //    base-game and Workshop dependencies available before the project loads.
+    const ownerToken = this.processGuard.createOwnerToken();
     const args = buildWorkbenchLaunchArgs(
       resolvedGproj,
       this.config?.workbenchAddonDirs,
-      this.config?.workbenchScriptAuthorizeAll === true
+      this.config?.workbenchScriptAuthorizeAll === true,
+      // Automated sessions never permit modal assertions. A legacy false
+      // setting can no longer weaken this invariant.
+      true,
+      this.processGuard.ownerArgument(ownerToken)
     );
 
     // Retain the game install directory as a backward-compatible CWD fallback
@@ -567,17 +852,78 @@ export class WorkbenchClient {
     const cwd = this.findGameDir() || dirname(exePath);
 
     logger.info(`Launching Workbench: ${exePath}${args.length ? ` ${args.join(" ")}` : ""} (cwd: ${cwd})`);
+    const launchedAtMs = Date.now();
     const proc = spawn(exePath, args, {
       detached: true,
       stdio: "ignore",
       cwd,
     });
+    if (proc.pid === undefined) {
+      // A failed spawn reports through the asynchronous error event. Consume it
+      // so refusing an unowned process cannot become an unhandled exception.
+      proc.once("error", (error) => logger.warn(`Workbench spawn failed: ${error.message}`));
+      throw new WorkbenchError(
+        "Workbench was spawned without a process ID; ownership cannot be proven.",
+        "LAUNCH_FAILED"
+      );
+    }
+    const owned: OwnedWorkbenchLaunch = {
+      process: proc,
+      pid: proc.pid,
+      gprojPath: resolvedGproj ?? null,
+      marker: null,
+    };
+    proc.once("error", (error) => {
+      owned.spawnError = error;
+      if (this.ownedWorkbench === owned) this.ownedWorkbench = null;
+    });
+    proc.once("exit", () => {
+      if (owned.marker) this.processGuard.clearOwnerMarker(owned.marker.token);
+      if (this.ownedWorkbench === owned) this.ownedWorkbench = null;
+    });
     proc.unref();
+
+    try {
+      owned.marker = await this.processGuard.captureOwnerMarker({
+        pid: owned.pid,
+        executablePath: exePath,
+        token: ownerToken,
+        launchedAtMs,
+        gprojPath: owned.gprojPath,
+        host: this.host,
+        port: this.port,
+      });
+      if (this.ownedWorkbench) {
+        throw new WorkbenchError(
+          `Refusing to overwrite ownership of Workbench PID ${this.ownedWorkbench.pid}.`,
+          "LAUNCH_FAILED"
+        );
+      }
+      this.ownedWorkbench = owned;
+    } catch (error) {
+      await this.terminateSpawnedChild(owned);
+      throw error instanceof WorkbenchError
+        ? error
+        : new WorkbenchError(error instanceof Error ? error.message : String(error), "LAUNCH_FAILED");
+    }
 
     // 5. Wait for NET API — track the last error type so the timeout message is actionable
     const deadline = Date.now() + LAUNCH_TIMEOUT_MS;
     let lastErrorCode: WorkbenchError["code"] | undefined;
+    try {
     while (Date.now() < deadline) {
+      if (owned.spawnError) {
+        throw new WorkbenchError(
+          `Workbench process ${owned.pid} failed to start: ${owned.spawnError.message}`,
+          "LAUNCH_FAILED"
+        );
+      }
+      if (proc.exitCode !== null) {
+        throw new WorkbenchError(
+          `Workbench process ${owned.pid} exited before the NET API became available (exit code ${proc.exitCode}).`,
+          "LAUNCH_FAILED"
+        );
+      }
       try {
         await this.rawCall("EMCP_WB_Ping", {}, { timeout: 3000, skipAutoLaunch: true });
         this._state.connected = true;
@@ -610,10 +956,15 @@ export class WorkbenchClient {
         `File > Options > General > Net API (checkbox must be on).`;
     }
 
-    throw new WorkbenchError(
-      `Workbench launched but did not connect within ${LAUNCH_TIMEOUT_MS / 1000}s.\n\n${hint}`,
-      "LAUNCH_FAILED"
-    );
+      throw new WorkbenchError(
+        `Workbench launched but did not connect within ${LAUNCH_TIMEOUT_MS / 1000}s. ` +
+          `The exact owned child will be terminated before failure is returned.\n\n${hint}`,
+        "LAUNCH_FAILED"
+      );
+    } catch (error) {
+      await this.terminateSpawnedChild(owned);
+      throw error;
+    }
   }
 
   private findWorkbenchExe(): string | null {
@@ -707,7 +1058,7 @@ export class WorkbenchClient {
    * Copy handler scripts into a mod directory so they compile as part of that mod.
    * If no modDir given, installs to default project path (standalone, less useful).
    */
-  private installHandlerScripts(modDir?: string, force = false): void {
+  private installHandlerScripts(modDir?: string): void {
     const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
     const bundledDir = join(packageRoot, "mod", "Scripts", "WorkbenchGame", HANDLER_FOLDER);
     if (!existsSync(bundledDir)) {
@@ -724,20 +1075,25 @@ export class WorkbenchClient {
     const targetBase = modDir || join(fallbackBase!, HANDLER_FOLDER);
     const targetScriptsDir = join(targetBase, "Scripts", "WorkbenchGame", HANDLER_FOLDER);
 
-    // Already installed? Skip unless force-reinstalling (e.g. recovery after missing handlers)
-    if (!force && existsSync(join(targetScriptsDir, "EMCP_WB_Ping.c"))) {
-      return;
-    }
-
-
-    logger.info(`Installing handler scripts to ${targetScriptsDir}`);
+    logger.info(`Refreshing handler scripts at ${targetScriptsDir}`);
     mkdirSync(targetScriptsDir, { recursive: true });
 
     const files = readdirSync(bundledDir).filter((f) => f.endsWith(".c"));
     try {
+      const bundled = new Set(files);
+      for (const existing of readdirSync(targetScriptsDir)) {
+        if (existing.endsWith(".c") && !bundled.has(existing)) {
+          rmSync(join(targetScriptsDir, existing), { force: true });
+        }
+      }
       for (const file of files) {
         copyFileSync(join(bundledDir, file), join(targetScriptsDir, file));
       }
+      writeFileSync(
+        join(targetScriptsDir, ".reforger-forge-handler-bundle.json"),
+        `${JSON.stringify({ version: 2, files: files.slice().sort() }, null, 2)}\n`,
+        "utf8"
+      );
     } catch (e) {
       // Partial installation — clean up to avoid broken state on next attempt
       logger.error(`Failed to install handler scripts, rolling back: ${e}`);
@@ -747,7 +1103,7 @@ export class WorkbenchClient {
       throw e;
     }
 
-    logger.info(`Installed ${files.length} handler scripts.`);
+    logger.info(`Refreshed ${files.length} handler scripts (bundle version 2).`);
 
     // When using the standalone fallback path, also write a .gproj so Workbench
     // treats the directory as a loadable addon and compiles the handler scripts.

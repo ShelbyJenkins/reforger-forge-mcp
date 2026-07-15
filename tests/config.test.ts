@@ -55,6 +55,13 @@ afterEach(() => {
 });
 
 describe("loadConfig", () => {
+  it("enables non-modal assertion handling by default and allows an explicit override", () => {
+    expect(loadConfig().workbenchNoThrow).toBe(true);
+
+    putConfig(localConfigPath, { workbenchNoThrow: false });
+    expect(loadConfig().workbenchNoThrow).toBe(false);
+  });
+
   it("merges home below package-local config and environment variables above both", () => {
     putConfig(homeConfigPath, {
       projectPath: "home-project",

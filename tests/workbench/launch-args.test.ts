@@ -34,6 +34,7 @@ describe("buildWorkbenchLaunchArgs", () => {
     const args = buildWorkbenchLaunchArgs(
       gproj,
       [base, workshop, base],
+      true,
       true
     );
 
@@ -43,6 +44,7 @@ describe("buildWorkbenchLaunchArgs", () => {
       "-gproj",
       gproj,
       "-scriptAuthorizeAll",
+      "-noThrow",
     ]);
     expect(args.filter((arg) => arg === "-addonsDir")).toHaveLength(1);
   });
@@ -53,6 +55,21 @@ describe("buildWorkbenchLaunchArgs", () => {
     expect(buildWorkbenchLaunchArgs(gproj, undefined, false)).toEqual([
       "-gproj",
       gproj,
+    ]);
+  });
+
+  it("can suppress modal assertion dialogs for automated sessions", () => {
+    expect(buildWorkbenchLaunchArgs(null, undefined, false, true)).toEqual([
+      "-noThrow",
+    ]);
+  });
+
+  it("passes the random durable-owner token as one literal argument", () => {
+    const ownerArgument = "-reforgerForgeOwnerToken=de305d54-75b4-431b-adb2-eb6b9e546014";
+
+    expect(buildWorkbenchLaunchArgs(null, undefined, false, true, ownerArgument)).toEqual([
+      "-noThrow",
+      ownerArgument,
     ]);
   });
 

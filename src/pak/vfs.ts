@@ -1,6 +1,6 @@
 import { openSync, readSync, closeSync, readdirSync, existsSync } from "node:fs";
 import { join, extname } from "node:path";
-import { inflateRawSync } from "node:zlib";
+import { inflateSync } from "node:zlib";
 import { parsePakIndex, type PakIndex, type PakDirEntry, type PakFileEntry } from "./reader.js";
 import { logger } from "../utils/logger.js";
 
@@ -15,8 +15,12 @@ export interface VfsEntry {
 
 interface FileRef {
   pakPath: string;
-  dataStart: number;
   entry: PakFileEntry;
+}
+
+export interface PakVfsDiagnostic {
+  pakPath: string;
+  message: string;
 }
 
 // ── PakVirtualFS ─────────────────────────────────────────────────────────────
@@ -36,6 +40,10 @@ export class PakVirtualFS {
   private fileIndex = new Map<string, FileRef>();
   /** Merged directory tree for browsing */
   private root: PakDirEntry = { kind: "dir", name: "", children: new Map() };
+  /** PAKs requested for this VFS, in deterministic precedence order. */
+  private readonly sourcePakPaths: string[];
+  /** PAKs that could not be indexed. Callers that require completeness can fail closed. */
+  private readonly sourceDiagnostics: PakVfsDiagnostic[] = [];
 
   /** Clear the cached VFS instance, forcing a fresh rebuild on next get(). */
   static invalidate(): void {
@@ -90,7 +98,18 @@ export class PakVirtualFS {
     return vfs;
   }
 
+  /**
+   * Build an independent VFS over an explicit PAK set. This is useful for
+   * project dependency audits where scanning every installed Workshop addon
+   * would include unrelated resource overrides.
+   */
+  static fromPakFiles(pakFiles: string[]): PakVirtualFS {
+    const normalized = [...new Set(pakFiles)].sort();
+    return new PakVirtualFS(normalized);
+  }
+
   private constructor(pakFiles: string[]) {
+    this.sourcePakPaths = [...pakFiles];
     const start = Date.now();
     let totalFiles = 0;
 
@@ -100,7 +119,9 @@ export class PakVirtualFS {
         const count = this.mergeTree(this.root, index.root, index, "");
         totalFiles += count;
       } catch (e) {
-        logger.warn(`Failed to parse pak file ${pakPath}: ${e}`);
+        const message = e instanceof Error ? e.message : String(e);
+        this.sourceDiagnostics.push({ pakPath, message });
+        logger.warn(`Failed to parse pak file ${pakPath}: ${message}`);
         // Continue with other paks — graceful degradation
       }
     }
@@ -152,13 +173,17 @@ export class PakVirtualFS {
       throw new Error(`File not found in pak: ${virtualPath}`);
     }
 
-    const { pakPath, dataStart, entry } = ref;
+    const { pakPath, entry } = ref;
     const readLen = entry.compressed ? entry.compressedLen : entry.decompressedLen;
 
     const fd = openSync(pakPath, "r");
     try {
       const buf = Buffer.alloc(readLen);
-      const position = dataStart + entry.offset;
+      // PAC1 FILE entries store absolute .pak offsets. Treating them as
+      // DATA-relative shifts every read by the DATA header position (normally
+      // 56 bytes), truncating the current file's prefix and appending bytes
+      // from the following entry.
+      const position = entry.offset;
       const bytesRead = readSync(fd, buf, 0, readLen, position);
       if (bytesRead < readLen) {
         throw new Error(
@@ -167,7 +192,8 @@ export class PakVirtualFS {
       }
 
       if (entry.compressed) {
-        return inflateRawSync(buf);
+        // Reforger PAKs use a zlib-wrapped DEFLATE stream, not raw DEFLATE.
+        return inflateSync(buf);
       }
       return buf;
     } finally {
@@ -195,6 +221,16 @@ export class PakVirtualFS {
   /** Get the number of indexed files. */
   get fileCount(): number {
     return this.fileIndex.size;
+  }
+
+  /** PAK paths included in this VFS. */
+  get pakPaths(): readonly string[] {
+    return this.sourcePakPaths;
+  }
+
+  /** Indexing failures suppressed during construction for browse-oriented callers. */
+  get diagnostics(): readonly PakVfsDiagnostic[] {
+    return this.sourceDiagnostics;
   }
 
   // ── Internals ────────────────────────────────────────────────────────────
@@ -229,7 +265,6 @@ export class PakVirtualFS {
           target.children.set(name, child);
           this.fileIndex.set(norm, {
             pakPath: index.pakPath,
-            dataStart: index.dataStart,
             entry: child,
           });
           count++;

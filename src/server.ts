@@ -22,6 +22,7 @@ import { registerWbLaunch } from "./tools/wb-launch.js";
 import { registerWbConnect } from "./tools/wb-connect.js";
 import { registerWbDiagnose } from "./tools/wb-diagnose.js";
 import { registerWbReload } from "./tools/wb-reload.js";
+import { registerWbRestart } from "./tools/wb-restart.js";
 import { registerWbEditorTools } from "./tools/wb-editor.js";
 import { registerWbExecuteAction } from "./tools/wb-execute-action.js";
 import { registerWbEntityTools } from "./tools/wb-entities.js";
@@ -80,6 +81,7 @@ export function registerTools(server: McpServer, config: Config): void {
   registerWbConnect(server, wbClient);
   registerWbDiagnose(server, wbClient);
   registerWbReload(server, wbClient);
+  registerWbRestart(server, wbClient);
   registerWbEditorTools(server, wbClient);
   registerWbExecuteAction(server, wbClient);
   registerWbEntityTools(server, wbClient);

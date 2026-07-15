@@ -98,7 +98,8 @@ export function registerWbDiagnose(server: McpServer, client: WorkbenchClient): 
       if (r.netApi === "up_no_handlers" && r.installedMods.length === 0) {
         problems.push(
           "NET API is up but no handler scripts are installed anywhere. " +
-            "Call wb_launch with a gprojPath to inject handlers into the correct mod."
+            "Do not inject them into this live session. Close this Workbench yourself, " +
+            "then call wb_launch with a gprojPath to start an owner-scoped session."
         );
       }
 
