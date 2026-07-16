@@ -556,8 +556,8 @@ export function registerMod(
               // Ensure directory exists (prefabs go in type-specific subdirs)
               const prefabDir = join(addonDir, "Prefabs");
               mkdirSync(prefabDir, { recursive: true });
-              // Note: prefab file generation is done via prefab_create tool for full control
-              createdFiles.push(`(Use prefab_create for: ${prefabName})`);
+              // Prefab generation is handled by the merged prefab tool for full control.
+              createdFiles.push(`(Use prefab with action "create" for: ${prefabName})`);
             }
 
             // Apply pattern configs

@@ -83,6 +83,18 @@ export function registerWbDiagnose(server: McpServer, client: WorkbenchClient): 
           break;
       }
 
+      // Read-only lifecycle information. Diagnosis never claims a lease.
+      lines.push("\n### Lifecycle State");
+      lines.push(`- **Record:** ${r.lifecycle.state}${r.lifecycle.version ? ` (schema v${r.lifecycle.version})` : ""}`);
+      lines.push(`- **Generation:** ${r.lifecycle.generation ?? "(none)"}`);
+      lines.push(`- **Phase:** ${r.lifecycle.phase ?? "(none)"}`);
+      lines.push(`- **Endpoint:** ${r.lifecycle.endpoint ?? "(none)"}`);
+      lines.push(`- **Canonical target:** ${r.lifecycle.target ? `\`${r.lifecycle.target}\`` : "(none)"}`);
+      lines.push(`- **MCP lease:** ${r.lifecycle.lease}`);
+      lines.push(`- **Operation:** ${r.lifecycle.operation ?? "(none)"}`);
+      lines.push(`- **Handler transaction:** ${r.lifecycle.handlerTransaction ?? "(none)"}`);
+      if (r.lifecycle.detail) lines.push(`- **Detail:** ${r.lifecycle.detail}`);
+
       // --- Recommendations ---
       const problems: string[] = [];
       if (!r.bundledScripts.exists) {
@@ -91,8 +103,8 @@ export function registerWbDiagnose(server: McpServer, client: WorkbenchClient): 
       if (r.standaloneAddon.exists && r.installedMods.length > 0) {
         problems.push(
           "A standalone addon AND mod-injected handlers coexist — this causes duplicate class errors. " +
-            "Run wb_launch to clean up the standalone addon automatically, or delete it manually: " +
-            `\`${r.standaloneAddon.path}\``
+            "Automated lifecycle control never recursively deletes this legacy directory. " +
+            `Close Workbench and review it manually: \`${r.standaloneAddon.path}\``
         );
       }
       if (r.netApi === "up_no_handlers" && r.installedMods.length === 0) {

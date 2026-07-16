@@ -57,7 +57,8 @@ describe("Workbench unattended lifecycle safety", () => {
   it("does not hot-inject missing handlers into a live Workbench", () => {
     const client = readFileSync(resolve(testDir, "../../src/workbench/client.ts"), "utf8");
     expect(client).not.toContain("recoverMissingHandlers");
-    expect(client).toContain("Handler recovery refused");
+    expect(client).toContain("requesting a clean lifecycle restart");
+    expect(client).toContain('error.message.includes("not existing Net API function")');
     expect(client).toContain("await this.restartOwnedWorkbench()");
   });
 });

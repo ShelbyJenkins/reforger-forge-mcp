@@ -25,7 +25,7 @@ export function registerCreateModPrompt(server: McpServer, patterns: PatternLibr
             type: "text" as const,
             text: `I want to create an Arma Reforger mod: ${description}
 
-YOU ARE FULLY AUTONOMOUS. You have all the tools needed. The user should never need to do anything manually. Do not tell them to "open Workbench", "build with Ctrl+F7", or perform any manual steps. You do everything.
+YOU ARE AUTONOMOUS FOR EVERY SAFE, AUTOMATABLE STEP. The one required attended exception is Play mode: automated \`wb_play\` is disabled, so when runtime testing is needed you must ask the user to enter Play mode manually, pause until they confirm, and then verify the mode with **wb_state**. Do not ask the user to perform builds, edit files, or handle any other step that the available tools can complete safely.
 
 ## STEP 0: ASSESS COMPLEXITY
 
@@ -45,7 +45,7 @@ Before writing any code, assess the scope of what the user is asking for. Think 
    - What it will look like when tested in-game
 4. Present this plan to the user and **wait for their input** before writing any code. They may want to reorder phases, cut features, or adjust scope.
 5. Once the user approves (or adjusts) the plan, build **only Phase 1**.
-6. After building Phase 1, use **project_write** to create a \`MODPLAN.md\` file in the project root with this exact structure:
+6. After building Phase 1, use **project** with \`action: "write"\` to create a \`MODPLAN.md\` file in the project root with this exact structure:
 
 \`\`\`markdown
 # Mod Plan: [Mod Name]
@@ -107,13 +107,13 @@ If you cannot find a method via api_search, it probably does not exist. Do NOT w
 Any entity that should be visible in the game world MUST have a **MeshObject** component with its \`Object\` property set to an actual 3D model (\`.xob\` file) from the base game. Without this, the entity will be **completely invisible** — no model, no collision, nothing.
 
 You don't need to create custom models. Just borrow one from the base game that looks reasonable:
-- Use **api_search** or **project_browse** on the base Arma Reforger data to find \`.xob\` paths
+- Use **asset_search** or **game_browse** on the base Arma Reforger data to find \`.xob\` paths
 - Example paths (format: \`{GUID}path/to/model.xob\`):
   - Military barrel: \`{5F4C4181F065B447}Assets/Props/Military/Barrels/BarrelGreen_01.xob\`
   - Ammo crate: \`{1E648E8B6B28E837}Assets/Props/Military/AmmoBoxes/AmmoBox_545x39_60rnd.xob\`
   - Medical box: \`{D26ABAE8B017EC4E}Assets/Props/Military/CasualtyBag/CasualtyBag_01.xob\`
 - Pick something that vaguely fits the purpose — a healing station could use a medical box, a terminal could use a radio, etc.
-- After creating a prefab with **prefab_create**, use **project_read** + **project_write** to set the MeshObject \`Object\` property to a real model path
+- After creating a prefab with **prefab** and \`action: "create"\`, use **project** with \`action: "read"\` and then \`action: "write"\` to set the MeshObject \`Object\` property to a real model path
 
 This applies to ALL physical in-game objects: interactive props, spawn points with markers, placed items, vehicles, weapons, etc.
 
@@ -121,14 +121,14 @@ This applies to ALL physical in-game objects: interactive props, spawn points wi
 
 1. Use **api_search** to find the relevant Enfusion API classes AND verify that the methods you plan to use actually exist. Search every class you intend to call methods on. Do this BEFORE writing any scripts.
 
-2. Use **mod_create** to scaffold the addon project. Pick a good name, class prefix, and pattern based on the description.
+2. Use **mod** with \`action: "create"\` to scaffold the addon project. Pick a good name, class prefix, and pattern based on the description.
 
 3. Use **script_create** for each script:
    - Correct scriptType (component, gamemode, action, modded, etc.)
    - Proper method stubs and description comments
    - ONLY call methods verified via api_search
 
-4. Use **prefab_create** for any prefabs needed (spawn points, entities, game mode, etc.)
+4. Use **prefab** with \`action: "create"\` for any prefabs needed (spawn points, entities, game mode, etc.)
 
 5. Use **layout_create** for any UI layouts (hud, menu, dialog, list, custom).
 
@@ -136,16 +136,17 @@ This applies to ALL physical in-game objects: interactive props, spawn points wi
 
 7. Use **server_config** for a test server configuration if this is a multiplayer mod.
 
-8. Use **mod_validate** to check for structural issues.
+8. Use **mod** with \`action: "validate"\` to check for structural issues.
 
-9. **Workbench Setup** (MANDATORY — do not skip, do not tell the user to do this):
+9. **Workbench Setup** (MANDATORY — automate every safe step; attended Play is the one manual exception):
    a. **wb_launch** with \`gprojPath\` set to the addon's .gproj file — this copies handler scripts into the mod, skips the launcher, and opens the project in the World Editor with full NET API access
-   b. **wb_play** — After the clean startup compilation, enter game mode and verify the world launches successfully.
-   c. **wb_stop** — Return to the World Editor after verifying the game launched successfully
-   d. If compilation failed (errors in the Workbench console), fix with **project_write**, then use **wb_restart** to recompile from a clean owner-scoped session, and try **wb_play** again. Do not hot-reload scripts while a world is loaded.
-   e. **wb_resources** (action: "register") — Register every new prefab, config, and layout file
+   b. Ask the user to enter Play mode manually in Workbench because automated \`wb_play\` is disabled. Pause and wait for the user to confirm that Play has started.
+   c. After confirmation, call **wb_state** and proceed only after it reports Play mode. Verify that the world launches successfully.
+   d. Use **wb_stop** to return to the World Editor. Calling it in edit mode is an idempotent success.
+   e. If compilation failed (errors in the Workbench console), fix with **project** and \`action: "write"\`, then use **wb_restart** to recompile from a clean owner-scoped session. Ask the user to enter Play manually again, wait for confirmation, and verify the result with **wb_state**. Do not hot-reload scripts while a world is loaded.
+   f. **wb_resources** (action: "register") — Register every new prefab, config, and layout file
 
-10. **wb_play** again if needed for further testing. Use **wb_stop** to return to editor.
+10. If further runtime testing is needed, repeat the attended manual Play, confirmation, and **wb_state** verification flow. Use **wb_stop** to return to edit mode.
 
 11. **wb_cleanup** with the addon's root directory path — Remove the temporary handler scripts before the user publishes. NEVER skip this step.
 

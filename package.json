@@ -1,6 +1,6 @@
 {
   "name": "reforger-forge-mcp",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "type": "module",
   "description": "Universal MCP server for Arma Reforger modding — works with any AI agent (Cursor, Claude, Kiro, VS Code)",
   "bin": {
@@ -14,6 +14,8 @@
     "scrape:remote": "tsx scripts/scrape.ts --source remote",
     "scrape:local": "tsx scripts/scrape.ts --source local",
     "test": "vitest run",
+    "test:integration": "vitest run tests/workbench/project-launcher-safety.test.ts tests/animation/integration-m151a2.test.ts",
+    "test:package": "npm run build && node scripts/check-package.mjs",
     "test:watch": "vitest",
     "prepare": "npm run build"
   },
@@ -38,7 +40,15 @@
     "dist",
     "data",
     "mod",
+    "configs",
     "docs/AGENTS.md",
+    "reforger-forge.config.example.json",
+    "scripts/check-package.mjs",
+    "scripts/install-agents.ps1",
+    "scripts/list-tools.mjs",
+    "scripts/setup.ps1",
+    "scripts/windows/workbench-lifecycle.ps1",
+    "RELEASE_NOTES_v1.1.0.md",
     "README.md",
     "LICENSE"
   ],

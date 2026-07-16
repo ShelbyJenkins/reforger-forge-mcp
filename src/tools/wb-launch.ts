@@ -1,10 +1,14 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { basename, dirname, join, resolve } from "node:path";
-import { existsSync, readdirSync } from "node:fs";
+import { basename, dirname } from "node:path";
 import type { Config } from "../config.js";
-import type { WorkbenchClient } from "../workbench/client.js";
+import { WorkbenchError, type WorkbenchClient } from "../workbench/client.js";
 import { formatConnectionStatus } from "../workbench/status.js";
+
+function errorText(error: unknown): string {
+  if (error instanceof WorkbenchError) return `\`${error.code}\` — ${error.message}`;
+  return error instanceof Error ? error.message : String(error);
+}
 
 export function registerWbLaunch(
   server: McpServer,
@@ -15,146 +19,101 @@ export function registerWbLaunch(
     "wb_launch",
     {
       description:
-        "Launch Arma Reforger Workbench (Arma Reforger Tools). Automatically copies handler scripts " +
-        "into the target mod's Scripts/WorkbenchGame/ directory (so NET API handlers compile as part " +
-        "of the mod), starts Workbench with unattended assertion handling, tracks the exact child PID, " +
-        "persists a random-token process identity, and waits for the NET API to become available. Only " +
-        "a process whose durable PID/executable/start-time/token proof still matches can later be cleanly " +
-        "recompiled with wb_restart, including after this MCP server restarts. " +
-        "All other wb_* tools call this automatically if Workbench is not running, so you rarely need to " +
-        "call this directly. IMPORTANT: When done working with Workbench, call wb_cleanup to remove the " +
-        "handler scripts from the mod before the user publishes.",
+        "Launch or reuse the exact canonical .gproj in an automated Windows Workbench session. " +
+        "Lifecycle operations are serialized by a machine-wide mutex and an exact MCP-owner lease. " +
+        "A different target, live second MCP owner, user-launched Workbench, occupied endpoint, or " +
+        "unverifiable process is refused before handler files change. The managed handler bundle is " +
+        "transactional and Workbench is started with -noThrow. Use wb_shutdown before wb_cleanup.",
       inputSchema: {
-        gprojPath: z
-          .string()
-          .optional()
-          .describe(
-            "Path to a .gproj file to open directly. Skips the Workbench launcher screen and goes straight " +
-            "into the World Editor. Handler scripts are copied into the mod so all wb_* tools work. " +
-            "If omitted, Workbench opens to its launcher."
-          ),
+        gprojPath: z.string().optional().describe(
+          "Path to the exact .gproj to open. If omitted, a previously verified target or exactly one " +
+          "configured project must be available; ambiguous fallback is refused."
+        ),
       },
     },
     async ({ gprojPath }) => {
       try {
-        // Remember which addon was requested so other tools default to it
-        if (gprojPath) {
-          config.defaultMod = basename(dirname(resolve(gprojPath)));
-        }
-
-        const alreadyRunning = await client.ping();
-        if (alreadyRunning) {
-          const owned = await client.hasOwnedWorkbench();
-          if (!owned) {
-            return {
-              content: [{
-                type: "text" as const,
-                text:
-                  `**Workbench Not Owned** — NET API is responding, but this editor has no valid MCP owner marker. ` +
-                  `It will not be restarted or terminated. Close it yourself before requesting an automated session.` +
-                  formatConnectionStatus(client),
-              }],
-              isError: true,
-            };
-          }
-          return {
-            content: [
-              {
-                type: "text" as const,
-                text: `**Workbench Already Running** — NET API is responding. All \`wb_*\` tools are available.${formatConnectionStatus(client)}`,
-              },
-            ],
-          };
-        }
-
-        await client.ensureRunning(gprojPath);
-
-        const modDir = gprojPath ? dirname(resolve(gprojPath)) : null;
-        const note = modDir
-          ? `\n\nNote: Handler scripts were copied to ${modDir}/Scripts/WorkbenchGame/EnfusionMCP/. ` +
-            `Call **wb_cleanup** with the mod directory path when done to remove them before publishing.`
-          : "";
-
+        const result = await client.ensureRunning(gprojPath);
+        // The mutable default is updated only after an exact launch/reuse succeeds.
+        config.defaultMod = basename(dirname(result.gprojPath));
+        const label = result.action === "launched" ? "Workbench Ready" : "Workbench Already Running";
         return {
-          content: [
-            {
-              type: "text" as const,
-              text: `**Workbench Ready** — Launched, handler scripts installed, NET API responding. All \`wb_*\` tools are available.${note}${formatConnectionStatus(client)}`,
-            },
-          ],
+          content: [{
+            type: "text" as const,
+            text:
+              `**${label}** — ${result.action === "launched" ? "launched" : "reused"} exact owned ` +
+              `PID ${result.pid}.\n\nProject: \`${result.gprojPath}\`\n` +
+              `Lifecycle generation: \`${result.generation}\`\n\n` +
+              "When finished, call **wb_shutdown** first, then **wb_cleanup** for this mod." +
+              formatConnectionStatus(client),
+          }],
         };
-      } catch (e) {
-        const msg = e instanceof Error ? e.message : String(e);
+      } catch (error) {
         return {
-          content: [
-            {
-              type: "text" as const,
-              text: `**Launch Failed**\n\n${msg}${formatConnectionStatus(client)}`,
-            },
-          ],
+          content: [{
+            type: "text" as const,
+            text: `**Launch Refused**\n\n${errorText(error)}${formatConnectionStatus(client)}`,
+          }],
           isError: true,
         };
       }
     }
   );
 
-  // Cleanup tool to remove handler scripts after Workbench work is done
   server.registerTool(
     "wb_cleanup",
     {
       description:
-        "Remove the temporary EnfusionMCP handler scripts from a mod's directory. " +
-        "Deletes Scripts/WorkbenchGame/EnfusionMCP/ from the mod. " +
-        "Call this after finishing Workbench work and before the user publishes their mod. " +
-        "Safe to call even if scripts were never installed.",
+        "Remove only hash-matching, manifest-owned Workbench handler files after exact shutdown. " +
+        "Cleanup is a serialized lifecycle operation and is refused while any matching, externally " +
+        "owned, or unverifiable Workbench may be watching the mod. Modified and unrelated files are preserved.",
       inputSchema: {
-        modDir: z
-          .string()
-          .describe("Path to the mod's root directory (the folder containing the .gproj file)."),
+        modDir: z.string().describe("Canonicalizable mod root containing exactly one direct .gproj file."),
       },
     },
     async ({ modDir }) => {
-      // Resolve to absolute path and validate
-      const resolvedModDir = resolve(modDir);
-      if (!existsSync(resolvedModDir)) {
-        return {
-          content: [{
-            type: "text" as const,
-            text: `**Error:** Directory not found: ${modDir}${formatConnectionStatus(client)}`,
-          }],
-        isError: true,
-        };
-      }
-      const hasGproj = readdirSync(resolvedModDir).some(f => f.endsWith(".gproj"));
-      if (!hasGproj) {
-        return {
-          content: [{
-            type: "text" as const,
-            text: `**Error:** "${resolvedModDir}" does not appear to be a mod directory (no .gproj file found). Provide the mod root directory containing the .gproj file.${formatConnectionStatus(client)}`,
-          }],
-        isError: true,
-        };
-      }
-
-      const removed = client.cleanupHandlerScripts(resolvedModDir);
-      if (removed) {
-        return {
-          content: [
-            {
+      try {
+        const result = await client.cleanupHandlerScripts(modDir);
+        if (result.kind === "not_installed") {
+          return {
+            content: [{
               type: "text" as const,
-              text: `**Cleanup Complete** — EnfusionMCP handler scripts removed from the mod. The mod is ready to publish.${formatConnectionStatus(client)}`,
-            },
-          ],
+              text: `**No Cleanup Needed** — no managed handler bundle is installed at ` +
+                `\`${result.handlerDirectory}\`.${formatConnectionStatus(client)}`,
+            }],
+          };
+        }
+        if (result.kind === "modified_files") {
+          return {
+            content: [{
+              type: "text" as const,
+              text:
+                "**Cleanup Needs Manual Review** — exact managed files were removed, but modified files " +
+                `were preserved:\n${result.modified.map((file) => `- \`${file}\``).join("\n")}\n\n` +
+                `Unrelated files were also preserved (${result.unrelated.length}).` +
+                formatConnectionStatus(client),
+            }],
+            isError: true,
+          };
+        }
+        return {
+          content: [{
+            type: "text" as const,
+            text:
+              `**Cleanup Complete** — removed ${result.removed.length} manifest-owned handler file(s). ` +
+              `${result.unrelated.length} unrelated file(s) were preserved.` +
+              formatConnectionStatus(client),
+          }],
+        };
+      } catch (error) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: `**Cleanup Refused**\n\n${errorText(error)}${formatConnectionStatus(client)}`,
+          }],
+          isError: true,
         };
       }
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: `**No Cleanup Needed** — Handler scripts were not present in the mod directory.${formatConnectionStatus(client)}`,
-          },
-        ],
-      };
     }
   );
 }

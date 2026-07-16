@@ -40,13 +40,39 @@ export function registerWbEditorTools(server: McpServer, client: WorkbenchClient
     "wb_stop",
     {
       description:
-        "Stop game mode and return to the World Editor. Equivalent to pressing Stop in the World Editor. Requires play mode.",
+        "Stop game mode and return to the World Editor. Equivalent to pressing Stop in the World Editor. " +
+        "Returns an idempotent success when Workbench is already in edit mode.",
       inputSchema: {},
     },
     async () => {
+      if (client.state.mode === "unknown" && client.state.connected) {
+        try {
+          await client.call<Record<string, unknown>>(
+            "EMCP_WB_GetState",
+            {},
+            { skipAutoLaunch: true }
+          );
+        } catch {
+          // The mode remains unknown and the guarded response below explains
+          // how to confirm state without attempting a stop blindly.
+        }
+      }
+
+      if (client.state.mode === "edit") {
+        return {
+          content: [{
+            type: "text" as const,
+            text: `**Already Stopped** — Workbench is already in edit mode.${formatConnectionStatus(client)}`,
+          }],
+        };
+      }
+
       const modeErr = requirePlayMode(client, "stop play mode");
       if (modeErr) {
-        return { content: [{ type: "text" as const, text: modeErr + formatConnectionStatus(client) }] };
+        return {
+          content: [{ type: "text" as const, text: modeErr + formatConnectionStatus(client) }],
+          isError: true,
+        };
       }
       try {
         const result = await client.call<Record<string, unknown>>("EMCP_WB_EditorControl", {

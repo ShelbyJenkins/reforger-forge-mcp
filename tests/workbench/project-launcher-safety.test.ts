@@ -1,186 +1,280 @@
-import { describe, expect, it } from "vitest";
-import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { afterEach, describe, expect, it } from "vitest";
+import { execFileSync, spawn } from "node:child_process";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { platform, tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { WorkbenchProcessGuard } from "../../src/workbench/process-guard.js";
 
-function projectScript(name: string): string {
-  return readFileSync(
-    new URL(`../../../addons/RoadblockRunners/${name}`, import.meta.url),
-    "utf8"
-  );
-}
+const helperPath = fileURLToPath(
+  new URL("../../scripts/windows/workbench-lifecycle.ps1", import.meta.url)
+);
+const helper = readFileSync(helperPath, "utf8");
+const roots: string[] = [];
 
-function quotePowerShell(value: string): string {
-  return value.replaceAll("'", "''");
-}
+afterEach(() => {
+  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+});
 
-describe("Roadblock Runners Workbench launchers", () => {
-  const guardPath = fileURLToPath(
-    new URL("../../../addons/RoadblockRunners/workbench_process_guard.ps1", import.meta.url)
-  );
-  const guard = projectScript("workbench_process_guard.ps1");
-  const start = projectScript("start_workbench.ps1");
-  const launch = projectScript("launch_workbench.ps1");
-  const build = projectScript("build_workbench.ps1");
-
-  it("uses the exact Node-compatible atomic machine-wide lock in every launcher", () => {
-    expect(guard).toContain("reforger-forge-mcp-workbench.launch.lock");
-    expect(guard).toContain("[IO.FileMode]::CreateNew");
-    expect(guard).toContain("[IO.FileShare]::None");
-    expect(guard).toContain("[IO.FileOptions]::DeleteOnClose");
-
-    for (const source of [start, launch, build]) {
-      expect(source).toContain("workbench_process_guard.ps1");
-      expect(source).toContain("$LaunchLock = Enter-RRWorkbenchLaunchLock");
-      expect(source).toContain("Assert-RRNoWorkbenchProcess");
-      expect(source).toContain("Exit-RRWorkbenchLaunchLock -Lock $LaunchLock");
-    }
+describe("bundled Windows Workbench lifecycle helper", () => {
+  it("uses a global named mutex and contains no pathname stale-recovery lock", () => {
+    expect(helper).toContain("[Threading.Mutex]::new");
+    expect(helper).toContain("[Threading.AbandonedMutexException]");
+    expect(helper).toContain("MutexSecurity");
+    expect(helper).not.toContain("reforger-forge-mcp-workbench.launch.lock");
+    expect(helper).not.toContain("lockStaleMs");
+    expect(helper).not.toContain("Test-RRProcessIdAlive");
   });
 
-  it("never reclaims an aged lock without proving its holder PID is absent", () => {
-    expect(guard).toContain("if (-not (Test-RRProcessIdAlive -ProcessId $holderPid))");
-    expect(guard).toContain("Remove-Item -LiteralPath $script:RRWorkbenchLaunchLockPath");
-    expect(guard.indexOf("Test-RRProcessIdAlive -ProcessId $holderPid"))
-      .toBeLessThan(guard.indexOf("Remove-Item -LiteralPath $script:RRWorkbenchLaunchLockPath"));
-    expect(guard).toContain("Access denial or another inspection failure must never authorize stale");
+  it("verifies and terminates through one retained native process handle", () => {
+    expect(helper).toContain("OpenProcess");
+    expect(helper).toContain("GetProcessTimes");
+    expect(helper).toContain("QueryFullProcessImageName");
+    expect(helper).toContain("HasExactArgument");
+    expect(helper).toContain("CharSet = CharSet.Unicode");
+    expect(helper).toContain("TerminateAndWait");
+    expect(helper).toContain("TerminateProcess(handle");
+    expect(helper).toContain("WaitForSingleObject(handle");
+    expect(helper).not.toContain("taskkill");
+    expect(helper).not.toContain("Stop-Process -Name");
+  });
+
+  it("generation-checks, flushes, and atomically replaces lifecycle state", () => {
+    expect(helper).toContain("expectedGeneration");
+    expect(helper).toContain("Lifecycle state generation mismatch");
+    expect(helper).toContain("$stream.Flush($true)");
+    expect(helper).toContain("MOVEFILE_REPLACE_EXISTING");
+    expect(helper).toContain("MOVEFILE_WRITE_THROUGH");
+    expect(helper).toContain("AtomicReplace($tempPath, $statePath)");
+  });
+
+  it("uses only private JSON stdin/stdout protocol messages", () => {
+    expect(helper).toContain("[Console]::In.ReadLine()");
+    expect(helper).toContain("[Console]::Out.WriteLine($json)");
+    expect(helper).toContain("[Console]::Out.Flush()");
+    expect(helper).not.toContain("Write-Host");
   });
 
   it.runIf(platform() === "win32")(
-    "bounds a stale FileShare.None collision even when lock read and deletion fail",
+    "inspects the caller through an exact Windows process handle",
     () => {
-      const root = mkdtempSync(join(tmpdir(), "rr-powershell-lock-test-"));
-      const lockPath = join(root, "reforger-forge-mcp-workbench.launch.lock");
-      const script = [
-        "$ErrorActionPreference = 'Stop'",
-        `. '${quotePowerShell(guardPath)}'`,
-        `$script:RRWorkbenchLaunchLockPath = '${quotePowerShell(lockPath)}'`,
-        "[IO.File]::WriteAllText($script:RRWorkbenchLaunchLockPath, '{\"pid\":0}')",
-        "(Get-Item -LiteralPath $script:RRWorkbenchLaunchLockPath).LastWriteTimeUtc = [DateTime]::UtcNow.AddMinutes(-5)",
-        "$held = [IO.File]::Open($script:RRWorkbenchLaunchLockPath, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)",
-        "$timer = [Diagnostics.Stopwatch]::StartNew()",
-        "try {",
-        "  try {",
-        "    $unexpected = Enter-RRWorkbenchLaunchLock -TimeoutSeconds 1 -StaleSeconds 30",
-        "    throw 'unexpectedly acquired the exclusively held lock'",
-        "  } catch {",
-        "    if (-not $_.Exception.Message.Contains('Timed out waiting for the machine-wide Workbench launch lock')) { throw }",
-        "  }",
-        "  if ($timer.Elapsed.TotalSeconds -gt 5) { throw 'lock timeout was not bounded' }",
-        "} finally {",
-        "  $held.Dispose()",
-        "  Remove-Item -LiteralPath $script:RRWorkbenchLaunchLockPath -Force -ErrorAction SilentlyContinue",
-        "}",
-      ].join("\r\n");
-      const encoded = Buffer.from(script, "utf16le").toString("base64");
-
-      try {
-        expect(() => execFileSync(
-          "powershell.exe",
-          ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", encoded],
-          { timeout: 10_000, windowsHide: true, stdio: "pipe" }
-        )).not.toThrow();
-      } finally {
-        rmSync(root, { recursive: true, force: true });
-      }
+      const response = execFileSync(
+        "powershell.exe",
+        [
+          "-NoProfile",
+          "-NonInteractive",
+          "-ExecutionPolicy",
+          "Bypass",
+          "-File",
+          helperPath,
+          "-Mode",
+          "InspectCurrent",
+        ],
+        {
+          input: `${JSON.stringify({ pid: process.pid })}\n`,
+          encoding: "utf8",
+          windowsHide: true,
+          timeout: 20_000,
+        }
+      );
+      const parsed = JSON.parse(response.trim()) as {
+        ok: boolean;
+        identity: { pid: number; executablePath: string; creationTime: string; userSid: string };
+      };
+      expect(parsed.ok).toBe(true);
+      expect(parsed.identity.pid).toBe(process.pid);
+      expect(parsed.identity.executablePath.length).toBeGreaterThan(0);
+      expect(parsed.identity.creationTime).toMatch(/^[1-9][0-9]+$/);
+      expect(parsed.identity.userSid).toMatch(/^S-/);
     },
-    15_000
+    30_000
   );
 
   it.runIf(platform() === "win32")(
-    "writes a durable PowerShell owner marker that Node reads without BOM loss",
-    () => {
-      const root = mkdtempSync(join(tmpdir(), "rr-powershell-owner-test-"));
-      const markerPath = join(root, "reforger-forge-mcp-workbench.owner.json");
-      const projectPath = join(root, "RoadblockRunners.gproj");
-      const token = "de305d54-75b4-431b-adb2-eb6b9e546014";
-      const script = [
-        "$ErrorActionPreference = 'Stop'",
-        `. '${quotePowerShell(guardPath)}'`,
-        `$script:RRWorkbenchOwnerMarkerPath = '${quotePowerShell(markerPath)}'`,
-        "$process = [Diagnostics.Process]::GetCurrentProcess()",
-        "Write-RRWorkbenchOwnerMarker `",
-        "  -Process $process `",
-        "  -ExecutablePath $process.MainModule.FileName `",
-        `  -OwnerToken '${token}' \``,
-        `  -ProjectFile '${quotePowerShell(projectPath)}'`,
-      ].join("\r\n");
-      const encoded = Buffer.from(script, "utf16le").toString("base64");
-
-      try {
-        execFileSync(
-          "powershell.exe",
-          ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", encoded],
-          { timeout: 10_000, windowsHide: true, stdio: "pipe" }
-        );
-        const bytes = readFileSync(markerPath);
-        const nodeGuard = new WorkbenchProcessGuard({ stateDir: root });
-        const marker = nodeGuard.readOwnerMarker();
-
-        expect([...bytes.subarray(0, 3)]).not.toEqual([0xef, 0xbb, 0xbf]);
-        expect(marker).toMatchObject({
-          version: 1,
-          token,
-          commandLineToken: `-reforgerForgeOwnerToken=${token}`,
-          gprojPath: projectPath,
-          host: "127.0.0.1",
-          port: 5775,
-        });
-        expect(marker?.pid).toBeGreaterThan(0);
-        expect(marker?.creationTimeMs).toBeGreaterThan(0);
-      } finally {
-        rmSync(root, { recursive: true, force: true });
-      }
-    }
+    "holds the real global mutex for the complete callback",
+    async () => {
+      const stateRoot = mkdtempSync(join(tmpdir(), "reforger-forge-native-mutex-"));
+      roots.push(stateRoot);
+      const mutexName = `Global\\ReforgerForge.Test.${Date.now()}.${process.pid}`;
+      const first = new WorkbenchProcessGuard({
+        stateDir: join(stateRoot, "first"), helperPath, mutexName, lockTimeoutMs: 10_000,
+      });
+      const second = new WorkbenchProcessGuard({
+        stateDir: join(stateRoot, "second"), helperPath, mutexName, lockTimeoutMs: 10_000,
+      });
+      let releaseFirst!: () => void;
+      const release = new Promise<void>((resolve) => { releaseFirst = resolve; });
+      let firstEntered!: () => void;
+      const entered = new Promise<void>((resolve) => { firstEntered = resolve; });
+      const order: string[] = [];
+      const firstRun = first.withLifecycleLock(async () => {
+        order.push("first-enter");
+        firstEntered();
+        await release;
+        order.push("first-exit");
+      });
+      await entered;
+      const secondRun = second.withLifecycleLock(async () => { order.push("second-enter"); });
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(order).toEqual(["first-enter"]);
+      releaseFirst();
+      await Promise.all([firstRun, secondRun]);
+      expect(order).toEqual(["first-enter", "first-exit", "second-enter"]);
+    },
+    45_000
   );
 
-  it("persists a BOM-free owner marker with PID-reuse defenses for detached launches", () => {
-    expect(start).toContain("$OwnerToken = [Guid]::NewGuid().ToString('D')");
-    expect(start).toContain('"-reforgerForgeOwnerToken=$OwnerToken"');
-    expect(start).toContain("Write-RRWorkbenchOwnerMarker");
-    expect(guard).toContain('commandLineToken = "-reforgerForgeOwnerToken=$OwnerToken"');
-    expect(guard).toContain("$Process.StartTime.ToUniversalTime()");
-    expect(guard).toContain("[Text.UTF8Encoding]::new($false)");
-  });
+  it.runIf(platform() === "win32")(
+    "recovers an abandoned real global mutex",
+    async () => {
+      const mutexName = `Global\\ReforgerForge.Abandon.${Date.now()}.${process.pid}`;
+      const encoded = (source: string): string =>
+        Buffer.from(source, "utf16le").toString("base64");
+      const lineFrom = (child: ReturnType<typeof spawn>): Promise<string> =>
+        new Promise((resolvePromise, reject) => {
+          let buffer = "";
+          child.stdout?.setEncoding("utf8");
+          child.stdout?.on("data", (chunk: string) => {
+            buffer += chunk;
+            const newline = buffer.indexOf("\n");
+            if (newline >= 0) resolvePromise(buffer.slice(0, newline).trim());
+          });
+          child.once("error", reject);
+          child.once("close", (code) => {
+            if (!buffer.includes("\n")) reject(new Error(`mutex worker exited early (${code})`));
+          });
+        });
+      const ownerScript = [
+        "$m=[Threading.Mutex]::new($false,$env:RR_MUTEX_NAME)",
+        "$null=$m.WaitOne()",
+        "[Console]::Out.WriteLine('ready')",
+        "[Console]::Out.Flush()",
+        "$null=[Console]::In.ReadLine()",
+        "[Environment]::Exit(0)",
+      ].join("\n");
+      const anchorScript = [
+        "$m=[Threading.Mutex]::OpenExisting($env:RR_MUTEX_NAME)",
+        "[Console]::Out.WriteLine('anchored')",
+        "[Console]::Out.Flush()",
+        "$null=[Console]::In.ReadLine()",
+        "$m.Dispose()",
+      ].join("\n");
+      const environment = { ...process.env, RR_MUTEX_NAME: mutexName };
+      const owner = spawn("powershell.exe", [
+        "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded(ownerScript),
+      ], { stdio: ["pipe", "pipe", "pipe"], windowsHide: true, env: environment });
+      expect(await lineFrom(owner)).toBe("ready");
+      const ownerClosed = new Promise<void>((resolvePromise) => owner.once("close", () => resolvePromise()));
 
-  it("kills only the exact Process object and confirms exit on failure", () => {
-    expect(guard).toContain("$Process.Kill()");
-    expect(guard).toContain("$Process.WaitForExit($TimeoutSeconds * 1000)");
-    expect(guard).not.toContain("taskkill");
-    expect(guard).not.toContain("Stop-Process -Name");
-    expect(build).not.toContain("Stop-Process");
-    expect(start).not.toContain("Stop-Process");
-  });
+      const anchor = spawn("powershell.exe", [
+        "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded(anchorScript),
+      ], { stdio: ["pipe", "pipe", "pipe"], windowsHide: true, env: environment });
+      expect(await lineFrom(anchor)).toBe("anchored");
+      const anchorClosed = new Promise<void>((resolvePromise) => anchor.once("close", () => resolvePromise()));
 
-  it("runs ResourceManager buildData silently against an isolated platform target", () => {
-    expect(build).toContain("RoadblockRunners\\WorkbenchBuild\\PC");
-    expect(build).toContain("'-wbSilent'");
-    expect(build).toContain("'-wbModule=ResourceManager'");
-    expect(build).toContain("'-buildData', 'PC', ('\"{0}\"' -f $BuildTarget)");
-    expect(build).toContain("'-loadBuiltData'");
-    expect(build).toContain("$OwnerArgument = \"-reforgerForgeOwnerToken=$OwnerToken\"");
-  });
+      const contender = spawn("powershell.exe", [
+        "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+        "-File", helperPath, "-Mode", "HoldMutex",
+      ], { stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
+      contender.stdin?.write(`${JSON.stringify({ mutexName, timeoutMs: 10_000 })}\n`);
+      const acquiredLine = lineFrom(contender);
+      const contenderClosed = new Promise<void>((resolvePromise) =>
+        contender.once("close", () => resolvePromise())
+      );
 
-  it("requires exactly one attributable nonempty log directory before releasing the lock", () => {
-    expect(build).toContain("$NewLogDirectories.Count -ne 1");
-    expect(build).toContain("exactly one attributable directory is required");
-    expect(build).toContain("must contain at least one nonempty .log file");
-    expect(build).toContain("$OwnerTokenObserved = $false");
-    expect(build).toContain("if ($line.Contains($OwnerArgument))");
-    expect(build).toContain("if (-not $OwnerTokenObserved)");
-    expect(build).toContain("assertion failed|resources are leaking!|\\bout of memory\\b");
+      owner.stdin?.end("abandon\n");
+      await ownerClosed;
+      const acquired = JSON.parse(await acquiredLine) as {
+        ok: boolean;
+        status: string;
+        abandoned: boolean;
+      };
+      expect(acquired).toMatchObject({ ok: true, status: "acquired", abandoned: true });
+      contender.stdin?.end("release\n");
+      await contenderClosed;
+      anchor.stdin?.end("close\n");
+      await anchorClosed;
+    },
+    45_000
+  );
 
-    const logAudit = build.indexOf("$NewLogDirectories = @(");
-    const finalUnlock = build.lastIndexOf("Exit-RRWorkbenchLaunchLock -Lock $LaunchLock");
-    expect(logAudit).toBeGreaterThan(-1);
-    expect(finalUnlock).toBeGreaterThan(logAudit);
-  });
+  it.runIf(platform() === "win32")(
+    "verifies the owner argument and terminates through the same retained handle",
+    async () => {
+      const ownerArgument = `-reforgerForgeOwnerToken=native-${Date.now()}-${process.pid}`;
+      const workerRoot = mkdtempSync(join(tmpdir(), "reforger-forge-native-owner-"));
+      roots.push(workerRoot);
+      const workerScript = join(workerRoot, "owner-worker.cmd");
+      writeFileSync(
+        workerScript,
+        "@ping -n 31 127.0.0.1 >nul\r\n",
+        "utf8"
+      );
+      const worker = spawn(
+        "cmd.exe",
+        ["/d", "/c", workerScript, ownerArgument],
+        { stdio: "ignore", windowsHide: true }
+      );
+      const closed = new Promise<number | null>((resolvePromise) =>
+        worker.once("close", (code) => resolvePromise(code))
+      );
+      await new Promise<void>((resolvePromise, reject) => {
+        worker.once("spawn", resolvePromise);
+        worker.once("error", reject);
+      });
+      expect(worker.pid).toBeTypeOf("number");
 
-  it("fails closed if process-table inspection cannot prove Workbench is absent", () => {
-    expect(guard).toContain("Get-Process -ErrorAction Stop");
-    expect(guard).toContain("Cannot prove that Workbench is absent because process inspection failed");
-    expect(guard).toContain("No process was launched");
-  });
+      const inspectText = execFileSync(
+        "powershell.exe",
+        [
+          "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+          "-File", helperPath, "-Mode", "InspectProcess",
+        ],
+        {
+          input: `${JSON.stringify({
+            pid: worker.pid,
+            expectedOwnerTokenArgument: ownerArgument,
+          })}\n`,
+          encoding: "utf8",
+          windowsHide: true,
+          timeout: 20_000,
+        }
+      );
+      const inspected = JSON.parse(inspectText.trim()) as {
+        ok: boolean;
+        ownerArgumentMatched: boolean;
+        identity: { pid: number; executablePath: string; creationTime: string };
+      };
+      expect(inspected.ok).toBe(true);
+      expect(inspected.ownerArgumentMatched).toBe(true);
+
+      const terminateText = execFileSync(
+        "powershell.exe",
+        [
+          "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+          "-File", helperPath, "-Mode", "VerifyTerminate",
+        ],
+        {
+          input: `${JSON.stringify({
+            expected: {
+              ...inspected.identity,
+              ownerTokenArgument: ownerArgument,
+              launchedAtMs: Date.now(),
+            },
+            timeoutMs: 10_000,
+          })}\n`,
+          encoding: "utf8",
+          windowsHide: true,
+          timeout: 20_000,
+        }
+      );
+      const terminated = JSON.parse(terminateText.trim()) as {
+        ok: boolean;
+        status: string;
+      };
+      expect(terminated).toMatchObject({ ok: true, status: "terminated" });
+      await expect(closed).resolves.not.toBeNull();
+    },
+    45_000
+  );
 });

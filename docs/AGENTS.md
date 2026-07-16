@@ -112,16 +112,22 @@ Workbench from loading or saving resources.
 `Scripts/WorkbenchGame/EnfusionMCP`. Those handlers must compile as part of the
 target project. For the most reliable first connection, close an unrelated or
 stale Workbench session and call `wb_launch` with the target `gprojPath`.
-Every launch refreshes a versioned handler bundle. Handler and game-script
-changes require a full Workbench restart because every in-process script reload
-is disabled. Use `wb_restart` for a clean compile only when the durable PID,
-executable, start time, and random command-line token all verify. It retains the
-target `.gproj`, waits for the NET API port to release, launches with `-noThrow`,
-and refuses user-owned Workbench sessions. Durable ownership can be recovered
-after the MCP restarts; PID reuse or inaccessible identity data fails closed.
+A fresh owner-scoped start installs or refreshes the hashed, transactional
+handler bundle only while Workbench is stopped; reusing an already-running
+verified target never rewrites live handler files. Automated
+lifecycle control is supported on Windows and serialized with a global named
+mutex. A second live MCP cannot adopt the first MCP's Workbench. A replacement
+MCP may claim the lease only after the prior MCP PID and exact creation identity
+are proven dead. `wb_restart` preflights the complete replacement before it
+stops anything, retains the same canonical `.gproj`, terminates through the
+verified OS process handle, waits for the NET API port to release, launches with
+`-noThrow`, and refuses different-target, user-owned, or unverifiable sessions.
 
-Keep the handlers while live automation is in use. Call `wb_cleanup` with the
-mod root before publishing or packaging the mod.
+Keep the handlers while live automation is in use. When finished, call
+`wb_shutdown` to stop the exact owner and release the endpoint, then call
+`wb_cleanup` with the mod root. Cleanup is blocked while Workbench may be
+watching the project and removes only hash-matching manifest-owned files;
+modified and unrelated files are preserved for review.
 
 ## Start-of-Task Checklist
 
@@ -194,9 +200,11 @@ For live editor work:
    editor; `wb_save`/Save As are disabled because they may open modal UI.
 7. After script changes, use verified owner-scoped `wb_restart` for a clean
    compile. Never use `wb_reload` or a generic menu action for scripts.
-8. Run gameplay acceptance through a bounded standalone diagnostic/autotest
-   launcher. `wb_play` is disabled because it can compile inside the live
-   editor process.
+8. Prefer a bounded standalone diagnostic/autotest launcher for gameplay
+   acceptance. When attended in-editor testing is required, ask the user to
+   enter Play manually because `wb_play` is disabled, pause until they confirm,
+   verify Play mode with `wb_state`, and use `wb_stop` to return to edit mode.
+9. When live automation is finished, call `wb_shutdown` before `wb_cleanup`.
 
 After changing `.c` files in a session that has loaded a world, save intentional
 editor changes manually and use `wb_restart`. Do not route a script compile
@@ -257,7 +265,8 @@ includes:
 2. Launch the target project with all required addon roots.
 3. Compile the Game module and stop on project script errors.
 4. Reopen or inspect every changed prefab, config, and world resource.
-5. Enter Play and exercise the behavior's concrete acceptance cases.
+5. Ask the user to enter Play manually, wait for confirmation, verify Play mode
+   with `wb_state`, and exercise the behavior's concrete acceptance cases.
 6. Manually check the Workbench Log Console for new errors, warnings, and
    expected project-specific evidence.
 7. Test networking behavior with the required number of real clients; a solo
@@ -316,6 +325,7 @@ Before reporting completion or publishing:
   acceptance cases.
 - Save editor changes and record any validation that still requires manual or
   multiplayer testing.
-- Call `wb_cleanup` so `Scripts/WorkbenchGame/EnfusionMCP` is not shipped.
+- Call `wb_shutdown`, then `wb_cleanup`, so managed temporary handlers are not
+  shipped while modified or unrelated files remain protected.
 - Exclude local MCP config, logs, caches, absolute paths, usernames, and other
   machine-specific information from the commit.

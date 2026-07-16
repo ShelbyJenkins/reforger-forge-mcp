@@ -5,7 +5,7 @@
 
 .DESCRIPTION
   - Installs npm dependencies and builds the server
-  - Verifies all 50 tools register
+  - Verifies required tools register and prints the discovered count
   - Optionally installs reforger-forge into supported MCP clients
 #>
 
@@ -16,6 +16,22 @@ Write-Host "ReforgerForge MCP Setup" -ForegroundColor Cyan
 Write-Host "=======================" -ForegroundColor Cyan
 Write-Host ""
 Write-Host "Repo: $Root"
+
+$requiredAssets = @(
+    "reforger-forge.config.example.json",
+    "scripts\list-tools.mjs",
+    "scripts\install-agents.ps1",
+    "scripts\windows\workbench-lifecycle.ps1",
+    "docs\AGENTS.md",
+    "configs\claude-desktop.json",
+    "configs\cursor-global.json"
+)
+foreach ($asset in $requiredAssets) {
+    if (-not (Test-Path (Join-Path $Root $asset) -PathType Leaf)) {
+        Write-Host "ERROR: Required package asset is missing: $asset" -ForegroundColor Red
+        exit 1
+    }
+}
 
 # Check Node.js
 $nodeCommand = Get-Command node -ErrorAction SilentlyContinue
@@ -46,9 +62,9 @@ if (-not (Test-Path $configPath)) {
 Write-Host ""
 Write-Host "Building..." -ForegroundColor Yellow
 Push-Location $Root
-npm install
+npm.cmd install
 if ($LASTEXITCODE -ne 0) { Pop-Location; exit 1 }
-npm run build
+npm.cmd run build
 if ($LASTEXITCODE -ne 0) { Pop-Location; exit 1 }
 Pop-Location
 Write-Host "Build complete." -ForegroundColor Green
@@ -57,6 +73,7 @@ Write-Host "Build complete." -ForegroundColor Green
 Write-Host ""
 Write-Host "Verifying tools..." -ForegroundColor Yellow
 node (Join-Path $Root "scripts\list-tools.mjs")
+if ($LASTEXITCODE -ne 0) { exit 1 }
 
 # Optional global Cursor config
 Write-Host ""

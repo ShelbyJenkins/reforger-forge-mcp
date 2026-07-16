@@ -70,7 +70,7 @@ export function safePath(basePath: string, ...segments: string[]): string {
 
 /**
  * Validate a relative sub-path (which may contain slashes) stays within the base directory.
- * Used by project_read / project_write / project_browse for user-supplied relative paths.
+ * Used by the `project` tool actions for user-supplied relative paths.
  */
 export function validateProjectPath(basePath: string, subPath: string): string {
   if (subPath.includes("..")) {

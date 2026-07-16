@@ -8,7 +8,7 @@ Describe what you want to build — your AI agent handles API research, code gen
 
 ## Features
 
-- **50 MCP tools** — API search, wiki, asset browsing, code generation, Workbench live control
+- **Broad MCP toolset** — API search, wiki, asset browsing, code generation, and guarded Workbench control
 - **8,693 indexed API classes** — full Enfusion/Arma Reforger class hierarchy
 - **250+ wiki guides** — searchable tutorials and documentation
 - **Agent-agnostic** — one server, install script for every major AI IDE
@@ -40,7 +40,7 @@ Then install into your agent(s):
 .\scripts\install-agents.ps1 -Agent cursor
 ```
 
-Restart your agent and verify **reforger-forge** shows **51 tools**.
+Restart your agent and run `node scripts/list-tools.mjs` to verify the complete required tool set.
 
 ### Configure paths
 
@@ -181,7 +181,7 @@ Use the stdio template at `configs/agents/stdio-template.json`. Replace `REPLACE
 
 ---
 
-## Complete Tool Reference (51 tools)
+## Complete Tool Reference
 
 Legend: **Offline** = no Workbench needed | **Live** = requires Workbench running (`wb_launch`)
 
@@ -215,7 +215,6 @@ auto-launch it.
 |------|-----------|-------------|
 | `project` | No | Browse, read, or write files in your mod project directory (`action`: browse / read / write). |
 | `mod` | No | Manage addons: `action=create` scaffolds a new addon and `action=validate` checks structure. Unsafe generic `action=build` is retired; use a project-owned bounded build wrapper. |
-| `workshop_info` | No | Read `.gproj` Workshop publish metadata. |
 
 ### Code Generation (Offline)
 
@@ -236,15 +235,27 @@ auto-launch it.
 | `animation_graph` | No | Vehicle animation graph tool — `action=author` (generate .agr/.ast scaffolds), `action=inspect` (read/validate graphs), `action=setup` (full guided wizard). |
 | `building_setup` | No | Set up destructible building from Blender export manifest — creates structure prefab with slot wiring and per-phase destruction components. |
 
-### Workbench Connection & Diagnostics (Live)
+### Workbench Lifecycle, Connection & Diagnostics (Windows)
+
+Automated launch/restart/shutdown/cleanup lifecycle control is release-supported
+on Windows. A global named mutex serializes every mutation. A second live MCP
+cannot adopt the first MCP's Workbench; a replacement may claim the lease only
+after the prior MCP process identity is proven dead. The target is always one
+canonical `.gproj`, and a different requested target is refused rather than
+reported as success. User-launched or otherwise unverifiable Workbench processes
+are never terminated. If `gprojPath` is omitted, launch succeeds only when a
+prior verified target or exactly one configured project can be resolved;
+ambiguity is refused with the candidate paths. A live version-1 owner marker
+requires one manual Workbench close before the version-2 state can be initialized.
 
 | Tool | What it does |
 |------|-------------|
-| `wb_launch` | Start one atomically guarded `-noThrow` Workbench, refresh the versioned handler bundle, persist random-token process ownership, and wait for NET API. It refuses pre-existing/unowned Workbench processes and cleans up the exact child on failure. Call `wb_cleanup` before publishing mod. |
+| `wb_launch` | Launch or reuse one exact canonical `.gproj` under the v2 MCP lease, global mutex, and transactional handler bundle. Different targets, live-other-MCP owners, occupied endpoints, and user-owned/unverifiable Workbench processes are refused. |
 | `wb_connect` | Test connection to Workbench NET API. Returns connection status and editor mode. |
-| `wb_diagnose` | Full diagnostic — config, handler script locations, NET API status. Use when `wb_launch` or `wb_connect` fails. |
-| `wb_cleanup` | Remove temporary EnfusionMCP handler scripts from mod before publishing. Safe even if never installed. |
-| `wb_restart` | Cleanly recompile by restarting only a Workbench whose durable PID/executable/start-time/random-token identity verifies, including after an MCP restart. Retains the `.gproj`, waits for NET API port release, and refuses user-owned sessions. |
+| `wb_diagnose` | Non-mutating diagnostic — config, handler locations, NET API, lifecycle schema/generation/phase, canonical target, endpoint, lease status, operation, and handler transaction. |
+| `wb_restart` | Preflight a complete replacement, then terminate through the retained verified process handle and restart the same canonical `.gproj`. A live different MCP owner cannot be claimed. |
+| `wb_shutdown` | Stop only the exact verified owner process, wait for endpoint release, and transition lifecycle state to vacant. Required before cleanup; user-launched Workbench is never signalled. |
+| `wb_cleanup` | After `wb_shutdown`, remove only hash-matching manifest-owned handler files. Cleanup is blocked while Workbench may be watching the mod; modified and unrelated files are preserved. |
 | `wb_state` | Full Workbench snapshot — mode (edit/play), entity count, selection, terrain bounds, sub-scene, prefab edit status. |
 | `wb_reload` | Reload plugins only. Every in-process game-script reload is refused; use verified owner-scoped `wb_restart` for clean compilation. |
 
@@ -252,8 +263,8 @@ auto-launch it.
 
 | Tool | What it does |
 |------|-------------|
-| `wb_play` | Refused for unattended automation because Play can compile scripts inside the live editor. Use a bounded standalone diagnostic/autotest launcher. |
-| `wb_stop` | Exit play mode, return to World Editor. |
+| `wb_play` | Refused for unattended automation. Enter Play manually while attended, confirm the action, verify mode with `wb_state`, and use `wb_stop` to return to edit mode. |
+| `wb_stop` | Exit play mode and return to World Editor; already-edit mode is an idempotent success. |
 | `wb_save` | Refused for unattended automation because Save/Save As can open modal UI. Save intentional editor changes manually while attended. |
 | `wb_undo_redo` | Undo or redo the last World Editor action. |
 | `wb_open_resource` | Open a resource in its editor (.et → Prefab Editor, .c → Script Editor, etc.). |
@@ -286,7 +297,7 @@ auto-launch it.
 | `wb_script_editor` | Read/write lines in the open Script Editor file — get file, read/write/insert/remove lines, line count. |
 | `wb_validate` | Validate material or texture resources using Workbench built-in validators. Returns errors and warnings. |
 
-Run `node scripts/list-tools.mjs` anytime to verify all 51 tools register on your machine.
+Run `node scripts/list-tools.mjs` anytime to verify every required tool registers on your machine.
 
 ---
 
@@ -330,6 +341,7 @@ both.
 ## Requirements
 
 - **Node.js 20+**
+- **Windows** — required for the exact automated Workbench lifecycle guarantee
 - **Arma Reforger Tools** (Steam) — for resource registration and reviewed live editor-control tools
 - **Arma Reforger** (Steam) — for game asset browsing
 
@@ -339,9 +351,11 @@ both.
 
 ```bash
 npm run build                  # Compile TypeScript
-npm test                       # Run test suite (446 tests)
+npm test                       # Run hermetic default unit/contract suite
+npm run test:integration       # Run explicitly gated environment integration tests
+npm run test:package           # Verify published-package contents
 npm run dev                    # Run server in dev mode
-node scripts/list-tools.mjs    # Verify all 51 tools register
+node scripts/list-tools.mjs    # Verify every required tool registers
 .\scripts\install-agents.ps1 -All   # Push config to all agents
 ```
 
@@ -357,7 +371,8 @@ reforger-forge-mcp/
 ├── scripts/
 │   ├── setup.ps1                # Build + configure
 │   ├── install-agents.ps1       # Install into any AI agent
-│   └── list-tools.mjs           # Verify tool registration
+│   ├── list-tools.mjs           # Verify tool registration
+│   └── windows/                 # Named-mutex and exact-process lifecycle helper
 └── dist/                        # Built server (generated)
 ```
 
