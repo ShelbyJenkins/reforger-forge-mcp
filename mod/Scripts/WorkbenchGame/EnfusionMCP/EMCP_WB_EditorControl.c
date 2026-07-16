@@ -1,7 +1,8 @@
 /**
  * EMCP_WB_EditorControl.c - Editor mode control handler
  *
- * Supports actions: play, stop, save, undo, redo, openResource
+ * Supports unattended actions: stop, undo, redo, openResource.
+ * play/save/saveAs are explicitly refused before any editor operation.
  * Called via NET API TCP protocol: APIFunc = "EMCP_WB_EditorControl"
  */
 
@@ -47,6 +48,18 @@ class EMCP_WB_EditorControl : NetApiHandler
 		EMCP_WB_EditorControlRequest req = EMCP_WB_EditorControlRequest.Cast(request);
 		EMCP_WB_EditorControlResponse resp = new EMCP_WB_EditorControlResponse();
 		resp.action = req.action;
+		if (req.action == "play")
+		{
+			resp.status = "error";
+			resp.message = "In-editor Play is disabled for unattended automation because it can compile scripts in a live editor process. Use a standalone diagnostic runtime launcher.";
+			return resp;
+		}
+		if (req.action == "save" || req.action == "saveAs")
+		{
+			resp.status = "error";
+			resp.message = "Unattended save is disabled because Workbench may open a modal dialog. Save manually.";
+			return resp;
+		}
 
 		WorldEditor worldEditor = Workbench.GetModule(WorldEditor);
 		if (!worldEditor)
@@ -56,33 +69,11 @@ class EMCP_WB_EditorControl : NetApiHandler
 			return resp;
 		}
 
-		if (req.action == "play")
-		{
-			worldEditor.SwitchToGameMode(req.debugMode, req.fullScreen);
-			resp.status = "ok";
-			resp.message = "Switched to game mode";
-		}
-		else if (req.action == "stop")
+		if (req.action == "stop")
 		{
 			worldEditor.SwitchToEditMode();
 			resp.status = "ok";
 			resp.message = "Switched to edit mode";
-		}
-		else if (req.action == "save")
-		{
-			bool saved = worldEditor.Save();
-			resp.status = "ok";
-			if (saved)
-				resp.message = "World saved";
-			else
-				resp.message = "Save returned false (may already be up to date)";
-		}
-		else if (req.action == "saveAs")
-		{
-			// WorldEditor does not expose SaveAs directly; fall back to Save
-			bool saved = worldEditor.Save();
-			resp.status = "ok";
-			resp.message = "SaveAs not available, used Save instead";
 		}
 		else if (req.action == "undo")
 		{
@@ -133,7 +124,7 @@ class EMCP_WB_EditorControl : NetApiHandler
 		else
 		{
 			resp.status = "error";
-			resp.message = "Unknown action: " + req.action + ". Valid: play, stop, save, saveAs, undo, redo, openResource";
+			resp.message = "Unknown action: " + req.action + ". Valid unattended actions: stop, undo, redo, openResource";
 		}
 
 		return resp;

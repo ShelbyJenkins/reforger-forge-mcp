@@ -24,8 +24,8 @@
 | Delete | `src/tools/mod-build.ts`, `mod-create.ts`, `mod-validate.ts` |
 | Modify | `src/tools/wb-scenario.ts` (merge two `registerTool` calls into one) |
 | Modify | `src/server.ts` (update all imports and registration calls) |
-| Create | `C:\Users\Steffen\.claude\arma-knowledge\tools-routing.md` |
-| Modify | `C:\Users\Steffen\.claude\arma-knowledge\INDEX.md` |
+| Create | `$ARMA_KNOWLEDGE_ROOT/tools-routing.md` |
+| Modify | `$ARMA_KNOWLEDGE_ROOT/INDEX.md` |
 
 ---
 
@@ -126,7 +126,7 @@ export function registerAnimationGraph(server: McpServer, config: Config): void 
 - [ ] **Step 3: Verify TypeScript compiles**
 
 ```bash
-cd "c:/Users/Steffen/Documents/A_documents/Github/enfusion-mcp-BK"
+# Run from the reforger-forge-mcp repository root.
 npx tsc --noEmit
 ```
 
@@ -570,7 +570,7 @@ git commit -m "refactor: consolidate 9 tools into 4 merged tools (54 → 47)"
 ## Task 7: Create tools-routing.md
 
 **Files:**
-- Create: `C:\Users\Steffen\.claude\arma-knowledge\tools-routing.md`
+- Create: `$ARMA_KNOWLEDGE_ROOT/tools-routing.md`
 
 - [ ] **Step 1: Write the routing file**
 
@@ -671,7 +671,7 @@ All tools are available via the `mcp__enfusion-mcp__*` deferred tool list.
 - [ ] **Step 2: Verify the file saved correctly**
 
 ```bash
-cat "C:/Users/Steffen/.claude/arma-knowledge/tools-routing.md" | head -20
+head -20 "$ARMA_KNOWLEDGE_ROOT/tools-routing.md"
 ```
 
 Expected: first 20 lines of the routing guide.
@@ -681,7 +681,7 @@ Expected: first 20 lines of the routing guide.
 ## Task 8: Update INDEX.md
 
 **Files:**
-- Modify: `C:\Users\Steffen\.claude\arma-knowledge\INDEX.md`
+- Modify: `$ARMA_KNOWLEDGE_ROOT/INDEX.md`
 
 - [ ] **Step 1: Add MCP Tools section to INDEX.md**
 
@@ -712,8 +712,8 @@ Also update the `## How to Use` step 1 to mention the routing file:
 - [ ] **Step 2: Commit**
 
 ```bash
-git -C "C:/Users/Steffen/Documents/A_documents/Github/enfusion-mcp-BK" add docs/superpowers/plans/2026-03-27-tool-discoverability.md docs/superpowers/specs/2026-03-27-tool-discoverability-design.md
-git -C "C:/Users/Steffen/Documents/A_documents/Github/enfusion-mcp-BK" commit -m "docs: add tool discoverability spec and implementation plan"
+git add docs/superpowers/plans/2026-03-27-tool-discoverability.md docs/superpowers/specs/2026-03-27-tool-discoverability-design.md
+git commit -m "docs: add tool discoverability spec and implementation plan"
 ```
 
 The arma-knowledge files are not in the repo, so no git add needed for them.

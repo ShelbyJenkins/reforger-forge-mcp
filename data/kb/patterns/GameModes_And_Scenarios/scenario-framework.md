@@ -2285,7 +2285,7 @@ In **OnTaskFinished** on the final LayerTask:
 
 ## MCP Workbench Placement — Verified GUIDs (from live layer files)
 
-These GUIDs are confirmed from `TESTING CLAUD` sample layer files. Use these with `wb_entity_create`.
+These GUIDs are confirmed from sample layer files. Use these with `wb_entity_create`.
 
 | Prefab | GUID |
 |--------|------|

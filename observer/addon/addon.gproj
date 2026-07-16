@@ -1,0 +1,14 @@
+GameProject {
+ ID ReforgerForgeObserver
+ GUID "7F3A91C2E40B6D58"
+ TITLE "ReforgerForge Observer"
+ Dependencies {
+  "58D0FB3206B6F859"
+ }
+ Configurations {
+  GameProjectConfig PC {
+  }
+  GameProjectConfig HEADLESS {
+  }
+ }
+}

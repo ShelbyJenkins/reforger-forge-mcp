@@ -1,0 +1,19 @@
+{
+  "protocolVersion": "1.0",
+  "addonVersion": "0.1.0",
+  "bundleDigest": "1111111111111111111111111111111111111111111111111111111111111111",
+  "buildIdentity": "000cec19226673ce911c68dca027dca7449ff58a604fe0cef6509afbc4d7ec22",
+  "agentInstanceId": "agent-example-01",
+  "sessionId": "session-example-01",
+  "launchNonce": "launch_nonce_example_12345678901234567890",
+  "instanceId": "instance-headless-01",
+  "instanceNonce": "headless_nonce_example_123456789012345678",
+  "processId": 4321,
+  "runtimeKind": "dedicated",
+  "capabilities": ["authority.server", "world.query", "transport.mailbox"],
+  "selectedTransport": "mailbox",
+  "headless": true,
+  "worldId": "world-example-01",
+  "worldEpoch": 1,
+  "registeredAt": "2026-07-16T20:00:02.000Z"
+}

@@ -28,11 +28,21 @@ param(
 $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $PSScriptRoot
 $ServerEntry = Join-Path $Root "dist\index.js"
+$LifecycleHelper = Join-Path $Root "scripts\windows\workbench-lifecycle.ps1"
 
 if (-not (Test-Path $ServerEntry)) {
     Write-Host "ERROR: Server not built. Run: npm run build" -ForegroundColor Red
     exit 1
 }
+if (-not (Test-Path $LifecycleHelper -PathType Leaf)) {
+    Write-Host "ERROR: Bundled Windows lifecycle helper is missing: $LifecycleHelper" -ForegroundColor Red
+    exit 1
+}
+
+Write-Host "Verifying registered tools..." -ForegroundColor Yellow
+node (Join-Path $Root "scripts\list-tools.mjs")
+if ($LASTEXITCODE -ne 0) { exit 1 }
+Write-Host ""
 
 $configPath = Join-Path $Root "reforger-forge.config.json"
 if (-not (Test-Path $configPath)) {
@@ -190,7 +200,7 @@ if ($All -or $Agent -eq "all") {
 }
 
 Write-Host ""
-Write-Host "Done! Restart your agent and verify 'reforger-forge' shows 50 tools." -ForegroundColor Green
+Write-Host "Done! Restart your agent and verify 'reforger-forge' is available." -ForegroundColor Green
 Write-Host ""
 Write-Host "Agent config locations:" -ForegroundColor Cyan
 Write-Host "  Cursor:       $env:USERPROFILE\.cursor\mcp.json"

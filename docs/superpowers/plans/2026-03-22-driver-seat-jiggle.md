@@ -14,18 +14,18 @@
 
 | File | Change |
 |---|---|
-| `C:/Users/Steffen/Documents/My Games/ArmaReforgerWorkbench/addons/TESTING CLAUD/Testanims2/Testanims2M151A2.agf` | Add one `AnimSrcNodeProcTrBoneItem` inside the existing `Jiggles` node's `Bones {}` block |
+| `<example-addon>/Animations/ExampleM151A2.agf` | Add one `AnimSrcNodeProcTrBoneItem` inside the existing `Jiggles` node's `Bones {}` block |
 
 ---
 
 ### Task 1: Add the seat jiggle bone item
 
 **Files:**
-- Modify: `Testanims2M151A2.agf` — Body sheet, `Jiggles` node, `Bones {}` block
+- Modify: `ExampleM151A2.agf` — Body sheet, `Jiggles` node, `Bones {}` block
 
 - [ ] **Step 1: Locate the insertion point**
 
-Open `Testanims2M151A2.agf`. Find the `Jiggles` node in the Body sheet (search for `AnimSrcNodeProcTransform Jiggles`). It currently ends with:
+Open `ExampleM151A2.agf`. Find the `Jiggles` node in the Body sheet (search for `AnimSrcNodeProcTransform Jiggles`). It currently ends with:
 
 ```
       AnimSrcNodeProcTrBoneItem "{68EC9D5F562D4C9E}" {
@@ -78,13 +78,13 @@ The indentation uses single spaces (1 space per level). Confirm:
 
 - [ ] **Step 4: Open in Workbench to let it assign a real GUID**
 
-Open the Workbench Animation Editor with the `Testanims2M151A2.agf` file. Workbench will detect `{A1B2C3D4E5F60001}` as a placeholder and replace it with a real GUID on save. Save the file from within Workbench.
+Open the Workbench Animation Editor with the `ExampleM151A2.agf` file. Workbench will detect `{A1B2C3D4E5F60001}` as a placeholder and replace it with a real GUID on save. Save the file from within Workbench.
 
 If Workbench refuses to open due to a parse error, the indentation or brace structure is wrong — re-check Step 2.
 
 - [ ] **Step 5: Test in-game**
 
-Launch the game with the TESTING CLAUD mod. Spawn the M151A2 using the custom prefab. Drive over rough terrain (dirt roads, off-road).
+Launch the game with the example mod. Spawn the M151A2 using the custom prefab. Drive over rough terrain (dirt roads, off-road).
 
 Expected: driver character visibly bounces up and down, amplitude grows on rough terrain, nearly still on flat paved road.
 
@@ -103,8 +103,8 @@ To adjust frequency, change `15`:
 - [ ] **Step 7: Commit**
 
 ```bash
-git add "C:/Users/Steffen/Documents/My Games/ArmaReforgerWorkbench/addons/TESTING CLAUD/Testanims2/Testanims2M151A2.agf"
+git add "Animations/ExampleM151A2.agf"
 git commit -m "feat(animation): add suspension-driven driver seat jiggle to M151A2"
 ```
 
-(Commit from the `enfusion-mcp-BK` repo if the game files are tracked there, otherwise commit from the mod directory if it has its own git repo.)
+(Commit from the `reforger-forge-mcp` repo if the game files are tracked there, otherwise commit from the mod directory if it has its own git repo.)

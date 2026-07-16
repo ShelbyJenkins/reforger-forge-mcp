@@ -5,7 +5,7 @@ import { requireEditMode, formatConnectionStatus } from "../workbench/status.js"
 
 const SF = "Prefabs/Systems/ScenarioFramework/Components";
 
-// GUIDs verified from live Workbench layer files (TESTING CLAUD sample worlds)
+// GUIDs verified from live Workbench sample layer files
 const PREFABS: Record<string, Record<string, string>> = {
   kill: {
     layerTask: `{2008B4EE6C4D528E}${SF}/LayerTaskKill.et`,

@@ -20,7 +20,7 @@ async function fetchPage(url: string): Promise<string> {
   const response = await fetch(url, {
     headers: {
       "User-Agent":
-        "reforger-forge-scraper/1.0.0 (https://github.com/goatboynz/reforger-forge-mcp)",
+        "reforger-forge-scraper/1.1.0 (https://github.com/wastelandgoats/reforger-forge-mcp)",
     },
   });
 

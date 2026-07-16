@@ -1,41 +1,141 @@
 /**
- * TCP client for the Workbench NET API.
+ * TCP client and target-aware Workbench lifecycle coordinator.
  *
- * Each rawCall() opens a fresh TCP connection, sends one request, reads the
- * response, and closes the socket (protocol requirement).
- *
- * call() wraps rawCall() with auto-launch: if Workbench isn't running,
- * it installs handler scripts, launches the exe, waits for the NET API,
- * and retries the original call.
+ * Every NET API call uses a fresh socket. Every process/filesystem mutation is
+ * serialized in-process and then performed while the machine-wide lifecycle
+ * mutex is held by WorkbenchProcessGuard.
  */
 
-import { Socket } from "node:net";
-import { existsSync, mkdirSync, copyFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
-import { join, resolve, dirname } from "node:path";
+import { randomUUID } from "node:crypto";
+import { spawn, type ChildProcess, type SpawnOptions } from "node:child_process";
+import {
+  existsSync,
+  readdirSync,
+  realpathSync,
+  statSync,
+} from "node:fs";
+import { dirname, extname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { spawn, execSync } from "node:child_process";
-import { encodeRequest, decodeResponse } from "./protocol.js";
-import { logger } from "../utils/logger.js";
+import { Socket } from "node:net";
 import type { Config } from "../config.js";
-import { generateGproj } from "../templates/gproj.js";
+import { logger } from "../utils/logger.js";
+import {
+  WorkbenchActivityError,
+  WorkbenchActivityGate,
+  type CaptureActivityBinding,
+  type CaptureActivityLease,
+  type WorkbenchActivityGateTiming,
+} from "./activity-gate.js";
+import { decodeResponse, encodeRequest } from "./protocol.js";
+import {
+  HandlerBundleError,
+  HandlerBundleManager,
+  HANDLER_FOLDER,
+  type HandlerCleanupResult,
+  type HandlerTransactionRecord,
+  type PreparedHandlerTransaction,
+} from "./handler-bundle.js";
+import {
+  ProjectIdentityError,
+  canonicalizeGproj,
+  resolveProjectIdentity,
+  revalidateProjectIdentity,
+  type CanonicalProjectIdentity,
+} from "./project-identity.js";
+import {
+  WorkbenchProcessGuard,
+  LifecycleGuardError,
+  type ExpectedStateVersion,
+  type HandlerLifecycleState,
+  type LifecycleClaimResult,
+  type LifecycleOperationKind,
+  type LifecycleStateDraft,
+  type WorkbenchIdentity,
+  type WorkbenchLifecycleSession,
+  type WorkbenchLifecycleStateV2,
+} from "./process-guard.js";
 
 const DEFAULT_CLIENT_ID = "EnfusionMCP";
 const DEFAULT_TIMEOUT_MS = 10_000;
-/** Maximum response size (10 MB) to prevent memory exhaustion from malformed/unexpected data. */
 const MAX_RESPONSE_SIZE = 10 * 1024 * 1024;
 const WORKBENCH_EXE = "ArmaReforgerWorkbenchSteamDiag.exe";
 const WORKBENCH_SUBDIR = "Workbench";
-const HANDLER_FOLDER = "EnfusionMCP";
 const LAUNCH_POLL_INTERVAL_MS = 3_000;
 const LAUNCH_TIMEOUT_MS = 90_000;
-/** Delay after killing Workbench before relaunching, to let the port release. */
-const KILL_SETTLE_MS = 3_000;
-/** How long to wait for Workbench to recompile handler scripts after installation. */
-const HANDLER_RECOMPILE_TIMEOUT_MS = 30_000;
-/** Interval between polls while waiting for handler script recompilation. */
-const HANDLER_RECOMPILE_POLL_MS = 2_000;
+const OWNED_PROCESS_EXIT_TIMEOUT_MS = 15_000;
+const PORT_RELEASE_TIMEOUT_MS = 15_000;
+const PORT_RELEASE_POLL_MS = 200;
 
 export type WorkbenchMode = "edit" | "play" | "unknown";
+
+export interface WorkbenchState {
+  connected: boolean;
+  mode: WorkbenchMode;
+  lastUpdated: number;
+}
+
+export interface WorkbenchCallOptions {
+  timeout?: number;
+  skipAutoLaunch?: boolean;
+}
+
+export interface WorkbenchLaunchResult {
+  action: "launched" | "reused";
+  pid: number;
+  gprojPath: string;
+  generation: string;
+}
+
+export interface WorkbenchRestartResult {
+  previousPid: number;
+  pid: number;
+  gprojPath: string;
+  generation: string;
+}
+
+export interface WorkbenchShutdownResult {
+  stopped: boolean;
+  previousPid: number | null;
+  gprojPath: string | null;
+  generation: string;
+}
+
+/**
+ * Immutable, already-running Workbench identity handed to observer adapters.
+ * The private owner-token argument remains inside the lifecycle subsystem.
+ */
+export interface WorkbenchObserverSnapshot {
+  readonly generation: string;
+  readonly target: {
+    readonly path: string;
+    readonly comparisonKey: string;
+  };
+  readonly endpoint: {
+    readonly host: string;
+    readonly port: number;
+  };
+  readonly process: {
+    readonly pid: number;
+    readonly executablePath: string;
+    readonly creationTime: string;
+    readonly launchedAtMs: number;
+  };
+}
+
+export type WorkbenchCaptureActivityLease = CaptureActivityLease;
+
+export interface LifecycleDiagnostic {
+  state: "missing" | "valid" | "legacy" | "malformed";
+  version: number | null;
+  generation: string | null;
+  phase: string | null;
+  endpoint: string | null;
+  target: string | null;
+  lease: "current_mcp" | "other_mcp" | "vacant" | "unknown";
+  operation: string | null;
+  handlerTransaction: string | null;
+  detail?: string;
+}
 
 export interface DiagnosticReport {
   host: string;
@@ -46,44 +146,201 @@ export interface DiagnosticReport {
   bundledScripts: { path: string; exists: boolean };
   standaloneAddon: { path: string; exists: boolean; fileCount: number };
   installedMods: Array<{ modDir: string; handlerDir: string; fileCount: number }>;
-  /** Result of the NET API probe. */
   netApi: "up_with_handlers" | "up_no_handlers" | "refused" | "timeout" | "error";
   netApiError?: string;
+  lifecycle: LifecycleDiagnostic;
 }
 
-export interface WorkbenchState {
-  connected: boolean;
-  mode: WorkbenchMode;
-  lastUpdated: number;
-}
-
-export interface WorkbenchCallOptions {
-  /** Timeout in milliseconds (default 10 000). */
-  timeout?: number;
-  /** Skip auto-launch on connection failure (used internally by ping). */
-  skipAutoLaunch?: boolean;
-}
+export type WorkbenchErrorCode =
+  | "CONNECTION_REFUSED"
+  | "TIMEOUT"
+  | "PROTOCOL_ERROR"
+  | "API_ERROR"
+  | "LAUNCH_FAILED"
+  | "TARGET_REQUIRED"
+  | "AMBIGUOUS_TARGET"
+  | "INVALID_TARGET"
+  | "TARGET_CHANGED"
+  | "TARGET_CONFLICT"
+  | "OWNED_BY_OTHER_MCP"
+  | "UNOWNED_WORKBENCH"
+  | "ENDPOINT_CONFLICT"
+  | "USER_CONFLICT"
+  | "LEGACY_OWNER"
+  | "IDENTITY_UNVERIFIABLE"
+  | "STATE_INVALID"
+  | "CLEANUP_BLOCKED_LIVE"
+  | "HANDLER_CONFLICT"
+  | "RECOVERY_REQUIRED"
+  | "UNSUPPORTED_PLATFORM"
+  | "LIFECYCLE_BUSY"
+  | "ACTIVE_CAPTURE"
+  | "CAPTURE_INVALIDATED";
 
 export class WorkbenchError extends Error {
   constructor(
     message: string,
-    public readonly code:
-      | "CONNECTION_REFUSED"
-      | "TIMEOUT"
-      | "PROTOCOL_ERROR"
-      | "API_ERROR"
-      | "LAUNCH_FAILED" = "API_ERROR"
+    public readonly code: WorkbenchErrorCode = "API_ERROR"
   ) {
     super(message);
     this.name = "WorkbenchError";
   }
 }
 
-export class WorkbenchClient {
-  private launchPromise: Promise<void> | null = null;
-  private _state: WorkbenchState = { connected: false, mode: "unknown", lastUpdated: 0 };
+export function buildWorkbenchLaunchArgs(
+  gprojPath?: string | null,
+  configuredAddonDirs?: readonly string[],
+  scriptAuthorizeAll = false,
+  noThrow = false,
+  ownerArgument?: string
+): string[] {
+  const args: string[] = [];
+  const addonDirs: string[] = [];
+  const seen = new Set<string>();
+  const invalid: string[] = [];
 
-  /** Current cached connection state. Updated after every successful call. */
+  if (configuredAddonDirs !== undefined && !Array.isArray(configuredAddonDirs)) {
+    throw new WorkbenchError(
+      "Workbench addon directories must be configured as an array of paths.",
+      "LAUNCH_FAILED"
+    );
+  }
+  for (const configuredDir of configuredAddonDirs ?? []) {
+    if (typeof configuredDir !== "string" || configuredDir.trim().length === 0) {
+      throw new WorkbenchError(
+        "Workbench addon directories must be non-empty paths.",
+        "LAUNCH_FAILED"
+      );
+    }
+    const configuredPath = configuredDir.trim();
+    if (configuredPath.includes(",")) {
+      throw new WorkbenchError(
+        `Workbench addon directory cannot contain a comma: ${configuredPath}`,
+        "LAUNCH_FAILED"
+      );
+    }
+    const addonDir = resolve(configuredPath);
+    const key = process.platform === "win32" ? addonDir.toLowerCase() : addonDir;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    try {
+      if (!statSync(addonDir).isDirectory()) invalid.push(addonDir);
+      else addonDirs.push(addonDir);
+    } catch {
+      invalid.push(addonDir);
+    }
+  }
+  if (invalid.length > 0) {
+    const description = invalid.length === 1
+      ? "Configured Workbench addon path is not a directory"
+      : "Configured Workbench addon paths are not directories";
+    throw new WorkbenchError(
+      `${description}:\n` +
+        invalid.map((path) => `  - ${path}`).join("\n"),
+      "LAUNCH_FAILED"
+    );
+  }
+  if (addonDirs.length > 0) args.push("-addonsDir", addonDirs.join(","));
+  if (gprojPath) args.push("-gproj", gprojPath);
+  if (scriptAuthorizeAll) args.push("-scriptAuthorizeAll");
+  if (noThrow) args.push("-noThrow");
+  if (ownerArgument) args.push(ownerArgument);
+  return args;
+}
+
+interface LaunchPreflight {
+  project: CanonicalProjectIdentity;
+  executablePath: string;
+  cwd: string;
+  args: string[];
+}
+
+interface OwnedChildObservation {
+  child: ChildProcess;
+  identity: WorkbenchIdentity;
+  generation: string;
+  targetKey: string;
+}
+
+interface ActiveLifecycleOperation {
+  kind: LifecycleOperationKind;
+  operationId: string;
+  targetKey: string | null;
+  promise: Promise<unknown>;
+}
+
+type StoredLifecycleTarget = NonNullable<WorkbenchLifecycleStateV2["target"]>;
+
+export interface WorkbenchClientDependencies {
+  handlerBundle?: HandlerBundleManager;
+  spawnProcess?: (command: string, args: string[], options: SpawnOptions) => ChildProcess;
+  launchTimeoutMs?: number;
+  launchPollIntervalMs?: number;
+  activityGate?: WorkbenchActivityGate;
+  captureRestoreTimeoutMs?: number;
+  activityGateTiming?: WorkbenchActivityGateTiming;
+}
+
+function pathKey(path: string): string {
+  const absolute = resolve(path);
+  return process.platform === "win32" ? absolute.toLowerCase() : absolute;
+}
+
+function observerBinding(snapshot: WorkbenchObserverSnapshot): CaptureActivityBinding {
+  return {
+    generation: snapshot.generation,
+    targetKey: snapshot.target.comparisonKey,
+    process: {
+      pid: snapshot.process.pid,
+      executablePath: snapshot.process.executablePath,
+      creationTime: snapshot.process.creationTime,
+    },
+  };
+}
+
+function stateExpected(state: WorkbenchLifecycleStateV2): ExpectedStateVersion {
+  return { generation: state.generation, leaseId: state.mcpOwner?.leaseId ?? null };
+}
+
+function stateDraft(
+  state: WorkbenchLifecycleStateV2,
+  overrides: Partial<LifecycleStateDraft>
+): LifecycleStateDraft {
+  return {
+    phase: overrides.phase ?? state.phase,
+    endpoint: overrides.endpoint ?? state.endpoint,
+    target: overrides.target === undefined ? state.target : overrides.target,
+    mcpOwner: overrides.mcpOwner === undefined ? state.mcpOwner : overrides.mcpOwner,
+    workbench: overrides.workbench === undefined ? state.workbench : overrides.workbench,
+    handler: overrides.handler === undefined ? state.handler : overrides.handler,
+    operation: overrides.operation === undefined ? state.operation : overrides.operation,
+  };
+}
+
+function handlerState(
+  transaction: HandlerTransactionRecord,
+  phase: HandlerLifecycleState["phase"],
+  keepTransaction = true
+): HandlerLifecycleState {
+  return {
+    modDirectory: transaction.modDirectory,
+    manifestGeneration: transaction.manifest.generation,
+    transactionId: keepTransaction ? transaction.id : null,
+    phase,
+    backupPath: keepTransaction ? transaction.backupPath : null,
+  };
+}
+
+export class WorkbenchClient {
+  private activeLifecycle: ActiveLifecycleOperation | null = null;
+  private ownedChild: OwnedChildObservation | null = null;
+  private _state: WorkbenchState = { connected: false, mode: "unknown", lastUpdated: 0 };
+  private readonly handlerBundle: HandlerBundleManager;
+  private readonly spawnProcess: WorkbenchClientDependencies["spawnProcess"];
+  private readonly launchTimeoutMs: number;
+  private readonly launchPollIntervalMs: number;
+  private readonly activityGate: WorkbenchActivityGate;
+
   get state(): Readonly<WorkbenchState> {
     return this._state;
   }
@@ -92,106 +349,61 @@ export class WorkbenchClient {
     private readonly host: string,
     private readonly port: number,
     private readonly config?: Config,
-    private readonly clientId: string = DEFAULT_CLIENT_ID
-  ) {}
+    private readonly clientId: string = DEFAULT_CLIENT_ID,
+    private readonly processGuard: WorkbenchProcessGuard = new WorkbenchProcessGuard(),
+    dependencies: WorkbenchClientDependencies = {}
+  ) {
+    this.handlerBundle = dependencies.handlerBundle ?? new HandlerBundleManager({
+      stateDir: this.processGuard.stateDir,
+    });
+    this.spawnProcess = dependencies.spawnProcess ?? ((command, args, options) =>
+      spawn(command, args, options));
+    this.launchTimeoutMs = dependencies.launchTimeoutMs ?? LAUNCH_TIMEOUT_MS;
+    this.launchPollIntervalMs = dependencies.launchPollIntervalMs ?? LAUNCH_POLL_INTERVAL_MS;
+    this.activityGate = dependencies.activityGate ?? new WorkbenchActivityGate({
+      restoreTimeoutMs: dependencies.captureRestoreTimeoutMs,
+      timing: dependencies.activityGateTiming,
+    });
+  }
 
-  /**
-   * Call a Workbench NET API function.
-   * Auto-launches Workbench if not running.
-   */
   async call<T = Record<string, unknown>>(
     apiFunc: string,
     params: Record<string, unknown> = {},
     options: WorkbenchCallOptions = {}
   ): Promise<T> {
     try {
-      const result = await this.rawCall<T>(apiFunc, params, options);
-      this._state.connected = true;
-      this._state.lastUpdated = Date.now();
-      this.extractMode(result);
-      return result;
-    } catch (err) {
-      if (err instanceof WorkbenchError) {
-        if (err.code === "CONNECTION_REFUSED" || err.code === "TIMEOUT" || err.code === "PROTOCOL_ERROR") {
-          this._state = { connected: false, mode: "unknown", lastUpdated: Date.now() };
+      return await this.callAndCache<T>(apiFunc, params, options);
+    } catch (error) {
+      if (error instanceof WorkbenchError) {
+        if (["CONNECTION_REFUSED", "TIMEOUT", "PROTOCOL_ERROR"].includes(error.code)) {
+          this.resetConnectionState();
         }
-        if (!options.skipAutoLaunch && this.config) {
-          if (err.code === "CONNECTION_REFUSED") {
-            // Workbench not running — install handlers, launch, retry
-            logger.info(`Workbench not running, auto-launching...`);
-            await this.ensureRunning();
-            const result = await this.rawCall<T>(apiFunc, params, options);
-            this._state.connected = true;
-            this._state.lastUpdated = Date.now();
-            this.extractMode(result);
-            return result;
-          }
-          if (err.code === "API_ERROR" && err.message.includes("Undefined API func")) {
-            // Workbench is running but our custom handler scripts aren't compiled.
-            // This happens when the user opened Workbench manually, or when handlers
-            // were cleaned up but Workbench kept running.
-            logger.info(`Handler scripts not loaded in Workbench, recovering...`);
-            await this.recoverMissingHandlers();
-            const result = await this.rawCall<T>(apiFunc, params, options);
-            this._state.connected = true;
-            this._state.lastUpdated = Date.now();
-            this.extractMode(result);
-            return result;
-          }
+        if (!options.skipAutoLaunch && this.config && error.code === "CONNECTION_REFUSED") {
+          logger.info("Workbench is unavailable; requesting target-aware auto-launch.");
+          await this.ensureRunning();
+          return this.callAndCache<T>(apiFunc, params, options);
+        }
+        if (!options.skipAutoLaunch && this.config && error.code === "API_ERROR" &&
+            (error.message.includes("Undefined API func") ||
+              error.message.includes("not existing Net API function"))) {
+          logger.info("Owned Workbench handlers are unavailable; requesting a clean lifecycle restart.");
+          await this.restartOwnedWorkbench();
+          return this.callAndCache<T>(apiFunc, params, options);
         }
       }
-      throw err;
+      throw error;
     }
   }
 
-  /**
-   * Explicitly refresh cached state by calling EMCP_WB_GetState.
-   */
   async refreshState(): Promise<WorkbenchState> {
     try {
       await this.call<Record<string, unknown>>("EMCP_WB_GetState");
-      return { ...this._state };
     } catch {
-      this._state = { connected: false, mode: "unknown", lastUpdated: Date.now() };
-      return { ...this._state };
+      this.resetConnectionState();
     }
+    return { ...this._state };
   }
 
-  /**
-   * Ensure Workbench is running. Installs handler scripts, launches exe,
-   * and waits for NET API. Safe to call concurrently — deduplicates launches.
-   * @param gprojPath Optional .gproj file path to open directly (skips launcher).
-   */
-  async ensureRunning(gprojPath?: string): Promise<void> {
-    if (!this.config) {
-      throw new WorkbenchError("No config provided — cannot auto-launch Workbench.", "LAUNCH_FAILED");
-    }
-
-    // Deduplicate concurrent calls — all callers await the same promise
-    if (this.launchPromise) {
-      return this.launchPromise;
-    }
-
-    const promise = this.launchWorkbench(gprojPath).finally(() => {
-      // Only clear if this is still the active promise (guards against re-entrant calls)
-      if (this.launchPromise === promise) {
-        this.launchPromise = null;
-      }
-    });
-
-    this.launchPromise = promise;
-    return promise;
-  }
-
-  /**
-   * Quick health check. Returns true if Workbench responds, false otherwise.
-   * Does NOT auto-launch.
-   *
-   * Uses our custom EMCP_WB_Ping handler (not the built-in GetLoadedProjects)
-   * so the launch poller only succeeds once the mod's handler scripts have
-   * finished compiling — avoiding a race where the NET API socket is up but
-   * custom handlers aren't loaded yet.
-   */
   async ping(): Promise<boolean> {
     try {
       await this.rawCall("EMCP_WB_Ping", {}, { timeout: 3000, skipAutoLaunch: true });
@@ -202,643 +414,1583 @@ export class WorkbenchClient {
   }
 
   /**
-   * Remove injected handler scripts from a mod's directory.
-   * Call this after Workbench work is done, before publishing the mod.
-   * Deletes Scripts/WorkbenchGame/EnfusionMCP/ from the mod.
-   * Safe to call even if scripts were never injected.
+   * Verify and snapshot an already-running exact Workbench owned by this MCP.
+   * This path never launches, adopts, restarts, or mutates lifecycle state.
    */
-  cleanupHandlerScripts(modDir: string): boolean {
-    const handlerDir = resolve(modDir, "Scripts", "WorkbenchGame", HANDLER_FOLDER);
-    logger.info(`Checking for handler scripts at: ${handlerDir}`);
-    if (!existsSync(handlerDir)) {
-      logger.info(`Handler scripts not found at ${handlerDir}`);
-      return false;
-    }
+  async getRunningObserverSnapshot(): Promise<WorkbenchObserverSnapshot> {
     try {
-      rmSync(handlerDir, { recursive: true, force: true });
-      logger.info(`Removed handler scripts from ${handlerDir}`);
-      // Clean up empty parent dirs
-      const wbGameDir = join(modDir, "Scripts", "WorkbenchGame");
-      if (existsSync(wbGameDir) && readdirSync(wbGameDir).length === 0) {
-        rmSync(wbGameDir);
-      }
-      return true;
-    } catch (e) {
-      logger.warn(`Failed to clean up handler scripts: ${e}`);
-      return false;
+      return await this.processGuard.withLifecycleLock(async (session) => {
+        const read = await session.readState();
+        if (read.kind !== "valid") {
+          throw new WorkbenchError(
+            "Observer capture requires a valid version-2 Workbench lifecycle record.",
+            "STATE_INVALID"
+          );
+        }
+        const state = read.state;
+        if (state.phase !== "running" || state.operation !== null) {
+          throw new WorkbenchError(
+            `Observer capture requires an idle running Workbench; lifecycle phase is ${state.phase}.`,
+            "LIFECYCLE_BUSY"
+          );
+        }
+
+        const owner = state.mcpOwner;
+        const current = session.mcp;
+        if (!owner || owner.instanceId !== current.instanceId || owner.leaseId !== current.leaseId ||
+            owner.pid !== current.pid || owner.creationTime !== current.creationTime ||
+            pathKey(owner.executablePath) !== pathKey(current.executablePath) ||
+            owner.userSid !== current.userSid) {
+          throw new WorkbenchError(
+            "Observer capture requires the exact Workbench lifecycle lease owned by this MCP instance.",
+            owner ? "OWNED_BY_OTHER_MCP" : "UNOWNED_WORKBENCH"
+          );
+        }
+        if (!state.target) {
+          throw new WorkbenchError(
+            "Observer capture requires a recorded canonical Workbench project target.",
+            "TARGET_REQUIRED"
+          );
+        }
+        if (!state.workbench) {
+          throw new WorkbenchError(
+            "Observer capture requires an already-running exact owned Workbench process.",
+            "UNOWNED_WORKBENCH"
+          );
+        }
+
+        const configuredHost = this.host.trim().toLowerCase().replace(/^\[|\]$/g, "");
+        if (state.endpoint.host !== configuredHost || state.endpoint.port !== this.port) {
+          throw new WorkbenchError(
+            `Recorded Workbench endpoint ${state.endpoint.host}:${state.endpoint.port} does not ` +
+              `match this client endpoint ${configuredHost}:${this.port}.`,
+            "ENDPOINT_CONFLICT"
+          );
+        }
+
+        const canonicalTarget = canonicalizeGproj(state.target.path);
+        if (canonicalTarget.comparisonKey !== state.target.comparisonKey) {
+          throw new WorkbenchError(
+            `Recorded Workbench target ${state.target.path} changed canonical identity.`,
+            "TARGET_CHANGED"
+          );
+        }
+        if (await this.inspectRecordedWorkbench(state) !== "live") {
+          throw new WorkbenchError(
+            "Recorded exact owned Workbench exited before observer snapshot acquisition.",
+            "IDENTITY_UNVERIFIABLE"
+          );
+        }
+        await this.assertEndpointOwnedByRecordedWorkbench(
+          session,
+          state.workbench,
+          "observer snapshot"
+        );
+
+        return Object.freeze({
+          generation: state.generation,
+          target: Object.freeze({
+            path: canonicalTarget.displayPath,
+            comparisonKey: canonicalTarget.comparisonKey,
+          }),
+          endpoint: Object.freeze({ ...state.endpoint }),
+          process: Object.freeze({
+            pid: state.workbench.pid,
+            executablePath: state.workbench.executablePath,
+            creationTime: state.workbench.creationTime,
+            launchedAtMs: state.workbench.launchedAtMs,
+          }),
+        });
+      });
+    } catch (error) {
+      throw this.mapLifecycleError(error);
     }
   }
 
-  /**
-   * Collect a diagnostic snapshot: config, file system, and NET API state.
-   * Does NOT auto-launch Workbench or throw — always returns a report.
-   */
+  acquireCaptureActivity(snapshot: WorkbenchObserverSnapshot): WorkbenchCaptureActivityLease {
+    try {
+      return this.activityGate.acquireCapture(observerBinding(snapshot));
+    } catch (error) {
+      throw this.mapLifecycleError(error);
+    }
+  }
+
+  async revalidateCaptureActivity(
+    lease: WorkbenchCaptureActivityLease
+  ): Promise<WorkbenchObserverSnapshot> {
+    try {
+      // Fail without acquiring the machine mutex if exit handling already
+      // invalidated this lease.
+      this.activityGate.revalidateCapture(lease, lease.binding);
+      const current = await this.getRunningObserverSnapshot();
+      this.activityGate.revalidateCapture(lease, observerBinding(current));
+      return current;
+    } catch (error) {
+      try {
+        this.activityGate.invalidateCapture(
+          lease,
+          `Workbench capture ${lease.id} failed lifecycle identity revalidation.`
+        );
+      } catch {
+        // Preserve the authoritative validation error.
+      }
+      throw this.mapLifecycleError(error);
+    }
+  }
+
+  releaseCaptureActivity(lease: WorkbenchCaptureActivityLease): void {
+    try {
+      this.activityGate.releaseCapture(lease);
+    } catch (error) {
+      throw this.mapLifecycleError(error);
+    }
+  }
+
+  async ensureRunning(gprojPath?: string): Promise<WorkbenchLaunchResult> {
+    this.requireConfig("auto-launch");
+    const project = await this.resolveLifecycleProject(gprojPath);
+    try {
+      return await this.activityGate.runLifecycle("launch", () =>
+        this.coordinateLifecycle("launch", project.comparisonKey, async (operationId) =>
+          this.processGuard.withLifecycleLock(async (session) =>
+            this.ensureRunningLocked(session, revalidateProjectIdentity(project), operationId)
+          )
+        )
+      );
+    } catch (error) {
+      throw this.mapLifecycleError(error);
+    }
+  }
+
+  async restartOwnedWorkbench(): Promise<WorkbenchRestartResult> {
+    this.requireConfig("restart");
+    const project = await this.resolveLifecycleProject();
+    try {
+      return await this.activityGate.runLifecycle("restart", () =>
+        this.coordinateLifecycle("restart", project.comparisonKey, async (operationId) =>
+          this.processGuard.withLifecycleLock(async (session) =>
+            this.restartLocked(session, revalidateProjectIdentity(project), operationId)
+          )
+        )
+      );
+    } catch (error) {
+      throw this.mapLifecycleError(error);
+    }
+  }
+
+  async shutdownOwnedWorkbench(): Promise<WorkbenchShutdownResult> {
+    this.requireConfig("shutdown");
+    try {
+      const read = await this.processGuard.readLifecycleState();
+      const targetKey = read.kind === "valid" ? read.state.target?.comparisonKey ?? null : null;
+      return await this.activityGate.runLifecycle("shutdown", () =>
+        this.coordinateLifecycle("shutdown", targetKey, async (operationId) =>
+          this.processGuard.withLifecycleLock(async (session) =>
+            this.shutdownLocked(session, operationId)
+          )
+        )
+      );
+    } catch (error) {
+      throw this.mapLifecycleError(error);
+    }
+  }
+
+  async cleanupHandlerScripts(modDir: string): Promise<HandlerCleanupResult> {
+    const project = this.projectFromModDirectory(modDir);
+    try {
+      return await this.activityGate.runLifecycle("cleanup", () =>
+        this.coordinateLifecycle("cleanup", project.comparisonKey, async (operationId) =>
+          this.processGuard.withLifecycleLock(async (session) => {
+            const lockedProject = revalidateProjectIdentity(project);
+            let state = await this.claimState(session, lockedProject);
+            const processStatus = await this.inspectRecordedWorkbench(state);
+            if (processStatus === "live") {
+              throw new WorkbenchError(
+                `Cleanup is blocked while Workbench PID ${state.workbench!.pid} may be watching ` +
+                  `${project.displayPath}. Call wb_shutdown first.`,
+                "CLEANUP_BLOCKED_LIVE"
+              );
+            }
+            if (processStatus === "absent") {
+              state = await this.reconcileAbsentState(
+                session,
+                state,
+                this.lifecycleTarget(lockedProject)
+              );
+            }
+            await this.assertNoWorkbenchProcesses(session, "cleanup");
+            state = await session.transition(stateExpected(state), stateDraft(state, {
+              phase: "cleaning",
+              target: this.lifecycleTarget(lockedProject),
+              operation: { kind: "cleanup", operationId },
+              handler: state.handler ? { ...state.handler, phase: "cleaning" } : null,
+            }));
+            try {
+              const result = this.handlerBundle.cleanup(lockedProject);
+              const manifest = this.handlerBundle.readManifest(lockedProject.modDirectory);
+              const nextHandler = manifest ? {
+                modDirectory: lockedProject.modDirectory,
+                manifestGeneration: manifest.generation,
+                transactionId: null,
+                phase: "installed" as const,
+                backupPath: null,
+              } : null;
+              await session.transitionToVacant(stateExpected(state), {
+                target: this.lifecycleTarget(lockedProject),
+                handler: nextHandler,
+              });
+              return result;
+            } catch (error) {
+              await session.transition(stateExpected(state), stateDraft(state, {
+                phase: "vacant",
+                operation: null,
+                handler: state.handler ? { ...state.handler, phase: "installed" } : null,
+              })).catch(() => undefined);
+              throw this.mapLifecycleError(error);
+            }
+          })
+        )
+      );
+    } catch (error) {
+      throw this.mapLifecycleError(error);
+    }
+  }
+
   async diagnose(): Promise<DiagnosticReport> {
-    // --- Config info ---
-    const host = this.host;
-    const port = this.port;
-    const defaultMod = this.config?.defaultMod ?? null;
-
-    // Workbench exe
-    let workbenchExe: DiagnosticReport["workbenchExe"] = null;
-    if (this.config) {
-      const exePath = this.findWorkbenchExe();
-      const candidate =
-        exePath ??
-        join(this.config.workbenchPath, WORKBENCH_SUBDIR, WORKBENCH_EXE);
-      workbenchExe = { path: candidate, exists: existsSync(candidate) };
-    }
-
-    // Project path
-    let projectPathInfo: DiagnosticReport["projectPath"] = null;
-    if (this.config?.projectPath) {
-      projectPathInfo = {
-        path: this.config.projectPath,
-        exists: existsSync(this.config.projectPath),
-      };
-    }
-
-    // Bundled handler scripts (inside this package)
-    const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
-    const bundledDir = join(packageRoot, "mod", "Scripts", "WorkbenchGame", HANDLER_FOLDER);
-    const bundledScripts = { path: bundledDir, exists: existsSync(bundledDir) };
-
-    // Standalone addon
+    const workbenchExePath = this.config
+      ? this.findWorkbenchExe() ?? join(this.config.workbenchPath, WORKBENCH_SUBDIR, WORKBENCH_EXE)
+      : null;
+    const projectPath = this.config?.projectPath
+      ? { path: this.config.projectPath, exists: existsSync(this.config.projectPath) }
+      : null;
+    const bundledScripts = {
+      path: this.handlerBundle.bundleDir,
+      exists: existsSync(this.handlerBundle.bundleDir),
+    };
     const standaloneBase = this.config?.projectPath
       ? join(this.config.projectPath, HANDLER_FOLDER)
       : join("<unknown>", HANDLER_FOLDER);
-    const standaloneScriptsDir = join(standaloneBase, "Scripts", "WorkbenchGame", HANDLER_FOLDER);
-    const standaloneFileCount = existsSync(standaloneScriptsDir)
-      ? readdirSync(standaloneScriptsDir).filter((f) => f.endsWith(".c")).length
-      : 0;
+    const standaloneScripts = join(standaloneBase, "Scripts", "WorkbenchGame", HANDLER_FOLDER);
     const standaloneAddon = {
       path: standaloneBase,
       exists: existsSync(standaloneBase),
-      fileCount: standaloneFileCount,
+      fileCount: existsSync(standaloneScripts)
+        ? readdirSync(standaloneScripts).filter((name) => name.toLowerCase().endsWith(".c")).length
+        : 0,
     };
-
-    // Scan project path for mods that have handler scripts installed
     const installedMods: DiagnosticReport["installedMods"] = [];
     if (this.config?.projectPath && existsSync(this.config.projectPath)) {
       try {
         for (const entry of readdirSync(this.config.projectPath, { withFileTypes: true })) {
           if (!entry.isDirectory()) continue;
-          if (entry.name === HANDLER_FOLDER) continue; // standalone, covered above
-          const handlerDir = join(this.config.projectPath, entry.name, "Scripts", "WorkbenchGame", HANDLER_FOLDER);
-          if (existsSync(handlerDir)) {
-            const fileCount = readdirSync(handlerDir).filter((f) => f.endsWith(".c")).length;
-            installedMods.push({ modDir: join(this.config.projectPath, entry.name), handlerDir, fileCount });
-          }
+          const modDir = join(this.config.projectPath, entry.name);
+          const handlerDir = join(modDir, "Scripts", "WorkbenchGame", HANDLER_FOLDER);
+          if (!existsSync(handlerDir)) continue;
+          installedMods.push({
+            modDir,
+            handlerDir,
+            fileCount: readdirSync(handlerDir).filter((name) => name.toLowerCase().endsWith(".c")).length,
+          });
         }
-      } catch { /* ignore */ }
+      } catch {
+        // Diagnostics remain best effort and non-mutating.
+      }
     }
 
-    // --- NET API probe ---
     let netApi: DiagnosticReport["netApi"] = "refused";
     let netApiError: string | undefined;
     try {
       await this.rawCall("EMCP_WB_Ping", {}, { timeout: 3000, skipAutoLaunch: true });
       netApi = "up_with_handlers";
-    } catch (err) {
-      if (err instanceof WorkbenchError) {
-        netApiError = err.message;
-        if (err.code === "CONNECTION_REFUSED") {
-          netApi = "refused";
-        } else if (err.code === "TIMEOUT") {
-          netApi = "timeout";
-        } else if (err.code === "API_ERROR" && err.message.includes("not existing Net API function")) {
+    } catch (error) {
+      if (error instanceof WorkbenchError) {
+        netApiError = error.message;
+        if (error.code === "CONNECTION_REFUSED") netApi = "refused";
+        else if (error.code === "TIMEOUT") netApi = "timeout";
+        else if (error.code === "API_ERROR" &&
+          (error.message.includes("not existing Net API function") || error.message.includes("Undefined API func"))) {
           netApi = "up_no_handlers";
-        } else {
-          netApi = "error";
-        }
+        } else netApi = "error";
       } else {
         netApi = "error";
-        netApiError = String(err);
+        netApiError = String(error);
       }
     }
 
     return {
-      host,
-      port,
-      workbenchExe,
-      projectPath: projectPathInfo,
-      defaultMod,
+      host: this.host,
+      port: this.port,
+      workbenchExe: workbenchExePath
+        ? { path: workbenchExePath, exists: existsSync(workbenchExePath) }
+        : null,
+      projectPath,
+      defaultMod: this.config?.defaultMod ?? null,
       bundledScripts,
       standaloneAddon,
       installedMods,
       netApi,
       netApiError,
+      lifecycle: await this.lifecycleDiagnostic(),
     };
-  }
-
-  /**
-   * Remove the standalone EnfusionMCP addon directory if it exists.
-   * This prevents duplicate class name errors when handler scripts are injected
-   * into a user's mod and the standalone folder is also present in the addons dir.
-   */
-  private cleanupStandaloneAddon(): void {
-    const fallbackBase = this.config?.projectPath;
-    if (!fallbackBase) return;
-    const standaloneDir = join(fallbackBase, HANDLER_FOLDER);
-    if (!existsSync(standaloneDir)) return;
-    try {
-      rmSync(standaloneDir, { recursive: true, force: true });
-      logger.info(`Removed leftover standalone addon: ${standaloneDir}`);
-    } catch (e) {
-      logger.warn(`Failed to remove standalone addon: ${e}`);
-    }
   }
 
   toString(): string {
     return `WorkbenchClient(${this.host}:${this.port})`;
   }
 
-  // ---------------------------------------------------------------------------
-  // Private
-  // ---------------------------------------------------------------------------
+  private requireConfig(action: string): Config {
+    if (!this.config) {
+      throw new WorkbenchError(`No config provided — cannot ${action} Workbench.`, "LAUNCH_FAILED");
+    }
+    return this.config;
+  }
 
-  /** Extract mode from a response object if it contains a `mode` field. */
+  private async callAndCache<T>(
+    apiFunc: string,
+    params: Record<string, unknown>,
+    options: WorkbenchCallOptions
+  ): Promise<T> {
+    const result = await this.rawCall<T>(apiFunc, params, options);
+    this._state.connected = true;
+    this._state.lastUpdated = Date.now();
+    this.extractMode(result);
+    return result;
+  }
+
+  private resetConnectionState(): void {
+    this._state = { connected: false, mode: "unknown", lastUpdated: Date.now() };
+  }
+
   private extractMode(result: unknown): void {
-    if (result && typeof result === "object" && "mode" in result) {
-      const mode = (result as Record<string, unknown>).mode;
-      if (mode === "edit") {
-        this._state.mode = "edit";
-      } else if (mode === "play" || mode === "game") {
-        // Scripts return "game" when in play mode (WorldEditorAPI unavailable)
-        this._state.mode = "play";
+    if (!result || typeof result !== "object" || !("mode" in result)) return;
+    const mode = (result as Record<string, unknown>).mode;
+    if (mode === "edit") this._state.mode = "edit";
+    else if (mode === "play" || mode === "game") this._state.mode = "play";
+    else this._state.mode = "unknown";
+  }
+
+  private coordinateLifecycle<T>(
+    kind: LifecycleOperationKind,
+    targetKey: string | null,
+    action: (operationId: string) => Promise<T>
+  ): Promise<T> {
+    const current = this.activeLifecycle;
+    if (current) {
+      const sameTarget = current.targetKey === targetKey;
+      if (sameTarget && ((kind === "launch" && current.kind === "launch") ||
+          (kind === "restart" && current.kind === "restart"))) {
+        return current.promise as Promise<T>;
       }
-      // "no_world_editor" and unrecognised values leave mode as-is (stays "unknown")
+      if (targetKey && current.targetKey && targetKey !== current.targetKey) {
+        return Promise.reject(new WorkbenchError(
+          `TARGET_CONFLICT: lifecycle ${current.kind} ${current.operationId} is operating on ` +
+            `${current.targetKey}; requested target is ${targetKey}.`,
+          "TARGET_CONFLICT"
+        ));
+      }
+      return current.promise
+        .catch(() => undefined)
+        .then(() => this.coordinateLifecycle(kind, targetKey, action));
+    }
+
+    const operationId = randomUUID();
+    let promise: Promise<T>;
+    promise = Promise.resolve()
+      .then(() => action(operationId))
+      .finally(() => {
+        if (this.activeLifecycle?.promise === promise) this.activeLifecycle = null;
+      });
+    this.activeLifecycle = { kind, operationId, targetKey, promise };
+    return promise;
+  }
+
+  private async resolveLifecycleProject(gprojPath?: string): Promise<CanonicalProjectIdentity> {
+    const read = await this.processGuard.readLifecycleState();
+    const priorTarget = read.kind === "valid" ? read.state.target?.path ?? null : null;
+    try {
+      return resolveProjectIdentity({
+        gprojPath,
+        priorTarget,
+        projectRoot: this.config?.projectPath,
+        defaultMod: this.config?.defaultMod,
+      });
+    } catch (error) {
+      throw this.mapLifecycleError(error);
     }
   }
 
-  /**
-   * Recover from "not existing Net API function" errors.
-   * Workbench is running but our custom handler scripts aren't compiled.
-   * Installs handlers into the mod directory and waits for Workbench to
-   * auto-recompile them — without killing the running Workbench process.
-   *
-   * Previous behaviour killed Workbench with taskkill, which broke other
-   * tools (e.g. the Enfusion Blender plugin) that share the same NET API.
-   */
-  private async recoverMissingHandlers(): Promise<void> {
-    if (!this.config) {
-      throw new WorkbenchError("No config provided — cannot recover handlers.", "LAUNCH_FAILED");
+  private projectFromModDirectory(modDir: string): CanonicalProjectIdentity {
+    let canonicalMod: string;
+    try {
+      canonicalMod = realpathSync.native(resolve(modDir));
+      if (!statSync(canonicalMod).isDirectory()) throw new Error("not a directory");
+    } catch {
+      throw new WorkbenchError(`Invalid mod directory: ${resolve(modDir)}`, "INVALID_TARGET");
     }
-
-    // Inject into the currently-open mod (same logic as launchWorkbench).
-    const recoveryGproj = this.findFallbackGproj();
-    if (recoveryGproj) {
-      this.installHandlerScripts(dirname(recoveryGproj), true);
-      this.cleanupStandaloneAddon();
-    } else {
-      this.installHandlerScripts(undefined, true);
+    const candidates = readdirSync(canonicalMod, { withFileTypes: true })
+      .filter((entry) => entry.isFile() && extname(entry.name).toLowerCase() === ".gproj")
+      .map((entry) => canonicalizeGproj(join(canonicalMod, entry.name)));
+    const unique = new Map(candidates.map((entry) => [entry.comparisonKey, entry]));
+    if (unique.size !== 1) {
+      const paths = [...unique.values()].map((entry) => entry.displayPath).sort();
+      throw new WorkbenchError(
+        unique.size === 0
+          ? `No .gproj exists directly in mod directory ${canonicalMod}.`
+          : `Cleanup target is ambiguous; provide a mod directory containing exactly one .gproj:\n` +
+            paths.map((path) => `  - ${path}`).join("\n"),
+        unique.size === 0 ? "TARGET_REQUIRED" : "AMBIGUOUS_TARGET"
+      );
     }
+    return [...unique.values()][0];
+  }
 
-    // Wait for Workbench to detect the new files and recompile scripts.
-    // Workbench watches its script directories and recompiles automatically.
-    // Poll with our custom EMCP_WB_Ping handler — it only succeeds once
-    // the handler scripts are compiled and registered.
-    logger.info("Handler scripts installed. Waiting for Workbench to recompile...");
-    const deadline = Date.now() + HANDLER_RECOMPILE_TIMEOUT_MS;
-    while (Date.now() < deadline) {
-      await new Promise((r) => setTimeout(r, HANDLER_RECOMPILE_POLL_MS));
-      if (await this.ping()) {
-        logger.info("Handler scripts compiled and loaded.");
-        return;
-      }
-    }
+  private lifecycleTarget(project: CanonicalProjectIdentity): {
+    path: string;
+    comparisonKey: string;
+  } {
+    return { path: project.displayPath, comparisonKey: project.comparisonKey };
+  }
 
-    throw new WorkbenchError(
-      `Handler scripts were installed but Workbench did not recompile them within ` +
-        `${HANDLER_RECOMPILE_TIMEOUT_MS / 1000}s. Try recompiling scripts manually in ` +
-        `Workbench (Plugins > Reload Scripts) or restart Workbench.`,
-      "LAUNCH_FAILED"
+  private async claimState(
+    session: WorkbenchLifecycleSession,
+    project: CanonicalProjectIdentity | null
+  ): Promise<WorkbenchLifecycleStateV2> {
+    const result = await session.validateAndClaim({
+      endpoint: { host: this.host.trim().toLowerCase(), port: this.port },
+      target: project ? this.lifecycleTarget(project) : null,
+    });
+    if (result.kind === "claimed" || result.kind === "owned_by_current_mcp") return result.state;
+    throw this.claimRefusal(result);
+  }
+
+  private expectedTransactionError(context: string, error: unknown): WorkbenchError {
+    return new WorkbenchError(
+      `RECOVERY_REQUIRED: ${context}: ${error instanceof Error ? error.message : String(error)}`,
+      "RECOVERY_REQUIRED"
     );
   }
 
-  /**
-   * Kill any running Workbench process. Windows-only (taskkill).
-   * Safe to call even if Workbench isn't running.
-   */
-  private killWorkbench(): void {
+  private loadExpectedTransaction(
+    handler: HandlerLifecycleState | null,
+    target: StoredLifecycleTarget | null,
+    context: string
+  ): HandlerTransactionRecord {
+    if (!handler || !target) {
+      throw this.expectedTransactionError(
+        context,
+        "the lifecycle state does not bind the transaction to a handler and target"
+      );
+    }
     try {
-      execSync(`taskkill /IM ${WORKBENCH_EXE} /F`, { stdio: "ignore" });
-      logger.info("Killed running Workbench process.");
-    } catch {
-      // Process might not be running — ignore
+      return this.handlerBundle.loadExpectedTransaction(handler, target);
+    } catch (error) {
+      throw this.expectedTransactionError(context, error);
     }
   }
 
-  private async launchWorkbench(gprojPath?: string): Promise<void> {
-    // 1. Check if already running (maybe it came up between the failed call and now)
-    if (await this.ping()) {
-      logger.info("Workbench is already running.");
-      return;
+  private restoreExpectedTransaction(
+    handler: HandlerLifecycleState | null,
+    target: StoredLifecycleTarget | null,
+    context: string
+  ): HandlerTransactionRecord {
+    if (!handler || !target) {
+      throw this.expectedTransactionError(
+        context,
+        "the lifecycle state does not bind the transaction to a handler and target"
+      );
     }
+    try {
+      return this.handlerBundle.restoreExpectedTransaction(handler, target);
+    } catch (error) {
+      throw this.expectedTransactionError(context, error);
+    }
+  }
 
-    // 2. Resolve the target .gproj and inject handler scripts into that mod.
-    //    Handler scripts must compile as part of the opened project — Workbench
-    //    only compiles the active project and its declared dependencies, NOT every
-    //    addon folder in the project directory.  A standalone sibling addon will
-    //    never be compiled unless the user's project explicitly depends on it.
-    let resolvedGproj = gprojPath || this.findFallbackGproj();
-    if (resolvedGproj) {
-      this.installHandlerScripts(dirname(resolvedGproj));
-      // Remove any leftover standalone addon to prevent duplicate class errors.
-      // If a previous session created {projectPath}/EnfusionMCP/ it would be
-      // picked up as a sibling addon and cause compile-time class name conflicts.
-      this.cleanupStandaloneAddon();
-    } else {
-      // No project found — fall back to standalone addon as last resort and open it
-      // directly so its handlers at least compile (user's project won't be open).
-      this.installHandlerScripts();
-      const fallbackBase = this.config?.projectPath;
-      if (fallbackBase) {
-        const standaloneGproj = join(fallbackBase, HANDLER_FOLDER, `${HANDLER_FOLDER}.gproj`);
-        if (existsSync(standaloneGproj)) {
-          resolvedGproj = standaloneGproj;
-        }
+  private commitExpectedTransaction(
+    handler: HandlerLifecycleState | null,
+    target: StoredLifecycleTarget | null,
+    context: string
+  ): void {
+    if (!handler || !target) {
+      throw this.expectedTransactionError(
+        context,
+        "the lifecycle state does not bind the transaction to a handler and target"
+      );
+    }
+    try {
+      this.handlerBundle.commitExpectedTransaction(handler, target);
+    } catch (error) {
+      if (error instanceof HandlerBundleError) throw this.expectedTransactionError(context, error);
+      throw error;
+    }
+  }
+
+  private discardExpectedTransaction(
+    handler: HandlerLifecycleState | null,
+    target: StoredLifecycleTarget | null,
+    context: string
+  ): void {
+    if (!handler || !target) {
+      throw this.expectedTransactionError(
+        context,
+        "the lifecycle state does not bind the transaction to a handler and target"
+      );
+    }
+    try {
+      this.handlerBundle.discardExpectedTransaction(handler, target);
+    } catch (error) {
+      if (error instanceof HandlerBundleError) throw this.expectedTransactionError(context, error);
+      throw error;
+    }
+  }
+
+  private abortExpectedTransaction(
+    handler: HandlerLifecycleState,
+    target: StoredLifecycleTarget,
+    context: string
+  ): void {
+    try {
+      this.handlerBundle.abortExpectedTransaction(handler, target);
+    } catch (error) {
+      if (error instanceof HandlerBundleError) throw this.expectedTransactionError(context, error);
+      throw error;
+    }
+  }
+
+  private claimRefusal(result: Extract<LifecycleClaimResult, { kind: "refused" }>): WorkbenchError {
+    const code = result.code === "STATE_INVALID" ? "STATE_INVALID" : result.code;
+    return new WorkbenchError(`${code}: ${result.message}`, code);
+  }
+
+  private async inspectRecordedWorkbench(
+    state: WorkbenchLifecycleStateV2
+  ): Promise<"live" | "absent"> {
+    const processes = await this.processGuard.listWorkbenchProcesses();
+    const expected = state.workbench;
+    if (!expected) {
+      if (processes.length === 0) return "absent";
+      throw new WorkbenchError(
+        `UNOWNED_WORKBENCH: Workbench PID(s) ${processes.map((entry) => entry.pid).join(", ")} ` +
+          "are running without an exact lifecycle identity.",
+        "UNOWNED_WORKBENCH"
+      );
+    }
+    const matches = processes.filter((entry) => entry.pid === expected.pid &&
+      pathKey(entry.executablePath) === pathKey(expected.executablePath) &&
+      entry.creationTime === expected.creationTime);
+    if (matches.length === 1 && processes.length === 1) {
+      try {
+        return await this.processGuard.inspectOwnedWorkbench(expected);
+      } catch (error) {
+        throw this.mapLifecycleError(error);
       }
     }
+    if (processes.length === 0) return "absent";
+    throw new WorkbenchError(
+      `IDENTITY_UNVERIFIABLE: recorded Workbench PID ${expected.pid} no longer matches the exact ` +
+        "machine-wide process identity; no process was signalled.",
+      "IDENTITY_UNVERIFIABLE"
+    );
+  }
 
-    // 3. Find executable
-    const exePath = this.findWorkbenchExe();
-    if (!exePath) {
-      const wbPath = this.config?.workbenchPath ?? "(not configured)";
+  private async assertNoWorkbenchProcesses(
+    session: WorkbenchLifecycleSession,
+    action: string
+  ): Promise<void> {
+    try {
+      await session.assertNoWorkbenchProcesses();
+    } catch (error) {
+      const mapped = this.mapLifecycleError(error);
       throw new WorkbenchError(
-        `Cannot find ${WORKBENCH_EXE}. Install Arma Reforger Tools from Steam, ` +
-          `or set ENFUSION_WORKBENCH_PATH. Searched:\n` +
-          `  - ${join(wbPath, WORKBENCH_SUBDIR, WORKBENCH_EXE)}\n` +
-          `  - ${join(wbPath, WORKBENCH_EXE)}`,
+        `${action} refused: ${mapped.message}`,
+        mapped.code
+      );
+    }
+  }
+
+  private async assertEndpointOwnedByRecordedWorkbench(
+    session: WorkbenchLifecycleSession,
+    expected: WorkbenchIdentity,
+    context: string
+  ): Promise<void> {
+    let result;
+    try {
+      result = await session.verifyEndpointOwner(
+        { host: this.host, port: this.port },
+        expected
+      );
+    } catch (error) {
+      const mapped = this.mapLifecycleError(error);
+      throw new WorkbenchError(
+        `IDENTITY_UNVERIFIABLE: ${context} could not prove that NET API endpoint ` +
+          `${this.host}:${this.port} belongs to exact Workbench PID ${expected.pid}: ${mapped.message}`,
+        "IDENTITY_UNVERIFIABLE"
+      );
+    }
+    if (result.kind === "refused") {
+      throw new WorkbenchError(
+        `IDENTITY_UNVERIFIABLE: ${context} refused NET API endpoint ${this.host}:${this.port} ` +
+          `for exact Workbench PID ${expected.pid} (${result.reason}): ${result.message}`,
+        "IDENTITY_UNVERIFIABLE"
+      );
+    }
+  }
+
+  private async reconcileAbsentState(
+    session: WorkbenchLifecycleSession,
+    state: WorkbenchLifecycleStateV2,
+    target: StoredLifecycleTarget | null
+  ): Promise<WorkbenchLifecycleStateV2> {
+    const recoveryTarget = target ?? state.target;
+    const recoveryHandler = state.handler;
+    let restoredTransaction: HandlerTransactionRecord | null = null;
+    let nextHandler = state.handler;
+    if (recoveryHandler?.backupPath && recoveryHandler.transactionId) {
+      try {
+        restoredTransaction = this.restoreExpectedTransaction(
+          recoveryHandler,
+          recoveryTarget,
+          `could not cross-bind and restore handler transaction ${recoveryHandler.transactionId}`
+        );
+        const manifest = this.handlerBundle.readManifest(restoredTransaction.modDirectory);
+        nextHandler = manifest ? {
+          modDirectory: restoredTransaction.modDirectory,
+          manifestGeneration: manifest.generation,
+          transactionId: null,
+          phase: "installed",
+          backupPath: null,
+        } : null;
+      } catch (error) {
+        if (error instanceof WorkbenchError && error.code === "RECOVERY_REQUIRED") throw error;
+        throw new WorkbenchError(
+          `RECOVERY_REQUIRED: could not roll back handler transaction ` +
+            `${recoveryHandler.transactionId}: ${error instanceof Error ? error.message : String(error)}`,
+          "RECOVERY_REQUIRED"
+        );
+      }
+    }
+    // Re-read the durable record immediately before the recovery CAS. A
+    // mismatched journal must never be hidden by transitioning lifecycle state.
+    if (restoredTransaction) {
+      this.loadExpectedTransaction(
+        recoveryHandler,
+        recoveryTarget,
+        `handler transaction ${restoredTransaction.id} changed before recovery transition`
+      );
+    }
+    this.resetConnectionState();
+    const vacant = await session.transitionToVacant(stateExpected(state), {
+      target: recoveryTarget,
+      handler: nextHandler,
+    });
+    if (restoredTransaction) {
+      try {
+        this.discardExpectedTransaction(
+          recoveryHandler,
+          recoveryTarget,
+          `could not cross-bind recovered handler transaction ${restoredTransaction.id} before discard`
+        );
+      } catch (error) {
+        if (error instanceof WorkbenchError && error.code === "RECOVERY_REQUIRED") throw error;
+        logger.warn(
+          `Recovered handler transaction ${restoredTransaction.id}, but its backup could not be ` +
+            `pruned: ${error instanceof Error ? error.message : String(error)}`
+        );
+      }
+    }
+    return vacant;
+  }
+
+  private async reconcileForEnsure(
+    session: WorkbenchLifecycleSession,
+    state: WorkbenchLifecycleStateV2,
+    project: CanonicalProjectIdentity
+  ): Promise<{ state: WorkbenchLifecycleStateV2; live: boolean }> {
+    if (state.handler?.backupPath) {
+      this.loadExpectedTransaction(
+        state.handler,
+        state.target,
+        `lifecycle ${state.phase} recovery could not cross-bind its pending handler transaction`
+      );
+    }
+    const status = await this.inspectRecordedWorkbench(state);
+    if (status === "absent") {
+      await this.assertNoWorkbenchProcesses(session, "Lifecycle recovery");
+      return {
+        state: await this.reconcileAbsentState(session, state, this.lifecycleTarget(project)),
+        live: false,
+      };
+    }
+    if (state.phase === "stopping") {
+      const stopped = await this.terminateExact(session, state.workbench!);
+      if (!stopped) throw new WorkbenchError("Exact Workbench shutdown could not be proven.", "RECOVERY_REQUIRED");
+      await this.waitForPortRelease();
+      return {
+        state: await this.reconcileAbsentState(session, state, this.lifecycleTarget(project)),
+        live: false,
+      };
+    }
+    if (state.phase === "starting" || state.phase === "restarting") {
+      if (await this.ping()) {
+        if (!state.workbench) {
+          throw new WorkbenchError(
+            "Lifecycle recovery reached a live endpoint without a recorded exact Workbench identity.",
+            "IDENTITY_UNVERIFIABLE"
+          );
+        }
+        await this.assertEndpointOwnedByRecordedWorkbench(
+          session,
+          state.workbench,
+          `${state.phase} recovery`
+        );
+        let nextHandler = state.handler;
+        let completedTransaction: HandlerTransactionRecord | null = null;
+        const transactionHandler = state.handler;
+        const transactionTarget = state.target;
+        if (transactionHandler?.backupPath) {
+          const record = this.loadExpectedTransaction(
+            transactionHandler,
+            transactionTarget,
+            "live Workbench recovery could not cross-bind its handler transaction"
+          );
+          if (record.phase !== "applied") {
+            throw new WorkbenchError(
+              `RECOVERY_REQUIRED: live Workbench has an un-applied handler transaction ${record.id}.`,
+              "RECOVERY_REQUIRED"
+            );
+          }
+          completedTransaction = record;
+          nextHandler = handlerState(record, "installed", false);
+        }
+        if (completedTransaction) {
+          this.loadExpectedTransaction(
+            transactionHandler,
+            transactionTarget,
+            `handler transaction ${completedTransaction.id} changed before running recovery transition`
+          );
+        }
+        const running = await session.transition(stateExpected(state), stateDraft(state, {
+          phase: "running",
+          operation: null,
+          handler: nextHandler,
+        }));
+        if (completedTransaction) {
+          try {
+            this.commitExpectedTransaction(
+              transactionHandler,
+              transactionTarget,
+              `could not cross-bind completed handler transaction ${completedTransaction.id} before commit`
+            );
+          } catch (error) {
+            if (error instanceof WorkbenchError && error.code === "RECOVERY_REQUIRED") throw error;
+            logger.warn(
+              `Handler transaction ${completedTransaction.id} was durably completed, but its ` +
+                `backup could not be pruned: ${error instanceof Error ? error.message : String(error)}`
+            );
+          }
+        }
+        return { state: running, live: true };
+      }
+      await this.terminateExact(session, state.workbench!);
+      await this.waitForPortRelease();
+      return {
+        state: await this.reconcileAbsentState(session, state, this.lifecycleTarget(project)),
+        live: false,
+      };
+    }
+    return { state, live: true };
+  }
+
+  private async ensureRunningLocked(
+    session: WorkbenchLifecycleSession,
+    project: CanonicalProjectIdentity,
+    operationId: string
+  ): Promise<WorkbenchLaunchResult> {
+    let state = await this.claimState(session, project);
+    const reconciled = await this.reconcileForEnsure(session, state, project);
+    state = reconciled.state;
+    if (reconciled.live) {
+      if (!state.workbench || !state.target || state.target.comparisonKey !== project.comparisonKey) {
+        throw new WorkbenchError("Recorded Workbench target does not match the requested project.", "TARGET_CONFLICT");
+      }
+      if (!(await this.ping())) {
+        throw new WorkbenchError(
+          `Exact owned Workbench PID ${state.workbench.pid} is running but its handler endpoint is unavailable.`,
+          "LAUNCH_FAILED"
+        );
+      }
+      await this.assertEndpointOwnedByRecordedWorkbench(
+        session,
+        state.workbench,
+        "running-session reuse"
+      );
+      return {
+        action: "reused",
+        pid: state.workbench.pid,
+        gprojPath: project.displayPath,
+        generation: state.generation,
+      };
+    }
+
+    await this.assertNoWorkbenchProcesses(session, "Launch");
+    if (await this.isPortListening()) {
+      throw new WorkbenchError(
+        `UNOWNED_WORKBENCH: NET API endpoint ${this.host}:${this.port} is occupied without the exact ` +
+          "recorded Workbench identity.",
+        "UNOWNED_WORKBENCH"
+      );
+    }
+    const preflight = this.preflightLaunch(project);
+    const started = await this.startLocked(session, state, preflight, "starting", "launch", operationId);
+    return {
+      action: "launched",
+      pid: started.workbench!.pid,
+      gprojPath: project.displayPath,
+      generation: started.generation,
+    };
+  }
+
+  private async restartLocked(
+    session: WorkbenchLifecycleSession,
+    project: CanonicalProjectIdentity,
+    operationId: string
+  ): Promise<WorkbenchRestartResult> {
+    let state = await this.claimState(session, project);
+    const reconciled = await this.reconcileForEnsure(session, state, project);
+    state = reconciled.state;
+    if (!reconciled.live || !state.workbench) {
+      throw new WorkbenchError("Restart refused: no exact owned Workbench is running.", "LAUNCH_FAILED");
+    }
+
+    // Complete replacement preflight before changing state or stopping a healthy process.
+    const preflight = this.preflightLaunch(revalidateProjectIdentity(project));
+    const previous = state.workbench;
+    const priorPhase = state.phase;
+    state = await session.transition(stateExpected(state), stateDraft(state, {
+      phase: "restarting",
+      operation: { kind: "restart", operationId },
+    }));
+    try {
+      await this.terminateExact(session, previous);
+    } catch (error) {
+      await session.transition(stateExpected(state), stateDraft(state, {
+        phase: priorPhase,
+        operation: null,
+      })).catch(() => undefined);
+      throw error;
+    }
+    this.resetConnectionState();
+    await this.waitForPortRelease();
+    state = await session.transition(stateExpected(state), stateDraft(state, {
+      phase: "restarting",
+      workbench: null,
+    }));
+    const restarted = await this.startLocked(
+      session,
+      state,
+      preflight,
+      "restarting",
+      "restart",
+      operationId
+    );
+    return {
+      previousPid: previous.pid,
+      pid: restarted.workbench!.pid,
+      gprojPath: project.displayPath,
+      generation: restarted.generation,
+    };
+  }
+
+  private async shutdownLocked(
+    session: WorkbenchLifecycleSession,
+    operationId: string
+  ): Promise<WorkbenchShutdownResult> {
+    // Shutdown is identity-driven. Preserve the durable target spelling/key but
+    // do not touch the .gproj: it may have been deleted or disconnected while
+    // the exact recorded Workbench is still safely terminable.
+    let state = await this.claimState(session, null);
+    const target = state.target;
+    if (state.handler?.backupPath) {
+      this.loadExpectedTransaction(
+        state.handler,
+        target,
+        `shutdown could not cross-bind lifecycle ${state.phase} handler transaction`
+      );
+    }
+    const status = await this.inspectRecordedWorkbench(state);
+    if (status === "absent") {
+      await this.assertNoWorkbenchProcesses(session, "Shutdown");
+      state = await this.reconcileAbsentState(session, state, target);
+      return {
+        stopped: false,
+        previousPid: null,
+        gprojPath: state.target?.path ?? null,
+        generation: state.generation,
+      };
+    }
+    const expected = state.workbench!;
+    state = await session.transition(stateExpected(state), stateDraft(state, {
+      phase: "stopping",
+      operation: { kind: "shutdown", operationId },
+    }));
+    try {
+      await this.terminateExact(session, expected);
+    } catch (error) {
+      await session.transition(stateExpected(state), stateDraft(state, {
+        phase: "running",
+        operation: null,
+      })).catch(() => undefined);
+      throw error;
+    }
+    await this.waitForPortRelease();
+    this.resetConnectionState();
+    const observedChild = this.ownedChild;
+    if (observedChild && observedChild.identity.pid === expected.pid &&
+        observedChild.identity.creationTime === expected.creationTime) {
+      this.ownedChild = null;
+    }
+    const vacant = await this.reconcileAbsentState(session, state, target);
+    return {
+      stopped: true,
+      previousPid: expected.pid,
+      gprojPath: target?.path ?? state.target?.path ?? null,
+      generation: vacant.generation,
+    };
+  }
+
+  private preflightLaunch(project: CanonicalProjectIdentity): LaunchPreflight {
+    const currentProject = revalidateProjectIdentity(project);
+    const executablePath = this.findWorkbenchExe();
+    if (!executablePath) {
+      const root = this.config?.workbenchPath ?? "(not configured)";
+      throw new WorkbenchError(
+        `Cannot find ${WORKBENCH_EXE}. Searched:\n` +
+          `  - ${join(root, WORKBENCH_SUBDIR, WORKBENCH_EXE)}\n` +
+          `  - ${join(root, WORKBENCH_EXE)}`,
         "LAUNCH_FAILED"
       );
     }
+    try {
+      if (!statSync(executablePath).isFile()) throw new Error("not a regular file");
+    } catch (error) {
+      throw new WorkbenchError(
+        `Workbench executable is not a readable regular file: ${executablePath} ` +
+          `(${error instanceof Error ? error.message : String(error)})`,
+        "LAUNCH_FAILED"
+      );
+    }
+    // Validate all arguments and the complete handler source/target before a restart stops anything.
+    const args = buildWorkbenchLaunchArgs(
+      currentProject.displayPath,
+      this.config?.workbenchAddonDirs,
+      this.config?.workbenchScriptAuthorizeAll === true,
+      true
+    );
+    try {
+      this.handlerBundle.preflight(currentProject);
+    } catch (error) {
+      throw this.mapLifecycleError(error);
+    }
+    return {
+      project: currentProject,
+      executablePath,
+      cwd: this.findGameDir() ?? dirname(executablePath),
+      args,
+    };
+  }
 
-    // 4. Spawn with -gproj to skip the launcher
-    const args: string[] = [];
-    if (resolvedGproj) {
-      args.push("-gproj", resolvedGproj);
+  private async startLocked(
+    session: WorkbenchLifecycleSession,
+    initialState: WorkbenchLifecycleStateV2,
+    preflight: LaunchPreflight,
+    transientPhase: "starting" | "restarting",
+    operationKind: "launch" | "restart",
+    operationId: string
+  ): Promise<WorkbenchLifecycleStateV2> {
+    const launchTarget = this.lifecycleTarget(preflight.project);
+    let state = await session.transition(stateExpected(initialState), stateDraft(initialState, {
+      phase: transientPhase,
+      target: launchTarget,
+      workbench: null,
+      operation: { kind: operationKind, operationId },
+    }));
+    const originalHandler = initialState.handler;
+    let transaction: PreparedHandlerTransaction;
+    try {
+      transaction = this.handlerBundle.prepare(preflight.project);
+    } catch (error) {
+      await session.transitionToVacant(stateExpected(state), {
+        target: launchTarget,
+        handler: originalHandler,
+      }).catch(() => undefined);
+      throw this.mapLifecycleError(error);
     }
 
-    // Use the game install directory as CWD so Workbench finds base game addons
-    // (data/ArmaReforger.gproj with GUID 58D0FB3206B6F859) via ./addons resolution.
-    const cwd = this.findGameDir() || dirname(exePath);
+    try {
+      state = await session.transition(stateExpected(state), stateDraft(state, {
+        handler: handlerState(transaction.record, "installing"),
+      }));
+    } catch (error) {
+      this.abortExpectedTransaction(
+        handlerState(transaction.record, "installing"),
+        launchTarget,
+        `could not cross-bind prepared handler transaction ${transaction.record.id} before abort`
+      );
+      throw error;
+    }
 
-    logger.info(`Launching Workbench: ${exePath}${args.length ? ` ${args.join(" ")}` : ""} (cwd: ${cwd})`);
-    const proc = spawn(exePath, args, {
-      detached: true,
-      stdio: "ignore",
-      cwd,
+    try {
+      const applied = this.handlerBundle.apply(transaction);
+      this.loadExpectedTransaction(
+        state.handler,
+        state.target,
+        `handler transaction ${applied.id} changed before installed transition`
+      );
+      state = await session.transition(stateExpected(state), stateDraft(state, {
+        handler: handlerState(applied, "installed"),
+      }));
+    } catch (error) {
+      try {
+        const rollbackHandler = state.handler;
+        const rollbackTarget = state.target;
+        const restored = this.restoreExpectedTransaction(
+          rollbackHandler,
+          rollbackTarget,
+          `could not cross-bind failed handler transaction ${transaction.record.id} before restore`
+        );
+        this.loadExpectedTransaction(
+          rollbackHandler,
+          rollbackTarget,
+          `handler transaction ${restored.id} changed before rollback transition`
+        );
+        await session.transitionToVacant(stateExpected(state), {
+          target: launchTarget,
+          handler: originalHandler,
+        });
+        try {
+          this.discardExpectedTransaction(
+            rollbackHandler,
+            rollbackTarget,
+            `could not cross-bind restored handler transaction ${restored.id} before discard`
+          );
+        } catch (discardError) {
+          if (discardError instanceof WorkbenchError && discardError.code === "RECOVERY_REQUIRED") {
+            throw discardError;
+          }
+          logger.warn(
+            `Rolled back handler transaction ${restored.id}, but its backup could not be pruned: ` +
+              `${discardError instanceof Error ? discardError.message : String(discardError)}`
+          );
+        }
+      } catch (rollbackError) {
+        throw new WorkbenchError(
+          `RECOVERY_REQUIRED: handler installation failed and rollback could not be completed. ` +
+            `Transaction ${transaction.record.id} remains durable at ` +
+            `${transaction.record.backupPath}: ` +
+            `${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`,
+          "RECOVERY_REQUIRED"
+        );
+      }
+      throw this.mapLifecycleError(error);
+    }
+
+    const completedHandler = state.handler;
+    const completedTarget = state.target;
+
+    const ownerToken = this.processGuard.createOwnerToken();
+    const ownerArgument = this.processGuard.ownerArgument(ownerToken);
+    const args = [...preflight.args, ownerArgument];
+    const redactedArgs = args.map((arg) => arg === ownerArgument ? "[owner-token-redacted]" : arg);
+    logger.info(
+      `Launching Workbench: ${preflight.executablePath} ${redactedArgs.join(" ")} ` +
+        `(cwd: ${preflight.cwd})`
+    );
+
+    let child: ChildProcess | null = null;
+    let identity: WorkbenchIdentity | null = null;
+    let childObservation: OwnedChildObservation | null = null;
+    let spawnError: Error | null = null;
+    try {
+      const launchedAtMs = Date.now();
+      child = this.spawnProcess!(preflight.executablePath, args, {
+        detached: true,
+        stdio: "ignore",
+        cwd: preflight.cwd,
+        // Workbench is a graphical editor. A hidden Windows process has no
+        // native viewport dimensions/projection and therefore cannot support
+        // editor observation. Launches happen only through explicit lifecycle
+        // operations; capture itself still probes with skipAutoLaunch.
+        windowsHide: false,
+      });
+      child.once("error", (error) => { spawnError = error; });
+      if (!child.pid) {
+        throw new WorkbenchError(
+          "Workbench spawn returned no PID; exact process ownership cannot be established.",
+          "IDENTITY_UNVERIFIABLE"
+        );
+      }
+      identity = await session.inspectSpawnedWorkbench({
+        pid: child.pid,
+        executablePath: preflight.executablePath,
+        ownerTokenArgument: ownerArgument,
+        launchedAtMs,
+      });
+      state = await session.transition(stateExpected(state), stateDraft(state, {
+        workbench: identity,
+      }));
+      childObservation = this.attachOwnedChild(
+        child,
+        identity,
+        state.generation,
+        preflight.project.comparisonKey
+      );
+      child.unref();
+      await this.waitForHandlerReady(child, () => spawnError);
+      if (!identity) {
+        throw new WorkbenchError(
+          "Workbench handler became ready without an exact recorded process identity.",
+          "IDENTITY_UNVERIFIABLE"
+        );
+      }
+      await this.assertEndpointOwnedByRecordedWorkbench(
+        session,
+        identity,
+        `${operationKind} readiness`
+      );
+      const completedTransaction = this.loadExpectedTransaction(
+        completedHandler,
+        completedTarget,
+        `handler transaction ${transaction.record.id} changed before running transition`
+      );
+      if (completedTransaction.phase !== "applied") {
+        throw new WorkbenchError(
+          `RECOVERY_REQUIRED: handler transaction ${completedTransaction.id} is not applied at launch commit.`,
+          "RECOVERY_REQUIRED"
+        );
+      }
+      state = await session.transition(stateExpected(state), stateDraft(state, {
+        phase: "running",
+        handler: handlerState(completedTransaction, "installed", false),
+        operation: null,
+      }));
+      // This final CAS is the transaction commit point. Until it succeeds the
+      // backup remains durable and a failure terminates the exact child before
+      // rolling watched files back.
+      if (childObservation) childObservation.generation = state.generation;
+    } catch (error) {
+      await this.rollbackFailedLaunch(
+        session,
+        state,
+        transaction.record,
+        identity,
+        originalHandler
+      );
+      throw this.mapLifecycleError(error);
+    }
+
+    const runningIdentity = identity;
+    if (!runningIdentity) {
+      throw new WorkbenchError(
+        "Workbench reached readiness without an exact process identity.",
+        "IDENTITY_UNVERIFIABLE"
+      );
+    }
+    try {
+      // The lifecycle CAS above is authoritative. Removing the rollback journal
+      // is post-commit pruning, so a crash here can leave only a harmless orphan
+      // rather than state that points at a missing recovery record.
+      this.commitExpectedTransaction(
+        completedHandler,
+        completedTarget,
+        `could not cross-bind completed handler transaction ${transaction.record.id} before commit`
+      );
+    } catch (error) {
+      if (error instanceof WorkbenchError && error.code === "RECOVERY_REQUIRED") throw error;
+      logger.warn(
+        `Handler transaction ${transaction.record.id} was durably completed for Workbench PID ` +
+          `${runningIdentity.pid}, but its backup could not be pruned: ` +
+          `${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+    this._state.connected = true;
+    this._state.lastUpdated = Date.now();
+    return state;
+  }
+
+  private async rollbackFailedLaunch(
+    session: WorkbenchLifecycleSession,
+    state: WorkbenchLifecycleStateV2,
+    transaction: HandlerTransactionRecord,
+    identity: WorkbenchIdentity | null,
+    originalHandler: HandlerLifecycleState | null
+  ): Promise<void> {
+    const rollbackHandler = state.handler;
+    const rollbackTarget = state.target;
+    const boundTransaction = this.loadExpectedTransaction(
+      rollbackHandler,
+      rollbackTarget,
+      `failed launch could not cross-bind handler transaction ${transaction.id}`
+    );
+    if (boundTransaction.id !== transaction.id) {
+      throw this.expectedTransactionError(
+        `failed launch transaction ${transaction.id} does not match its lifecycle journal`,
+        `lifecycle references transaction ${boundTransaction.id}`
+      );
+    }
+    if (identity) {
+      const result = await session.verifyAndTerminate(identity, OWNED_PROCESS_EXIT_TIMEOUT_MS);
+      if (result.kind === "refused") {
+        throw new WorkbenchError(
+          `RECOVERY_REQUIRED: launch failed and exact Workbench shutdown was refused (${result.reason}): ` +
+            `${result.message}. Handler transaction ${boundTransaction.id} was preserved.`,
+          "RECOVERY_REQUIRED"
+        );
+      }
+      await this.waitForPortRelease();
+    } else {
+      const processes = await this.processGuard.listWorkbenchProcesses();
+      if (processes.length > 0) {
+        throw new WorkbenchError(
+          `RECOVERY_REQUIRED: launch identity was not established and Workbench PID(s) ` +
+            `${processes.map((entry) => entry.pid).join(", ")} are present. Handler transaction ` +
+            `${boundTransaction.id} was preserved; watched files were not changed again.`,
+          "RECOVERY_REQUIRED"
+        );
+      }
+    }
+    const restored = this.restoreExpectedTransaction(
+      rollbackHandler,
+      rollbackTarget,
+      `could not cross-bind failed launch transaction ${boundTransaction.id} before restore`
+    );
+    this.loadExpectedTransaction(
+      rollbackHandler,
+      rollbackTarget,
+      `handler transaction ${restored.id} changed before failed-launch recovery transition`
+    );
+    await session.transitionToVacant(stateExpected(state), {
+      target: state.target,
+      handler: originalHandler,
     });
-    proc.unref();
+    try {
+      this.discardExpectedTransaction(
+        rollbackHandler,
+        rollbackTarget,
+        `could not cross-bind failed launch transaction ${restored.id} before discard`
+      );
+    } catch (error) {
+      if (error instanceof WorkbenchError && error.code === "RECOVERY_REQUIRED") throw error;
+      logger.warn(
+        `Rolled back failed launch transaction ${restored.id}, but its backup could not be ` +
+          `pruned: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+    this.resetConnectionState();
+  }
 
-    // 5. Wait for NET API — track the last error type so the timeout message is actionable
-    const deadline = Date.now() + LAUNCH_TIMEOUT_MS;
-    let lastErrorCode: WorkbenchError["code"] | undefined;
+  private async waitForHandlerReady(
+    child: ChildProcess,
+    getSpawnError: () => Error | null
+  ): Promise<void> {
+    const deadline = Date.now() + this.launchTimeoutMs;
+    let lastErrorCode: WorkbenchErrorCode | undefined;
     while (Date.now() < deadline) {
+      const spawnError = getSpawnError();
+      if (spawnError) {
+        throw new WorkbenchError(`Workbench failed to start: ${spawnError.message}`, "LAUNCH_FAILED");
+      }
+      if (child.exitCode !== null) {
+        throw new WorkbenchError(
+          `Workbench exited before its handler endpoint became ready (exit code ${child.exitCode}).`,
+          "LAUNCH_FAILED"
+        );
+      }
       try {
         await this.rawCall("EMCP_WB_Ping", {}, { timeout: 3000, skipAutoLaunch: true });
-        this._state.connected = true;
-        this._state.lastUpdated = Date.now();
-        logger.info("Workbench NET API is responding.");
         return;
-      } catch (err) {
-        if (err instanceof WorkbenchError) {
-          lastErrorCode = err.code;
-          logger.debug(`Workbench poll (${err.code}): ${err.message}`);
-        }
+      } catch (error) {
+        if (error instanceof WorkbenchError) lastErrorCode = error.code;
       }
-      await new Promise((r) => setTimeout(r, LAUNCH_POLL_INTERVAL_MS));
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, this.launchPollIntervalMs));
     }
-
-    // Build a specific diagnostic based on what was failing at timeout.
-    // CONNECTION_REFUSED = NET API port never opened → NET API likely disabled.
-    // API_ERROR = NET API is up but EMCP_WB_Ping isn't registered → handler scripts
-    //             didn't compile (project has script errors, or wrong mod directory).
-    let hint: string;
-    if (lastErrorCode === "API_ERROR") {
-      hint =
-        `Workbench NET API responded but handler scripts did not load. ` +
-        `Check for script compilation errors in Workbench (Script Editor). ` +
-        `Fix any errors in the project's scripts so the EnfusionMCP handlers can compile, ` +
-        `then try again.`;
-    } else {
-      hint =
-        `NET API port never responded. Ensure NET API is enabled in Workbench: ` +
-        `File > Options > General > Net API (checkbox must be on).`;
-    }
-
+    const hint = lastErrorCode === "API_ERROR"
+      ? "The NET API opened, but the managed handler bundle did not compile. Inspect Workbench script errors."
+      : "The NET API never became ready. Confirm that Workbench NET API is enabled.";
     throw new WorkbenchError(
-      `Workbench launched but did not connect within ${LAUNCH_TIMEOUT_MS / 1000}s.\n\n${hint}`,
+      `Workbench did not become ready within ${this.launchTimeoutMs / 1000}s. ${hint}`,
       "LAUNCH_FAILED"
     );
+  }
+
+  private async terminateExact(
+    session: WorkbenchLifecycleSession,
+    expected: WorkbenchIdentity
+  ): Promise<boolean> {
+    const result = await session.verifyAndTerminate(expected, OWNED_PROCESS_EXIT_TIMEOUT_MS);
+    if (result.kind === "refused") {
+      throw new WorkbenchError(
+        `IDENTITY_UNVERIFIABLE: exact Workbench termination was refused (${result.reason}): ` +
+          `${result.message}. No PID-only signal was attempted.`,
+        "IDENTITY_UNVERIFIABLE"
+      );
+    }
+    return true;
+  }
+
+  private attachOwnedChild(
+    child: ChildProcess,
+    identity: WorkbenchIdentity,
+    generation: string,
+    targetKey: string
+  ): OwnedChildObservation {
+    const observation: OwnedChildObservation = { child, identity, generation, targetKey };
+    this.ownedChild = observation;
+    child.once("exit", () => {
+      if (this.ownedChild !== observation) return;
+      this.activityGate.invalidateForUnexpectedExit({
+        generation: observation.generation,
+        targetKey: observation.targetKey,
+        process: {
+          pid: identity.pid,
+          executablePath: identity.executablePath,
+          creationTime: identity.creationTime,
+        },
+      });
+      this.resetConnectionState();
+      this.ownedChild = null;
+      void this.activityGate.runLifecycle("recovery", () =>
+        this.coordinateLifecycle("recovery", targetKey, async () =>
+          this.processGuard.withLifecycleLock(async (session) => {
+            const read = await session.readState();
+            if (read.kind !== "valid" || read.state.generation !== observation.generation ||
+                !read.state.workbench || read.state.workbench.pid !== identity.pid ||
+                read.state.workbench.creationTime !== identity.creationTime) return;
+            await this.assertNoWorkbenchProcesses(session, "Unexpected-exit recovery");
+            await this.reconcileAbsentState(session, read.state, read.state.target);
+          })
+        )
+      ).catch((error) => logger.warn(
+        `Workbench exit reconciliation failed: ${error instanceof Error ? error.message : String(error)}`
+      ));
+    });
+    return observation;
   }
 
   private findWorkbenchExe(): string | null {
     if (!this.config) return null;
-    const subPath = join(this.config.workbenchPath, WORKBENCH_SUBDIR, WORKBENCH_EXE);
-    if (existsSync(subPath)) return subPath;
-
-    const rootPath = join(this.config.workbenchPath, WORKBENCH_EXE);
-    if (existsSync(rootPath)) return rootPath;
-
-    return null;
-  }
-
-  /**
-   * Find a .gproj to pass via -gproj so Workbench skips the launcher.
-   * Prefers config.defaultMod if set; otherwise picks first addon found.
-   * Scans for any .gproj in each addon folder (name need not match folder).
-   */
-  private findFallbackGproj(): string | null {
-    const findGprojInDir = (dir: string): string | null => {
-      try {
-        for (const f of readdirSync(dir, { withFileTypes: true })) {
-          if (!f.isDirectory() && f.name.endsWith(".gproj")) {
-            return join(dir, f.name);
-          }
-        }
-      } catch { /* ignore */ }
-      return null;
-    };
-
-    try {
-      const addonsDir = this.config?.projectPath;
-      if (!addonsDir || !existsSync(addonsDir)) return null;
-
-      // Prefer the configured default mod over alphabetical first-pick
-      const preferred = this.config?.defaultMod;
-      if (preferred) {
-        const gprojPath = findGprojInDir(join(addonsDir, preferred));
-        if (gprojPath) {
-          logger.info(`Using defaultMod gproj to skip launcher: ${gprojPath}`);
-          return gprojPath;
-        }
-      }
-
-      for (const entry of readdirSync(addonsDir, { withFileTypes: true })) {
-        if (!entry.isDirectory()) continue;
-        const gprojPath = findGprojInDir(join(addonsDir, entry.name));
-        if (gprojPath) {
-          logger.info(`Using fallback gproj to skip launcher: ${gprojPath}`);
-          return gprojPath;
-        }
-      }
-    } catch { /* ignore */ }
-    return null;
-  }
-
-  /**
-   * Derive the Arma Reforger game install directory.
-   * Checks ENFUSION_GAME_PATH env var first, then walks up from workbenchPath.
-   * workbenchPath may point to the Tools root OR the Workbench subdirectory,
-   * so we try both one and two levels up.
-   */
-  private findGameDir(): string | null {
-    // Explicit env var takes priority
-    const envGamePath = process.env.ENFUSION_GAME_PATH;
-    if (envGamePath && existsSync(join(envGamePath, "addons"))) {
-      logger.info(`Using game directory from ENFUSION_GAME_PATH: ${envGamePath}`);
-      return envGamePath;
-    }
-
-    if (!this.config) return null;
-    const toolsDir = this.config.workbenchPath;
-    // workbenchPath may be "Arma Reforger Tools" or "Arma Reforger Tools\Workbench"
     const candidates = [
-      resolve(toolsDir, "..", "Arma Reforger"),
-      resolve(toolsDir, "..", "ArmaReforger"),
-      resolve(toolsDir, "..", "..", "Arma Reforger"),
-      resolve(toolsDir, "..", "..", "ArmaReforger"),
+      join(this.config.workbenchPath, WORKBENCH_SUBDIR, WORKBENCH_EXE),
+      join(this.config.workbenchPath, WORKBENCH_EXE),
     ];
-    for (const candidate of candidates) {
-      if (existsSync(join(candidate, "addons"))) {
-        logger.info(`Using game directory as CWD: ${candidate}`);
-        return candidate;
-      }
-    }
-    logger.warn("Could not find Arma Reforger game directory. Workbench may fail to resolve base game addon.");
-    return null;
+    return candidates.find((candidate) => existsSync(candidate)) ?? null;
   }
 
-  /**
-   * Copy handler scripts into a mod directory so they compile as part of that mod.
-   * If no modDir given, installs to default project path (standalone, less useful).
-   */
-  private installHandlerScripts(modDir?: string, force = false): void {
-    const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
-    const bundledDir = join(packageRoot, "mod", "Scripts", "WorkbenchGame", HANDLER_FOLDER);
-    if (!existsSync(bundledDir)) {
-      logger.warn("Bundled handler scripts not found in package.");
-      return;
+  private findGameDir(): string | null {
+    const configured = this.config?.gamePath;
+    if (configured && existsSync(join(configured, "addons"))) return configured;
+    const environment = process.env.ENFUSION_GAME_PATH;
+    if (environment && existsSync(join(environment, "addons"))) return environment;
+    if (!this.config) return null;
+    const candidates = [
+      resolve(this.config.workbenchPath, "..", "Arma Reforger"),
+      resolve(this.config.workbenchPath, "..", "ArmaReforger"),
+      resolve(this.config.workbenchPath, "..", "..", "Arma Reforger"),
+      resolve(this.config.workbenchPath, "..", "..", "ArmaReforger"),
+    ];
+    return candidates.find((candidate) => existsSync(join(candidate, "addons"))) ?? null;
+  }
+
+  private async waitForPortRelease(): Promise<void> {
+    const deadline = Date.now() + PORT_RELEASE_TIMEOUT_MS;
+    while (Date.now() < deadline) {
+      if (!(await this.isPortListening())) return;
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, PORT_RELEASE_POLL_MS));
     }
+    throw new WorkbenchError(
+      `NET API endpoint ${this.host}:${this.port} remained occupied after exact Workbench exit.`,
+      "IDENTITY_UNVERIFIABLE"
+    );
+  }
 
-    const fallbackBase = this.config?.projectPath;
-    if (!modDir && !fallbackBase) {
-      logger.warn("No modDir or projectPath configured — cannot install handler scripts.");
-      return;
-    }
-    const isFallback = !modDir;
-    const targetBase = modDir || join(fallbackBase!, HANDLER_FOLDER);
-    const targetScriptsDir = join(targetBase, "Scripts", "WorkbenchGame", HANDLER_FOLDER);
+  private isPortListening(timeoutMs = 500): Promise<boolean> {
+    return new Promise((resolvePromise) => {
+      const socket = new Socket();
+      let settled = false;
+      const finish = (listening: boolean): void => {
+        if (settled) return;
+        settled = true;
+        socket.destroy();
+        resolvePromise(listening);
+      };
+      socket.setTimeout(timeoutMs);
+      socket.once("connect", () => finish(true));
+      socket.once("timeout", () => finish(false));
+      socket.once("error", () => finish(false));
+      socket.connect(this.port, this.host);
+    });
+  }
 
-    // Already installed? Skip unless force-reinstalling (e.g. recovery after missing handlers)
-    if (!force && existsSync(join(targetScriptsDir, "EMCP_WB_Ping.c"))) {
-      return;
-    }
-
-
-    logger.info(`Installing handler scripts to ${targetScriptsDir}`);
-    mkdirSync(targetScriptsDir, { recursive: true });
-
-    const files = readdirSync(bundledDir).filter((f) => f.endsWith(".c"));
+  private async lifecycleDiagnostic(): Promise<LifecycleDiagnostic> {
     try {
-      for (const file of files) {
-        copyFileSync(join(bundledDir, file), join(targetScriptsDir, file));
+      const read = await this.processGuard.readLifecycleState();
+      if (read.kind === "missing") {
+        return {
+          state: "missing", version: null, generation: null, phase: null, endpoint: null,
+          target: null, lease: "vacant", operation: null, handlerTransaction: null,
+        };
       }
-    } catch (e) {
-      // Partial installation — clean up to avoid broken state on next attempt
-      logger.error(`Failed to install handler scripts, rolling back: ${e}`);
-      try {
-        rmSync(targetScriptsDir, { recursive: true, force: true });
-      } catch { /* best-effort cleanup */ }
-      throw e;
-    }
-
-    logger.info(`Installed ${files.length} handler scripts.`);
-
-    // When using the standalone fallback path, also write a .gproj so Workbench
-    // treats the directory as a loadable addon and compiles the handler scripts.
-    if (isFallback) {
-      const gprojPath = join(targetBase, `${HANDLER_FOLDER}.gproj`);
-      if (!existsSync(gprojPath)) {
-        const gprojContent = generateGproj({ name: HANDLER_FOLDER, title: "EnfusionMCP Handlers" });
-        writeFileSync(gprojPath, gprojContent, "utf-8");
-        logger.info(`Created standalone addon .gproj at ${gprojPath}`);
+      if (read.kind === "legacy") {
+        return {
+          state: "legacy", version: 1, generation: null, phase: null, endpoint: null,
+          target: null, lease: "unknown", operation: null, handlerTransaction: null,
+          detail: "A live legacy record is never adopted; close its Workbench once before migration.",
+        };
       }
+      if (read.kind === "malformed") {
+        return {
+          state: "malformed", version: null, generation: null, phase: null, endpoint: null,
+          target: null, lease: "unknown", operation: null, handlerTransaction: null,
+          detail: read.message,
+        };
+      }
+      const state = read.state;
+      return {
+        state: "valid",
+        version: 2,
+        generation: state.generation,
+        phase: state.phase,
+        endpoint: `${state.endpoint.host}:${state.endpoint.port}`,
+        target: state.target?.path ?? null,
+        lease: !state.mcpOwner ? "vacant" :
+          state.mcpOwner.instanceId === this.processGuard.mcpInstanceId ? "current_mcp" : "other_mcp",
+        operation: state.operation ? `${state.operation.kind}:${state.operation.operationId}` : null,
+        handlerTransaction: state.handler?.transactionId ?? null,
+      };
+    } catch (error) {
+      return {
+        state: "malformed", version: null, generation: null, phase: null, endpoint: null,
+        target: null, lease: "unknown", operation: null, handlerTransaction: null,
+        detail: error instanceof Error ? error.message : String(error),
+      };
     }
   }
 
-  /**
-   * Raw TCP call — no auto-launch, no retry.
-   */
+  private mapLifecycleError(error: unknown): WorkbenchError {
+    if (error instanceof WorkbenchError) return error;
+    if (error instanceof WorkbenchActivityError) {
+      return new WorkbenchError(error.message, error.code);
+    }
+    if (error instanceof ProjectIdentityError) {
+      return new WorkbenchError(error.message, error.code);
+    }
+    if (error instanceof HandlerBundleError) {
+      const code = error.code === "HANDLER_CONFLICT" || error.code === "HANDLER_MANIFEST_INVALID"
+        ? "HANDLER_CONFLICT"
+        : "LAUNCH_FAILED";
+      return new WorkbenchError(error.message, code);
+    }
+    if (error instanceof LifecycleGuardError) {
+      const code: WorkbenchErrorCode = error.code === "GENERATION_MISMATCH" ||
+          error.code === "HELPER_FAILURE"
+        ? "STATE_INVALID"
+        : error.code;
+      return new WorkbenchError(error.message, code);
+    }
+    return new WorkbenchError(error instanceof Error ? error.message : String(error), "LAUNCH_FAILED");
+  }
+
   private rawCall<T = Record<string, unknown>>(
     apiFunc: string,
     params: Record<string, unknown> = {},
     options: WorkbenchCallOptions = {}
   ): Promise<T> {
     const timeout = options.timeout ?? DEFAULT_TIMEOUT_MS;
-    const requestBuf = encodeRequest(this.clientId, apiFunc, params);
-
-    return new Promise<T>((resolve, reject) => {
+    const request = encodeRequest(this.clientId, apiFunc, params);
+    return new Promise<T>((resolvePromise, reject) => {
       const chunks: Buffer[] = [];
       let totalBytes = 0;
       let settled = false;
-
       const socket = new Socket();
-
       const timer = setTimeout(() => {
-        if (!settled) {
-          settled = true;
-          cleanup();
-          socket.destroy();
-          reject(
-            new WorkbenchError(
-              `Workbench call "${apiFunc}" timed out after ${timeout}ms`,
-              "TIMEOUT"
-            )
-          );
-        }
-      }, timeout);
-
-      const cleanup = () => {
-        clearTimeout(timer);
-        socket.removeAllListeners();
-      };
-
-      socket.on("error", (err) => {
         if (settled) return;
         settled = true;
         cleanup();
-        const code = (err as NodeJS.ErrnoException).code;
-        if (code === "ECONNREFUSED") {
-          reject(
-            new WorkbenchError(
-              `Cannot connect to Workbench at ${this.host}:${this.port}.`,
-              "CONNECTION_REFUSED"
-            )
-          );
-        } else {
-          reject(
-            new WorkbenchError(
-              `Connection error: ${err.message}`,
-              "PROTOCOL_ERROR"
-            )
-          );
-        }
-      });
-
-      socket.on("data", (chunk) => {
-        totalBytes += chunk.length;
-        if (totalBytes > MAX_RESPONSE_SIZE) {
-          if (!settled) {
-            settled = true;
-            cleanup();
-            socket.destroy();
-            reject(
-              new WorkbenchError(
-                `Response for "${apiFunc}" exceeded ${MAX_RESPONSE_SIZE} bytes — possible malformed data`,
-                "PROTOCOL_ERROR"
-              )
-            );
-          }
+        socket.destroy();
+        reject(new WorkbenchError(
+          `Workbench call "${apiFunc}" timed out after ${timeout}ms`,
+          "TIMEOUT"
+        ));
+      }, timeout);
+      const cleanup = (): void => {
+        clearTimeout(timer);
+        socket.removeAllListeners();
+      };
+      const decode = (): void => {
+        const response = Buffer.concat(chunks);
+        if (response.length === 0) {
+          reject(new WorkbenchError(
+            `Empty response from Workbench for "${apiFunc}"`,
+            "PROTOCOL_ERROR"
+          ));
           return;
         }
-        chunks.push(chunk);
+        try {
+          const result = decodeResponse<T>(response);
+          logger.debug(`Workbench response for "${apiFunc}":`, result);
+          resolvePromise(result);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          const apiError = message.startsWith("Workbench error:");
+          reject(new WorkbenchError(
+            apiError ? message : `Failed to decode response for "${apiFunc}": ${message}`,
+            apiError ? "API_ERROR" : "PROTOCOL_ERROR"
+          ));
+        }
+      };
+      socket.on("error", (error) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(new WorkbenchError(
+          (error as NodeJS.ErrnoException).code === "ECONNREFUSED"
+            ? `Cannot connect to Workbench at ${this.host}:${this.port}.`
+            : `Connection error: ${error.message}`,
+          (error as NodeJS.ErrnoException).code === "ECONNREFUSED"
+            ? "CONNECTION_REFUSED"
+            : "PROTOCOL_ERROR"
+        ));
       });
-
+      socket.on("data", (chunk) => {
+        totalBytes += chunk.length;
+        if (totalBytes <= MAX_RESPONSE_SIZE) {
+          chunks.push(chunk);
+          return;
+        }
+        if (settled) return;
+        settled = true;
+        cleanup();
+        socket.destroy();
+        reject(new WorkbenchError(
+          `Response for "${apiFunc}" exceeded ${MAX_RESPONSE_SIZE} bytes`,
+          "PROTOCOL_ERROR"
+        ));
+      });
       socket.on("end", () => {
         if (settled) return;
         settled = true;
         cleanup();
-
-        const responseBuf = Buffer.concat(chunks);
-        if (responseBuf.length === 0) {
-          reject(
-            new WorkbenchError(
-              `Empty response from Workbench for "${apiFunc}" — connection closed without data`,
-              "PROTOCOL_ERROR"
-            )
-          );
-          return;
-        }
-
-        try {
-          const result = decodeResponse<T>(responseBuf);
-          logger.debug(`Workbench response for "${apiFunc}":`, result);
-          resolve(result);
-        } catch (err) {
-          const errMsg = err instanceof Error ? err.message : String(err);
-          const isApiError = errMsg.startsWith("Workbench error:");
-          reject(
-            new WorkbenchError(
-              isApiError ? errMsg : `Failed to decode response for "${apiFunc}": ${errMsg}`,
-              isApiError ? "API_ERROR" : "PROTOCOL_ERROR"
-            )
-          );
-        }
+        decode();
       });
-
-      socket.on("close", (hadError) => {
+      socket.on("close", () => {
         if (settled) return;
-        // close fired without end — connection dropped unexpectedly
         settled = true;
         cleanup();
-
-        if (hadError) {
-          reject(
-            new WorkbenchError(
-              `Connection to Workbench closed with error for "${apiFunc}"`,
-              "PROTOCOL_ERROR"
-            )
-          );
-          return;
-        }
-
-        // No end event + no error = unusual. Try to decode what we have.
-        const responseBuf = Buffer.concat(chunks);
-        if (responseBuf.length === 0) {
-          reject(
-            new WorkbenchError(
-              `Connection closed without response for "${apiFunc}"`,
-              "PROTOCOL_ERROR"
-            )
-          );
-          return;
-        }
-
-        try {
-          const result = decodeResponse<T>(responseBuf);
-          resolve(result);
-        } catch (err) {
-          const errMsg = err instanceof Error ? err.message : String(err);
-          const isApiError = errMsg.startsWith("Workbench error:");
-          reject(
-            new WorkbenchError(
-              isApiError ? errMsg : `Failed to decode response for "${apiFunc}": ${errMsg}`,
-              isApiError ? "API_ERROR" : "PROTOCOL_ERROR"
-            )
-          );
-        }
+        decode();
       });
-
       socket.connect(this.port, this.host, () => {
-        logger.debug(
-          `Connected to Workbench at ${this.host}:${this.port}, calling "${apiFunc}"`
-        );
-        socket.end(requestBuf);
+        logger.debug(`Connected to Workbench at ${this.host}:${this.port}, calling "${apiFunc}"`);
+        socket.end(request);
       });
     });
   }
 }
-

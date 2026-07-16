@@ -3,7 +3,7 @@
  *
  * Actions: select, deselect, clear, getSelected
  * Note: The WorldEditorAPI does not expose AddToEntitySelection publicly.
- * "select" uses ClearEntitySelection + a workaround via entity iteration.
+ * "select" therefore returns a refusal without changing the current selection.
  * "deselect" uses RemoveFromEntitySelection.
  * "clear" uses ClearEntitySelection.
  * "getSelected" iterates GetSelectedEntity.
@@ -123,20 +123,12 @@ class EMCP_WB_SelectEntity : NetApiHandler
 				return resp;
 			}
 
-			// Clear existing selection and select via menu action approach
-			// The API provides ClearEntitySelection and GetSelectedEntity but
-			// not AddToEntitySelection directly. We use the following workaround:
-			// Set the entity as the focused/selected entity via ExecuteAction
-			api.ClearEntitySelection();
-
-			// Workaround: Use SetVariableValue on the entity to trigger selection
-			// or use the select-all-by-name approach via menu
-			// In practice, selection can be achieved by centering on the entity
-			// Best available approach: report the entity was found and suggest
-			// using the GUI or ExecuteAction("Edit", "Select All") + filter
-			resp.status = "ok";
+			// There is no supported public API for adding one entity to the
+			// selection. Do not clear or otherwise mutate the user's existing
+			// selection while pretending this operation succeeded.
+			resp.status = "error";
 			resp.selectedCount = api.GetSelectedEntitiesCount();
-			resp.message = "Entity found: " + req.name + ". Note: Programmatic AddToEntitySelection not available in public API. Use EMCP_WB_ExecuteAction with Edit menu for selection.";
+			resp.message = "Selection refused for entity " + req.name + ": WorldEditorAPI does not expose a supported AddToEntitySelection operation. The existing selection was left unchanged.";
 		}
 		else if (req.action == "deselect")
 		{

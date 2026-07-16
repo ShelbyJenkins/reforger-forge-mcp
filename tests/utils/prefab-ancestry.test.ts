@@ -1,11 +1,93 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeAll, afterAll } from "vitest";
+import { writeFileSync, mkdirSync, rmSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import type { Config } from "../../src/config.js";
+import { PakVirtualFS } from "../../src/pak/vfs.js";
 import {
   stripGuid,
   parseParentPath,
   parseComponents,
+  walkChain,
   mergeAncestryComponents,
   type AncestorLevel,
 } from "../../src/utils/prefab-ancestry.js";
+
+/** Build the subset of PAC1 needed by ancestry tests using real absolute offsets. */
+function buildAncestryPak(files: Array<{ path: string; content: string }>): Buffer {
+  interface TreeFile {
+    name: string;
+    offset: number;
+    length: number;
+  }
+  interface TreeDir {
+    name: string;
+    children: Map<string, TreeDir | TreeFile>;
+  }
+
+  const headLen = 0x1c;
+  const dataStart = 12 + 8 + headLen + 8;
+  const dataChunks: Buffer[] = [];
+  let offset = dataStart;
+  const root: TreeDir = { name: "", children: new Map() };
+
+  for (const file of files) {
+    const raw = Buffer.from(file.content, "utf-8");
+    const parts = file.path.split("/");
+    const fileName = parts.pop()!;
+    let dir = root;
+    for (const part of parts) {
+      let child = dir.children.get(part);
+      if (!child || !("children" in child)) {
+        child = { name: part, children: new Map() };
+        dir.children.set(part, child);
+      }
+      dir = child as TreeDir;
+    }
+    dir.children.set(fileName, { name: fileName, offset, length: raw.length });
+    dataChunks.push(raw);
+    offset += raw.length;
+  }
+
+  function serializeEntry(entry: TreeDir | TreeFile): Buffer {
+    const name = Buffer.from(entry.name, "utf-8");
+    const header = Buffer.from(["children" in entry ? 0 : 1, name.length]);
+    if ("children" in entry) {
+      const count = Buffer.alloc(4);
+      count.writeUInt32LE(entry.children.size);
+      return Buffer.concat([
+        header,
+        name,
+        count,
+        ...Array.from(entry.children.values(), serializeEntry),
+      ]);
+    }
+
+    const meta = Buffer.alloc(24);
+    meta.writeUInt32LE(entry.offset, 0);
+    meta.writeUInt32LE(entry.length, 4);
+    meta.writeUInt32LE(entry.length, 8);
+    return Buffer.concat([header, name, meta]);
+  }
+
+  const data = Buffer.concat(dataChunks);
+  const fileTree = serializeEntry(root);
+  const totalPayload = 4 + 8 + headLen + 8 + data.length + 8 + fileTree.length;
+  const pak = Buffer.alloc(8 + totalPayload);
+  let pos = 0;
+  pak.write("FORM", pos, 4, "ascii"); pos += 4;
+  pak.writeUInt32BE(totalPayload, pos); pos += 4;
+  pak.write("PAC1", pos, 4, "ascii"); pos += 4;
+  pak.write("HEAD", pos, 4, "ascii"); pos += 4;
+  pak.writeUInt32BE(headLen, pos); pos += 4 + headLen;
+  pak.write("DATA", pos, 4, "ascii"); pos += 4;
+  pak.writeUInt32BE(data.length, pos); pos += 4;
+  data.copy(pak, pos); pos += data.length;
+  pak.write("FILE", pos, 4, "ascii"); pos += 4;
+  pak.writeUInt32BE(fileTree.length, pos); pos += 4;
+  fileTree.copy(pak, pos);
+  return pak;
+}
 
 describe("stripGuid", () => {
   it("removes leading GUID prefix", () => {
@@ -107,5 +189,85 @@ describe("mergeAncestryComponents", () => {
     expect(merged.size).toBe(2);
     expect(merged.has("AAAAAAAAAAAAAAAA")).toBe(true);
     expect(merged.has("BBBBBBBBBBBBBBBB")).toBe(true);
+  });
+});
+
+describe("walkChain with real PAC1 absolute offsets", () => {
+  const testDir = join(tmpdir(), `reforger-forge-ancestry-${process.pid}`);
+  const gameDir = join(testDir, "game");
+  const dataDir = join(gameDir, "addons", "data");
+  const workshopDir = join(gameDir, "addons", "WCS_Armaments_fixture");
+  const config: Config = {
+    workbenchPath: "",
+    projectPath: join(testDir, "no-project"),
+    gamePath: gameDir,
+    dataDir: "",
+    patternsDir: "",
+    workbenchHost: "127.0.0.1",
+    workbenchPort: 5775,
+  };
+
+  beforeAll(() => {
+    mkdirSync(dataDir, { recursive: true });
+    mkdirSync(workshopDir, { recursive: true });
+
+    writeFileSync(join(dataDir, "data007.pak"), buildAncestryPak([
+      {
+        path: "Prefabs/Vehicles/Core/Wheeled_Car_Base.et",
+        content: 'Vehicle {\n components {\n  RigidBody "{AAAAAAAAAAAAAAAA}" {\n  }\n }\n}',
+      },
+      {
+        path: "Prefabs/Vehicles/Wheeled/S1203/S1203_base.et",
+        content: 'Vehicle : "{1111111111111111}Prefabs/Vehicles/Core/Wheeled_Car_Base.et" {\n components {\n  MeshObject "{BBBBBBBBBBBBBBBB}" {\n  }\n }\n}',
+      },
+      {
+        path: "Prefabs/Vehicles/Wheeled/S105/S105_rally.et",
+        content: 'Vehicle {\n components {\n  MeshObject "{CCCCCCCCCCCCCCCC}" {\n  }\n }\n}',
+      },
+      { path: "Sentinel/after_base.txt", content: "following entry bytes" },
+    ]));
+
+    writeFileSync(join(workshopDir, "data.pak"), buildAncestryPak([
+      {
+        path: "Prefabs/Vehicles/Wheeled/S105/S105_rally_wcs.et",
+        content: 'Vehicle : "{2222222222222222}Prefabs/Vehicles/Wheeled/S105/S105_rally.et" {\r\n components {\r\n  RigidBody "{DDDDDDDDDDDDDDDD}" {\r\n  }\r\n }\r\n}',
+      },
+      {
+        path: "Prefabs/Vehicles/Wheeled/S105/S105_rally_wcs_M134_M261.et",
+        content: 'Vehicle : "{3333333333333333}Prefabs/Vehicles/Wheeled/S105/S105_rally_wcs.et" {\r\n components {\r\n  MeshObject "{EEEEEEEEEEEEEEEE}" {\r\n  }\r\n }\r\n}',
+      },
+      { path: "Sentinel/after_workshop.txt", content: "following workshop bytes" },
+    ]));
+
+    PakVirtualFS.invalidate();
+  });
+
+  afterAll(() => {
+    PakVirtualFS.invalidate();
+    rmSync(testDir, { recursive: true, force: true });
+  });
+
+  it("resolves a base-game chain whose prefix was previously shifted by DATA start", () => {
+    const result = walkChain("Prefabs/Vehicles/Wheeled/S1203/S1203_base.et", config);
+    expect(result.warnings).toEqual([]);
+    expect(result.levels.map((level) => level.path)).toEqual([
+      "Prefabs/Vehicles/Core/Wheeled_Car_Base.et",
+      "Prefabs/Vehicles/Wheeled/S1203/S1203_base.et",
+    ]);
+    expect(result.levels[1].rawContent).toMatch(/^Vehicle :/);
+  });
+
+  it("resolves a Workshop chain across nested and base-game PAKs", () => {
+    const result = walkChain(
+      "Prefabs/Vehicles/Wheeled/S105/S105_rally_wcs_M134_M261.et",
+      config
+    );
+    expect(result.warnings).toEqual([]);
+    expect(result.levels.map((level) => level.path)).toEqual([
+      "Prefabs/Vehicles/Wheeled/S105/S105_rally.et",
+      "Prefabs/Vehicles/Wheeled/S105/S105_rally_wcs.et",
+      "Prefabs/Vehicles/Wheeled/S105/S105_rally_wcs_M134_M261.et",
+    ]);
+    expect(result.levels[2].entityClass).toBe("Vehicle");
   });
 });

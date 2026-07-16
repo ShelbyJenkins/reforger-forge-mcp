@@ -1,0 +1,9 @@
+{
+  "protocolVersion": "1.0",
+  "jobId": "job-example-17",
+  "idempotencyKey": "capture-test-17",
+  "deadlineAt": "2026-07-16T20:00:15.000Z",
+  "view": { "kind": "lookAt", "position": [100, 25, 200], "target": [120, 2, 240], "fov": 60 },
+  "settleFrames": 3,
+  "performancePolicy": "evidence"
+}

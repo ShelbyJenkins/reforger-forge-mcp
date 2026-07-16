@@ -17,7 +17,9 @@ import { parsePakIndex } from "../../src/pak/reader.js";
 function buildTestPak(files: Array<{ path: string; content: string; compress: boolean }>): Buffer {
   // ── Build DATA payload and FILE tree simultaneously ────────────────────
   const dataChunks: Buffer[] = [];
-  let dataOffset = 0;
+  const headLen = 0x1c;
+  const dataStart = 12 + 8 + headLen + 8;
+  let dataOffset = dataStart;
 
   interface TreeFile {
     name: string;
@@ -114,7 +116,6 @@ function buildTestPak(files: Array<{ path: string; content: string; compress: bo
   const dataPayload = Buffer.concat(dataChunks);
 
   // ── HEAD chunk (minimal: 0x1c bytes of zeros) ──────────────────────────
-  const headLen = 0x1c;
   const headPayload = Buffer.alloc(headLen);
 
   // ── Assemble chunks ────────────────────────────────────────────────────
@@ -184,6 +185,7 @@ describe("parsePakIndex", () => {
     expect(hello).toBeDefined();
     expect(hello.kind).toBe("file");
     expect(hello.compressed).toBe(false);
+    expect(hello.offset).toBe(12 + 8 + 0x1c + 8); // absolute .pak position
     expect(hello.decompressedLen).toBe(Buffer.from("void main() {}").length);
   });
 

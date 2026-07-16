@@ -151,6 +151,11 @@ describe("enfusion-text serializer", () => {
     expect(text).toContain("}");
   });
 
+  it("preserves parsed bare identifier properties", () => {
+    const node = parse(`TestNode {\n Mode Runtime\n}`);
+    expect(serialize(node)).toContain("Mode Runtime");
+  });
+
   it("serializes node with inheritance", () => {
     const node = createNode("GenericEntity", {
       inheritance: "{GUID}Prefabs/Base.et",

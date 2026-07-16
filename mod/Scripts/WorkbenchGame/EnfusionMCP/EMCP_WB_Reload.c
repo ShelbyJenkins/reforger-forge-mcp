@@ -47,55 +47,9 @@ class EMCP_WB_Reload : NetApiHandler
 
 		if (target == "scripts" || target == "both")
 		{
-			ScriptEditor scriptEditor = Workbench.GetModule(ScriptEditor);
-			if (scriptEditor)
-			{
-				// Try known menu paths for script compilation in ScriptEditor
-				array<string> menuPath = {};
-				bool compiled = false;
-
-				// Try "Script, Compile" first
-				menuPath.Insert("Script");
-				menuPath.Insert("Compile");
-				compiled = scriptEditor.ExecuteAction(menuPath);
-
-				if (!compiled)
-				{
-					// Try "Build, Compile All"
-					menuPath.Clear();
-					menuPath.Insert("Build");
-					menuPath.Insert("Compile All");
-					compiled = scriptEditor.ExecuteAction(menuPath);
-				}
-
-				if (!compiled)
-				{
-					// Try "Script, Compile All"
-					menuPath.Clear();
-					menuPath.Insert("Script");
-					menuPath.Insert("Compile All");
-					compiled = scriptEditor.ExecuteAction(menuPath);
-				}
-
-				if (!compiled)
-				{
-					// Try via WorldEditor as fallback
-					WorldEditor worldEditor = Workbench.GetModule(WorldEditor);
-					if (worldEditor)
-					{
-						menuPath.Clear();
-						menuPath.Insert("Plugins");
-						menuPath.Insert("Reload Scripts");
-						compiled = worldEditor.ExecuteAction(menuPath);
-					}
-				}
-
-				results.Insert("Scripts: compilation triggered (ExecuteAction=" + compiled.ToString() + ")");
-			}
-			else
-			{
-				results.Insert("Scripts: ScriptEditor module not available");
-			}
+			resp.status = "error";
+			resp.message = "Script reload is disabled in every editor state. Use wb_restart for a clean, verified MCP-owned -noThrow compilation.";
+			return resp;
 		}
 
 		if (target == "plugins" || target == "both")

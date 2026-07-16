@@ -24,7 +24,7 @@ The arma-knowledge patterns base has a single `animation-graph.md` covering basi
 ### Folder Structure
 
 ```
-C:\Users\Steffen\.claude\arma-knowledge\patterns\Character_And_Animation\
+<knowledge-base>/patterns/Character_And_Animation/
 ├── gadgets-actions.md                  (existing, unchanged)
 ├── animation-graph.md                  (DELETED — content migrated)
 └── animation/
@@ -144,7 +144,7 @@ Every AGF node type with: purpose, key properties, usage pattern, gotchas. Categ
 
 ## Part 2: New MCP Tools
 
-All three tools added to `enfusion-mcp-BK` repo, following existing tool patterns in `src/tools/`.
+All three tools added to the `reforger-forge-mcp` repo, following existing tool patterns in `src/tools/`.
 
 ### Tool 1: `animation_graph_inspect`
 

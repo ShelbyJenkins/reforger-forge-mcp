@@ -2,7 +2,6 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { existsSync, mkdirSync, writeFileSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { resolve, join, extname, relative } from "node:path";
-import { spawn } from "node:child_process";
 import type { Config } from "../config.js";
 import { generateGproj } from "../templates/gproj.js";
 import { generateScript } from "../templates/script.js";
@@ -12,70 +11,6 @@ import type { SearchEngine } from "../index/search-engine.js";
 import { parse, getProperty } from "../formats/enfusion-text.js";
 
 // ─── build helpers ────────────────────────────────────────────────────────────
-
-const WORKBENCH_DIAG_EXE = "ArmaReforgerWorkbenchSteamDiag.exe";
-const BUILD_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
-
-function findWorkbenchExe(workbenchPath: string): string | null {
-  // Check Workbench subdirectory first (standard Steam layout: "Arma Reforger Tools/Workbench/")
-  const subPath = join(workbenchPath, "Workbench", WORKBENCH_DIAG_EXE);
-  if (existsSync(subPath)) return subPath;
-
-  // Check root (in case config points directly to Workbench/)
-  const rootPath = join(workbenchPath, WORKBENCH_DIAG_EXE);
-  if (existsSync(rootPath)) return rootPath;
-
-  return null;
-}
-
-function runBuild(
-  exePath: string,
-  args: string[],
-  timeoutMs: number
-): Promise<{ exitCode: number; stdout: string; stderr: string; timedOut: boolean }> {
-  return new Promise((resolve) => {
-    let stdout = "";
-    let stderr = "";
-    let timedOut = false;
-
-    const proc = spawn(exePath, args, {
-      windowsHide: true,
-    });
-
-    const timer = setTimeout(() => {
-      timedOut = true;
-      proc.kill("SIGTERM");
-    }, timeoutMs);
-
-    proc.stdout.on("data", (data) => {
-      stdout += data.toString();
-    });
-
-    proc.stderr.on("data", (data) => {
-      stderr += data.toString();
-    });
-
-    proc.on("close", (code) => {
-      clearTimeout(timer);
-      resolve({
-        exitCode: code ?? 1,
-        stdout,
-        stderr,
-        timedOut,
-      });
-    });
-
-    proc.on("error", (err) => {
-      clearTimeout(timer);
-      resolve({
-        exitCode: 1,
-        stdout,
-        stderr: stderr + `\nProcess error: ${err.message}`,
-        timedOut: false,
-      });
-    });
-  });
-}
 
 // ─── create helpers ───────────────────────────────────────────────────────────
 
@@ -395,11 +330,11 @@ export function registerMod(
     "mod",
     {
       description:
-        "Manage Arma Reforger addons: build with the Workbench CLI, scaffold a new addon, or validate an existing addon without building.",
+        "Scaffold or validate Arma Reforger addons. The legacy build action is retained only to return a safe refusal; use a project-owned bounded build wrapper.",
       inputSchema: {
         action: z
           .enum(["build", "create", "validate"])
-          .describe("Action to perform: 'build' compiles the addon, 'create' scaffolds a new addon, 'validate' checks an existing addon."),
+          .describe("Action to perform: 'create' scaffolds, 'validate' checks, and legacy 'build' returns a safe refusal."),
 
         // ── build params ──────────────────────────────────────────────────────
         addonName: z
@@ -462,104 +397,16 @@ export function registerMod(
 
       // ── build ──────────────────────────────────────────────────────────────
       if (action === "build") {
-        if (!addonName) {
-          return {
-            content: [{ type: "text", text: "Missing required parameter for action 'build': addonName" }],
-            isError: true,
-          };
-        }
-
-        const exePath = findWorkbenchExe(config.workbenchPath);
-        if (!exePath) {
-          return {
-            content: [
-              {
-                type: "text",
-                text: `Workbench not found at: ${config.workbenchPath}\n\n${WORKBENCH_DIAG_EXE} is required for building.\n\nInstall Arma Reforger Tools from Steam, or set ENFUSION_WORKBENCH_PATH to the correct path.\n\nNote: You need the Diag version (opt into "Profiling Build" beta in Steam).`,
-              },
-            ],
-            isError: true,
-          };
-        }
-
-        const buildOutput =
-          outputPath ||
-          resolve(config.workbenchPath, "addons", addonName, "output");
-
-        const args: string[] = [
-          "-wbModule=ResourceManager",
-          `-buildData`,
-          platform ?? "PC",
-          buildOutput,
-          addonName,
-        ];
-
-        if (gprojPath) {
-          args.push(`-gproj`, gprojPath);
-        }
-
-        if (filterPath) {
-          args.push(`-filterPath`, filterPath);
-        }
-
-        try {
-          const startTime = Date.now();
-          const result = await runBuild(exePath, args, BUILD_TIMEOUT_MS);
-          const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-
-          const lines: string[] = [];
-          lines.push(`## Build Result: ${addonName}`);
-          lines.push("");
-
-          if (result.timedOut) {
-            lines.push(`**Status:** TIMEOUT (exceeded ${BUILD_TIMEOUT_MS / 1000}s limit)`);
-            lines.push("The build process was killed. Try building a smaller scope with filterPath.");
-          } else if (result.exitCode === 0) {
-            lines.push("**Status:** SUCCESS");
-            lines.push(`**Build time:** ${elapsed}s`);
-            lines.push(`**Output:** ${buildOutput}`);
-          } else {
-            lines.push(`**Status:** FAILED (exit code ${result.exitCode})`);
-            lines.push(`**Build time:** ${elapsed}s`);
-          }
-
-          lines.push("");
-          lines.push(`**Command:** ${WORKBENCH_DIAG_EXE} ${args.join(" ")}`);
-
-          if (result.stdout.trim()) {
-            lines.push("");
-            lines.push("### Output");
-            lines.push("```");
-            const stdoutLines = result.stdout.trim().split("\n");
-            const shown = stdoutLines.slice(-100);
-            if (stdoutLines.length > 100) {
-              lines.push(`... (${stdoutLines.length - 100} lines omitted)`);
-            }
-            lines.push(shown.join("\n"));
-            lines.push("```");
-          }
-
-          if (result.stderr.trim()) {
-            lines.push("");
-            lines.push("### Errors");
-            lines.push("```");
-            const stderrLines = result.stderr.trim().split("\n");
-            const shown = stderrLines.slice(-50);
-            if (stderrLines.length > 50) {
-              lines.push(`... (${stderrLines.length - 50} lines omitted)`);
-            }
-            lines.push(shown.join("\n"));
-            lines.push("```");
-          }
-
-          return { content: [{ type: "text", text: lines.join("\n") }] };
-        } catch (e) {
-          const msg = e instanceof Error ? e.message : String(e);
-          return {
-            content: [{ type: "text", text: `Error running build: ${msg}` }],
-            isError: true,
-          };
-        }
+        return {
+          content: [{
+            type: "text",
+            text:
+              "Direct MCP Workbench builds are disabled because a server crash cannot supervise their process lifetime safely. " +
+              "Use a project-owned bounded build wrapper that enforces a machine-wide launch lock, -noThrow, -wbSilent, " +
+              "an explicit platform and target folder, exact-child cleanup, and log validation.",
+          }],
+          isError: true,
+        };
       }
 
       // ── create ─────────────────────────────────────────────────────────────
@@ -709,8 +556,8 @@ export function registerMod(
               // Ensure directory exists (prefabs go in type-specific subdirs)
               const prefabDir = join(addonDir, "Prefabs");
               mkdirSync(prefabDir, { recursive: true });
-              // Note: prefab file generation is done via prefab_create tool for full control
-              createdFiles.push(`(Use prefab_create for: ${prefabName})`);
+              // Prefab generation is handled by the merged prefab tool for full control.
+              createdFiles.push(`(Use prefab with action "create" for: ${prefabName})`);
             }
 
             // Apply pattern configs

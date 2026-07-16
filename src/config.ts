@@ -4,6 +4,23 @@ import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
 import { logger } from "./utils/logger.js";
 
+export interface ObserverConfig {
+  /** Optional managed observer root. The agent default is outside projectPath. */
+  managedRoot?: string;
+  /** Optional approved root for observer-exclusive runtime profiles. */
+  profileRoot?: string;
+  /** Optional override for the packaged private-child entry point. */
+  agentPath?: string;
+  startupTimeoutMs: number;
+  requestTimeoutMs: number;
+  defaultCaptureTimeoutMs: number;
+  maxInlineImageBytes: number;
+  retentionIntervalMs: number;
+  retentionMaxAgeMs: number;
+  retentionMaxBytes: number;
+  sessionTtlMs: number;
+}
+
 export interface Config {
   /** Path to "Arma Reforger Tools" installation */
   workbenchPath: string;
@@ -11,6 +28,15 @@ export interface Config {
   projectPath: string;
   /** Path to base game installation (auto-derived from workbenchPath) */
   gamePath: string;
+  /** Optional ordered addon roots passed to Workbench as one comma-separated
+   *  -addonsDir argument. Paths are validated before Workbench is launched. */
+  workbenchAddonDirs?: string[];
+  /** Suppress prompts for protected Workbench script operations in trusted
+   *  local projects. Disabled by default. */
+  workbenchScriptAuthorizeAll?: boolean;
+  /** Pass -noThrow to automated Workbench sessions so assertions are written
+   *  to the log instead of opening a modal dialog. Enabled by default. */
+  workbenchNoThrow?: boolean;
   /** Optional path to a pre-extracted game data library (fully flattened prefabs).
    *  When set, game_duplicate checks here first before falling back to pak loose files.
    *  Set via ENFUSION_EXTRACTED_PATH env var. */
@@ -23,6 +49,8 @@ export interface Config {
   workbenchHost: string;
   /** Workbench NET API port (default 5775) */
   workbenchPort: number;
+  /** Optional observer overrides plus bounded MCP/agent defaults. */
+  observer?: ObserverConfig;
   /** Default addon folder name used when modName is not specified in tool calls.
    *  Automatically set at runtime when wb_launch opens a .gproj file.
    *  Can also be set via ENFUSION_DEFAULT_MOD env var as a static fallback. */
@@ -32,7 +60,7 @@ export interface Config {
 const DEFAULT_WORKBENCH_PATH =
   "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Arma Reforger Tools";
 
-const DEFAULTS: Config = {
+const DEFAULTS: Config & { observer: ObserverConfig } = {
   workbenchPath: DEFAULT_WORKBENCH_PATH,
   projectPath: join(homedir(), "Documents", "My Games", "ArmaReforgerWorkbench", "addons"),
   gamePath: resolve(DEFAULT_WORKBENCH_PATH, "..", "Arma Reforger"),
@@ -49,6 +77,17 @@ const DEFAULTS: Config = {
   ),
   workbenchHost: "127.0.0.1",
   workbenchPort: 5775,
+  workbenchNoThrow: true,
+  observer: {
+    startupTimeoutMs: 10_000,
+    requestTimeoutMs: 30_000,
+    defaultCaptureTimeoutMs: 30_000,
+    maxInlineImageBytes: 8 * 1024 * 1024,
+    retentionIntervalMs: 60_000,
+    retentionMaxAgeMs: 7 * 24 * 60 * 60 * 1_000,
+    retentionMaxBytes: 512 * 1024 * 1024,
+    sessionTtlMs: 20 * 60 * 1_000,
+  },
 };
 
 function loadJsonFile(path: string): Partial<Config> {
@@ -68,26 +107,39 @@ function loadJsonFile(path: string): Partial<Config> {
 
 export function loadConfig(): Config {
   // 1. Start with defaults
-  const config = { ...DEFAULTS };
+  const config = { ...DEFAULTS, observer: { ...DEFAULTS.observer } };
 
-  // 2. Package-local config file (new name first, legacy fallback)
+  // 2. Load the user-home config as a lower-precedence base. The legacy name
+  //    is a fallback only when the current config file does not exist.
   const packageDir = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-  const localConfigPaths = [
-    resolve(packageDir, "reforger-forge.config.json"),
-    resolve(packageDir, "enfusion-mcp.config.json"),
-  ];
-  for (const path of localConfigPaths) {
-    Object.assign(config, loadJsonFile(path));
-  }
+  const homeConfigPath = resolve(homedir(), ".reforger-forge", "config.json");
+  const legacyHomeConfigPath = resolve(homedir(), ".enfusion-mcp", "config.json");
+  const homeConfig = loadJsonFile(
+    existsSync(homeConfigPath) ? homeConfigPath : legacyHomeConfigPath
+  );
+  const homeObserver = {
+    ...DEFAULTS.observer,
+    ...(homeConfig.observer && typeof homeConfig.observer === "object" ? homeConfig.observer : {}),
+  };
+  Object.assign(config, homeConfig);
+  config.observer = homeObserver;
 
-  // 3. User home config (new name first, legacy fallback)
-  const homeConfigPaths = [
-    resolve(homedir(), ".reforger-forge", "config.json"),
-    resolve(homedir(), ".enfusion-mcp", "config.json"),
-  ];
-  for (const path of homeConfigPaths) {
-    Object.assign(config, loadJsonFile(path));
-  }
+  // 3. Package-local config overrides the user-home config. Its legacy name is
+  //    likewise considered only when the current file is absent.
+  const localConfigPath = resolve(packageDir, "reforger-forge.config.json");
+  const legacyLocalConfigPath = resolve(packageDir, "enfusion-mcp.config.json");
+  const localConfig = loadJsonFile(
+    existsSync(localConfigPath) ? localConfigPath : legacyLocalConfigPath
+  );
+  const localObserver = {
+    ...config.observer,
+    ...(localConfig.observer && typeof localConfig.observer === "object" ? localConfig.observer : {}),
+  };
+  Object.assign(config, localConfig);
+  config.observer = localObserver;
+
+  const gamePathConfigured =
+    homeConfig.gamePath !== undefined || localConfig.gamePath !== undefined;
 
   // 4. Environment variables override everything
   if (process.env.ENFUSION_WORKBENCH_PATH) {
@@ -119,9 +171,41 @@ export function loadConfig(): Config {
   if (process.env.ENFUSION_DEFAULT_MOD) {
     config.defaultMod = process.env.ENFUSION_DEFAULT_MOD;
   }
+  if (process.env.REFORGER_FORGE_OBSERVER_ROOT) {
+    config.observer.managedRoot = process.env.REFORGER_FORGE_OBSERVER_ROOT;
+  }
+  if (process.env.REFORGER_FORGE_OBSERVER_PROFILE_ROOT) {
+    config.observer.profileRoot = process.env.REFORGER_FORGE_OBSERVER_PROFILE_ROOT;
+  }
+  if (process.env.REFORGER_FORGE_OBSERVER_AGENT_PATH) {
+    config.observer.agentPath = process.env.REFORGER_FORGE_OBSERVER_AGENT_PATH;
+  }
+  type ObserverNumericKey = Exclude<keyof ObserverConfig, "managedRoot" | "profileRoot" | "agentPath">;
+  const observerNumericEnvironment: Array<[ObserverNumericKey, string]> = [
+    ["startupTimeoutMs", "REFORGER_FORGE_OBSERVER_STARTUP_TIMEOUT_MS"],
+    ["requestTimeoutMs", "REFORGER_FORGE_OBSERVER_REQUEST_TIMEOUT_MS"],
+    ["defaultCaptureTimeoutMs", "REFORGER_FORGE_OBSERVER_CAPTURE_TIMEOUT_MS"],
+    ["maxInlineImageBytes", "REFORGER_FORGE_OBSERVER_MAX_INLINE_IMAGE_BYTES"],
+    ["retentionIntervalMs", "REFORGER_FORGE_OBSERVER_RETENTION_INTERVAL_MS"],
+    ["retentionMaxAgeMs", "REFORGER_FORGE_OBSERVER_RETENTION_MAX_AGE_MS"],
+    ["retentionMaxBytes", "REFORGER_FORGE_OBSERVER_RETENTION_MAX_BYTES"],
+    ["sessionTtlMs", "REFORGER_FORGE_OBSERVER_SESSION_TTL_MS"],
+  ];
+  for (const [key, environmentName] of observerNumericEnvironment) {
+    const raw = process.env[environmentName];
+    if (!raw) continue;
+    const value = Number(raw);
+    if (Number.isSafeInteger(value) && value > 0) {
+      config.observer[key] = value;
+    }
+  }
 
-  // Auto-derive gamePath from workbenchPath if not explicitly set
-  if (!process.env.ENFUSION_GAME_PATH && config.workbenchPath !== DEFAULT_WORKBENCH_PATH) {
+  // Auto-derive gamePath only when neither JSON nor the environment supplied it.
+  if (
+    !process.env.ENFUSION_GAME_PATH &&
+    !gamePathConfigured &&
+    config.workbenchPath !== DEFAULT_WORKBENCH_PATH
+  ) {
     config.gamePath = resolve(config.workbenchPath, "..", "Arma Reforger");
   }
 

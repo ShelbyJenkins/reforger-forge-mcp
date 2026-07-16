@@ -14,5 +14,5 @@
     "declarationMap": true,
     "sourceMap": true
   },
-  "include": ["src/**/*", "scripts/**/*", "tests/**/*"]
+  "include": ["src/**/*", "observer/agent/**/*", "observer/protocol/**/*", "scripts/**/*", "tests/**/*"]
 }

@@ -15,6 +15,9 @@
 export interface EnfusionProperty {
   key: string;
   value: string | EnfusionNode;
+  /** Preserve whether a parsed string value was quoted. For newly-created
+   *  properties, strings default to quoted while numeric/boolean literals do not. */
+  quoted?: boolean;
 }
 
 /** A node in the Enfusion text tree */
@@ -297,7 +300,7 @@ class Parser {
             node.children.push(child);
           } else {
             // Key "value" — simple property
-            node.properties.push({ key: identTok.value, value: strTok.value });
+            node.properties.push({ key: identTok.value, value: strTok.value, quoted: true });
           }
         } else if (after.type === TokenType.Identifier) {
           // Could be: Key SubNode  (e.g., "Configurations" "GameProjectConfig PC { ... }")
@@ -336,11 +339,11 @@ class Parser {
               // Ident Ident "string" without brace — unusual
               // Treat first ident as key, rest as value
               this.pos = saved2;
-              node.properties.push({ key: identTok.value, value: ident2.value });
+              node.properties.push({ key: identTok.value, value: ident2.value, quoted: false });
             }
           } else {
             // Key BareValue — simple property with unquoted value
-            node.properties.push({ key: identTok.value, value: ident2.value });
+            node.properties.push({ key: identTok.value, value: ident2.value, quoted: false });
           }
         } else if (after.type === TokenType.OpenBrace) {
           // TypeName { ... } — child node with no ID
@@ -456,12 +459,13 @@ function serializeNode(node: EnfusionNode, indent: number): string {
   // Properties
   for (const prop of node.properties) {
     if (typeof prop.value === "string") {
-      // Emit bare (unquoted) values for numbers, booleans, and bare identifiers (enums like Manual, Runtime, None)
-      if (
+      // Preserve the source representation when parsing and re-serializing.
+      // For newly-created properties, only numeric and boolean literals are
+      // emitted bare; ordinary strings (including IDs and GUIDs) are quoted.
+      const isLiteral =
         /^-?\d+(\.\d+)?$/.test(prop.value) ||
-        prop.value === "true" || prop.value === "false" ||
-        /^[A-Za-z_][A-Za-z0-9_]*$/.test(prop.value)
-      ) {
+        prop.value === "true" || prop.value === "false";
+      if (prop.quoted === false || (prop.quoted === undefined && isLiteral)) {
         parts.push(`${innerPad}${prop.key} ${prop.value}`);
       } else {
         parts.push(`${innerPad}${prop.key} "${escapeString(prop.value)}"`);

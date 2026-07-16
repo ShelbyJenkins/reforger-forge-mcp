@@ -1,0 +1,17 @@
+{
+  "protocolVersion": "1.0",
+  "addonVersion": "0.1.0",
+  "bundleDigest": "1111111111111111111111111111111111111111111111111111111111111111",
+  "buildIdentity": "000cec19226673ce911c68dca027dca7449ff58a604fe0cef6509afbc4d7ec22",
+  "expectedRuntimeKind": "client",
+  "sessionId": "session-example-01",
+  "launchNonce": "launch_nonce_example_12345678901234567890",
+  "sessionToken": "session_token_example_1234567890123456789",
+  "createdAt": "2026-07-16T20:00:00.000Z",
+  "expiresAt": "2026-07-16T20:20:00.000Z",
+  "expiresAtUnix": 1784233200,
+  "agent": { "host": "127.0.0.1", "port": 47831, "instanceId": "agent-example-01" },
+  "transportPreference": ["rest", "mailbox"],
+  "profileDirectoryName": "ReforgerForgeObserver",
+  "limits": { "maxPendingJobs": 4, "maxCaptureRatePerMinute": 12, "maxArtifactBytes": 67108864, "minFov": 10, "maxFov": 120, "maxSettleFrames": 30, "maxCaptureDistance": 100000 }
+}

@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://reforger-forge.dev/observer/v1/heartbeat.schema.json",
+  "title": "Observer heartbeat",
+  "type": "object",
+  "required": ["protocolVersion", "sessionId", "instanceId", "instanceNonce", "sequence", "sentAt", "worldId", "worldEpoch", "capabilities", "transportHealthy"],
+  "properties": {
+    "protocolVersion": { "type": "string", "pattern": "^1\\.[0-9]+$" },
+    "sessionId": { "$ref": "#/$defs/id" },
+    "instanceId": { "$ref": "#/$defs/id" },
+    "instanceNonce": { "type": "string", "minLength": 32, "maxLength": 256 },
+    "sequence": { "type": "integer", "minimum": 0 },
+    "sentAt": { "type": "string", "format": "date-time" },
+    "worldId": { "oneOf": [{ "type": "string", "minLength": 1, "maxLength": 512 }, { "type": "null" }] },
+    "worldEpoch": { "type": "integer", "minimum": 0 },
+    "capabilities": { "type": "array", "maxItems": 64, "items": { "type": "string", "maxLength": 64 } },
+    "activeJobId": { "oneOf": [{ "$ref": "#/$defs/id" }, { "type": "null" }] },
+    "cameraLeaseJobId": { "oneOf": [{ "$ref": "#/$defs/id" }, { "type": "null" }] },
+    "transportHealthy": { "type": "boolean" },
+    "lastErrorCode": { "type": ["string", "null"] }
+  },
+  "$defs": { "id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{1,96}$" } }
+}

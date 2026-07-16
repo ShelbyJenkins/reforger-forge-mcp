@@ -11,13 +11,22 @@ import {
 import { validateGraph } from "../../src/animation/validator.js";
 import { generateSuggestions, formatSuggestions } from "../../src/animation/suggestions.js";
 
-const BASE = "C:/Users/Steffen/Documents/My Games/ArmaReforgerWorkbench/profile/TESTANIM";
+// Opt in by pointing this at a directory containing the M151A2 fixture files.
+const fixtureRoot = process.env.REFORGER_ANIMATION_FIXTURES;
+const describeWithFixtures = fixtureRoot ? describe : describe.skip;
 
 function readFile(name: string): string {
-  return readFileSync(`${BASE}/${name}`, "utf-8");
+  if (!fixtureRoot) {
+    throw new Error("Set REFORGER_ANIMATION_FIXTURES to run this integration suite");
+  }
+  return readFileSync(`${fixtureRoot}/${name}`, "utf-8");
 }
 
-describe("M151A2 Integration", () => {
+describeWithFixtures("M151A2 Integration", () => {
+  // Vitest still invokes a skipped suite's factory while collecting tests.
+  // Return before loading fixtures when the opt-in path is not configured.
+  if (!fixtureRoot) return;
+
   const agrContent = readFile("M151A2.agr");
   const agfContent = readFile("M151A2.agf");
   const astContent = readFile("M151A2.ast");

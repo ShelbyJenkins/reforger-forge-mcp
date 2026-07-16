@@ -30,7 +30,7 @@ via `EMCP_WB_ModifyEntity` may not produce the correct saved nesting.
 **Files:**
 - `src/tools/wb-scenario.ts` (slot reparent order fixed, may need layer-file-write approach)
 - `mod/Scripts/WorkbenchGame/EnfusionMCP/EMCP_WB_ModifyEntity.c` (reparent handler)
-- Test layer: `TESTING CLAUD/worlds/unnamed_Layers/default.layer`
+- Test layer: `<example-addon>/worlds/unnamed_Layers/default.layer`
 
 ---
 
