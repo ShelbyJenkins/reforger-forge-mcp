@@ -1,0 +1,14 @@
+{
+  "extends": "../tsconfig.json",
+  "compilerOptions": {
+    "rootDir": ".",
+    "outDir": "../dist/observer"
+  },
+  "include": [
+    "agent/**/*.ts",
+    "protocol/**/*.ts"
+  ],
+  "exclude": [
+    "**/*.test.ts"
+  ]
+}

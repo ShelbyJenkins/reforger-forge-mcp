@@ -39,6 +39,17 @@ const configEnvKeys = [
   "ENFUSION_WORKBENCH_HOST",
   "ENFUSION_WORKBENCH_PORT",
   "ENFUSION_DEFAULT_MOD",
+  "REFORGER_FORGE_OBSERVER_ROOT",
+  "REFORGER_FORGE_OBSERVER_PROFILE_ROOT",
+  "REFORGER_FORGE_OBSERVER_AGENT_PATH",
+  "REFORGER_FORGE_OBSERVER_STARTUP_TIMEOUT_MS",
+  "REFORGER_FORGE_OBSERVER_REQUEST_TIMEOUT_MS",
+  "REFORGER_FORGE_OBSERVER_CAPTURE_TIMEOUT_MS",
+  "REFORGER_FORGE_OBSERVER_MAX_INLINE_IMAGE_BYTES",
+  "REFORGER_FORGE_OBSERVER_RETENTION_INTERVAL_MS",
+  "REFORGER_FORGE_OBSERVER_RETENTION_MAX_AGE_MS",
+  "REFORGER_FORGE_OBSERVER_RETENTION_MAX_BYTES",
+  "REFORGER_FORGE_OBSERVER_SESSION_TTL_MS",
 ] as const;
 
 function putConfig(path: string, values: Record<string, unknown>): void {
@@ -135,5 +146,25 @@ describe("loadConfig", () => {
     vi.stubEnv("ENFUSION_GAME_PATH", environmentGamePath);
 
     expect(loadConfig().gamePath).toBe(environmentGamePath);
+  });
+
+  it("merges observer defaults and applies bounded environment overrides", () => {
+    putConfig(homeConfigPath, {
+      observer: { maxInlineImageBytes: 1_000_000, sessionTtlMs: 90_000 },
+    });
+    putConfig(localConfigPath, {
+      observer: { defaultCaptureTimeoutMs: 45_000 },
+    });
+    vi.stubEnv("REFORGER_FORGE_OBSERVER_ROOT", resolve("D:\\Observer", "managed"));
+    vi.stubEnv("REFORGER_FORGE_OBSERVER_MAX_INLINE_IMAGE_BYTES", "2000000");
+    vi.stubEnv("REFORGER_FORGE_OBSERVER_SESSION_TTL_MS", "not-a-number");
+
+    const observer = loadConfig().observer!;
+
+    expect(observer.managedRoot).toBe(resolve("D:\\Observer", "managed"));
+    expect(observer.maxInlineImageBytes).toBe(2_000_000);
+    expect(observer.defaultCaptureTimeoutMs).toBe(45_000);
+    expect(observer.sessionTtlMs).toBe(90_000);
+    expect(observer.retentionMaxAgeMs).toBeGreaterThan(0);
   });
 });

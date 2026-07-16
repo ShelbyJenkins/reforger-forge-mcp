@@ -1,12 +1,27 @@
 [CmdletBinding()]
 param(
 	[Parameter(Mandatory = $true)]
-	[ValidateSet('HoldMutex', 'InspectCurrent', 'InspectProcess', 'ListWorkbench', 'VerifyTerminate', 'ReplaceState', 'ArchiveState')]
-	[string]$Mode
+	[ValidateSet('HoldMutex', 'InspectCurrent', 'InspectProcess', 'ListWorkbench', 'VerifyEndpointOwner', 'VerifyTerminate', 'ReplaceState', 'ArchiveState')]
+	[string]$Mode,
+
+	[long]$DeadlineUnixMs = 0
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+
+function Get-LifecycleUnixMilliseconds
+{
+	return [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+}
+
+function Assert-LifecycleDeadline
+{
+	if ($DeadlineUnixMs -gt 0 -and (Get-LifecycleUnixMilliseconds) -ge $DeadlineUnixMs)
+	{
+		throw "Lifecycle helper mode $Mode exceeded its self-enforced deadline."
+	}
+}
 
 function Write-LifecycleProtocol
 {
@@ -18,12 +33,15 @@ function Write-LifecycleProtocol
 
 function Read-LifecycleRequest
 {
+	Assert-LifecycleDeadline
 	$line = [Console]::In.ReadLine()
 	if ($null -eq $line -or [string]::IsNullOrWhiteSpace($line))
 	{
 		throw 'Lifecycle helper received no JSON request.'
 	}
-	return $line | ConvertFrom-Json
+	$request = $line | ConvertFrom-Json
+	Assert-LifecycleDeadline
+	return $request
 }
 
 function Get-LifecycleProperty
@@ -46,6 +64,8 @@ using System;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Globalization;
+using System.Net;
+using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using System.Text;
 
@@ -300,6 +320,190 @@ public static class LifecycleFile
             throw new Win32Exception(Marshal.GetLastWin32Error(), "Lifecycle-state archival failed.");
     }
 }
+
+public static class LifecycleTcpTable
+{
+    private const int AF_INET = 2;
+    private const int AF_INET6 = 23;
+    private const uint NO_ERROR = 0;
+    private const uint ERROR_INSUFFICIENT_BUFFER = 122;
+
+    private enum TCP_TABLE_CLASS
+    {
+        TCP_TABLE_BASIC_LISTENER,
+        TCP_TABLE_BASIC_CONNECTIONS,
+        TCP_TABLE_BASIC_ALL,
+        TCP_TABLE_OWNER_PID_LISTENER
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MIB_TCPROW_OWNER_PID
+    {
+        public uint State;
+        public uint LocalAddress;
+        public uint LocalPort;
+        public uint RemoteAddress;
+        public uint RemotePort;
+        public uint OwningPid;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MIB_TCP6ROW_OWNER_PID
+    {
+        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 16)]
+        public byte[] LocalAddress;
+        public uint LocalScopeId;
+        public uint LocalPort;
+        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 16)]
+        public byte[] RemoteAddress;
+        public uint RemoteScopeId;
+        public uint RemotePort;
+        public uint State;
+        public uint OwningPid;
+    }
+
+    private sealed class Listener
+    {
+        public IPAddress Address;
+        public int Port;
+        public int ProcessId;
+    }
+
+    [DllImport("iphlpapi.dll", SetLastError = true)]
+    private static extern uint GetExtendedTcpTable(
+        IntPtr table,
+        ref int size,
+        bool sorted,
+        int addressFamily,
+        TCP_TABLE_CLASS tableClass,
+        uint reserved);
+
+    private static int DecodePort(uint value)
+    {
+        return checked((int)(((value & 0xFFU) << 8) | ((value >> 8) & 0xFFU)));
+    }
+
+    private static List<Listener> ReadListeners(int addressFamily)
+    {
+        int size = 0;
+        uint result = GetExtendedTcpTable(
+            IntPtr.Zero,
+            ref size,
+            true,
+            addressFamily,
+            TCP_TABLE_CLASS.TCP_TABLE_OWNER_PID_LISTENER,
+            0);
+        if (result != ERROR_INSUFFICIENT_BUFFER || size <= 0)
+            throw new LifecycleProcessException(
+                "helper_failure",
+                "GetExtendedTcpTable size query failed with Windows error " +
+                    result.ToString(CultureInfo.InvariantCulture) + ".");
+
+        IntPtr buffer = Marshal.AllocHGlobal(size);
+        try
+        {
+            result = GetExtendedTcpTable(
+                buffer,
+                ref size,
+                true,
+                addressFamily,
+                TCP_TABLE_CLASS.TCP_TABLE_OWNER_PID_LISTENER,
+                0);
+            if (result != NO_ERROR)
+                throw new LifecycleProcessException(
+                    "helper_failure",
+                    "GetExtendedTcpTable failed with Windows error " +
+                        result.ToString(CultureInfo.InvariantCulture) + ".");
+
+            int count = Marshal.ReadInt32(buffer);
+            IntPtr current = IntPtr.Add(buffer, sizeof(uint));
+            List<Listener> listeners = new List<Listener>(count);
+            if (addressFamily == AF_INET)
+            {
+                int rowSize = Marshal.SizeOf(typeof(MIB_TCPROW_OWNER_PID));
+                for (int index = 0; index < count; index++)
+                {
+                    MIB_TCPROW_OWNER_PID row = (MIB_TCPROW_OWNER_PID)Marshal.PtrToStructure(
+                        current,
+                        typeof(MIB_TCPROW_OWNER_PID));
+                    listeners.Add(new Listener
+                    {
+                        Address = new IPAddress(BitConverter.GetBytes(row.LocalAddress)),
+                        Port = DecodePort(row.LocalPort),
+                        ProcessId = checked((int)row.OwningPid)
+                    });
+                    current = IntPtr.Add(current, rowSize);
+                }
+            }
+            else
+            {
+                int rowSize = Marshal.SizeOf(typeof(MIB_TCP6ROW_OWNER_PID));
+                for (int index = 0; index < count; index++)
+                {
+                    MIB_TCP6ROW_OWNER_PID row = (MIB_TCP6ROW_OWNER_PID)Marshal.PtrToStructure(
+                        current,
+                        typeof(MIB_TCP6ROW_OWNER_PID));
+                    listeners.Add(new Listener
+                    {
+                        Address = new IPAddress(row.LocalAddress, row.LocalScopeId),
+                        Port = DecodePort(row.LocalPort),
+                        ProcessId = checked((int)row.OwningPid)
+                    });
+                    current = IntPtr.Add(current, rowSize);
+                }
+            }
+            return listeners;
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(buffer);
+        }
+    }
+
+    public static int ResolveLoopbackListenerOwner(string host, int port)
+    {
+        IPAddress target;
+        if (!IPAddress.TryParse(host, out target) || !IPAddress.IsLoopback(target))
+            throw new LifecycleProcessException(
+                "endpoint_not_loopback",
+                "Automated Workbench lifecycle control requires a numeric loopback endpoint.");
+        if (port <= 0 || port > 65535)
+            throw new LifecycleProcessException("helper_failure", "The lifecycle endpoint port is invalid.");
+
+        int family = target.AddressFamily == AddressFamily.InterNetwork ? AF_INET : AF_INET6;
+        IPAddress wildcard = family == AF_INET ? IPAddress.Any : IPAddress.IPv6Any;
+        HashSet<int> owners = new HashSet<int>();
+        foreach (Listener listener in ReadListeners(family))
+        {
+            if (listener.Port == port &&
+                (listener.Address.Equals(target) || listener.Address.Equals(wildcard)))
+            {
+                owners.Add(listener.ProcessId);
+            }
+        }
+        // A dual-mode IPv6 wildcard can accept an IPv4 loopback connection and
+        // appears only in the AF_INET6 owner table. Include it for an IPv4 target;
+        // the successful ping immediately before this check proves reachability.
+        if (family == AF_INET)
+        {
+            foreach (Listener listener in ReadListeners(AF_INET6))
+            {
+                if (listener.Port == port && listener.Address.Equals(IPAddress.IPv6Any))
+                    owners.Add(listener.ProcessId);
+            }
+        }
+        if (owners.Count == 0)
+            throw new LifecycleProcessException(
+                "listener_not_found",
+                "No listening TCP socket was found for the configured loopback endpoint.");
+        if (owners.Count != 1)
+            throw new LifecycleProcessException(
+                "listener_ambiguous",
+                "More than one process owns a matching listening TCP socket.");
+        foreach (int owner in owners) return owner;
+        throw new LifecycleProcessException("helper_failure", "Listener-owner resolution failed.");
+    }
+}
 '@
 
 function ConvertTo-LifecycleIdentity
@@ -332,6 +536,12 @@ function Invoke-HoldMutex
 	{
 		throw 'Mutex request is invalid.'
 	}
+	if ($DeadlineUnixMs -gt 0)
+	{
+		$remainingMs = $DeadlineUnixMs - (Get-LifecycleUnixMilliseconds)
+		if ($remainingMs -le 0) { Assert-LifecycleDeadline }
+		$timeoutMs = [Math]::Min($timeoutMs, [int][Math]::Min($remainingMs, [int]::MaxValue))
+	}
 
 	$security = [Security.AccessControl.MutexSecurity]::new()
 	$world = [Security.Principal.SecurityIdentifier]::new(
@@ -359,6 +569,7 @@ function Invoke-HoldMutex
 			$owned = $true
 			$abandoned = $true
 		}
+		Assert-LifecycleDeadline
 		if (-not $owned)
 		{
 			Write-LifecycleProtocol ([ordered]@{ ok = $false; status = 'timeout'; reason = 'mutex_timeout' })
@@ -388,6 +599,7 @@ function Invoke-InspectCurrent
 	try
 	{
 		$handle = [LifecycleProcessHandle]::Open($processId, $false)
+		Assert-LifecycleDeadline
 		$identity = ConvertTo-LifecycleIdentity -Handle $handle
 		$identity.userSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
 		Write-LifecycleProtocol ([ordered]@{ ok = $true; status = 'found'; identity = $identity })
@@ -411,12 +623,14 @@ function Invoke-InspectProcess
 	try
 	{
 		$handle = [LifecycleProcessHandle]::Open($processId, $false)
+		Assert-LifecycleDeadline
 		$identity = ConvertTo-LifecycleIdentity -Handle $handle
 		$argumentMatched = $null
 		if (-not [string]::IsNullOrWhiteSpace($expectedArgument))
 		{
 			$argumentMatched = $handle.HasExactArgument($expectedArgument)
 		}
+		Assert-LifecycleDeadline
 		Write-LifecycleProtocol ([ordered]@{
 			ok = $true
 			status = 'found'
@@ -448,6 +662,7 @@ function Invoke-ListWorkbench
 	$unverifiable = New-Object 'System.Collections.Generic.List[object]'
 	foreach ($process in [Diagnostics.Process]::GetProcessesByName('ArmaReforgerWorkbenchSteamDiag'))
 	{
+		Assert-LifecycleDeadline
 		$handle = $null
 		try
 		{
@@ -471,12 +686,154 @@ function Invoke-ListWorkbench
 			$process.Dispose()
 		}
 	}
+	Assert-LifecycleDeadline
 	Write-LifecycleProtocol ([ordered]@{
 		ok = $true
 		status = 'complete'
-		processes = @($processes)
-		unverifiable = @($unverifiable)
+		processes = @($processes | ForEach-Object { $_ })
+		unverifiable = @($unverifiable | ForEach-Object { $_ })
 	})
+}
+
+function Invoke-VerifyEndpointOwner
+{
+	$request = Read-LifecycleRequest
+	$endpoint = Get-LifecycleProperty -Object $request -Name 'endpoint'
+	$expected = Get-LifecycleProperty -Object $request -Name 'expected'
+	$hostName = [string](Get-LifecycleProperty -Object $endpoint -Name 'host' -Default '')
+	$portNumber = [int](Get-LifecycleProperty -Object $endpoint -Name 'port' -Default 0)
+	$processId = [int](Get-LifecycleProperty -Object $expected -Name 'pid' -Default 0)
+	$expectedPath = [string](Get-LifecycleProperty -Object $expected -Name 'executablePath' -Default '')
+	$expectedCreation = [string](Get-LifecycleProperty -Object $expected -Name 'creationTime' -Default '')
+	$expectedArgument = [string](Get-LifecycleProperty -Object $expected -Name 'ownerTokenArgument' -Default '')
+	$handle = $null
+	try
+	{
+		$loopbackAddress = $null
+		if (-not [Net.IPAddress]::TryParse($hostName, [ref]$loopbackAddress) -or
+			-not [Net.IPAddress]::IsLoopback($loopbackAddress))
+		{
+			throw [LifecycleProcessException]::new(
+				'endpoint_not_loopback',
+				'Automated Workbench lifecycle control requires a numeric loopback endpoint.')
+		}
+		if ($portNumber -le 0 -or $portNumber -gt 65535)
+		{
+			throw [LifecycleProcessException]::new('helper_failure', 'The lifecycle endpoint port is invalid.')
+		}
+		# Retain the expected process handle across both listener-table samples and
+		# the sole-Workbench scan so PID reuse cannot satisfy this operation.
+		$handle = [LifecycleProcessHandle]::Open($processId, $false)
+		$actualPath = $handle.GetExecutablePath()
+		$actualCreation = $handle.GetCreationTime()
+		if (-not [StringComparer]::OrdinalIgnoreCase.Equals(
+			[IO.Path]::GetFullPath($expectedPath),
+			[IO.Path]::GetFullPath($actualPath)))
+		{
+			throw [LifecycleProcessException]::new('executable_mismatch', 'The endpoint owner executable path does not match the recorded Workbench.')
+		}
+		if (-not [StringComparer]::Ordinal.Equals($expectedCreation, $actualCreation))
+		{
+			throw [LifecycleProcessException]::new('creation_time_mismatch', 'The endpoint owner creation time does not match the recorded Workbench.')
+		}
+		if ($handle.HasExited())
+		{
+			throw [LifecycleProcessException]::new('workbench_process_mismatch', 'The recorded Workbench exited before endpoint ownership could be proven.')
+		}
+		if (-not $handle.HasExactArgument($expectedArgument))
+		{
+			throw [LifecycleProcessException]::new('token_mismatch', 'The exact owner argument is absent from the endpoint-owner process.')
+		}
+		Assert-LifecycleDeadline
+
+		$firstListenerPid = [LifecycleTcpTable]::ResolveLoopbackListenerOwner($hostName, $portNumber)
+		if ($firstListenerPid -ne $processId)
+		{
+			throw [LifecycleProcessException]::new(
+				'listener_pid_mismatch',
+				"The listening TCP socket belongs to PID $firstListenerPid, not recorded Workbench PID $processId.")
+		}
+
+		$workbenchIdentities = New-Object 'System.Collections.Generic.List[object]'
+		foreach ($process in [Diagnostics.Process]::GetProcessesByName('ArmaReforgerWorkbenchSteamDiag'))
+		{
+			$scanHandle = $null
+			try
+			{
+				Assert-LifecycleDeadline
+				$scanHandle = [LifecycleProcessHandle]::Open($process.Id, $false)
+				[void]$workbenchIdentities.Add((ConvertTo-LifecycleIdentity -Handle $scanHandle))
+			}
+			catch [LifecycleProcessException]
+			{
+				if ($_.Exception.Reason -ne 'pid_not_found') { throw }
+			}
+			finally
+			{
+				if ($null -ne $scanHandle) { $scanHandle.Dispose() }
+				$process.Dispose()
+			}
+		}
+		if ($workbenchIdentities.Count -ne 1)
+		{
+			throw [LifecycleProcessException]::new(
+				'workbench_process_mismatch',
+				"Endpoint ownership requires exactly one Workbench process; found $($workbenchIdentities.Count).")
+		}
+		$soleWorkbench = $workbenchIdentities[0]
+		if ([int]$soleWorkbench.pid -ne $processId -or
+			-not [StringComparer]::Ordinal.Equals([string]$soleWorkbench.creationTime, $expectedCreation) -or
+			-not [StringComparer]::OrdinalIgnoreCase.Equals(
+				[IO.Path]::GetFullPath([string]$soleWorkbench.executablePath),
+				[IO.Path]::GetFullPath($expectedPath)))
+		{
+			throw [LifecycleProcessException]::new(
+				'workbench_process_mismatch',
+				'The sole Workbench process does not match the exact recorded identity.')
+		}
+
+		Assert-LifecycleDeadline
+		$secondListenerPid = [LifecycleTcpTable]::ResolveLoopbackListenerOwner($hostName, $portNumber)
+		if ($secondListenerPid -ne $processId)
+		{
+			throw [LifecycleProcessException]::new(
+				'listener_pid_mismatch',
+				'The listening TCP socket owner changed during endpoint verification.')
+		}
+		if ($handle.HasExited() -or -not $handle.HasExactArgument($expectedArgument))
+		{
+			throw [LifecycleProcessException]::new(
+				'workbench_process_mismatch',
+				'The exact Workbench identity changed during endpoint verification.')
+		}
+		Assert-LifecycleDeadline
+		Write-LifecycleProtocol ([ordered]@{
+			ok = $true
+			status = 'owned'
+			listenerPid = $secondListenerPid
+			identity = ConvertTo-LifecycleIdentity -Handle $handle
+		})
+	}
+	catch [LifecycleProcessException]
+	{
+		if ($_.Exception.Reason -eq 'pid_not_found')
+		{
+			Write-LifecycleProtocol ([ordered]@{
+				ok = $false
+				status = 'refused'
+				reason = 'workbench_process_mismatch'
+				message = 'The recorded Workbench process is absent.'
+			})
+		}
+		else
+		{
+			Write-LifecycleProcessRefusal -Exception $_.Exception
+		}
+	}
+	finally
+	{
+		if ($null -ne $handle) { $handle.Dispose() }
+	}
 }
 
 function Invoke-VerifyTerminate
@@ -488,10 +845,17 @@ function Invoke-VerifyTerminate
 	$expectedPath = [string](Get-LifecycleProperty -Object $expected -Name 'executablePath' -Default '')
 	$expectedCreation = [string](Get-LifecycleProperty -Object $expected -Name 'creationTime' -Default '')
 	$expectedArgument = [string](Get-LifecycleProperty -Object $expected -Name 'ownerTokenArgument' -Default '')
+	if ($DeadlineUnixMs -gt 0)
+	{
+		$remainingMs = $DeadlineUnixMs - (Get-LifecycleUnixMilliseconds)
+		if ($remainingMs -le 0) { Assert-LifecycleDeadline }
+		$timeoutMs = [Math]::Min($timeoutMs, [int][Math]::Min($remainingMs, [int]::MaxValue))
+	}
 	$handle = $null
 	try
 	{
 		$handle = [LifecycleProcessHandle]::Open($processId, $true)
+		Assert-LifecycleDeadline
 		$actualPath = $handle.GetExecutablePath()
 		$actualCreation = $handle.GetCreationTime()
 		if (-not [StringComparer]::OrdinalIgnoreCase.Equals(
@@ -511,6 +875,7 @@ function Invoke-VerifyTerminate
 			Write-LifecycleProtocol ([ordered]@{ ok = $false; status = 'refused'; reason = 'token_mismatch'; message = 'The exact owner argument is absent from the retained process instance.' })
 			return
 		}
+		Assert-LifecycleDeadline
 		$terminated = $handle.TerminateAndWait($timeoutMs)
 		Write-LifecycleProtocol ([ordered]@{
 			ok = $true
@@ -540,6 +905,7 @@ function Invoke-ReplaceState
 	$statePath = [IO.Path]::GetFullPath([string](Get-LifecycleProperty -Object $request -Name 'statePath' -Default ''))
 	$expectedGeneration = Get-LifecycleProperty -Object $request -Name 'expectedGeneration'
 	$nextJson = [string](Get-LifecycleProperty -Object $request -Name 'nextJson' -Default '')
+	Assert-LifecycleDeadline
 	$next = $nextJson.TrimStart([char]0xFEFF) | ConvertFrom-Json
 	if ([int](Get-LifecycleProperty -Object $next -Name 'version' -Default 0) -ne 2 -or
 		[string]::IsNullOrWhiteSpace([string](Get-LifecycleProperty -Object $next -Name 'generation' -Default '')))
@@ -572,6 +938,7 @@ function Invoke-ReplaceState
 	try
 	{
 		$bytes = [Text.UTF8Encoding]::new($false).GetBytes($nextJson)
+		Assert-LifecycleDeadline
 		$stream = [IO.FileStream]::new(
 			$tempPath,
 			[IO.FileMode]::CreateNew,
@@ -583,6 +950,7 @@ function Invoke-ReplaceState
 		$stream.Flush($true)
 		$stream.Dispose()
 		$stream = $null
+		Assert-LifecycleDeadline
 		[LifecycleFile]::AtomicReplace($tempPath, $statePath)
 	}
 	finally
@@ -599,6 +967,7 @@ function Invoke-ArchiveState
 	$statePath = [IO.Path]::GetFullPath([string](Get-LifecycleProperty -Object $request -Name 'statePath' -Default ''))
 	$archivePath = [IO.Path]::GetFullPath([string](Get-LifecycleProperty -Object $request -Name 'archivePath' -Default ''))
 	$expectedHash = [string](Get-LifecycleProperty -Object $request -Name 'expectedSha256' -Default '')
+	Assert-LifecycleDeadline
 	if (-not [IO.File]::Exists($statePath)) { throw 'Lifecycle state archival failed because the active record is missing.' }
 	$bytes = [IO.File]::ReadAllBytes($statePath)
 	$sha = [Security.Cryptography.SHA256]::Create()
@@ -614,6 +983,7 @@ function Invoke-ArchiveState
 	{
 		throw 'Lifecycle state archival hash mismatch; no state was moved.'
 	}
+	Assert-LifecycleDeadline
 	[IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($archivePath)) | Out-Null
 	[LifecycleFile]::AtomicMoveNew($statePath, $archivePath)
 	Write-LifecycleProtocol ([ordered]@{ ok = $true; status = 'archived' })
@@ -621,12 +991,14 @@ function Invoke-ArchiveState
 
 try
 {
+	Assert-LifecycleDeadline
 	switch ($Mode)
 	{
 		'HoldMutex' { Invoke-HoldMutex }
 		'InspectCurrent' { Invoke-InspectCurrent }
 		'InspectProcess' { Invoke-InspectProcess }
 		'ListWorkbench' { Invoke-ListWorkbench }
+		'VerifyEndpointOwner' { Invoke-VerifyEndpointOwner }
 		'VerifyTerminate' { Invoke-VerifyTerminate }
 		'ReplaceState' { Invoke-ReplaceState }
 		'ArchiveState' { Invoke-ArchiveState }

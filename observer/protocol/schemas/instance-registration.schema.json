@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://reforger-forge.dev/observer/v1/instance-registration.schema.json",
+  "title": "Observer instance registration",
+  "type": "object",
+  "required": ["protocolVersion", "addonVersion", "bundleDigest", "buildIdentity", "agentInstanceId", "sessionId", "launchNonce", "instanceId", "instanceNonce", "runtimeKind", "capabilities", "selectedTransport", "headless", "worldId", "worldEpoch", "registeredAt"],
+  "properties": {
+    "protocolVersion": { "type": "string", "pattern": "^1\\.[0-9]+$" },
+    "addonVersion": { "type": "string" },
+    "bundleDigest": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "buildIdentity": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "agentInstanceId": { "$ref": "#/$defs/id" },
+    "sessionId": { "$ref": "#/$defs/id" },
+    "launchNonce": { "type": "string", "minLength": 32, "maxLength": 256 },
+    "instanceId": { "$ref": "#/$defs/id" },
+    "instanceNonce": { "type": "string", "minLength": 32, "maxLength": 256 },
+    "processId": { "type": "integer", "minimum": 1 },
+    "runtimeKind": { "enum": ["client", "listenServer", "dedicated", "workbench", "testRunner"] },
+    "capabilities": { "type": "array", "maxItems": 64, "items": { "type": "string", "maxLength": 64 } },
+    "selectedTransport": { "enum": ["rest", "mailbox"] },
+    "headless": { "type": "boolean" },
+    "worldId": { "oneOf": [{ "type": "string", "minLength": 1, "maxLength": 512 }, { "type": "null" }] },
+    "worldEpoch": { "type": "integer", "minimum": 0 },
+    "registeredAt": { "type": "string", "format": "date-time" }
+  },
+  "$defs": { "id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{1,96}$" } }
+}

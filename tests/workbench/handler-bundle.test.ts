@@ -14,7 +14,10 @@ import {
   HANDLER_MANIFEST_NAME,
   HandlerBundleError,
   HandlerBundleManager,
+  type ExpectedHandlerTransactionState,
+  type ExpectedHandlerTransactionTarget,
   type HandlerManifest,
+  type HandlerTransactionRecord,
 } from "../../src/workbench/handler-bundle.js";
 import { canonicalizeGproj } from "../../src/workbench/project-identity.js";
 
@@ -118,6 +121,85 @@ describe("transactional Workbench handler bundle", () => {
     expect(readFileSync(extraPath, "utf8")).toBe("keep me\n");
     expect(readFileSync(manifestPath)).toEqual(originalManifest);
     expect(existsSync(applied.backupPath)).toBe(false);
+  });
+
+  it("cross-binds every lifecycle transaction field before a recovery mutation", () => {
+    const fx = fixture();
+    const project = canonicalizeGproj(fx.projectPath);
+    const prepared = fx.manager.prepare(project);
+    const applied = fx.manager.apply(prepared);
+    const watchedPath = join(fx.handlerDir, "EMCP_A.c");
+    const watchedBytes = readFileSync(watchedPath);
+    const handler: ExpectedHandlerTransactionState = {
+      modDirectory: applied.modDirectory,
+      manifestGeneration: applied.manifest.generation,
+      transactionId: applied.id,
+      backupPath: applied.backupPath,
+    };
+    const target: ExpectedHandlerTransactionTarget = {
+      path: project.displayPath,
+      comparisonKey: project.comparisonKey,
+    };
+
+    expect(fx.manager.loadExpectedTransaction(handler, target).id).toBe(applied.id);
+    const mismatches: Array<{
+      handler: ExpectedHandlerTransactionState;
+      target: ExpectedHandlerTransactionTarget;
+    }> = [
+      { handler: { ...handler, transactionId: "different-transaction" }, target },
+      { handler: { ...handler, modDirectory: join(fx.root, "DifferentMod") }, target },
+      { handler: { ...handler, manifestGeneration: "different-generation" }, target },
+      { handler, target: { ...target, comparisonKey: "different-project-key" } },
+      { handler, target: { ...target, path: join(fx.modDir, "Different.gproj") } },
+    ];
+    for (const mismatch of mismatches) {
+      expect(() => fx.manager.restoreExpectedTransaction(mismatch.handler, mismatch.target))
+        .toThrowError(expect.objectContaining<Partial<HandlerBundleError>>({
+          code: "HANDLER_TRANSACTION_INVALID",
+        }));
+      expect(readFileSync(watchedPath)).toEqual(watchedBytes);
+      expect(existsSync(applied.backupPath)).toBe(true);
+    }
+  });
+
+  it("rejects internally inconsistent transaction, manifest, and handler paths", () => {
+    const fx = fixture();
+    const project = canonicalizeGproj(fx.projectPath);
+    const prepared = fx.manager.prepare(project);
+    const applied = fx.manager.apply(prepared);
+    const transactionPath = join(applied.backupPath, "transaction.json");
+    const original = JSON.parse(readFileSync(transactionPath, "utf8")) as HandlerTransactionRecord;
+    const watchedPath = join(fx.handlerDir, "EMCP_A.c");
+    const watchedBytes = readFileSync(watchedPath);
+    const handler: ExpectedHandlerTransactionState = {
+      modDirectory: applied.modDirectory,
+      manifestGeneration: applied.manifest.generation,
+      transactionId: applied.id,
+      backupPath: applied.backupPath,
+    };
+    const target: ExpectedHandlerTransactionTarget = {
+      path: project.displayPath,
+      comparisonKey: project.comparisonKey,
+    };
+    const mutations: Array<(record: HandlerTransactionRecord) => void> = [
+      (record) => { record.handlerDirectory = join(fx.modDir, "Scripts", "WorkbenchGame", "Other"); },
+      (record) => { record.manifest.canonicalProject = join(fx.modDir, "Other.gproj"); },
+      (record) => { record.manifest.canonicalProjectKey = "other-project-key"; },
+      (record) => { record.manifest.modDirectory = join(fx.root, "OtherMod"); },
+      (record) => { record.backupPath = join(fx.manager.transactionsDir, "other-transaction"); },
+    ];
+
+    for (const mutate of mutations) {
+      const corrupted = JSON.parse(JSON.stringify(original)) as HandlerTransactionRecord;
+      mutate(corrupted);
+      writeFileSync(transactionPath, `${JSON.stringify(corrupted, null, 2)}\n`, "utf8");
+      expect(() => fx.manager.restoreExpectedTransaction(handler, target))
+        .toThrowError(expect.objectContaining<Partial<HandlerBundleError>>({
+          code: "HANDLER_TRANSACTION_INVALID",
+        }));
+      expect(readFileSync(watchedPath)).toEqual(watchedBytes);
+      expect(existsSync(applied.backupPath)).toBe(true);
+    }
   });
 
   it("cleanup removes hash-matching managed files but preserves unrelated files", () => {

@@ -1,0 +1,75 @@
+{
+  "manifestVersion": 1,
+  "addonVersion": "0.1.0",
+  "protocolVersion": "1.0",
+  "addonId": "ReforgerForgeObserver",
+  "addonGuid": "7F3A91C2E40B6D58",
+  "buildIdentity": "000cec19226673ce911c68dca027dca7449ff58a604fe0cef6509afbc4d7ec22",
+  "bundleDigest": "89f629f0b618a2041f60f07ea162a0b8ec868d5ddc67f17c833933205dd48772",
+  "files": [
+    {
+      "path": "addon.gproj",
+      "sha256": "5606e5810d5a82c09ef7e148454f23d80b9e69d728bd5994132aad3cc82af086"
+    },
+    {
+      "path": "Scripts/Game/ReforgerForgeObserver/RFO_ObserverBootstrap.c",
+      "sha256": "1c348c771413ec60eca170780e6c5406b1cc3fcc1c078d541ed938cf9f05886f"
+    },
+    {
+      "path": "Scripts/Game/ReforgerForgeObserver/RFO_ObserverBuild.c",
+      "sha256": "f508228012ed724548cf62781b155397157c8023f0fb7f1b0a48def2d792fe13"
+    },
+    {
+      "path": "Scripts/Game/ReforgerForgeObserver/RFO_ObserverCameraLease.c",
+      "sha256": "13eedf81fa0f376cd0a5306d0eaf485e37b3253d2125ccba72de8c2d3ab65bac"
+    },
+    {
+      "path": "Scripts/Game/ReforgerForgeObserver/RFO_ObserverCapabilities.c",
+      "sha256": "cec20659406022ed35fa504c2f83db4373958a6cd4a5d63d0ce56629221b9904"
+    },
+    {
+      "path": "Scripts/Game/ReforgerForgeObserver/RFO_ObserverCapture.c",
+      "sha256": "a8add9100d5fa69712ade15c6889b66c083c9776c8a43cdd0c652d395e3aa1d0"
+    },
+    {
+      "path": "Scripts/Game/ReforgerForgeObserver/RFO_ObserverJob.c",
+      "sha256": "3dc70f682f2459bc2d6cb2f13c89359059c2e6505fa22a51b7eafc9d6f63e46b"
+    },
+    {
+      "path": "Scripts/Game/ReforgerForgeObserver/RFO_ObserverJson.c",
+      "sha256": "a9325afdc8fdd8c58d67ec1d33e2e85e9aad38a52af0891b63bb0f27f13a8c96"
+    },
+    {
+      "path": "Scripts/Game/ReforgerForgeObserver/RFO_ObserverMailboxTransport.c",
+      "sha256": "709f4f139904d02b101c534e11ad57e38c097cf20f20d4c7adad3cbb5d9fe1ae"
+    },
+    {
+      "path": "Scripts/Game/ReforgerForgeObserver/RFO_ObserverRestTransport.c",
+      "sha256": "0aaac3c173464765d20279081c295932a5338d5bf72258b4ac021b45d6741299"
+    },
+    {
+      "path": "Scripts/Game/ReforgerForgeObserver/RFO_ObserverService.c",
+      "sha256": "6ebadbc68262e9e66fcf9fdd1f157924a221d8740febe5e0395532730055110e"
+    },
+    {
+      "path": "Scripts/Game/ReforgerForgeObserver/RFO_ObserverSession.c",
+      "sha256": "4323b0ff1cf365467f89116d951ba864cc76a79ea320b47b72ad94f05fad520d"
+    },
+    {
+      "path": "Scripts/Game/ReforgerForgeObserver/RFO_ObserverTime.c",
+      "sha256": "422d8a30859b9e0c24371df738642fe849f325f3761565ce97d363c7fcfea4bd"
+    },
+    {
+      "path": "Scripts/Game/ReforgerForgeObserver/RFO_ObserverTransport.c",
+      "sha256": "f341cfe08bcd65c3a3a20e650e1a389bb5d9fde32de12b8898bc6a6d762851cc"
+    },
+    {
+      "path": "Scripts/Game/ReforgerForgeObserver/RFO_ObserverWorld.c",
+      "sha256": "3778201e8752b54faedd46a8d0fbd1f764e895d515425b4c4edd6b82618ebd60"
+    },
+    {
+      "path": "Scripts/WorkbenchGame/README.md",
+      "sha256": "d73e8f233c64dc3341205176dcc31d11141748a1d57679ca67703aaf371d8d84"
+    }
+  ]
+}

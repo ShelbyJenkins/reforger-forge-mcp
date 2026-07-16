@@ -129,6 +129,23 @@ Keep the handlers while live automation is in use. When finished, call
 watching the project and removes only hash-matching manifest-owned files;
 modified and unrelated files are preserved for review.
 
+Workbench observer capture uses dedicated managed NET API handlers and the same
+long-lived client, canonical target, exact owner lease, and lifecycle generation
+as other `wb_*` operations. It never auto-launches Workbench; launch the visible
+target explicitly with `wb_launch` first. The lifecycle canonical target is the
+mod `.gproj`, while `Workbench.GetCurrentGameProjectFile()` separately reports
+the base-game settings project. The guard proves the former and the handler
+cross-binds it while tracking the latter and the editor world/subscene identity.
+
+`camera.editor` remains unavailable after each Workbench start until a
+current-view capture has proved exact restoration of the native `BaseWorld`
+camera slot, full matrix, measured vertical FOV, and read-only far plane.
+`BaseWorld` has no near-plane getter, so observer capture does not mutate that
+value. Workbench capture produces native PNG artifacts; do not document or
+expect a BMP conversion path. Treat `RESTORATION_UNCONFIRMED` as a hard failure.
+Restore or cancel active captures before `wb_shutdown`, then wait for vacancy
+before `wb_cleanup`.
+
 ## Start-of-Task Checklist
 
 Before editing:
@@ -167,6 +184,10 @@ name below.
 | Place Scenario Framework entities in the open world | `scenario_create` (live) |
 | Generate Conflict scenario files | `scenario_create_conflict` (offline) |
 | Create or validate an addon | `mod` (`action=build` is retired) |
+| Stage or diagnose the observer companion addon | `observer_setup` |
+| Prepare an instrumented runtime argument array without launching it | `observer_prepare_launch` |
+| Inventory runtime or exact-owned Workbench renderers | `observer_instances` |
+| Capture a current, explicit-pose, or look-at PNG | `observer_capture`; use `observer_job` for async status/cancel/release |
 | Inspect Workbench and troubleshoot the connection | `wb_state`, `wb_connect`, `wb_diagnose` |
 | Inspect or edit placed entities | `wb_entity_list`, `wb_entity_inspect`, `wb_entity_modify`, `wb_component` |
 | Duplicate an entity already placed in a scene | `wb_entity_duplicate` |

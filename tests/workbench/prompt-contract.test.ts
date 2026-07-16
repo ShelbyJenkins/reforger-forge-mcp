@@ -1,8 +1,9 @@
-import { describe, expect, it } from "vitest";
+import { fileURLToPath } from "node:url";
+import { join } from "node:path";
+import { beforeAll, describe, expect, it } from "vitest";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import type { PatternLibrary } from "../../src/patterns/loader.js";
-import { registerCreateModPrompt } from "../../src/prompts/create-mod.js";
-import { registerModifyModPrompt } from "../../src/prompts/modify-mod.js";
+import type { Config } from "../../src/config.js";
+import { registerTools } from "../../src/server.js";
 
 interface PromptResult {
   messages: Array<{ content: { type: string; text: string } }>;
@@ -10,47 +11,46 @@ interface PromptResult {
 
 type PromptHandler = (input: Record<string, string>) => PromptResult;
 
-const REGISTERED_UNDERSCORE_TOOLS = new Set([
-  "api_search",
-  "asset_search",
-  "component_search",
-  "config_create",
-  "game_browse",
-  "game_read",
-  "layout_create",
-  "script_create",
-  "server_config",
-  "wb_cleanup",
-  "wb_launch",
-  "wb_play",
-  "wb_resources",
-  "wb_restart",
-  "wb_state",
-  "wb_stop",
-  "wiki_read",
-  "wiki_search",
-]);
+interface RuntimeRegistry {
+  tools: Map<string, unknown>;
+  prompts: Map<string, PromptHandler>;
+}
 
 const OBSOLETE_TOOL_NAMES = /\b(?:mod_create|mod_validate|prefab_create|project_browse|project_read|project_write)\b/;
 
-function promptCollector(): {
-  server: McpServer;
-  prompts: Map<string, PromptHandler>;
-} {
+function collectRuntimeRegistry(): RuntimeRegistry {
+  const tools = new Map<string, unknown>();
   const prompts = new Map<string, PromptHandler>();
   const server = {
+    registerTool: (name: string, definition: unknown): void => {
+      tools.set(name, definition);
+    },
     registerPrompt: (name: string, _definition: unknown, handler: PromptHandler): void => {
       prompts.set(name, handler);
     },
+    registerResource: (): void => undefined,
   } as unknown as McpServer;
-  return { server, prompts };
+
+  const packageRoot = fileURLToPath(new URL("../../", import.meta.url));
+  const config: Config = {
+    workbenchPath: packageRoot,
+    projectPath: packageRoot,
+    gamePath: packageRoot,
+    dataDir: join(packageRoot, "data"),
+    patternsDir: join(packageRoot, "data", "patterns"),
+    workbenchHost: "127.0.0.1",
+    workbenchPort: 5775,
+    workbenchNoThrow: true,
+  };
+  registerTools(server, config);
+  return { tools, prompts };
 }
 
 function promptText(result: PromptResult): string {
   return result.messages.map((message) => message.content.text).join("\n");
 }
 
-function assertExecutableContract(text: string): void {
+function assertExecutableContract(text: string, registeredTools: Map<string, unknown>): void {
   expect(text).not.toMatch(OBSOLETE_TOOL_NAMES);
   expect(text).not.toContain("**wb_play**");
   expect(text).toContain("enter Play mode manually");
@@ -58,44 +58,57 @@ function assertExecutableContract(text: string): void {
   expect(text).toContain("**wb_state**");
   expect(text).toContain("**wb_stop**");
 
-  const referencedUnderscoreNames = new Set(text.match(/\b[a-z]+(?:_[a-z]+)+\b/g) ?? []);
-  for (const name of referencedUnderscoreNames) {
+  const referencedToolNames = new Set(text.match(/\b[a-z]+(?:_[a-z0-9]+)+\b/g) ?? []);
+  for (const match of text.matchAll(/\*\*([a-z][a-z0-9]*(?:_[a-z0-9]+)*)\*\*/g)) {
+    referencedToolNames.add(match[1]);
+  }
+
+  for (const name of referencedToolNames) {
     expect(
-      REGISTERED_UNDERSCORE_TOOLS.has(name),
-      `prompt references unregistered tool-like name ${name}`
+      registeredTools.has(name),
+      `prompt references tool-like name ${name}, but registerTools() did not register it`
     ).toBe(true);
   }
 }
 
 describe("prompt/tool contracts", () => {
-  it("create-mod uses merged tools and an attended manual Play checkpoint", () => {
-    const { server, prompts } = promptCollector();
-    const patterns = { getSummary: () => "fixture pattern" } as unknown as PatternLibrary;
-    registerCreateModPrompt(server, patterns);
+  let registry: RuntimeRegistry;
 
-    const handler = prompts.get("create-mod");
+  beforeAll(() => {
+    registry = collectRuntimeRegistry();
+  });
+
+  it("collects tools and prompts from the real runtime registration path", () => {
+    expect(registry.tools.size).toBeGreaterThan(30);
+    expect(registry.tools.has("mod")).toBe(true);
+    expect(registry.tools.has("project")).toBe(true);
+    expect(registry.tools.has("prefab")).toBe(true);
+    expect(registry.tools.has("wb_state")).toBe(true);
+    expect(registry.prompts.has("create-mod")).toBe(true);
+    expect(registry.prompts.has("modify-mod")).toBe(true);
+  });
+
+  it("create-mod uses registered merged tools and an attended manual Play checkpoint", () => {
+    const handler = registry.prompts.get("create-mod");
     expect(handler).toBeDefined();
     const text = promptText(handler?.({ description: "A small test mod" }) as PromptResult);
 
-    assertExecutableContract(text);
+    assertExecutableContract(text, registry.tools);
     expect(text).toContain('**mod** with `action: "create"`');
     expect(text).toContain('**mod** with `action: "validate"`');
     expect(text).toContain('**prefab** with `action: "create"`');
     expect(text).toContain('**project** with `action: "write"`');
   });
 
-  it("modify-mod uses merged tools and an attended manual Play checkpoint", () => {
-    const { server, prompts } = promptCollector();
-    registerModifyModPrompt(server);
-
-    const handler = prompts.get("modify-mod");
+  it("modify-mod uses registered merged tools and an attended manual Play checkpoint", () => {
+    const handler = registry.prompts.get("modify-mod");
     expect(handler).toBeDefined();
     const text = promptText(handler?.({
       projectPath: "C:/mods/TestMod",
       task: "Change one script",
     }) as PromptResult);
 
-    assertExecutableContract(text);
+    assertExecutableContract(text, registry.tools);
     expect(text).toContain('**mod** with `action: "validate"`');
     expect(text).toContain('**prefab** with `action: "create"`');
     expect(text).toContain('**project** with `action: "browse"`');

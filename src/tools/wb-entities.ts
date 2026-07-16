@@ -403,7 +403,7 @@ export function registerWbEntityTools(server: McpServer, client: WorkbenchClient
     "wb_entity_select",
     {
       description:
-        "Manage entity selection in the World Editor. Select, deselect, clear selection, or get the current selection.",
+        "Manage entity selection in the World Editor. Deselect, clear, or inspect selection. Selecting one entity is safely refused because the public API cannot perform it without risking the existing selection.",
       inputSchema: {
         action: z
           .enum(["select", "deselect", "clear", "getSelected"])
@@ -422,6 +422,19 @@ export function registerWbEntityTools(server: McpServer, client: WorkbenchClient
               {
                 type: "text" as const,
                 text: `Error: \`name\` is required for the "${action}" action.`,
+              },
+            ],
+            isError: true,
+          };
+        }
+
+        if (action === "select") {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text:
+                  "**Selection Refused**\n\nWorkbench does not expose a supported API for adding one entity to the selection. The existing selection was left unchanged.",
               },
             ],
             isError: true,

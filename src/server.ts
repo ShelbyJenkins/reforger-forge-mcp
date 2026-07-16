@@ -18,6 +18,7 @@ import { registerGroupResource } from "./resources/group-resource.js";
 import { SearchEngine } from "./index/search-engine.js";
 import { PatternLibrary } from "./patterns/loader.js";
 import { WorkbenchClient } from "./workbench/client.js";
+import { WorkbenchObserverAdapter } from "./workbench/observer-adapter.js";
 import { registerWbLaunch } from "./tools/wb-launch.js";
 import { registerWbConnect } from "./tools/wb-connect.js";
 import { registerWbDiagnose } from "./tools/wb-diagnose.js";
@@ -50,6 +51,8 @@ import { registerAnimationGraph } from "./tools/animation-graph.js";
 import { registerWbKnowledge } from "./tools/wb-knowledge.js";
 import { registerBuildingSetup } from "./tools/building-setup.js";
 import type { Config } from "./config.js";
+import { ObserverCoordinator } from "./observer/coordinator.js";
+import { registerObserverTools } from "./observer/tools.js";
 
 export function registerTools(server: McpServer, config: Config): void {
   const searchEngine = new SearchEngine(config.dataDir);
@@ -78,6 +81,42 @@ export function registerTools(server: McpServer, config: Config): void {
     config.workbenchPort,
     config
   );
+  const observerConfig = config.observer;
+  // The observer adapter deliberately shares the one Workbench client and its
+  // lifecycle/activity gate with every other Workbench tool. It never owns an
+  // independent connection or auto-launch path.
+  const workbenchObserver = new WorkbenchObserverAdapter(wbClient, {
+    handlerTimeoutMs: observerConfig?.requestTimeoutMs,
+  });
+  const observerCoordinator = new ObserverCoordinator({
+    agentPath: observerConfig?.agentPath,
+    managedRoot: observerConfig?.managedRoot,
+    profileRoot: observerConfig?.profileRoot,
+    projectPath: config.projectPath,
+    startupTimeoutMs: observerConfig?.startupTimeoutMs,
+    requestTimeoutMs: observerConfig?.requestTimeoutMs,
+    defaultCaptureTimeoutMs: observerConfig?.defaultCaptureTimeoutMs,
+    maxInlineImageBytes: observerConfig?.maxInlineImageBytes,
+    retentionIntervalMs: observerConfig?.retentionIntervalMs,
+    retentionMaxAgeMs: observerConfig?.retentionMaxAgeMs,
+    retentionMaxBytes: observerConfig?.retentionMaxBytes,
+    workbenchAdapter: workbenchObserver,
+  });
+  registerObserverTools(server, observerCoordinator, {
+    sessionTtlMs: observerConfig?.sessionTtlMs,
+    defaultCaptureTimeoutMs: observerConfig?.defaultCaptureTimeoutMs,
+  });
+  const protocolServer = (server as unknown as { server?: { onclose?: () => void } }).server;
+  if (protocolServer) {
+    const previousOnClose = protocolServer.onclose;
+    protocolServer.onclose = () => {
+      try {
+        previousOnClose?.();
+      } finally {
+        void observerCoordinator.close().catch(() => undefined);
+      }
+    };
+  }
   registerWbLaunch(server, config, wbClient);
   registerWbConnect(server, wbClient);
   registerWbDiagnose(server, wbClient);

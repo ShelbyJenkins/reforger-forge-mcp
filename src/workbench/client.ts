@@ -19,6 +19,13 @@ import { fileURLToPath } from "node:url";
 import { Socket } from "node:net";
 import type { Config } from "../config.js";
 import { logger } from "../utils/logger.js";
+import {
+  WorkbenchActivityError,
+  WorkbenchActivityGate,
+  type CaptureActivityBinding,
+  type CaptureActivityLease,
+  type WorkbenchActivityGateTiming,
+} from "./activity-gate.js";
 import { decodeResponse, encodeRequest } from "./protocol.js";
 import {
   HandlerBundleError,
@@ -93,6 +100,30 @@ export interface WorkbenchShutdownResult {
   generation: string;
 }
 
+/**
+ * Immutable, already-running Workbench identity handed to observer adapters.
+ * The private owner-token argument remains inside the lifecycle subsystem.
+ */
+export interface WorkbenchObserverSnapshot {
+  readonly generation: string;
+  readonly target: {
+    readonly path: string;
+    readonly comparisonKey: string;
+  };
+  readonly endpoint: {
+    readonly host: string;
+    readonly port: number;
+  };
+  readonly process: {
+    readonly pid: number;
+    readonly executablePath: string;
+    readonly creationTime: string;
+    readonly launchedAtMs: number;
+  };
+}
+
+export type WorkbenchCaptureActivityLease = CaptureActivityLease;
+
 export interface LifecycleDiagnostic {
   state: "missing" | "valid" | "legacy" | "malformed";
   version: number | null;
@@ -142,7 +173,9 @@ export type WorkbenchErrorCode =
   | "HANDLER_CONFLICT"
   | "RECOVERY_REQUIRED"
   | "UNSUPPORTED_PLATFORM"
-  | "LIFECYCLE_BUSY";
+  | "LIFECYCLE_BUSY"
+  | "ACTIVE_CAPTURE"
+  | "CAPTURE_INVALIDATED";
 
 export class WorkbenchError extends Error {
   constructor(
@@ -236,16 +269,33 @@ interface ActiveLifecycleOperation {
   promise: Promise<unknown>;
 }
 
+type StoredLifecycleTarget = NonNullable<WorkbenchLifecycleStateV2["target"]>;
+
 export interface WorkbenchClientDependencies {
   handlerBundle?: HandlerBundleManager;
   spawnProcess?: (command: string, args: string[], options: SpawnOptions) => ChildProcess;
   launchTimeoutMs?: number;
   launchPollIntervalMs?: number;
+  activityGate?: WorkbenchActivityGate;
+  captureRestoreTimeoutMs?: number;
+  activityGateTiming?: WorkbenchActivityGateTiming;
 }
 
 function pathKey(path: string): string {
   const absolute = resolve(path);
   return process.platform === "win32" ? absolute.toLowerCase() : absolute;
+}
+
+function observerBinding(snapshot: WorkbenchObserverSnapshot): CaptureActivityBinding {
+  return {
+    generation: snapshot.generation,
+    targetKey: snapshot.target.comparisonKey,
+    process: {
+      pid: snapshot.process.pid,
+      executablePath: snapshot.process.executablePath,
+      creationTime: snapshot.process.creationTime,
+    },
+  };
 }
 
 function stateExpected(state: WorkbenchLifecycleStateV2): ExpectedStateVersion {
@@ -289,6 +339,7 @@ export class WorkbenchClient {
   private readonly spawnProcess: WorkbenchClientDependencies["spawnProcess"];
   private readonly launchTimeoutMs: number;
   private readonly launchPollIntervalMs: number;
+  private readonly activityGate: WorkbenchActivityGate;
 
   get state(): Readonly<WorkbenchState> {
     return this._state;
@@ -309,6 +360,10 @@ export class WorkbenchClient {
       spawn(command, args, options));
     this.launchTimeoutMs = dependencies.launchTimeoutMs ?? LAUNCH_TIMEOUT_MS;
     this.launchPollIntervalMs = dependencies.launchPollIntervalMs ?? LAUNCH_POLL_INTERVAL_MS;
+    this.activityGate = dependencies.activityGate ?? new WorkbenchActivityGate({
+      restoreTimeoutMs: dependencies.captureRestoreTimeoutMs,
+      timing: dependencies.activityGateTiming,
+    });
   }
 
   async call<T = Record<string, unknown>>(
@@ -358,13 +413,148 @@ export class WorkbenchClient {
     }
   }
 
+  /**
+   * Verify and snapshot an already-running exact Workbench owned by this MCP.
+   * This path never launches, adopts, restarts, or mutates lifecycle state.
+   */
+  async getRunningObserverSnapshot(): Promise<WorkbenchObserverSnapshot> {
+    try {
+      return await this.processGuard.withLifecycleLock(async (session) => {
+        const read = await session.readState();
+        if (read.kind !== "valid") {
+          throw new WorkbenchError(
+            "Observer capture requires a valid version-2 Workbench lifecycle record.",
+            "STATE_INVALID"
+          );
+        }
+        const state = read.state;
+        if (state.phase !== "running" || state.operation !== null) {
+          throw new WorkbenchError(
+            `Observer capture requires an idle running Workbench; lifecycle phase is ${state.phase}.`,
+            "LIFECYCLE_BUSY"
+          );
+        }
+
+        const owner = state.mcpOwner;
+        const current = session.mcp;
+        if (!owner || owner.instanceId !== current.instanceId || owner.leaseId !== current.leaseId ||
+            owner.pid !== current.pid || owner.creationTime !== current.creationTime ||
+            pathKey(owner.executablePath) !== pathKey(current.executablePath) ||
+            owner.userSid !== current.userSid) {
+          throw new WorkbenchError(
+            "Observer capture requires the exact Workbench lifecycle lease owned by this MCP instance.",
+            owner ? "OWNED_BY_OTHER_MCP" : "UNOWNED_WORKBENCH"
+          );
+        }
+        if (!state.target) {
+          throw new WorkbenchError(
+            "Observer capture requires a recorded canonical Workbench project target.",
+            "TARGET_REQUIRED"
+          );
+        }
+        if (!state.workbench) {
+          throw new WorkbenchError(
+            "Observer capture requires an already-running exact owned Workbench process.",
+            "UNOWNED_WORKBENCH"
+          );
+        }
+
+        const configuredHost = this.host.trim().toLowerCase().replace(/^\[|\]$/g, "");
+        if (state.endpoint.host !== configuredHost || state.endpoint.port !== this.port) {
+          throw new WorkbenchError(
+            `Recorded Workbench endpoint ${state.endpoint.host}:${state.endpoint.port} does not ` +
+              `match this client endpoint ${configuredHost}:${this.port}.`,
+            "ENDPOINT_CONFLICT"
+          );
+        }
+
+        const canonicalTarget = canonicalizeGproj(state.target.path);
+        if (canonicalTarget.comparisonKey !== state.target.comparisonKey) {
+          throw new WorkbenchError(
+            `Recorded Workbench target ${state.target.path} changed canonical identity.`,
+            "TARGET_CHANGED"
+          );
+        }
+        if (await this.inspectRecordedWorkbench(state) !== "live") {
+          throw new WorkbenchError(
+            "Recorded exact owned Workbench exited before observer snapshot acquisition.",
+            "IDENTITY_UNVERIFIABLE"
+          );
+        }
+        await this.assertEndpointOwnedByRecordedWorkbench(
+          session,
+          state.workbench,
+          "observer snapshot"
+        );
+
+        return Object.freeze({
+          generation: state.generation,
+          target: Object.freeze({
+            path: canonicalTarget.displayPath,
+            comparisonKey: canonicalTarget.comparisonKey,
+          }),
+          endpoint: Object.freeze({ ...state.endpoint }),
+          process: Object.freeze({
+            pid: state.workbench.pid,
+            executablePath: state.workbench.executablePath,
+            creationTime: state.workbench.creationTime,
+            launchedAtMs: state.workbench.launchedAtMs,
+          }),
+        });
+      });
+    } catch (error) {
+      throw this.mapLifecycleError(error);
+    }
+  }
+
+  acquireCaptureActivity(snapshot: WorkbenchObserverSnapshot): WorkbenchCaptureActivityLease {
+    try {
+      return this.activityGate.acquireCapture(observerBinding(snapshot));
+    } catch (error) {
+      throw this.mapLifecycleError(error);
+    }
+  }
+
+  async revalidateCaptureActivity(
+    lease: WorkbenchCaptureActivityLease
+  ): Promise<WorkbenchObserverSnapshot> {
+    try {
+      // Fail without acquiring the machine mutex if exit handling already
+      // invalidated this lease.
+      this.activityGate.revalidateCapture(lease, lease.binding);
+      const current = await this.getRunningObserverSnapshot();
+      this.activityGate.revalidateCapture(lease, observerBinding(current));
+      return current;
+    } catch (error) {
+      try {
+        this.activityGate.invalidateCapture(
+          lease,
+          `Workbench capture ${lease.id} failed lifecycle identity revalidation.`
+        );
+      } catch {
+        // Preserve the authoritative validation error.
+      }
+      throw this.mapLifecycleError(error);
+    }
+  }
+
+  releaseCaptureActivity(lease: WorkbenchCaptureActivityLease): void {
+    try {
+      this.activityGate.releaseCapture(lease);
+    } catch (error) {
+      throw this.mapLifecycleError(error);
+    }
+  }
+
   async ensureRunning(gprojPath?: string): Promise<WorkbenchLaunchResult> {
     this.requireConfig("auto-launch");
     const project = await this.resolveLifecycleProject(gprojPath);
     try {
-      return await this.coordinateLifecycle("launch", project.comparisonKey, async (operationId) =>
-        this.processGuard.withLifecycleLock(async (session) =>
-          this.ensureRunningLocked(session, revalidateProjectIdentity(project), operationId)
+      return await this.activityGate.runLifecycle("launch", () =>
+        this.coordinateLifecycle("launch", project.comparisonKey, async (operationId) =>
+          this.processGuard.withLifecycleLock(async (session) =>
+            this.ensureRunningLocked(session, revalidateProjectIdentity(project), operationId)
+          )
         )
       );
     } catch (error) {
@@ -376,9 +566,11 @@ export class WorkbenchClient {
     this.requireConfig("restart");
     const project = await this.resolveLifecycleProject();
     try {
-      return await this.coordinateLifecycle("restart", project.comparisonKey, async (operationId) =>
-        this.processGuard.withLifecycleLock(async (session) =>
-          this.restartLocked(session, revalidateProjectIdentity(project), operationId)
+      return await this.activityGate.runLifecycle("restart", () =>
+        this.coordinateLifecycle("restart", project.comparisonKey, async (operationId) =>
+          this.processGuard.withLifecycleLock(async (session) =>
+            this.restartLocked(session, revalidateProjectIdentity(project), operationId)
+          )
         )
       );
     } catch (error) {
@@ -388,14 +580,14 @@ export class WorkbenchClient {
 
   async shutdownOwnedWorkbench(): Promise<WorkbenchShutdownResult> {
     this.requireConfig("shutdown");
-    const read = await this.processGuard.readLifecycleState();
-    const project = read.kind === "valid" && read.state.target
-      ? canonicalizeGproj(read.state.target.path)
-      : null;
     try {
-      return await this.coordinateLifecycle("shutdown", project?.comparisonKey ?? null, async (operationId) =>
-        this.processGuard.withLifecycleLock(async (session) =>
-          this.shutdownLocked(session, project, operationId)
+      const read = await this.processGuard.readLifecycleState();
+      const targetKey = read.kind === "valid" ? read.state.target?.comparisonKey ?? null : null;
+      return await this.activityGate.runLifecycle("shutdown", () =>
+        this.coordinateLifecycle("shutdown", targetKey, async (operationId) =>
+          this.processGuard.withLifecycleLock(async (session) =>
+            this.shutdownLocked(session, operationId)
+          )
         )
       );
     } catch (error) {
@@ -406,52 +598,58 @@ export class WorkbenchClient {
   async cleanupHandlerScripts(modDir: string): Promise<HandlerCleanupResult> {
     const project = this.projectFromModDirectory(modDir);
     try {
-      return await this.coordinateLifecycle("cleanup", project.comparisonKey, async (operationId) =>
-        this.processGuard.withLifecycleLock(async (session) => {
-        const lockedProject = revalidateProjectIdentity(project);
-        let state = await this.claimState(session, lockedProject);
-        const processStatus = await this.inspectRecordedWorkbench(state);
-        if (processStatus === "live") {
-          throw new WorkbenchError(
-            `Cleanup is blocked while Workbench PID ${state.workbench!.pid} may be watching ` +
-              `${project.displayPath}. Call wb_shutdown first.`,
-            "CLEANUP_BLOCKED_LIVE"
-          );
-        }
-        if (processStatus === "absent") {
-          state = await this.reconcileAbsentState(session, state, lockedProject);
-        }
-        await this.assertNoWorkbenchProcesses(session, "cleanup");
-        state = await session.transition(stateExpected(state), stateDraft(state, {
-          phase: "cleaning",
-          target: this.lifecycleTarget(lockedProject),
-          operation: { kind: "cleanup", operationId },
-          handler: state.handler ? { ...state.handler, phase: "cleaning" } : null,
-        }));
-        try {
-          const result = this.handlerBundle.cleanup(lockedProject);
-          const manifest = this.handlerBundle.readManifest(lockedProject.modDirectory);
-          const nextHandler = manifest ? {
-            modDirectory: lockedProject.modDirectory,
-            manifestGeneration: manifest.generation,
-            transactionId: null,
-            phase: "installed" as const,
-            backupPath: null,
-          } : null;
-          await session.transitionToVacant(stateExpected(state), {
-            target: this.lifecycleTarget(lockedProject),
-            handler: nextHandler,
-          });
-          return result;
-        } catch (error) {
-          await session.transition(stateExpected(state), stateDraft(state, {
-            phase: "vacant",
-            operation: null,
-            handler: state.handler ? { ...state.handler, phase: "installed" } : null,
-          })).catch(() => undefined);
-          throw this.mapLifecycleError(error);
-        }
-        })
+      return await this.activityGate.runLifecycle("cleanup", () =>
+        this.coordinateLifecycle("cleanup", project.comparisonKey, async (operationId) =>
+          this.processGuard.withLifecycleLock(async (session) => {
+            const lockedProject = revalidateProjectIdentity(project);
+            let state = await this.claimState(session, lockedProject);
+            const processStatus = await this.inspectRecordedWorkbench(state);
+            if (processStatus === "live") {
+              throw new WorkbenchError(
+                `Cleanup is blocked while Workbench PID ${state.workbench!.pid} may be watching ` +
+                  `${project.displayPath}. Call wb_shutdown first.`,
+                "CLEANUP_BLOCKED_LIVE"
+              );
+            }
+            if (processStatus === "absent") {
+              state = await this.reconcileAbsentState(
+                session,
+                state,
+                this.lifecycleTarget(lockedProject)
+              );
+            }
+            await this.assertNoWorkbenchProcesses(session, "cleanup");
+            state = await session.transition(stateExpected(state), stateDraft(state, {
+              phase: "cleaning",
+              target: this.lifecycleTarget(lockedProject),
+              operation: { kind: "cleanup", operationId },
+              handler: state.handler ? { ...state.handler, phase: "cleaning" } : null,
+            }));
+            try {
+              const result = this.handlerBundle.cleanup(lockedProject);
+              const manifest = this.handlerBundle.readManifest(lockedProject.modDirectory);
+              const nextHandler = manifest ? {
+                modDirectory: lockedProject.modDirectory,
+                manifestGeneration: manifest.generation,
+                transactionId: null,
+                phase: "installed" as const,
+                backupPath: null,
+              } : null;
+              await session.transitionToVacant(stateExpected(state), {
+                target: this.lifecycleTarget(lockedProject),
+                handler: nextHandler,
+              });
+              return result;
+            } catch (error) {
+              await session.transition(stateExpected(state), stateDraft(state, {
+                phase: "vacant",
+                operation: null,
+                handler: state.handler ? { ...state.handler, phase: "installed" } : null,
+              })).catch(() => undefined);
+              throw this.mapLifecycleError(error);
+            }
+          })
+        )
       );
     } catch (error) {
       throw this.mapLifecycleError(error);
@@ -665,6 +863,100 @@ export class WorkbenchClient {
     throw this.claimRefusal(result);
   }
 
+  private expectedTransactionError(context: string, error: unknown): WorkbenchError {
+    return new WorkbenchError(
+      `RECOVERY_REQUIRED: ${context}: ${error instanceof Error ? error.message : String(error)}`,
+      "RECOVERY_REQUIRED"
+    );
+  }
+
+  private loadExpectedTransaction(
+    handler: HandlerLifecycleState | null,
+    target: StoredLifecycleTarget | null,
+    context: string
+  ): HandlerTransactionRecord {
+    if (!handler || !target) {
+      throw this.expectedTransactionError(
+        context,
+        "the lifecycle state does not bind the transaction to a handler and target"
+      );
+    }
+    try {
+      return this.handlerBundle.loadExpectedTransaction(handler, target);
+    } catch (error) {
+      throw this.expectedTransactionError(context, error);
+    }
+  }
+
+  private restoreExpectedTransaction(
+    handler: HandlerLifecycleState | null,
+    target: StoredLifecycleTarget | null,
+    context: string
+  ): HandlerTransactionRecord {
+    if (!handler || !target) {
+      throw this.expectedTransactionError(
+        context,
+        "the lifecycle state does not bind the transaction to a handler and target"
+      );
+    }
+    try {
+      return this.handlerBundle.restoreExpectedTransaction(handler, target);
+    } catch (error) {
+      throw this.expectedTransactionError(context, error);
+    }
+  }
+
+  private commitExpectedTransaction(
+    handler: HandlerLifecycleState | null,
+    target: StoredLifecycleTarget | null,
+    context: string
+  ): void {
+    if (!handler || !target) {
+      throw this.expectedTransactionError(
+        context,
+        "the lifecycle state does not bind the transaction to a handler and target"
+      );
+    }
+    try {
+      this.handlerBundle.commitExpectedTransaction(handler, target);
+    } catch (error) {
+      if (error instanceof HandlerBundleError) throw this.expectedTransactionError(context, error);
+      throw error;
+    }
+  }
+
+  private discardExpectedTransaction(
+    handler: HandlerLifecycleState | null,
+    target: StoredLifecycleTarget | null,
+    context: string
+  ): void {
+    if (!handler || !target) {
+      throw this.expectedTransactionError(
+        context,
+        "the lifecycle state does not bind the transaction to a handler and target"
+      );
+    }
+    try {
+      this.handlerBundle.discardExpectedTransaction(handler, target);
+    } catch (error) {
+      if (error instanceof HandlerBundleError) throw this.expectedTransactionError(context, error);
+      throw error;
+    }
+  }
+
+  private abortExpectedTransaction(
+    handler: HandlerLifecycleState,
+    target: StoredLifecycleTarget,
+    context: string
+  ): void {
+    try {
+      this.handlerBundle.abortExpectedTransaction(handler, target);
+    } catch (error) {
+      if (error instanceof HandlerBundleError) throw this.expectedTransactionError(context, error);
+      throw error;
+    }
+  }
+
   private claimRefusal(result: Extract<LifecycleClaimResult, { kind: "refused" }>): WorkbenchError {
     const code = result.code === "STATE_INVALID" ? "STATE_INVALID" : result.code;
     return new WorkbenchError(`${code}: ${result.message}`, code);
@@ -716,16 +1008,50 @@ export class WorkbenchClient {
     }
   }
 
+  private async assertEndpointOwnedByRecordedWorkbench(
+    session: WorkbenchLifecycleSession,
+    expected: WorkbenchIdentity,
+    context: string
+  ): Promise<void> {
+    let result;
+    try {
+      result = await session.verifyEndpointOwner(
+        { host: this.host, port: this.port },
+        expected
+      );
+    } catch (error) {
+      const mapped = this.mapLifecycleError(error);
+      throw new WorkbenchError(
+        `IDENTITY_UNVERIFIABLE: ${context} could not prove that NET API endpoint ` +
+          `${this.host}:${this.port} belongs to exact Workbench PID ${expected.pid}: ${mapped.message}`,
+        "IDENTITY_UNVERIFIABLE"
+      );
+    }
+    if (result.kind === "refused") {
+      throw new WorkbenchError(
+        `IDENTITY_UNVERIFIABLE: ${context} refused NET API endpoint ${this.host}:${this.port} ` +
+          `for exact Workbench PID ${expected.pid} (${result.reason}): ${result.message}`,
+        "IDENTITY_UNVERIFIABLE"
+      );
+    }
+  }
+
   private async reconcileAbsentState(
     session: WorkbenchLifecycleSession,
     state: WorkbenchLifecycleStateV2,
-    project: CanonicalProjectIdentity | null
+    target: StoredLifecycleTarget | null
   ): Promise<WorkbenchLifecycleStateV2> {
+    const recoveryTarget = target ?? state.target;
+    const recoveryHandler = state.handler;
     let restoredTransaction: HandlerTransactionRecord | null = null;
     let nextHandler = state.handler;
-    if (state.handler?.backupPath && state.handler.transactionId) {
+    if (recoveryHandler?.backupPath && recoveryHandler.transactionId) {
       try {
-        restoredTransaction = this.handlerBundle.restore(state.handler.backupPath);
+        restoredTransaction = this.restoreExpectedTransaction(
+          recoveryHandler,
+          recoveryTarget,
+          `could not cross-bind and restore handler transaction ${recoveryHandler.transactionId}`
+        );
         const manifest = this.handlerBundle.readManifest(restoredTransaction.modDirectory);
         nextHandler = manifest ? {
           modDirectory: restoredTransaction.modDirectory,
@@ -735,22 +1061,37 @@ export class WorkbenchClient {
           backupPath: null,
         } : null;
       } catch (error) {
+        if (error instanceof WorkbenchError && error.code === "RECOVERY_REQUIRED") throw error;
         throw new WorkbenchError(
           `RECOVERY_REQUIRED: could not roll back handler transaction ` +
-            `${state.handler.transactionId}: ${error instanceof Error ? error.message : String(error)}`,
+            `${recoveryHandler.transactionId}: ${error instanceof Error ? error.message : String(error)}`,
           "RECOVERY_REQUIRED"
         );
       }
     }
+    // Re-read the durable record immediately before the recovery CAS. A
+    // mismatched journal must never be hidden by transitioning lifecycle state.
+    if (restoredTransaction) {
+      this.loadExpectedTransaction(
+        recoveryHandler,
+        recoveryTarget,
+        `handler transaction ${restoredTransaction.id} changed before recovery transition`
+      );
+    }
     this.resetConnectionState();
     const vacant = await session.transitionToVacant(stateExpected(state), {
-      target: project ? this.lifecycleTarget(project) : state.target,
+      target: recoveryTarget,
       handler: nextHandler,
     });
     if (restoredTransaction) {
       try {
-        this.handlerBundle.discardTransaction(restoredTransaction);
+        this.discardExpectedTransaction(
+          recoveryHandler,
+          recoveryTarget,
+          `could not cross-bind recovered handler transaction ${restoredTransaction.id} before discard`
+        );
       } catch (error) {
+        if (error instanceof WorkbenchError && error.code === "RECOVERY_REQUIRED") throw error;
         logger.warn(
           `Recovered handler transaction ${restoredTransaction.id}, but its backup could not be ` +
             `pruned: ${error instanceof Error ? error.message : String(error)}`
@@ -765,23 +1106,53 @@ export class WorkbenchClient {
     state: WorkbenchLifecycleStateV2,
     project: CanonicalProjectIdentity
   ): Promise<{ state: WorkbenchLifecycleStateV2; live: boolean }> {
+    if (state.handler?.backupPath) {
+      this.loadExpectedTransaction(
+        state.handler,
+        state.target,
+        `lifecycle ${state.phase} recovery could not cross-bind its pending handler transaction`
+      );
+    }
     const status = await this.inspectRecordedWorkbench(state);
     if (status === "absent") {
       await this.assertNoWorkbenchProcesses(session, "Lifecycle recovery");
-      return { state: await this.reconcileAbsentState(session, state, project), live: false };
+      return {
+        state: await this.reconcileAbsentState(session, state, this.lifecycleTarget(project)),
+        live: false,
+      };
     }
     if (state.phase === "stopping") {
       const stopped = await this.terminateExact(session, state.workbench!);
       if (!stopped) throw new WorkbenchError("Exact Workbench shutdown could not be proven.", "RECOVERY_REQUIRED");
       await this.waitForPortRelease();
-      return { state: await this.reconcileAbsentState(session, state, project), live: false };
+      return {
+        state: await this.reconcileAbsentState(session, state, this.lifecycleTarget(project)),
+        live: false,
+      };
     }
     if (state.phase === "starting" || state.phase === "restarting") {
       if (await this.ping()) {
+        if (!state.workbench) {
+          throw new WorkbenchError(
+            "Lifecycle recovery reached a live endpoint without a recorded exact Workbench identity.",
+            "IDENTITY_UNVERIFIABLE"
+          );
+        }
+        await this.assertEndpointOwnedByRecordedWorkbench(
+          session,
+          state.workbench,
+          `${state.phase} recovery`
+        );
         let nextHandler = state.handler;
         let completedTransaction: HandlerTransactionRecord | null = null;
-        if (state.handler?.backupPath) {
-          const record = this.handlerBundle.loadTransaction(state.handler.backupPath);
+        const transactionHandler = state.handler;
+        const transactionTarget = state.target;
+        if (transactionHandler?.backupPath) {
+          const record = this.loadExpectedTransaction(
+            transactionHandler,
+            transactionTarget,
+            "live Workbench recovery could not cross-bind its handler transaction"
+          );
           if (record.phase !== "applied") {
             throw new WorkbenchError(
               `RECOVERY_REQUIRED: live Workbench has an un-applied handler transaction ${record.id}.`,
@@ -791,6 +1162,13 @@ export class WorkbenchClient {
           completedTransaction = record;
           nextHandler = handlerState(record, "installed", false);
         }
+        if (completedTransaction) {
+          this.loadExpectedTransaction(
+            transactionHandler,
+            transactionTarget,
+            `handler transaction ${completedTransaction.id} changed before running recovery transition`
+          );
+        }
         const running = await session.transition(stateExpected(state), stateDraft(state, {
           phase: "running",
           operation: null,
@@ -798,8 +1176,13 @@ export class WorkbenchClient {
         }));
         if (completedTransaction) {
           try {
-            this.handlerBundle.commit(completedTransaction);
+            this.commitExpectedTransaction(
+              transactionHandler,
+              transactionTarget,
+              `could not cross-bind completed handler transaction ${completedTransaction.id} before commit`
+            );
           } catch (error) {
+            if (error instanceof WorkbenchError && error.code === "RECOVERY_REQUIRED") throw error;
             logger.warn(
               `Handler transaction ${completedTransaction.id} was durably completed, but its ` +
                 `backup could not be pruned: ${error instanceof Error ? error.message : String(error)}`
@@ -810,7 +1193,10 @@ export class WorkbenchClient {
       }
       await this.terminateExact(session, state.workbench!);
       await this.waitForPortRelease();
-      return { state: await this.reconcileAbsentState(session, state, project), live: false };
+      return {
+        state: await this.reconcileAbsentState(session, state, this.lifecycleTarget(project)),
+        live: false,
+      };
     }
     return { state, live: true };
   }
@@ -833,6 +1219,11 @@ export class WorkbenchClient {
           "LAUNCH_FAILED"
         );
       }
+      await this.assertEndpointOwnedByRecordedWorkbench(
+        session,
+        state.workbench,
+        "running-session reuse"
+      );
       return {
         action: "reused",
         pid: state.workbench.pid,
@@ -912,18 +1303,28 @@ export class WorkbenchClient {
 
   private async shutdownLocked(
     session: WorkbenchLifecycleSession,
-    project: CanonicalProjectIdentity | null,
     operationId: string
   ): Promise<WorkbenchShutdownResult> {
-    let state = await this.claimState(session, project);
+    // Shutdown is identity-driven. Preserve the durable target spelling/key but
+    // do not touch the .gproj: it may have been deleted or disconnected while
+    // the exact recorded Workbench is still safely terminable.
+    let state = await this.claimState(session, null);
+    const target = state.target;
+    if (state.handler?.backupPath) {
+      this.loadExpectedTransaction(
+        state.handler,
+        target,
+        `shutdown could not cross-bind lifecycle ${state.phase} handler transaction`
+      );
+    }
     const status = await this.inspectRecordedWorkbench(state);
     if (status === "absent") {
       await this.assertNoWorkbenchProcesses(session, "Shutdown");
-      state = await this.reconcileAbsentState(session, state, project);
+      state = await this.reconcileAbsentState(session, state, target);
       return {
         stopped: false,
         previousPid: null,
-        gprojPath: project?.displayPath ?? state.target?.path ?? null,
+        gprojPath: state.target?.path ?? null,
         generation: state.generation,
       };
     }
@@ -948,11 +1349,11 @@ export class WorkbenchClient {
         observedChild.identity.creationTime === expected.creationTime) {
       this.ownedChild = null;
     }
-    const vacant = await this.reconcileAbsentState(session, state, project);
+    const vacant = await this.reconcileAbsentState(session, state, target);
     return {
       stopped: true,
       previousPid: expected.pid,
-      gprojPath: project?.displayPath ?? state.target?.path ?? null,
+      gprojPath: target?.path ?? state.target?.path ?? null,
       generation: vacant.generation,
     };
   }
@@ -1006,9 +1407,10 @@ export class WorkbenchClient {
     operationKind: "launch" | "restart",
     operationId: string
   ): Promise<WorkbenchLifecycleStateV2> {
+    const launchTarget = this.lifecycleTarget(preflight.project);
     let state = await session.transition(stateExpected(initialState), stateDraft(initialState, {
       phase: transientPhase,
-      target: this.lifecycleTarget(preflight.project),
+      target: launchTarget,
       workbench: null,
       operation: { kind: operationKind, operationId },
     }));
@@ -1018,7 +1420,7 @@ export class WorkbenchClient {
       transaction = this.handlerBundle.prepare(preflight.project);
     } catch (error) {
       await session.transitionToVacant(stateExpected(state), {
-        target: this.lifecycleTarget(preflight.project),
+        target: launchTarget,
         handler: originalHandler,
       }).catch(() => undefined);
       throw this.mapLifecycleError(error);
@@ -1029,25 +1431,52 @@ export class WorkbenchClient {
         handler: handlerState(transaction.record, "installing"),
       }));
     } catch (error) {
-      this.handlerBundle.abortPrepared(transaction.record);
+      this.abortExpectedTransaction(
+        handlerState(transaction.record, "installing"),
+        launchTarget,
+        `could not cross-bind prepared handler transaction ${transaction.record.id} before abort`
+      );
       throw error;
     }
 
     try {
       const applied = this.handlerBundle.apply(transaction);
+      this.loadExpectedTransaction(
+        state.handler,
+        state.target,
+        `handler transaction ${applied.id} changed before installed transition`
+      );
       state = await session.transition(stateExpected(state), stateDraft(state, {
         handler: handlerState(applied, "installed"),
       }));
     } catch (error) {
       try {
-        const restored = this.handlerBundle.restore(transaction.record.backupPath);
+        const rollbackHandler = state.handler;
+        const rollbackTarget = state.target;
+        const restored = this.restoreExpectedTransaction(
+          rollbackHandler,
+          rollbackTarget,
+          `could not cross-bind failed handler transaction ${transaction.record.id} before restore`
+        );
+        this.loadExpectedTransaction(
+          rollbackHandler,
+          rollbackTarget,
+          `handler transaction ${restored.id} changed before rollback transition`
+        );
         await session.transitionToVacant(stateExpected(state), {
-          target: this.lifecycleTarget(preflight.project),
+          target: launchTarget,
           handler: originalHandler,
         });
         try {
-          this.handlerBundle.discardTransaction(restored);
+          this.discardExpectedTransaction(
+            rollbackHandler,
+            rollbackTarget,
+            `could not cross-bind restored handler transaction ${restored.id} before discard`
+          );
         } catch (discardError) {
+          if (discardError instanceof WorkbenchError && discardError.code === "RECOVERY_REQUIRED") {
+            throw discardError;
+          }
           logger.warn(
             `Rolled back handler transaction ${restored.id}, but its backup could not be pruned: ` +
               `${discardError instanceof Error ? discardError.message : String(discardError)}`
@@ -1064,6 +1493,9 @@ export class WorkbenchClient {
       }
       throw this.mapLifecycleError(error);
     }
+
+    const completedHandler = state.handler;
+    const completedTarget = state.target;
 
     const ownerToken = this.processGuard.createOwnerToken();
     const ownerArgument = this.processGuard.ownerArgument(ownerToken);
@@ -1084,7 +1516,11 @@ export class WorkbenchClient {
         detached: true,
         stdio: "ignore",
         cwd: preflight.cwd,
-        windowsHide: true,
+        // Workbench is a graphical editor. A hidden Windows process has no
+        // native viewport dimensions/projection and therefore cannot support
+        // editor observation. Launches happen only through explicit lifecycle
+        // operations; capture itself still probes with skipAutoLaunch.
+        windowsHide: false,
       });
       child.once("error", (error) => { spawnError = error; });
       if (!child.pid) {
@@ -1110,9 +1546,31 @@ export class WorkbenchClient {
       );
       child.unref();
       await this.waitForHandlerReady(child, () => spawnError);
+      if (!identity) {
+        throw new WorkbenchError(
+          "Workbench handler became ready without an exact recorded process identity.",
+          "IDENTITY_UNVERIFIABLE"
+        );
+      }
+      await this.assertEndpointOwnedByRecordedWorkbench(
+        session,
+        identity,
+        `${operationKind} readiness`
+      );
+      const completedTransaction = this.loadExpectedTransaction(
+        completedHandler,
+        completedTarget,
+        `handler transaction ${transaction.record.id} changed before running transition`
+      );
+      if (completedTransaction.phase !== "applied") {
+        throw new WorkbenchError(
+          `RECOVERY_REQUIRED: handler transaction ${completedTransaction.id} is not applied at launch commit.`,
+          "RECOVERY_REQUIRED"
+        );
+      }
       state = await session.transition(stateExpected(state), stateDraft(state, {
         phase: "running",
-        handler: handlerState(transaction.record, "installed", false),
+        handler: handlerState(completedTransaction, "installed", false),
         operation: null,
       }));
       // This final CAS is the transaction commit point. Until it succeeds the
@@ -1141,8 +1599,13 @@ export class WorkbenchClient {
       // The lifecycle CAS above is authoritative. Removing the rollback journal
       // is post-commit pruning, so a crash here can leave only a harmless orphan
       // rather than state that points at a missing recovery record.
-      this.handlerBundle.commit(transaction.record);
+      this.commitExpectedTransaction(
+        completedHandler,
+        completedTarget,
+        `could not cross-bind completed handler transaction ${transaction.record.id} before commit`
+      );
     } catch (error) {
+      if (error instanceof WorkbenchError && error.code === "RECOVERY_REQUIRED") throw error;
       logger.warn(
         `Handler transaction ${transaction.record.id} was durably completed for Workbench PID ` +
           `${runningIdentity.pid}, but its backup could not be pruned: ` +
@@ -1161,12 +1624,25 @@ export class WorkbenchClient {
     identity: WorkbenchIdentity | null,
     originalHandler: HandlerLifecycleState | null
   ): Promise<void> {
+    const rollbackHandler = state.handler;
+    const rollbackTarget = state.target;
+    const boundTransaction = this.loadExpectedTransaction(
+      rollbackHandler,
+      rollbackTarget,
+      `failed launch could not cross-bind handler transaction ${transaction.id}`
+    );
+    if (boundTransaction.id !== transaction.id) {
+      throw this.expectedTransactionError(
+        `failed launch transaction ${transaction.id} does not match its lifecycle journal`,
+        `lifecycle references transaction ${boundTransaction.id}`
+      );
+    }
     if (identity) {
       const result = await session.verifyAndTerminate(identity, OWNED_PROCESS_EXIT_TIMEOUT_MS);
       if (result.kind === "refused") {
         throw new WorkbenchError(
           `RECOVERY_REQUIRED: launch failed and exact Workbench shutdown was refused (${result.reason}): ` +
-            `${result.message}. Handler transaction ${transaction.id} was preserved.`,
+            `${result.message}. Handler transaction ${boundTransaction.id} was preserved.`,
           "RECOVERY_REQUIRED"
         );
       }
@@ -1177,19 +1653,33 @@ export class WorkbenchClient {
         throw new WorkbenchError(
           `RECOVERY_REQUIRED: launch identity was not established and Workbench PID(s) ` +
             `${processes.map((entry) => entry.pid).join(", ")} are present. Handler transaction ` +
-            `${transaction.id} was preserved; watched files were not changed again.`,
+            `${boundTransaction.id} was preserved; watched files were not changed again.`,
           "RECOVERY_REQUIRED"
         );
       }
     }
-    const restored = this.handlerBundle.restore(transaction.backupPath);
+    const restored = this.restoreExpectedTransaction(
+      rollbackHandler,
+      rollbackTarget,
+      `could not cross-bind failed launch transaction ${boundTransaction.id} before restore`
+    );
+    this.loadExpectedTransaction(
+      rollbackHandler,
+      rollbackTarget,
+      `handler transaction ${restored.id} changed before failed-launch recovery transition`
+    );
     await session.transitionToVacant(stateExpected(state), {
       target: state.target,
       handler: originalHandler,
     });
     try {
-      this.handlerBundle.discardTransaction(restored);
+      this.discardExpectedTransaction(
+        rollbackHandler,
+        rollbackTarget,
+        `could not cross-bind failed launch transaction ${restored.id} before discard`
+      );
     } catch (error) {
+      if (error instanceof WorkbenchError && error.code === "RECOVERY_REQUIRED") throw error;
       logger.warn(
         `Rolled back failed launch transaction ${restored.id}, but its backup could not be ` +
           `pruned: ${error instanceof Error ? error.message : String(error)}`
@@ -1257,18 +1747,28 @@ export class WorkbenchClient {
     this.ownedChild = observation;
     child.once("exit", () => {
       if (this.ownedChild !== observation) return;
+      this.activityGate.invalidateForUnexpectedExit({
+        generation: observation.generation,
+        targetKey: observation.targetKey,
+        process: {
+          pid: identity.pid,
+          executablePath: identity.executablePath,
+          creationTime: identity.creationTime,
+        },
+      });
       this.resetConnectionState();
       this.ownedChild = null;
-      void this.coordinateLifecycle("recovery", targetKey, async () =>
-        this.processGuard.withLifecycleLock(async (session) => {
-          const read = await session.readState();
-          if (read.kind !== "valid" || read.state.generation !== observation.generation ||
-              !read.state.workbench || read.state.workbench.pid !== identity.pid ||
-              read.state.workbench.creationTime !== identity.creationTime) return;
-          await this.assertNoWorkbenchProcesses(session, "Unexpected-exit recovery");
-          await this.reconcileAbsentState(session, read.state,
-            read.state.target ? canonicalizeGproj(read.state.target.path) : null);
-        })
+      void this.activityGate.runLifecycle("recovery", () =>
+        this.coordinateLifecycle("recovery", targetKey, async () =>
+          this.processGuard.withLifecycleLock(async (session) => {
+            const read = await session.readState();
+            if (read.kind !== "valid" || read.state.generation !== observation.generation ||
+                !read.state.workbench || read.state.workbench.pid !== identity.pid ||
+                read.state.workbench.creationTime !== identity.creationTime) return;
+            await this.assertNoWorkbenchProcesses(session, "Unexpected-exit recovery");
+            await this.reconcileAbsentState(session, read.state, read.state.target);
+          })
+        )
       ).catch((error) => logger.warn(
         `Workbench exit reconciliation failed: ${error instanceof Error ? error.message : String(error)}`
       ));
@@ -1377,6 +1877,9 @@ export class WorkbenchClient {
 
   private mapLifecycleError(error: unknown): WorkbenchError {
     if (error instanceof WorkbenchError) return error;
+    if (error instanceof WorkbenchActivityError) {
+      return new WorkbenchError(error.message, error.code);
+    }
     if (error instanceof ProjectIdentityError) {
       return new WorkbenchError(error.message, error.code);
     }

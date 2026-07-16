@@ -38,7 +38,7 @@ Before writing any code, assess the scope of what the user is asking for. Think 
 → Do NOT attempt to build everything at once. Instead:
 
 1. Tell the user this is a large project and roughly how many systems are involved.
-2. Break the full mod into **phases**, where each phase is a standalone deliverable that builds on the previous one. Phase 1 should always be the minimum viable foundation — the mod should load and do *something* testable after Phase 1.
+2. Break the full mod into *phases*, where each phase is a standalone deliverable that builds on the previous one. Phase 1 should always be the minimum viable foundation — the mod should load and do *something* testable after Phase 1.
 3. For each phase, list:
    - What systems/features it covers
    - What scripts, prefabs, and configs it will need

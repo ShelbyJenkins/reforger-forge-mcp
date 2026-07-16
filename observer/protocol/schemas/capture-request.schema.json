@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://reforger-forge.dev/observer/v1/capture-request.schema.json",
+  "title": "Observer capture request",
+  "type": "object",
+  "required": ["protocolVersion", "jobId", "idempotencyKey", "deadlineAt", "view", "settleFrames", "performancePolicy"],
+  "properties": {
+    "protocolVersion": { "type": "string", "pattern": "^1\\.[0-9]+$" },
+    "jobId": { "$ref": "#/$defs/id" },
+    "idempotencyKey": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "instanceId": { "$ref": "#/$defs/id" },
+    "worldEpoch": { "type": "integer", "minimum": 0 },
+    "deadlineAt": { "type": "string", "format": "date-time" },
+    "view": {
+      "oneOf": [
+        { "type": "object", "required": ["kind"], "properties": { "kind": { "const": "current" } } },
+        { "type": "object", "required": ["kind", "position", "orientation", "fov"], "properties": { "kind": { "const": "pose" }, "position": { "$ref": "#/$defs/vector3" }, "orientation": { "$ref": "#/$defs/quaternion" }, "fov": { "type": "number", "minimum": 1, "maximum": 179 } } },
+        { "type": "object", "required": ["kind", "position", "target", "fov"], "properties": { "kind": { "const": "lookAt" }, "position": { "$ref": "#/$defs/vector3" }, "target": { "$ref": "#/$defs/vector3" }, "fov": { "type": "number", "minimum": 1, "maximum": 179 } } }
+      ]
+    },
+    "settleFrames": { "type": "integer", "minimum": 0, "maximum": 30 },
+    "performancePolicy": { "enum": ["evidence", "instrumented", "performance"] }
+  },
+  "$defs": {
+    "id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{1,96}$" },
+    "vector3": { "type": "array", "minItems": 3, "maxItems": 3, "items": { "type": "number" } },
+    "quaternion": { "type": "array", "minItems": 4, "maxItems": 4, "items": { "type": "number" } }
+  }
+}

@@ -38,6 +38,12 @@ export const REQUIRED_HANDLER_FILES = [
   "EMCP_WB_ListEntities.c",
   "EMCP_WB_Localization.c",
   "EMCP_WB_ModifyEntity.c",
+  "EMCP_WB_ObserverCancel.c",
+  "EMCP_WB_ObserverCommon.c",
+  "EMCP_WB_ObserverPing.c",
+  "EMCP_WB_ObserverRelease.c",
+  "EMCP_WB_ObserverStatus.c",
+  "EMCP_WB_ObserverSubmit.c",
   "EMCP_WB_Ping.c",
   "EMCP_WB_Prefabs.c",
   "EMCP_WB_Reload.c",
@@ -96,6 +102,23 @@ export interface HandlerTransactionRecord {
   newManagedFiles: string[];
   createdDirectories: string[];
   manifest: HandlerManifest;
+}
+
+/**
+ * The durable lifecycle fields that bind a handler transaction to one target.
+ * These deliberately do not require the project file to exist: recovery may
+ * need to restore watched files after the .gproj was removed or disconnected.
+ */
+export interface ExpectedHandlerTransactionState {
+  modDirectory: string;
+  manifestGeneration: string | null;
+  transactionId: string | null;
+  backupPath: string | null;
+}
+
+export interface ExpectedHandlerTransactionTarget {
+  path: string;
+  comparisonKey: string;
 }
 
 export interface PreparedHandlerTransaction {
@@ -616,15 +639,92 @@ export class HandlerBundleManager {
       );
     }
     const record = validateTransactionRecord(parsed);
-    if (!record || resolve(record.backupPath) !== resolve(backupPath) ||
-        !isContained(this.transactionsDir, record.backupPath) ||
-        !isContained(record.modDirectory, record.handlerDirectory)) {
+    const relationshipsAreValid = record !== null &&
+      pathKey(record.backupPath) === pathKey(backupPath) &&
+      pathKey(record.backupPath) === pathKey(join(this.transactionsDir, record.id)) &&
+      isContained(this.transactionsDir, record.backupPath) &&
+      pathKey(record.handlerDirectory) === pathKey(join(
+        record.modDirectory,
+        "Scripts",
+        "WorkbenchGame",
+        HANDLER_FOLDER
+      )) &&
+      pathKey(dirname(record.canonicalProject)) === pathKey(record.modDirectory) &&
+      pathKey(record.manifest.canonicalProject) === pathKey(record.canonicalProject) &&
+      record.manifest.canonicalProjectKey === record.canonicalProjectKey &&
+      pathKey(record.manifest.modDirectory) === pathKey(record.modDirectory);
+    if (!record || !relationshipsAreValid) {
       throw new HandlerBundleError(
         `Handler transaction record is malformed or unsafe: ${transactionPath}`,
         "HANDLER_TRANSACTION_INVALID"
       );
     }
     return record;
+  }
+
+  /**
+   * Load and cross-bind a transaction to the lifecycle record that references
+   * it. Callers use this before every recovery mutation or state transition so
+   * a swapped backup, target, manifest, or mod cannot affect watched files.
+   */
+  loadExpectedTransaction(
+    handler: ExpectedHandlerTransactionState,
+    target: ExpectedHandlerTransactionTarget
+  ): HandlerTransactionRecord {
+    if (!handler.transactionId || !handler.backupPath || !handler.manifestGeneration ||
+        !target.path || !target.comparisonKey) {
+      throw new HandlerBundleError(
+        "Lifecycle state does not contain a complete handler transaction binding.",
+        "HANDLER_TRANSACTION_INVALID"
+      );
+    }
+    const record = this.loadTransaction(handler.backupPath);
+    const expectedHandlerDirectory = join(
+      record.modDirectory,
+      "Scripts",
+      "WorkbenchGame",
+      HANDLER_FOLDER
+    );
+    if (record.id !== handler.transactionId ||
+        pathKey(record.modDirectory) !== pathKey(handler.modDirectory) ||
+        record.manifest.generation !== handler.manifestGeneration ||
+        record.canonicalProjectKey !== target.comparisonKey ||
+        pathKey(record.canonicalProject) !== pathKey(target.path) ||
+        pathKey(record.handlerDirectory) !== pathKey(expectedHandlerDirectory)) {
+      throw new HandlerBundleError(
+        `Handler transaction ${record.id} does not match its lifecycle target and handler state.`,
+        "HANDLER_TRANSACTION_INVALID"
+      );
+    }
+    return record;
+  }
+
+  restoreExpectedTransaction(
+    handler: ExpectedHandlerTransactionState,
+    target: ExpectedHandlerTransactionTarget
+  ): HandlerTransactionRecord {
+    return this.restore(this.loadExpectedTransaction(handler, target));
+  }
+
+  commitExpectedTransaction(
+    handler: ExpectedHandlerTransactionState,
+    target: ExpectedHandlerTransactionTarget
+  ): void {
+    this.commit(this.loadExpectedTransaction(handler, target));
+  }
+
+  discardExpectedTransaction(
+    handler: ExpectedHandlerTransactionState,
+    target: ExpectedHandlerTransactionTarget
+  ): void {
+    this.discardTransaction(this.loadExpectedTransaction(handler, target));
+  }
+
+  abortExpectedTransaction(
+    handler: ExpectedHandlerTransactionState,
+    target: ExpectedHandlerTransactionTarget
+  ): void {
+    this.abortPrepared(this.loadExpectedTransaction(handler, target));
   }
 
   restore(recordOrBackupPath: HandlerTransactionRecord | string): HandlerTransactionRecord {
@@ -672,7 +772,13 @@ export class HandlerBundleManager {
   discardTransaction(recordOrBackupPath: HandlerTransactionRecord | string): void {
     const record = typeof recordOrBackupPath === "string"
       ? this.loadTransaction(recordOrBackupPath)
-      : recordOrBackupPath;
+      : this.loadTransaction(recordOrBackupPath.backupPath);
+    if (typeof recordOrBackupPath !== "string" && record.id !== recordOrBackupPath.id) {
+      throw new HandlerBundleError(
+        `Handler transaction ${recordOrBackupPath.id} cannot discard backup for ${record.id}.`,
+        "HANDLER_TRANSACTION_INVALID"
+      );
+    }
     if (!isContained(this.transactionsDir, record.backupPath)) {
       throw new HandlerBundleError(
         `Handler transaction is outside the managed transaction directory: ${record.backupPath}`,

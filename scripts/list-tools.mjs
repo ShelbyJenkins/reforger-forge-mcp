@@ -31,6 +31,7 @@ const offline = [];
 const workbench = [];
 const lifecycle = [];
 const connection = [];
+const observer = [];
 const hybrid = [];
 
 const offlineNames = new Set([
@@ -45,6 +46,13 @@ const lifecycleNames = new Set([
 const connectionNames = new Set(["wb_connect", "wb_diagnose"]);
 const workbenchNames = new Set(["scenario_create"]);
 const hybridNames = new Set(["game_duplicate", "mod"]);
+const observerNames = new Set([
+  "observer_setup",
+  "observer_prepare_launch",
+  "observer_instances",
+  "observer_capture",
+  "observer_job",
+]);
 const readme = readFileSync(join(root, "README.md"), "utf8");
 const toolReference = readme.split("## Complete Tool Reference")[1]?.split(/^## /m)[0] ?? "";
 const documentedNames = new Set(
@@ -52,7 +60,8 @@ const documentedNames = new Set(
 );
 
 for (const tool of sorted) {
-  if (lifecycleNames.has(tool.name)) lifecycle.push(tool.name);
+  if (observerNames.has(tool.name)) observer.push(tool.name);
+  else if (lifecycleNames.has(tool.name)) lifecycle.push(tool.name);
   else if (connectionNames.has(tool.name)) connection.push(tool.name);
   else if (offlineNames.has(tool.name)) offline.push(tool.name);
   else if (workbenchNames.has(tool.name) || tool.name.startsWith("wb_")) workbench.push(tool.name);
@@ -67,6 +76,8 @@ console.log(`\nWorkbench lifecycle / maintenance (${lifecycle.length}):`);
 lifecycle.forEach((t) => console.log(`  - ${t}`));
 console.log(`\nWorkbench connection / diagnostics (${connection.length}):`);
 connection.forEach((t) => console.log(`  - ${t}`));
+console.log(`\nObserver platform (${observer.length}):`);
+observer.forEach((t) => console.log(`  - ${t}`));
 console.log(`\nWorkbench live tools (${workbench.length}):`);
 workbench.forEach((t) => console.log(`  - ${t}`));
 if (hybrid.length) {
@@ -75,10 +86,14 @@ if (hybrid.length) {
 }
 
 const registeredNames = new Set(sorted.map((tool) => tool.name));
+const missingObserverTools = [...observerNames].filter((name) => !registeredNames.has(name));
 const missingDocumented = [...documentedNames].filter((name) => !registeredNames.has(name));
 const undocumented = [...registeredNames].filter((name) => !documentedNames.has(name));
-if (documentedNames.size === 0 || missingDocumented.length > 0 || undocumented.length > 0) {
+if (documentedNames.size === 0 || missingObserverTools.length > 0 || missingDocumented.length > 0 || undocumented.length > 0) {
   if (documentedNames.size === 0) console.error("\nREADME tool reference could not be parsed.");
+  if (missingObserverTools.length > 0) {
+    console.error(`\nRequired observer tools missing at runtime: ${missingObserverTools.join(", ")}`);
+  }
   if (missingDocumented.length > 0) {
     console.error(`\nDocumented tools missing at runtime: ${missingDocumented.join(", ")}`);
   }

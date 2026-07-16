@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://reforger-forge.dev/observer/v1/job-status.schema.json",
+  "title": "Observer job status",
+  "type": "object",
+  "required": ["protocolVersion", "sessionId", "instanceId", "instanceNonce", "jobId", "sequence", "state", "worldId", "worldEpoch", "timestamp"],
+  "properties": {
+    "protocolVersion": { "type": "string", "pattern": "^1\\.[0-9]+$" },
+    "sessionId": { "$ref": "#/$defs/id" },
+    "instanceId": { "$ref": "#/$defs/id" },
+    "instanceNonce": { "type": "string", "minLength": 32, "maxLength": 256 },
+    "jobId": { "$ref": "#/$defs/id" },
+    "sequence": { "type": "integer", "minimum": 0 },
+    "state": { "enum": ["queued", "dispatched", "accepted", "resolving", "preloading", "acquiringCamera", "positioning", "settling", "capturing", "awaitingArtifact", "restoring", "completed", "failed", "cancelled"] },
+    "worldId": { "oneOf": [{ "type": "string", "minLength": 1, "maxLength": 512 }, { "type": "null" }] },
+    "worldEpoch": { "type": "integer", "minimum": 0 },
+    "timestamp": { "type": "string", "format": "date-time" },
+    "deliveryToken": { "type": "string", "minLength": 16, "maxLength": 256, "pattern": "^[A-Za-z0-9_-]+$" },
+    "cameraLease": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["held", "leaseId", "observerCameraId"],
+          "properties": {
+            "held": { "const": true },
+            "leaseId": { "$ref": "#/$defs/id" },
+            "observerCameraId": { "oneOf": [{ "$ref": "#/$defs/id" }, { "type": "integer", "minimum": 0 }] }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["held", "restorationConfirmed"],
+          "properties": {
+            "held": { "const": false },
+            "restorationConfirmed": { "type": "boolean" }
+          }
+        }
+      ]
+    },
+    "errorCode": { "type": "string" },
+    "message": { "type": "string", "maxLength": 512 }
+  },
+  "$defs": { "id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{1,96}$" } }
+}

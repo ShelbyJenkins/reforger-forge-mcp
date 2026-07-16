@@ -9,6 +9,8 @@ import {
 import type {
   ExactProcessIdentity,
   ProcessInspection,
+  LifecycleEndpoint,
+  VerifyEndpointOwnerResult,
   VerifyTerminateResult,
   WorkbenchIdentity,
   WorkbenchLifecycleBackend,
@@ -22,8 +24,13 @@ export class FakeLifecycleBackend implements WorkbenchLifecycleBackend {
   readonly ownerArguments = new Map<number, string>();
   readonly workbenchPids = new Set<number>();
   readonly terminationCalls: WorkbenchIdentity[] = [];
+  readonly endpointOwnershipCalls: Array<{
+    endpoint: LifecycleEndpoint;
+    expected: WorkbenchIdentity;
+  }> = [];
   unverifiable: WorkbenchProcessScan["unverifiable"] = [];
   terminationResult: VerifyTerminateResult | null = null;
+  endpointOwnershipResult: VerifyEndpointOwnerResult | null = null;
   replaceFailure: ((args: {
     path: string;
     expectedGeneration: string | null;
@@ -91,6 +98,32 @@ export class FakeLifecycleBackend implements WorkbenchLifecycleBackend {
         .filter((entry): entry is ExactProcessIdentity => entry !== undefined),
       unverifiable: [...this.unverifiable],
     };
+  }
+
+  async verifyEndpointOwner(
+    endpoint: LifecycleEndpoint,
+    expected: WorkbenchIdentity
+  ): Promise<VerifyEndpointOwnerResult> {
+    this.endpointOwnershipCalls.push({ endpoint, expected });
+    if (this.endpointOwnershipResult) return this.endpointOwnershipResult;
+    const actual = this.processes.get(expected.pid);
+    if (!actual || actual.creationTime !== expected.creationTime ||
+        actual.executablePath.toLowerCase() !== expected.executablePath.toLowerCase() ||
+        this.ownerArguments.get(expected.pid) !== expected.ownerTokenArgument) {
+      return {
+        kind: "refused",
+        reason: "workbench_process_mismatch",
+        message: "The expected fake Workbench identity is not live and exact.",
+      };
+    }
+    if (this.workbenchPids.size !== 1 || !this.workbenchPids.has(expected.pid)) {
+      return {
+        kind: "refused",
+        reason: "workbench_process_mismatch",
+        message: "The expected fake Workbench is not the sole Workbench process.",
+      };
+    }
+    return { kind: "owned", listenerPid: expected.pid };
   }
 
   async verifyAndTerminate(expected: WorkbenchIdentity): Promise<VerifyTerminateResult> {

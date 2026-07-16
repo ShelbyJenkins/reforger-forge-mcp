@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://reforger-forge.dev/observer/v1/artifact-manifest.schema.json",
+  "title": "Observer artifact completion manifest",
+  "type": "object",
+  "required": ["protocolVersion", "sessionId", "instanceId", "instanceNonce", "jobId", "artifactId", "relativeScreenshotFilename", "screenshotIssuedAt", "completedAt", "worldId", "worldEpoch", "actualCamera", "requestedSettleFrames", "actualSettleFrames", "contaminated", "warnings"],
+  "properties": {
+    "protocolVersion": { "type": "string", "pattern": "^1\\.[0-9]+$" },
+    "sessionId": { "$ref": "#/$defs/id" },
+    "instanceId": { "$ref": "#/$defs/id" },
+    "instanceNonce": { "type": "string", "minLength": 32, "maxLength": 256 },
+    "jobId": { "$ref": "#/$defs/id" },
+    "artifactId": { "$ref": "#/$defs/id" },
+    "relativeScreenshotFilename": { "type": "string", "pattern": "^[A-Za-z0-9_-]{1,96}\\.(bmp|png)$" },
+    "screenshotIssuedAt": { "type": "string", "format": "date-time" },
+    "completedAt": { "type": "string", "format": "date-time" },
+    "expectedByteCount": { "type": "integer", "minimum": 1, "maximum": 67108864 },
+    "worldId": { "oneOf": [{ "type": "string", "minLength": 1, "maxLength": 512 }, { "type": "null" }] },
+    "worldEpoch": { "type": "integer", "minimum": 0 },
+    "actualCamera": { "type": "object" },
+    "actualFov": { "type": "number", "minimum": 1, "maximum": 179 },
+    "requestedSettleFrames": { "type": "integer", "minimum": 0, "maximum": 30 },
+    "actualSettleFrames": { "type": "integer", "minimum": 0, "maximum": 30 },
+    "contaminated": { "type": "boolean" },
+    "warnings": { "type": "array", "maxItems": 16, "items": { "type": "string", "maxLength": 256 } }
+  },
+  "$defs": { "id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{1,96}$" } }
+}

@@ -6,5 +6,15 @@
   "workbenchScriptAuthorizeAll": false,
   "workbenchNoThrow": true,
   "workbenchHost": "127.0.0.1",
-  "workbenchPort": 5775
+  "workbenchPort": 5775,
+  "observer": {
+    "startupTimeoutMs": 10000,
+    "requestTimeoutMs": 30000,
+    "defaultCaptureTimeoutMs": 30000,
+    "maxInlineImageBytes": 8388608,
+    "retentionIntervalMs": 60000,
+    "retentionMaxAgeMs": 604800000,
+    "retentionMaxBytes": 536870912,
+    "sessionTtlMs": 1200000
+  }
 }

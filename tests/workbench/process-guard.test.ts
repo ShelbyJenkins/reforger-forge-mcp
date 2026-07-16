@@ -271,6 +271,73 @@ describe("WorkbenchProcessGuard v2 lifecycle state", () => {
     }))).rejects.toMatchObject({ code: "IDENTITY_UNVERIFIABLE" });
   });
 
+  it("binds a loopback listener to the exact sole owned Workbench", async () => {
+    const stateDir = root();
+    const backend = new FakeLifecycleBackend();
+    const guard = new WorkbenchProcessGuard({ stateDir, backend });
+    const expected: WorkbenchIdentity = {
+      pid: 5250,
+      executablePath: "C:\\Tools\\Workbench.exe",
+      creationTime: "5250",
+      ownerTokenArgument: guard.ownerArgument("endpoint-token"),
+      launchedAtMs: 1,
+    };
+    backend.addWorkbench(expected, expected.ownerTokenArgument);
+
+    const result = await guard.withLifecycleLock((session) =>
+      session.verifyEndpointOwner({ host: "127.0.0.1", port: 5775 }, expected)
+    );
+
+    expect(result).toEqual({ kind: "owned", listenerPid: expected.pid });
+    expect(backend.endpointOwnershipCalls).toEqual([{
+      endpoint: { host: "127.0.0.1", port: 5775 },
+      expected,
+    }]);
+  });
+
+  it("refuses a valid foreign endpoint response while the spawned child remains live", async () => {
+    const stateDir = root();
+    const backend = new FakeLifecycleBackend();
+    const guard = new WorkbenchProcessGuard({ stateDir, backend });
+    const expected: WorkbenchIdentity = {
+      pid: 5350,
+      executablePath: "C:\\Tools\\Workbench.exe",
+      creationTime: "5350",
+      ownerTokenArgument: guard.ownerArgument("foreign-endpoint-token"),
+      launchedAtMs: 1,
+    };
+    backend.addWorkbench(expected, expected.ownerTokenArgument);
+    backend.endpointOwnershipResult = {
+      kind: "refused",
+      reason: "listener_pid_mismatch",
+      message: "The listener belongs to foreign PID 9999.",
+    };
+
+    const result = await guard.withLifecycleLock((session) =>
+      session.verifyEndpointOwner({ host: "127.0.0.1", port: 5775 }, expected)
+    );
+
+    expect(result).toMatchObject({
+      kind: "refused",
+      reason: "listener_pid_mismatch",
+    });
+    expect(backend.processes.has(expected.pid)).toBe(true);
+  });
+
+  it("refuses non-loopback automated lifecycle endpoints before claiming state", async () => {
+    const stateDir = root();
+    const backend = new FakeLifecycleBackend();
+    const guard = new WorkbenchProcessGuard({ stateDir, backend });
+
+    const result = await guard.withLifecycleLock((session) => session.validateAndClaim({
+      endpoint: { host: "192.0.2.10", port: 5775 },
+      target: target(),
+    }));
+
+    expect(result).toMatchObject({ kind: "refused", code: "IDENTITY_UNVERIFIABLE" });
+    expect(existsSync(guard.statePath)).toBe(false);
+  });
+
   it("delegates termination as one exact handle-bound backend operation", async () => {
     const stateDir = root();
     const backend = new FakeLifecycleBackend();

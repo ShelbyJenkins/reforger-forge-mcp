@@ -1,7 +1,9 @@
 import { createHash, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
+import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { homedir, platform, tmpdir } from "node:os";
+import { isIP } from "node:net";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -14,6 +16,8 @@ const HELPER_TIMEOUT_MS = 20_000;
 const PROCESS_CAPTURE_TIMEOUT_MS = 5_000;
 const PROCESS_POLL_MS = 100;
 const LIFECYCLE_VERSION = 2;
+
+export type LifecycleFailStop = (message: string) => never;
 
 export interface ExactProcessIdentity {
   pid: number;
@@ -140,6 +144,23 @@ export interface WorkbenchProcessScan {
   unverifiable: Array<{ pid: number; reason: string; message: string }>;
 }
 
+export type EndpointOwnershipRefusalReason =
+  | "endpoint_not_loopback"
+  | "listener_not_found"
+  | "listener_ambiguous"
+  | "listener_pid_mismatch"
+  | "access_denied"
+  | "executable_mismatch"
+  | "creation_time_mismatch"
+  | "command_line_unverifiable"
+  | "token_mismatch"
+  | "workbench_process_mismatch"
+  | "helper_failure";
+
+export type VerifyEndpointOwnerResult =
+  | { kind: "owned"; listenerPid: number }
+  | { kind: "refused"; reason: EndpointOwnershipRefusalReason; message: string };
+
 export interface WorkbenchLifecycleBackend {
   readonly platform: "win32" | "test";
   withMachineMutex<T>(args: {
@@ -150,6 +171,10 @@ export interface WorkbenchLifecycleBackend {
   inspectCurrentProcess(pid: number): Promise<ExactProcessIdentity & { userSid: string }>;
   inspectProcess(pid: number, expectedOwnerTokenArgument?: string): Promise<ProcessInspection | null>;
   scanWorkbenchProcesses(): Promise<WorkbenchProcessScan>;
+  verifyEndpointOwner(
+    endpoint: LifecycleEndpoint,
+    expected: WorkbenchIdentity
+  ): Promise<VerifyEndpointOwnerResult>;
   verifyAndTerminate(expected: WorkbenchIdentity, timeoutMs: number): Promise<VerifyTerminateResult>;
   replaceState(args: {
     path: string;
@@ -205,6 +230,10 @@ export interface WorkbenchLifecycleSession {
     ownerTokenArgument: string;
     launchedAtMs: number;
   }): Promise<WorkbenchIdentity>;
+  verifyEndpointOwner(
+    endpoint: LifecycleEndpoint,
+    expected: WorkbenchIdentity
+  ): Promise<VerifyEndpointOwnerResult>;
   verifyAndTerminate(expected: WorkbenchIdentity, timeoutMs: number): Promise<VerifyTerminateResult>;
   assertNoWorkbenchProcesses(): Promise<void>;
 }
@@ -218,6 +247,7 @@ interface HelperResponse {
   ownerArgumentMatched?: unknown;
   processes?: unknown;
   unverifiable?: unknown;
+  listenerPid?: unknown;
 }
 
 function sleep(ms: number): Promise<void> {
@@ -230,11 +260,22 @@ function normalizedPath(path: string): string {
 }
 
 function normalizedEndpoint(endpoint: LifecycleEndpoint): LifecycleEndpoint {
-  const host = endpoint.host.trim().toLowerCase();
+  let host = endpoint.host.trim().toLowerCase();
+  if (host.startsWith("[") && host.endsWith("]")) host = host.slice(1, -1);
   if (!host || !Number.isInteger(endpoint.port) || endpoint.port <= 0 || endpoint.port > 65535) {
     throw new LifecycleGuardError("Lifecycle endpoint is invalid.", "STATE_INVALID");
   }
   return { host, port: endpoint.port };
+}
+
+export function isLoopbackLifecycleHost(host: string): boolean {
+  const normalized = host.trim().toLowerCase().replace(/^\[|\]$/g, "");
+  const family = isIP(normalized);
+  if (family === 4) return normalized.split(".")[0] === "127";
+  if (family === 6) {
+    return normalized === "::1" || normalized === "0:0:0:0:0:0:0:1";
+  }
+  return false;
 }
 
 function isPositiveFileTime(value: unknown): value is string {
@@ -357,10 +398,32 @@ function defaultStateDir(): string {
     : join(homedir(), "AppData", "Local", "ReforgerForge", "Workbench", "v2");
 }
 
-class WindowsLifecycleBackend implements WorkbenchLifecycleBackend {
-  readonly platform = "win32" as const;
+export interface WindowsLifecycleBackendOptions {
+  helperTimeoutMs?: number;
+  failStop?: LifecycleFailStop;
+}
 
-  constructor(private readonly helperPath: string) {}
+export class WindowsLifecycleBackend implements WorkbenchLifecycleBackend {
+  readonly platform = "win32" as const;
+  private readonly helperTimeoutMs: number;
+  private readonly failStop: LifecycleFailStop;
+
+  constructor(
+    private readonly helperPath: string,
+    options: WindowsLifecycleBackendOptions = {}
+  ) {
+    this.helperTimeoutMs = options.helperTimeoutMs ?? HELPER_TIMEOUT_MS;
+    if (!Number.isInteger(this.helperTimeoutMs) || this.helperTimeoutMs <= 0) {
+      throw new LifecycleGuardError("Windows lifecycle helper timeout must be positive.", "STATE_INVALID");
+    }
+    this.failStop = options.failStop ?? ((message): never => {
+      try {
+        process.stderr.write(`ReforgerForge lifecycle fail-stop: ${message}\n`);
+      } finally {
+        process.abort();
+      }
+    });
+  }
 
   private assertSupported(): void {
     if (platform() !== "win32") {
@@ -377,7 +440,7 @@ class WindowsLifecycleBackend implements WorkbenchLifecycleBackend {
     }
   }
 
-  private powershellArgs(mode: string): string[] {
+  private powershellArgs(mode: string, deadlineUnixMs: number): string[] {
     return [
       "-NoProfile",
       "-NonInteractive",
@@ -387,30 +450,83 @@ class WindowsLifecycleBackend implements WorkbenchLifecycleBackend {
       this.helperPath,
       "-Mode",
       mode,
+      "-DeadlineUnixMs",
+      String(deadlineUnixMs),
     ];
   }
 
-  private async invoke(mode: string, request: unknown, timeoutMs = HELPER_TIMEOUT_MS): Promise<HelperResponse> {
+  private async waitForMutexHelperExit(
+    child: ChildProcessWithoutNullStreams,
+    closePromise: Promise<number | null>,
+    context: string,
+    killImmediately: boolean
+  ): Promise<void> {
+    if (killImmediately) child.kill();
+    let timer: NodeJS.Timeout | undefined;
+    await Promise.race([
+      closePromise.then(() => undefined),
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => {
+          child.kill();
+          try {
+            this.failStop(
+              `${context}; the mutex helper did not exit within ${this.helperTimeoutMs}ms.`
+            );
+          } catch (error) {
+            reject(error);
+          }
+        }, this.helperTimeoutMs);
+        timer.unref();
+      }),
+    ]).finally(() => {
+      if (timer) clearTimeout(timer);
+    });
+  }
+
+  private async invoke(
+    mode: string,
+    request: unknown,
+    timeoutMs = this.helperTimeoutMs,
+    mutationOutcomeUncertainOnTimeout = false
+  ): Promise<HelperResponse> {
     this.assertSupported();
-    // Mutation helpers have their own bounded native waits. Never return while
-    // a helper may still be replacing state or terminating a process; if the
-    // helper itself wedges, retaining the lifecycle mutex is the safe failure.
-    void timeoutMs;
+    if (!Number.isInteger(timeoutMs) || timeoutMs <= 0) {
+      throw new LifecycleGuardError("Windows lifecycle helper timeout must be positive.", "STATE_INVALID");
+    }
+    const deadlineUnixMs = Date.now() + timeoutMs;
     return new Promise<HelperResponse>((resolvePromise, reject) => {
-      const child = spawn("powershell.exe", this.powershellArgs(mode), {
+      const child = spawn("powershell.exe", this.powershellArgs(mode, deadlineUnixMs), {
         stdio: ["pipe", "pipe", "pipe"],
         windowsHide: true,
-      });
+      }) as ChildProcessWithoutNullStreams;
       let stdout = "";
       let stderr = "";
       let settled = false;
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        child.kill();
+        const message = `Windows lifecycle helper mode ${mode} exceeded its ${timeoutMs}ms deadline.`;
+        if (mutationOutcomeUncertainOnTimeout) {
+          try {
+            this.failStop(message);
+          } catch (error) {
+            reject(error);
+          }
+          return;
+        }
+        reject(new LifecycleGuardError(message, "HELPER_FAILURE"));
+      }, timeoutMs);
+      timer.unref();
       child.stdout.setEncoding("utf8");
       child.stderr.setEncoding("utf8");
+      child.stdin.on("error", () => undefined);
       child.stdout.on("data", (chunk: string) => { stdout += chunk; });
       child.stderr.on("data", (chunk: string) => { stderr += chunk; });
       child.once("error", (error) => {
         if (settled) return;
         settled = true;
+        clearTimeout(timer);
         reject(new LifecycleGuardError(
           `Could not start Windows lifecycle helper: ${error.message}`,
           "HELPER_FAILURE"
@@ -419,6 +535,7 @@ class WindowsLifecycleBackend implements WorkbenchLifecycleBackend {
       child.once("close", (code) => {
         if (settled) return;
         settled = true;
+        clearTimeout(timer);
         const lines = stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
         if (lines.length === 0) {
           reject(new LifecycleGuardError(
@@ -456,12 +573,18 @@ class WindowsLifecycleBackend implements WorkbenchLifecycleBackend {
     action: () => Promise<T>;
   }): Promise<T> {
     this.assertSupported();
-    const child = spawn("powershell.exe", this.powershellArgs("HoldMutex"), {
+    const acquisitionBudgetMs = args.timeoutMs + this.helperTimeoutMs;
+    const child = spawn(
+      "powershell.exe",
+      this.powershellArgs("HoldMutex", Date.now() + acquisitionBudgetMs),
+      {
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
-    });
+      }
+    ) as ChildProcessWithoutNullStreams;
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
+    child.stdin.on("error", () => undefined);
     let stderr = "";
     child.stderr.on("data", (chunk: string) => { stderr += chunk; });
     const closePromise = new Promise<number | null>((resolveClose) =>
@@ -469,14 +592,45 @@ class WindowsLifecycleBackend implements WorkbenchLifecycleBackend {
     );
     const acquired = await new Promise<HelperResponse>((resolveAcquired, reject) => {
       let buffer = "";
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        const error = new LifecycleGuardError(
+          `Lifecycle mutex holder produced no acquisition response within ${acquisitionBudgetMs}ms.`,
+          "HELPER_FAILURE"
+        );
+        void this.waitForMutexHelperExit(
+          child,
+          closePromise,
+          "Lifecycle mutex acquisition timed out",
+          true
+        ).then(() => reject(error), reject);
+      }, acquisitionBudgetMs);
+      timer.unref();
       const cleanup = (): void => {
+        clearTimeout(timer);
         child.stdout.off("data", onData);
         child.off("error", onError);
+        child.off("close", onClose);
       };
       const onError = (error: Error): void => {
+        if (settled) return;
+        settled = true;
         cleanup();
         reject(new LifecycleGuardError(
           `Could not start the lifecycle mutex holder: ${error.message}`,
+          "HELPER_FAILURE"
+        ));
+      };
+      const onClose = (code: number | null): void => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(new LifecycleGuardError(
+          `Lifecycle mutex holder exited before its acquisition response (code ${code})` +
+            `${stderr.trim() ? `: ${stderr.trim()}` : "."}`,
           "HELPER_FAILURE"
         ));
       };
@@ -484,23 +638,36 @@ class WindowsLifecycleBackend implements WorkbenchLifecycleBackend {
         buffer += chunk;
         const newline = buffer.indexOf("\n");
         if (newline < 0) return;
+        settled = true;
         cleanup();
         try {
           resolveAcquired(parseJsonText(buffer.slice(0, newline).trim()) as HelperResponse);
         } catch (error) {
-          reject(new LifecycleGuardError(
+          const invalidResponse = new LifecycleGuardError(
             `Lifecycle mutex holder returned invalid JSON: ${error instanceof Error ? error.message : String(error)}`,
             "HELPER_FAILURE"
-          ));
+          );
+          void this.waitForMutexHelperExit(
+            child,
+            closePromise,
+            "Lifecycle mutex holder returned invalid JSON",
+            true
+          ).then(() => reject(invalidResponse), reject);
         }
       };
       child.once("error", onError);
+      child.once("close", onClose);
       child.stdout.on("data", onData);
       child.stdin.write(`${JSON.stringify({ mutexName: args.name, timeoutMs: args.timeoutMs })}\n`);
     });
     if (acquired.ok !== true || acquired.status !== "acquired") {
       child.stdin.end();
-      await closePromise;
+      await this.waitForMutexHelperExit(
+        child,
+        closePromise,
+        "Lifecycle mutex holder did not exit after refusing acquisition",
+        false
+      );
       throw new LifecycleGuardError(
         acquired.status === "timeout"
           ? `Timed out waiting for the machine-wide Workbench lifecycle mutex ${args.name}.`
@@ -515,7 +682,7 @@ class WindowsLifecycleBackend implements WorkbenchLifecycleBackend {
         // JavaScript callbacks cannot be safely cancelled after the OS mutex
         // has been abandoned. Fail-stop the MCP process so no background
         // lifecycle action can continue after another MCP acquires the mutex.
-        process.abort();
+        this.failStop(`Lifecycle mutex holder exited unexpectedly with code ${code}.`);
       }
       return new Promise<never>(() => undefined);
     });
@@ -524,7 +691,12 @@ class WindowsLifecycleBackend implements WorkbenchLifecycleBackend {
     } finally {
       released = true;
       child.stdin.end("release\n");
-      await closePromise;
+      await this.waitForMutexHelperExit(
+        child,
+        closePromise,
+        "Lifecycle mutex holder did not release",
+        false
+      );
     }
   }
 
@@ -598,11 +770,60 @@ class WindowsLifecycleBackend implements WorkbenchLifecycleBackend {
     return { processes, unverifiable };
   }
 
+  async verifyEndpointOwner(
+    endpoint: LifecycleEndpoint,
+    expected: WorkbenchIdentity
+  ): Promise<VerifyEndpointOwnerResult> {
+    const normalized = normalizedEndpoint(endpoint);
+    if (!isLoopbackLifecycleHost(normalized.host)) {
+      return {
+        kind: "refused",
+        reason: "endpoint_not_loopback",
+        message: `Automated Workbench lifecycle endpoint ${normalized.host}:${normalized.port} is not loopback.`,
+      };
+    }
+    const response = await this.invoke("VerifyEndpointOwner", {
+      endpoint: normalized,
+      expected,
+    });
+    const listenerPid = Number(response.listenerPid);
+    if (response.ok === true && response.status === "owned" &&
+        Number.isInteger(listenerPid) && listenerPid === expected.pid) {
+      return { kind: "owned", listenerPid };
+    }
+    const allowedReasons = new Set<EndpointOwnershipRefusalReason>([
+      "endpoint_not_loopback",
+      "listener_not_found",
+      "listener_ambiguous",
+      "listener_pid_mismatch",
+      "access_denied",
+      "executable_mismatch",
+      "creation_time_mismatch",
+      "command_line_unverifiable",
+      "token_mismatch",
+      "workbench_process_mismatch",
+      "helper_failure",
+    ]);
+    const reason = allowedReasons.has(response.reason as EndpointOwnershipRefusalReason)
+      ? response.reason as EndpointOwnershipRefusalReason
+      : "helper_failure";
+    return {
+      kind: "refused",
+      reason,
+      message: response.message ?? "The listener could not be bound to the exact owned Workbench process.",
+    };
+  }
+
   async verifyAndTerminate(
     expected: WorkbenchIdentity,
     timeoutMs: number
   ): Promise<VerifyTerminateResult> {
-    const response = await this.invoke("VerifyTerminate", { expected, timeoutMs }, timeoutMs + HELPER_TIMEOUT_MS);
+    const response = await this.invoke(
+      "VerifyTerminate",
+      { expected, timeoutMs },
+      timeoutMs + this.helperTimeoutMs,
+      true
+    );
     if (response.ok === true && (response.status === "terminated" || response.status === "already_exited")) {
       return { kind: response.status };
     }
@@ -622,7 +843,7 @@ class WindowsLifecycleBackend implements WorkbenchLifecycleBackend {
       statePath: args.path,
       expectedGeneration: args.expectedGeneration,
       nextJson: `${JSON.stringify(args.next, null, 2)}\n`,
-    });
+    }, this.helperTimeoutMs, true);
     if (response.ok !== true || response.status !== "replaced") {
       throw new LifecycleGuardError(
         `Lifecycle state replacement failed: ${response.message ?? response.reason ?? "unknown helper error"}`,
@@ -640,7 +861,7 @@ class WindowsLifecycleBackend implements WorkbenchLifecycleBackend {
       statePath: args.path,
       archivePath: args.archivePath,
       expectedSha256: args.expectedSha256,
-    });
+    }, this.helperTimeoutMs, true);
     if (response.ok !== true || response.status !== "archived") {
       throw new LifecycleGuardError(
         `Lifecycle state archival failed: ${response.message ?? response.reason ?? "unknown helper error"}`,
@@ -755,6 +976,22 @@ class LifecycleSession implements WorkbenchLifecycleSession {
         `${lastError instanceof Error ? `: ${lastError.message}` : "."}`,
       "IDENTITY_UNVERIFIABLE"
     );
+  }
+
+  async verifyEndpointOwner(
+    endpoint: LifecycleEndpoint,
+    expected: WorkbenchIdentity
+  ): Promise<VerifyEndpointOwnerResult> {
+    this.assertActive();
+    const normalized = normalizedEndpoint(endpoint);
+    if (!isLoopbackLifecycleHost(normalized.host)) {
+      return {
+        kind: "refused",
+        reason: "endpoint_not_loopback",
+        message: `Automated Workbench lifecycle endpoint ${normalized.host}:${normalized.port} is not loopback.`,
+      };
+    }
+    return this.guard.backend.verifyEndpointOwner(normalized, expected);
   }
 
   async verifyAndTerminate(
@@ -923,6 +1160,13 @@ export class WorkbenchProcessGuard {
     }
   ): Promise<LifecycleClaimResult> {
     const endpoint = normalizedEndpoint(args.endpoint);
+    if (!isLoopbackLifecycleHost(endpoint.host)) {
+      return {
+        kind: "refused",
+        code: "IDENTITY_UNVERIFIABLE",
+        message: `Automated Workbench lifecycle endpoint ${endpoint.host}:${endpoint.port} must be a numeric loopback address.`,
+      };
+    }
     const target = args.target ?? null;
     const read = await this.readLifecycleState();
 

@@ -1,5 +1,5 @@
 import { EventEmitter } from "node:events";
-import type { ChildProcess } from "node:child_process";
+import type { ChildProcess, SpawnOptions } from "node:child_process";
 import {
   afterEach,
   describe,
@@ -61,6 +61,7 @@ interface Harness {
   manager: HandlerBundleManager;
   client: WorkbenchClient;
   children: FakeChild[];
+  spawnOptions: SpawnOptions[];
 }
 
 function createHarness(): Harness {
@@ -110,6 +111,7 @@ function createHarness(): Harness {
     requiredFiles: ["EMCP_WB_Ping.c"],
   });
   const children: FakeChild[] = [];
+  const spawnOptions: SpawnOptions[] = [];
   let nextPid = 12_000;
   const client = new WorkbenchClient(
     config.workbenchHost,
@@ -119,7 +121,8 @@ function createHarness(): Harness {
     guard,
     {
       handlerBundle: manager,
-      spawnProcess: (command, args) => {
+      spawnProcess: (command, args, options) => {
+        spawnOptions.push(options);
         const child = new FakeChild(nextPid++);
         const ownerArgument = args.find((arg) =>
           arg.startsWith("-reforgerForgeOwnerToken=")
@@ -167,6 +170,7 @@ function createHarness(): Harness {
     manager,
     client,
     children,
+    spawnOptions,
   };
 }
 
@@ -206,6 +210,18 @@ afterEach(() => {
 });
 
 describe("exact owner-scoped Workbench restart", () => {
+  it("launches an explicit graphical Workbench lifecycle with a visible native viewport", async () => {
+    const harness = createHarness();
+    await harness.client.ensureRunning(harness.projectPath);
+
+    expect(harness.spawnOptions).toHaveLength(1);
+    expect(harness.spawnOptions[0]).toMatchObject({
+      detached: true,
+      stdio: "ignore",
+      windowsHide: false,
+    });
+  });
+
   it("restarts only the recorded exact process and never calls ChildProcess.kill", async () => {
     const harness = createHarness();
     const launched = await harness.client.ensureRunning(harness.projectPath);
@@ -333,6 +349,32 @@ describe("exact owner-scoped Workbench restart", () => {
     }
   });
 
+  it("rolls back when a foreign endpoint answers ping while the spawned child stays alive", async () => {
+    const harness = createHarness();
+    harness.backend.endpointOwnershipResult = {
+      kind: "refused",
+      reason: "listener_pid_mismatch",
+      message: "listener belongs to injected foreign PID 44004",
+    };
+
+    await expect(harness.client.ensureRunning(harness.projectPath)).rejects.toMatchObject({
+      code: "IDENTITY_UNVERIFIABLE",
+    });
+    expect(harness.children).toHaveLength(1);
+    expect(harness.backend.endpointOwnershipCalls).toHaveLength(1);
+    expect(harness.backend.endpointOwnershipCalls[0].expected.pid).toBe(harness.children[0].pid);
+    expect(harness.backend.terminationCalls).toHaveLength(1);
+    expect(harness.backend.workbenchPids.size).toBe(0);
+    expect(existsSync(harness.handlerPath)).toBe(false);
+    const read = await harness.guard.readLifecycleState();
+    expect(read.kind).toBe("valid");
+    if (read.kind === "valid") {
+      expect(read.state.phase).toBe("vacant");
+      expect(read.state.workbench).toBeNull();
+      expect(read.state.handler).toBeNull();
+    }
+  });
+
   it("preserves the live failed-launch transaction when exact stop is refused", async () => {
     const harness = createHarness();
     (harness.client as unknown as {
@@ -394,6 +436,89 @@ describe("exact owner-scoped Workbench restart", () => {
     expect(harness.backend.terminationCalls).toHaveLength(1);
   });
 
+  it("shuts down the exact owned process after its recorded .gproj is deleted", async () => {
+    const harness = createHarness();
+    const launched = await harness.client.ensureRunning(harness.projectPath);
+    unlinkSync(harness.projectPath);
+
+    const shutdown = await harness.client.shutdownOwnedWorkbench();
+
+    expect(shutdown).toMatchObject({
+      stopped: true,
+      previousPid: launched.pid,
+      gprojPath: harness.projectPath,
+    });
+    expect(harness.backend.terminationCalls).toHaveLength(1);
+    expect(harness.backend.terminationCalls[0].pid).toBe(launched.pid);
+    const read = await harness.guard.readLifecycleState();
+    expect(read.kind).toBe("valid");
+    if (read.kind === "valid") {
+      expect(read.state.phase).toBe("vacant");
+      expect(read.state.target?.path).toBe(harness.projectPath);
+      expect(read.state.workbench).toBeNull();
+    }
+  });
+
+  it("still revalidates the recorded .gproj before restart", async () => {
+    const harness = createHarness();
+    const launched = await harness.client.ensureRunning(harness.projectPath);
+    unlinkSync(harness.projectPath);
+
+    await expect(harness.client.restartOwnedWorkbench()).rejects.toMatchObject({
+      code: "INVALID_TARGET",
+    });
+    expect(harness.backend.terminationCalls).toHaveLength(0);
+    expect(harness.backend.workbenchPids.has(launched.pid)).toBe(true);
+  });
+
+  it("returns RECOVERY_REQUIRED before restoring a cross-bound transaction mismatch", async () => {
+    const harness = createHarness();
+    (harness.client as unknown as {
+      waitForHandlerReady: () => Promise<void>;
+    }).waitForHandlerReady = vi.fn().mockRejectedValue(new WorkbenchError(
+      "injected readiness failure",
+      "LAUNCH_FAILED"
+    ));
+    harness.backend.terminationResult = {
+      kind: "refused",
+      reason: "access_denied",
+      message: "preserve interrupted transaction",
+    };
+    await expect(harness.client.ensureRunning(harness.projectPath)).rejects.toMatchObject({
+      code: "RECOVERY_REQUIRED",
+    });
+
+    const interrupted = await harness.guard.readLifecycleState();
+    expect(interrupted.kind).toBe("valid");
+    if (interrupted.kind !== "valid" || !interrupted.state.handler?.backupPath) return;
+    const watchedBytes = readFileSync(harness.handlerPath);
+    const backupPath = interrupted.state.handler.backupPath;
+    const pid = interrupted.state.workbench!.pid;
+    harness.backend.terminationResult = null;
+    harness.backend.processes.delete(pid);
+    harness.backend.workbenchPids.delete(pid);
+    writeFileSync(harness.guard.statePath, `${JSON.stringify({
+      ...interrupted.state,
+      handler: {
+        ...interrupted.state.handler,
+        transactionId: "cross-bound-to-a-different-transaction",
+      },
+    }, null, 2)}\n`, "utf8");
+
+    await expect(harness.client.shutdownOwnedWorkbench()).rejects.toMatchObject({
+      code: "RECOVERY_REQUIRED",
+    });
+    expect(readFileSync(harness.handlerPath)).toEqual(watchedBytes);
+    expect(existsSync(backupPath)).toBe(true);
+    const after = await harness.guard.readLifecycleState();
+    expect(after.kind).toBe("valid");
+    if (after.kind === "valid") {
+      expect(after.state.phase).toBe("starting");
+      expect(after.state.handler?.transactionId)
+        .toBe("cross-bound-to-a-different-transaction");
+    }
+  });
+
   it("fails closed when this MCP has no exact running owner", async () => {
     const harness = createHarness();
     try {
@@ -420,6 +545,64 @@ describe("exact owner-scoped Workbench restart", () => {
     });
     expect(harness.children).toHaveLength(1);
     expect(harness.backend.terminationCalls).toHaveLength(0);
+  });
+
+  it("re-proves endpoint ownership before reusing a recorded running session", async () => {
+    const harness = createHarness();
+    const launched = await harness.client.ensureRunning(harness.projectPath);
+    expect(harness.backend.endpointOwnershipCalls).toHaveLength(1);
+    vi.spyOn(harness.client, "ping").mockResolvedValue(true);
+    harness.backend.endpointOwnershipResult = {
+      kind: "refused",
+      reason: "listener_pid_mismatch",
+      message: "listener moved to foreign PID 55100",
+    };
+
+    await expect(harness.client.ensureRunning(harness.projectPath)).rejects.toMatchObject({
+      code: "IDENTITY_UNVERIFIABLE",
+    });
+    expect(harness.backend.endpointOwnershipCalls).toHaveLength(2);
+    expect(harness.backend.endpointOwnershipCalls[1].expected.pid).toBe(launched.pid);
+    expect(harness.backend.terminationCalls).toHaveLength(0);
+    expect(harness.backend.workbenchPids.has(launched.pid)).toBe(true);
+  });
+
+  it("re-proves endpoint ownership before recovering a starting session", async () => {
+    const harness = createHarness();
+    const launched = await harness.client.ensureRunning(harness.projectPath);
+    await harness.guard.withLifecycleLock(async (session) => {
+      const read = await session.readState();
+      if (read.kind !== "valid") throw new Error("missing lifecycle state");
+      const state = read.state;
+      const mcpOwner = state.mcpOwner;
+      if (!mcpOwner) throw new Error("missing lifecycle owner");
+      await session.transition(
+        { generation: state.generation, leaseId: mcpOwner.leaseId },
+        {
+          phase: "starting",
+          endpoint: state.endpoint,
+          target: state.target,
+          mcpOwner,
+          workbench: state.workbench,
+          handler: state.handler,
+          operation: { kind: "launch", operationId: "recovery-fixture" },
+        }
+      );
+    });
+    vi.spyOn(harness.client, "ping").mockResolvedValue(true);
+    harness.backend.endpointOwnershipResult = {
+      kind: "refused",
+      reason: "listener_pid_mismatch",
+      message: "foreign endpoint answered recovery ping",
+    };
+
+    await expect(harness.client.ensureRunning(harness.projectPath)).rejects.toMatchObject({
+      code: "IDENTITY_UNVERIFIABLE",
+    });
+    expect(harness.backend.endpointOwnershipCalls).toHaveLength(2);
+    expect(harness.backend.endpointOwnershipCalls[1].expected.pid).toBe(launched.pid);
+    expect(harness.backend.terminationCalls).toHaveLength(0);
+    expect(harness.backend.workbenchPids.has(launched.pid)).toBe(true);
   });
 
   it("blocks every lifecycle mutation from a second live MCP lease", async () => {
@@ -592,6 +775,27 @@ describe("exact owner-scoped Workbench restart", () => {
       expect(read.kind).toBe("valid");
       if (read.kind === "valid") {
         expect(read.state.phase).toBe("vacant");
+        expect(read.state.workbench).toBeNull();
+      }
+    });
+  });
+
+  it("reconciles an unexpected exact-child exit after the .gproj is deleted", async () => {
+    const harness = createHarness();
+    const launched = await harness.client.ensureRunning(harness.projectPath);
+    const child = harness.children[0];
+    unlinkSync(harness.projectPath);
+    harness.backend.processes.delete(launched.pid);
+    harness.backend.workbenchPids.delete(launched.pid);
+    child.exitCode = 9;
+    child.emit("exit", 9, null);
+
+    await vi.waitFor(async () => {
+      const read = await harness.guard.readLifecycleState();
+      expect(read.kind).toBe("valid");
+      if (read.kind === "valid") {
+        expect(read.state.phase).toBe("vacant");
+        expect(read.state.target?.path).toBe(harness.projectPath);
         expect(read.state.workbench).toBeNull();
       }
     });
