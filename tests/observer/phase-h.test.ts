@@ -5,7 +5,9 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import type { ChildProcess, fork } from "node:child_process";
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import {
   ObserverCoordinator,
   ObserverCoordinatorError,
@@ -104,7 +106,10 @@ function fakeFork(child: FakeChild, count: { value: number }): typeof fork {
 }
 
 interface RegisteredTool {
-  definition: { description?: string };
+  definition: {
+    description?: string;
+    inputSchema?: Record<string, { safeParse(value: unknown): { success: boolean; data?: unknown } }>;
+  };
   handler: (input: Record<string, unknown>, extra: { signal: AbortSignal }) => Promise<{
     content: Array<{ type: string; data?: string; mimeType?: string; text?: string }>;
     isError?: boolean;
@@ -575,6 +580,73 @@ describe("Phase H observer MCP tools", () => {
       "observer_setup",
     ]);
     for (const tool of tools.values()) expect(tool.definition.description?.length).toBeGreaterThan(40);
+  });
+
+  it("publishes a portable fixed-length capture schema without positional items or nested refs", async () => {
+    const coordinator = {
+      defaultCaptureTimeoutMs: 30_000,
+      maxInlineImageBytes: 1_024,
+      capture: vi.fn(),
+    } as unknown as ObserverCoordinator;
+    const server = new McpServer({ name: "observer-schema-test", version: "1.0.0" });
+    registerObserverTools(server, coordinator);
+    const client = new Client({ name: "observer-schema-client", version: "1.0.0" });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    try {
+      await server.connect(serverTransport);
+      await client.connect(clientTransport);
+      const listed = await client.listTools();
+      const capture = listed.tools.find((tool) => tool.name === "observer_capture");
+      expect(capture).toBeDefined();
+
+      const visit = (value: unknown): void => {
+        if (Array.isArray(value)) {
+          for (const entry of value) visit(entry);
+          return;
+        }
+        if (!value || typeof value !== "object") return;
+        const record = value as Record<string, unknown>;
+        if ("items" in record) expect(Array.isArray(record.items)).toBe(false);
+        expect(record).not.toHaveProperty("$ref");
+        for (const entry of Object.values(record)) visit(entry);
+      };
+      visit(capture!.inputSchema);
+
+      const view = toolRegistry(coordinator).get("observer_capture")!.definition.inputSchema!.view;
+      expect(view.safeParse({
+        kind: "pose",
+        position: [1, 2, 3],
+        orientation: [0, 0, 0, 1],
+        fov: 60,
+      })).toMatchObject({ success: true, data: { position: [1, 2, 3], orientation: [0, 0, 0, 1] } });
+      expect(view.safeParse({
+        kind: "pose",
+        position: [1, 2],
+        orientation: [0, 0, 0, 1],
+        fov: 60,
+      }).success).toBe(false);
+      expect(view.safeParse({
+        kind: "pose",
+        position: [1, 2, 3],
+        orientation: [0, 0, 0, 2],
+        fov: 60,
+      }).success).toBe(false);
+      expect(view.safeParse({
+        kind: "lookAt",
+        position: [1, 2, 3],
+        target: [1, 2, 3],
+        fov: 60,
+      }).success).toBe(false);
+      expect(view.safeParse({
+        kind: "lookAt",
+        position: [1, 2, 3],
+        target: [4, 5, 6],
+        fov: 60,
+      }).success).toBe(true);
+    } finally {
+      await client.close();
+      await server.close();
+    }
   });
 
   it("formats one validated PNG image and one concise text metadata item", async () => {

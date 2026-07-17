@@ -979,14 +979,22 @@ class EMCP_WB_ObserverService
 		vector centerDirection;
 		vector topDirection;
 		vector bottomDirection;
-		// Screen dimensions are pixel counts but projection coordinates use the
-		// optical center at width/2,height/2. Sample the largest symmetric interior
-		// quarter-height offset and retain its exact NDC scale so pixel-center bias
-		// is not composed when a measured FOV is written back for restoration.
-		float centerX = width * 0.5;
-		float centerY = height * 0.5;
-		float sampleOffset = (height - 1) * 0.25;
-		float sampleScale = (height - 1) / (2.0 * height);
+		// ProjectViewportToWorld samples integer screen pixels. Fractional samples
+		// truncate, so the old quarter-height float offset produced unequal top and
+		// bottom distances in even-sized viewports. Keep every sample on the integer
+		// pixel lattice and derive the exact normalized span for odd dimensions.
+		int centerPixelX = width / 2;
+		int centerPixelY = height / 2;
+		int samplePixelOffset = height / 4;
+		if (samplePixelOffset < 1)
+		{
+			m_LastProjectionDiagnostic = "The editor viewport is too short to sample its perspective projection";
+			return false;
+		}
+		float centerX = centerPixelX;
+		float centerY = centerPixelY;
+		float sampleOffset = samplePixelOffset;
+		float sampleScale = (2.0 * samplePixelOffset) / height;
 		world.ProjectViewportToWorld(centerX, centerY, cameraId, width, height, centerDirection);
 		world.ProjectViewportToWorld(centerX, centerY - sampleOffset, cameraId, width, height, topDirection);
 		world.ProjectViewportToWorld(centerX, centerY + sampleOffset, cameraId, width, height, bottomDirection);
@@ -1006,7 +1014,7 @@ class EMCP_WB_ObserverService
 		float bottomSampleRadians = Math.Acos(bottomCosine);
 		if (Math.AbsFloat(topSampleRadians - bottomSampleRadians) * Math.RAD2DEG > FOV_SYMMETRY_EPSILON)
 		{
-			m_LastProjectionDiagnostic = "The active editor projection is asymmetric or unsupported";
+			m_LastProjectionDiagnostic = "The active editor projection is asymmetric or unsupported (viewport=" + width.ToString() + "x" + height.ToString() + ", topSampleDegrees=" + (topSampleRadians * Math.RAD2DEG).ToString() + ", bottomSampleDegrees=" + (bottomSampleRadians * Math.RAD2DEG).ToString() + ", center=" + centerDirection.ToString() + ", top=" + topDirection.ToString() + ", bottom=" + bottomDirection.ToString() + ")";
 			return false;
 		}
 		float sampleRadians = (topSampleRadians + bottomSampleRadians) * 0.5;

@@ -73,7 +73,13 @@ describe("dedicated Workbench observer handler contract", () => {
     expect(restoreBody).toMatch(/if \(exact\)\s+\{\s+job\.cameraLeaseHeld = false/);
     expect(common).not.toMatch(/CameraManager|CameraBase|originalOwner|GetGame\(\)\.GetWorld/);
     expect(common).toContain("api.GetScreenWidth() != job.viewportWidth");
-    expect(common).toContain("float sampleScale = (height - 1) / (2.0 * height)");
+    expect(common).toContain("int centerPixelX = width / 2;");
+    expect(common).toContain("int centerPixelY = height / 2;");
+    expect(common).toContain("int samplePixelOffset = height / 4;");
+    expect(common).toContain("float sampleScale = (2.0 * samplePixelOffset) / height;");
+    expect(common).not.toContain("float centerY = height * 0.5;");
+    expect(common).not.toContain("float sampleOffset = (height - 1) * 0.25;");
+    expect(common).not.toContain("float sampleScale = (height - 1) / (2.0 * height);");
     expect(common).toContain("ProjectViewportToWorld(centerX, centerY - sampleOffset");
     expect(common).toContain("Math.Atan2(Math.Tan(sampleRadians), sampleScale)");
     expect(common).toContain("Math.AbsFloat(topSampleRadians - bottomSampleRadians) * Math.RAD2DEG > FOV_SYMMETRY_EPSILON");

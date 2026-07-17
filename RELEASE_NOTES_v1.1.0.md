@@ -110,42 +110,29 @@ exact-owner lifecycle coordinator.
 
 Hermetic protocol, coordinator, private-child, staging, runtime-contract,
 artifact, Workbench-adapter, handler, and lifecycle regression suites are
-included. Two separately double-gated live harnesses are also included:
+included. A double-gated Workbench live harness is also included:
 
 ```powershell
-$env:RFO_RUN_AI_STRESS_OBSERVER_ACCEPTANCE = "1"
-npm run observer:acceptance:ai-stress -- --confirm-live-run
-
 $env:RFO_RUN_LIVE_WORKBENCH_OBSERVER_ACCEPTANCE = "1"
 npm run observer:acceptance:workbench -- --confirm-live-run
 ```
 
-Both double-gated transactions passed on 2026-07-16 and their retained images
-were reviewed:
+The transaction passed on 2026-07-16 and its retained images were reviewed.
+Visible Workbench run `run-owDNnE` produced three materially varied 1165x641
+native PNG digests:
+`b70ee2343ea330eefcedd2fae6465385f7e8740d1812fb72dbfae4d0c2707d23`,
+`ee09b489f4bae2531d2c4d02a0b0819efd4137e7d2fc423c843d936ed40f7af8`,
+and `084844713cbfcc845fca4742abd3fcbf1ead885cefb13e169b0afad6633fc087`.
+The explicit-pose image used a `(75, 25, 50)` world-space displacement and a
+10-degree FOV change before exact camera restoration.
+All three captures confirmed restoration; exact-owner shutdown left no
+Workbench process, and cleanup removed the unchanged managed bundle with no
+modified or unrelated files.
 
-- Runtime run `20260716T092709791Z-b798a7a42d6441a3a365407a7835d8ee`
-  used Arma Reforger 1.7.0.54 (engine build 190965) and staged bundle
-  `89f629f0b618a2041f60f07ea162a0b8ec868d5ddc67f17c833933205dd48772`.
-  Its three materially varied 2560x1440 PNG digests were
-  `88473b2a19530f01af9499c85c6d7209547cf67935b5630fe0319bd8fadaf62e`,
-  `c1143b44d0d549c03d0aefbda5b7c65b33056f0ebd5fc4cd6feb73165e865b9c`,
-  and `ffa187b75c10a76a0c4d5adefb6d1ce62b652f7d430093a4dc60a3abe8d10694`;
-  the explicit-pose lease finished released and restoration-confirmed.
-- Visible Workbench run `run-owDNnE` produced three materially varied 1165x641
-  native PNG digests:
-  `b70ee2343ea330eefcedd2fae6465385f7e8740d1812fb72dbfae4d0c2707d23`,
-  `ee09b489f4bae2531d2c4d02a0b0819efd4137e7d2fc423c843d936ed40f7af8`,
-  and `084844713cbfcc845fca4742abd3fcbf1ead885cefb13e169b0afad6633fc087`.
-  The explicit-pose image used a `(75, 25, 50)` world-space displacement and
-  a 10-degree FOV change before exact camera restoration.
-  All three captures confirmed restoration; exact-owner shutdown left no
-  Workbench process, and cleanup removed the unchanged managed bundle with no
-  modified or unrelated files.
-
-The summaries remain outside the repository beneath each run's
-`evidence/summary.json`. These results qualify the screenshot and camera
-transaction cases only. They do not claim a complete AI match, dedicated or
-headless rendering, minimized/out-of-focus operation, failure injection, or
+The summary remains outside the repository beneath the run's
+`evidence/summary.json`. These results qualify the Workbench screenshot and
+camera transaction case only. They do not claim dedicated or headless
+rendering, minimized/out-of-focus operation, failure injection, or
 remote/delegated rendering.
 
 ## Migration and operator notes

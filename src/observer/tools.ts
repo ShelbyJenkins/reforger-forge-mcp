@@ -9,25 +9,40 @@ import {
 import { prepareObserverLaunch } from "./launch.js";
 import { runObserverSetup } from "./setup.js";
 
-const finite = z.number().finite();
-const vector3 = z.tuple([finite, finite, finite]);
-const quaternion = z.tuple([finite, finite, finite, finite]).refine((value) => {
+const finite = () => z.number().finite();
+
+// Public MCP schemas must use homogeneous array items. Positional tuple schemas
+// serialize as draft-07 `items: [...]` with nested item references, which some
+// MCP hosts cannot import and may cause them to omit the complete tool. The
+// transforms preserve the exact tuple types required by ObserverCaptureView
+// after the fixed-length arrays have been validated.
+const vector3 = () => finite().array().length(3).transform((value): [number, number, number] => [
+  value[0],
+  value[1],
+  value[2],
+]);
+const quaternion = () => finite().array().length(4).refine((value) => {
   const length = Math.hypot(...value);
   return length > 0.000001 && Math.abs(length - 1) < 0.01;
-}, "orientation must be a normalized non-zero quaternion");
+}, "orientation must be a normalized non-zero quaternion").transform((value): [number, number, number, number] => [
+  value[0],
+  value[1],
+  value[2],
+  value[3],
+]);
 const viewSchema = z.union([
   z.object({ kind: z.literal("current") }),
   z.object({
     kind: z.literal("pose"),
-    position: vector3,
-    orientation: quaternion,
-    fov: finite.min(1).max(179),
+    position: vector3(),
+    orientation: quaternion(),
+    fov: finite().min(1).max(179),
   }),
   z.object({
     kind: z.literal("lookAt"),
-    position: vector3,
-    target: vector3,
-    fov: finite.min(1).max(179),
+    position: vector3(),
+    target: vector3(),
+    fov: finite().min(1).max(179),
   }).refine((value) => Math.hypot(
     value.target[0] - value.position[0],
     value.target[1] - value.position[1],

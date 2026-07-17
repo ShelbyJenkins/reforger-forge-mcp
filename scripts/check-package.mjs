@@ -79,7 +79,7 @@ const requiredFiles = [
   "scripts/check-package.mjs",
   "scripts/install-agents.ps1",
   "scripts/list-tools.mjs",
-  "scripts/run-observer-ai-stress-acceptance.ts",
+  "scripts/observer-live-acceptance-support.ts",
   "scripts/run-workbench-observer-acceptance.ts",
   "scripts/update-observer-source-manifest.mjs",
   "scripts/setup.ps1",

@@ -29,7 +29,7 @@ import {
   analyzePngMaterial,
   inspectBlockingProcesses,
   type PngMaterialEvidence,
-} from "./run-observer-ai-stress-acceptance.js";
+} from "./observer-live-acceptance-support.js";
 
 export const LIVE_WORKBENCH_OBSERVER_ENVIRONMENT =
   "RFO_RUN_LIVE_WORKBENCH_OBSERVER_ACCEPTANCE";

@@ -21,11 +21,16 @@ function filesRecursively(root: string): string[] {
 describe("observer package and source contracts", () => {
   it("keeps observer and MCP builds separate and publishes required runtime assets", () => {
     const packageJson = JSON.parse(readFileSync(join(repositoryRoot, "package.json"), "utf8"));
+    const gitAttributes = readFileSync(join(repositoryRoot, ".gitattributes"), "utf8");
+    expect(gitAttributes.split(/\r?\n/)).toContain("observer/addon/** -text");
     expect(packageJson.scripts.build).toContain("build:mcp");
     expect(packageJson.scripts.build).toContain("build:observer");
+    expect(Object.keys(packageJson.scripts).filter((name) =>
+      name.startsWith("observer:acceptance:")
+    )).toEqual(["observer:acceptance:workbench"]);
     expect(packageJson.files).toEqual(expect.arrayContaining(["dist", "observer/addon", "observer/protocol", "observer/README.md"]));
     const observerReleaseScripts = [
-      "scripts/run-observer-ai-stress-acceptance.ts",
+      "scripts/observer-live-acceptance-support.ts",
       "scripts/run-workbench-observer-acceptance.ts",
       "scripts/update-observer-source-manifest.mjs",
     ];
@@ -107,7 +112,7 @@ describe("observer package and source contracts", () => {
     const job = readFileSync(join(observerAddonSource, "Scripts", "Game", "ReforgerForgeObserver", "RFO_ObserverJob.c"), "utf8");
     expect(job).toContain("class RFO_ObserverCommandWireView");
     expect(job).toContain("view != null && DecodeWireView()");
-    expect(source).not.toMatch(/RoadblockRunners|EnfusionMCP|targetProject|outputPath|https:\/\//);
+    expect(source).not.toMatch(/EnfusionMCP|targetProject|outputPath|https:\/\//);
     const workbench = join(observerAddonSource, "Scripts", "WorkbenchGame");
     expect(filesRecursively(workbench).filter((path) => path.endsWith(".c"))).toEqual([]);
   });

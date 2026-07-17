@@ -110,10 +110,8 @@ Managed uninstall requests cancellation first and returns `CAMERA_BUSY` while
 any job or runtime camera lease still requires terminal restoration; retry only
 after `observer_job` reports a terminal state.
 
-Repository maintainers can prove a real AI-live current screenshot, explicit
-pose restoration, and a post-restoration screenshot with the double-gated
-[AI-stress observer acceptance harness](observer/README.md#opt-in-ai-stress-screenshot-acceptance).
-The equivalent editor transaction is covered by the
+Repository maintainers can prove an editor current screenshot, explicit pose
+restoration, and a post-restoration screenshot with the double-gated
 [Workbench screenshot harness](observer/README.md#opt-in-workbench-screenshot-acceptance).
 
 ---
@@ -483,47 +481,32 @@ applications. Each requires an environment gate and an independent command-line
 confirmation:
 
 ```powershell
-$env:RFO_RUN_AI_STRESS_OBSERVER_ACCEPTANCE = "1"
-npm run observer:acceptance:ai-stress -- --confirm-live-run
-
 $env:RFO_RUN_LIVE_WORKBENCH_OBSERVER_ACCEPTANCE = "1"
 npm run observer:acceptance:workbench -- --confirm-live-run
 ```
 
-The AI-stress command also needs the diagnostic executable, base-game addon
-root, and Workshop addon roots through its documented environment variables or
-CLI arguments. The Workbench command reads installed-tool and addon-root paths
-from the gitignored `reforger-forge.config.json`. Both retain their evidence
-outside the repository by default and refuse to start if an Arma Reforger or
-Workbench process is already running.
+The Workbench command reads installed-tool and addon-root paths from the
+gitignored `reforger-forge.config.json`. It retains its evidence outside the
+repository by default and refuses to start if an Arma Reforger or Workbench
+process is already running.
 
-**Live validation status:** both screenshot harnesses passed on 2026-07-16 and
-their retained PNGs were reviewed.
+**Live validation status:** the Workbench screenshot harness passed on
+2026-07-16 and its retained PNGs were reviewed. Run `run-owDNnE` passed with
+three materially varied 1165x641 native PNGs whose SHA-256 values are
+`b70ee2343ea330eefcedd2fae6465385f7e8740d1812fb72dbfae4d0c2707d23`,
+`ee09b489f4bae2531d2c4d02a0b0819efd4137e7d2fc423c843d936ed40f7af8`,
+and `084844713cbfcc845fca4742abd3fcbf1ead885cefb13e169b0afad6633fc087`.
+The explicit pose moved the editor camera by `(75, 25, 50)` world units and
+increased vertical FOV by 10 degrees before exact restoration.
+Every transaction reported restoration, the exact lifecycle owner shut down,
+no Workbench process remained, and cleanup removed the unmodified managed
+handler bundle with no modified or unrelated files.
 
-- Runtime run `20260716T092709791Z-b798a7a42d6441a3a365407a7835d8ee`
-  passed on Arma Reforger 1.7.0.54 (engine build 190965) with staged bundle
-  `89f629f0b618a2041f60f07ea162a0b8ec868d5ddc67f17c833933205dd48772`.
-  Its three materially varied 2560x1440 PNGs have SHA-256 values
-  `88473b2a19530f01af9499c85c6d7209547cf67935b5630fe0319bd8fadaf62e`,
-  `c1143b44d0d549c03d0aefbda5b7c65b33056f0ebd5fc4cd6feb73165e865b9c`,
-  and `ffa187b75c10a76a0c4d5adefb6d1ce62b652f7d430093a4dc60a3abe8d10694`;
-  the pose lease was held, released, and restoration-confirmed.
-- Workbench run `run-owDNnE` passed with three materially varied 1165x641
-  native PNGs whose SHA-256 values are
-  `b70ee2343ea330eefcedd2fae6465385f7e8740d1812fb72dbfae4d0c2707d23`,
-  `ee09b489f4bae2531d2c4d02a0b0819efd4137e7d2fc423c843d936ed40f7af8`,
-  and `084844713cbfcc845fca4742abd3fcbf1ead885cefb13e169b0afad6633fc087`.
-  The explicit pose moved the editor camera by `(75, 25, 50)` world units and
-  increased vertical FOV by 10 degrees before exact restoration.
-  Every transaction reported restoration, the exact lifecycle owner shut down,
-  no Workbench process remained, and cleanup removed the unmodified managed
-  handler bundle with no modified or unrelated files.
-
-The summaries are retained outside the repository under each run's
-`evidence/summary.json`. These passes qualify the documented screenshot and
-camera-restoration transactions only; they do not qualify a complete AI match,
-headless rendering, minimized/out-of-focus capture, failure injection, or
-remote/delegated rendering.
+The summary is retained outside the repository under the run's
+`evidence/summary.json`. This pass qualifies the documented screenshot and
+camera-restoration transaction only; it does not qualify headless rendering,
+minimized/out-of-focus capture, failure injection, or remote/delegated
+rendering.
 
 The real Workbench lifecycle smoke test is separately gated because it opens and
 closes the installed GUI against a disposable project:

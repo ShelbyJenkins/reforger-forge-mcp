@@ -74,6 +74,72 @@ until the host has validated the regular PNG file, dimensions, stable size,
 digest, and session/job binding. Status and doctor remain non-mutating while the
 private child is idle.
 
+## Using screenshots effectively today
+
+Use synchronous capture for evidence. It is the only current public path that
+returns the validated image bytes to the MCP client. Async capture is useful for
+status and cancellation, but `observer_job` does not yet have an image-read
+action. Likewise, an image over the configured inline limit remains managed but
+cannot currently be exported through a public tool. Do not treat either case as
+retained evidence.
+
+Choose the view by what the image must prove:
+
+| View | Use it for |
+|---|---|
+| `current` | Player camera, UI, an already-positioned validation camera, or the exact Workbench viewport |
+| `lookAt` | A reproducible world overview using an explicit position, target, and FOV |
+| `pose` | Replaying a known transform with a normalized quaternion |
+
+For Workbench, take one successful `current` capture after each restart before
+requesting `pose` or `lookAt`; that restoration proof enables
+`camera.editor`. A settle value can reduce capture-time movement, but it does
+not prove elapsed gameplay time. Use `performancePolicy="evidence"` normally.
+`instrumented` deliberately marks the result contaminated and adds a warning;
+`performance` is exposed by the current schema but rejected because no external
+measurement coordinator exists.
+
+Inventory first, select an explicit renderer, and capture soon afterward. The
+current input cannot lock the inventory's expected `worldId` and `worldEpoch`,
+so re-inventory after a world transition and reject evidence whose completed
+metadata does not match the intended world. A runtime current-view request uses:
+
+```json
+{
+  "sessionId": "<prepared-session-id>",
+  "instanceId": "<selected-runtime-instance-id>",
+  "view": { "kind": "current" },
+  "asynchronous": false,
+  "timeoutMs": 30000,
+  "settleFrames": 0,
+  "performancePolicy": "evidence"
+}
+```
+
+For Workbench, select its inventory `instanceId` and omit `sessionId`:
+
+```json
+{
+  "instanceId": "<selected-workbench-instance-id>",
+  "view": { "kind": "current" },
+  "asynchronous": false,
+  "timeoutMs": 30000,
+  "settleFrames": 0,
+  "performancePolicy": "evidence"
+}
+```
+
+Inspect the returned image itself. Keep raw or rejected working material in the
+external observer managed root or another external temporary directory, never
+in a target project or Git worktree. After review, retain only the selected PNG
+and binding metadata in the owning evidence directory, then call
+`observer_job` with `action="release"`. On timeout or failure, cancel and wait
+for a terminal restoration result before stopping an owned process.
+
+The planned run IDs, capture labels, expected-world binding, async/oversized
+retrieval, standardized evidence export, and full scratch retention are defined
+in the [companion and evidence implementation guide](../docs/plans/2026-07-17-observer-companion-evidence-workflow.md).
+
 ## Workbench adapter
 
 The Workbench backend is implemented by five dedicated NET API handlers
@@ -108,52 +174,6 @@ managed profile capture directory. The adapter confines and canonicalizes the
 exact `.png`, validates its regular-file status, stable size, PNG
 signature/structure and dimensions, computes SHA-256, and exposes those exact
 bytes in the same one-image plus metadata MCP result as the runtime backend.
-
-## Opt-in AI-stress screenshot acceptance
-
-The repository-local acceptance harness combines the compiled Phase H
-coordinator/private child with the Roadblock Runners maximum-AI autotest. It
-refuses to launch while any Arma Reforger or Workbench process exists, holds the
-shared machine launch lock, and terminates only its directly owned diagnostic
-game PID. A live run requires two independent confirmations:
-
-```powershell
-$env:RFO_RUN_AI_STRESS_OBSERVER_ACCEPTANCE = '1'
-$env:RFO_ENGINE_EXECUTABLE = '<ARMA_REFORGER_DIRECTORY>\ArmaReforgerSteamDiag.exe'
-$env:RFO_BASE_GAME_ADDONS = '<ARMA_REFORGER_DIRECTORY>\addons'
-$env:RFO_WORKSHOP_ADDONS = '<WORKSHOP_ADDONS_DIRECTORY>'
-npm run observer:acceptance:ai-stress -- --confirm-live-run
-```
-
-Use the platform path delimiter in `RFO_WORKSHOP_ADDONS` for multiple roots, or
-repeat `--workshop-addons`. Optional `--artifact-root`, `--timeout-seconds`, and
-`--capture-timeout-seconds` arguments control retained evidence and bounds.
-The integration-test entry also requires `RFO_ENGINE_TESTS=1`; without both
-environment gates, `npm run test:observer:integration` skips the live case.
-
-The run waits for the exact 48-bot ACTIVE-entry line and a negative-ID live
-runner camera-focus line before taking the required nonblank current-view PNG.
-It then captures an explicit pose at the baseline position, requires public job
-evidence that the camera lease was held and exactly restored, and takes another
-nonblank current-view PNG to prove the renderer remains operational. PNGs,
-metadata, jobs, marker lines, full isolated profile logs, process output, and a
-machine-readable summary remain beneath the run artifact directory. This is a
-screenshot/camera transaction qualification; it intentionally stops after its
-evidence and does not claim that the full AI match passed.
-
-Reviewed live proof: run
-`20260716T092709791Z-b798a7a42d6441a3a365407a7835d8ee` passed on Arma
-Reforger 1.7.0.54 (engine build 190965) with staged bundle digest
-`89f629f0b618a2041f60f07ea162a0b8ec868d5ddc67f17c833933205dd48772`.
-The retained `ai-live-current.png`, `pose-restoration.png`, and
-`post-restoration-current.png` were each 2560x1440 and materially varied. Their
-SHA-256 values are, respectively,
-`88473b2a19530f01af9499c85c6d7209547cf67935b5630fe0319bd8fadaf62e`,
-`c1143b44d0d549c03d0aefbda5b7c65b33056f0ebd5fc4cd6feb73165e865b9c`,
-and `ffa187b75c10a76a0c4d5adefb6d1ce62b652f7d430093a4dc60a3abe8d10694`.
-The explicit-pose job proved its lease was held, no longer held at completion,
-and exactly restored. The retained summary is the run's
-`evidence/summary.json` outside the repository.
 
 ## Opt-in Workbench screenshot acceptance
 
@@ -204,17 +224,16 @@ implemented paths; it is not a substitute for recording a successful live run.
 
 | Case | Implemented behavior | Capability advertisement | Live validation |
 |---|---|---|---|
-| Graphical runtime client/listen host | REST and mailbox delivery, current/pose/look-at PNG capture, camera lease and exact transform/FOV restoration | `render.capture` and `camera.runtime` only after graphical renderer/camera initialization | Passed for the Roadblock Runners diagnostic test runner in run `20260716T092709791Z-b798a7a42d6441a3a365407a7835d8ee`; generic listen-host qualification remains unrecorded |
+| Graphical runtime client/listen host | REST and mailbox delivery, current/pose/look-at PNG capture, camera lease and exact transform/FOV restoration | `render.capture` and `camera.runtime` only after graphical renderer/camera initialization | Pending generic listen-host qualification |
 | Dedicated/headless server | Registration, health, authority facts, coordination, and diagnostics without camera/render claims | Never advertises `render.capture` or a camera capability | Pending non-render qualification |
 | Minimized/out-of-focus client | Same transaction path; `-forceUpdate` remains an explicit launch-preparation option | Same initialized graphical gates | Pending |
 | World unload or agent loss during a lease | World epochs invalidate stale work; cancellation/watchdog restoration must reach a terminal state | Renderer is withheld when restoration or world identity is uncertain | Pending failure-injection qualification |
 | Workbench editor | Dedicated NET API adapter, confined native-PNG validation, lifecycle activity gating, and exact `BaseWorld` slot/matrix/FOV restoration | `render.capture` when current capture is initialized; `camera.editor` only after a current-view restoration proof in that exact process | Passed in run `run-owDNnE`, including displaced explicit pose, exact restoration/shutdown, and managed cleanup |
 
-**Live validation status:** both double-gated screenshot transactions passed and
-their retained images were reviewed as recorded above. This proves the exact
-AI-stress diagnostic-renderer and visible Workbench cases only. Dedicated and
+**Live validation status:** the double-gated Workbench screenshot transaction
+passed and its retained images were reviewed as recorded above. Dedicated and
 headless non-render behavior, minimized/out-of-focus rendering, world-unload or
-agent-loss failure injection, a full AI match, generic listen-host operation,
-and remote/delegated rendering remain outside this live proof.
+agent-loss failure injection, generic listen-host operation, and
+remote/delegated rendering remain outside this live proof.
 
 Real-engine tests belong under `tests/observer/integration` and run only through `npm run test:observer:integration` with disposable profiles and target projects.

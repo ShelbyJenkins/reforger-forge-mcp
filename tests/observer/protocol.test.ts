@@ -106,7 +106,31 @@ describe("observer protocol", () => {
   it("keeps the stable error vocabulary unique", () => {
     expect(new Set(ERROR_CODES).size).toBe(ERROR_CODES.length);
     expect(ERROR_CODES).toContain("WORLD_CHANGED");
+    expect(ERROR_CODES).toContain("CAMERA_OWNERSHIP_LOST");
     expect(ERROR_CODES).toContain("STAGED_ADDON_CONFLICT");
+  });
+
+  it("accepts every failure code emitted by the runtime addon", () => {
+    const runtimeService = readFileSync(join(
+      repositoryRoot,
+      "observer",
+      "addon",
+      "Scripts",
+      "Game",
+      "ReforgerForgeObserver",
+      "RFO_ObserverService.c"
+    ), "utf8");
+    const emittedCodes = [
+      ...runtimeService.matchAll(/RecordFailure\("([A-Z_]+)"/g),
+      ...runtimeService.matchAll(/RejectCommand\([^,\r\n]+,\s*"([A-Z_]+)"/g),
+      ...runtimeService.matchAll(/m_RFO_LastErrorCode\s*=\s*"([A-Z_]+)"/g),
+      ...runtimeService.matchAll(/terminalErrorCode\s*=(?!=)\s*"([A-Z_]+)"/g),
+    ].map((match) => match[1]);
+
+    expect(emittedCodes.length).toBeGreaterThan(0);
+    expect([...new Set(emittedCodes)].filter((code) => !ERROR_CODES.includes(
+      code as (typeof ERROR_CODES)[number]
+    ))).toEqual([]);
   });
 
   it("redacts contract bodies, nonce credentials, bearer headers, and named token values from diagnostics", () => {

@@ -65,6 +65,9 @@ function png(width = 1, height = 1): Buffer {
 
 interface FakeOptions {
   cameraEditor?: boolean;
+  captureCurrent?: boolean;
+  restorationApiAvailable?: boolean;
+  readinessMessage?: string;
   numericBooleans?: boolean;
   reportedBaseProject?: string;
   completeOnStatus?: boolean;
@@ -154,13 +157,13 @@ class FakeObserverClient implements WorkbenchObserverClient {
     if (apiFunc === "EMCP_WB_ObserverPing") {
       return {
         status: "ok",
-        message: "full camera APIs available",
+        message: this.options.readinessMessage ?? "full camera APIs available",
         adapterProtocol: "reforger-forge-workbench-observer/1",
         projectFile: this.options.reportedBaseProject ?? this.project,
         worldIdentity: `${this.project}|world-a|0|false`,
         activeJobId: this.active?.jobId ?? "",
-        captureCurrent: this.wireBoolean(true),
-        restorationApiAvailable: this.wireBoolean(true),
+        captureCurrent: this.wireBoolean(this.options.captureCurrent ?? true),
+        restorationApiAvailable: this.wireBoolean(this.options.restorationApiAvailable ?? true),
         cameraEditor: this.wireBoolean(this.options.cameraEditor ?? false),
       } as T;
     }
@@ -489,5 +492,28 @@ describe("Workbench observer adapter", () => {
         restorationApiAvailable: true,
       }),
     ]);
+  });
+
+  it("fails closed before acquiring a lifecycle lease when projection capture is unavailable", async () => {
+    const diagnostic = "The active editor projection is asymmetric or unsupported";
+    const client = new FakeObserverClient({
+      captureCurrent: false,
+      restorationApiAvailable: false,
+      readinessMessage: diagnostic,
+    });
+    const adapter = new WorkbenchObserverAdapter(client);
+
+    await expect(adapter.instances()).resolves.toEqual([
+      expect.objectContaining({
+        capabilities: [],
+        restorationApiAvailable: false,
+        readinessMessage: diagnostic,
+      }),
+    ]);
+    await expect(adapter.submit({ view: { kind: "current" } })).rejects.toMatchObject({
+      code: "CAPABILITY_UNAVAILABLE",
+    });
+    expect(client.acquireCaptureActivity).not.toHaveBeenCalled();
+    expect(client.calls.some((call) => call.apiFunc === "EMCP_WB_ObserverSubmit")).toBe(false);
   });
 });

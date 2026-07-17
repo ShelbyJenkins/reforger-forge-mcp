@@ -83,6 +83,100 @@ describe("observer mailbox", () => {
     expect(readdirSync(mailbox.commandsDirectory).some((name) => name.includes(`-capture-${job.request.jobId}-1.json`))).toBe(true);
   });
 
+  it("consumes restored ownership-loss status and the following heartbeat without quarantine", async () => {
+    const root = temporaryDirectory();
+    roots.push(root);
+    const fixture = createSessionFixture(root);
+    const registry = new InstanceRegistry(fixture.store, { clock: fixture.clock });
+    const registration = graphicalRegistration(fixture.created, {
+      selectedTransport: "mailbox",
+      capabilities: ["render.capture", "camera.runtime", "world.query", "transport.mailbox"],
+    });
+    registry.register(registration, fixture.created.contract.sessionToken);
+    const jobs = new JobStore(fixture.store, registry, fixture.clock);
+    const artifacts = new ArtifactStore(join(root, "artifacts"), fixture.store, jobs);
+    const mailbox = new MailboxTransport(fixture.profilePath);
+    const coordinator = new MailboxCoordinator(fixture.store, registry, jobs, artifacts);
+    const job = jobs.submit({
+      sessionId: registration.sessionId,
+      idempotencyKey: "mailbox-ownership-loss",
+      deadlineAt: new Date(fixture.clock.now() + 30_000).toISOString(),
+      view: { kind: "lookAt", position: [0, 1, 0], target: [1, 1, 0], fov: 60 },
+    });
+    const command = jobs.nextCommand(registration.sessionId, registration.instanceId, registration.instanceNonce)!;
+    const baseStatus = {
+      protocolVersion: "1.0",
+      sessionId: registration.sessionId,
+      instanceId: registration.instanceId,
+      instanceNonce: registration.instanceNonce,
+      jobId: job.request.jobId,
+      worldId: registration.worldId,
+      worldEpoch: registration.worldEpoch,
+      timestamp: new Date(fixture.clock.now()).toISOString(),
+      deliveryToken: command.deliveryToken,
+    };
+    const heldCamera = { held: true, leaseId: `lease-${job.request.jobId}`, observerCameraId: 42 } as const;
+    const restoredCamera = { held: false, restorationConfirmed: true } as const;
+    const update = (sequence: number, state: string, cameraLease: typeof heldCamera | typeof restoredCamera | { held: false; restorationConfirmed: false }) => {
+      jobs.update({ ...baseStatus, sequence, state, cameraLease }, fixture.created.contract.sessionToken);
+    };
+    update(0, "accepted", { held: false, restorationConfirmed: false });
+    update(1, "acquiringCamera", heldCamera);
+    update(2, "positioning", heldCamera);
+    update(3, "capturing", heldCamera);
+    update(4, "restoring", restoredCamera);
+
+    const terminalName = `000000000006-status-${job.request.jobId}.json`;
+    writeFileSync(join(mailbox.statusDirectory, terminalName), JSON.stringify({
+      ...baseStatus,
+      sequence: 5,
+      state: "failed",
+      cameraLease: restoredCamera,
+      errorCode: "CAMERA_OWNERSHIP_LOST",
+      message: "Observer camera ownership changed before screenshot issuance",
+      sessionToken: fixture.created.contract.sessionToken,
+    }));
+    writeFileSync(join(mailbox.statusDirectory, `${terminalName}.complete`), "ready");
+
+    const heartbeatName = `000000000007-heartbeat-${registration.instanceId}.json`;
+    writeFileSync(join(mailbox.statusDirectory, heartbeatName), JSON.stringify({
+      protocolVersion: "1.0",
+      sessionId: registration.sessionId,
+      instanceId: registration.instanceId,
+      instanceNonce: registration.instanceNonce,
+      sequence: 48,
+      sentAt: new Date(fixture.clock.now()).toISOString(),
+      worldId: registration.worldId,
+      worldEpoch: registration.worldEpoch,
+      capabilities: registration.capabilities,
+      activeJobId: null,
+      cameraLeaseJobId: null,
+      transportHealthy: true,
+      lastErrorCode: "CAMERA_OWNERSHIP_LOST",
+      sessionToken: fixture.created.contract.sessionToken,
+    }));
+    writeFileSync(join(mailbox.statusDirectory, `${heartbeatName}.complete`), "ready");
+
+    await coordinator.pollOnce();
+
+    expect(job).toMatchObject({
+      state: "failed",
+      terminalErrorCode: "CAMERA_OWNERSHIP_LOST",
+      cameraLease: { held: false, restorationConfirmed: true },
+    });
+    expect(registry.require(registration.sessionId, registration.instanceId)).toMatchObject({
+      lastHeartbeatSequence: 48,
+      activeJobId: null,
+      cameraLeaseJobId: null,
+      lastErrorCode: "CAMERA_OWNERSHIP_LOST",
+    });
+    expect(existsSync(join(mailbox.statusDirectory, terminalName))).toBe(false);
+    expect(existsSync(join(mailbox.statusDirectory, `${terminalName}.complete`))).toBe(false);
+    expect(existsSync(join(mailbox.statusDirectory, heartbeatName))).toBe(false);
+    expect(existsSync(join(mailbox.statusDirectory, `${heartbeatName}.complete`))).toBe(false);
+    expect(existsSync(join(mailbox.statusDirectory, "quarantine"))).toBe(false);
+  });
+
   it("retries malformed ingress a bounded number of times and quarantines it", async () => {
     const root = temporaryDirectory();
     roots.push(root);
