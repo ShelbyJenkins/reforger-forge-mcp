@@ -58,6 +58,8 @@ describe("observer package and source contracts", () => {
     expect(existsSync(join(repositoryRoot, "observer", "protocol", "VERSION"))).toBe(true);
     const packageCheck = readFileSync(join(repositoryRoot, "scripts", "check-package.mjs"), "utf8");
     expect(packageCheck).toContain("dist/observer/agent/private-child.js");
+    expect(packageCheck).toContain("dist/observer/owned-runtime-manager.js");
+    expect(packageCheck).toContain("dist/tools/observer-runtime.js");
     expect(packageCheck).toContain("dist/workbench/observer-adapter.js");
     expect(packageCheck).toContain("dist/workbench/helper-addon.js");
     expect(packageCheck).toContain("legacy project-injection handler must not be packaged");
@@ -70,6 +72,43 @@ describe("observer package and source contracts", () => {
     expect(manifestGenerator).toContain(".reforger-forge-workbench-helper-source.json");
     expect(manifestGenerator).toContain("RFWB_HelperBuild.c");
     expect(verifySourceBundle(observerAddonSource).manifest.files.length).toBeGreaterThan(10);
+  });
+
+  it("publishes and documents the exact seven-tool observer surface", () => {
+    const expected = [
+      "observer_capture",
+      "observer_instances",
+      "observer_job",
+      "observer_prepare_launch",
+      "observer_run",
+      "observer_runtime",
+      "observer_setup",
+    ];
+    const toolLister = readFileSync(join(repositoryRoot, "scripts", "list-tools.mjs"), "utf8");
+    const observerBlock = toolLister.match(/const observerNames = new Set\(\[([\s\S]*?)\]\);/)?.[1] ?? "";
+    const discovered = [...observerBlock.matchAll(/"(observer_[a-z_]+)"/g)]
+      .map((match) => match[1])
+      .sort();
+    expect(discovered).toEqual(expected);
+
+    const readme = readFileSync(join(repositoryRoot, "README.md"), "utf8");
+    const toolReference = readme.split("## Complete Tool Reference")[1]?.split(/^## /m)[0] ?? "";
+    const documented = [...toolReference.matchAll(/^\|\s*`(observer_[a-z_]+)`\s*\|/gm)]
+      .map((match) => match[1])
+      .sort();
+    expect(documented).toEqual(expected);
+    expect(readme).toContain("preparedLaunchId");
+    expect(readme).toContain("identity_mismatch");
+
+    const observerReadme = readFileSync(join(repositoryRoot, "observer", "README.md"), "utf8");
+    expect(observerReadme).toContain("exactly seven MCP");
+    expect(observerReadme).toContain("observer_runtime");
+    expect(observerReadme).toContain("terminal restoration");
+    expect(observerReadme).toContain("lifecycle recovery");
+
+    const agentInstructions = readFileSync(join(repositoryRoot, "docs", "AGENTS.md"), "utf8");
+    expect(agentInstructions).toContain("`observer_runtime`");
+    expect(agentInstructions).toContain("preparedLaunchId");
   });
 
   it("preserves the exact Workbench handler inventory", () => {
@@ -115,13 +154,23 @@ describe("observer package and source contracts", () => {
 
   it("packages and centrally registers the completed Phase H integration", () => {
     const observerSource = join(repositoryRoot, "src", "observer");
-    for (const name of ["coordinator.ts", "setup.ts", "launch.ts", "tools.ts"]) {
+    for (const name of ["coordinator.ts", "setup.ts", "launch.ts", "owned-runtime-manager.ts", "tools.ts"]) {
       expect(existsSync(join(observerSource, name))).toBe(true);
     }
+    expect(existsSync(join(repositoryRoot, "src", "tools", "observer-runtime.ts"))).toBe(true);
     expect(existsSync(join(repositoryRoot, "observer", "agent", "private-child.ts"))).toBe(true);
     const server = readFileSync(join(repositoryRoot, "src", "server.ts"), "utf8");
     expect(server.match(/new ObserverCoordinator\(/g)).toHaveLength(1);
+    expect(server.match(/new OwnedRuntimeManager\(/g)).toHaveLength(1);
     expect(server.match(/registerObserverTools\(/g)).toHaveLength(1);
+    expect(server).toContain("return disposeObserverLifecycle");
+    expect(server).toContain("observerShutdown ??=");
+    const entrypoint = readFileSync(join(repositoryRoot, "src", "index.ts"), "utf8");
+    expect(entrypoint).toContain("process.stdin.once(\"end\", onStdinEnd)");
+    expect(entrypoint).toContain("process.once(\"SIGINT\", onSigint)");
+    expect(entrypoint).toContain("process.once(\"SIGTERM\", onSigterm)");
+    expect(entrypoint.indexOf("reportSealResult(await disposeTools())"))
+      .toBeLessThan(entrypoint.indexOf("await server.close()"));
     const integrationSource = filesRecursively(observerSource)
       .map((path) => readFileSync(path, "utf8"))
       .join("\n");

@@ -15,8 +15,9 @@ projects and from Workbench lifecycle ownership.
   there.
 - The addon is dormant without a valid, unexpired contract and accepts no arbitrary URL or output path.
 - The agent binds loopback only. Runtime session tokens cannot call control operations.
-- Runtime process IDs are diagnostic only; the observer never adopts, signals, restarts, or terminates a game process.
-- MCP tools remain thin orchestration over one lazy private child; they do not duplicate staging, job, artifact, camera, or game-process behavior.
+- Runtime process IDs returned by inventory are diagnostic only. Preparation and capture never adopt or signal a game process; only an explicit `observer_runtime` lifecycle action may affect the exact child it started and verified.
+- Exact-owned runtime lifecycle state is atomic beneath the external managed root and uses owner-only creation modes where supported. On Windows it inherits that root's ACL, so a custom managed root must be current-user-private rather than shared or broadly writable. The lifecycle never uses process names, a PID alone, a shell command, or broad process-tree termination, and it never adopts a pre-existing Arma process.
+- MCP tools remain thin orchestration over the lazy private child and the shared exact-process lifecycle service; they do not duplicate staging, job, artifact, camera, or process-identity behavior.
 - Workbench capture reuses the existing shared `WorkbenchClient`, version-3
   lifecycle lease, activity gate, externally staged Workbench companion, and
   dedicated external profile. It never creates a parallel Workbench owner or
@@ -47,15 +48,19 @@ merged `-addonsDir`, one merged `-addons`, one matching `-profile`, and
 The MCP server lazily forks `dist/observer/agent/private-child.js` with an
 inherited JSON IPC channel and an ephemeral loopback runtime port. The child is
 never adopted by another MCP, exits on parent-channel loss, and is asked to
-shut down when the MCP transport closes. The public surface is exactly six MCP
+shut down when the MCP transport closes. The public surface is exactly seven MCP
 tools:
 
 - `observer_setup` verifies/stages both immutable companion add-ons, reports
   both managed roots, applies bounded Workbench-helper retention while vacant,
   and performs restoration- and lifecycle-aware managed uninstall.
-- `observer_prepare_launch` creates an expiring activation session and merges
-  the observer into a caller-supplied launch argument array without spawning a
-  process.
+- `observer_prepare_launch` creates an expiring activation session, merges the
+  observer into a caller-supplied launch argument array without spawning a
+  process, and returns an opaque one-shot `preparedLaunchId` in addition to the
+  structured arguments.
+- `observer_runtime` explicitly starts, inspects, or stops an exact-owned
+  graphical runtime on Windows. Start and stop require idempotency keys;
+  status is read-only, and stop is restoration-gated.
 - `observer_instances` inventories runtime and already-running exact-owned
   Workbench renderers, including capabilities, health, world identity, and any
   active job.
@@ -86,6 +91,100 @@ callback only records proof and disarms itself. Observer-entity destruction and
 lease release occur on the following update, never from inside the entity's own
 callback. Ownership or world drift remains fail-closed and cannot be promoted
 to restoration success.
+
+## Prepare, own, capture, restore, stop
+
+Launch preparation is launcher-neutral and side-effect free with respect to
+the game. Its structured `arguments` remain suitable for an external launcher;
+the additional `preparedLaunchId` is an opaque handle for callers that opt into
+the supported Windows lifecycle:
+
+```json
+{
+  "action": "start",
+  "preparedLaunchId": "<value from observer_prepare_launch>",
+  "idempotencyKey": "<unique start key>"
+}
+```
+
+The prepared descriptor is immutable, bound to its observer session and
+profile, expiring, and one-shot. Start resolves an allowlisted graphical
+executable beneath the configured `gamePath`, appends exactly one generated
+`-reforgerForgeOwnerToken=...` token, and spawns it visibly with the original
+arguments preserved token-for-token, `shell: false`, and the executable
+directory as its working directory. It publishes a `runtimeId` only after the
+spawned child has been verified by PID, canonical executable path, exact
+Windows creation time, exact owner argument, and stable pre/post-spawn
+executable file identity plus SHA-256. The atomic ownership receipt
+also binds the session, `preparedLaunchId`, argument-array SHA-256, profile,
+runtime kind, start time, and MCP installation/Windows-owner identity. If spawn
+or inspection fails, the manager attempts to stop only its retained child and
+does not publish a successful ownership receipt. If retained-child exit cannot
+be proved, it preserves a distinct non-success pending record that grants no
+PID-only recovery or termination authority.
+
+Status reopens the receipt and exact process identity:
+
+```json
+{
+  "action": "status",
+  "runtimeId": "<owned runtime ID>"
+}
+```
+
+The state is `running`, `exited`, `identity_mismatch`, `unverifiable`, or
+`stale`. Matching a PID or executable name is insufficient. PID reuse,
+executable-path drift, creation-time mismatch, or a missing/changed owner token
+fails closed. `stale` reports that the observer session expired while the exact
+process may remain owned; session expiry never causes an automatic stop.
+Multiple runtimes remain independent under their own `runtimeId` receipts.
+
+Capturing is a separate transaction. Inventory binds the runtime instance and
+world; capture may acquire a camera lease; completion, cancellation, or failure
+must reach terminal restoration. Only then should the caller request stop:
+
+```json
+{
+  "action": "stop",
+  "runtimeId": "<owned runtime ID>",
+  "waitForRestorationMs": 20000,
+  "idempotencyKey": "<unique stop key>"
+}
+```
+
+Stop inspects the observer session for active jobs and camera leases. It may
+wait up to `waitForRestorationMs`, but refuses with `CAMERA_BUSY` if terminal
+restoration cannot be proved. It then reopens and reverifies the exact identity,
+terminates only that verified process through the native handle backend, waits
+for exact-process exit, proves the identity vacant, and preserves an idempotent
+stop-result receipt. A successful restoration reservation seals the session
+against new capture submissions and is persisted before native termination.
+The stop receipt records that proof; observer-session completion is separately
+acknowledged and retried idempotently before stop reports success. It never
+invokes `taskkill`, `Stop-Process`, process-name enumeration, PID-only
+termination, or broad tree termination.
+
+A restarted MCP may recover exact status for a persisted lifecycle receipt only
+when it belongs to the same installation and Windows owner and every
+executable, creation-time, PID, and owner-token identity field still matches.
+If the new private agent does not know the old observer session, stopping after
+restart additionally requires the durable restoration seal created during a
+clean MCP shutdown. The old MCP writes that seal only after reserving the
+session and proving there are no active jobs, camera leases, or pending
+restoration. An unclean restart without that proof makes stop fail with
+`SESSION_UNVERIFIABLE` and preserves the process for diagnosis. This
+exact-match path is lifecycle recovery, not adoption of an arbitrary
+pre-existing Arma process. Identity mismatch or unverifiable state is reported
+and never signalled; unrelated Arma and Workbench processes remain untouched.
+
+Successful receipts are the only restart-recoverable ownership authority.
+Pending-start evidence is intentionally not adoptable: if the host dies in the
+narrow interval after process creation but before its exact PID/creation record
+is durable, recovery fails closed and an operator must handle that visible
+process without PID/name automation. Executable file-ID and digest snapshots
+detect stable or in-place replacement; as with trusted executable discovery,
+they assume the configured game installation is not being maliciously
+swap-and-restored during the exact process-creation interval.
 
 ## Using screenshots effectively
 
@@ -209,11 +308,10 @@ The Windows-only runtime harness performs an end-to-end screenshot transaction
 against an installed graphical Diag executable. It maps the requested fixture
 world to Reforger's `-server <world>` launch form and prepares the matching
 `listenServer` observer contract, producing a visible graphical listen host.
-Unlike the observer MCP tools, the harness intentionally launches one runtime,
-but it retains the exact `ChildProcess` it created and may stop only that
-process. It refuses to start while any Arma Reforger or Workbench process
-exists. A direct live run requires both an environment gate and an independent
-command-line confirmation:
+It exercises the shared exact-owned lifecycle service and may stop only the
+runtime whose full receipt identity it verified. It refuses to start while any
+Arma Reforger or Workbench process exists. A direct live run requires both an
+environment gate and an independent command-line confirmation:
 
 ```powershell
 $env:RFO_RUN_LIVE_RUNTIME_OBSERVER_ACCEPTANCE = '1'
@@ -277,8 +375,8 @@ bundle as qualification evidence.
 On failure, the harness cancels unfinished jobs and requires terminal camera
 restoration before discarding the managed run. If restoration cannot be
 proven, it preserves the open run and managed artifacts for diagnosis instead.
-It then revokes the session, stops only its directly owned runtime, closes the
-coordinator, and proves process vacancy. It retains the external
+It then stops only its exact-owned runtime after the restoration gate, closes
+the coordinator, and proves process vacancy. It retains the external
 `acceptance-summary.json`; no scratch data is written into a target project or
 its `screenshots` directory. A successful run removes its exact owned managed,
 profile, and diagnostic scratch, leaving only the summary and finalized

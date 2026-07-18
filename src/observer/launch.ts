@@ -12,11 +12,20 @@ export interface ObserverLaunchInput {
 
 export interface ObserverPreparedLaunch {
   arguments: string[];
+  /** Opaque one-shot handle present on the public MCP preparation path. */
+  preparedLaunchId?: string;
   sessionId: string;
   expiresAt: string;
   bundleDigest: string;
   profilePath: string;
   warnings: string[];
+}
+
+export interface ObserverPreparedLaunchRecorder {
+  recordPreparedLaunch(
+    input: ObserverLaunchInput,
+    prepared: ObserverPreparedLaunch
+  ): Promise<string>;
 }
 
 function record(value: unknown): Record<string, unknown> | null {
@@ -31,7 +40,8 @@ function record(value: unknown): Record<string, unknown> | null {
  */
 export async function prepareObserverLaunch(
   coordinator: ObserverCoordinator,
-  input: ObserverLaunchInput
+  input: ObserverLaunchInput,
+  recorder?: ObserverPreparedLaunchRecorder
 ): Promise<ObserverPreparedLaunch> {
   let sessionId: string | null = null;
   try {
@@ -46,7 +56,7 @@ export async function prepareObserverLaunch(
         typeof session.profilePath !== "string" || typeof session.contractPath !== "string") {
       throw new ObserverCoordinatorError("TRANSPORT_UNAVAILABLE", "Observer agent returned an invalid prepared-launch descriptor");
     }
-    return {
+    const prepared: ObserverPreparedLaunch = {
       arguments: response.arguments as string[],
       sessionId,
       expiresAt: session.expiresAt,
@@ -56,6 +66,9 @@ export async function prepareObserverLaunch(
         ? response.warnings.filter((warning): warning is string => typeof warning === "string")
         : [],
     };
+    if (!recorder) return prepared;
+    const preparedLaunchId = await recorder.recordPreparedLaunch(input, prepared);
+    return { ...prepared, preparedLaunchId };
   } catch (error) {
     if (sessionId) await coordinator.revokeSession(sessionId).catch(() => undefined);
     throw error;

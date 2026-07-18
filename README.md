@@ -9,6 +9,7 @@ Describe what you want to build — your AI agent handles API research, code gen
 ## Features
 
 - **Transactional observer captures** — launcher-neutral runtime instrumentation with validated PNG evidence
+- **Opt-in owned runtime lifecycle** — explicit, exact-identity start/status/stop for observer-prepared graphical runtimes on Windows
 - **Broad MCP toolset** — API search, wiki, asset browsing, code generation, and guarded Workbench control
 - **8,693 indexed API classes** — full Enfusion/Arma Reforger class hierarchy
 - **250+ wiki guides** — searchable tutorials and documentation
@@ -80,16 +81,20 @@ rules, validation steps, and troubleshooting reference.
 ### Observer capture workflow
 
 The runtime observer and Workbench helper are separately staged companion
-addons. Their managed files and profiles remain outside target projects. The
-observer never launches or terminates Arma Reforger.
+addons. Their managed files, lifecycle receipts, and profiles remain outside
+target projects. Preparing or capturing never starts or terminates a process.
+On Windows, `observer_runtime` is a separate, explicit lifecycle tool for a
+graphical runtime that ReforgerForge starts and proves it owns exactly.
 
 1. Call `observer_setup` with `action="ensure"` to verify and stage both packaged companion add-ons, re-attest their hashes, and sweep expired Workbench helper bundles/captures when the lifecycle is vacant.
 2. Call `observer_run` with `action="begin"`; the host creates a managed `runId` outside the project.
-3. Call `observer_prepare_launch` with the launcher's existing argument array and an observer-exclusive profile path. Use the returned array in your own launcher, or explicitly start an editor with `wb_launch`.
-4. Call `observer_instances` and record the selected `instanceId`, `worldId`, and `worldEpoch`.
-5. Call `observer_capture` with the run ID, a meaningful unique `captureLabel`, and the expected world binding. Prefer synchronous capture for immediate review.
-6. Use `observer_job action="read"` for a completed asynchronous image that fits the inline limit. Oversized images stay managed for finalization.
-7. Call `observer_run action="finalize"` to export only reviewed captures into an allowlisted evidence root, or `discard` a rejected run.
+3. Call `observer_prepare_launch` with the launcher's existing argument array and an observer-exclusive profile path. It returns both the structured argument array for external launchers and an opaque, expiring `preparedLaunchId`; no process has started.
+4. Either pass the returned arguments token-for-token to your own launcher, or explicitly call `observer_runtime action="start"` with the `preparedLaunchId` and a unique `idempotencyKey`. The managed path consumes the prepared launch once and returns a `runtimeId`. Start an editor separately with `wb_launch`.
+5. Optionally call `observer_runtime action="status"` with that `runtimeId`, then call `observer_instances` and record the selected `instanceId`, `worldId`, and `worldEpoch`.
+6. Call `observer_capture` with the run ID, a meaningful unique `captureLabel`, and the expected world binding. Prefer synchronous capture for immediate review.
+7. Use `observer_job action="read"` for a completed asynchronous image that fits the inline limit. Oversized images stay managed for finalization.
+8. Cancel unfinished work when necessary and wait for every capture to reach terminal camera restoration. If the runtime was lifecycle-managed, call `observer_runtime action="stop"` with its `runtimeId`, a unique `idempotencyKey`, and a bounded `waitForRestorationMs`.
+9. Call `observer_run action="finalize"` to export only reviewed captures into an allowlisted evidence root, or `discard` a rejected run.
 
 The returned `profilePath` is the outer directory passed to Enfusion's
 `-profile` argument. Enfusion mounts `$profile:` at the physical
@@ -97,6 +102,42 @@ The returned `profilePath` is the outer directory passed to Enfusion's
 activation contract and observer-owned files are beneath that child's
 `ReforgerForgeObserver` directory. Do not append the inner `profile` segment to
 the launch argument yourself.
+
+`preparedLaunchId` is bound to an immutable session, profile, runtime kind, and
+argument array. It is one-shot, expires with the prepared descriptor, and is
+needed only for the opt-in managed start; keeping the returned arguments
+preserves external-launch compatibility. Managed start resolves an allowlisted
+graphical executable from `gamePath`, appends exactly one random owner-token
+argument, and performs a visible direct spawn with a structured argument array
+and no shell. A successful `runtimeId` is published only after PID, canonical
+executable path, exact Windows creation time, and the owner argument have all
+been verified. Start also brackets process creation with a stable executable
+file identity and SHA-256 check, so later replacement at the same path fails
+closed. Only then is an atomic external receipt written.
+Lifecycle files use owner-only creation modes where the platform supports
+them. On Windows they inherit the ACL of the configured observer managed root,
+so any custom `observer.managedRoot` must be current-user-private rather than a
+shared or broadly writable directory.
+
+Runtime status is `running`, `exited`, `identity_mismatch`, `unverifiable`, or
+`stale`. A PID or executable name alone never proves ownership. `stale` means
+the prepared observer session expired while the exact runtime may still be
+running; expiry never triggers unsafe automatic termination. Stop first gates
+on active jobs and camera restoration, then reopens and reverifies the exact
+identity, terminates only that process, proves its identity vacant, and retains
+a stop receipt. It seals the session against new capture work during stop and
+revokes the activation after success. A restarted MCP can recover exact status
+only for the same installation and Windows owner and only while every recorded
+identity field and owner token still matches. If the new private observer agent
+does not know the old session, post-restart stop additionally requires the
+durable restoration seal written during a clean MCP shutdown after proving no
+active jobs, camera leases, or pending restoration. An unclean restart without
+that seal fails stop with `SESSION_UNVERIFIABLE` and preserves the process.
+This is lifecycle recovery, not adoption of an arbitrary existing Arma
+process. Failed starts do not publish ownership, and unrelated Arma or
+Workbench processes are never signalled. If retained-child cleanup cannot be
+proved, a distinct non-success pending record remains; it grants neither
+normal runtime ownership nor PID-only cleanup authority.
 
 The same inventory also includes a compatible, already-running exact-owned
 Workbench. Start that visible editor lifecycle explicitly with `wb_launch`;
@@ -285,13 +326,15 @@ auto-launch it.
 
 The observer coordinator starts its disposable child only when an operation
 needs private agent state; idle status and doctor checks stay non-mutating.
-Launch preparation returns argument tokens and session data; it does not start
-the game.
+Launch preparation returns argument tokens, session data, and an opaque
+`preparedLaunchId`; it does not start the game. Starting or stopping is always
+a distinct, explicit `observer_runtime` action.
 
 | Tool | What it does |
 |------|-------------|
 | `observer_setup` | Ensure/status/doctor/uninstall for immutable companion-addon staging. Uninstall refuses while restoration is pending, then revokes sessions and preserves modified or unrelated files. |
-| `observer_prepare_launch` | Merge the staged observer and exclusive profile into an existing structured argument array without spawning Enfusion. |
+| `observer_prepare_launch` | Merge the staged observer and exclusive profile into an existing structured argument array without spawning Enfusion; also return an opaque, expiring, one-shot `preparedLaunchId` for an optional managed start. |
+| `observer_runtime` | On Windows, explicitly start, inspect, or stop an exact-owned graphical runtime. Start and stop are idempotent side effects; status is read-only, and stop waits for terminal camera restoration before exact-identity termination. |
 | `observer_instances` | List live and stale runtime instances, capabilities, transport, world epoch, active job, and health; optionally wait for compatible renderers. |
 | `observer_capture` | Submit current-view, explicit-pose, or look-at capture. Sync mode returns one validated PNG plus metadata; async mode returns a job ID. |
 | `observer_job` | Inspect, read, cancel, or release a capture. Inline reads return a completed validated PNG; oversized captures remain available to run finalization. |

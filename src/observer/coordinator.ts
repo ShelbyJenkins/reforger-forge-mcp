@@ -10,6 +10,7 @@ import type {
   WorkbenchObserverInstance,
   WorkbenchObserverJobStatus,
 } from "../workbench/observer-adapter.js";
+import type { RuntimeStopPreflight } from "./owned-runtime-manager.js";
 
 const CHILD_PROTOCOL = "rfo-observer-child-v1" as const;
 const TERMINAL_STATES = new Set(["completed", "failed", "cancelled"]);
@@ -488,6 +489,39 @@ export class ObserverCoordinator {
 
   async revokeSession(sessionId: string): Promise<Record<string, unknown>> {
     return asRecord(await this.request("revoke", { sessionId }), "Observer session revocation");
+  }
+
+  async reserveRuntimeStop(sessionId: string): Promise<RuntimeStopPreflight> {
+    const response = asRecord(
+      await this.request("runtimeStopPreflight", { sessionId }),
+      "Observer runtime stop preflight"
+    );
+    const strings = (value: unknown): string[] => Array.isArray(value)
+      ? value.filter((entry): entry is string => typeof entry === "string")
+      : [];
+    return {
+      sessionKnown: response.sessionKnown === true,
+      ready: response.ready === true,
+      reserved: response.reserved === true,
+      activeJobIds: strings(response.activeJobIds),
+      cameraLeaseJobIds: strings(response.cameraLeaseJobIds),
+      restorationPendingJobIds: strings(response.restorationPendingJobIds),
+      ...(typeof response.reason === "string" ? { reason: response.reason } : {}),
+    };
+  }
+
+  async releaseRuntimeStop(sessionId: string): Promise<Record<string, unknown>> {
+    return asRecord(
+      await this.request("runtimeStopRelease", { sessionId }),
+      "Observer runtime stop release"
+    );
+  }
+
+  async completeRuntimeStop(sessionId: string): Promise<Record<string, unknown>> {
+    return asRecord(
+      await this.request("runtimeStopComplete", { sessionId }),
+      "Observer runtime stop completion"
+    );
   }
 
   private async readOnlySetupStatus(operation: "status" | "doctor"): Promise<Record<string, unknown>> {

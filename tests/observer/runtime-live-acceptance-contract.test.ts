@@ -173,19 +173,30 @@ describe("live graphical runtime observer acceptance contract", () => {
     });
   });
 
-  it("uses the public run workflow and exact spawned-child cleanup", () => {
+  it("uses the public run workflow and exact-owned runtime lifecycle service", () => {
     const source = readFileSync(resolve("scripts/run-runtime-observer-acceptance.ts"), "utf8");
     expect(source).toContain("agentPath: PRIVATE_CHILD_PATH");
     expect(source).toContain("await prepareObserverLaunch(coordinator");
+    expect(source).toContain("}, runtimeManager);");
+    expect(source).toContain("new OwnedRuntimeManager({");
+    expect(source).toContain("executableResolver: () => executable");
+    expect(source).toContain("findRuntimeExecutable(options.executablePath)");
+    expect(source).toContain("await runtimeManager.start({");
+    expect(source.match(/await runtimeManager\.status\(runtimeId\)/g)).toHaveLength(2);
+    expect(source).toContain("await runtimeManager.stop({");
+    expect(source).toContain("stoppedRuntime.identityVacant !== true");
+    expect(source).toContain("vacantRuntime.identityVacant !== true");
     expect(source).toContain('runtimeKind: "listenServer"');
     expect(source).toContain('"-server", worldResource');
     expect(source).toContain("await coordinator.beginRun(");
     expect(source).toContain("await coordinator.instances(");
     expect(source).toContain("await coordinator.capture(");
     expect(source).toContain("await coordinator.finalizeRun(");
-    expect(source).toContain("await coordinator.revokeSession(sessionId)");
-    expect(source).toContain("await stopOwnedRuntime(child)");
-    expect(source).toContain("This is the exact ChildProcess returned by the direct executable spawn");
+    const stopIndex = source.indexOf("await runtimeManager.stop({");
+    const revokeIndex = source.indexOf("await coordinator.revokeSession(sessionId)");
+    expect(stopIndex).toBeGreaterThan(-1);
+    expect(revokeIndex).toBeGreaterThan(stopIndex);
+    expect(source).toContain("preserved because exact-process vacancy was not proven");
     expect(source).toContain('imagesReviewed: false');
     expect(source).toContain('outcome: "Unreviewed"');
     expect(source).toContain("resolveRuntimeAcceptanceArtifactRoot(options.artifactRoot)");
@@ -207,6 +218,7 @@ describe("live graphical runtime observer acceptance contract", () => {
     expect(source).toContain("postLookAtDistanceMeters");
     expect(source).toContain('writeFileSync(imagePath, capture.image, { flag: "wx" })');
     expect(source).toContain('diagnostics: removeOwnedScratch(runDirectory, diagnosticsRoot');
+    expect(source).not.toMatch(/spawnOwnedRuntime|stopOwnedRuntime|ChildProcess|\.kill\(/);
     expect(source).not.toMatch(/taskkill|Stop-Process|KillProcess|execSync|shell:\s*true/i);
   });
 

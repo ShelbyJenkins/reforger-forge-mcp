@@ -163,6 +163,7 @@ export async function runPrivateObserverChild(argumentsArray: string[]): Promise
   };
   const agent = createObserverAgent(options);
   const descriptor = await agent.server.start();
+  const runtimeStopReservations = new Set<string>();
   let closing = false;
 
   const close = async (): Promise<void> => {
@@ -198,7 +199,82 @@ export async function runPrivateObserverChild(argumentsArray: string[]): Promise
       return { revoked: agent.control.revokeSession(requiredString(payload, "sessionId")) };
     }
     if (name === "instances") return { instances: agent.registry.diagnostics() };
-    if (name === "submitJob") return serializeJob(agent.jobs.submit(payload as never));
+    if (name === "runtimeStopPreflight") {
+      const sessionId = requiredString(payload, "sessionId");
+      if (runtimeStopReservations.has(sessionId)) {
+        return {
+          sessionKnown: true,
+          ready: true,
+          reserved: true,
+          activeJobIds: [],
+          cameraLeaseJobIds: [],
+          restorationPendingJobIds: [],
+        };
+      }
+      const sessionKnown = agent.control.sessions.diagnostics().some((session) =>
+        session.sessionId === sessionId
+      );
+      const jobs = agent.jobs.diagnostics(sessionId);
+      const instances = agent.registry.diagnostics().filter((instance) =>
+        instance.sessionId === sessionId
+      );
+      const activeJobIds = [...new Set([
+        ...jobs.filter((job) => typeof job.state !== "string" || !TERMINAL_STATES.has(job.state))
+          .map((job) => String(job.jobId)),
+        ...instances.map((instance) => instance.activeJobId)
+          .filter((jobId): jobId is string => typeof jobId === "string" && jobId.length > 0),
+      ])];
+      const cameraLeaseJobIds = [...new Set([
+        ...jobs.filter((job) => {
+          const lease = job.cameraLease && typeof job.cameraLease === "object"
+            ? job.cameraLease as Record<string, unknown>
+            : null;
+          return lease?.held === true;
+        }).map((job) => String(job.jobId)),
+        ...instances.map((instance) => instance.cameraLeaseJobId)
+          .filter((jobId): jobId is string => typeof jobId === "string" && jobId.length > 0),
+      ])];
+      const restorationPendingJobIds = jobs.filter((job) => {
+        const lease = job.cameraLease && typeof job.cameraLease === "object"
+          ? job.cameraLease as Record<string, unknown>
+          : null;
+        return lease?.everHeld === true && lease.restorationConfirmed !== true;
+      }).map((job) => String(job.jobId));
+      const ready = sessionKnown && activeJobIds.length === 0 && cameraLeaseJobIds.length === 0 &&
+        restorationPendingJobIds.length === 0;
+      if (ready) runtimeStopReservations.add(sessionId);
+      return {
+        sessionKnown,
+        ready,
+        reserved: ready,
+        activeJobIds,
+        cameraLeaseJobIds,
+        restorationPendingJobIds,
+        ...(!sessionKnown ? { reason: "observer_session_unknown" } : {}),
+      };
+    }
+    if (name === "runtimeStopRelease") {
+      return {
+        released: runtimeStopReservations.delete(requiredString(payload, "sessionId")),
+      };
+    }
+    if (name === "runtimeStopComplete") {
+      const sessionId = requiredString(payload, "sessionId");
+      const revoked = agent.control.revokeSession(sessionId);
+      runtimeStopReservations.delete(sessionId);
+      return { completed: true, revoked };
+    }
+    if (name === "submitJob") {
+      const sessionId = requiredString(payload, "sessionId");
+      if (runtimeStopReservations.has(sessionId)) {
+        throw new ObserverError(
+          "CAMERA_BUSY",
+          "Observer runtime stop has sealed this session against new capture jobs",
+          409
+        );
+      }
+      return serializeJob(agent.jobs.submit(payload as never));
+    }
     if (name === "jobStatus") {
       return serializeJob(agent.jobs.require(requiredString(payload, "sessionId"), requiredString(payload, "jobId")));
     }

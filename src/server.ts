@@ -57,8 +57,11 @@ import { registerBuildingSetup } from "./tools/building-setup.js";
 import type { Config } from "./config.js";
 import { ObserverCoordinator } from "./observer/coordinator.js";
 import { registerObserverTools } from "./observer/tools.js";
+import { closeObserverRuntimeLifecycle, OwnedRuntimeManager } from "./observer/owned-runtime-manager.js";
 
-export function registerTools(server: McpServer, config: Config): void {
+export type RegisteredToolsDisposer = () => Promise<Record<string, unknown>>;
+
+export function registerTools(server: McpServer, config: Config): RegisteredToolsDisposer {
   const searchEngine = new SearchEngine(config.dataDir);
   const patterns = new PatternLibrary(config.patternsDir);
 
@@ -114,12 +117,24 @@ export function registerTools(server: McpServer, config: Config): void {
     supportingLogRoots: observerConfig?.supportingLogRoots,
     workbenchAdapter: workbenchObserver,
   });
+  const ownedRuntimeManager = new OwnedRuntimeManager({
+    managedRoot: observerConfig?.managedRoot ?? defaultWorkbenchHelperManagedRoot(),
+    gamePath: config.gamePath,
+    projectPath: config.projectPath,
+    observerGate: observerCoordinator,
+  });
   registerObserverTools(server, observerCoordinator, {
     sessionTtlMs: observerConfig?.sessionTtlMs,
     defaultCaptureTimeoutMs: observerConfig?.defaultCaptureTimeoutMs,
     workbenchClient: wbClient,
     projectPath: config.projectPath,
+    ownedRuntimeManager,
   });
+  let observerShutdown: Promise<Record<string, unknown>> | null = null;
+  const disposeObserverLifecycle = (): Promise<Record<string, unknown>> => {
+    observerShutdown ??= closeObserverRuntimeLifecycle(ownedRuntimeManager, observerCoordinator);
+    return observerShutdown;
+  };
   const protocolServer = (server as unknown as { server?: { onclose?: () => void } }).server;
   if (protocolServer) {
     const previousOnClose = protocolServer.onclose;
@@ -127,7 +142,18 @@ export function registerTools(server: McpServer, config: Config): void {
       try {
         previousOnClose?.();
       } finally {
-        void observerCoordinator.close().catch(() => undefined);
+        const fallbackShutdown = observerShutdown === null;
+        void disposeObserverLifecycle().then((result) => {
+          if (!fallbackShutdown) return;
+          const errors = Array.isArray(result.errorRuntimes) ? result.errorRuntimes.length : 0;
+          const busy = Array.isArray(result.busyRuntimeIds) ? result.busyRuntimeIds.length : 0;
+          if (errors > 0 || busy > 0) {
+            console.error(`[reforger-forge-observer] shutdown left ${busy} busy and ${errors} unverifiable runtime lifecycle(s) unsealed`);
+          }
+        }).catch((error) => {
+          if (!fallbackShutdown) return;
+          console.error(`[reforger-forge-observer] lifecycle shutdown sealing failed: ${error instanceof Error ? error.message : String(error)}`);
+        });
       }
     };
   }
@@ -173,4 +199,5 @@ export function registerTools(server: McpServer, config: Config): void {
   registerClassResource(server, searchEngine);
   registerPatternResource(server, patterns);
   registerGroupResource(server, searchEngine);
+  return disposeObserverLifecycle;
 }

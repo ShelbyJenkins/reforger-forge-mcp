@@ -9,6 +9,8 @@ import {
 import { prepareObserverLaunch } from "./launch.js";
 import { runObserverSetup } from "./setup.js";
 import type { WorkbenchClient } from "../workbench/client.js";
+import type { OwnedRuntimeManager } from "./owned-runtime-manager.js";
+import { registerObserverRuntime } from "../tools/observer-runtime.js";
 
 const finite = () => z.number().finite();
 
@@ -67,6 +69,7 @@ export interface ObserverToolDefaults {
   defaultCaptureTimeoutMs?: number;
   workbenchClient?: WorkbenchClient;
   projectPath?: string;
+  ownedRuntimeManager?: OwnedRuntimeManager;
 }
 
 function jsonText(heading: string, value: unknown): string {
@@ -173,7 +176,11 @@ export function registerObserverTools(
     },
     async (input) => {
       try {
-        const prepared = await prepareObserverLaunch(coordinator, input);
+        const prepared = await prepareObserverLaunch(
+          coordinator,
+          input,
+          defaults.ownedRuntimeManager
+        );
         return { content: [{ type: "text" as const, text: jsonText("Observer launch arguments prepared; no process was started.", prepared) }] };
       } catch (error) {
         return toolError(error);
@@ -295,6 +302,10 @@ export function registerObserverTools(
       }
     }
   );
+
+  if (defaults.ownedRuntimeManager) {
+    registerObserverRuntime(server, defaults.ownedRuntimeManager);
+  }
 
   server.registerTool(
     "observer_run",

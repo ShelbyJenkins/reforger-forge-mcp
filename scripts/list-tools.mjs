@@ -49,6 +49,7 @@ const hybridNames = new Set(["game_duplicate", "mod"]);
 const observerNames = new Set([
   "observer_setup",
   "observer_prepare_launch",
+  "observer_runtime",
   "observer_instances",
   "observer_capture",
   "observer_job",

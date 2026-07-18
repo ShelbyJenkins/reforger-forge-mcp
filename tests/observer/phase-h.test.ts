@@ -15,6 +15,7 @@ import {
 } from "../../src/observer/coordinator.js";
 import { registerObserverTools } from "../../src/observer/tools.js";
 import { prepareObserverLaunch } from "../../src/observer/launch.js";
+import type { OwnedRuntimeManager } from "../../src/observer/owned-runtime-manager.js";
 import { uninstallManagedObserver } from "../../observer/agent/private-child.js";
 import { ObserverError } from "../../observer/agent/errors.js";
 
@@ -138,14 +139,19 @@ interface RegisteredTool {
   }>;
 }
 
-function toolRegistry(coordinator: ObserverCoordinator): Map<string, RegisteredTool> {
+function toolRegistry(
+  coordinator: ObserverCoordinator,
+  ownedRuntimeManager: OwnedRuntimeManager = {} as OwnedRuntimeManager
+): Map<string, RegisteredTool> {
   const tools = new Map<string, RegisteredTool>();
   const server = {
     registerTool: (name: string, definition: RegisteredTool["definition"], handler: RegisteredTool["handler"]): void => {
       tools.set(name, { definition, handler });
     },
   } as unknown as McpServer;
-  registerObserverTools(server, coordinator);
+  registerObserverTools(server, coordinator, {
+    ownedRuntimeManager,
+  });
   return tools;
 }
 
@@ -574,6 +580,9 @@ describe("Phase H observer MCP tools", () => {
       revokeSession: vi.fn(),
     } as unknown as ObserverCoordinator;
 
+    const recorder = {
+      recordPreparedLaunch: vi.fn(async () => "pl-00000000-0000-4000-8000-000000000001"),
+    };
     const result = await prepareObserverLaunch(coordinator, {
       runtimeKind: "client",
       arguments: [],
@@ -581,9 +590,11 @@ describe("Phase H observer MCP tools", () => {
       sessionTtlMs: 60_000,
       transportPreference: ["rest"],
       forceUpdate: false,
-    });
+    }, recorder);
 
     expect(result).toMatchObject({
+      arguments: ["-profile", "C:/profiles/run-1"],
+      preparedLaunchId: "pl-00000000-0000-4000-8000-000000000001",
       sessionId: "session-1",
       expiresAt: "2026-07-15T12:30:00.000Z",
       bundleDigest: "a".repeat(64),
@@ -592,9 +603,21 @@ describe("Phase H observer MCP tools", () => {
     });
     expect(result).not.toHaveProperty("launchNonce");
     expect(result).not.toHaveProperty("contractPath");
+    expect(recorder.recordPreparedLaunch).toHaveBeenCalledOnce();
+
+    const externalOnly = await prepareObserverLaunch(coordinator, {
+      runtimeKind: "client",
+      arguments: [],
+      profilePath: "C:/profiles/run-1",
+      sessionTtlMs: 60_000,
+      transportPreference: ["rest"],
+      forceUpdate: false,
+    });
+    expect(externalOnly.arguments).toEqual(["-profile", "C:/profiles/run-1"]);
+    expect(externalOnly).not.toHaveProperty("preparedLaunchId");
   });
 
-  it("registers the six exact public tools", () => {
+  it("registers the seven exact public tools", () => {
     const coordinator = { defaultCaptureTimeoutMs: 30_000, maxInlineImageBytes: 1_024 } as ObserverCoordinator;
     const tools = toolRegistry(coordinator);
     expect([...tools.keys()].sort()).toEqual([
@@ -603,9 +626,47 @@ describe("Phase H observer MCP tools", () => {
       "observer_job",
       "observer_prepare_launch",
       "observer_run",
+      "observer_runtime",
       "observer_setup",
     ]);
     for (const tool of tools.values()) expect(tool.definition.description?.length).toBeGreaterThan(40);
+  });
+
+  it("routes explicit observer_runtime actions without exposing owner-token receipt fields", async () => {
+    const manager = {
+      start: vi.fn(async () => ({ runtimeId: "rt-one", state: "running", exactOwned: true })),
+      status: vi.fn(async () => ({ runtimeId: "rt-one", state: "running", exactOwned: true })),
+      stop: vi.fn(async () => ({ runtimeId: "rt-one", state: "exited", identityVacant: true })),
+    } as unknown as OwnedRuntimeManager;
+    const coordinator = { defaultCaptureTimeoutMs: 30_000, maxInlineImageBytes: 1_024 } as ObserverCoordinator;
+    const handler = toolRegistry(coordinator, manager).get("observer_runtime")!.handler;
+    const signal = new AbortController().signal;
+    const started = await handler({
+      action: "start",
+      preparedLaunchId: "pl-00000000-0000-4000-8000-000000000001",
+      idempotencyKey: "start-one",
+    }, { signal });
+    expect(started.isError).not.toBe(true);
+    expect(manager.start).toHaveBeenCalledWith({
+      preparedLaunchId: "pl-00000000-0000-4000-8000-000000000001",
+      idempotencyKey: "start-one",
+    });
+    await handler({ action: "status", runtimeId: "rt-00000000-0000-4000-8000-000000000001" }, { signal });
+    expect(manager.status).toHaveBeenCalledOnce();
+    await handler({
+      action: "stop",
+      runtimeId: "rt-00000000-0000-4000-8000-000000000001",
+      waitForRestorationMs: 20_000,
+      idempotencyKey: "stop-one",
+    }, { signal });
+    expect(manager.stop).toHaveBeenCalledWith(expect.objectContaining({
+      idempotencyKey: "stop-one",
+      waitForRestorationMs: 20_000,
+      signal,
+    }));
+    const invalid = await handler({ action: "start" }, { signal });
+    expect(invalid.isError).toBe(true);
+    expect(invalid.content[0].text).toContain("INVALID_REQUEST");
   });
 
   it("rejects stale Workbench expected-world binding before adapter submission", async () => {

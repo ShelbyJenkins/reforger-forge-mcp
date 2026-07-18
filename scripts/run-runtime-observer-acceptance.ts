@@ -1,5 +1,4 @@
 #!/usr/bin/env node
-import { spawn, type ChildProcess } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import {
   existsSync,
@@ -24,6 +23,7 @@ import {
   type ObserverCaptureView,
 } from "../src/observer/coordinator.js";
 import { prepareObserverLaunch } from "../src/observer/launch.js";
+import { OwnedRuntimeManager } from "../src/observer/owned-runtime-manager.js";
 import {
   analyzePngMaterial,
   comparePngImages,
@@ -359,50 +359,6 @@ function launchArguments(
     result.push(token);
   }
   return result;
-}
-
-async function spawnOwnedRuntime(executable: string, argumentsArray: string[]): Promise<ChildProcess> {
-  const child = spawn(executable, argumentsArray, {
-    cwd: dirname(executable),
-    detached: false,
-    shell: false,
-    stdio: "ignore",
-    windowsHide: false,
-  });
-  await new Promise<void>((resolvePromise, reject) => {
-    const onSpawn = (): void => {
-      child.removeListener("error", onError);
-      resolvePromise();
-    };
-    const onError = (error: Error): void => {
-      child.removeListener("spawn", onSpawn);
-      reject(error);
-    };
-    child.once("spawn", onSpawn);
-    child.once("error", onError);
-  });
-  if (!Number.isSafeInteger(child.pid) || (child.pid ?? 0) <= 0) {
-    throw new Error("Graphical runtime spawn returned no owned process ID");
-  }
-  return child;
-}
-
-async function stopOwnedRuntime(child: ChildProcess, timeoutMs = 20_000): Promise<Record<string, unknown>> {
-  if (child.exitCode !== null || child.signalCode !== null) {
-    return { pid: child.pid ?? null, alreadyExited: true, exitCode: child.exitCode, signal: child.signalCode };
-  }
-  const exited = new Promise<void>((resolvePromise) => child.once("exit", () => resolvePromise()));
-  // This is the exact ChildProcess returned by the direct executable spawn.
-  // Never enumerate or terminate by process name/PID from this harness.
-  if (!child.kill()) throw new Error("Exact-owned graphical runtime refused termination");
-  const completed = await Promise.race([
-    exited.then(() => true),
-    delay(timeoutMs).then(() => false),
-  ]);
-  if (!completed || (child.exitCode === null && child.signalCode === null)) {
-    throw new Error("Exact-owned graphical runtime did not exit before the cleanup deadline");
-  }
-  return { pid: child.pid ?? null, alreadyExited: false, exitCode: child.exitCode, signal: child.signalCode };
 }
 
 export function captureMatrix(
@@ -823,6 +779,13 @@ export async function runRuntimeObserverAcceptance(
     defaultCaptureTimeoutMs: Math.min(timeoutMs, 300_000),
     maxInlineImageBytes: 64 * 1024 * 1024,
   });
+  const runtimeManager = new OwnedRuntimeManager({
+    managedRoot,
+    gamePath: dirname(executable),
+    projectPath: fixture?.addonDirectory,
+    observerGate: coordinator,
+    executableResolver: () => executable,
+  });
   const summary: Record<string, unknown> = {
     version: 1,
     status: "running",
@@ -835,10 +798,10 @@ export async function runRuntimeObserverAcceptance(
       addonGuid: fixture.addonGuid,
       gprojPath: fixture.gprojPath,
     } : null,
-    processPolicy: "preflight-all-Arma; direct exact-ChildProcess termination only",
+    processPolicy: "preflight-all-Arma; exact OwnedRuntimeManager identity termination only",
   };
   writeSummary(summaryPath, summary);
-  let child: ChildProcess | null = null;
+  let runtimeId: string | null = null;
   let sessionId: string | null = null;
   let managedRunId: string | null = null;
   let finalized = false;
@@ -865,9 +828,13 @@ export async function runRuntimeObserverAcceptance(
       transportPreference: ["rest", "mailbox"],
       forceUpdate: true,
       idempotencyKey: `runtime-launch-${randomUUID()}`,
-    });
+    }, runtimeManager);
     sessionId = prepared.sessionId;
+    if (!prepared.preparedLaunchId) {
+      throw new Error("Observer launch preparation returned no owned-runtime handle");
+    }
     summary.preparedLaunch = {
+      preparedLaunchId: prepared.preparedLaunchId,
       sessionId,
       expiresAt: prepared.expiresAt,
       bundleDigest: prepared.bundleDigest,
@@ -877,8 +844,23 @@ export async function runRuntimeObserverAcceptance(
     };
 
     assertArmaVacant("Live runtime observer acceptance launch");
-    child = await spawnOwnedRuntime(executable, prepared.arguments);
-    summary.ownedRuntimePid = child.pid;
+    const startedRuntime = await runtimeManager.start({
+      preparedLaunchId: prepared.preparedLaunchId,
+      idempotencyKey: `runtime-start-${randomUUID()}`,
+    });
+    runtimeId = startedRuntime.runtimeId;
+    if (startedRuntime.state !== "running" || startedRuntime.exactOwned !== true ||
+        startedRuntime.sessionId !== sessionId) {
+      throw new Error("Owned runtime did not start with an exact session-bound identity");
+    }
+    summary.runtimeStart = startedRuntime;
+    summary.ownedRuntimePid = startedRuntime.pid;
+    const runningRuntime = await runtimeManager.status(runtimeId);
+    if (runningRuntime.state !== "running" || runningRuntime.exactOwned !== true ||
+        runningRuntime.sessionId !== sessionId) {
+      throw new Error("Owned runtime status did not confirm the exact running process");
+    }
+    summary.runtimeStatus = runningRuntime;
     const remainingForInventory = Math.max(1_000, deadline - Date.now());
     const inventory = await coordinator.instances({
       sessionId,
@@ -1151,22 +1133,40 @@ export async function runRuntimeObserverAcceptance(
         summary.runDiscard = "preserved because restored terminal job state was not proven";
       }
     }
-    if (sessionId) {
+    let exactRuntimeVacancy = runtimeId === null;
+    if (runtimeId) {
       try {
-        summary.sessionRevoke = await coordinator.revokeSession(sessionId);
-      } catch (error) {
-        failure ??= error;
-        summary.sessionRevoke = error instanceof Error ? error.message : String(error);
-        summary.status = "failed";
-      }
-    }
-    if (child) {
-      try {
-        summary.runtimeShutdown = await stopOwnedRuntime(child);
+        const stoppedRuntime = await runtimeManager.stop({
+          runtimeId,
+          waitForRestorationMs: 20_000,
+          idempotencyKey: `runtime-stop-${randomUUID()}`,
+        });
+        summary.runtimeShutdown = stoppedRuntime;
+        const vacantRuntime = await runtimeManager.status(runtimeId);
+        summary.runtimeVacancy = vacantRuntime;
+        if (stoppedRuntime.state !== "exited" || stoppedRuntime.exactOwned !== true ||
+            stoppedRuntime.identityVacant !== true || vacantRuntime.state !== "exited" ||
+            vacantRuntime.exactOwned !== true || vacantRuntime.identityVacant !== true) {
+          throw new Error("Owned runtime stop did not prove exact-process vacancy");
+        }
+        exactRuntimeVacancy = true;
       } catch (error) {
         failure ??= error;
         summary.runtimeShutdown = error instanceof Error ? error.message : String(error);
         summary.status = "failed";
+      }
+    }
+    if (sessionId) {
+      if (exactRuntimeVacancy) {
+        try {
+          summary.sessionRevoke = await coordinator.revokeSession(sessionId);
+        } catch (error) {
+          failure ??= error;
+          summary.sessionRevoke = error instanceof Error ? error.message : String(error);
+          summary.status = "failed";
+        }
+      } else {
+        summary.sessionRevoke = "preserved because exact-process vacancy was not proven";
       }
     }
     try {

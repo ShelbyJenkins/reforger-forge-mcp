@@ -165,6 +165,72 @@ qualified fresh output on 2026-07-18. Keep the lifecycle and receipt checks
 intact: child launch and zero exit alone remain insufficient, and any missing or
 stale output proof must fail closed.
 
+## Observer Runtime Lifecycle (Windows)
+
+Keep the runtime phases distinct:
+
+1. `observer_prepare_launch` stages an activation session and returns both a
+   structured argument array and an opaque, expiring `preparedLaunchId`. It
+   never starts a process. The array remains available for external launchers.
+2. `observer_runtime action="start"` is an explicit side effect. Pass the
+   `preparedLaunchId` and a unique `idempotencyKey`; the one-shot immutable
+   descriptor is consumed and a successful call returns a `runtimeId`.
+3. `observer_instances` and `observer_capture` observe that running instance.
+   A pose/look-at transaction may hold a camera lease, and success, failure, or
+   cancellation is not terminal until camera restoration is confirmed.
+4. `observer_runtime action="stop"` is a separate explicit side effect. Pass
+   the `runtimeId`, a unique `idempotencyKey`, and an appropriate
+   `waitForRestorationMs`; it refuses if restoration cannot become terminal.
+
+Managed start resolves the graphical executable from trusted configuration,
+preserves each prepared argument as one token, appends exactly one random owner
+argument, and performs a visible direct spawn without a shell. It publishes an
+external atomic receipt only after verifying the child by PID, canonical
+executable path, exact Windows creation time, exact owner argument, and stable
+pre/post-spawn executable file identity plus SHA-256. Later same-path
+replacement fails closed. A failed spawn or inspection publishes no successful
+ownership receipt; unproved retained-child cleanup remains a non-success
+pending record without PID-only termination authority.
+Lifecycle files use owner-only creation modes where supported. On Windows they
+inherit the configured observer managed root's ACL, so configure any custom
+`observer.managedRoot` as a current-user-private directory, never a shared or
+broadly writable location.
+
+Use `observer_runtime action="status"` with the returned `runtimeId` to inspect
+`running`, `exited`, `identity_mismatch`, `unverifiable`, or `stale`. A PID or
+process name alone never proves ownership. `stale` means the observer session
+expired while the exact process may still exist; expiry never triggers an
+automatic stop. Before termination, stop checks active jobs and camera leases,
+waits only for the requested bound, reverifies every identity field, terminates
+through the native exact-process handle, proves identity vacancy, and preserves
+a stop-result receipt. The restoration reservation is persisted before native
+termination, and observer-session completion is separately acknowledged and
+retried idempotently before stop reports success. Once restoration is reserved,
+the session rejects new capture submissions; successful stop revokes its
+activation session.
+
+A restarted MCP may recover exact status only for one of the same
+installation's persisted receipts under the same Windows owner and only when
+every identity field and owner token still matches. If the new private observer
+agent does not know the old session, post-restart stop additionally requires a
+durable restoration seal from a clean MCP shutdown. That seal is written only
+after the old MCP reserves the session and proves there are no active jobs,
+camera leases, or pending restoration. After an unclean restart without the
+seal, preserve the process: stop fails with `SESSION_UNVERIFIABLE`. This is
+lifecycle recovery, not adoption. Never use `taskkill`, `Stop-Process`,
+process-name enumeration, PID-only termination, or broad process-tree
+termination as a substitute, and never signal an unrelated Arma or Workbench
+process.
+
+Only a successful runtime receipt is restart-recoverable. A pending-start file
+is failure evidence, not adoption authority. If the host dies between process
+creation and durable exact PID/creation publication, preserve safety and handle
+the visible process manually; never substitute PID/name cleanup. Treat the
+configured game installation as trusted during process creation: file-ID and
+digest snapshots fail closed on stable/in-place replacement but are not a
+defense against a privileged swap-and-restore attacker inside that exact
+interval.
+
 ## Start-of-Task Checklist
 
 Before editing:
@@ -206,6 +272,7 @@ name below.
 | Stage or diagnose the observer companion addon | `observer_setup` |
 | Begin, inspect, finalize, or discard a managed evidence run | `observer_run` |
 | Prepare an instrumented runtime argument array without launching it | `observer_prepare_launch` |
+| Explicitly start, inspect, or restoration-gated stop an exact-owned graphical runtime | `observer_runtime` |
 | Inventory runtime or exact-owned Workbench renderers | `observer_instances` |
 | Capture a current, explicit-pose, or look-at PNG | `observer_capture`; use `observer_job` for async status/read/cancel/release |
 | Inspect Workbench and troubleshoot the connection | `wb_state`, `wb_connect`, `wb_diagnose` |
@@ -269,7 +336,9 @@ archives, probe logs, or raw capture work. Configure its absolute path in
 external managed root.
 
 1. Call `observer_run action="begin"` and retain the generated `runId`.
-2. Prepare and start a runtime, or explicitly call `wb_launch` for an editor.
+2. Prepare a runtime with `observer_prepare_launch`. Either use its structured
+   arguments in an external launcher or explicitly start its `preparedLaunchId`
+   with `observer_runtime`; call `wb_launch` separately for an editor.
 3. Call `observer_instances`, choose one exact renderer, and record its
    `instanceId`, `worldId`, and `worldEpoch`.
 4. Call `observer_capture` with the `runId`, a meaningful unique
@@ -285,6 +354,8 @@ external managed root.
    is `<evidenceRoot>/<runId>/` with `RESULT.md`, `manifest.json`, capture
    PNG/JSON pairs, and only supplied allowlisted logs or sanitized runtime
    configuration. Use `discard` when the run should produce no evidence.
+8. For an exact-owned runtime, wait for every job to reach terminal restoration,
+   call `observer_runtime action="stop"`, and confirm `identityVacant=true`.
 
 An outcome of `Passed` requires `review.imagesReviewed=true`. Record warnings,
 contamination, limitations, source revision, procedure revision, and the stable
@@ -365,6 +436,8 @@ remaining validation gap. Do not describe an unrun check as passed.
 | `RegisterResourceFile` reports failure | Reopen the project or rebuild the resource database, then verify the resource and `.meta` resolve before treating it as a cache-only warning. |
 | Edits seem stale in Play | Stop Play, save in edit mode, reload the affected resource or scripts, and start a fresh Play session. |
 | Runtime manager references are null | Inspect inherited components and required support managers; a bare manager entity may not contain required arrays or references. |
+| `observer_runtime` reports `identity_mismatch` or `unverifiable` | Do not terminate by PID or name. Preserve the receipt for diagnosis and verify the configured executable, exact creation identity, owner token, MCP installation, and Windows owner. |
+| `observer_runtime` stop reports `CAMERA_BUSY` | Cancel or finish active captures, poll `observer_job` until restoration is terminal, then retry with an appropriate bounded `waitForRestorationMs`. |
 | Unexpected game-mode behavior | Check for multiple active game-mode entities and leftovers from failed duplication attempts. |
 | Project is read-only or saves intermittently | Move it out of synchronized storage or remove the external lock before continuing. |
 
@@ -396,7 +469,8 @@ Before reporting completion or publishing:
   acceptance cases.
 - Save editor changes and record any validation that still requires manual or
   multiplayer testing.
-- Restore/cancel observer work and call `wb_shutdown`; confirm no MCP helper
-  files exist beneath the target addon.
+- Restore/cancel observer work; stop each exact-owned runtime through
+  `observer_runtime` and prove identity vacancy, then call `wb_shutdown` for an
+  owned editor. Confirm no MCP helper files exist beneath the target addon.
 - Exclude local MCP config, logs, caches, absolute paths, usernames, and other
   machine-specific information from the commit.
