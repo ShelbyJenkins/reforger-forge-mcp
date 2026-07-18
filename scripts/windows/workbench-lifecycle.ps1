@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
 	[Parameter(Mandatory = $true)]
-	[ValidateSet('HoldMutex', 'InspectCurrent', 'InspectProcess', 'ListWorkbench', 'VerifyEndpointOwner', 'VerifyTerminate', 'ReplaceState', 'ArchiveState')]
+	[ValidateSet('HoldMutex', 'InspectCurrent', 'InspectProcess', 'ListWorkbench', 'VerifyEndpointOwner', 'VerifyEndpointVacant', 'VerifyTerminate', 'ReplaceState', 'ArchiveState')]
 	[string]$Mode,
 
 	[long]$DeadlineUnixMs = 0
@@ -872,6 +872,50 @@ function Invoke-VerifyEndpointOwner
 	}
 }
 
+function Invoke-VerifyEndpointVacant
+{
+	$request = Read-LifecycleRequest
+	$endpoint = Get-LifecycleProperty -Object $request -Name 'endpoint'
+	$hostName = [string](Get-LifecycleProperty -Object $endpoint -Name 'host' -Default '')
+	$portNumber = [int](Get-LifecycleProperty -Object $endpoint -Name 'port' -Default 0)
+	try
+	{
+		$loopbackAddress = $null
+		if (-not [Net.IPAddress]::TryParse($hostName, [ref]$loopbackAddress) -or
+			-not [Net.IPAddress]::IsLoopback($loopbackAddress))
+		{
+			throw [LifecycleProcessException]::new(
+				'endpoint_not_loopback',
+				'Automated Workbench lifecycle control requires a numeric loopback endpoint.')
+		}
+		if ($portNumber -le 0 -or $portNumber -gt 65535)
+		{
+			throw [LifecycleProcessException]::new('helper_failure', 'The lifecycle endpoint port is invalid.')
+		}
+		Assert-LifecycleDeadline
+		$listenerPid = [LifecycleTcpTable]::ResolveLoopbackListenerOwner($hostName, $portNumber)
+		Write-LifecycleProtocol ([ordered]@{
+			ok = $false
+			status = 'refused'
+			reason = 'listener_present'
+			listenerPid = $listenerPid
+			message = "Loopback endpoint ${hostName}:$portNumber is still owned by PID $listenerPid."
+		})
+	}
+	catch [LifecycleProcessException]
+	{
+		$processException = Resolve-LifecycleProcessException -ErrorRecord $_
+		if ($processException.Reason -eq 'listener_not_found')
+		{
+			Write-LifecycleProtocol ([ordered]@{ ok = $true; status = 'vacant' })
+		}
+		else
+		{
+			Write-LifecycleProcessRefusal -Exception $processException
+		}
+	}
+}
+
 function Invoke-VerifyTerminate
 {
 	$request = Read-LifecycleRequest
@@ -1036,6 +1080,7 @@ try
 		'InspectProcess' { Invoke-InspectProcess }
 		'ListWorkbench' { Invoke-ListWorkbench }
 		'VerifyEndpointOwner' { Invoke-VerifyEndpointOwner }
+		'VerifyEndpointVacant' { Invoke-VerifyEndpointVacant }
 		'VerifyTerminate' { Invoke-VerifyTerminate }
 		'ReplaceState' { Invoke-ReplaceState }
 		'ArchiveState' { Invoke-ArchiveState }

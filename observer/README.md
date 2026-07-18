@@ -340,7 +340,23 @@ bytes in the same one-image plus metadata MCP result as the runtime backend.
 For project launch/build wrappers, use the packaged
 `reforger-forge-workbench` foreground editor or bounded build command. It shares
 the same lifecycle and companion staging, so a project does not need its own
-Workbench process guard.
+Workbench process guard. A build holds one machine lock and absolute deadline
+across two exact children: a managed-companion preflight proves endpoint/Ping
+identity and post-termination endpoint vacancy before a distinct target-only
+child starts. Its version-3 receipt keeps the preflight and build PIDs,
+generations, and attributed log directories distinct and requires a fresh
+nonempty `resourceDatabase.rdb` for success from a caller-supplied unique empty
+output root. It also binds the project and output-database SHA-256 values.
+Timeout, nonzero exit, and output-attestation failure remain machine-readable
+without being promoted to success.
+
+That lifecycle and receipt hardening is supported, but successful guarded data
+build is not supported on installed Workbench 1.7.0.54. Revalidation of the
+no-`-run`, explicit `AddonName`, and clean `-run` Resource Manager forms never
+entered `buildData` or produced output. The wrapper fails closed when output
+proof is absent; do not treat child launch, zero exit, or `-run` as evidence that
+Resource Manager dispatched a build. A successful guarded build remains
+unsupported pending a verified engine-native dispatch path.
 
 ## Opt-in Workbench screenshot acceptance
 

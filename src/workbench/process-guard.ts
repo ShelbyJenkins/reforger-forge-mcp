@@ -163,6 +163,10 @@ export type VerifyEndpointOwnerResult =
   | { kind: "owned"; listenerPid: number }
   | { kind: "refused"; reason: EndpointOwnershipRefusalReason; message: string };
 
+export type VerifyEndpointVacantResult =
+  | { kind: "vacant" }
+  | { kind: "refused"; listenerPid?: number; message: string };
+
 export interface WorkbenchLifecycleBackend {
   readonly platform: "win32" | "test";
   withMachineMutex<T>(args: {
@@ -177,6 +181,7 @@ export interface WorkbenchLifecycleBackend {
     endpoint: LifecycleEndpoint,
     expected: WorkbenchIdentity
   ): Promise<VerifyEndpointOwnerResult>;
+  verifyEndpointVacant(endpoint: LifecycleEndpoint): Promise<VerifyEndpointVacantResult>;
   verifyAndTerminate(expected: WorkbenchIdentity, timeoutMs: number): Promise<VerifyTerminateResult>;
   replaceState(args: {
     path: string;
@@ -235,6 +240,7 @@ export interface WorkbenchLifecycleSession {
     endpoint: LifecycleEndpoint,
     expected: WorkbenchIdentity
   ): Promise<VerifyEndpointOwnerResult>;
+  verifyEndpointVacant(endpoint: LifecycleEndpoint): Promise<VerifyEndpointVacantResult>;
   verifyAndTerminate(expected: WorkbenchIdentity, timeoutMs: number): Promise<VerifyTerminateResult>;
   assertNoWorkbenchProcesses(): Promise<void>;
 }
@@ -817,6 +823,21 @@ export class WindowsLifecycleBackend implements WorkbenchLifecycleBackend {
     };
   }
 
+  async verifyEndpointVacant(endpoint: LifecycleEndpoint): Promise<VerifyEndpointVacantResult> {
+    const normalized = normalizedEndpoint(endpoint);
+    if (!isLoopbackLifecycleHost(normalized.host)) {
+      return { kind: "refused", message: "Endpoint vacancy requires a numeric loopback endpoint." };
+    }
+    const response = await this.invoke("VerifyEndpointVacant", { endpoint: normalized });
+    if (response.ok === true && response.status === "vacant") return { kind: "vacant" };
+    const listenerPid = Number(response.listenerPid);
+    return {
+      kind: "refused",
+      ...(Number.isInteger(listenerPid) && listenerPid > 0 ? { listenerPid } : {}),
+      message: response.message ?? "The Workbench endpoint is not provably vacant.",
+    };
+  }
+
   async verifyAndTerminate(
     expected: WorkbenchIdentity,
     timeoutMs: number
@@ -997,6 +1018,15 @@ class LifecycleSession implements WorkbenchLifecycleSession {
       };
     }
     return this.guard.backend.verifyEndpointOwner(normalized, expected);
+  }
+
+  async verifyEndpointVacant(endpoint: LifecycleEndpoint): Promise<VerifyEndpointVacantResult> {
+    this.assertActive();
+    const normalized = normalizedEndpoint(endpoint);
+    if (!isLoopbackLifecycleHost(normalized.host)) {
+      return { kind: "refused", message: "Endpoint vacancy requires a numeric loopback endpoint." };
+    }
+    return this.guard.backend.verifyEndpointVacant(normalized);
   }
 
   async verifyAndTerminate(

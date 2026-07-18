@@ -15,6 +15,7 @@ function redactPrivateOwnerTokens(message: string): string {
 }
 
 function receiptExitCode(receipt: WorkbenchRunnerReceipt): number {
+  if (receipt.intent === "build" && receipt.validationFailure) return 1;
   if (receipt.exitStatus.reason === "timed_out") return 124;
   if (receipt.exitStatus.reason === "aborted") return 130;
   if (receipt.exitStatus.exitCode === null) return receipt.exitStatus.signal ? 1 : 0;

@@ -129,6 +129,8 @@ export interface WorkbenchCompanionProvider {
     companion: WorkbenchCompanionLaunch,
     targetProjectPath?: string
   ): WorkbenchCompanionLaunch;
+  /** Re-verify the immutable packaged source and require its digest to remain exact. */
+  verifySourceDigest?(expectedBundleDigest: string): string;
   status?(): WorkbenchCompanionManagedStatus;
   applyRetention?(options?: WorkbenchCompanionRetentionOptions): WorkbenchCompanionRetentionResult;
   uninstall?(): WorkbenchCompanionUninstallResult;
@@ -738,6 +740,23 @@ export class WorkbenchHelperStager implements WorkbenchCompanionProvider {
       actualProfile,
       true
     );
+  }
+
+  verifySourceDigest(expectedBundleDigest: string): string {
+    if (!SHA256_PATTERN.test(expectedBundleDigest)) {
+      throw new WorkbenchHelperStageError(
+        "Expected Workbench helper source digest is invalid",
+        "WORKBENCH_HELPER_STAGE_CONFLICT"
+      );
+    }
+    const currentBundleDigest = verifyWorkbenchHelperSource(this.sourceDirectory).manifest.bundleDigest;
+    if (currentBundleDigest !== expectedBundleDigest) {
+      throw new WorkbenchHelperStageError(
+        "Packaged Workbench helper source changed after its managed companion was staged",
+        "WORKBENCH_HELPER_STAGE_CONFLICT"
+      );
+    }
+    return currentBundleDigest;
   }
 
   status(): WorkbenchCompanionManagedStatus {

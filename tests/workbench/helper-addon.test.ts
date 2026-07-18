@@ -81,6 +81,25 @@ describe("MCP-managed Workbench helper add-on", () => {
     );
   });
 
+  it("re-attests the packaged source digest and rejects source mutation after staging", () => {
+    const root = temporaryDirectory();
+    const source = join(root, "source");
+    cpSync(defaultWorkbenchHelperSource(), source, { recursive: true });
+    const stager = new WorkbenchHelperStager({
+      managedRoot: join(root, "managed"),
+      sourceDirectory: source,
+    });
+    const staged = stager.ensureStaged();
+
+    expect(stager.verifySourceDigest(staged.bundleDigest)).toBe(staged.bundleDigest);
+    writeFileSync(join(source, "addon.gproj"), "modified", "utf8");
+    expect(() => stager.verifySourceDigest(staged.bundleDigest)).toThrowError(
+      expect.objectContaining<Partial<WorkbenchHelperStageError>>({
+        code: "WORKBENCH_HELPER_SOURCE_INVALID",
+      })
+    );
+  });
+
   it("allows Workbench's generated resource database only in an existing staged bundle", () => {
     const root = temporaryDirectory();
     const stager = new WorkbenchHelperStager({ managedRoot: join(root, "managed") });

@@ -49,6 +49,7 @@ export function fakeCompanionProvider(
   return {
     ensureStaged: () => launch,
     verifyStaged: (candidate) => candidate,
+    verifySourceDigest: (expected) => expected,
   };
 }
 

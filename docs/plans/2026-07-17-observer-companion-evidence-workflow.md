@@ -183,15 +183,19 @@ reforger-forge-workbench build --gproj <path> --platform PC --output <path> --ti
 
 Editor mode must remain in the foreground for the lifetime of its owned
 Workbench. Detached one-shot ownership is refused. Build mode validates the
-target and output, enforces a maximum deadline, attributes the exact Workbench
-log directory, terminates only the proven child when required, and emits a JSON
-receipt containing:
+target and output, then uses a companion preflight and distinct target-only
+Resource Manager build under one maximum deadline and machine lock. It
+terminates only proven children when required and emits a version-3 JSON receipt
+containing:
 
 - intent and exact target;
-- PID and lifecycle generation;
+- separate preflight/build PIDs and lifecycle generations;
 - exact companion ID, GUID, protocol, build identity, and bundle digest;
-- endpoint ownership result;
-- attributed log directory; and
+- preflight endpoint ownership plus post-preflight vacancy proof;
+- separate attributed preflight/build log directories;
+- exact target add-on ID/GUID/project SHA-256 and fresh nonempty hashed
+  `resourceDatabase.rdb` proof from a unique empty output root, or an explicit
+  output-attestation failure; and
 - exit reason, code, signal, and timeout state.
 
 Project wrappers should only validate project-specific inputs and invoke this
@@ -199,8 +203,18 @@ runner. They must not implement a second lock, owner marker, process scan, or
 termination policy.
 
 The runner publishes version-3 `starting`, `running`, and `stopping` lifecycle
-states while it owns Workbench, verifies the exact companion Ping before
-readiness, and returns to `vacant` only after exact child absence is proven.
+states while it owns each Workbench child, verifies the exact companion Ping in
+preflight, and returns to `vacant` only after exact child absence is proven. This
+two-phase lifecycle and receipt hardening is supported and fails closed when the
+target child does not produce the required output proof.
+
+Successful guarded data build remains unsupported on installed Workbench
+1.7.0.54. Revalidation covered the no-`-run`, explicit `AddonName`, and clean
+`-run` Resource Manager forms; none entered `buildData` or produced output.
+Consequently, no tested form is documented as reconciling global module
+dispatch with the Resource Manager build action. Child launch and zero exit are
+not build evidence. A successful guarded build requires a separately verified
+engine-native dispatch path before this plan can claim support.
 
 ### Workbench observer adapter
 

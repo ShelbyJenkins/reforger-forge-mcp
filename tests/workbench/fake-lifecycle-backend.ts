@@ -11,6 +11,7 @@ import type {
   ProcessInspection,
   LifecycleEndpoint,
   VerifyEndpointOwnerResult,
+  VerifyEndpointVacantResult,
   VerifyTerminateResult,
   WorkbenchIdentity,
   WorkbenchLifecycleBackend,
@@ -28,9 +29,11 @@ export class FakeLifecycleBackend implements WorkbenchLifecycleBackend {
     endpoint: LifecycleEndpoint;
     expected: WorkbenchIdentity;
   }> = [];
+  readonly endpointVacancyCalls: LifecycleEndpoint[] = [];
   unverifiable: WorkbenchProcessScan["unverifiable"] = [];
   terminationResult: VerifyTerminateResult | null = null;
   endpointOwnershipResult: VerifyEndpointOwnerResult | null = null;
+  endpointVacancyResult: VerifyEndpointVacantResult | null = null;
   replaceFailure: ((args: {
     path: string;
     expectedGeneration: string | null;
@@ -124,6 +127,18 @@ export class FakeLifecycleBackend implements WorkbenchLifecycleBackend {
       };
     }
     return { kind: "owned", listenerPid: expected.pid };
+  }
+
+  async verifyEndpointVacant(_endpoint: LifecycleEndpoint): Promise<VerifyEndpointVacantResult> {
+    this.endpointVacancyCalls.push(_endpoint);
+    if (this.endpointVacancyResult) return this.endpointVacancyResult;
+    if (this.workbenchPids.size === 0) return { kind: "vacant" };
+    const listenerPid = [...this.workbenchPids][0];
+    return {
+      kind: "refused",
+      listenerPid,
+      message: `Fake endpoint is still owned by PID ${listenerPid}.`,
+    };
   }
 
   async verifyAndTerminate(expected: WorkbenchIdentity): Promise<VerifyTerminateResult> {

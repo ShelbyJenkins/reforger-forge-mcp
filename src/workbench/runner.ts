@@ -1,10 +1,12 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { spawn as spawnChild } from "node:child_process";
 import type { ChildProcess, SpawnOptions } from "node:child_process";
 import {
   createReadStream,
   existsSync,
+  lstatSync,
   mkdirSync,
+  readFileSync,
   readdirSync,
   realpathSync,
   statSync,
@@ -13,6 +15,7 @@ import { Socket } from "node:net";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { Config } from "../config.js";
+import { getProperty, parse as parseEnfusionText } from "../formats/enfusion-text.js";
 import {
   defaultWorkbenchHelperManagedRoot,
   WORKBENCH_HELPER_ADDON_GUID,
@@ -24,7 +27,7 @@ import {
   type WorkbenchCompanionLaunch,
   type WorkbenchCompanionProvider,
 } from "./helper-addon.js";
-import { canonicalizeGproj } from "./project-identity.js";
+import { canonicalizeGproj, revalidateProjectIdentity } from "./project-identity.js";
 import { decodeResponse, encodeRequest } from "./protocol.js";
 import {
   isLoopbackLifecycleHost,
@@ -61,7 +64,10 @@ export type WorkbenchRunnerErrorCode =
   | "IDENTITY_UNVERIFIABLE"
   | "ENDPOINT_UNVERIFIABLE"
   | "TERMINATION_REFUSED"
-  | "LOG_ATTRIBUTION_FAILED";
+  | "LOG_ATTRIBUTION_FAILED"
+  | "OUTPUT_ATTESTATION_FAILED"
+  | "BUILD_DEADLINE_EXCEEDED"
+  | "BUILD_ABORTED";
 
 export class WorkbenchRunnerError extends Error {
   constructor(
@@ -97,9 +103,9 @@ export interface WorkbenchRunnerExitStatus {
   timedOut: boolean;
 }
 
-export interface WorkbenchRunnerReceipt {
+export interface WorkbenchEditorRunnerReceipt {
   version: 2;
-  intent: WorkbenchRunnerIntent["kind"];
+  intent: "editor";
   pid: number;
   target: string;
   lifecycleGeneration: string;
@@ -108,6 +114,53 @@ export interface WorkbenchRunnerReceipt {
   logDirectory: string;
   exitStatus: WorkbenchRunnerExitStatus;
 }
+
+export interface WorkbenchBuildPreflightProof {
+  pid: number;
+  executablePath: string;
+  creationTime: string;
+  lifecycleGeneration: string;
+  endpointOwnership: "verified";
+  endpointVacancy: "verified";
+  logDirectory: string;
+}
+
+export interface WorkbenchBuildOutputProof {
+  root: string;
+  freshArtifactCount: number;
+  freshBytes: number;
+  resourceDatabasePath: string;
+  previousResourceDatabaseSha256: string | null;
+  resourceDatabaseSha256: string;
+}
+
+export interface WorkbenchBuildValidationFailure {
+  code: "OUTPUT_ATTESTATION_FAILED";
+  message: string;
+}
+
+export interface WorkbenchBuildRunnerReceipt {
+  version: 3;
+  intent: "build";
+  /** Exact target-only build child, never the companion preflight child. */
+  pid: number;
+  executablePath: string;
+  creationTime: string;
+  target: string;
+  targetAddon: { addonId: string; addonGuid: string; sourceSha256: string };
+  lifecycleGeneration: string;
+  processOwnership: "verified";
+  endpointVacancy: "verified";
+  companionIdentity: WorkbenchRunnerCompanionIdentity;
+  preflight: WorkbenchBuildPreflightProof;
+  logDirectory: string;
+  output: WorkbenchBuildOutputProof | null;
+  /** Present only when an exit-0 build failed post-exit output attestation. */
+  validationFailure: WorkbenchBuildValidationFailure | null;
+  exitStatus: WorkbenchRunnerExitStatus;
+}
+
+export type WorkbenchRunnerReceipt = WorkbenchEditorRunnerReceipt | WorkbenchBuildRunnerReceipt;
 
 export interface WorkbenchRunnerCompanionIdentity {
   addonId: string;
@@ -323,7 +376,9 @@ function validateBuildOutput(intent: WorkbenchBuildIntent): string {
   const output = resolve(intent.outputPath.trim());
   try {
     mkdirSync(output, { recursive: true });
-    return canonicalDirectory(output, "Workbench build output");
+    const canonical = canonicalDirectory(output, "Workbench build output");
+    assertEmptyBuildOutput(canonical);
+    return canonical;
   } catch (error) {
     if (error instanceof WorkbenchRunnerError) throw error;
     throw new WorkbenchRunnerError(
@@ -332,6 +387,162 @@ function validateBuildOutput(intent: WorkbenchBuildIntent): string {
       "INVALID_INTENT"
     );
   }
+}
+
+function assertEmptyBuildOutput(root: string): void {
+  if (readdirSync(root).length !== 0) {
+    throw new WorkbenchRunnerError(
+      `Workbench build output must be a unique empty directory before launch: ${root}`,
+      "OUTPUT_ATTESTATION_FAILED"
+    );
+  }
+}
+
+interface WorkbenchBuildProjectMetadata {
+  addonId: string;
+  addonGuid: string;
+  sourceSha256: string;
+}
+
+interface BuildOutputArtifactState {
+  path: string;
+  size: number;
+  mtimeMs: number;
+  sha256: string | null;
+}
+
+function resolveBuildProjectMetadata(gprojPath: string): WorkbenchBuildProjectMetadata {
+  let document;
+  let source: Buffer;
+  try {
+    source = readFileSync(gprojPath);
+    document = parseEnfusionText(source.toString("utf8"));
+  } catch (error) {
+    throw new WorkbenchRunnerError(
+      `Workbench build project could not be parsed: ${gprojPath} ` +
+        `(${error instanceof Error ? error.message : String(error)})`,
+      "INVALID_TARGET"
+    );
+  }
+  const addonId = document.type === "GameProject" ? getProperty(document, "ID") : undefined;
+  const addonGuid = document.type === "GameProject" ? getProperty(document, "GUID") : undefined;
+  if (typeof addonId !== "string" || !/^[A-Za-z0-9_.-]{1,128}$/.test(addonId) ||
+      typeof addonGuid !== "string" || !/^[A-Fa-f0-9]{16}$/.test(addonGuid)) {
+    throw new WorkbenchRunnerError(
+      `Workbench build project must declare one safe GameProject ID and GUID: ${gprojPath}`,
+      "INVALID_TARGET"
+    );
+  }
+  return {
+    addonId,
+    addonGuid: addonGuid.toUpperCase(),
+    sourceSha256: createHash("sha256").update(source).digest("hex"),
+  };
+}
+
+function snapshotBuildOutput(root: string): Map<string, BuildOutputArtifactState> {
+  const artifacts = new Map<string, BuildOutputArtifactState>();
+  const visit = (directory: string): void => {
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      const lexical = join(directory, entry.name);
+      const relativePath = relative(root, lexical).split(sep).join("/");
+      const stat = lstatSync(lexical);
+      if (entry.isSymbolicLink() || stat.isSymbolicLink()) {
+        throw new WorkbenchRunnerError(
+          `Workbench build output contains a symbolic link or reparse traversal: ${lexical}`,
+          "OUTPUT_ATTESTATION_FAILED"
+        );
+      }
+      const canonical = realpathSync.native(lexical);
+      if (!isContainedPath(root, canonical)) {
+        throw new WorkbenchRunnerError(
+          `Workbench build output entry escapes its canonical root: ${lexical}`,
+          "OUTPUT_ATTESTATION_FAILED"
+        );
+      }
+      if (stat.isDirectory()) {
+        visit(canonical);
+        continue;
+      }
+      if (!stat.isFile()) {
+        throw new WorkbenchRunnerError(
+          `Workbench build output contains an unsupported filesystem entry: ${lexical}`,
+          "OUTPUT_ATTESTATION_FAILED"
+        );
+      }
+      const isResourceDatabase = basename(relativePath).toLowerCase() === "resourcedatabase.rdb";
+      const sha256 = isResourceDatabase
+        ? createHash("sha256").update(readFileSync(canonical)).digest("hex")
+        : null;
+      const confirmed = lstatSync(lexical);
+      if (!confirmed.isFile() || confirmed.isSymbolicLink() ||
+          confirmed.size !== stat.size || confirmed.mtimeMs !== stat.mtimeMs ||
+          pathKey(realpathSync.native(lexical)) !== pathKey(canonical)) {
+        throw new WorkbenchRunnerError(
+          `Workbench build output changed during attestation: ${lexical}`,
+          "OUTPUT_ATTESTATION_FAILED"
+        );
+      }
+      artifacts.set(relativePath, {
+        path: canonical,
+        size: stat.size,
+        mtimeMs: stat.mtimeMs,
+        sha256,
+      });
+    }
+  };
+  visit(root);
+  return artifacts;
+}
+
+function attestFreshBuildOutput(
+  root: string,
+  before: ReadonlyMap<string, BuildOutputArtifactState>
+): WorkbenchBuildOutputProof {
+  const after = snapshotBuildOutput(root);
+  const fresh: BuildOutputArtifactState[] = [];
+  const resourceDatabases = [...after.entries()].filter(([relativePath]) =>
+    basename(relativePath).toLowerCase() === "resourcedatabase.rdb"
+  );
+  if (resourceDatabases.length !== 1) {
+    throw new WorkbenchRunnerError(
+      `Workbench exit-zero output must contain exactly one regular resourceDatabase.rdb; ` +
+        `found ${resourceDatabases.length}.`,
+      "OUTPUT_ATTESTATION_FAILED"
+    );
+  }
+  const [resourceDatabaseRelativePath, resourceDatabase] = resourceDatabases[0];
+  const previousResourceDatabase = before.get(resourceDatabaseRelativePath);
+  if (resourceDatabase.size <= 0 || !resourceDatabase.sha256 ||
+      previousResourceDatabase?.sha256 === resourceDatabase.sha256) {
+    throw new WorkbenchRunnerError(
+      "Workbench exited successfully without a fresh nonempty hashed resourceDatabase.rdb.",
+      "OUTPUT_ATTESTATION_FAILED"
+    );
+  }
+  for (const [relativePath, artifact] of after) {
+    const previous = before.get(relativePath);
+    const contentChanged = artifact.sha256 !== null && artifact.sha256 !== previous?.sha256;
+    if (artifact.size <= 0 || (!contentChanged && previous && previous.size === artifact.size &&
+        previous.mtimeMs === artifact.mtimeMs)) {
+      continue;
+    }
+    fresh.push(artifact);
+  }
+  if (fresh.length === 0) {
+    throw new WorkbenchRunnerError(
+      "Workbench exited successfully without fresh nonempty build artifacts.",
+      "OUTPUT_ATTESTATION_FAILED"
+    );
+  }
+  return {
+    root,
+    freshArtifactCount: fresh.length,
+    freshBytes: fresh.reduce((total, artifact) => total + artifact.size, 0),
+    resourceDatabasePath: resourceDatabase.path,
+    previousResourceDatabaseSha256: previousResourceDatabase?.sha256 ?? null,
+    resourceDatabaseSha256: resourceDatabase.sha256,
+  };
 }
 
 function validateCompanionLaunch(
@@ -387,49 +598,98 @@ function validateCompanionLaunch(
   };
 }
 
-function buildArguments(
+function commonProfileArguments(
   config: Pick<Config, "workbenchScriptAuthorizeAll">,
-  intent: WorkbenchRunnerIntent,
-  target: string,
   addonDirectories: readonly string[],
-  companion: WorkbenchCompanionLaunch,
-  ownerArgument: string,
-  outputPath: string | null
+  profilePath: string
 ): string[] {
   const args: string[] = [];
   if (addonDirectories.length > 0) args.push("-addonsDir", addonDirectories.join(","));
+  args.push("-profile", profilePath);
+  args.push("-noThrow");
+  if (config.workbenchScriptAuthorizeAll === true) args.push("-scriptAuthorizeAll");
+  return args;
+}
+
+function editorArguments(
+  config: Pick<Config, "workbenchScriptAuthorizeAll">,
+  intent: WorkbenchEditorIntent,
+  target: string,
+  addonDirectories: readonly string[],
+  companion: WorkbenchCompanionLaunch,
+  ownerArgument: string
+): string[] {
+  if (intent.foreground !== true) {
+    throw new WorkbenchRunnerError(
+      "Editor intent must be foreground; one-shot detached ownership is unsupported.",
+      "INVALID_INTENT"
+    );
+  }
+  const args = commonProfileArguments(
+    config,
+    addonDirectories,
+    companion.workbenchProfilePath
+  );
   args.push(
     "-addons",
     companion.addonGuid,
-    "-profile",
-    companion.workbenchProfilePath,
     "-gproj",
     target,
-    "-noThrow"
+    ownerArgument,
+    "-wbModule=WorldEditor",
+    "-run"
   );
-  if (config.workbenchScriptAuthorizeAll === true) args.push("-scriptAuthorizeAll");
-  if (intent.kind === "editor") {
-    if (intent.foreground !== true) {
-      throw new WorkbenchRunnerError(
-        "Editor intent must be foreground; one-shot detached ownership is unsupported.",
-        "INVALID_INTENT"
-      );
-    }
-    args.push("-wbModule=WorldEditor", "-run");
-  } else {
-    if (!outputPath) {
-      throw new WorkbenchRunnerError("Build output was not prepared.", "INVALID_INTENT");
-    }
-    args.push(
-      "-wbSilent",
-      "-wbModule=ResourceManager",
-      "-buildData",
-      intent.platform,
-      outputPath,
-      "-loadBuiltData"
-    );
-  }
-  args.push(ownerArgument);
+  return args;
+}
+
+function buildPreflightArguments(
+  config: Pick<Config, "workbenchScriptAuthorizeAll">,
+  target: string,
+  addonDirectories: readonly string[],
+  companion: WorkbenchCompanionLaunch,
+  ownerArgument: string
+): string[] {
+  const args = commonProfileArguments(
+    config,
+    addonDirectories,
+    companion.workbenchProfilePath
+  );
+  args.push(
+    "-addons",
+    companion.addonGuid,
+    "-gproj",
+    target,
+    ownerArgument,
+    "-wbModule=ResourceManager",
+    "-run"
+  );
+  return args;
+}
+
+function targetBuildArguments(
+  config: Pick<Config, "workbenchScriptAuthorizeAll">,
+  intent: WorkbenchBuildIntent,
+  target: string,
+  addonDirectories: readonly string[],
+  profilePath: string,
+  ownerArgument: string,
+  outputPath: string,
+  addonId: string
+): string[] {
+  const args = commonProfileArguments(config, addonDirectories, profilePath);
+  args.push(
+    "-gproj",
+    target,
+    "-gprojConfig",
+    intent.platform,
+    ownerArgument,
+    "-wbModule=ResourceManager",
+    "-run",
+    "-buildData",
+    intent.platform,
+    outputPath,
+    addonId
+  );
   return args;
 }
 
@@ -1009,6 +1269,506 @@ function safeSpawn(
   }
 }
 
+interface BuildCompanionPreflightArgs {
+  session: WorkbenchLifecycleSession;
+  guard: WorkbenchProcessGuard;
+  config: Config;
+  executablePath: string;
+  target: CanonicalProjectIdentity;
+  companion: WorkbenchCompanionLaunch;
+  companionProvider: WorkbenchCompanionProvider;
+  reattestCompanion: () => WorkbenchCompanionLaunch;
+  reattestTarget: () => WorkbenchBuildProjectMetadata;
+  addonDirectories: readonly string[];
+  endpoint: LifecycleEndpoint;
+  logRoot: string;
+  spawnProcess: NonNullable<WorkbenchRunnerDependencies["spawnProcess"]>;
+  endpointProbeTimeoutMs: number;
+  endpointPollMs: number;
+  companionProbe: WorkbenchRunnerCompanionProbe;
+  logAttributionTimeoutMs: number;
+  logPollMs: number;
+  terminationTimeoutMs: number;
+  deadlineMs: number;
+  signal?: AbortSignal;
+}
+
+interface BuildCompanionPreflightResult {
+  proof: WorkbenchBuildPreflightProof;
+  companionIdentity: WorkbenchRunnerCompanionIdentity;
+}
+
+async function runBuildCompanionPreflight(
+  args: BuildCompanionPreflightArgs
+): Promise<BuildCompanionPreflightResult> {
+  let lifecycle = await claimExternalRunLifecycle(
+    args.session,
+    args.endpoint,
+    args.target,
+    args.companion
+  );
+  let child: ChildProcess | null = null;
+  let childExit: ChildObservation | null = null;
+  let identity: WorkbenchIdentity | null = null;
+  let verifiedCompanion: WorkbenchRunnerCompanionIdentity | null = null;
+  let lifecycleGeneration: string | null = null;
+  let endpointOwnership: "verified" | null = null;
+  let beforeLogs: Map<string, number> | null = null;
+  let ownerToken: string | null = null;
+  let logDirectory: string | null = null;
+  let primaryError: unknown = null;
+  let cleanupError: unknown = null;
+  let absenceProven = false;
+  let endpointVacant = false;
+
+  try {
+    if (args.signal?.aborted) {
+      throw new WorkbenchRunnerError(
+        "Workbench build was aborted before companion preflight spawn.",
+        "BUILD_ABORTED"
+      );
+    }
+    if (Date.now() >= args.deadlineMs) {
+      throw new WorkbenchRunnerError(
+        "Workbench build deadline expired before companion preflight spawn.",
+        "BUILD_DEADLINE_EXCEEDED"
+      );
+    }
+    await args.session.assertNoWorkbenchProcesses();
+    args.reattestTarget();
+    args.reattestCompanion();
+    args.companionProvider.applyRetention?.({ protectedDigests: [args.companion.bundleDigest] });
+    beforeLogs = snapshotLogDirectories(args.logRoot);
+    ownerToken = args.guard.createOwnerToken();
+    const ownerArgument = args.guard.ownerArgument(ownerToken);
+    const launchArguments = buildPreflightArguments(
+      args.config,
+      args.target.path,
+      args.addonDirectories,
+      args.companion,
+      ownerArgument
+    );
+    if (args.signal?.aborted) {
+      throw new WorkbenchRunnerError(
+        "Workbench build was aborted before companion preflight spawn.",
+        "BUILD_ABORTED"
+      );
+    }
+    if (Date.now() >= args.deadlineMs) {
+      throw new WorkbenchRunnerError(
+        "Workbench build deadline expired before companion preflight spawn.",
+        "BUILD_DEADLINE_EXCEEDED"
+      );
+    }
+    args.reattestTarget();
+    args.reattestCompanion();
+    const launchedAtMs = Date.now();
+    child = safeSpawn(args.spawnProcess, args.executablePath, launchArguments, {
+      cwd: dirname(args.executablePath),
+      detached: false,
+      stdio: "ignore",
+      windowsHide: true,
+    });
+    childExit = observeChild(child);
+    identity = await inspectSpawnedIdentity(
+      args.session,
+      child,
+      childExit,
+      args.executablePath,
+      ownerArgument,
+      launchedAtMs
+    );
+    lifecycle = await args.session.transition(expectedState(lifecycle), lifecycleDraft(lifecycle, {
+      phase: "starting",
+      workbench: identity,
+    }));
+    endpointOwnership = await probeEndpointOwnership({
+      session: args.session,
+      endpoint: args.endpoint,
+      identity,
+      childExit,
+      timeoutMs: Math.max(1, Math.min(args.endpointProbeTimeoutMs, args.deadlineMs - Date.now())),
+      pollMs: args.endpointPollMs,
+      signal: args.signal,
+    });
+    verifiedCompanion = await waitForCompanionIdentity({
+      endpoint: args.endpoint,
+      expected: args.companion,
+      childExit,
+      probe: args.companionProbe,
+      timeoutMs: Math.max(1, Math.min(args.endpointProbeTimeoutMs, args.deadlineMs - Date.now())),
+      pollMs: args.endpointPollMs,
+      signal: args.signal,
+    });
+    args.reattestCompanion();
+    lifecycle = await args.session.transition(expectedState(lifecycle), lifecycleDraft(lifecycle, {
+      phase: "running",
+      workbench: identity,
+      companion: companionState(args.companion),
+      operation: null,
+    }));
+    lifecycleGeneration = lifecycle.generation;
+  } catch (error) {
+    primaryError = error;
+  }
+
+  try {
+    if (lifecycle.phase !== "vacant") {
+      lifecycle = await args.session.transition(expectedState(lifecycle), lifecycleDraft(lifecycle, {
+        phase: "stopping",
+        workbench: identity,
+        operation: { kind: "shutdown", operationId: randomUUID() },
+      }));
+    }
+  } catch (error) {
+    cleanupError = error;
+  }
+
+  if (childExit) {
+    const absence = await ensureExactChildAbsent({
+      session: args.session,
+      guard: args.guard,
+      identity,
+      childExit,
+      timeoutMs: args.terminationTimeoutMs,
+    });
+    cleanupError ??= absence.error ?? null;
+    absenceProven = !absence.error;
+  }
+
+  if (!primaryError && !cleanupError && beforeLogs && ownerToken) {
+    try {
+      logDirectory = await attributeLogDirectory({
+        logRoot: args.logRoot,
+        before: beforeLogs,
+        launchedAtMs: identity?.launchedAtMs ?? Date.now(),
+        ownerToken,
+        timeoutMs: args.logAttributionTimeoutMs,
+        pollMs: args.logPollMs,
+      });
+    } catch (error) {
+      primaryError = error;
+    }
+  }
+
+  if (absenceProven) {
+    try {
+      const vacancy = await args.session.verifyEndpointVacant(args.endpoint);
+      if (vacancy.kind !== "vacant") {
+        throw new WorkbenchRunnerError(
+          `Workbench companion endpoint remained occupied after exact child absence: ${vacancy.message}`,
+          "ENDPOINT_UNVERIFIABLE"
+        );
+      }
+      endpointVacant = true;
+      args.reattestTarget();
+      args.reattestCompanion();
+    } catch (error) {
+      primaryError ??= error;
+    }
+  }
+
+  try {
+    lifecycle = await args.session.transitionToVacant(expectedState(lifecycle), {
+      endpoint: args.endpoint,
+      target: args.target,
+      companion: companionState(args.companion),
+    });
+  } catch (error) {
+    cleanupError ??= error;
+  }
+
+  if (cleanupError) throw cleanupError;
+  if (primaryError) throw primaryError;
+  if (!identity || !verifiedCompanion || !lifecycleGeneration ||
+      endpointOwnership !== "verified" || !logDirectory || !absenceProven || !endpointVacant) {
+    throw new WorkbenchRunnerError(
+      "Workbench companion preflight completed without a fully identity-bound proof.",
+      "IDENTITY_UNVERIFIABLE"
+    );
+  }
+  return {
+    proof: {
+      pid: identity.pid,
+      lifecycleGeneration,
+      endpointOwnership,
+      endpointVacancy: "verified",
+      executablePath: identity.executablePath,
+      creationTime: identity.creationTime,
+      logDirectory,
+    },
+    companionIdentity: verifiedCompanion,
+  };
+}
+
+interface TargetBuildStageArgs {
+  session: WorkbenchLifecycleSession;
+  guard: WorkbenchProcessGuard;
+  config: Config;
+  intent: WorkbenchBuildIntent;
+  executablePath: string;
+  target: CanonicalProjectIdentity;
+  buildProject: WorkbenchBuildProjectMetadata;
+  companion: WorkbenchCompanionLaunch;
+  companionProvider: WorkbenchCompanionProvider;
+  reattestCompanion: () => WorkbenchCompanionLaunch;
+  reattestTarget: () => WorkbenchBuildProjectMetadata;
+  addonDirectories: readonly string[];
+  endpoint: LifecycleEndpoint;
+  logRoot: string;
+  outputPath: string;
+  preflight: BuildCompanionPreflightResult;
+  spawnProcess: NonNullable<WorkbenchRunnerDependencies["spawnProcess"]>;
+  logAttributionTimeoutMs: number;
+  logPollMs: number;
+  terminationTimeoutMs: number;
+  deadlineMs: number;
+  signal?: AbortSignal;
+}
+
+async function runTargetBuildStage(args: TargetBuildStageArgs): Promise<WorkbenchBuildRunnerReceipt> {
+  let lifecycle = await claimExternalRunLifecycle(
+    args.session,
+    args.endpoint,
+    args.target,
+    args.companion
+  );
+  let child: ChildProcess | null = null;
+  let childExit: ChildObservation | null = null;
+  let identity: WorkbenchIdentity | null = null;
+  let lifecycleGeneration: string | null = null;
+  let beforeLogs: Map<string, number> | null = null;
+  let beforeOutput: Map<string, BuildOutputArtifactState> | null = null;
+  let ownerToken: string | null = null;
+  let launchedAtMs = 0;
+  let reason: WorkbenchRunnerExitStatus["reason"] | null = null;
+  let exit: ChildExit | null = null;
+  let logDirectory: string | null = null;
+  let output: WorkbenchBuildOutputProof | null = null;
+  let validationFailure: WorkbenchBuildValidationFailure | null = null;
+  let primaryError: unknown = null;
+  let cleanupError: unknown = null;
+  let absenceProven = false;
+  let endpointVacant = false;
+
+  try {
+    await args.session.assertNoWorkbenchProcesses();
+    if (args.signal?.aborted) {
+      throw new WorkbenchRunnerError(
+        "Workbench build was aborted after companion preflight and before target spawn.",
+        "BUILD_ABORTED"
+      );
+    }
+    if (Date.now() >= args.deadlineMs) {
+      throw new WorkbenchRunnerError(
+        "Workbench build deadline expired after companion preflight and before target spawn.",
+        "BUILD_DEADLINE_EXCEEDED"
+      );
+    }
+    const revalidatedTarget = args.reattestTarget();
+    args.reattestCompanion();
+    args.companionProvider.applyRetention?.({ protectedDigests: [args.companion.bundleDigest] });
+    beforeLogs = snapshotLogDirectories(args.logRoot);
+    assertEmptyBuildOutput(args.outputPath);
+    beforeOutput = snapshotBuildOutput(args.outputPath);
+    ownerToken = args.guard.createOwnerToken();
+    const ownerArgument = args.guard.ownerArgument(ownerToken);
+    const launchArguments = targetBuildArguments(
+      args.config,
+      args.intent,
+      args.target.path,
+      args.addonDirectories,
+      args.companion.workbenchProfilePath,
+      ownerArgument,
+      args.outputPath,
+      revalidatedTarget.addonId
+    );
+    if (args.signal?.aborted) {
+      throw new WorkbenchRunnerError(
+        "Workbench build was aborted after companion preflight and before target spawn.",
+        "BUILD_ABORTED"
+      );
+    }
+    if (Date.now() >= args.deadlineMs) {
+      throw new WorkbenchRunnerError(
+        "Workbench build deadline expired after companion preflight and before target spawn.",
+        "BUILD_DEADLINE_EXCEEDED"
+      );
+    }
+    args.reattestTarget();
+    args.reattestCompanion();
+    launchedAtMs = Date.now();
+    child = safeSpawn(args.spawnProcess, args.executablePath, launchArguments, {
+      cwd: dirname(args.executablePath),
+      detached: false,
+      stdio: "ignore",
+      windowsHide: true,
+    });
+    childExit = observeChild(child);
+    identity = await inspectSpawnedIdentity(
+      args.session,
+      child,
+      childExit,
+      args.executablePath,
+      ownerArgument,
+      launchedAtMs
+    );
+    lifecycle = await args.session.transition(expectedState(lifecycle), lifecycleDraft(lifecycle, {
+      phase: "starting",
+      workbench: identity,
+    }));
+    lifecycle = await args.session.transition(expectedState(lifecycle), lifecycleDraft(lifecycle, {
+      phase: "running",
+      workbench: identity,
+      companion: companionState(args.companion),
+      operation: null,
+    }));
+    lifecycleGeneration = lifecycle.generation;
+
+    const completion = await waitForExitOrControl({
+      childExit,
+      timeoutMs: Math.max(1, args.deadlineMs - Date.now()),
+      signal: args.signal,
+    });
+    const observedChildError = childExit.getError();
+    if (observedChildError) throw observedChildError;
+    if (completion.reason === "child_error") throw completion.error;
+    if (completion.reason === "exited") {
+      reason = "exited";
+      exit = completion.exit;
+    } else {
+      reason = completion.reason;
+    }
+  } catch (error) {
+    primaryError = error;
+  }
+
+  try {
+    if (lifecycle.phase !== "vacant") {
+      lifecycle = await args.session.transition(expectedState(lifecycle), lifecycleDraft(lifecycle, {
+        phase: "stopping",
+        workbench: identity,
+        operation: { kind: "shutdown", operationId: randomUUID() },
+      }));
+    }
+  } catch (error) {
+    cleanupError = error;
+  }
+
+  if (childExit) {
+    const absence = await ensureExactChildAbsent({
+      session: args.session,
+      guard: args.guard,
+      identity,
+      childExit,
+      timeoutMs: args.terminationTimeoutMs,
+    });
+    exit ??= absence.exit;
+    cleanupError ??= absence.error ?? null;
+    absenceProven = !absence.error;
+  }
+
+  if (absenceProven) {
+    if (!primaryError && !cleanupError && reason === "exited" && exit?.code === 0 && beforeOutput) {
+      try {
+        output = attestFreshBuildOutput(args.outputPath, beforeOutput);
+      } catch (error) {
+        if (error instanceof WorkbenchRunnerError && error.code === "OUTPUT_ATTESTATION_FAILED") {
+          validationFailure = {
+            code: "OUTPUT_ATTESTATION_FAILED",
+            message: error.message.replace(
+              /-reforgerForgeOwnerToken(?:=|\s+)[^\s"']+/gi,
+              "-reforgerForgeOwnerToken=[redacted]"
+            ),
+          };
+        } else {
+          primaryError = error;
+        }
+      }
+    }
+    try {
+      args.reattestTarget();
+      args.reattestCompanion();
+    } catch (error) {
+      primaryError ??= error;
+    }
+    try {
+      const vacancy = await args.session.verifyEndpointVacant(args.endpoint);
+      if (vacancy.kind !== "vacant") {
+        throw new WorkbenchRunnerError(
+          `Workbench endpoint was occupied after exact target-build child absence: ${vacancy.message}`,
+          "ENDPOINT_UNVERIFIABLE"
+        );
+      }
+      endpointVacant = true;
+    } catch (error) {
+      primaryError ??= error;
+    }
+  }
+
+  if (!primaryError && !cleanupError && beforeLogs && ownerToken) {
+    try {
+      logDirectory = await attributeLogDirectory({
+        logRoot: args.logRoot,
+        before: beforeLogs,
+        launchedAtMs,
+        ownerToken,
+        timeoutMs: args.logAttributionTimeoutMs,
+        pollMs: args.logPollMs,
+      });
+    } catch (error) {
+      primaryError = error;
+    }
+  }
+
+  try {
+    lifecycle = await args.session.transitionToVacant(expectedState(lifecycle), {
+      endpoint: args.endpoint,
+      target: args.target,
+      companion: companionState(args.companion),
+    });
+  } catch (error) {
+    cleanupError ??= error;
+  }
+
+  if (cleanupError) throw cleanupError;
+  if (primaryError) throw primaryError;
+  if (!identity || !lifecycleGeneration || !reason || !exit || !logDirectory ||
+      !absenceProven || !endpointVacant) {
+    throw new WorkbenchRunnerError(
+      "Workbench target build completed without a fully identity-bound process proof.",
+      "IDENTITY_UNVERIFIABLE"
+    );
+  }
+  return {
+    version: 3,
+    intent: "build",
+    pid: identity.pid,
+    executablePath: identity.executablePath,
+    creationTime: identity.creationTime,
+    target: args.target.path,
+    targetAddon: {
+      addonId: args.buildProject.addonId,
+      addonGuid: args.buildProject.addonGuid,
+      sourceSha256: args.buildProject.sourceSha256,
+    },
+    lifecycleGeneration,
+    processOwnership: "verified",
+    endpointVacancy: "verified",
+    companionIdentity: args.preflight.companionIdentity,
+    preflight: args.preflight.proof,
+    logDirectory,
+    output,
+    validationFailure,
+    exitStatus: {
+      reason,
+      exitCode: exit.code,
+      signal: exit.signal,
+      timedOut: reason === "timed_out",
+    },
+  };
+}
+
 /**
  * Run a structured Workbench purpose while retaining the shared machine mutex
  * and exact child ownership for the complete process lifetime.
@@ -1027,6 +1787,9 @@ export async function runWorkbenchIntent(
     throw new WorkbenchRunnerError("Workbench runner intent is unsupported.", "INVALID_INTENT");
   }
   const project = canonicalizeGproj(intent.gprojPath);
+  const buildProject = intent.kind === "build"
+    ? resolveBuildProjectMetadata(project.displayPath)
+    : null;
   const executablePath = resolveWorkbenchExecutable(config);
   const configuredAddonDirectories = validateWorkbenchAddonDirectories(config.workbenchAddonDirs);
   const companionProvider = dependencies.companionProvider ?? new WorkbenchHelperStager({
@@ -1047,11 +1810,29 @@ export async function runWorkbenchIntent(
     );
   }
   const reattestCompanion = (): WorkbenchCompanionLaunch => {
-    if (!companionProvider.verifyStaged) return companion;
-    const attested = validateCompanionLaunch(
-      companionProvider.verifyStaged(companion, project.displayPath),
-      project.modDirectory
-    );
+    if (!companionProvider.verifyStaged || !companionProvider.verifySourceDigest) {
+      throw new WorkbenchRunnerError(
+        "Workbench companion provider cannot re-attest both staged and packaged source identity.",
+        "INVALID_CONFIG"
+      );
+    }
+    let attested: WorkbenchCompanionLaunch;
+    try {
+      const sourceDigest = companionProvider.verifySourceDigest(companion.bundleDigest);
+      if (sourceDigest !== companion.bundleDigest) {
+        throw new Error("packaged source digest does not match the staged bundle");
+      }
+      attested = validateCompanionLaunch(
+        companionProvider.verifyStaged(companion, project.displayPath),
+        project.modDirectory
+      );
+    } catch (error) {
+      throw new WorkbenchRunnerError(
+        `Workbench companion source/stage re-attestation failed: ` +
+          `${error instanceof Error ? error.message : String(error)}`,
+        "IDENTITY_UNVERIFIABLE"
+      );
+    }
     if (attested.bundleDigest !== companion.bundleDigest ||
         pathKey(attested.addonDirectory) !== pathKey(companion.addonDirectory) ||
         pathKey(attested.addonSearchRoot) !== pathKey(companion.addonSearchRoot) ||
@@ -1064,15 +1845,55 @@ export async function runWorkbenchIntent(
     companion = attested;
     return companion;
   };
+  const reattestBuildTarget = (): WorkbenchBuildProjectMetadata => {
+    if (!buildProject) {
+      throw new WorkbenchRunnerError(
+        "Workbench build target metadata was not prepared.",
+        "INVALID_TARGET"
+      );
+    }
+    let current: WorkbenchBuildProjectMetadata;
+    try {
+      const identity = revalidateProjectIdentity(project);
+      current = resolveBuildProjectMetadata(identity.displayPath);
+    } catch (error) {
+      if (error instanceof WorkbenchRunnerError) throw error;
+      throw new WorkbenchRunnerError(
+        `Workbench build target identity could not be revalidated: ` +
+          `${error instanceof Error ? error.message : String(error)}`,
+        "INVALID_TARGET"
+      );
+    }
+    if (current.addonId !== buildProject.addonId ||
+        current.addonGuid !== buildProject.addonGuid ||
+        current.sourceSha256 !== buildProject.sourceSha256) {
+      throw new WorkbenchRunnerError(
+        "Workbench build target path, add-on ID/GUID, or project content changed after validation.",
+        "INVALID_TARGET"
+      );
+    }
+    return current;
+  };
   reattestCompanion();
-  const addonDirectories = validateWorkbenchAddonDirectories([
+  const targetAddonSearchRoot = canonicalDirectory(
+    dirname(project.modDirectory),
+    "Workbench target add-on search root"
+  );
+  const targetAddonDirectories = validateWorkbenchAddonDirectories([
     ...configuredAddonDirectories,
+    targetAddonSearchRoot,
+  ]);
+  const preflightAddonDirectories = validateWorkbenchAddonDirectories([
+    ...targetAddonDirectories,
     companion.addonSearchRoot,
   ]);
+  const buildAddonDirectories = targetAddonDirectories;
   const endpoint = validateEndpoint(config);
+  const managedLogRoot = join(companion.workbenchProfilePath, "logs");
+  if (!dependencies.logRoot) mkdirSync(managedLogRoot, { recursive: true });
   const logRoot = dependencies.logRoot
     ? canonicalDirectory(dependencies.logRoot, "Workbench log root")
-    : resolveWorkbenchLogRoot(addonDirectories);
+    : canonicalDirectory(managedLogRoot, "Workbench log root");
   const outputPath = intent.kind === "build" ? validateBuildOutput(intent) : null;
   if (intent.kind === "editor" && intent.foreground !== true) {
     throw new WorkbenchRunnerError(
@@ -1110,6 +1931,63 @@ export async function runWorkbenchIntent(
       path: project.displayPath,
       comparisonKey: project.comparisonKey,
     };
+    if (intent.kind === "build") {
+      if (!buildProject || !outputPath) {
+        throw new WorkbenchRunnerError(
+          "Workbench build project metadata or output was not prepared.",
+          "INVALID_INTENT"
+        );
+      }
+      const deadlineMs = Date.now() + intent.timeoutMs;
+      const preflight = await runBuildCompanionPreflight({
+        session,
+        guard,
+        config,
+        executablePath,
+        target,
+        companion,
+        companionProvider,
+        reattestCompanion,
+        reattestTarget: reattestBuildTarget,
+        addonDirectories: preflightAddonDirectories,
+        endpoint,
+        logRoot,
+        spawnProcess,
+        endpointProbeTimeoutMs,
+        endpointPollMs,
+        companionProbe: dependencies.companionProbe ?? rawCompanionPing,
+        logAttributionTimeoutMs,
+        logPollMs,
+        terminationTimeoutMs,
+        deadlineMs,
+        signal: dependencies.signal,
+      });
+      return runTargetBuildStage({
+        session,
+        guard,
+        config,
+        intent,
+        executablePath,
+        target,
+        buildProject,
+        companion,
+        companionProvider,
+        reattestCompanion,
+        reattestTarget: reattestBuildTarget,
+        addonDirectories: buildAddonDirectories,
+        endpoint,
+        logRoot,
+        outputPath,
+        preflight,
+        spawnProcess,
+        logAttributionTimeoutMs,
+        logPollMs,
+        terminationTimeoutMs,
+        deadlineMs,
+        signal: dependencies.signal,
+      });
+    }
+    const editorIntent = intent;
     let lifecycle = await claimExternalRunLifecycle(session, endpoint, target, companion);
     let child: ChildProcess | null = null;
     let childExit: ChildObservation | null = null;
@@ -1125,6 +2003,7 @@ export async function runWorkbenchIntent(
     let primaryError: unknown = null;
     let cleanupError: unknown = null;
     let logDirectory: string | null = null;
+    let absenceProven = false;
 
     try {
       await session.assertNoWorkbenchProcesses();
@@ -1133,21 +2012,20 @@ export async function runWorkbenchIntent(
       beforeLogs = snapshotLogDirectories(logRoot);
       ownerToken = guard.createOwnerToken();
       const ownerArgument = guard.ownerArgument(ownerToken);
-      const args = buildArguments(
+      const args = editorArguments(
         config,
-        intent,
+        editorIntent,
         project.displayPath,
-        addonDirectories,
+        preflightAddonDirectories,
         companion,
-        ownerArgument,
-        outputPath
+        ownerArgument
       );
       launchedAtMs = Date.now();
       child = safeSpawn(spawnProcess, executablePath, args, {
         cwd: dirname(executablePath),
         detached: false,
         stdio: "ignore",
-        windowsHide: intent.kind === "build",
+        windowsHide: false,
       });
       childExit = observeChild(child);
       identity = await inspectSpawnedIdentity(
@@ -1190,13 +2068,9 @@ export async function runWorkbenchIntent(
       }));
       lifecycleGeneration = lifecycle.generation;
 
-      const elapsedMs = Date.now() - launchedAtMs;
-      const remainingBuildMs = intent.kind === "build"
-        ? Math.max(1, intent.timeoutMs - elapsedMs)
-        : null;
       const completion = await waitForExitOrControl({
         childExit,
-        timeoutMs: remainingBuildMs,
+        timeoutMs: null,
         signal: dependencies.signal,
       });
       const observedChildError = childExit.getError();
@@ -1234,6 +2108,15 @@ export async function runWorkbenchIntent(
       });
       exit ??= absence.exit;
       cleanupError ??= absence.error ?? null;
+      absenceProven = !absence.error;
+    }
+
+    if (absenceProven) {
+      try {
+        reattestCompanion();
+      } catch (error) {
+        primaryError ??= error;
+      }
     }
 
     if (!primaryError && !cleanupError && beforeLogs && ownerToken) {
@@ -1264,7 +2147,7 @@ export async function runWorkbenchIntent(
     if (cleanupError) throw cleanupError;
     if (primaryError) throw primaryError;
     if (!identity || !verifiedCompanion || !lifecycleGeneration ||
-        endpointOwnership !== "verified" || !reason || !exit || !logDirectory) {
+        endpointOwnership !== "verified" || !reason || !exit || !logDirectory || !absenceProven) {
       throw new WorkbenchRunnerError(
         "Workbench runner completed without a fully identity-bound receipt.",
         "IDENTITY_UNVERIFIABLE"
@@ -1272,7 +2155,7 @@ export async function runWorkbenchIntent(
     }
     return {
       version: 2,
-      intent: intent.kind,
+      intent: "editor",
       pid: identity.pid,
       target: project.displayPath,
       lifecycleGeneration,

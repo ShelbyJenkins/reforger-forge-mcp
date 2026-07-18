@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { execFileSync, spawn } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createServer } from "node:net";
 import { platform, tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -67,6 +68,67 @@ describe("bundled Windows Workbench lifecycle helper", () => {
     expect(helper).toContain("[Console]::Out.Flush()");
     expect(helper).not.toContain("Write-Host");
   });
+
+  it("exposes an explicit fail-closed endpoint-vacancy protocol mode", () => {
+    expect(helper).toContain("'VerifyEndpointVacant'");
+    expect(helper).toContain("function Invoke-VerifyEndpointVacant");
+    expect(helper).toContain("reason = 'listener_present'");
+    expect(helper).toContain("status = 'vacant'");
+  });
+
+  it.runIf(platform() === "win32")(
+    "distinguishes an owned loopback listener from a vacant endpoint",
+    async () => {
+      const server = createServer();
+      await new Promise<void>((resolvePromise, reject) => {
+        server.once("error", reject);
+        server.listen(0, "127.0.0.1", resolvePromise);
+      });
+      const address = server.address();
+      if (!address || typeof address === "string") throw new Error("TCP test listener has no port");
+      const request = `${JSON.stringify({
+        endpoint: { host: "127.0.0.1", port: address.port },
+      })}\n`;
+
+      try {
+        const occupiedText = execFileSync(
+          "powershell.exe",
+          [
+            "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+            "-File", helperPath, "-Mode", "VerifyEndpointVacant",
+          ],
+          { input: request, encoding: "utf8", windowsHide: true, timeout: 20_000 }
+        );
+        const occupied = JSON.parse(occupiedText.trim()) as {
+          ok: boolean;
+          status: string;
+          reason: string;
+          listenerPid: number;
+        };
+        expect(occupied).toMatchObject({
+          ok: false,
+          status: "refused",
+          reason: "listener_present",
+          listenerPid: process.pid,
+        });
+      } finally {
+        await new Promise<void>((resolvePromise, reject) => {
+          server.close((error) => error ? reject(error) : resolvePromise());
+        });
+      }
+
+      const vacantText = execFileSync(
+        "powershell.exe",
+        [
+          "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+          "-File", helperPath, "-Mode", "VerifyEndpointVacant",
+        ],
+        { input: request, encoding: "utf8", windowsHide: true, timeout: 20_000 }
+      );
+      expect(JSON.parse(vacantText.trim())).toMatchObject({ ok: true, status: "vacant" });
+    },
+    30_000
+  );
 
   it.runIf(platform() === "win32")(
     "inspects the caller through an exact Windows process handle",

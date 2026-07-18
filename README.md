@@ -389,10 +389,26 @@ reforger-forge-workbench editor --gproj <path> --foreground
 reforger-forge-workbench build --gproj <path> --platform PC --output <path> --timeout-ms <n>
 ```
 
-Editor mode is intentionally foreground-only. Both modes publish a durable
-version-3 busy lifecycle while active and prove the exact helper Ping identity.
-Build mode is bounded, attributes the exact Workbench log directory, and returns
-a version-2 receipt bound to the companion bundle digest.
+Editor mode is intentionally foreground-only and returns its version-2 receipt
+only after exact helper endpoint and Ping qualification. Build mode provides a
+guarded two-phase lifecycle under one machine lock and one absolute deadline.
+Its managed-companion preflight proves endpoint ownership and immutable Ping
+identity, then is exact-terminated and followed by an endpoint-vacancy proof
+before the distinct target-only child starts. The version-3 build receipt keeps
+the two PIDs, lifecycle generations, and attributed log directories separate;
+binds the target add-on ID/GUID, project-file SHA-256, and companion bundle; and
+requires fresh nonempty output containing exactly one hashed
+`resourceDatabase.rdb` before reporting success. Timeout and nonzero exits have
+`output: null`; an exit-zero output-proof failure carries `validationFailure`
+and makes the CLI fail while preserving both attributed log directories.
+
+Successful guarded data build is not currently supported on installed
+Workbench 1.7.0.54. Revalidation of the no-`-run`, explicit `AddonName`, and
+clean `-run` Resource Manager forms never entered `buildData` or produced
+output. The runner therefore fails closed at output attestation; neither a
+spawned child nor a zero exit is build evidence. Do not claim that `-run`
+reconciles dispatch. A successful guarded build remains unsupported until an
+engine-native dispatch path is independently verified.
 
 ### Workbench Editor Control (Live)
 

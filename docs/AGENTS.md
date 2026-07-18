@@ -151,8 +151,20 @@ reforger-forge-workbench build --gproj <path> --platform PC --output <path> --ti
 ```
 
 Editor ownership is foreground-only. Build execution is deadline-bounded and
-returns a JSON receipt with the exact target, lifecycle generation, endpoint
-ownership, attributed log directory, and exit status.
+uses a companion-qualification preflight followed by a distinct target-only
+child under the same machine lock. The version-3 JSON receipt keeps their exact
+PIDs, lifecycle generations, and attributed log directories separate, records
+preflight endpoint/Ping ownership, and requires fresh nonempty output containing
+one hashed `resourceDatabase.rdb` after a zero build exit. Supply a unique empty
+output directory for every run.
+
+Treat this as supported lifecycle and receipt hardening, not as a supported
+successful data-build path on installed Workbench 1.7.0.54. The no-`-run`,
+explicit `AddonName`, and clean `-run` Resource Manager forms were revalidated;
+none entered `buildData` or produced output. The runner correctly fails closed
+when output proof is absent. Do not claim that `-run` reconciles dispatch, and
+do not accept child launch or a zero exit as build evidence. Successful guarded
+build remains unsupported until an engine-native dispatch path is verified.
 
 ## Start-of-Task Checklist
 

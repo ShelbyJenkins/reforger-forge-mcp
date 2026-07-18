@@ -11,6 +11,7 @@ import {
   mkdirSync,
   mkdtempSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -88,7 +89,13 @@ function createHarness(): RunnerHarness {
   mkdirSync(companionAddonDirectory, { recursive: true });
   mkdirSync(companionProfile, { recursive: true });
   mkdirSync(logRoot, { recursive: true });
-  writeFileSync(projectPath, "project");
+  writeFileSync(projectPath, [
+    "GameProject {",
+    " ID ExampleMod",
+    ' GUID "1122334455667788"',
+    "}",
+    "",
+  ].join("\n"));
   writeFileSync(executablePath, "fake Workbench");
   const config: Config = {
     workbenchPath: toolsRoot,
@@ -122,6 +129,8 @@ function createHarness(): RunnerHarness {
   };
   const companionProvider: WorkbenchCompanionProvider = {
     ensureStaged: vi.fn(() => companion),
+    verifyStaged: vi.fn((candidate) => candidate),
+    verifySourceDigest: vi.fn((expected) => expected),
   };
   return {
     root,
@@ -173,6 +182,52 @@ function runnerDependencies(
   };
 }
 
+function createBuildSpawner(
+  harness: RunnerHarness,
+  options: {
+    logRoot?: string;
+    buildExitCode?: number;
+    onSpawn?: (index: number, args: readonly string[]) => void;
+    onBuildBeforeExit?: (args: readonly string[]) => void;
+    pidBase?: number;
+  } = {}
+): {
+  spawnProcess: NonNullable<WorkbenchRunnerDependencies["spawnProcess"]>;
+  spawnCount: () => number;
+} {
+  let count = 0;
+  const pidBase = options.pidBase ?? 22_000;
+  return {
+    spawnProcess: (command, args) => {
+      const index = count++;
+      options.onSpawn?.(index, args);
+      const child = new FakeRunnerChild(pidBase + index);
+      const ownerArgument = args.find((arg) => arg.startsWith("-reforgerForgeOwnerToken="));
+      if (!ownerArgument) throw new Error("owner argument missing");
+      harness.backend.addWorkbench({
+        pid: child.pid,
+        executablePath: command,
+        creationTime: `1339000000000${String(child.pid).padStart(5, "0")}`,
+      }, ownerArgument);
+      addAttributedLog(
+        options.logRoot ?? harness.logRoot,
+        index === 0 ? `preflight-${pidBase}` : `build-${pidBase}`,
+        ownerArgument
+      );
+      if (index === 1) {
+        setTimeout(() => {
+          options.onBuildBeforeExit?.(args);
+          harness.backend.processes.delete(child.pid);
+          harness.backend.workbenchPids.delete(child.pid);
+          child.close(options.buildExitCode ?? 0);
+        }, 5);
+      }
+      return child as unknown as ChildProcess;
+    },
+    spawnCount: () => count,
+  };
+}
+
 afterEach(() => {
   vi.restoreAllMocks();
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
@@ -219,12 +274,16 @@ describe("standalone Workbench lifecycle runner", () => {
     const addonArgument = observedArgs[observedArgs.indexOf("-addonsDir") + 1];
     expect(addonArgument.split(",")).toEqual([
       harness.addonRoot,
+      join(harness.root, "addons"),
       harness.companion.addonSearchRoot,
     ]);
-    expect(observedArgs.slice(observedArgs.indexOf("-addons"), observedArgs.indexOf("-addons") + 4))
+    expect(observedArgs.slice(observedArgs.indexOf("-addons"), observedArgs.indexOf("-addons") + 2))
       .toEqual([
         "-addons",
         WORKBENCH_HELPER_ADDON_GUID,
+      ]);
+    expect(observedArgs.slice(observedArgs.indexOf("-profile"), observedArgs.indexOf("-profile") + 2))
+      .toEqual([
         "-profile",
         harness.companion.workbenchProfilePath,
       ]);
@@ -317,16 +376,20 @@ describe("standalone Workbench lifecycle runner", () => {
 
   it("terminates only the exact build child when its bounded timeout expires", async () => {
     const harness = createHarness();
+    const observedArguments: Array<readonly string[]> = [];
+    let spawnIndex = 0;
     const dependencies = runnerDependencies(harness, (command, args, options) => {
       expect(options.windowsHide).toBe(true);
-      const child = new FakeRunnerChild(21_003);
+      observedArguments.push(args);
+      const current = spawnIndex++;
+      const child = new FakeRunnerChild(current === 0 ? 21_003 : 21_004);
       const ownerArgument = args.find((arg) => arg.startsWith("-reforgerForgeOwnerToken="))!;
       harness.backend.addWorkbench({
         pid: child.pid,
         executablePath: command,
-        creationTime: "133900000000021003",
+        creationTime: current === 0 ? "133900000000021003" : "133900000000021004",
       }, ownerArgument);
-      addAttributedLog(harness.logRoot, "timed-build", ownerArgument);
+      addAttributedLog(harness.logRoot, current === 0 ? "build-preflight" : "timed-build", ownerArgument);
       return child as unknown as ChildProcess;
     });
 
@@ -335,7 +398,7 @@ describe("standalone Workbench lifecycle runner", () => {
       gprojPath: harness.projectPath,
       platform: "PC",
       outputPath: harness.outputPath,
-      timeoutMs: 10,
+      timeoutMs: 1_000,
     }, dependencies);
 
     expect(receipt.exitStatus).toMatchObject({
@@ -344,40 +407,637 @@ describe("standalone Workbench lifecycle runner", () => {
       signal: null,
       timedOut: true,
     });
-    expect(harness.backend.terminationCalls).toHaveLength(1);
-    expect(harness.backend.terminationCalls[0]).toMatchObject({
-      pid: 21_003,
+    expect(receipt).toMatchObject({
+      version: 3,
+      intent: "build",
+      pid: 21_004,
+      processOwnership: "verified",
+      output: null,
+      validationFailure: null,
+      endpointVacancy: "verified",
+      preflight: {
+        pid: 21_003,
+        executablePath: harness.executablePath,
+        creationTime: "133900000000021003",
+        endpointOwnership: "verified",
+        endpointVacancy: "verified",
+      },
+    });
+    expect(JSON.stringify(receipt)).not.toContain("reforgerForgeOwnerToken");
+    expect(harness.backend.terminationCalls).toHaveLength(2);
+    expect(harness.backend.terminationCalls[1]).toMatchObject({
+      pid: 21_004,
       executablePath: harness.executablePath,
-      creationTime: "133900000000021003",
+      creationTime: "133900000000021004",
+    });
+    expect(harness.backend.endpointVacancyCalls).toHaveLength(2);
+
+    const [preflightArgs, buildArgs] = observedArguments;
+    const preflightOwner = preflightArgs.findIndex((arg) => arg.startsWith("-reforgerForgeOwnerToken="));
+    expect(preflightOwner).toBeGreaterThan(-1);
+    expect(preflightOwner).toBeLessThan(preflightArgs.indexOf("-wbModule=ResourceManager"));
+    expect(preflightArgs).toContain("-run");
+    expect(preflightArgs).toContain(WORKBENCH_HELPER_ADDON_GUID);
+    expect(preflightArgs[preflightArgs.indexOf("-addonsDir") + 1].split(",")).toEqual([
+      harness.addonRoot,
+      join(harness.root, "addons"),
+      harness.companion.addonSearchRoot,
+    ]);
+
+    const buildOwner = buildArgs.findIndex((arg) => arg.startsWith("-reforgerForgeOwnerToken="));
+    expect(buildOwner).toBeGreaterThan(-1);
+    expect(buildOwner).toBeLessThan(buildArgs.indexOf("-wbModule=ResourceManager"));
+    expect(buildArgs).not.toContain("-addons");
+    expect(buildArgs.filter((arg) => arg === "-run")).toHaveLength(1);
+    expect(buildArgs).not.toContain("-wbSilent");
+    expect(buildArgs).not.toContain("-loadBuiltData");
+    const buildModuleIndex = buildArgs.indexOf("-wbModule=ResourceManager");
+    expect(buildArgs.slice(buildModuleIndex, buildModuleIndex + 3)).toEqual([
+      "-wbModule=ResourceManager",
+      "-run",
+      "-buildData",
+    ]);
+    expect(buildArgs[buildArgs.indexOf("-addonsDir") + 1].split(",")).toEqual([
+      harness.addonRoot,
+      join(harness.root, "addons"),
+    ]);
+    expect(buildArgs.slice(buildArgs.indexOf("-buildData"), buildArgs.indexOf("-buildData") + 4))
+      .toEqual(["-buildData", "PC", harness.outputPath, "ExampleMod"]);
+  });
+
+  it("uses the last safely tested installed-1.7 argument form without claiming output", async () => {
+    const harness = createHarness();
+    let targetArguments: readonly string[] = [];
+    const spawner = createBuildSpawner(harness, {
+      pidBase: 21_020,
+      buildExitCode: 1,
+      onSpawn: (index, args) => {
+        if (index === 1) targetArguments = args;
+      },
+    });
+
+    await runWorkbenchIntent(harness.config, {
+      kind: "build",
+      gprojPath: harness.projectPath,
+      platform: "PC",
+      outputPath: harness.outputPath,
+      timeoutMs: 1_000,
+    }, runnerDependencies(harness, spawner.spawnProcess));
+
+    const buildDataIndex = targetArguments.indexOf("-buildData");
+    expect(buildDataIndex).toBeGreaterThan(-1);
+    expect(targetArguments.slice(buildDataIndex - 2, buildDataIndex + 4)).toEqual([
+      "-wbModule=ResourceManager",
+      "-run",
+      "-buildData",
+      "PC",
+      harness.outputPath,
+      "ExampleMod",
+    ]);
+    expect(targetArguments.slice(buildDataIndex, buildDataIndex + 4)).toEqual([
+      "-buildData",
+      "PC",
+      harness.outputPath,
+      "ExampleMod",
+    ]);
+    expect(targetArguments[buildDataIndex + 3]).not.toBe(WORKBENCH_HELPER_ADDON_ID);
+    expect(targetArguments[buildDataIndex + 3]).not.toBe(WORKBENCH_HELPER_ADDON_GUID);
+  });
+
+  it("runs companion preflight and a distinct exact target build with fresh output proof", async () => {
+    const harness = createHarness();
+    const reattestationAbsence: boolean[] = [];
+    harness.companionProvider.verifyStaged = vi.fn(() => {
+      reattestationAbsence.push(harness.backend.workbenchPids.size === 0);
+      return harness.companion;
+    });
+    let spawnIndex = 0;
+    const receipt = await runWorkbenchIntent(harness.config, {
+      kind: "build",
+      gprojPath: harness.projectPath,
+      platform: "PC",
+      outputPath: harness.outputPath,
+      timeoutMs: 1_000,
+    }, runnerDependencies(harness, (command, args) => {
+      const current = spawnIndex++;
+      if (current === 1) expect(harness.backend.workbenchPids.size).toBe(0);
+      const child = new FakeRunnerChild(current === 0 ? 21_030 : 21_031);
+      const ownerArgument = args.find((arg) => arg.startsWith("-reforgerForgeOwnerToken="))!;
+      harness.backend.addWorkbench({
+        pid: child.pid,
+        executablePath: command,
+        creationTime: current === 0 ? "133900000000021030" : "133900000000021031",
+      }, ownerArgument);
+      addAttributedLog(
+        harness.logRoot,
+        current === 0 ? "successful-preflight" : "successful-build",
+        ownerArgument
+      );
+      if (current === 1) {
+        setTimeout(() => {
+          const artifactRoot = join(harness.outputPath, "ExampleMod");
+          mkdirSync(artifactRoot, { recursive: true });
+          writeFileSync(join(artifactRoot, "resourceDatabase.rdb"), "fresh database");
+          writeFileSync(join(artifactRoot, "data.bin"), "fresh data");
+          harness.backend.processes.delete(child.pid);
+          harness.backend.workbenchPids.delete(child.pid);
+          child.close(0);
+        }, 5);
+      }
+      return child as unknown as ChildProcess;
+    }));
+
+    expect(spawnIndex).toBe(2);
+    expect(receipt).toMatchObject({
+      version: 3,
+      intent: "build",
+      pid: 21_031,
+      executablePath: harness.executablePath,
+      creationTime: "133900000000021031",
+      target: harness.projectPath,
+      targetAddon: {
+        addonId: "ExampleMod",
+        addonGuid: "1122334455667788",
+        sourceSha256: expect.stringMatching(/^[a-f0-9]{64}$/),
+      },
+      processOwnership: "verified",
+      endpointVacancy: "verified",
+      preflight: {
+        pid: 21_030,
+        executablePath: harness.executablePath,
+        creationTime: "133900000000021030",
+        endpointOwnership: "verified",
+        endpointVacancy: "verified",
+        logDirectory: join(harness.logRoot, "successful-preflight"),
+      },
+      logDirectory: join(harness.logRoot, "successful-build"),
+      output: {
+        root: harness.outputPath,
+        freshArtifactCount: 2,
+        resourceDatabasePath: join(harness.outputPath, "ExampleMod", "resourceDatabase.rdb"),
+        previousResourceDatabaseSha256: null,
+        resourceDatabaseSha256: expect.stringMatching(/^[a-f0-9]{64}$/),
+      },
+      validationFailure: null,
+      exitStatus: { reason: "exited", exitCode: 0, timedOut: false },
+    });
+    expect(receipt.output?.freshBytes).toBeGreaterThan(0);
+    expect(harness.backend.endpointVacancyCalls).toHaveLength(2);
+    expect(reattestationAbsence.at(-1)).toBe(true);
+    expect(JSON.stringify(receipt)).not.toContain("reforgerForgeOwnerToken");
+    expect(await harness.guard.readLifecycleState()).toMatchObject({
+      kind: "valid",
+      state: { phase: "vacant", workbench: null, operation: null },
+    });
+  });
+
+  it("refuses an occupied companion endpoint after preflight absence and never spawns the build", async () => {
+    const harness = createHarness();
+    harness.backend.endpointVacancyResult = {
+      kind: "refused",
+      listenerPid: 42_424,
+      message: "another listener remains",
+    };
+    const spawner = createBuildSpawner(harness, { pidBase: 22_100 });
+
+    await expect(runWorkbenchIntent(harness.config, {
+      kind: "build",
+      gprojPath: harness.projectPath,
+      platform: "PC",
+      outputPath: harness.outputPath,
+      timeoutMs: 1_000,
+    }, runnerDependencies(harness, spawner.spawnProcess))).rejects.toMatchObject({
+      code: "ENDPOINT_UNVERIFIABLE",
+    });
+
+    expect(spawner.spawnCount()).toBe(1);
+    expect(harness.backend.terminationCalls).toHaveLength(1);
+    expect(harness.backend.endpointVacancyCalls).toHaveLength(1);
+  });
+
+  it("refuses an endpoint that becomes occupied after exact target-build absence", async () => {
+    const harness = createHarness();
+    const originalVacancy = harness.backend.verifyEndpointVacant.bind(harness.backend);
+    let vacancyIndex = 0;
+    harness.backend.verifyEndpointVacant = vi.fn(async (endpoint) => {
+      if (vacancyIndex++ === 0) return originalVacancy(endpoint);
+      harness.backend.endpointVacancyCalls.push(endpoint);
+      return {
+        kind: "refused" as const,
+        listenerPid: 42_425,
+        message: "listener appeared after target exit",
+      };
+    });
+    const spawner = createBuildSpawner(harness, {
+      pidBase: 22_105,
+      onBuildBeforeExit: () => {
+        const artifactRoot = join(harness.outputPath, "ExampleMod");
+        mkdirSync(artifactRoot, { recursive: true });
+        writeFileSync(join(artifactRoot, "resourceDatabase.rdb"), "complete database");
+      },
+    });
+
+    await expect(runWorkbenchIntent(harness.config, {
+      kind: "build",
+      gprojPath: harness.projectPath,
+      platform: "PC",
+      outputPath: harness.outputPath,
+      timeoutMs: 1_000,
+    }, runnerDependencies(harness, spawner.spawnProcess))).rejects.toMatchObject({
+      code: "ENDPOINT_UNVERIFIABLE",
+    });
+
+    expect(spawner.spawnCount()).toBe(2);
+    expect(harness.backend.endpointVacancyCalls).toHaveLength(2);
+    expect(harness.backend.workbenchPids.size).toBe(0);
+  });
+
+  it("revalidates target content between phases and refuses a mutated gproj before build spawn", async () => {
+    const harness = createHarness();
+    const spawner = createBuildSpawner(harness, { pidBase: 22_110 });
+    harness.backend.replaceFailure = ({ next }) => {
+      if (next.phase === "vacant" && spawner.spawnCount() === 1) {
+        writeFileSync(harness.projectPath, [
+          "GameProject {",
+          " ID MutatedMod",
+          ' GUID "8877665544332211"',
+          "}",
+          "",
+        ].join("\n"));
+      }
+      return null;
+    };
+
+    await expect(runWorkbenchIntent(harness.config, {
+      kind: "build",
+      gprojPath: harness.projectPath,
+      platform: "PC",
+      outputPath: harness.outputPath,
+      timeoutMs: 1_000,
+    }, runnerDependencies(harness, spawner.spawnProcess))).rejects.toMatchObject({
+      code: "INVALID_TARGET",
+    });
+
+    expect(spawner.spawnCount()).toBe(1);
+  });
+
+  it("revalidates packaged companion source between phases and refuses digest mutation", async () => {
+    const harness = createHarness();
+    const spawner = createBuildSpawner(harness, { pidBase: 22_120 });
+    let currentSourceDigest = harness.companion.bundleDigest;
+    harness.companionProvider.verifySourceDigest = vi.fn(() => currentSourceDigest);
+    harness.backend.replaceFailure = ({ next }) => {
+      if (next.phase === "vacant" && spawner.spawnCount() === 1) {
+        currentSourceDigest = "b".repeat(64);
+      }
+      return null;
+    };
+
+    await expect(runWorkbenchIntent(harness.config, {
+      kind: "build",
+      gprojPath: harness.projectPath,
+      platform: "PC",
+      outputPath: harness.outputPath,
+      timeoutMs: 1_000,
+    }, runnerDependencies(harness, spawner.spawnProcess))).rejects.toMatchObject({
+      code: "IDENTITY_UNVERIFIABLE",
+    });
+
+    expect(spawner.spawnCount()).toBe(1);
+  });
+
+  it("uses one absolute build deadline and never spawns the target after preflight consumes it", async () => {
+    const harness = createHarness();
+    const originalVacancy = harness.backend.verifyEndpointVacant.bind(harness.backend);
+    harness.backend.verifyEndpointVacant = vi.fn(async (endpoint) => {
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 150));
+      return originalVacancy(endpoint);
+    });
+    const spawner = createBuildSpawner(harness, { pidBase: 22_200 });
+
+    await expect(runWorkbenchIntent(harness.config, {
+      kind: "build",
+      gprojPath: harness.projectPath,
+      platform: "PC",
+      outputPath: harness.outputPath,
+      timeoutMs: 100,
+    }, runnerDependencies(harness, spawner.spawnProcess))).rejects.toMatchObject({
+      code: "BUILD_DEADLINE_EXCEEDED",
+    });
+
+    expect(spawner.spawnCount()).toBe(1);
+  });
+
+  it("does not spawn preflight when the build is already aborted", async () => {
+    const harness = createHarness();
+    const controller = new AbortController();
+    controller.abort();
+    const spawnProcess = vi.fn();
+
+    await expect(runWorkbenchIntent(harness.config, {
+      kind: "build",
+      gprojPath: harness.projectPath,
+      platform: "PC",
+      outputPath: harness.outputPath,
+      timeoutMs: 1_000,
+    }, runnerDependencies(harness, spawnProcess, {
+      signal: controller.signal,
+    }))).rejects.toMatchObject({ code: "BUILD_ABORTED" });
+
+    expect(spawnProcess).not.toHaveBeenCalled();
+  });
+
+  it("returns output null without an attestation failure for a nonzero target exit", async () => {
+    const harness = createHarness();
+    const spawner = createBuildSpawner(harness, {
+      pidBase: 22_300,
+      buildExitCode: 7,
+    });
+
+    const receipt = await runWorkbenchIntent(harness.config, {
+      kind: "build",
+      gprojPath: harness.projectPath,
+      platform: "PC",
+      outputPath: harness.outputPath,
+      timeoutMs: 1_000,
+    }, runnerDependencies(harness, spawner.spawnProcess));
+
+    expect(receipt).toMatchObject({
+      version: 3,
+      output: null,
+      validationFailure: null,
+      exitStatus: { reason: "exited", exitCode: 7, timedOut: false },
+    });
+  });
+
+  it("refuses a nonempty output root before spawning either Workbench phase", async () => {
+    const harness = createHarness();
+    const artifactRoot = join(harness.outputPath, "ExampleMod");
+    mkdirSync(artifactRoot, { recursive: true });
+    writeFileSync(join(artifactRoot, "resourceDatabase.rdb"), "stale database");
+    const spawnProcess = vi.fn();
+
+    await expect(runWorkbenchIntent(harness.config, {
+      kind: "build",
+      gprojPath: harness.projectPath,
+      platform: "PC",
+      outputPath: harness.outputPath,
+      timeoutMs: 1_000,
+    }, runnerDependencies(harness, spawnProcess))).rejects.toMatchObject({
+      code: "OUTPUT_ATTESTATION_FAILED",
+    });
+    expect(spawnProcess).not.toHaveBeenCalled();
+  });
+
+  it("returns a diagnostic receipt when exit zero produces no resource database", async () => {
+    const harness = createHarness();
+    const spawner = createBuildSpawner(harness, { pidBase: 22_400 });
+
+    const receipt = await runWorkbenchIntent(harness.config, {
+      kind: "build",
+      gprojPath: harness.projectPath,
+      platform: "PC",
+      outputPath: harness.outputPath,
+      timeoutMs: 1_000,
+    }, runnerDependencies(harness, spawner.spawnProcess));
+
+    expect(receipt).toMatchObject({
+      version: 3,
+      logDirectory: join(harness.logRoot, "build-22400"),
+      output: null,
+      validationFailure: {
+        code: "OUTPUT_ATTESTATION_FAILED",
+        message: expect.stringMatching(/exactly one regular resourceDatabase\.rdb/i),
+      },
+      exitStatus: { reason: "exited", exitCode: 0 },
+    });
+  });
+
+  it("rejects a fresh zero-byte resource database as unattested output", async () => {
+    const harness = createHarness();
+    const spawner = createBuildSpawner(harness, {
+      pidBase: 22_500,
+      onBuildBeforeExit: () => {
+        const artifactRoot = join(harness.outputPath, "ExampleMod");
+        mkdirSync(artifactRoot, { recursive: true });
+        writeFileSync(join(artifactRoot, "resourceDatabase.rdb"), "");
+      },
+    });
+
+    const receipt = await runWorkbenchIntent(harness.config, {
+      kind: "build",
+      gprojPath: harness.projectPath,
+      platform: "PC",
+      outputPath: harness.outputPath,
+      timeoutMs: 1_000,
+    }, runnerDependencies(harness, spawner.spawnProcess));
+
+    expect(receipt.output).toBeNull();
+    expect(receipt.intent === "build" && receipt.validationFailure).toMatchObject({
+      code: "OUTPUT_ATTESTATION_FAILED",
+    });
+  });
+
+  it("rejects exit-zero output containing more than one resource database", async () => {
+    const harness = createHarness();
+    const spawner = createBuildSpawner(harness, {
+      pidBase: 22_550,
+      onBuildBeforeExit: () => {
+        for (const name of ["A", "B"]) {
+          const artifactRoot = join(harness.outputPath, name);
+          mkdirSync(artifactRoot, { recursive: true });
+          writeFileSync(join(artifactRoot, "resourceDatabase.rdb"), `database ${name}`);
+        }
+      },
+    });
+
+    const receipt = await runWorkbenchIntent(harness.config, {
+      kind: "build",
+      gprojPath: harness.projectPath,
+      platform: "PC",
+      outputPath: harness.outputPath,
+      timeoutMs: 1_000,
+    }, runnerDependencies(harness, spawner.spawnProcess));
+
+    expect(receipt.output).toBeNull();
+    expect(receipt.intent === "build" && receipt.validationFailure?.message)
+      .toMatch(/exactly one regular resourceDatabase\.rdb; found 2/i);
+  });
+
+  it("rejects a post-build output symlink and redacts its private token from the receipt", async () => {
+    const harness = createHarness();
+    const externalRoot = join(harness.root, "external-output");
+    mkdirSync(externalRoot, { recursive: true });
+    let privateOwnerArgument = "";
+    const spawner = createBuildSpawner(harness, {
+      pidBase: 22_600,
+      onBuildBeforeExit: (args) => {
+        privateOwnerArgument = args.find((arg) =>
+          arg.startsWith("-reforgerForgeOwnerToken="))!;
+        symlinkSync(
+          externalRoot,
+          join(harness.outputPath, `${privateOwnerArgument}-escape`),
+          process.platform === "win32" ? "junction" : "dir"
+        );
+      },
+    });
+
+    const receipt = await runWorkbenchIntent(harness.config, {
+      kind: "build",
+      gprojPath: harness.projectPath,
+      platform: "PC",
+      outputPath: harness.outputPath,
+      timeoutMs: 1_000,
+    }, runnerDependencies(harness, spawner.spawnProcess));
+
+    expect(receipt.output).toBeNull();
+    expect(receipt.intent === "build" && receipt.validationFailure).toMatchObject({
+      code: "OUTPUT_ATTESTATION_FAILED",
+    });
+    expect(privateOwnerArgument).not.toBe("");
+    expect(JSON.stringify(receipt)).not.toContain(privateOwnerArgument);
+    expect(JSON.stringify(receipt)).toContain("[redacted]");
+  });
+
+  it("attributes both build phases under the managed companion profile log root by default", async () => {
+    const harness = createHarness();
+    const managedLogRoot = join(harness.companion.workbenchProfilePath, "logs");
+    const spawner = createBuildSpawner(harness, {
+      pidBase: 22_700,
+      logRoot: managedLogRoot,
+      onBuildBeforeExit: () => {
+        const artifactRoot = join(harness.outputPath, "ExampleMod");
+        mkdirSync(artifactRoot, { recursive: true });
+        writeFileSync(join(artifactRoot, "resourceDatabase.rdb"), "managed build");
+      },
+    });
+
+    const receipt = await runWorkbenchIntent(harness.config, {
+      kind: "build",
+      gprojPath: harness.projectPath,
+      platform: "PC",
+      outputPath: harness.outputPath,
+      timeoutMs: 1_000,
+    }, runnerDependencies(harness, spawner.spawnProcess, { logRoot: undefined }));
+
+    expect(receipt).toMatchObject({
+      version: 3,
+      preflight: { logDirectory: join(managedLogRoot, "preflight-22700") },
+      logDirectory: join(managedLogRoot, "build-22700"),
+      validationFailure: null,
+    });
+    expect(receipt.intent === "build" && receipt.output).not.toBeNull();
+  });
+
+  it("accepts consecutive deterministic builds only when each uses a distinct empty output root", async () => {
+    const harness = createHarness();
+    const receipts = [];
+    for (let index = 0; index < 2; index += 1) {
+      const outputPath = join(harness.root, "build", `run-${index}`, "PC");
+      const spawner = createBuildSpawner(harness, {
+        pidBase: 22_800 + index * 10,
+        onBuildBeforeExit: () => {
+          const artifactRoot = join(outputPath, "ExampleMod");
+          mkdirSync(artifactRoot, { recursive: true });
+          writeFileSync(join(artifactRoot, "resourceDatabase.rdb"), "deterministic database");
+        },
+      });
+      receipts.push(await runWorkbenchIntent(harness.config, {
+        kind: "build",
+        gprojPath: harness.projectPath,
+        platform: "PC",
+        outputPath,
+        timeoutMs: 1_000,
+      }, runnerDependencies(harness, spawner.spawnProcess)));
+    }
+
+    expect(receipts.map((receipt) => receipt.intent === "build"
+      ? receipt.output?.resourceDatabaseSha256
+      : null)).toEqual([
+      expect.stringMatching(/^[a-f0-9]{64}$/),
+      expect.stringMatching(/^[a-f0-9]{64}$/),
+    ]);
+    expect(receipts[0].intent === "build" && receipts[1].intent === "build" &&
+      receipts[0].output?.resourceDatabaseSha256)
+      .toBe(receipts[1].intent === "build" ? receipts[1].output?.resourceDatabaseSha256 : null);
+  });
+
+  it("distinguishes sequential children by creation time even when Windows reuses the PID", async () => {
+    const harness = createHarness();
+    let spawnIndex = 0;
+    const reusedPid = 22_900;
+    const receipt = await runWorkbenchIntent(harness.config, {
+      kind: "build",
+      gprojPath: harness.projectPath,
+      platform: "PC",
+      outputPath: harness.outputPath,
+      timeoutMs: 1_000,
+    }, runnerDependencies(harness, (command, args) => {
+      const current = spawnIndex++;
+      const child = new FakeRunnerChild(reusedPid);
+      const ownerArgument = args.find((arg) => arg.startsWith("-reforgerForgeOwnerToken="))!;
+      harness.backend.addWorkbench({
+        pid: reusedPid,
+        executablePath: command,
+        creationTime: current === 0 ? "133900000000022900" : "133900000000022901",
+      }, ownerArgument);
+      addAttributedLog(harness.logRoot, current === 0 ? "reused-preflight" : "reused-build", ownerArgument);
+      if (current === 1) {
+        setTimeout(() => {
+          const artifactRoot = join(harness.outputPath, "ExampleMod");
+          mkdirSync(artifactRoot, { recursive: true });
+          writeFileSync(join(artifactRoot, "resourceDatabase.rdb"), "reused pid database");
+          harness.backend.processes.delete(reusedPid);
+          harness.backend.workbenchPids.delete(reusedPid);
+          child.close(0);
+        }, 5);
+      }
+      return child as unknown as ChildProcess;
+    }));
+
+    expect(receipt).toMatchObject({
+      pid: reusedPid,
+      creationTime: "133900000000022901",
+      preflight: { pid: reusedPid, creationTime: "133900000000022900" },
     });
   });
 
   it("keeps the mutex and guardian alive when exact timeout termination is refused", async () => {
     const harness = createHarness();
-    harness.backend.terminationResult = {
-      kind: "refused",
-      reason: "creation_time_mismatch",
-      message: "identity changed",
-    };
-    let child!: FakeRunnerChild;
+    let targetChild!: FakeRunnerChild;
+    let spawnIndex = 0;
     const run = runWorkbenchIntent(harness.config, {
       kind: "build",
       gprojPath: harness.projectPath,
       platform: "PC",
       outputPath: harness.outputPath,
-      timeoutMs: 5,
+      timeoutMs: 100,
     }, runnerDependencies(harness, (command, args) => {
-      child = new FakeRunnerChild(21_005);
+      const current = spawnIndex++;
+      const child = new FakeRunnerChild(current === 0 ? 21_005 : 21_015);
       const ownerArgument = args.find((arg) => arg.startsWith("-reforgerForgeOwnerToken="))!;
       harness.backend.addWorkbench({
         pid: child.pid,
         executablePath: command,
-        creationTime: "133900000000021005",
+        creationTime: current === 0 ? "133900000000021005" : "133900000000021015",
       }, ownerArgument);
+      addAttributedLog(
+        harness.logRoot,
+        current === 0 ? "refusal-preflight" : "refusal-build",
+        ownerArgument
+      );
+      if (current === 1) {
+        targetChild = child;
+        harness.backend.terminationResult = {
+          kind: "refused",
+          reason: "creation_time_mismatch",
+          message: "identity changed",
+        };
+      }
       return child as unknown as ChildProcess;
     }));
     const rejection = expect(run).rejects.toMatchObject({ code: "TERMINATION_REFUSED" });
-    while (harness.backend.terminationCalls.length === 0) {
+    while (harness.backend.terminationCalls.length < 2) {
       await new Promise((resolvePromise) => setTimeout(resolvePromise, 1));
     }
 
@@ -388,9 +1048,9 @@ describe("standalone Workbench lifecycle runner", () => {
     await new Promise((resolvePromise) => setTimeout(resolvePromise, 10));
     expect(contenderEntered).toBe(false);
 
-    harness.backend.processes.delete(child.pid);
-    harness.backend.workbenchPids.delete(child.pid);
-    child.close(0);
+    harness.backend.processes.delete(targetChild.pid);
+    harness.backend.workbenchPids.delete(targetChild.pid);
+    targetChild.close(0);
     await rejection;
     await contender;
     expect(contenderEntered).toBe(true);

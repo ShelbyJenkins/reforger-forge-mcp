@@ -402,8 +402,13 @@ export function registerMod(
             type: "text",
             text:
               "Direct MCP Workbench builds are disabled because a server crash cannot supervise their process lifetime safely. " +
-              "Use a project-owned bounded build wrapper that enforces a machine-wide launch lock, -noThrow, -wbSilent, " +
-              "an explicit platform and target folder, exact-child cleanup, and log validation.",
+              "The packaged reforger-forge-workbench runner supports a guarded two-phase lifecycle and version-3 receipt: " +
+              "it holds one machine lock, qualifies and exact-cleans a disposable managed-companion preflight, proves endpoint vacancy, " +
+              "then supervises and exact-cleans a distinct target-only child while requiring hashed fresh output proof. " +
+              "Successful guarded data build is not supported on installed Workbench 1.7.0.54: revalidated forms without -run, with explicit AddonName, " +
+              "and clean -run Resource Manager forms never entered buildData or produced output. The runner fails closed when proof is absent. " +
+              "A project-owned bounded build wrapper may invoke the guarded runner, but must not treat child launch, zero exit, or -run as build evidence; " +
+              "successful support remains pending a verified engine-native dispatch path.",
           }],
           isError: true,
         };
