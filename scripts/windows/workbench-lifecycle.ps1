@@ -527,6 +527,17 @@ function Write-LifecycleProcessRefusal
 	})
 }
 
+function Resolve-LifecycleProcessException
+{
+	param([Parameter(Mandatory = $true)][Management.Automation.ErrorRecord]$ErrorRecord)
+	$exception = $ErrorRecord.Exception.GetBaseException()
+	if ($exception -isnot [LifecycleProcessException])
+	{
+		throw 'The lifecycle process exception wrapper did not contain the expected native failure.'
+	}
+	return $exception
+}
+
 function Invoke-HoldMutex
 {
 	$request = Read-LifecycleRequest
@@ -606,7 +617,8 @@ function Invoke-InspectCurrent
 	}
 	catch [LifecycleProcessException]
 	{
-		Write-LifecycleProcessRefusal -Exception $_.Exception
+		$processException = Resolve-LifecycleProcessException -ErrorRecord $_
+		Write-LifecycleProcessRefusal -Exception $processException
 	}
 	finally
 	{
@@ -640,13 +652,14 @@ function Invoke-InspectProcess
 	}
 	catch [LifecycleProcessException]
 	{
-		if ($_.Exception.Reason -eq 'pid_not_found')
+		$processException = Resolve-LifecycleProcessException -ErrorRecord $_
+		if ($processException.Reason -eq 'pid_not_found')
 		{
 			Write-LifecycleProtocol ([ordered]@{ ok = $true; status = 'absent' })
 		}
 		else
 		{
-			Write-LifecycleProcessRefusal -Exception $_.Exception
+			Write-LifecycleProcessRefusal -Exception $processException
 		}
 	}
 	finally
@@ -671,12 +684,13 @@ function Invoke-ListWorkbench
 		}
 		catch [LifecycleProcessException]
 		{
-			if ($_.Exception.Reason -ne 'pid_not_found')
+			$processException = Resolve-LifecycleProcessException -ErrorRecord $_
+			if ($processException.Reason -ne 'pid_not_found')
 			{
 				[void]$unverifiable.Add([ordered]@{
 					pid = $process.Id
-					reason = $_.Exception.Reason
-					message = $_.Exception.Message
+					reason = $processException.Reason
+					message = $processException.Message
 				})
 			}
 		}
@@ -766,7 +780,8 @@ function Invoke-VerifyEndpointOwner
 			}
 			catch [LifecycleProcessException]
 			{
-				if ($_.Exception.Reason -ne 'pid_not_found') { throw }
+				$processException = Resolve-LifecycleProcessException -ErrorRecord $_
+				if ($processException.Reason -ne 'pid_not_found') { throw }
 			}
 			finally
 			{
@@ -816,7 +831,8 @@ function Invoke-VerifyEndpointOwner
 	}
 	catch [LifecycleProcessException]
 	{
-		if ($_.Exception.Reason -eq 'pid_not_found')
+		$processException = Resolve-LifecycleProcessException -ErrorRecord $_
+		if ($processException.Reason -eq 'pid_not_found')
 		{
 			Write-LifecycleProtocol ([ordered]@{
 				ok = $false
@@ -827,7 +843,7 @@ function Invoke-VerifyEndpointOwner
 		}
 		else
 		{
-			Write-LifecycleProcessRefusal -Exception $_.Exception
+			Write-LifecycleProcessRefusal -Exception $processException
 		}
 	}
 	finally
@@ -884,13 +900,14 @@ function Invoke-VerifyTerminate
 	}
 	catch [LifecycleProcessException]
 	{
-		if ($_.Exception.Reason -eq 'pid_not_found')
+		$processException = Resolve-LifecycleProcessException -ErrorRecord $_
+		if ($processException.Reason -eq 'pid_not_found')
 		{
 			Write-LifecycleProtocol ([ordered]@{ ok = $true; status = 'already_exited' })
 		}
 		else
 		{
-			Write-LifecycleProcessRefusal -Exception $_.Exception
+			Write-LifecycleProcessRefusal -Exception $processException
 		}
 	}
 	finally

@@ -39,6 +39,12 @@ describe("bundled Windows Workbench lifecycle helper", () => {
     expect(helper).not.toContain("Stop-Process -Name");
   });
 
+  it("unwraps native lifecycle failures before reading their refusal reason", () => {
+    expect(helper).toContain("$ErrorRecord.Exception.GetBaseException()");
+    expect(helper).toContain("$processException.Reason");
+    expect(helper).not.toContain("$_.Exception.Reason");
+  });
+
   it("generation-checks, flushes, and atomically replaces lifecycle state", () => {
     expect(helper).toContain("expectedGeneration");
     expect(helper).toContain("Lifecycle state generation mismatch");
