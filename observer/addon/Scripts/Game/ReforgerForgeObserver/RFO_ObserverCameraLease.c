@@ -20,6 +20,7 @@ class RFO_ObserverCameraLease
 	protected bool m_RFO_Restoring;
 	protected bool m_RFO_RestorationConfirmed;
 	protected bool m_RFO_RestoreTargetSelected;
+	protected bool m_RFO_RestorationPostFrameConfirmed;
 
 	bool Acquire(string jobId, BaseWorld world, int worldEpoch, vector requestedMatrix[4], float fovDegrees)
 	{
@@ -126,8 +127,18 @@ class RFO_ObserverCameraLease
 		if (jobId != m_RFO_JobId)
 			return false;
 		m_RFO_Restoring = true;
-		if (m_RFO_ObserverCamera)
-			m_RFO_ObserverCamera.Disarm();
+		// Keep the observer entity armed while restoration is pending. Its
+		// POSTFRAME callback is the only point at which a CameraBase publication
+		// can be verified after normal gameplay camera updates. Destruction is
+		// deliberately deferred to this following Update call.
+		if (m_RFO_RestorationPostFrameConfirmed)
+		{
+			if (!RestorationCleanupBindingStillCurrent(world, currentWorldEpoch))
+				return false;
+			DestroyObserverCamera(m_RFO_ObserverCamera);
+			Clear(true);
+			return true;
+		}
 		if (m_RFO_UsesDetachedPlayerCamera)
 			return RestoreDetachedPlayerCamera(world, currentWorldEpoch);
 
@@ -143,7 +154,7 @@ class RFO_ObserverCameraLease
 			return false;
 		}
 		if (m_RFO_RestoreTargetSelected && current == m_RFO_OriginalCamera)
-			return FinishOriginalRestoration();
+			return false;
 		if (current != m_RFO_ObserverCamera)
 		{
 			// Another camera owner won. Never switch away from it during cleanup.
@@ -159,7 +170,37 @@ class RFO_ObserverCameraLease
 		if (m_RFO_CameraManager.CurrentCamera() != m_RFO_OriginalCamera)
 			return false;
 		m_RFO_RestoreTargetSelected = true;
-		return FinishOriginalRestoration();
+		return false;
+	}
+
+	// Restoration is staged from the service Update, but CameraBase publishes
+	// its native render slot in POSTFRAME. Reapply and prove the original state
+	// here, then disarm the witness without deleting it from its own callback.
+	// The next Update observes the proof, destroys the observer, and clears the
+	// lease transaction.
+	bool CommitRestorationPostFrame(RFO_ObserverCamera camera, BaseWorld world, int currentWorldEpoch, float timeSlice)
+	{
+		if (!m_RFO_Acquired || !m_RFO_Restoring || !m_RFO_RestoreTargetSelected || m_RFO_RestorationPostFrameConfirmed)
+			return false;
+		if (camera != m_RFO_ObserverCamera || !camera || !camera.IsArmed() || camera.IsDeleted())
+			return false;
+		if (world != m_RFO_World || currentWorldEpoch != m_RFO_WorldEpoch || !m_RFO_OriginalCamera || m_RFO_OriginalCamera.IsDeleted())
+			return false;
+		if (m_RFO_UsesDetachedPlayerCamera)
+		{
+			if (world.GetCurrentCameraId() != m_RFO_WorldCameraId)
+				return false;
+		}
+		else if (!m_RFO_CameraManager || m_RFO_CameraManager.CurrentCamera() != m_RFO_OriginalCamera)
+			return false;
+
+		ApplyOriginalState(m_RFO_OriginalCamera);
+		m_RFO_OriginalCamera.ApplyTransform(timeSlice);
+		if (!OriginalCameraMatches() || !PublishedCameraMatches(m_RFO_OriginalCamera, m_RFO_OriginalMatrix, m_RFO_OriginalFov))
+			return false;
+		m_RFO_RestorationPostFrameConfirmed = true;
+		m_RFO_ObserverCamera.Disarm();
+		return true;
 	}
 
 	bool IsHeld()
@@ -245,6 +286,7 @@ class RFO_ObserverCameraLease
 		m_RFO_Restoring = false;
 		m_RFO_RestorationConfirmed = false;
 		m_RFO_RestoreTargetSelected = false;
+		m_RFO_RestorationPostFrameConfirmed = false;
 		m_RFO_UsesDetachedPlayerCamera = false;
 	}
 
@@ -287,7 +329,14 @@ class RFO_ObserverCameraLease
 		if (world != m_RFO_World || currentWorldEpoch != m_RFO_WorldEpoch)
 			return RetireOldWorldObserver();
 		if (m_RFO_RestoreTargetSelected)
-			return FinishDetachedRestoration();
+		{
+			if (!m_RFO_World || m_RFO_World.GetCurrentCameraId() != m_RFO_WorldCameraId)
+			{
+				DestroyObserverCamera(m_RFO_ObserverCamera);
+				Clear(false);
+			}
+			return false;
+		}
 		if (!m_RFO_OriginalCamera || m_RFO_OriginalCamera.IsDeleted())
 			return false;
 		if (!WorldCameraMatches(m_RFO_ActualMatrix, m_RFO_ActualFovDegrees))
@@ -297,35 +346,8 @@ class RFO_ObserverCameraLease
 			return false;
 		}
 		ApplyOriginalState(m_RFO_OriginalCamera);
-		m_RFO_OriginalCamera.ApplyTransform(0.0);
 		m_RFO_RestoreTargetSelected = true;
-		return FinishDetachedRestoration();
-	}
-
-	protected bool FinishDetachedRestoration()
-	{
-		if (!m_RFO_OriginalCamera || m_RFO_OriginalCamera.IsDeleted())
-			return false;
-		ApplyOriginalState(m_RFO_OriginalCamera);
-		m_RFO_OriginalCamera.ApplyTransform(0.0);
-		if (!OriginalCameraMatches() || !PublishedCameraMatches(m_RFO_OriginalCamera, m_RFO_OriginalMatrix, m_RFO_OriginalFov))
-			return false;
-		DestroyObserverCamera(m_RFO_ObserverCamera);
-		Clear(true);
-		return true;
-	}
-
-	protected bool FinishOriginalRestoration()
-	{
-		if (!m_RFO_CameraManager || !m_RFO_OriginalCamera || m_RFO_OriginalCamera.IsDeleted() || m_RFO_CameraManager.CurrentCamera() != m_RFO_OriginalCamera)
-			return false;
-		ApplyOriginalState(m_RFO_OriginalCamera);
-		m_RFO_OriginalCamera.ApplyTransform(0.0);
-		if (!OriginalCameraMatches() || !PublishedCameraMatches(m_RFO_OriginalCamera, m_RFO_OriginalMatrix, m_RFO_OriginalFov))
-			return false;
-		DestroyObserverCamera(m_RFO_ObserverCamera);
-		Clear(true);
-		return true;
+		return false;
 	}
 
 	protected bool OriginalCameraMatches()
@@ -336,6 +358,24 @@ class RFO_ObserverCameraLease
 			&& Math.AbsFloat(m_RFO_OriginalCamera.GetVerticalFOV() - m_RFO_OriginalFov) <= 0.0001
 			&& Math.AbsFloat(m_RFO_OriginalCamera.GetNearPlane() - m_RFO_OriginalNearPlane) <= 0.0001
 			&& Math.AbsFloat(m_RFO_OriginalCamera.GetFarPlane() - m_RFO_OriginalFarPlane) <= 0.0001;
+	}
+
+	protected bool RestorationCleanupBindingStillCurrent(BaseWorld world, int currentWorldEpoch)
+	{
+		if (world != m_RFO_World || currentWorldEpoch != m_RFO_WorldEpoch || !m_RFO_OriginalCamera || m_RFO_OriginalCamera.IsDeleted())
+			return false;
+		if (m_RFO_OriginalCamera.GetCameraIndex() != m_RFO_WorldCameraId || world.GetCurrentCameraId() != m_RFO_WorldCameraId)
+			return false;
+		// A reselected observer must never be deleted from stale POSTFRAME proof.
+		if (m_RFO_CameraManager && m_RFO_CameraManager.CurrentCamera() == m_RFO_ObserverCamera)
+			return false;
+		if (!m_RFO_UsesDetachedPlayerCamera)
+			return m_RFO_CameraManager && m_RFO_CameraManager.CurrentCamera() == m_RFO_OriginalCamera;
+		// A detached player camera normally has no manager owner. If a manager
+		// acquired one before cleanup, accept only the exact stored original.
+		if (m_RFO_CameraManager && m_RFO_CameraManager.CurrentCamera() && m_RFO_CameraManager.CurrentCamera() != m_RFO_OriginalCamera)
+			return false;
+		return true;
 	}
 
 	protected bool RetireOldWorldObserver()
@@ -436,6 +476,7 @@ class RFO_ObserverCameraLease
 		m_RFO_OriginalCamera = null;
 		m_RFO_ObserverCamera = null;
 		m_RFO_RestoreTargetSelected = false;
+		m_RFO_RestorationPostFrameConfirmed = false;
 		m_RFO_UsesDetachedPlayerCamera = false;
 		m_RFO_WorldCameraId = 0;
 		m_RFO_LastPostFrameCommit = 0;

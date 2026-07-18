@@ -136,6 +136,11 @@ class RFO_ObserverService
 	{
 		if (!m_RFO_Active || !m_RFO_ActiveJob || !m_RFO_CameraLease || !m_RFO_World)
 			return;
+		if (m_RFO_CameraLease.IsRestoring())
+		{
+			m_RFO_CameraLease.CommitRestorationPostFrame(camera, world, m_RFO_World.GetEpoch(), timeSlice);
+			return;
+		}
 		if (!m_RFO_CameraLease.CommitPostFrame(camera, world, m_RFO_World.GetEpoch(), timeSlice))
 			return;
 		if (!m_RFO_PostFrameCaptureArmed || !m_RFO_ActiveJob.IsCameraView() || m_RFO_ActiveJob.state != RFO_ObserverJobState.CAPTURING || m_RFO_ActiveJob.screenshotIssued)

@@ -79,6 +79,14 @@ until the host has validated the regular PNG file, dimensions, stable size,
 digest, and session/job binding. Status and doctor remain non-mutating while the
 private child is idle.
 
+Explicit runtime views restore in two phases. The normal update stages the
+original camera owner and state; the still-live observer entity then reapplies
+and verifies that state from POSTFRAME, after gameplay camera updates. The
+callback only records proof and disarms itself. Observer-entity destruction and
+lease release occur on the following update, never from inside the entity's own
+callback. Ownership or world drift remains fail-closed and cannot be promoted
+to restoration success.
+
 ## Using screenshots effectively
 
 Configure one or more existing evidence destinations before finalizing:

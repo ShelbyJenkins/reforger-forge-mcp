@@ -150,6 +150,7 @@ describe("observer package and source contracts", () => {
     expect(cameraLease).toContain("CurrentCamera() != m_RFO_OriginalCamera");
     expect(cameraLease).toContain("game.SpawnEntity(RFO_ObserverCamera, world, spawnParams)");
     expect(cameraLease).toContain("CommitPostFrame");
+    expect(cameraLease).toContain("CommitRestorationPostFrame");
     expect(cameraLease).toContain("CameraRegistered(manager, original)");
     expect(cameraLease).toContain("m_RFO_UsesDetachedPlayerCamera = detachedPlayerCamera");
     expect(cameraLease).toContain("MaintainRequestedView");
