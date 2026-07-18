@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { dirname, resolve } from "node:path";
+import { delimiter, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const mockState = vi.hoisted(() => ({
@@ -42,6 +42,8 @@ const configEnvKeys = [
   "REFORGER_FORGE_OBSERVER_ROOT",
   "REFORGER_FORGE_OBSERVER_PROFILE_ROOT",
   "REFORGER_FORGE_OBSERVER_AGENT_PATH",
+  "REFORGER_FORGE_OBSERVER_EVIDENCE_ROOTS",
+  "REFORGER_FORGE_OBSERVER_SUPPORTING_LOG_ROOTS",
   "REFORGER_FORGE_OBSERVER_STARTUP_TIMEOUT_MS",
   "REFORGER_FORGE_OBSERVER_REQUEST_TIMEOUT_MS",
   "REFORGER_FORGE_OBSERVER_CAPTURE_TIMEOUT_MS",
@@ -157,6 +159,8 @@ describe("loadConfig", () => {
     });
     vi.stubEnv("REFORGER_FORGE_OBSERVER_ROOT", resolve("D:\\Observer", "managed"));
     vi.stubEnv("REFORGER_FORGE_OBSERVER_MAX_INLINE_IMAGE_BYTES", "2000000");
+    vi.stubEnv("REFORGER_FORGE_OBSERVER_EVIDENCE_ROOTS", ["D:\\Evidence", "E:\\Reviewed"].join(delimiter));
+    vi.stubEnv("REFORGER_FORGE_OBSERVER_SUPPORTING_LOG_ROOTS", ["D:\\Logs"].join(delimiter));
     vi.stubEnv("REFORGER_FORGE_OBSERVER_SESSION_TTL_MS", "not-a-number");
 
     const observer = loadConfig().observer!;
@@ -165,6 +169,8 @@ describe("loadConfig", () => {
     expect(observer.maxInlineImageBytes).toBe(2_000_000);
     expect(observer.defaultCaptureTimeoutMs).toBe(45_000);
     expect(observer.sessionTtlMs).toBe(90_000);
+    expect(observer.evidenceRoots).toEqual(["D:\\Evidence", "E:\\Reviewed"]);
+    expect(observer.supportingLogRoots).toEqual(["D:\\Logs"]);
     expect(observer.retentionMaxAgeMs).toBeGreaterThan(0);
   });
 });

@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { execFileSync, spawn } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { platform, tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -8,7 +8,7 @@ import {
   LifecycleGuardError,
   WindowsLifecycleBackend,
   type WorkbenchIdentity,
-  type WorkbenchLifecycleStateV2,
+  type WorkbenchLifecycleStateV3,
 } from "../../src/workbench/process-guard.js";
 
 const roots: string[] = [];
@@ -48,17 +48,26 @@ const expectedWorkbench: WorkbenchIdentity = {
   launchedAtMs: 1,
 };
 
-const vacantState: WorkbenchLifecycleStateV2 = {
-  version: 2,
+const vacantState: WorkbenchLifecycleStateV3 = {
+  version: 3,
   generation: "next-generation",
   phase: "vacant",
   endpoint: { host: "127.0.0.1", port: 5775 },
   target: null,
   mcpOwner: null,
   workbench: null,
-  handler: null,
+  companion: null,
   operation: null,
 };
+
+describe("Windows lifecycle helper schema contract", () => {
+  it("compares version-3 replacement records against a version-3 current record", () => {
+    const source = readFileSync(lifecycleHelperPath, "utf8");
+
+    expect(source).toMatch(/\$currentVersion\s+-ne\s+3/);
+    expect(source).not.toMatch(/\$currentVersion\s+-ne\s+2/);
+  });
+});
 
 describe.runIf(platform() === "win32")("Windows lifecycle helper parent deadlines", () => {
   it("rejects a mutex helper that exits silently before its acquisition response", async () => {

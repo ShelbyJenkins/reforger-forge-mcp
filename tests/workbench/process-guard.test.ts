@@ -15,6 +15,7 @@ import {
   type WorkbenchIdentity,
 } from "../../src/workbench/process-guard.js";
 import { FakeLifecycleBackend } from "./fake-lifecycle-backend.js";
+import { companionLifecycleState, createFakeCompanionLaunch } from "./fake-companion.js";
 
 const roots: string[] = [];
 
@@ -32,7 +33,7 @@ function target(name = "A"): { path: string; comparisonKey: string } {
   return { path: `C:\\mods\\${name}\\${name}.gproj`, comparisonKey: `c:\\mods\\${name.toLowerCase()}\\${name.toLowerCase()}.gproj` };
 }
 
-describe("WorkbenchProcessGuard v2 lifecycle state", () => {
+describe("WorkbenchProcessGuard v3 lifecycle state", () => {
   it("creates a durable vacant record with an exact MCP lease", async () => {
     const stateDir = root();
     const backend = new FakeLifecycleBackend();
@@ -46,13 +47,13 @@ describe("WorkbenchProcessGuard v2 lifecycle state", () => {
     expect(result.kind).toBe("claimed");
     if (result.kind !== "claimed") return;
     expect(result.source).toBe("missing");
-    expect(result.state.version).toBe(2);
+    expect(result.state.version).toBe(3);
     expect(result.state.phase).toBe("vacant");
     expect(result.state.mcpOwner?.instanceId).toBe(guard.mcpInstanceId);
     expect(result.state.mcpOwner?.leaseId).toBe(guard.leaseId);
     expect(result.state.mcpOwner?.creationTime).toBe(backend.current.creationTime);
     expect(existsSync(guard.statePath)).toBe(true);
-    expect(JSON.parse(readFileSync(guard.statePath, "utf8")).version).toBe(2);
+    expect(JSON.parse(readFileSync(guard.statePath, "utf8")).version).toBe(3);
     expect("lockPath" in guard).toBe(false);
   });
 
@@ -139,7 +140,13 @@ describe("WorkbenchProcessGuard v2 lifecycle state", () => {
       if (claim.kind !== "claimed") throw new Error("claim failed");
       await session.transition(
         { generation: claim.state.generation, leaseId: claim.state.mcpOwner!.leaseId },
-        { ...claim.state, phase: "running", workbench: wb, operation: null }
+        {
+          ...claim.state,
+          phase: "running",
+          workbench: wb,
+          companion: companionLifecycleState(createFakeCompanionLaunch(stateDir)),
+          operation: null,
+        }
       );
     });
     backend.addWorkbench(wb, wb.ownerTokenArgument);
@@ -209,19 +216,19 @@ describe("WorkbenchProcessGuard v2 lifecycle state", () => {
     expect((await guard.readLifecycleState()).kind).toBe("valid");
   });
 
-  it("never adopts a live version-1 marker", async () => {
+  it("never adopts a live obsolete lifecycle marker", async () => {
     const stateDir = root();
     const backend = new FakeLifecycleBackend();
     const guard = new WorkbenchProcessGuard({ stateDir, backend });
-    writeFileSync(guard.statePath, JSON.stringify({ version: 1, pid: 900 }), "utf8");
+    writeFileSync(guard.statePath, JSON.stringify({ version: 2, pid: 900 }), "utf8");
     backend.addWorkbench({ pid: 900, executablePath: "C:\\Workbench.exe", creationTime: "900" });
 
     const result = await guard.withLifecycleLock((session) => session.validateAndClaim({
       endpoint: { host: "127.0.0.1", port: 5775 }, target: target(),
     }));
 
-    expect(result).toMatchObject({ kind: "refused", code: "LEGACY_OWNER" });
-    expect(JSON.parse(readFileSync(guard.statePath, "utf8")).version).toBe(1);
+    expect(result).toMatchObject({ kind: "refused", code: "STATE_INVALID" });
+    expect(JSON.parse(readFileSync(guard.statePath, "utf8")).version).toBe(2);
   });
 
   it("captures a spawned process only when path and exact owner argument match", async () => {

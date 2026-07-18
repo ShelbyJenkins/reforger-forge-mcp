@@ -8,6 +8,7 @@ import {
 } from "./coordinator.js";
 import { prepareObserverLaunch } from "./launch.js";
 import { runObserverSetup } from "./setup.js";
+import type { WorkbenchClient } from "../workbench/client.js";
 
 const finite = () => z.number().finite();
 
@@ -64,6 +65,8 @@ const capabilities = [
 export interface ObserverToolDefaults {
   sessionTtlMs?: number;
   defaultCaptureTimeoutMs?: number;
+  workbenchClient?: WorkbenchClient;
+  projectPath?: string;
 }
 
 function jsonText(heading: string, value: unknown): string {
@@ -124,14 +127,28 @@ export function registerObserverTools(
     "observer_setup",
     {
       description:
-        "Manage the private ReforgerForge observer platform. ensure verifies and immutably stages the packaged companion addon; status and doctor report facts; uninstall requests cancellation and refuses until terminal camera restoration, then revokes sessions and removes only unchanged managed files on retry. Never launches or signals Arma Reforger or Workbench.",
+        "Manage the private runtime observer and Workbench helper add-ons. ensure verifies and immutably stages both managed companions and applies external retention; status and doctor report both roots; uninstall requests runtime cancellation and refuses while Workbench or camera restoration is active, then removes only managed files. Never launches or signals Arma Reforger or Workbench.",
       inputSchema: {
         action: z.enum(["ensure", "status", "doctor", "uninstall"]).default("status"),
       },
     },
     async ({ action }) => {
       try {
-        return { content: [{ type: "text" as const, text: jsonText(`Observer ${action} completed.`, await runObserverSetup(coordinator, action)) }] };
+        return {
+          content: [{
+            type: "text" as const,
+            text: jsonText(
+              `Observer ${action} completed.`,
+              await runObserverSetup(
+                coordinator,
+                action,
+                defaults.workbenchClient
+                  ? { client: defaults.workbenchClient, projectPath: defaults.projectPath }
+                  : undefined
+              )
+            ),
+          }],
+        };
       } catch (error) {
         return toolError(error);
       }
@@ -190,8 +207,11 @@ export function registerObserverTools(
     "observer_capture",
     {
       description:
-        "Submit a current-view, explicit-pose, or look-at capture to one compatible observer renderer. sessionId is required for a runtime renderer and optional for an explicitly selected already-running Workbench renderer. Synchronous mode waits for a host-validated PNG and returns exactly one image plus concise metadata; asynchronous mode returns a job ID. Ambiguous renderers are refused, and timeouts request cancellation.",
+        "Capture reviewed evidence into an open managed observer run. runId and a unique normalized captureLabel are required. sessionId is required for a runtime renderer and optional for an explicitly selected already-running Workbench renderer. expectedWorldId/expectedWorldEpoch close the inventory-to-submit race. Synchronous mode returns one validated PNG; asynchronous mode returns a job ID that observer_job read can retrieve after completion.",
       inputSchema: {
+        runId: z.string().regex(/^\d{8}T\d{6}Z-[a-f0-9]{8}$/),
+        captureLabel: z.string().min(1).max(128),
+        purpose: z.string().min(1).max(512).optional(),
         sessionId: z.string().min(1).max(96).optional(),
         view: viewSchema,
         instanceId: z.string().min(1).max(96).optional(),
@@ -200,7 +220,13 @@ export function registerObserverTools(
         timeoutMs: z.number().int().min(1_000).max(5 * 60 * 1_000)
           .default(defaults.defaultCaptureTimeoutMs ?? coordinator.defaultCaptureTimeoutMs),
         settleFrames: z.number().int().min(0).max(30).default(0),
-        performancePolicy: z.enum(["evidence", "instrumented", "performance"]).default("evidence"),
+        expectedWorldId: z.string().min(1).max(512).describe(
+          "Exact world ID returned by the immediately preceding observer_instances inventory."
+        ),
+        expectedWorldEpoch: z.number().int().nonnegative().describe(
+          "Exact world epoch returned by the immediately preceding observer_instances inventory."
+        ),
+        performancePolicy: z.enum(["evidence", "instrumented"]).default("evidence"),
       },
     },
     async (input, extra) => {
@@ -239,21 +265,107 @@ export function registerObserverTools(
     "observer_job",
     {
       description:
-        "Inspect, cancel, or release an observer capture job. sessionId is required for runtime jobs and optional for Workbench jobs returned by this server process. release removes only its retained managed artifact reference and never takes control of an active camera.",
+        "Inspect, read, cancel, or release an observer capture job. read returns one completed validated PNG when it fits the inline limit; larger images stay managed and must be exported by observer_run finalize. sessionId is required for runtime jobs and optional for Workbench jobs. Artifacts retained by an open run cannot be released independently.",
       inputSchema: {
-        action: z.enum(["status", "cancel", "release"]),
+        action: z.enum(["status", "read", "cancel", "release"]),
         sessionId: z.string().min(1).max(96).optional(),
         jobId: z.string().min(1).max(96),
       },
     },
     async ({ action, sessionId, jobId }) => {
       try {
+        if (action === "read") {
+          const result = await coordinator.readJob(sessionId, jobId);
+          if (!isPng(result.image)) throw new ObserverCoordinatorError("ARTIFACT_INVALID", "Observer agent did not return a validated PNG");
+          return {
+            content: [
+              { type: "image" as const, data: result.image.toString("base64"), mimeType: "image/png" },
+              { type: "text" as const, text: jsonText("Observer completed artifact.", capturePresentation({ asynchronous: false, ...result })) },
+            ],
+          };
+        }
         const result = action === "status"
           ? await coordinator.jobStatus(sessionId, jobId)
           : action === "cancel"
             ? await coordinator.cancelJob(sessionId, jobId)
             : await coordinator.releaseJob(sessionId, jobId);
         return { content: [{ type: "text" as const, text: jsonText(`Observer job ${action} completed.`, result) }] };
+      } catch (error) {
+        return toolError(error);
+      }
+    }
+  );
+
+  server.registerTool(
+    "observer_run",
+    {
+      description:
+        "Manage a bounded observation run. begin creates external managed run storage; status reports capture labels and artifact availability; finalize writes a standardized reviewed bundle beneath an allowlisted configured evidence root without overwriting; discard releases retained artifacts and removes run work.",
+      inputSchema: {
+        action: z.enum(["begin", "status", "finalize", "discard"]),
+        runId: z.string().regex(/^\d{8}T\d{6}Z-[a-f0-9]{8}$/).optional(),
+        title: z.string().min(1).max(256).optional(),
+        caseIds: z.array(z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,95}$/)).max(64).optional(),
+        sourceRevision: z.string().min(1).max(256).optional(),
+        procedureRevision: z.string().min(1).max(256).optional(),
+        idempotencyKey: z.string().min(1).max(128).optional(),
+        evidenceRoot: z.string().min(1).max(32_768).optional(),
+        includeCaptureLabels: z.array(z.string().min(1).max(128)).min(1).max(64).optional(),
+        review: z.object({
+          imagesReviewed: z.boolean(),
+          reviewer: z.string().min(1).max(256).optional(),
+          outcome: z.enum(["Passed", "Failed", "Inconclusive", "Unreviewed"]),
+          summary: z.string().min(1).max(2_048),
+          limitations: z.array(z.string().min(1).max(512)).max(32).optional(),
+        }).optional(),
+        runtimeConfig: z.object({
+          configurationId: z.string().min(1).max(128),
+          values: z.record(z.string(), z.union([z.string(), z.number().finite(), z.boolean(), z.null()])),
+        }).optional(),
+        supportingFiles: z.array(z.object({
+          kind: z.literal("relevantLog"),
+          label: z.string().min(1).max(128),
+          path: z.string().min(1).max(32_768),
+        })).max(16).optional(),
+        releaseManagedArtifacts: z.boolean().default(true),
+      },
+    },
+    async (input) => {
+      try {
+        let result: Record<string, unknown>;
+        if (input.action === "begin") {
+          if (!input.title) throw new ObserverCoordinatorError("INVALID_REQUEST", "title is required for observer_run begin");
+          result = await coordinator.beginRun({
+            title: input.title,
+            ...(input.caseIds ? { caseIds: input.caseIds } : {}),
+            ...(input.sourceRevision ? { sourceRevision: input.sourceRevision } : {}),
+            ...(input.procedureRevision ? { procedureRevision: input.procedureRevision } : {}),
+            ...(input.idempotencyKey ? { idempotencyKey: input.idempotencyKey } : {}),
+          });
+        } else if (input.action === "status") {
+          if (!input.runId) throw new ObserverCoordinatorError("INVALID_REQUEST", "runId is required for observer_run status");
+          result = await coordinator.runStatus(input.runId);
+        } else if (input.action === "discard") {
+          if (!input.runId) throw new ObserverCoordinatorError("INVALID_REQUEST", "runId is required for observer_run discard");
+          result = await coordinator.discardRun(input.runId);
+        } else {
+          if (!input.runId || !input.evidenceRoot || !input.includeCaptureLabels || !input.review) {
+            throw new ObserverCoordinatorError(
+              "INVALID_REQUEST",
+              "runId, evidenceRoot, includeCaptureLabels, and review are required for observer_run finalize"
+            );
+          }
+          result = await coordinator.finalizeRun({
+            runId: input.runId,
+            evidenceRoot: input.evidenceRoot,
+            includeCaptureLabels: input.includeCaptureLabels,
+            review: input.review,
+            ...(input.runtimeConfig ? { runtimeConfig: input.runtimeConfig } : {}),
+            ...(input.supportingFiles ? { supportingFiles: input.supportingFiles } : {}),
+            releaseManagedArtifacts: input.releaseManagedArtifacts,
+          });
+        }
+        return { content: [{ type: "text" as const, text: jsonText(`Observer run ${input.action} completed.`, result) }] };
       } catch (error) {
         return toolError(error);
       }

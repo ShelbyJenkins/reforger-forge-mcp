@@ -22,6 +22,14 @@ function option(argumentsArray: string[], name: string): string | undefined {
   return index >= 0 ? argumentsArray[index + 1] : undefined;
 }
 
+function optionValues(argumentsArray: string[], name: string): string[] {
+  const values: string[] = [];
+  for (let index = 0; index < argumentsArray.length; index += 1) {
+    if (argumentsArray[index] === name && argumentsArray[index + 1] !== undefined) values.push(argumentsArray[index + 1]);
+  }
+  return values;
+}
+
 function boundedIntegerOption(argumentsArray: string[], name: string, minimum: number, maximum: number): number | undefined {
   const value = option(argumentsArray, name);
   if (value === undefined) return undefined;
@@ -144,6 +152,8 @@ export async function runPrivateObserverChild(argumentsArray: string[]): Promise
     root: option(argumentsArray, "--root"),
     profileRoot: option(argumentsArray, "--profile-root"),
     sourceDirectory: option(argumentsArray, "--source-addon"),
+    evidenceRoots: optionValues(argumentsArray, "--evidence-root"),
+    supportingLogRoots: optionValues(argumentsArray, "--supporting-log-root"),
     host: "127.0.0.1",
     port: 0,
     enableControlHttp: false,
@@ -179,6 +189,7 @@ export async function runPrivateObserverChild(argumentsArray: string[]): Promise
         protocolVersion: descriptor.protocolVersion,
         instances: agent.registry.diagnostics(),
         jobs: agent.jobs.diagnostics().map(({ artifactPath: _path, ...job }) => job),
+        managedStorage: agent.server.managedStorageDiagnostics(),
       };
     }
     if (name === "stage") return agent.control.ensureStaged();
@@ -205,14 +216,91 @@ export async function runPrivateObserverChild(argumentsArray: string[]): Promise
       if (artifact.image.length > (maxBytes as number)) {
         throw new ObserverError(
           "ARTIFACT_TOO_LARGE",
-          `Validated PNG is ${artifact.image.length} bytes; the MCP inline limit is ${maxBytes} bytes`,
+          `Validated PNG is ${artifact.image.length} bytes; finalize its managed run instead of reading it above the ${maxBytes}-byte inline limit`,
           413
         );
       }
       return { imageBase64: artifact.image.toString("base64"), metadata: artifact.metadata };
     }
+    if (name === "readWorkbenchArtifact") {
+      const jobId = requiredString(payload, "jobId");
+      const maxBytes = payload.maxBytes;
+      if (!Number.isSafeInteger(maxBytes) || (maxBytes as number) <= 0) {
+        throw new ObserverError("INVALID_REQUEST", "maxBytes must be a positive integer");
+      }
+      const ref = agent.artifacts.workbenchRef(jobId);
+      const artifact = agent.artifacts.readRef(ref);
+      if (artifact.image.length > (maxBytes as number)) {
+        throw new ObserverError(
+          "ARTIFACT_TOO_LARGE",
+          `Validated PNG is ${artifact.image.length} bytes; finalize its managed run instead of reading it inline`,
+          413
+        );
+      }
+      return { imageBase64: artifact.image.toString("base64"), metadata: artifact.metadata };
+    }
+    if (name === "inspectWorkbenchArtifact") {
+      const jobId = requiredString(payload, "jobId");
+      try {
+        const artifact = agent.artifacts.readRef(agent.artifacts.workbenchRef(jobId));
+        return { available: true, metadata: artifact.metadata };
+      } catch (error) {
+        if (error instanceof ObserverError && error.code === "ARTIFACT_INCOMPLETE") {
+          return { available: false };
+        }
+        throw error;
+      }
+    }
+    if (name === "importWorkbenchArtifact") {
+      const jobId = requiredString(payload, "jobId");
+      const image = payload.image;
+      if (!Buffer.isBuffer(image) || image.length < 1 || image.length > 64 * 1024 * 1024) {
+        throw new ObserverError("ARTIFACT_TOO_LARGE", "Workbench artifact payload is invalid or exceeds the managed import limit", 413);
+      }
+      const metadata = objectPayload(payload.metadata);
+      const ref = agent.artifacts.importArtifact({ backend: "workbench", jobId, image, metadata });
+      if (typeof payload.runId === "string" && typeof payload.captureLabel === "string") {
+        agent.runs.attachImportedArtifact(payload.runId, payload.captureLabel, ref);
+      }
+      return { imported: true, artifact: ref };
+    }
+    if (name === "runBegin") return agent.runs.begin(payload as never);
+    if (name === "runStatus") return agent.runs.status(requiredString(payload, "runId"));
+    if (name === "runReserveCapture") return agent.runs.reserveCapture(payload as never);
+    if (name === "runBindCapture") return agent.runs.bindCapture(payload as never);
+    if (name === "runFailCapture") {
+      return agent.runs.failCapture(
+        requiredString(payload, "runId"),
+        requiredString(payload, "captureLabel"),
+        requiredString(payload, "code"),
+        requiredString(payload, "message")
+      );
+    }
+    if (name === "runFinalize") return agent.runs.finalize(payload as never);
+    if (name === "runDiscard") return agent.runs.discard(requiredString(payload, "runId"));
+    if (name === "assertJobReleaseAllowed") {
+      const backend = payload.backend;
+      if (backend !== "runtime" && backend !== "workbench") throw new ObserverError("INVALID_REQUEST", "Observer backend is invalid");
+      agent.runs.assertJobReleaseAllowed(backend, requiredString(payload, "jobId"), typeof payload.sessionId === "string" ? payload.sessionId : undefined);
+      return { allowed: true };
+    }
+    if (name === "releaseWorkbenchArtifact") {
+      const jobId = requiredString(payload, "jobId");
+      agent.runs.assertJobReleaseAllowed("workbench", jobId);
+      try {
+        return agent.artifacts.releaseRef(agent.artifacts.workbenchRef(jobId));
+      } catch (error) {
+        if (error instanceof ObserverError && ["INVALID_REQUEST", "ARTIFACT_INCOMPLETE"].includes(error.code)) {
+          return { released: false };
+        }
+        throw error;
+      }
+    }
     if (name === "releaseJob") {
-      return agent.artifacts.release(requiredString(payload, "sessionId"), requiredString(payload, "jobId"));
+      const sessionId = requiredString(payload, "sessionId");
+      const jobId = requiredString(payload, "jobId");
+      agent.runs.assertJobReleaseAllowed("runtime", jobId, sessionId);
+      return agent.artifacts.release(sessionId, jobId);
     }
     if (name === "uninstall") return uninstallManagedObserver(agent);
     if (name === "shutdown") return { stopping: true };

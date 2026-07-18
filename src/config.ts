@@ -1,5 +1,5 @@
 import { readFileSync, existsSync } from "node:fs";
-import { resolve, dirname, join } from "node:path";
+import { resolve, dirname, join, delimiter } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
 import { logger } from "./utils/logger.js";
@@ -11,6 +11,10 @@ export interface ObserverConfig {
   profileRoot?: string;
   /** Optional override for the packaged private-child entry point. */
   agentPath?: string;
+  /** Existing directories allowed as curated observer evidence destinations. */
+  evidenceRoots?: string[];
+  /** Existing directories from which bounded text log attachments may be read. */
+  supportingLogRoots?: string[];
   startupTimeoutMs: number;
   requestTimeoutMs: number;
   defaultCaptureTimeoutMs: number;
@@ -180,7 +184,13 @@ export function loadConfig(): Config {
   if (process.env.REFORGER_FORGE_OBSERVER_AGENT_PATH) {
     config.observer.agentPath = process.env.REFORGER_FORGE_OBSERVER_AGENT_PATH;
   }
-  type ObserverNumericKey = Exclude<keyof ObserverConfig, "managedRoot" | "profileRoot" | "agentPath">;
+  if (process.env.REFORGER_FORGE_OBSERVER_EVIDENCE_ROOTS) {
+    config.observer.evidenceRoots = process.env.REFORGER_FORGE_OBSERVER_EVIDENCE_ROOTS.split(delimiter).filter(Boolean);
+  }
+  if (process.env.REFORGER_FORGE_OBSERVER_SUPPORTING_LOG_ROOTS) {
+    config.observer.supportingLogRoots = process.env.REFORGER_FORGE_OBSERVER_SUPPORTING_LOG_ROOTS.split(delimiter).filter(Boolean);
+  }
+  type ObserverNumericKey = Exclude<keyof ObserverConfig, "managedRoot" | "profileRoot" | "agentPath" | "evidenceRoots" | "supportingLogRoots">;
   const observerNumericEnvironment: Array<[ObserverNumericKey, string]> = [
     ["startupTimeoutMs", "REFORGER_FORGE_OBSERVER_STARTUP_TIMEOUT_MS"],
     ["requestTimeoutMs", "REFORGER_FORGE_OBSERVER_REQUEST_TIMEOUT_MS"],

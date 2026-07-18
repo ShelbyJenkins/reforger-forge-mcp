@@ -1,0 +1,124 @@
+{
+  "manifestVersion": 1,
+  "role": "workbench-helper",
+  "addonVersion": "0.1.0",
+  "protocolVersion": "2.0",
+  "addonId": "ReforgerForgeWorkbenchHelper",
+  "addonGuid": "4D74249D90703F46",
+  "buildIdentity": "1c23de814274c130d32b665a84e6be3ee1a69a5747759fdba54a684e998936b3",
+  "bundleDigest": "db44e43be9ec4249c23e55c0d1f19a1fb6cf72d6800c4540e938773d729d1eed",
+  "files": [
+    {
+      "path": "addon.gproj",
+      "sha256": "696ee7103421d6e0fc3cc83b9b09bed59b91fa46f8b58a333418e3c707934891"
+    },
+    {
+      "path": "Scripts/WorkbenchGame/EnfusionMCP/EMCP_WB_Clipboard.c",
+      "sha256": "b2251887f6f5be51054483b0ddadc4994171093083b03315d15b6b03c124372e"
+    },
+    {
+      "path": "Scripts/WorkbenchGame/EnfusionMCP/EMCP_WB_Components.c",
+      "sha256": "aa15e4361e690df5ce3fd9a42371a983d4d7d2914cc70987bc3d2284768073f1"
+    },
+    {
+      "path": "Scripts/WorkbenchGame/EnfusionMCP/EMCP_WB_CreateEntity.c",
+      "sha256": "bf4906f65d33ae7cc1ec8f5af0d5b77afa15c5bd7f9b378c2c24b2035a623ac3"
+    },
+    {
+      "path": "Scripts/WorkbenchGame/EnfusionMCP/EMCP_WB_DeleteEntity.c",
+      "sha256": "b8338015f53c277a74209db1ffb48a925b0590479616a95f2fe9e3bfa24aeacc"
+    },
+    {
+      "path": "Scripts/WorkbenchGame/EnfusionMCP/EMCP_WB_EditorControl.c",
+      "sha256": "f21a09e287de2bb9a347e429189ab32ab4657bef9df0f7e2e62f2cca75c1f307"
+    },
+    {
+      "path": "Scripts/WorkbenchGame/EnfusionMCP/EMCP_WB_ExecuteAction.c",
+      "sha256": "3010554c45c0941e0f06ce3d4cb49e7b8053bc0596e8adec531d6fb29c88af3e"
+    },
+    {
+      "path": "Scripts/WorkbenchGame/EnfusionMCP/EMCP_WB_GetCameraPos.c",
+      "sha256": "3aeb6c7fc8a51b6cc03e957a6b88f67f6cd7f4b420405e16a6f3c003cfcf5610"
+    },
+    {
+      "path": "Scripts/WorkbenchGame/EnfusionMCP/EMCP_WB_GetEntity.c",
+      "sha256": "2818ff5612919eba71fdb6f8c6410ff950c4174440bd702047944ca51f690059"
+    },
+    {
+      "path": "Scripts/WorkbenchGame/EnfusionMCP/EMCP_WB_GetState.c",
+      "sha256": "bbe52649433b3470212f98453596732ec05ab08c511ea62d88c8cad9330198fe"
+    },
+    {
+      "path": "Scripts/WorkbenchGame/EnfusionMCP/EMCP_WB_Layers.c",
+      "sha256": "e33b702c5d83842a6693d0fd7b66b6e757aa8dd8df545428d99026177a1855e5"
+    },
+    {
+      "path": "Scripts/WorkbenchGame/EnfusionMCP/EMCP_WB_ListEntities.c",
+      "sha256": "0d2767a83f4e3f344b72e57133d4f4202ddf0a9f99e07088f7450dbc2e0d5762"
+    },
+    {
+      "path": "Scripts/WorkbenchGame/EnfusionMCP/EMCP_WB_Localization.c",
+      "sha256": "bf0c6883f6eb058401917466bfd501ae411e42f2b09c2c41ac3ea19d25922cb8"
+    },
+    {
+      "path": "Scripts/WorkbenchGame/EnfusionMCP/EMCP_WB_ModifyEntity.c",
+      "sha256": "d86fa75c6368087b240a676b730ab00c7a94f7295f0ef61542eeb2024f4f1b3a"
+    },
+    {
+      "path": "Scripts/WorkbenchGame/EnfusionMCP/EMCP_WB_ObserverCancel.c",
+      "sha256": "2918b4ec6b7e2b226e369415e866269cd3fdec6d3ab74a598f49abcf4ad3e3a9"
+    },
+    {
+      "path": "Scripts/WorkbenchGame/EnfusionMCP/EMCP_WB_ObserverCommon.c",
+      "sha256": "bb1c68e80a601315ebafab49c28e898f996850711c52b0f6b0476968b2554d69"
+    },
+    {
+      "path": "Scripts/WorkbenchGame/EnfusionMCP/EMCP_WB_ObserverPing.c",
+      "sha256": "ec99e6f4bcbb322e49d504cc2cf7b0063ee227545bad0e49ca81f14746bf5b47"
+    },
+    {
+      "path": "Scripts/WorkbenchGame/EnfusionMCP/EMCP_WB_ObserverRelease.c",
+      "sha256": "29941d22cd8e48f1605f9d6b45bb837943f8a219e0adca472a9180ebebca943a"
+    },
+    {
+      "path": "Scripts/WorkbenchGame/EnfusionMCP/EMCP_WB_ObserverStatus.c",
+      "sha256": "e1bbb2ba6beafa98f45374a17db75bb6f0158ed6741930a240fd1a55b7cae560"
+    },
+    {
+      "path": "Scripts/WorkbenchGame/EnfusionMCP/EMCP_WB_ObserverSubmit.c",
+      "sha256": "99410ae4abfbb85c1139ae0d17c472885e494a6a6a83fa632047673e1e39c971"
+    },
+    {
+      "path": "Scripts/WorkbenchGame/EnfusionMCP/EMCP_WB_Ping.c",
+      "sha256": "cd6fc7cf94bdf166414eb2d1c61147fba6042476151d3c05202009a72305e5f1"
+    },
+    {
+      "path": "Scripts/WorkbenchGame/EnfusionMCP/EMCP_WB_Prefabs.c",
+      "sha256": "dc98f9f9ddc110725d3d9840fad2a580f203494ae8af83e74b0e00055b11a1dd"
+    },
+    {
+      "path": "Scripts/WorkbenchGame/EnfusionMCP/EMCP_WB_Reload.c",
+      "sha256": "f724efd92b6acec93a655ecdf529cd4cfd854a49c3e4de3ba85b4729d1bc3f5c"
+    },
+    {
+      "path": "Scripts/WorkbenchGame/EnfusionMCP/EMCP_WB_Resources.c",
+      "sha256": "b1cdc6a748362a4d5d3edcd421827470689c65b3c43187181724cbb35c2faf89"
+    },
+    {
+      "path": "Scripts/WorkbenchGame/EnfusionMCP/EMCP_WB_ScriptEditor.c",
+      "sha256": "85e2e32149be96ac0115dad82c27d752d23057d0f75e59f9393a4c1dac8b881a"
+    },
+    {
+      "path": "Scripts/WorkbenchGame/EnfusionMCP/EMCP_WB_SelectEntity.c",
+      "sha256": "064deff2a3176b37086139758225179107860e45d7fc8f0b5c2562bc637c63f4"
+    },
+    {
+      "path": "Scripts/WorkbenchGame/EnfusionMCP/EMCP_WB_Terrain.c",
+      "sha256": "b862eaa7a80e96d9e79fe781a08bf56297e0b71d56c1bd43c55fd236262860c4"
+    },
+    {
+      "path": "Scripts/WorkbenchGame/EnfusionMCP/RFWB_HelperBuild.c",
+      "sha256": "0cc07ca93475325cb3d35d86da4e9a0c5cd2f434d02b6d79454cdc206d78c065"
+    }
+  ]
+}

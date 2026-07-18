@@ -59,6 +59,8 @@ export interface SubmitJobInput {
   view: CaptureView;
   settleFrames?: number;
   performancePolicy?: "evidence" | "instrumented" | "performance";
+  expectedWorldId?: string | null;
+  expectedWorldEpoch?: number;
 }
 
 export interface CommandDeliveryRecord {
@@ -118,6 +120,14 @@ export class JobStore {
 
   submit(input: SubmitJobInput): JobRecord {
     const session = this.sessions.get(input.sessionId);
+    if (input.expectedWorldId !== undefined && input.expectedWorldId !== null &&
+        (typeof input.expectedWorldId !== "string" || input.expectedWorldId.length < 1 || input.expectedWorldId.length > 512)) {
+      throw new ObserverError("INVALID_REQUEST", "Expected world ID is invalid");
+    }
+    if (input.expectedWorldEpoch !== undefined &&
+        (!Number.isSafeInteger(input.expectedWorldEpoch) || input.expectedWorldEpoch < 0)) {
+      throw new ObserverError("INVALID_REQUEST", "Expected world epoch is invalid");
+    }
     const idempotencyKey = `${input.sessionId}\0${input.idempotencyKey}`;
     const originalId = this.idempotency.get(idempotencyKey);
     if (originalId) return this.require(input.sessionId, originalId);
@@ -145,6 +155,12 @@ export class JobStore {
       ? (["render.capture"] as const)
       : (["render.capture", "camera.runtime", "world.query"] as const);
     const instance = this.registry.select(input.sessionId, required, input.instanceId);
+    if (input.expectedWorldId !== undefined && instance.worldId !== input.expectedWorldId) {
+      throw new ObserverError("WORLD_CHANGED", "Selected runtime no longer matches the expected world ID", 409);
+    }
+    if (input.expectedWorldEpoch !== undefined && instance.worldEpoch !== input.expectedWorldEpoch) {
+      throw new ObserverError("WORLD_CHANGED", "Selected runtime no longer matches the expected world epoch", 409);
+    }
     if (instance.worldId === null && input.view.kind !== "current") {
       throw new ObserverError("WORLD_UNAVAILABLE", "Camera views require an active world", 409);
     }

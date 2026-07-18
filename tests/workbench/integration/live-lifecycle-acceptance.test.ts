@@ -1,6 +1,5 @@
 import { describe, expect, it } from "vitest";
 import {
-  appendFileSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -15,10 +14,7 @@ import { fileURLToPath } from "node:url";
 import type { Config } from "../../../src/config.js";
 import { generateGproj } from "../../../src/templates/gproj.js";
 import { WorkbenchClient } from "../../../src/workbench/client.js";
-import {
-  HANDLER_FOLDER,
-  HANDLER_MANIFEST_NAME,
-} from "../../../src/workbench/handler-bundle.js";
+import { WorkbenchHelperStager } from "../../../src/workbench/helper-addon.js";
 import { WorkbenchProcessGuard } from "../../../src/workbench/process-guard.js";
 import { canonicalizeGproj } from "../../../src/workbench/project-identity.js";
 
@@ -119,7 +115,7 @@ async function observeOwnedWorkbench(
 }
 
 describe.runIf(runLive)("live exact-owner Workbench lifecycle acceptance", () => {
-  it("launches, reuses, conflicts, restarts, shuts down, and cleans a disposable project", async () => {
+  it("launches, reuses, conflicts, restarts, and shuts down with an external companion", async () => {
     const localPaths = readRepoLocalPaths();
     const executablePath = join(
       localPaths.workbenchPath,
@@ -129,6 +125,7 @@ describe.runIf(runLive)("live exact-owner Workbench lifecycle acceptance", () =>
     expect(existsSync(executablePath), `missing live Workbench executable: ${executablePath}`).toBe(true);
 
     const root = mkdtempSync(join(tmpdir(), "reforger-forge-live-acceptance-"));
+    const managedRoot = mkdtempSync(join(tmpdir(), "reforger-forge-live-helper-"));
     const firstMod = join(root, "LifecycleA");
     const secondMod = join(root, "LifecycleB");
     mkdirSync(firstMod);
@@ -152,7 +149,6 @@ describe.runIf(runLive)("live exact-owner Workbench lifecycle acceptance", () =>
     );
     const guard = new WorkbenchProcessGuard({
       stateDir,
-      legacyStatePath: join(root, "legacy-owner.json"),
       helperPath,
       lockTimeoutMs: 20_000,
     });
@@ -174,7 +170,11 @@ describe.runIf(runLive)("live exact-owner Workbench lifecycle acceptance", () =>
       config,
       "live-lifecycle-acceptance",
       guard,
-      { launchTimeoutMs: 120_000, launchPollIntervalMs: 1_000 }
+      {
+        companionProvider: new WorkbenchHelperStager({ managedRoot }),
+        launchTimeoutMs: 120_000,
+        launchPollIntervalMs: 1_000,
+      }
     );
     try {
       expect(await guard.listWorkbenchProcesses()).toEqual([]);
@@ -201,14 +201,8 @@ describe.runIf(runLive)("live exact-owner Workbench lifecycle acceptance", () =>
       expect(state.state.workbench?.pid).toBe(launched.pid);
       expect(state.state.workbench?.ownerTokenArgument).toMatch(/^-reforgerForgeOwnerToken=/);
       expect(state.state.mcpOwner?.leaseId).toBeTruthy();
-      const handlerDirectory = join(
-        firstMod,
-        "Scripts",
-        "WorkbenchGame",
-        HANDLER_FOLDER
-      );
-      const manifestPath = join(handlerDirectory, HANDLER_MANIFEST_NAME);
-      expect(existsSync(manifestPath)).toBe(true);
+      expect(state.state.companion?.addonDirectory.startsWith(managedRoot)).toBe(true);
+      expect(existsSync(join(firstMod, "Scripts", "WorkbenchGame", "EnfusionMCP"))).toBe(false);
 
       const reused = await client.ensureRunning(firstProject);
       expect(reused).toMatchObject({ action: "reused", pid: launched.pid });
@@ -252,17 +246,6 @@ describe.runIf(runLive)("live exact-owner Workbench lifecycle acceptance", () =>
       expect(await guard.listWorkbenchProcesses()).toEqual([]);
       expect(await client.ping()).toBe(false);
 
-      const modifiedManaged = join(handlerDirectory, "EMCP_WB_Ping.c");
-      appendFileSync(modifiedManaged, "\n// live acceptance modified fixture\n", "utf8");
-      const unrelated = join(handlerDirectory, "UserOwned.txt");
-      writeFileSync(unrelated, "preserve live acceptance fixture\n", "utf8");
-      const cleanup = await client.cleanupHandlerScripts(firstMod);
-      expect(cleanup.kind).toBe("modified_files");
-      expect(cleanup.modified).toContain("EMCP_WB_Ping.c");
-      expect(cleanup.unrelated).toContain("UserOwned.txt");
-      expect(existsSync(modifiedManaged)).toBe(true);
-      expect(existsSync(unrelated)).toBe(true);
-      expect(existsSync(manifestPath)).toBe(true);
     } finally {
       try {
         await client.shutdownOwnedWorkbench();
@@ -272,6 +255,7 @@ describe.runIf(runLive)("live exact-owner Workbench lifecycle acceptance", () =>
       const remaining = await guard.listWorkbenchProcesses();
       if (remaining.length === 0) {
         rmSync(root, { recursive: true, force: true });
+        rmSync(managedRoot, { recursive: true, force: true });
       } else {
         throw new Error(
           `live lifecycle acceptance left Workbench running: ${remaining.map((item) => item.pid).join(", ")}`

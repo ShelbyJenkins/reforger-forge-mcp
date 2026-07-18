@@ -173,7 +173,15 @@ export interface WorkbenchObserverAdapterOptions {
   maxArtifactBytes?: number;
   maxPixels?: number;
   createJobId?: () => string;
-  createLeaseId?: () => string;
+  /** Must be stable for a job ID so a fresh MCP process can recover the
+   *  handler transaction from its durable job association. */
+  createLeaseId?: (jobId: string) => string;
+}
+
+export interface WorkbenchObserverRecoverInput {
+  jobId: string;
+  /** Durable lifecycle/target binding recorded when the run capture was submitted. */
+  expectedInstanceId?: string;
 }
 
 export interface WorkbenchObserverClient {
@@ -243,6 +251,13 @@ function samePath(left: string, right: string): boolean {
 function instanceId(snapshot: WorkbenchObserverSnapshot): string {
   const target = createHash("sha256").update(snapshot.target.comparisonKey).digest("hex").slice(0, 16);
   return `workbench-${snapshot.generation}-${target}`;
+}
+
+function recoverableHandlerLeaseId(jobId: string): string {
+  // jobId is already a random, bounded identifier. Deriving the handler lease
+  // from it makes the binding reproducible after an MCP restart while the
+  // lifecycle generation and canonical target remain independently enforced.
+  return `wb-observer-${jobId}`;
 }
 
 function vectorToString(value: readonly number[]): string {
@@ -333,7 +348,7 @@ export class WorkbenchObserverAdapter {
   private readonly maxArtifactBytes: number;
   private readonly maxPixels: number;
   private readonly createJobId: () => string;
-  private readonly createLeaseId: () => string;
+  private readonly createLeaseId: (jobId: string) => string;
   private readonly jobs = new Map<string, AdapterJobRecord>();
   private readonly completedImages = new Map<string, Buffer>();
 
@@ -345,7 +360,7 @@ export class WorkbenchObserverAdapter {
     this.maxArtifactBytes = positiveInteger(options.maxArtifactBytes, DEFAULT_MAX_ARTIFACT_BYTES, "Workbench observer artifact limit");
     this.maxPixels = positiveInteger(options.maxPixels, DEFAULT_MAX_PIXELS, "Workbench observer pixel limit");
     this.createJobId = options.createJobId ?? (() => randomUUID());
-    this.createLeaseId = options.createLeaseId ?? (() => `wb-observer-${randomUUID()}`);
+    this.createLeaseId = options.createLeaseId ?? recoverableHandlerLeaseId;
   }
 
   async instances(): Promise<WorkbenchObserverInstance[]> {
@@ -398,7 +413,7 @@ export class WorkbenchObserverAdapter {
     if (!/^[A-Za-z0-9_-]{1,96}$/.test(jobId) || this.jobs.has(jobId)) {
       throw new WorkbenchObserverAdapterError("INVALID_REQUEST", "Workbench observer job ID is invalid or already retained");
     }
-    const handlerLeaseId = this.createLeaseId();
+    const handlerLeaseId = this.createLeaseId(jobId);
     if (!/^[A-Za-z0-9_-]{1,128}$/.test(handlerLeaseId)) {
       throw new WorkbenchObserverAdapterError("INVALID_REQUEST", "Generated Workbench observer handler lease is invalid");
     }
@@ -522,6 +537,76 @@ export class WorkbenchObserverAdapter {
     record.lastStatus = status;
     if (TERMINAL_STATES.has(status.state) && !status.cameraLeaseHeld && status.restorationConfirmed) this.releaseGate(record);
     return status;
+  }
+
+  /**
+   * Reattach this adapter to a handler transaction retained by the exact same
+   * Workbench lifecycle. This does not adopt arbitrary jobs: the random job ID,
+   * deterministic handler lease, lifecycle generation, canonical target, and
+   * optional durable instance ID must all agree before a status is accepted.
+   */
+  async recover(input: WorkbenchObserverRecoverInput): Promise<WorkbenchObserverJobStatus> {
+    if (!/^[A-Za-z0-9_-]{1,96}$/.test(input.jobId)) {
+      throw new WorkbenchObserverAdapterError("INVALID_REQUEST", "Workbench observer recovery job ID is invalid");
+    }
+    const retained = this.jobs.get(input.jobId);
+    if (retained) {
+      if (input.expectedInstanceId && retained.instanceId !== input.expectedInstanceId) {
+        throw new WorkbenchObserverAdapterError("STALE_LIFECYCLE", "Retained Workbench observer job belongs to a different lifecycle instance");
+      }
+      return this.status(input.jobId);
+    }
+
+    const snapshot = await this.client.getRunningObserverSnapshot();
+    const recoveredInstanceId = instanceId(snapshot);
+    if (input.expectedInstanceId && recoveredInstanceId !== input.expectedInstanceId) {
+      throw new WorkbenchObserverAdapterError("STALE_LIFECYCLE", "Workbench observer job belongs to an old lifecycle generation or canonical target");
+    }
+    const ping = await this.pingSnapshot(snapshot);
+    if (ping.activeJobId !== input.jobId) {
+      throw new WorkbenchObserverAdapterError("JOB_NOT_FOUND", `Workbench observer job ${input.jobId} is not retained by the current handler`);
+    }
+    const handlerLeaseId = this.createLeaseId(input.jobId);
+    if (!/^[A-Za-z0-9_-]{1,128}$/.test(handlerLeaseId)) {
+      throw new WorkbenchObserverAdapterError("INVALID_REQUEST", "Recovered Workbench observer handler lease is invalid");
+    }
+
+    const activityLease = this.client.acquireCaptureActivity(snapshot);
+    try {
+      const current = await this.client.revalidateCaptureActivity(activityLease);
+      if (current.generation !== snapshot.generation || current.target.comparisonKey !== snapshot.target.comparisonKey) {
+        throw new WorkbenchObserverAdapterError("STALE_LIFECYCLE", "Workbench lifecycle changed during observer recovery");
+      }
+    } catch (error) {
+      this.client.releaseCaptureActivity(activityLease);
+      throw this.mapError(error, "STALE_LIFECYCLE");
+    }
+
+    const ready = Promise.resolve();
+    const record: AdapterJobRecord = {
+      jobId: input.jobId,
+      instanceId: recoveredInstanceId,
+      snapshot,
+      activityLease,
+      // Status responses always carry the retained view kind. Current is only
+      // a non-mutating provisional value used if a broken handler omits it.
+      viewKind: "current",
+      handlerLeaseId,
+      lastStatus: null,
+      gateReleased: false,
+      released: false,
+      ready,
+      markReady: () => undefined,
+      abortListener: () => { void this.cancelForLifecycle(record); },
+    };
+    this.jobs.set(input.jobId, record);
+    activityLease.signal.addEventListener("abort", record.abortListener, { once: true });
+
+    // Keep the record and activity gate fail-closed if the handler call is
+    // temporarily unavailable. A later recovery/status call can converge it;
+    // dropping the record here could allow lifecycle mutation to overtake an
+    // unproven camera lease.
+    return this.status(input.jobId);
   }
 
   async cancel(jobId: string): Promise<WorkbenchObserverJobStatus> {
@@ -744,8 +829,16 @@ export class WorkbenchObserverAdapter {
     response: z.infer<typeof jobResponseSchema>
   ): WorkbenchObserverArtifact {
     const expectedLogical = `$profile:ReforgerForgeObserver/workbench/${record.jobId}.png`;
+    const expectedPhysical = resolve(
+      record.snapshot.companion.profilePath,
+      "profile",
+      "ReforgerForgeObserver",
+      "workbench",
+      `${record.jobId}.png`
+    );
     if (response.artifactLogicalPath !== expectedLogical || !isAbsolute(response.artifactPath) ||
-        basename(response.artifactPath).toLowerCase() !== `${record.jobId.toLowerCase()}.png`) {
+        basename(response.artifactPath).toLowerCase() !== `${record.jobId.toLowerCase()}.png` ||
+        !samePath(response.artifactPath, expectedPhysical)) {
       throw new WorkbenchObserverAdapterError("ARTIFACT_INVALID", "Workbench returned an unexpected generated artifact path");
     }
     const captureDirectory = dirname(response.artifactPath);

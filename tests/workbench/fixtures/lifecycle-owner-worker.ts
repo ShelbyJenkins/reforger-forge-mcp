@@ -19,7 +19,6 @@ if (!stateDir || !helperPath || !mutexName || !role || !gprojPath) {
 
 const guard = new WorkbenchProcessGuard({
   stateDir,
-  legacyStatePath: `${stateDir}.legacy.json`,
   helperPath,
   mutexName,
   lockTimeoutMs: 10_000,
@@ -75,7 +74,6 @@ try {
       launch: await refused(() => client.ensureRunning(gprojPath)),
       restart: await refused(() => client.restartOwnedWorkbench()),
       shutdown: await refused(() => client.shutdownOwnedWorkbench()),
-      cleanup: await refused(() => client.cleanupHandlerScripts(dirname(gprojPath))),
     };
     process.stdout.write(`${JSON.stringify({ role, results })}\n`);
   } else {

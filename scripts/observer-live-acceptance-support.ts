@@ -36,6 +36,79 @@ export interface PngMaterialEvidence {
   materiallyVaried: boolean;
 }
 
+export interface DecodedPngImage {
+  width: number;
+  height: number;
+  channels: 3 | 4;
+  sourceByteCount: number;
+  sourceSha256: string;
+  pixels: Buffer;
+}
+
+/** A resolution-independent region. Every value is expressed as a fraction of the image. */
+export interface NormalizedImageRegion {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+export interface PngComparisonOptions {
+  roi?: NormalizedImageRegion;
+  /** A pixel is changed when any visible RGB channel exceeds this delta. */
+  channelTolerance?: number;
+  minimumChangedPixelRatio?: number;
+  minimumMeanAbsoluteError?: number;
+  maximumChangedPixelRatioForSimilarity?: number;
+  maximumMeanAbsoluteErrorForSimilarity?: number;
+}
+
+export interface PngComparisonEvidence {
+  width: number;
+  height: number;
+  pixelRegion: {
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+  };
+  comparedPixels: number;
+  changedPixels: number;
+  changedPixelRatio: number;
+  meanAbsoluteError: number;
+  rootMeanSquareError: number;
+  maximumChannelDifference: number;
+  similarityScore: number;
+  materiallyDifferent: boolean;
+  materiallySimilar: boolean;
+}
+
+export type RgbColor = readonly [red: number, green: number, blue: number];
+
+export interface ColorMarkerOptions {
+  color: RgbColor;
+  roi?: NormalizedImageRegion;
+  channelTolerance?: number;
+  minimumMatchingPixels?: number;
+  minimumMatchRatio?: number;
+  /** RGBA pixels below this alpha are not eligible to match. */
+  minimumAlpha?: number;
+}
+
+export interface ColorMarkerEvidence {
+  detected: boolean;
+  inspectedPixels: number;
+  matchingPixels: number;
+  matchingPixelRatio: number;
+  pixelBounds: {
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+  } | null;
+  normalizedCentroid: readonly [x: number, y: number] | null;
+}
+
 export interface ProcessRow {
   Id?: unknown;
   ProcessName?: unknown;
@@ -120,7 +193,7 @@ function paeth(left: number, above: number, upperLeft: number): number {
   return aboveDistance <= diagonalDistance ? above : upperLeft;
 }
 
-export function analyzePngMaterial(png: Buffer): PngMaterialEvidence {
+export function decodePng(png: Buffer): DecodedPngImage {
   if (png.length < 45 || png.length > MAX_PNG_BYTES || !png.subarray(0, 8).equals(PNG_SIGNATURE)) {
     throw new Error("Retained capture is not a bounded PNG");
   }
@@ -204,6 +277,20 @@ export function analyzePngMaterial(png: Buffer): PngMaterialEvidence {
     }
   }
 
+  return {
+    width,
+    height,
+    channels,
+    sourceByteCount: png.length,
+    sourceSha256: createHash("sha256").update(png).digest("hex"),
+    pixels,
+  };
+}
+
+export function analyzePngMaterial(png: Buffer): PngMaterialEvidence {
+  const decoded = decodePng(png);
+  const { width, height, channels, pixels } = decoded;
+
   const pixelCount = width * height;
   const sampleStep = Math.max(1, Math.floor(pixelCount / 100_000));
   const colors = new Set<number>();
@@ -238,8 +325,8 @@ export function analyzePngMaterial(png: Buffer): PngMaterialEvidence {
     width,
     height,
     channels,
-    byteCount: png.length,
-    sha256: createHash("sha256").update(png).digest("hex"),
+    byteCount: decoded.sourceByteCount,
+    sha256: decoded.sourceSha256,
     sampledPixels,
     quantizedColorCount: colors.size,
     nonBlackRatio: Number(nonBlackRatio.toFixed(6)),
@@ -248,4 +335,271 @@ export function analyzePngMaterial(png: Buffer): PngMaterialEvidence {
     luminanceStandardDeviation: Number(standardDeviation.toFixed(3)),
     materiallyVaried,
   };
+}
+
+interface PixelRegion {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+function assertDecodedImage(image: DecodedPngImage, label: string): void {
+  const pixelCount = image.width * image.height;
+  if (!Number.isSafeInteger(pixelCount) || image.width < 1 || image.height < 1 || pixelCount > MAX_PNG_PIXELS) {
+    throw new Error(`${label} dimensions are invalid: ${image.width}x${image.height}`);
+  }
+  if (image.channels !== 3 && image.channels !== 4) {
+    throw new Error(`${label} must contain RGB or RGBA pixels`);
+  }
+  if (!Buffer.isBuffer(image.pixels) || image.pixels.length !== pixelCount * image.channels) {
+    throw new Error(`${label} decoded pixel length is invalid`);
+  }
+}
+
+function boundedNumber(name: string, value: number, minimum: number, maximum: number): number {
+  if (!Number.isFinite(value) || value < minimum || value > maximum) {
+    throw new Error(`${name} must be between ${minimum} and ${maximum}`);
+  }
+  return value;
+}
+
+function pixelRegionFor(
+  image: Pick<DecodedPngImage, "width" | "height">,
+  roi: NormalizedImageRegion | undefined
+): PixelRegion {
+  if (!roi) return { x: 0, y: 0, width: image.width, height: image.height };
+  const x = boundedNumber("ROI x", roi.x, 0, 1);
+  const y = boundedNumber("ROI y", roi.y, 0, 1);
+  const width = boundedNumber("ROI width", roi.width, Number.MIN_VALUE, 1);
+  const height = boundedNumber("ROI height", roi.height, Number.MIN_VALUE, 1);
+  if (x + width > 1 + 1e-12 || y + height > 1 + 1e-12) {
+    throw new Error("ROI must fit within the normalized image bounds");
+  }
+
+  // The small epsilon prevents an exact normalized boundary such as 0.1 + 0.2
+  // from including a neighboring pixel solely because of floating-point rounding.
+  const left = Math.min(image.width - 1, Math.floor(x * image.width + 1e-9));
+  const top = Math.min(image.height - 1, Math.floor(y * image.height + 1e-9));
+  const right = Math.max(
+    left + 1,
+    Math.min(image.width, Math.ceil(Math.min(1, x + width) * image.width - 1e-9))
+  );
+  const bottom = Math.max(
+    top + 1,
+    Math.min(image.height, Math.ceil(Math.min(1, y + height) * image.height - 1e-9))
+  );
+  return { x: left, y: top, width: right - left, height: bottom - top };
+}
+
+function visibleChannel(image: DecodedPngImage, pixelOffset: number, channel: 0 | 1 | 2): number {
+  const value = image.pixels[pixelOffset + channel];
+  if (image.channels === 3) return value;
+  return Math.round(value * image.pixels[pixelOffset + 3] / 255);
+}
+
+/**
+ * Compare decoded screenshots over the same normalized region.
+ *
+ * Similar and materially different intentionally use separate thresholds. A result can be
+ * neither, which prevents small animation/rendering noise from being promoted to evidence of
+ * a changed view while still allowing strict restoration checks.
+ */
+export function compareDecodedPng(
+  reference: DecodedPngImage,
+  candidate: DecodedPngImage,
+  options: PngComparisonOptions = {}
+): PngComparisonEvidence {
+  assertDecodedImage(reference, "Reference image");
+  assertDecodedImage(candidate, "Candidate image");
+  if (reference.width !== candidate.width || reference.height !== candidate.height) {
+    throw new Error(
+      `Screenshot dimensions differ: ${reference.width}x${reference.height} versus ` +
+      `${candidate.width}x${candidate.height}`
+    );
+  }
+
+  const channelTolerance = boundedNumber(
+    "Comparison channel tolerance",
+    options.channelTolerance ?? 8,
+    0,
+    255
+  );
+  const minimumChangedPixelRatio = boundedNumber(
+    "Minimum changed-pixel ratio",
+    options.minimumChangedPixelRatio ?? 0.02,
+    0,
+    1
+  );
+  const minimumMeanAbsoluteError = boundedNumber(
+    "Minimum mean absolute error",
+    options.minimumMeanAbsoluteError ?? 2,
+    0,
+    255
+  );
+  if (minimumChangedPixelRatio === 0 && minimumMeanAbsoluteError === 0) {
+    throw new Error("Material-difference thresholds cannot both be zero");
+  }
+  const maximumChangedPixelRatioForSimilarity = boundedNumber(
+    "Maximum changed-pixel ratio for similarity",
+    options.maximumChangedPixelRatioForSimilarity ?? 0.01,
+    0,
+    1
+  );
+  const maximumMeanAbsoluteErrorForSimilarity = boundedNumber(
+    "Maximum mean absolute error for similarity",
+    options.maximumMeanAbsoluteErrorForSimilarity ?? 1,
+    0,
+    255
+  );
+  const pixelRegion = pixelRegionFor(reference, options.roi);
+
+  let comparedPixels = 0;
+  let changedPixels = 0;
+  let absoluteDifference = 0;
+  let squaredDifference = 0;
+  let maximumChannelDifference = 0;
+  for (let y = pixelRegion.y; y < pixelRegion.y + pixelRegion.height; y += 1) {
+    for (let x = pixelRegion.x; x < pixelRegion.x + pixelRegion.width; x += 1) {
+      const referenceOffset = (y * reference.width + x) * reference.channels;
+      const candidateOffset = (y * candidate.width + x) * candidate.channels;
+      let pixelMaximum = 0;
+      for (let channel = 0 as 0 | 1 | 2; channel < 3; channel += 1) {
+        const delta = Math.abs(
+          visibleChannel(reference, referenceOffset, channel) -
+          visibleChannel(candidate, candidateOffset, channel)
+        );
+        absoluteDifference += delta;
+        squaredDifference += delta * delta;
+        pixelMaximum = Math.max(pixelMaximum, delta);
+        maximumChannelDifference = Math.max(maximumChannelDifference, delta);
+      }
+      comparedPixels += 1;
+      if (pixelMaximum > channelTolerance) changedPixels += 1;
+    }
+  }
+
+  const channelSamples = comparedPixels * 3;
+  const changedPixelRatio = changedPixels / comparedPixels;
+  const meanAbsoluteError = absoluteDifference / channelSamples;
+  const rootMeanSquareError = Math.sqrt(squaredDifference / channelSamples);
+  return {
+    width: reference.width,
+    height: reference.height,
+    pixelRegion,
+    comparedPixels,
+    changedPixels,
+    changedPixelRatio: Number(changedPixelRatio.toFixed(6)),
+    meanAbsoluteError: Number(meanAbsoluteError.toFixed(6)),
+    rootMeanSquareError: Number(rootMeanSquareError.toFixed(6)),
+    maximumChannelDifference,
+    similarityScore: Number(Math.max(0, 1 - rootMeanSquareError / 255).toFixed(6)),
+    materiallyDifferent:
+      changedPixelRatio >= minimumChangedPixelRatio && meanAbsoluteError >= minimumMeanAbsoluteError,
+    materiallySimilar:
+      changedPixelRatio <= maximumChangedPixelRatioForSimilarity &&
+      meanAbsoluteError <= maximumMeanAbsoluteErrorForSimilarity,
+  };
+}
+
+export function comparePngImages(
+  reference: Buffer,
+  candidate: Buffer,
+  options: PngComparisonOptions = {}
+): PngComparisonEvidence {
+  return compareDecodedPng(decodePng(reference), decodePng(candidate), options);
+}
+
+export function detectColorMarker(
+  image: DecodedPngImage,
+  options: ColorMarkerOptions
+): ColorMarkerEvidence {
+  assertDecodedImage(image, "Marker image");
+  if (!Array.isArray(options.color) || options.color.length !== 3) {
+    throw new Error("Marker color must contain exactly three RGB channels");
+  }
+  const markerChannel = (channel: number, index: number): number => {
+    if (!Number.isInteger(channel)) {
+      throw new Error(`Marker color channel ${index} must be an integer`);
+    }
+    return boundedNumber(`Marker color channel ${index}`, channel, 0, 255);
+  };
+  const color: [number, number, number] = [
+    markerChannel(options.color[0], 0),
+    markerChannel(options.color[1], 1),
+    markerChannel(options.color[2], 2),
+  ];
+  const channelTolerance = boundedNumber(
+    "Marker channel tolerance",
+    options.channelTolerance ?? 24,
+    0,
+    255
+  );
+  const minimumMatchingPixels = options.minimumMatchingPixels ?? 16;
+  if (!Number.isSafeInteger(minimumMatchingPixels) || minimumMatchingPixels < 1) {
+    throw new Error("Minimum matching marker pixels must be a positive safe integer");
+  }
+  const minimumMatchRatio = boundedNumber(
+    "Minimum marker match ratio",
+    options.minimumMatchRatio ?? 0.001,
+    0,
+    1
+  );
+  const minimumAlpha = boundedNumber("Minimum marker alpha", options.minimumAlpha ?? 128, 0, 255);
+  const pixelRegion = pixelRegionFor(image, options.roi);
+
+  let matchingPixels = 0;
+  let sumX = 0;
+  let sumY = 0;
+  let minimumX = image.width;
+  let minimumY = image.height;
+  let maximumX = -1;
+  let maximumY = -1;
+  for (let y = pixelRegion.y; y < pixelRegion.y + pixelRegion.height; y += 1) {
+    for (let x = pixelRegion.x; x < pixelRegion.x + pixelRegion.width; x += 1) {
+      const offset = (y * image.width + x) * image.channels;
+      const alpha = image.channels === 4 ? image.pixels[offset + 3] : 255;
+      if (
+        alpha >= minimumAlpha &&
+        Math.abs(image.pixels[offset] - color[0]) <= channelTolerance &&
+        Math.abs(image.pixels[offset + 1] - color[1]) <= channelTolerance &&
+        Math.abs(image.pixels[offset + 2] - color[2]) <= channelTolerance
+      ) {
+        matchingPixels += 1;
+        sumX += x;
+        sumY += y;
+        minimumX = Math.min(minimumX, x);
+        minimumY = Math.min(minimumY, y);
+        maximumX = Math.max(maximumX, x);
+        maximumY = Math.max(maximumY, y);
+      }
+    }
+  }
+
+  const inspectedPixels = pixelRegion.width * pixelRegion.height;
+  const matchingPixelRatio = matchingPixels / inspectedPixels;
+  return {
+    detected: matchingPixels >= minimumMatchingPixels && matchingPixelRatio >= minimumMatchRatio,
+    inspectedPixels,
+    matchingPixels,
+    matchingPixelRatio: Number(matchingPixelRatio.toFixed(6)),
+    pixelBounds: matchingPixels > 0
+      ? {
+          x: minimumX,
+          y: minimumY,
+          width: maximumX - minimumX + 1,
+          height: maximumY - minimumY + 1,
+        }
+      : null,
+    normalizedCentroid: matchingPixels > 0
+      ? [
+          Number(((sumX / matchingPixels + 0.5) / image.width).toFixed(6)),
+          Number(((sumY / matchingPixels + 0.5) / image.height).toFixed(6)),
+        ]
+      : null,
+  };
+}
+
+export function detectPngColorMarker(png: Buffer, options: ColorMarkerOptions): ColorMarkerEvidence {
+  return detectColorMarker(decodePng(png), options);
 }

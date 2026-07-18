@@ -2,20 +2,20 @@ import { createHash, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
-import { homedir, platform, tmpdir } from "node:os";
+import { homedir, platform } from "node:os";
 import { isIP } from "node:net";
-import { dirname, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 export const WORKBENCH_PROCESS_NAME = "ArmaReforgerWorkbenchSteamDiag.exe";
 export const WORKBENCH_OWNER_ARG_PREFIX = "-reforgerForgeOwnerToken=";
-export const DEFAULT_LIFECYCLE_MUTEX = "Global\\ReforgerForge.WorkbenchLifecycle.v2";
+export const DEFAULT_LIFECYCLE_MUTEX = "Global\\ReforgerForge.WorkbenchLifecycle.v3";
 
 const DEFAULT_LOCK_TIMEOUT_MS = 15_000;
 const HELPER_TIMEOUT_MS = 20_000;
 const PROCESS_CAPTURE_TIMEOUT_MS = 5_000;
 const PROCESS_POLL_MS = 100;
-const LIFECYCLE_VERSION = 2;
+const LIFECYCLE_VERSION = 3;
 
 export type LifecycleFailStop = (message: string) => never;
 
@@ -53,42 +53,45 @@ export type LifecyclePhase =
   | "starting"
   | "running"
   | "restarting"
-  | "stopping"
-  | "cleaning";
+  | "stopping";
 
 export type LifecycleOperationKind =
   | "launch"
   | "restart"
   | "shutdown"
-  | "cleanup"
   | "recovery";
 
-export interface HandlerLifecycleState {
-  modDirectory: string;
-  manifestGeneration: string | null;
-  transactionId: string | null;
-  phase: "clean" | "installing" | "installed" | "rolling_back" | "cleaning";
-  backupPath: string | null;
+/**
+ * Immutable identity of the MCP-owned companion add-on used by this
+ * Workbench generation.
+ */
+export interface WorkbenchCompanionLifecycleState {
+  addonId: string;
+  addonGuid: string;
+  addonDirectory: string;
+  addonSearchRoot: string;
+  bundleDigest: string;
+  buildIdentity: string;
+  profilePath: string;
 }
 
-export interface WorkbenchLifecycleStateV2 {
-  version: 2;
+export interface WorkbenchLifecycleStateV3 {
+  version: 3;
   generation: string;
   phase: LifecyclePhase;
   endpoint: LifecycleEndpoint;
   target: CanonicalProjectIdentity | null;
   mcpOwner: McpOwnerIdentity | null;
   workbench: WorkbenchIdentity | null;
-  handler: HandlerLifecycleState | null;
+  companion: WorkbenchCompanionLifecycleState | null;
   operation: { kind: LifecycleOperationKind; operationId: string } | null;
 }
 
-export type LifecycleStateDraft = Omit<WorkbenchLifecycleStateV2, "version" | "generation">;
+export type LifecycleStateDraft = Omit<WorkbenchLifecycleStateV3, "version" | "generation">;
 
 export type LifecycleStateRead =
   | { kind: "missing" }
-  | { kind: "valid"; state: WorkbenchLifecycleStateV2 }
-  | { kind: "legacy"; path: string; rawSha256: string }
+  | { kind: "valid"; state: WorkbenchLifecycleStateV3 }
   | { kind: "malformed"; path: string; rawSha256: string; message: string };
 
 export interface ExpectedStateVersion {
@@ -99,10 +102,10 @@ export interface ExpectedStateVersion {
 export type LifecycleClaimResult =
   | {
       kind: "claimed";
-      state: WorkbenchLifecycleStateV2;
-      source: "missing" | "vacant" | "dead_owner" | "legacy" | "malformed";
+      state: WorkbenchLifecycleStateV3;
+      source: "missing" | "vacant" | "dead_owner" | "malformed";
     }
-  | { kind: "owned_by_current_mcp"; state: WorkbenchLifecycleStateV2 }
+  | { kind: "owned_by_current_mcp"; state: WorkbenchLifecycleStateV3 }
   | {
       kind: "refused";
       code:
@@ -111,11 +114,10 @@ export type LifecycleClaimResult =
         | "ENDPOINT_CONFLICT"
         | "TARGET_CONFLICT"
         | "USER_CONFLICT"
-        | "LEGACY_OWNER"
         | "IDENTITY_UNVERIFIABLE"
         | "STATE_INVALID";
       message: string;
-      state?: WorkbenchLifecycleStateV2;
+      state?: WorkbenchLifecycleStateV3;
     };
 
 export type VerifyTerminateResult =
@@ -179,14 +181,13 @@ export interface WorkbenchLifecycleBackend {
   replaceState(args: {
     path: string;
     expectedGeneration: string | null;
-    next: WorkbenchLifecycleStateV2;
+    next: WorkbenchLifecycleStateV3;
   }): Promise<void>;
   archiveState(args: { path: string; archivePath: string; expectedSha256: string }): Promise<void>;
 }
 
 export interface WorkbenchProcessGuardOptions {
   stateDir?: string;
-  legacyStatePath?: string;
   mutexName?: string;
   lockTimeoutMs?: number;
   backend?: WorkbenchLifecycleBackend;
@@ -219,11 +220,11 @@ export interface WorkbenchLifecycleSession {
   transition(
     expected: ExpectedStateVersion,
     next: LifecycleStateDraft
-  ): Promise<WorkbenchLifecycleStateV2>;
+  ): Promise<WorkbenchLifecycleStateV3>;
   transitionToVacant(
     expected: ExpectedStateVersion,
-    overrides?: Partial<Pick<LifecycleStateDraft, "endpoint" | "target" | "handler">>
-  ): Promise<WorkbenchLifecycleStateV2>;
+    overrides?: Partial<Pick<LifecycleStateDraft, "endpoint" | "target" | "companion">>
+  ): Promise<WorkbenchLifecycleStateV3>;
   inspectSpawnedWorkbench(args: {
     pid: number;
     executablePath: string;
@@ -343,23 +344,24 @@ function isTarget(value: unknown): value is CanonicalProjectIdentity {
   return isString(target.path) && isString(target.comparisonKey);
 }
 
-function isHandlerState(value: unknown): value is HandlerLifecycleState {
+function isCompanionState(value: unknown): value is WorkbenchCompanionLifecycleState {
   if (!value || typeof value !== "object") return false;
-  const handler = value as Partial<HandlerLifecycleState>;
-  return isString(handler.modDirectory) &&
-    (handler.manifestGeneration === null || isString(handler.manifestGeneration)) &&
-    (handler.transactionId === null || isString(handler.transactionId)) &&
-    ["clean", "installing", "installed", "rolling_back", "cleaning"].includes(String(handler.phase)) &&
-    (handler.backupPath === null || isString(handler.backupPath)) &&
-    ((handler.transactionId === null && handler.backupPath === null) ||
-      (handler.transactionId !== null && handler.backupPath !== null));
+  const companion = value as Partial<WorkbenchCompanionLifecycleState>;
+  return typeof companion.addonId === "string" &&
+    /^[A-Za-z0-9._-]{1,128}$/.test(companion.addonId) &&
+    typeof companion.addonGuid === "string" && /^[A-Fa-f0-9]{16}$/.test(companion.addonGuid) &&
+    typeof companion.addonDirectory === "string" && isAbsolute(companion.addonDirectory) &&
+    typeof companion.addonSearchRoot === "string" && isAbsolute(companion.addonSearchRoot) &&
+    typeof companion.bundleDigest === "string" && /^[a-f0-9]{64}$/.test(companion.bundleDigest) &&
+    typeof companion.buildIdentity === "string" && /^[a-f0-9]{64}$/.test(companion.buildIdentity) &&
+    typeof companion.profilePath === "string" && isAbsolute(companion.profilePath);
 }
 
-function parseLifecycleState(value: unknown): WorkbenchLifecycleStateV2 | null {
+function parseLifecycleState(value: unknown): WorkbenchLifecycleStateV3 | null {
   if (!value || typeof value !== "object") return null;
-  const state = value as Partial<WorkbenchLifecycleStateV2>;
+  const state = value as Partial<WorkbenchLifecycleStateV3>;
   if (state.version !== LIFECYCLE_VERSION || !isString(state.generation) ||
-      !["vacant", "starting", "running", "restarting", "stopping", "cleaning"].includes(String(state.phase)) ||
+      !["vacant", "starting", "running", "restarting", "stopping"].includes(String(state.phase)) ||
       !state.endpoint || typeof state.endpoint !== "object") return null;
   let endpoint: LifecycleEndpoint;
   try {
@@ -370,23 +372,24 @@ function parseLifecycleState(value: unknown): WorkbenchLifecycleStateV2 | null {
   if (state.target !== null && !isTarget(state.target)) return null;
   if (state.mcpOwner !== null && !isMcpOwner(state.mcpOwner)) return null;
   if (state.workbench !== null && !isWorkbenchIdentity(state.workbench)) return null;
-  if (state.handler !== null && !isHandlerState(state.handler)) return null;
+  if (state.companion !== null && !isCompanionState(state.companion)) return null;
   if (state.operation !== null) {
     if (!state.operation || typeof state.operation !== "object" ||
-        !["launch", "restart", "shutdown", "cleanup", "recovery"].includes(String(state.operation.kind)) ||
+        !["launch", "restart", "shutdown", "recovery"].includes(String(state.operation.kind)) ||
         !isString(state.operation.operationId)) return null;
   }
   if (state.phase === "vacant" && (state.workbench !== null || state.operation !== null)) return null;
-  if (state.phase === "running" && (!state.workbench || !state.target || !state.mcpOwner)) return null;
+  if (state.phase === "running" &&
+      (!state.workbench || !state.target || !state.mcpOwner || !state.companion)) return null;
   return {
-    version: 2,
+    version: 3,
     generation: state.generation,
     phase: state.phase as LifecyclePhase,
     endpoint,
     target: state.target,
     mcpOwner: state.mcpOwner,
     workbench: state.workbench,
-    handler: state.handler,
+    companion: state.companion,
     operation: state.operation,
   };
 }
@@ -394,8 +397,8 @@ function parseLifecycleState(value: unknown): WorkbenchLifecycleStateV2 | null {
 function defaultStateDir(): string {
   const local = process.env.LOCALAPPDATA;
   return local && local.trim().length > 0
-    ? join(local, "ReforgerForge", "Workbench", "v2")
-    : join(homedir(), "AppData", "Local", "ReforgerForge", "Workbench", "v2");
+    ? join(local, "ReforgerForge", "Workbench", "v3")
+    : join(homedir(), "AppData", "Local", "ReforgerForge", "Workbench", "v3");
 }
 
 export interface WindowsLifecycleBackendOptions {
@@ -837,7 +840,7 @@ export class WindowsLifecycleBackend implements WorkbenchLifecycleBackend {
   async replaceState(args: {
     path: string;
     expectedGeneration: string | null;
-    next: WorkbenchLifecycleStateV2;
+    next: WorkbenchLifecycleStateV3;
   }): Promise<void> {
     const response = await this.invoke("ReplaceState", {
       statePath: args.path,
@@ -909,15 +912,15 @@ class LifecycleSession implements WorkbenchLifecycleSession {
   async transition(
     expected: ExpectedStateVersion,
     next: LifecycleStateDraft
-  ): Promise<WorkbenchLifecycleStateV2> {
+  ): Promise<WorkbenchLifecycleStateV3> {
     this.assertActive();
     return this.guard.transitionLocked(this, expected, next);
   }
 
   async transitionToVacant(
     expected: ExpectedStateVersion,
-    overrides: Partial<Pick<LifecycleStateDraft, "endpoint" | "target" | "handler">> = {}
-  ): Promise<WorkbenchLifecycleStateV2> {
+    overrides: Partial<Pick<LifecycleStateDraft, "endpoint" | "target" | "companion">> = {}
+  ): Promise<WorkbenchLifecycleStateV3> {
     this.assertActive();
     const read = await this.guard.readLifecycleState();
     if (read.kind !== "valid") {
@@ -929,7 +932,9 @@ class LifecycleSession implements WorkbenchLifecycleSession {
       target: overrides.target === undefined ? read.state.target : overrides.target,
       mcpOwner: read.state.mcpOwner,
       workbench: null,
-      handler: overrides.handler === undefined ? read.state.handler : overrides.handler,
+      companion: overrides.companion === undefined
+        ? read.state.companion
+        : overrides.companion,
       operation: null,
     });
   }
@@ -1018,7 +1023,6 @@ class LifecycleSession implements WorkbenchLifecycleSession {
 export class WorkbenchProcessGuard {
   readonly stateDir: string;
   readonly statePath: string;
-  readonly legacyStatePath: string;
   readonly mcpInstanceId = randomUUID();
   readonly leaseId = randomUUID();
   readonly backend: WorkbenchLifecycleBackend;
@@ -1029,9 +1033,6 @@ export class WorkbenchProcessGuard {
   constructor(options: WorkbenchProcessGuardOptions = {}) {
     this.stateDir = resolve(options.stateDir ?? defaultStateDir());
     this.statePath = join(this.stateDir, "lifecycle.json");
-    this.legacyStatePath = resolve(
-      options.legacyStatePath ?? join(tmpdir(), "reforger-forge-mcp-workbench.owner.json")
-    );
     this.mutexName = options.mutexName ?? DEFAULT_LIFECYCLE_MUTEX;
     this.lockTimeoutMs = options.lockTimeoutMs ?? DEFAULT_LOCK_TIMEOUT_MS;
     const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
@@ -1077,9 +1078,7 @@ export class WorkbenchProcessGuard {
   }
 
   async readLifecycleState(): Promise<LifecycleStateRead> {
-    const activePath = existsSync(this.statePath)
-      ? this.statePath
-      : existsSync(this.legacyStatePath) ? this.legacyStatePath : null;
+    const activePath = existsSync(this.statePath) ? this.statePath : null;
     if (!activePath) return { kind: "missing" };
     let raw: Buffer;
     try {
@@ -1105,16 +1104,12 @@ export class WorkbenchProcessGuard {
       };
     }
     const state = parseLifecycleState(parsed);
-    if (state && activePath === this.statePath) return { kind: "valid", state };
-    if (parsed && typeof parsed === "object" &&
-        Number((parsed as Record<string, unknown>).version) === 1) {
-      return { kind: "legacy", path: activePath, rawSha256 };
-    }
+    if (state) return { kind: "valid", state };
     return {
       kind: "malformed",
       path: activePath,
       rawSha256,
-      message: "Lifecycle state does not satisfy the strict version-2 schema.",
+      message: "Lifecycle state does not satisfy the strict version-3 schema.",
     };
   }
 
@@ -1177,20 +1172,18 @@ export class WorkbenchProcessGuard {
       return { kind: "claimed", state, source: "missing" };
     }
 
-    if (read.kind === "legacy" || read.kind === "malformed") {
+    if (read.kind === "malformed") {
       const processes = await this.scanStrict();
       if (processes.length > 0) {
         return {
           kind: "refused",
-          code: read.kind === "legacy" ? "LEGACY_OWNER" : "STATE_INVALID",
-          message: read.kind === "legacy"
-            ? "A live Workbench is associated with a legacy owner marker. Close it once manually before v2 migration."
-            : "Lifecycle state is malformed while Workbench may be live; automated recovery is refused.",
+          code: "STATE_INVALID",
+          message: "Lifecycle state is malformed while Workbench may be live; automated recovery is refused.",
         };
       }
       const archivePath = join(
         dirname(read.path),
-        `${read.kind}-${Date.now()}-${randomUUID()}.json`
+        `malformed-${Date.now()}-${randomUUID()}.json`
       );
       await this.backend.archiveState({
         path: read.path,
@@ -1198,7 +1191,7 @@ export class WorkbenchProcessGuard {
         expectedSha256: read.rawSha256,
       });
       const state = await this.createClaimedState(null, endpoint, target, session.mcp, args.operation ?? null);
-      return { kind: "claimed", state, source: read.kind };
+      return { kind: "claimed", state, source: "malformed" };
     }
 
     const state = read.state;
@@ -1250,7 +1243,7 @@ export class WorkbenchProcessGuard {
           target: target ?? state.target,
           mcpOwner: state.mcpOwner,
           workbench: state.workbench,
-          handler: state.handler,
+          companion: state.companion,
           operation: args.operation === undefined ? state.operation : args.operation,
         });
         return { kind: "owned_by_current_mcp", state: changed };
@@ -1290,7 +1283,7 @@ export class WorkbenchProcessGuard {
       target: target ?? state.target,
       mcpOwner: claimedOwner,
       workbench: state.workbench,
-      handler: state.handler,
+      companion: state.companion,
       operation: args.operation === undefined ? state.operation : args.operation,
     });
     return {
@@ -1304,7 +1297,7 @@ export class WorkbenchProcessGuard {
     session: LifecycleSession,
     expected: ExpectedStateVersion,
     next: LifecycleStateDraft
-  ): Promise<WorkbenchLifecycleStateV2> {
+  ): Promise<WorkbenchLifecycleStateV3> {
     const read = await this.readLifecycleState();
     if (read.kind !== "valid" || read.state.generation !== expected.generation ||
         (read.state.mcpOwner?.leaseId ?? null) !== expected.leaseId) {
@@ -1342,16 +1335,16 @@ export class WorkbenchProcessGuard {
     target: CanonicalProjectIdentity | null,
     owner: McpOwnerIdentity,
     operation: { kind: LifecycleOperationKind; operationId: string } | null
-  ): Promise<WorkbenchLifecycleStateV2> {
-    const next: WorkbenchLifecycleStateV2 = {
-      version: 2,
+  ): Promise<WorkbenchLifecycleStateV3> {
+    const next: WorkbenchLifecycleStateV3 = {
+      version: 3,
       generation: randomUUID(),
       phase: "vacant",
       endpoint,
       target,
       mcpOwner: { ...owner, claimedAtMs: Date.now() },
       workbench: null,
-      handler: null,
+      companion: null,
       operation: null,
     };
     if (!parseLifecycleState(next)) {
@@ -1362,14 +1355,14 @@ export class WorkbenchProcessGuard {
   }
 
   private async replaceExisting(
-    current: WorkbenchLifecycleStateV2,
+    current: WorkbenchLifecycleStateV3,
     draft: LifecycleStateDraft
-  ): Promise<WorkbenchLifecycleStateV2> {
-    const next: WorkbenchLifecycleStateV2 = {
+  ): Promise<WorkbenchLifecycleStateV3> {
+    const next: WorkbenchLifecycleStateV3 = {
       ...draft,
       // Write protected schema/CAS fields after the caller draft so a stale or
       // structurally over-wide object can never preserve its old generation.
-      version: 2,
+      version: 3,
       generation: randomUUID(),
       endpoint: normalizedEndpoint(draft.endpoint),
     };
@@ -1386,7 +1379,7 @@ export class WorkbenchProcessGuard {
 
   private unownedRefusal(
     processes: ExactProcessIdentity[],
-    state?: WorkbenchLifecycleStateV2
+    state?: WorkbenchLifecycleStateV3
   ): Extract<LifecycleClaimResult, { kind: "refused" }> {
     return {
       kind: "refused",

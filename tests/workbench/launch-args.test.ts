@@ -6,10 +6,11 @@ import {
   buildWorkbenchLaunchArgs,
   WorkbenchError,
 } from "../../src/workbench/client.js";
+import { createFakeCompanionLaunch } from "./fake-companion.js";
 
 const tempRoots: string[] = [];
 
-function createAddonRoots(): { base: string; workshop: string } {
+function createAddonRoots(): { root: string; base: string; workshop: string } {
   const root = mkdtempSync(join(tmpdir(), "reforger-forge-launch-"));
   tempRoots.push(root);
 
@@ -17,7 +18,7 @@ function createAddonRoots(): { base: string; workshop: string } {
   const workshop = join(root, "My Games", "ArmaReforger", "addons");
   mkdirSync(base, { recursive: true });
   mkdirSync(workshop, { recursive: true });
-  return { base, workshop };
+  return { root, base, workshop };
 }
 
 afterEach(() => {
@@ -47,6 +48,35 @@ describe("buildWorkbenchLaunchArgs", () => {
       "-noThrow",
     ]);
     expect(args.filter((arg) => arg === "-addonsDir")).toHaveLength(1);
+  });
+
+  it("merges the managed companion root and activates its GUID and isolated profile", () => {
+    const { root, base, workshop } = createAddonRoots();
+    const companion = createFakeCompanionLaunch(root);
+    const gproj = join(root, "ExampleMod", "ExampleMod.gproj");
+
+    const args = buildWorkbenchLaunchArgs(
+      gproj,
+      [base, workshop, companion.addonSearchRoot],
+      false,
+      true,
+      "-reforgerForgeOwnerToken=owner-a",
+      companion
+    );
+
+    expect(args).toEqual([
+      "-addonsDir",
+      `${base},${workshop},${companion.addonSearchRoot}`,
+      "-addons",
+      companion.addonGuid,
+      "-profile",
+      companion.workbenchProfilePath,
+      "-gproj",
+      gproj,
+      "-noThrow",
+      "-reforgerForgeOwnerToken=owner-a",
+    ]);
+    expect(args.filter((arg) => arg === companion.addonSearchRoot)).toHaveLength(0);
   });
 
   it("omits addon and authorization flags when they are not configured", () => {

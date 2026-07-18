@@ -13,6 +13,10 @@ import {
   workbenchCameraMatrix,
   type WorkbenchObserverClient,
 } from "../../src/workbench/observer-adapter.js";
+import {
+  companionLifecycleState,
+  createFakeCompanionLaunch,
+} from "./fake-companion.js";
 
 const roots: string[] = [];
 
@@ -119,13 +123,22 @@ class FakeObserverClient implements WorkbenchObserverClient {
 	this.failRevalidation = options.failRevalidation ?? false;
     this.root = mkdtempSync(join(tmpdir(), "reforger-forge-wb-observer-"));
     roots.push(this.root);
+    const managedRoot = mkdtempSync(join(tmpdir(), "reforger-forge-wb-profile-"));
+    roots.push(managedRoot);
+    const companion = createFakeCompanionLaunch(managedRoot);
     this.project = join(this.root, "Example", "Example.gproj");
-    this.artifactDirectory = join(this.root, "profile", "ReforgerForgeObserver", "workbench");
+    this.artifactDirectory = join(
+      companion.workbenchProfilePath,
+      "profile",
+      "ReforgerForgeObserver",
+      "workbench"
+    );
     mkdirSync(join(this.root, "Example"), { recursive: true });
     mkdirSync(this.artifactDirectory, { recursive: true });
     writeFileSync(this.project, "GameProject {}", "utf8");
     this.snapshot = Object.freeze({
       generation: "generation-a",
+      companion: Object.freeze(companionLifecycleState(companion)),
       target: Object.freeze({ path: this.project, comparisonKey: this.project.toLowerCase() }),
       endpoint: Object.freeze({ host: "127.0.0.1", port: 5775 }),
       process: Object.freeze({
@@ -369,6 +382,55 @@ describe("Workbench observer adapter", () => {
     expect(submits[0].params).toEqual(submits[1].params);
     expect(submits[0].params).toMatchObject({ leaseId: "ack-lease" });
     expect(client.submitMutations).toBe(1);
+  });
+
+  it("recovers a retained handler transaction after an adapter restart with the durable lifecycle binding", async () => {
+    const client = new FakeObserverClient({ completeOnStatus: true });
+    const original = new WorkbenchObserverAdapter(client, { createJobId: () => "restart-job" });
+    const submitted = await original.submit({ view: { kind: "current" } });
+    const submitCall = client.calls.find((call) => call.apiFunc === "EMCP_WB_ObserverSubmit");
+    expect(submitCall?.params).toMatchObject({
+      jobId: "restart-job",
+      leaseId: "wb-observer-restart-job",
+    });
+
+    const restarted = new WorkbenchObserverAdapter(client);
+    const recovered = await restarted.recover({
+      jobId: "restart-job",
+      expectedInstanceId: submitted.instanceId,
+    });
+
+    expect(recovered).toMatchObject({
+      jobId: "restart-job",
+      instanceId: submitted.instanceId,
+      state: "completed",
+      restorationConfirmed: true,
+    });
+    const statusCall = client.calls.filter((call) => call.apiFunc === "EMCP_WB_ObserverStatus").at(-1);
+    expect(statusCall?.params).toMatchObject({
+      jobId: "restart-job",
+      leaseId: "wb-observer-restart-job",
+      lifecycleGeneration: "generation-a",
+      canonicalTarget: client.project,
+    });
+    expect(restarted.readCompletedArtifact("restart-job").image).toEqual(png(2, 2));
+    await expect(restarted.release("restart-job")).resolves.toMatchObject({
+      jobId: "restart-job",
+      restorationConfirmed: true,
+    });
+  });
+
+  it("refuses restart recovery when the durable Workbench instance binding is stale", async () => {
+    const client = new FakeObserverClient();
+    const original = new WorkbenchObserverAdapter(client, { createJobId: () => "stale-restart-job" });
+    await original.submit({ view: { kind: "current" } });
+
+    const restarted = new WorkbenchObserverAdapter(client);
+    await expect(restarted.recover({
+      jobId: "stale-restart-job",
+      expectedInstanceId: "workbench-old-generation-deadbeefdeadbeef",
+    })).rejects.toMatchObject({ code: "STALE_LIFECYCLE" });
+    expect(client.calls.filter((call) => call.apiFunc === "EMCP_WB_ObserverStatus")).toHaveLength(0);
   });
 
   it("refuses public release while camera state is held and replays a lost terminal release acknowledgement", async () => {

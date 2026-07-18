@@ -8,10 +8,8 @@ import {
   vi,
 } from "vitest";
 import {
-  existsSync,
   mkdirSync,
   mkdtempSync,
-  readFileSync,
   rmSync,
   unlinkSync,
   writeFileSync,
@@ -24,12 +22,13 @@ import {
   WorkbenchClient,
   WorkbenchError,
 } from "../../src/workbench/client.js";
-import {
-  HANDLER_FOLDER,
-  HandlerBundleManager,
-} from "../../src/workbench/handler-bundle.js";
 import { WorkbenchProcessGuard } from "../../src/workbench/process-guard.js";
 import { FakeLifecycleBackend } from "./fake-lifecycle-backend.js";
+import {
+  createFakeCompanionLaunch,
+  fakeCompanionProvider,
+  WORKBENCH_HELPER_PING_RESPONSE,
+} from "./fake-companion.js";
 
 const roots: string[] = [];
 
@@ -53,15 +52,14 @@ interface Harness {
   modDirectory: string;
   projectPath: string;
   executablePath: string;
-  handlerPath: string;
   config: Config;
   mutexName: string;
   backend: FakeLifecycleBackend;
   guard: WorkbenchProcessGuard;
-  manager: HandlerBundleManager;
   client: WorkbenchClient;
   children: FakeChild[];
   spawnOptions: SpawnOptions[];
+  spawnArgs: string[][];
 }
 
 function createHarness(): Harness {
@@ -77,15 +75,12 @@ function createHarness(): Harness {
     "ArmaReforgerWorkbenchSteamDiag.exe"
   );
   const gamePath = join(root, "Arma Reforger");
-  const bundleDir = join(root, "bundle");
   const stateDir = join(root, "state");
   mkdirSync(modDirectory, { recursive: true });
   mkdirSync(join(toolsRoot, "Workbench"), { recursive: true });
   mkdirSync(join(gamePath, "addons"), { recursive: true });
-  mkdirSync(bundleDir, { recursive: true });
   writeFileSync(projectPath, "project");
   writeFileSync(executablePath, "fake executable");
-  writeFileSync(join(bundleDir, "EMCP_WB_Ping.c"), "class TestHandler {}\n");
 
   const config: Config = {
     workbenchPath: toolsRoot,
@@ -102,16 +97,12 @@ function createHarness(): Harness {
   const guard = new WorkbenchProcessGuard({
     backend,
     stateDir,
-    legacyStatePath: join(root, "legacy.json"),
     mutexName,
   });
-  const manager = new HandlerBundleManager({
-    stateDir,
-    bundleDir,
-    requiredFiles: ["EMCP_WB_Ping.c"],
-  });
+  const companion = createFakeCompanionLaunch(root);
   const children: FakeChild[] = [];
   const spawnOptions: SpawnOptions[] = [];
+  const spawnArgs: string[][] = [];
   let nextPid = 12_000;
   const client = new WorkbenchClient(
     config.workbenchHost,
@@ -120,9 +111,10 @@ function createHarness(): Harness {
     "test-client",
     guard,
     {
-      handlerBundle: manager,
+      companionProvider: fakeCompanionProvider(companion),
       spawnProcess: (command, args, options) => {
         spawnOptions.push(options);
+        spawnArgs.push([...args]);
         const child = new FakeChild(nextPid++);
         const ownerArgument = args.find((arg) =>
           arg.startsWith("-reforgerForgeOwnerToken=")
@@ -146,8 +138,12 @@ function createHarness(): Harness {
   (client as unknown as { isPortListening: () => Promise<boolean> }).isPortListening =
     vi.fn().mockResolvedValue(false);
   (client as unknown as {
-    waitForHandlerReady: (child: ChildProcess, error: () => Error | null) => Promise<void>;
-  }).waitForHandlerReady = vi.fn().mockResolvedValue(undefined);
+    waitForCompanionReady: (
+      child: ChildProcess,
+      error: () => Error | null,
+      companion: unknown
+    ) => Promise<void>;
+  }).waitForCompanionReady = vi.fn().mockResolvedValue(undefined);
   (client as unknown as { waitForPortRelease: () => Promise<void> }).waitForPortRelease =
     vi.fn().mockResolvedValue(undefined);
 
@@ -156,21 +152,14 @@ function createHarness(): Harness {
     modDirectory,
     projectPath,
     executablePath,
-    handlerPath: join(
-      modDirectory,
-      "Scripts",
-      "WorkbenchGame",
-      HANDLER_FOLDER,
-      "EMCP_WB_Ping.c"
-    ),
     config,
     mutexName,
     backend,
     guard,
-    manager,
     client,
     children,
     spawnOptions,
+    spawnArgs,
   };
 }
 
@@ -210,6 +199,35 @@ afterEach(() => {
 });
 
 describe("exact owner-scoped Workbench restart", () => {
+  it("refuses configured NET API calls before touching an unmanaged endpoint", async () => {
+    const harness = createHarness();
+    const rawCall = vi.spyOn(
+      harness.client as unknown as { rawCall: (api: string) => Promise<Record<string, unknown>> },
+      "rawCall"
+    );
+
+    await expect(harness.client.call("EMCP_WB_ListEntities", {}, { skipAutoLaunch: true }))
+      .rejects.toMatchObject({ code: "CONNECTION_REFUSED" });
+    expect(rawCall).not.toHaveBeenCalled();
+  });
+
+  it("permits calls only after exact lifecycle, process, endpoint, and companion attestation", async () => {
+    const harness = createHarness();
+    await harness.client.ensureRunning(harness.projectPath);
+    const rawCall = vi.spyOn(
+      harness.client as unknown as { rawCall: (api: string) => Promise<Record<string, unknown>> },
+      "rawCall"
+    ).mockImplementation(async (api) => api === "EMCP_WB_Ping"
+      ? WORKBENCH_HELPER_PING_RESPONSE
+      : { status: "ok", count: 0 });
+
+    await expect(harness.client.call("EMCP_WB_ListEntities", {}, { skipAutoLaunch: true }))
+      .resolves.toMatchObject({ status: "ok", count: 0 });
+    expect(rawCall.mock.calls.map(([api]) => api)).toEqual([
+      "EMCP_WB_Ping",
+      "EMCP_WB_ListEntities",
+    ]);
+  });
   it("launches an explicit graphical Workbench lifecycle with a visible native viewport", async () => {
     const harness = createHarness();
     await harness.client.ensureRunning(harness.projectPath);
@@ -239,39 +257,15 @@ describe("exact owner-scoped Workbench restart", () => {
     expect(harness.children.every((child) => child.kill.mock.calls.length === 0)).toBe(true);
   });
 
-  it("finishes replacement preflight before stopping a healthy process or touching handlers", async () => {
+  it("finishes companion and executable preflight before stopping a healthy process", async () => {
     const harness = createHarness();
     await harness.client.ensureRunning(harness.projectPath);
-    const installedBytes = readFileSync(harness.handlerPath);
     unlinkSync(harness.executablePath);
 
     await expect(harness.client.restartOwnedWorkbench()).rejects.toMatchObject({
       code: "LAUNCH_FAILED",
     });
     expect(harness.backend.terminationCalls).toHaveLength(0);
-    expect(readFileSync(harness.handlerPath)).toEqual(installedBytes);
-    expect(harness.children).toHaveLength(1);
-  });
-
-  it("validates the complete handler manifest before stopping a healthy process", async () => {
-    const harness = createHarness();
-    await harness.client.ensureRunning(harness.projectPath);
-    const handlerDirectory = join(
-      harness.modDirectory,
-      "Scripts",
-      "WorkbenchGame",
-      HANDLER_FOLDER
-    );
-    const manifestPath = join(handlerDirectory, ".reforger-forge-handler-bundle.json");
-    const installedBytes = readFileSync(harness.handlerPath);
-    writeFileSync(manifestPath, "{ malformed");
-
-    await expect(harness.client.restartOwnedWorkbench()).rejects.toMatchObject({
-      code: "HANDLER_CONFLICT",
-    });
-    expect(harness.backend.terminationCalls).toHaveLength(0);
-    expect(readFileSync(harness.handlerPath)).toEqual(installedBytes);
-    expect(readFileSync(manifestPath, "utf8")).toBe("{ malformed");
     expect(harness.children).toHaveLength(1);
   });
 
@@ -302,7 +296,7 @@ describe("exact owner-scoped Workbench restart", () => {
     let injected = false;
     harness.backend.replaceFailure = ({ next }) => {
       if (!injected && next.phase === "running" && next.workbench !== null &&
-          next.handler?.backupPath === null) {
+          next.companion !== null) {
         injected = true;
         return new Error("injected final CAS failure");
       }
@@ -315,21 +309,20 @@ describe("exact owner-scoped Workbench restart", () => {
     expect(injected).toBe(true);
     expect(harness.backend.terminationCalls).toHaveLength(1);
     expect(harness.backend.workbenchPids.size).toBe(0);
-    expect(existsSync(harness.handlerPath)).toBe(false);
     const read = await harness.guard.readLifecycleState();
     expect(read.kind).toBe("valid");
     if (read.kind === "valid") {
       expect(read.state.phase).toBe("vacant");
       expect(read.state.workbench).toBeNull();
-      expect(read.state.handler).toBeNull();
+      expect(read.state.companion).not.toBeNull();
     }
   });
 
-  it("terminates the exact failed launch before restoring handler bytes", async () => {
+  it("terminates the exact failed launch before returning to vacant", async () => {
     const harness = createHarness();
     (harness.client as unknown as {
-      waitForHandlerReady: () => Promise<void>;
-    }).waitForHandlerReady = vi.fn().mockRejectedValue(new WorkbenchError(
+      waitForCompanionReady: () => Promise<void>;
+    }).waitForCompanionReady = vi.fn().mockRejectedValue(new WorkbenchError(
       "injected readiness failure",
       "LAUNCH_FAILED"
     ));
@@ -339,13 +332,12 @@ describe("exact owner-scoped Workbench restart", () => {
     });
     expect(harness.backend.terminationCalls).toHaveLength(1);
     expect(harness.backend.workbenchPids.size).toBe(0);
-    expect(existsSync(harness.handlerPath)).toBe(false);
     const read = await harness.guard.readLifecycleState();
     expect(read.kind).toBe("valid");
     if (read.kind === "valid") {
       expect(read.state.phase).toBe("vacant");
       expect(read.state.workbench).toBeNull();
-      expect(read.state.handler).toBeNull();
+      expect(read.state.companion).not.toBeNull();
     }
   });
 
@@ -365,21 +357,20 @@ describe("exact owner-scoped Workbench restart", () => {
     expect(harness.backend.endpointOwnershipCalls[0].expected.pid).toBe(harness.children[0].pid);
     expect(harness.backend.terminationCalls).toHaveLength(1);
     expect(harness.backend.workbenchPids.size).toBe(0);
-    expect(existsSync(harness.handlerPath)).toBe(false);
     const read = await harness.guard.readLifecycleState();
     expect(read.kind).toBe("valid");
     if (read.kind === "valid") {
       expect(read.state.phase).toBe("vacant");
       expect(read.state.workbench).toBeNull();
-      expect(read.state.handler).toBeNull();
+      expect(read.state.companion).not.toBeNull();
     }
   });
 
   it("preserves the live failed-launch transaction when exact stop is refused", async () => {
     const harness = createHarness();
     (harness.client as unknown as {
-      waitForHandlerReady: () => Promise<void>;
-    }).waitForHandlerReady = vi.fn().mockRejectedValue(new WorkbenchError(
+      waitForCompanionReady: () => Promise<void>;
+    }).waitForCompanionReady = vi.fn().mockRejectedValue(new WorkbenchError(
       "injected readiness failure",
       "LAUNCH_FAILED"
     ));
@@ -394,40 +385,22 @@ describe("exact owner-scoped Workbench restart", () => {
     });
     expect(harness.backend.terminationCalls).toHaveLength(1);
     expect(harness.backend.workbenchPids.size).toBe(1);
-    expect(existsSync(harness.handlerPath)).toBe(true);
     const read = await harness.guard.readLifecycleState();
     expect(read.kind).toBe("valid");
     if (read.kind === "valid") {
       expect(read.state.phase).toBe("starting");
       expect(read.state.workbench).not.toBeNull();
-      expect(read.state.handler?.backupPath).toBeTruthy();
-      expect(read.state.handler?.transactionId).toBeTruthy();
+      expect(read.state.companion).not.toBeNull();
     }
   });
 
-  it("shuts down exactly, then permits manifest-scoped cleanup", async () => {
+  it("shuts down exactly and makes a second shutdown a no-op", async () => {
     const harness = createHarness();
     const launched = await harness.client.ensureRunning(harness.projectPath);
-    const handlerDirectory = join(
-      harness.modDirectory,
-      "Scripts",
-      "WorkbenchGame",
-      HANDLER_FOLDER
-    );
-    const unrelated = join(handlerDirectory, "UserOwned.txt");
-    writeFileSync(unrelated, "preserve me");
-
-    await expect(harness.client.cleanupHandlerScripts(harness.modDirectory)).rejects.toMatchObject({
-      code: "CLEANUP_BLOCKED_LIVE",
-    });
     const shutdown = await harness.client.shutdownOwnedWorkbench();
-    const cleanup = await harness.client.cleanupHandlerScripts(harness.modDirectory);
 
     expect(shutdown).toMatchObject({ stopped: true, previousPid: launched.pid });
     expect(harness.backend.terminationCalls).toHaveLength(1);
-    expect(cleanup.kind).toBe("removed");
-    expect(existsSync(harness.handlerPath)).toBe(false);
-    expect(readFileSync(unrelated, "utf8")).toBe("preserve me");
     expect(harness.children[0].kill).not.toHaveBeenCalled();
 
     const secondShutdown = await harness.client.shutdownOwnedWorkbench();
@@ -469,54 +442,6 @@ describe("exact owner-scoped Workbench restart", () => {
     });
     expect(harness.backend.terminationCalls).toHaveLength(0);
     expect(harness.backend.workbenchPids.has(launched.pid)).toBe(true);
-  });
-
-  it("returns RECOVERY_REQUIRED before restoring a cross-bound transaction mismatch", async () => {
-    const harness = createHarness();
-    (harness.client as unknown as {
-      waitForHandlerReady: () => Promise<void>;
-    }).waitForHandlerReady = vi.fn().mockRejectedValue(new WorkbenchError(
-      "injected readiness failure",
-      "LAUNCH_FAILED"
-    ));
-    harness.backend.terminationResult = {
-      kind: "refused",
-      reason: "access_denied",
-      message: "preserve interrupted transaction",
-    };
-    await expect(harness.client.ensureRunning(harness.projectPath)).rejects.toMatchObject({
-      code: "RECOVERY_REQUIRED",
-    });
-
-    const interrupted = await harness.guard.readLifecycleState();
-    expect(interrupted.kind).toBe("valid");
-    if (interrupted.kind !== "valid" || !interrupted.state.handler?.backupPath) return;
-    const watchedBytes = readFileSync(harness.handlerPath);
-    const backupPath = interrupted.state.handler.backupPath;
-    const pid = interrupted.state.workbench!.pid;
-    harness.backend.terminationResult = null;
-    harness.backend.processes.delete(pid);
-    harness.backend.workbenchPids.delete(pid);
-    writeFileSync(harness.guard.statePath, `${JSON.stringify({
-      ...interrupted.state,
-      handler: {
-        ...interrupted.state.handler,
-        transactionId: "cross-bound-to-a-different-transaction",
-      },
-    }, null, 2)}\n`, "utf8");
-
-    await expect(harness.client.shutdownOwnedWorkbench()).rejects.toMatchObject({
-      code: "RECOVERY_REQUIRED",
-    });
-    expect(readFileSync(harness.handlerPath)).toEqual(watchedBytes);
-    expect(existsSync(backupPath)).toBe(true);
-    const after = await harness.guard.readLifecycleState();
-    expect(after.kind).toBe("valid");
-    if (after.kind === "valid") {
-      expect(after.state.phase).toBe("starting");
-      expect(after.state.handler?.transactionId)
-        .toBe("cross-bound-to-a-different-transaction");
-    }
   });
 
   it("fails closed when this MCP has no exact running owner", async () => {
@@ -584,7 +509,7 @@ describe("exact owner-scoped Workbench restart", () => {
           target: state.target,
           mcpOwner,
           workbench: state.workbench,
-          handler: state.handler,
+          companion: state.companion,
           operation: { kind: "launch", operationId: "recovery-fixture" },
         }
       );
@@ -611,7 +536,6 @@ describe("exact owner-scoped Workbench restart", () => {
     const contenderGuard = new WorkbenchProcessGuard({
       backend: harness.backend,
       stateDir: harness.guard.stateDir,
-      legacyStatePath: join(harness.root, "contender-legacy.json"),
       mutexName: harness.mutexName,
     });
     const contender = new WorkbenchClient(
@@ -620,7 +544,11 @@ describe("exact owner-scoped Workbench restart", () => {
       harness.config,
       "contender",
       contenderGuard,
-      { handlerBundle: harness.manager }
+      {
+        companionProvider: fakeCompanionProvider(createFakeCompanionLaunch(
+          join(harness.root, "contender-helper")
+        )),
+      }
     );
 
     await expect(contender.ensureRunning(harness.projectPath)).rejects.toMatchObject({
@@ -632,12 +560,8 @@ describe("exact owner-scoped Workbench restart", () => {
     await expect(contender.shutdownOwnedWorkbench()).rejects.toMatchObject({
       code: "OWNED_BY_OTHER_MCP",
     });
-    await expect(contender.cleanupHandlerScripts(harness.modDirectory)).rejects.toMatchObject({
-      code: "OWNED_BY_OTHER_MCP",
-    });
     expect(harness.backend.terminationCalls).toHaveLength(0);
     expect(harness.children).toHaveLength(1);
-    expect(existsSync(harness.handlerPath)).toBe(true);
   });
 
   it("deduplicates concurrent launches of the same canonical target", async () => {
@@ -647,8 +571,8 @@ describe("exact owner-scoped Workbench restart", () => {
     const entered = new Promise<void>((resolvePromise) => { enteredReady = resolvePromise; });
     const blocked = new Promise<void>((resolvePromise) => { releaseReady = resolvePromise; });
     (harness.client as unknown as {
-      waitForHandlerReady: () => Promise<void>;
-    }).waitForHandlerReady = vi.fn(async () => {
+      waitForCompanionReady: () => Promise<void>;
+    }).waitForCompanionReady = vi.fn(async () => {
       enteredReady();
       await blocked;
     });
@@ -676,8 +600,8 @@ describe("exact owner-scoped Workbench restart", () => {
     const entered = new Promise<void>((resolvePromise) => { enteredReady = resolvePromise; });
     const blocked = new Promise<void>((resolvePromise) => { releaseReady = resolvePromise; });
     (harness.client as unknown as {
-      waitForHandlerReady: () => Promise<void>;
-    }).waitForHandlerReady = vi.fn(async () => {
+      waitForCompanionReady: () => Promise<void>;
+    }).waitForCompanionReady = vi.fn(async () => {
       enteredReady();
       await blocked;
     });
@@ -691,12 +615,6 @@ describe("exact owner-scoped Workbench restart", () => {
     await launching;
 
     expect(harness.children).toHaveLength(1);
-    expect(existsSync(join(
-      join(harness.root, "projects", "OtherMod"),
-      "Scripts",
-      "WorkbenchGame",
-      HANDLER_FOLDER
-    ))).toBe(false);
   });
 
   it("refuses target B while restart A is paused after exact old-process exit", async () => {

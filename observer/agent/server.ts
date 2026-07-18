@@ -1,5 +1,7 @@
 import { createHash, timingSafeEqual } from "node:crypto";
+import { existsSync, lstatSync, readdirSync, rmSync, statSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { join, sep } from "node:path";
 import { isIP } from "node:net";
 import { ZodError } from "zod";
 import { AGENT_VERSION, DEFAULT_LIMITS, MAX_PROTOCOL_MESSAGE_BYTES, PROTOCOL_VERSION } from "../protocol/index.js";
@@ -11,6 +13,7 @@ import { observerLogger } from "./logger.js";
 import { MailboxCoordinator } from "./mailbox-coordinator.js";
 import { InstanceRegistry } from "./registry.js";
 import { ObserverRuntimeApi } from "./runtime-api.js";
+import { ObserverRunStore } from "./runs.js";
 
 export interface ObserverAgentServerOptions {
   host?: "127.0.0.1" | "::1";
@@ -108,6 +111,7 @@ export class ObserverAgentServer {
     readonly registry: InstanceRegistry,
     readonly jobs: JobStore,
     readonly artifacts: ArtifactStore,
+    readonly runs: ObserverRunStore,
     private readonly options: ObserverAgentServerOptions = {}
   ) {
     this.runtime = new ObserverRuntimeApi(control.sessions, registry, jobs, artifacts);
@@ -164,9 +168,15 @@ export class ObserverAgentServer {
       if (now - this.lastRetentionAt >= retentionIntervalMs) {
         this.lastRetentionAt = now;
         try {
+          const maxAgeMs = this.options.retentionMaxAgeMs ?? 7 * 24 * 60 * 60 * 1_000;
+          const maxBytes = this.options.retentionMaxBytes ?? 512 * 1024 * 1024;
+          this.runs.applyRetention(maxAgeMs);
+          const auxiliaryBytes = this.sweepAuxiliaryStorage(maxAgeMs, maxBytes) +
+            this.directoryUsage(this.control.paths.runs).bytes;
           this.artifacts.applyRetention(
-            this.options.retentionMaxAgeMs ?? 7 * 24 * 60 * 60 * 1_000,
-            this.options.retentionMaxBytes ?? 512 * 1024 * 1024
+            maxAgeMs,
+            Math.max(0, maxBytes - auxiliaryBytes),
+            this.runs.protectedStoreKeys()
           );
         } catch (error) {
           observerLogger.warn("artifact retention sweep failed", {
@@ -183,6 +193,75 @@ export class ObserverAgentServer {
     }, 1_000);
     this.sweepTimer.unref();
     return this.descriptor;
+  }
+
+  managedStorageDiagnostics(): Record<string, unknown> {
+    return {
+      artifacts: this.directoryUsage(this.control.paths.artifacts),
+      runs: this.directoryUsage(this.control.paths.runs),
+      profiles: this.directoryUsage(this.control.profileRoot),
+      exportWork: this.directoryUsage(this.control.paths.exportWork),
+      logs: this.directoryUsage(this.control.paths.logs),
+      runStore: this.runs.diagnostics(),
+    };
+  }
+
+  private directoryUsage(root: string): { bytes: number; files: number; directories: number } {
+    const result = { bytes: 0, files: 0, directories: 0 };
+    if (!existsSync(root)) return result;
+    const visit = (directory: string): void => {
+      for (const entry of readdirSync(directory, { withFileTypes: true })) {
+        const path = join(directory, entry.name);
+        if (entry.isSymbolicLink()) continue;
+        if (entry.isDirectory()) {
+          result.directories += 1;
+          visit(path);
+        } else if (entry.isFile()) {
+          result.files += 1;
+          result.bytes += statSync(path).size;
+        }
+      }
+    };
+    visit(root);
+    return result;
+  }
+
+  private sweepAuxiliaryStorage(maxAgeMs: number, maxBytes: number): number {
+    const activeProfiles = new Set(this.control.sessions.activeRecords().map((record) =>
+      process.platform === "win32" ? record.profilePath.toLowerCase() : record.profilePath
+    ));
+    const candidates: Array<{ path: string; bytes: number; mtimeMs: number; protected: boolean }> = [];
+    for (const [root, protectProfiles] of [
+      [this.control.profileRoot, true],
+      [this.control.paths.logs, false],
+      [this.control.paths.exportWork, false],
+    ] as const) {
+      if (!existsSync(root)) continue;
+      for (const entry of readdirSync(root, { withFileTypes: true })) {
+        if (entry.isSymbolicLink()) continue;
+        const path = join(root, entry.name);
+        const info = lstatSync(path);
+        if (!info.isDirectory() && !info.isFile()) continue;
+        const key = process.platform === "win32" ? path.toLowerCase() : path;
+        candidates.push({
+          path,
+          bytes: info.isDirectory() ? this.directoryUsage(path).bytes : info.size,
+          mtimeMs: info.mtimeMs,
+          protected: protectProfiles && [...activeProfiles].some((active) => active === key || active.startsWith(`${key}${sep}`)),
+        });
+      }
+    }
+    candidates.sort((left, right) => left.mtimeMs - right.mtimeMs);
+    let total = candidates.reduce((sum, item) => sum + item.bytes, 0);
+    const now = Date.now();
+    for (const item of candidates) {
+      if (item.protected) continue;
+      if (now - item.mtimeMs <= maxAgeMs && total <= maxBytes) continue;
+      const info = lstatSync(item.path);
+      rmSync(item.path, { recursive: info.isDirectory(), force: false });
+      total -= item.bytes;
+    }
+    return total;
   }
 
   async close(): Promise<void> {

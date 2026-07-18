@@ -6,6 +6,7 @@ import {
   decodeInt32LE,
   encodePascalString,
 } from "../../src/workbench/protocol.js";
+import { WORKBENCH_HELPER_PING_RESPONSE } from "./fake-companion.js";
 
 /**
  * Create a mock Workbench NET API server that:
@@ -70,7 +71,7 @@ describe("WorkbenchClient", () => {
   beforeEach(() => {
     mockServer = createMockWorkbench((apiFunc, params) => {
       if (apiFunc === "EMCP_WB_Ping") {
-        return { status: "ok", mode: "edit", message: "EnfusionMCP Workbench bridge active" };
+        return WORKBENCH_HELPER_PING_RESPONSE;
       }
       if (apiFunc === "GetLoadedProjects") {
         return { "Loaded Projects": ["ArmaReforger", "TestMod"] };
@@ -121,6 +122,14 @@ describe("WorkbenchClient", () => {
     const deadClient = new WorkbenchClient("127.0.0.1", 1); // port 1 should refuse
     const ok = await deadClient.ping();
     expect(ok).toBe(false);
+  });
+
+  it("ping rejects a generic bridge response without the exact companion identity", async () => {
+    await mockServer.close();
+    mockServer = createMockWorkbench(() => ({ status: "ok", mode: "edit" }));
+    const unidentified = new WorkbenchClient("127.0.0.1", mockServer.port);
+
+    await expect(unidentified.ping()).resolves.toBe(false);
   });
 
   it("throws CONNECTION_REFUSED on bad port", async () => {

@@ -8,7 +8,7 @@ import { classifyMenuAction } from "../../src/tools/wb-execute-action.js";
 const testDir = dirname(fileURLToPath(import.meta.url));
 const handler = (name: string): string => readFileSync(resolve(
   testDir,
-  `../../mod/Scripts/WorkbenchGame/EnfusionMCP/${name}`
+  `../../observer/workbench-addon/Scripts/WorkbenchGame/EnfusionMCP/${name}`
 ), "utf8");
 
 describe("Workbench unattended lifecycle safety", () => {

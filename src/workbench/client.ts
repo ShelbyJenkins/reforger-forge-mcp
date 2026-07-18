@@ -10,11 +10,10 @@ import { randomUUID } from "node:crypto";
 import { spawn, type ChildProcess, type SpawnOptions } from "node:child_process";
 import {
   existsSync,
-  readdirSync,
   realpathSync,
   statSync,
 } from "node:fs";
-import { dirname, extname, join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Socket } from "node:net";
 import type { Config } from "../config.js";
@@ -28,13 +27,21 @@ import {
 } from "./activity-gate.js";
 import { decodeResponse, encodeRequest } from "./protocol.js";
 import {
-  HandlerBundleError,
-  HandlerBundleManager,
-  HANDLER_FOLDER,
-  type HandlerCleanupResult,
-  type HandlerTransactionRecord,
-  type PreparedHandlerTransaction,
-} from "./handler-bundle.js";
+  WORKBENCH_HELPER_ADDON_GUID,
+  WORKBENCH_HELPER_ADDON_ID,
+  WORKBENCH_HELPER_ADDON_VERSION,
+  WORKBENCH_HELPER_BUILD_IDENTITY,
+  WORKBENCH_HELPER_PROTOCOL_VERSION,
+  WorkbenchHelperStager,
+  defaultWorkbenchHelperManagedRoot,
+  defaultWorkbenchHelperSource,
+  verifyWorkbenchHelperSource,
+  type WorkbenchCompanionLaunch,
+  type WorkbenchCompanionManagedStatus,
+  type WorkbenchCompanionProvider,
+  type WorkbenchCompanionRetentionResult,
+  type WorkbenchCompanionUninstallResult,
+} from "./helper-addon.js";
 import {
   ProjectIdentityError,
   canonicalizeGproj,
@@ -46,13 +53,13 @@ import {
   WorkbenchProcessGuard,
   LifecycleGuardError,
   type ExpectedStateVersion,
-  type HandlerLifecycleState,
   type LifecycleClaimResult,
   type LifecycleOperationKind,
   type LifecycleStateDraft,
+  type WorkbenchCompanionLifecycleState,
   type WorkbenchIdentity,
   type WorkbenchLifecycleSession,
-  type WorkbenchLifecycleStateV2,
+  type WorkbenchLifecycleStateV3,
 } from "./process-guard.js";
 
 const DEFAULT_CLIENT_ID = "EnfusionMCP";
@@ -100,12 +107,19 @@ export interface WorkbenchShutdownResult {
   generation: string;
 }
 
+export interface WorkbenchCompanionLaunchArguments {
+  readonly addonGuid: string;
+  readonly addonSearchRoot: string;
+  readonly workbenchProfilePath: string;
+}
+
 /**
  * Immutable, already-running Workbench identity handed to observer adapters.
  * The private owner-token argument remains inside the lifecycle subsystem.
  */
 export interface WorkbenchObserverSnapshot {
   readonly generation: string;
+  readonly companion: Readonly<WorkbenchCompanionLifecycleState>;
   readonly target: {
     readonly path: string;
     readonly comparisonKey: string;
@@ -125,7 +139,7 @@ export interface WorkbenchObserverSnapshot {
 export type WorkbenchCaptureActivityLease = CaptureActivityLease;
 
 export interface LifecycleDiagnostic {
-  state: "missing" | "valid" | "legacy" | "malformed";
+  state: "missing" | "valid" | "malformed";
   version: number | null;
   generation: string | null;
   phase: string | null;
@@ -133,7 +147,7 @@ export interface LifecycleDiagnostic {
   target: string | null;
   lease: "current_mcp" | "other_mcp" | "vacant" | "unknown";
   operation: string | null;
-  handlerTransaction: string | null;
+  companionBuildIdentity: string | null;
   detail?: string;
 }
 
@@ -143,10 +157,14 @@ export interface DiagnosticReport {
   workbenchExe: { path: string; exists: boolean } | null;
   projectPath: { path: string; exists: boolean } | null;
   defaultMod: string | null;
-  bundledScripts: { path: string; exists: boolean };
-  standaloneAddon: { path: string; exists: boolean; fileCount: number };
-  installedMods: Array<{ modDir: string; handlerDir: string; fileCount: number }>;
-  netApi: "up_with_handlers" | "up_no_handlers" | "refused" | "timeout" | "error";
+  companionAddon: {
+    addonId: string;
+    addonGuid: string;
+    path: string;
+    buildIdentity: string;
+    bundleDigest: string;
+  } | null;
+  netApi: "up_with_companion" | "up_no_companion" | "refused" | "timeout" | "error";
   netApiError?: string;
   lifecycle: LifecycleDiagnostic;
 }
@@ -166,11 +184,8 @@ export type WorkbenchErrorCode =
   | "UNOWNED_WORKBENCH"
   | "ENDPOINT_CONFLICT"
   | "USER_CONFLICT"
-  | "LEGACY_OWNER"
   | "IDENTITY_UNVERIFIABLE"
   | "STATE_INVALID"
-  | "CLEANUP_BLOCKED_LIVE"
-  | "HANDLER_CONFLICT"
   | "RECOVERY_REQUIRED"
   | "UNSUPPORTED_PLATFORM"
   | "LIFECYCLE_BUSY"
@@ -192,7 +207,8 @@ export function buildWorkbenchLaunchArgs(
   configuredAddonDirs?: readonly string[],
   scriptAuthorizeAll = false,
   noThrow = false,
-  ownerArgument?: string
+  ownerArgument?: string,
+  companion?: WorkbenchCompanionLaunchArguments
 ): string[] {
   const args: string[] = [];
   const addonDirs: string[] = [];
@@ -205,7 +221,11 @@ export function buildWorkbenchLaunchArgs(
       "LAUNCH_FAILED"
     );
   }
-  for (const configuredDir of configuredAddonDirs ?? []) {
+  const requestedAddonDirs = [
+    ...(configuredAddonDirs ?? []),
+    ...(companion ? [companion.addonSearchRoot] : []),
+  ];
+  for (const configuredDir of requestedAddonDirs) {
     if (typeof configuredDir !== "string" || configuredDir.trim().length === 0) {
       throw new WorkbenchError(
         "Workbench addon directories must be non-empty paths.",
@@ -241,6 +261,21 @@ export function buildWorkbenchLaunchArgs(
     );
   }
   if (addonDirs.length > 0) args.push("-addonsDir", addonDirs.join(","));
+  if (companion) {
+    if (!/^[A-Fa-f0-9]{16}$/.test(companion.addonGuid)) {
+      throw new WorkbenchError("Workbench companion add-on GUID is invalid.", "LAUNCH_FAILED");
+    }
+    const profilePath = resolve(companion.workbenchProfilePath);
+    try {
+      if (!statSync(profilePath).isDirectory()) throw new Error("not a directory");
+    } catch {
+      throw new WorkbenchError(
+        `Workbench companion profile path is not a directory: ${profilePath}`,
+        "LAUNCH_FAILED"
+      );
+    }
+    args.push("-addons", companion.addonGuid, "-profile", profilePath);
+  }
   if (gprojPath) args.push("-gproj", gprojPath);
   if (scriptAuthorizeAll) args.push("-scriptAuthorizeAll");
   if (noThrow) args.push("-noThrow");
@@ -250,6 +285,7 @@ export function buildWorkbenchLaunchArgs(
 
 interface LaunchPreflight {
   project: CanonicalProjectIdentity;
+  companion: WorkbenchCompanionLaunch;
   executablePath: string;
   cwd: string;
   args: string[];
@@ -269,10 +305,10 @@ interface ActiveLifecycleOperation {
   promise: Promise<unknown>;
 }
 
-type StoredLifecycleTarget = NonNullable<WorkbenchLifecycleStateV2["target"]>;
+type StoredLifecycleTarget = NonNullable<WorkbenchLifecycleStateV3["target"]>;
 
 export interface WorkbenchClientDependencies {
-  handlerBundle?: HandlerBundleManager;
+  companionProvider?: WorkbenchCompanionProvider;
   spawnProcess?: (command: string, args: string[], options: SpawnOptions) => ChildProcess;
   launchTimeoutMs?: number;
   launchPollIntervalMs?: number;
@@ -298,12 +334,12 @@ function observerBinding(snapshot: WorkbenchObserverSnapshot): CaptureActivityBi
   };
 }
 
-function stateExpected(state: WorkbenchLifecycleStateV2): ExpectedStateVersion {
+function stateExpected(state: WorkbenchLifecycleStateV3): ExpectedStateVersion {
   return { generation: state.generation, leaseId: state.mcpOwner?.leaseId ?? null };
 }
 
 function stateDraft(
-  state: WorkbenchLifecycleStateV2,
+  state: WorkbenchLifecycleStateV3,
   overrides: Partial<LifecycleStateDraft>
 ): LifecycleStateDraft {
   return {
@@ -312,22 +348,22 @@ function stateDraft(
     target: overrides.target === undefined ? state.target : overrides.target,
     mcpOwner: overrides.mcpOwner === undefined ? state.mcpOwner : overrides.mcpOwner,
     workbench: overrides.workbench === undefined ? state.workbench : overrides.workbench,
-    handler: overrides.handler === undefined ? state.handler : overrides.handler,
+    companion: overrides.companion === undefined ? state.companion : overrides.companion,
     operation: overrides.operation === undefined ? state.operation : overrides.operation,
   };
 }
 
-function handlerState(
-  transaction: HandlerTransactionRecord,
-  phase: HandlerLifecycleState["phase"],
-  keepTransaction = true
-): HandlerLifecycleState {
+function companionLifecycleState(
+  companion: WorkbenchCompanionLaunch
+): WorkbenchCompanionLifecycleState {
   return {
-    modDirectory: transaction.modDirectory,
-    manifestGeneration: transaction.manifest.generation,
-    transactionId: keepTransaction ? transaction.id : null,
-    phase,
-    backupPath: keepTransaction ? transaction.backupPath : null,
+    addonId: companion.addonId,
+    addonGuid: companion.addonGuid,
+    addonDirectory: companion.addonDirectory,
+    addonSearchRoot: companion.addonSearchRoot,
+    bundleDigest: companion.bundleDigest,
+    buildIdentity: companion.buildIdentity,
+    profilePath: companion.workbenchProfilePath,
   };
 }
 
@@ -335,8 +371,8 @@ export class WorkbenchClient {
   private activeLifecycle: ActiveLifecycleOperation | null = null;
   private ownedChild: OwnedChildObservation | null = null;
   private _state: WorkbenchState = { connected: false, mode: "unknown", lastUpdated: 0 };
-  private readonly handlerBundle: HandlerBundleManager;
   private readonly spawnProcess: WorkbenchClientDependencies["spawnProcess"];
+  private readonly companionProvider: WorkbenchCompanionProvider | undefined;
   private readonly launchTimeoutMs: number;
   private readonly launchPollIntervalMs: number;
   private readonly activityGate: WorkbenchActivityGate;
@@ -353,9 +389,11 @@ export class WorkbenchClient {
     private readonly processGuard: WorkbenchProcessGuard = new WorkbenchProcessGuard(),
     dependencies: WorkbenchClientDependencies = {}
   ) {
-    this.handlerBundle = dependencies.handlerBundle ?? new HandlerBundleManager({
-      stateDir: this.processGuard.stateDir,
-    });
+    this.companionProvider = dependencies.companionProvider ?? (config
+      ? new WorkbenchHelperStager({
+          managedRoot: config.observer?.managedRoot ?? defaultWorkbenchHelperManagedRoot(),
+        })
+      : undefined);
     this.spawnProcess = dependencies.spawnProcess ?? ((command, args, options) =>
       spawn(command, args, options));
     this.launchTimeoutMs = dependencies.launchTimeoutMs ?? LAUNCH_TIMEOUT_MS;
@@ -371,8 +409,11 @@ export class WorkbenchClient {
     params: Record<string, unknown> = {},
     options: WorkbenchCallOptions = {}
   ): Promise<T> {
+    const invoke = (): Promise<T> => this.config
+      ? this.callManagedAndCache<T>(apiFunc, params, options)
+      : this.callAndCache<T>(apiFunc, params, options);
     try {
-      return await this.callAndCache<T>(apiFunc, params, options);
+      return await invoke();
     } catch (error) {
       if (error instanceof WorkbenchError) {
         if (["CONNECTION_REFUSED", "TIMEOUT", "PROTOCOL_ERROR"].includes(error.code)) {
@@ -381,14 +422,14 @@ export class WorkbenchClient {
         if (!options.skipAutoLaunch && this.config && error.code === "CONNECTION_REFUSED") {
           logger.info("Workbench is unavailable; requesting target-aware auto-launch.");
           await this.ensureRunning();
-          return this.callAndCache<T>(apiFunc, params, options);
+          return invoke();
         }
         if (!options.skipAutoLaunch && this.config && error.code === "API_ERROR" &&
             (error.message.includes("Undefined API func") ||
               error.message.includes("not existing Net API function"))) {
           logger.info("Owned Workbench handlers are unavailable; requesting a clean lifecycle restart.");
           await this.restartOwnedWorkbench();
-          return this.callAndCache<T>(apiFunc, params, options);
+          return invoke();
         }
       }
       throw error;
@@ -406,8 +447,17 @@ export class WorkbenchClient {
 
   async ping(): Promise<boolean> {
     try {
-      await this.rawCall("EMCP_WB_Ping", {}, { timeout: 3000, skipAutoLaunch: true });
-      return true;
+      const response = await this.rawCall<Record<string, unknown>>(
+        "EMCP_WB_Ping",
+        {},
+        { timeout: 3000, skipAutoLaunch: true }
+      );
+      return response.status === "ok" &&
+        response.helperAddonId === WORKBENCH_HELPER_ADDON_ID &&
+        response.helperAddonGuid === WORKBENCH_HELPER_ADDON_GUID &&
+        response.helperAddonVersion === WORKBENCH_HELPER_ADDON_VERSION &&
+        response.helperProtocolVersion === WORKBENCH_HELPER_PROTOCOL_VERSION &&
+        response.helperBuildIdentity === WORKBENCH_HELPER_BUILD_IDENTITY;
     } catch {
       return false;
     }
@@ -419,89 +469,8 @@ export class WorkbenchClient {
    */
   async getRunningObserverSnapshot(): Promise<WorkbenchObserverSnapshot> {
     try {
-      return await this.processGuard.withLifecycleLock(async (session) => {
-        const read = await session.readState();
-        if (read.kind !== "valid") {
-          throw new WorkbenchError(
-            "Observer capture requires a valid version-2 Workbench lifecycle record.",
-            "STATE_INVALID"
-          );
-        }
-        const state = read.state;
-        if (state.phase !== "running" || state.operation !== null) {
-          throw new WorkbenchError(
-            `Observer capture requires an idle running Workbench; lifecycle phase is ${state.phase}.`,
-            "LIFECYCLE_BUSY"
-          );
-        }
-
-        const owner = state.mcpOwner;
-        const current = session.mcp;
-        if (!owner || owner.instanceId !== current.instanceId || owner.leaseId !== current.leaseId ||
-            owner.pid !== current.pid || owner.creationTime !== current.creationTime ||
-            pathKey(owner.executablePath) !== pathKey(current.executablePath) ||
-            owner.userSid !== current.userSid) {
-          throw new WorkbenchError(
-            "Observer capture requires the exact Workbench lifecycle lease owned by this MCP instance.",
-            owner ? "OWNED_BY_OTHER_MCP" : "UNOWNED_WORKBENCH"
-          );
-        }
-        if (!state.target) {
-          throw new WorkbenchError(
-            "Observer capture requires a recorded canonical Workbench project target.",
-            "TARGET_REQUIRED"
-          );
-        }
-        if (!state.workbench) {
-          throw new WorkbenchError(
-            "Observer capture requires an already-running exact owned Workbench process.",
-            "UNOWNED_WORKBENCH"
-          );
-        }
-
-        const configuredHost = this.host.trim().toLowerCase().replace(/^\[|\]$/g, "");
-        if (state.endpoint.host !== configuredHost || state.endpoint.port !== this.port) {
-          throw new WorkbenchError(
-            `Recorded Workbench endpoint ${state.endpoint.host}:${state.endpoint.port} does not ` +
-              `match this client endpoint ${configuredHost}:${this.port}.`,
-            "ENDPOINT_CONFLICT"
-          );
-        }
-
-        const canonicalTarget = canonicalizeGproj(state.target.path);
-        if (canonicalTarget.comparisonKey !== state.target.comparisonKey) {
-          throw new WorkbenchError(
-            `Recorded Workbench target ${state.target.path} changed canonical identity.`,
-            "TARGET_CHANGED"
-          );
-        }
-        if (await this.inspectRecordedWorkbench(state) !== "live") {
-          throw new WorkbenchError(
-            "Recorded exact owned Workbench exited before observer snapshot acquisition.",
-            "IDENTITY_UNVERIFIABLE"
-          );
-        }
-        await this.assertEndpointOwnedByRecordedWorkbench(
-          session,
-          state.workbench,
-          "observer snapshot"
-        );
-
-        return Object.freeze({
-          generation: state.generation,
-          target: Object.freeze({
-            path: canonicalTarget.displayPath,
-            comparisonKey: canonicalTarget.comparisonKey,
-          }),
-          endpoint: Object.freeze({ ...state.endpoint }),
-          process: Object.freeze({
-            pid: state.workbench.pid,
-            executablePath: state.workbench.executablePath,
-            creationTime: state.workbench.creationTime,
-            launchedAtMs: state.workbench.launchedAtMs,
-          }),
-        });
-      });
+      return await this.processGuard.withLifecycleLock((session) =>
+        this.validateManagedRunningState(session, "observer capture", false));
     } catch (error) {
       throw this.mapLifecycleError(error);
     }
@@ -595,67 +564,6 @@ export class WorkbenchClient {
     }
   }
 
-  async cleanupHandlerScripts(modDir: string): Promise<HandlerCleanupResult> {
-    const project = this.projectFromModDirectory(modDir);
-    try {
-      return await this.activityGate.runLifecycle("cleanup", () =>
-        this.coordinateLifecycle("cleanup", project.comparisonKey, async (operationId) =>
-          this.processGuard.withLifecycleLock(async (session) => {
-            const lockedProject = revalidateProjectIdentity(project);
-            let state = await this.claimState(session, lockedProject);
-            const processStatus = await this.inspectRecordedWorkbench(state);
-            if (processStatus === "live") {
-              throw new WorkbenchError(
-                `Cleanup is blocked while Workbench PID ${state.workbench!.pid} may be watching ` +
-                  `${project.displayPath}. Call wb_shutdown first.`,
-                "CLEANUP_BLOCKED_LIVE"
-              );
-            }
-            if (processStatus === "absent") {
-              state = await this.reconcileAbsentState(
-                session,
-                state,
-                this.lifecycleTarget(lockedProject)
-              );
-            }
-            await this.assertNoWorkbenchProcesses(session, "cleanup");
-            state = await session.transition(stateExpected(state), stateDraft(state, {
-              phase: "cleaning",
-              target: this.lifecycleTarget(lockedProject),
-              operation: { kind: "cleanup", operationId },
-              handler: state.handler ? { ...state.handler, phase: "cleaning" } : null,
-            }));
-            try {
-              const result = this.handlerBundle.cleanup(lockedProject);
-              const manifest = this.handlerBundle.readManifest(lockedProject.modDirectory);
-              const nextHandler = manifest ? {
-                modDirectory: lockedProject.modDirectory,
-                manifestGeneration: manifest.generation,
-                transactionId: null,
-                phase: "installed" as const,
-                backupPath: null,
-              } : null;
-              await session.transitionToVacant(stateExpected(state), {
-                target: this.lifecycleTarget(lockedProject),
-                handler: nextHandler,
-              });
-              return result;
-            } catch (error) {
-              await session.transition(stateExpected(state), stateDraft(state, {
-                phase: "vacant",
-                operation: null,
-                handler: state.handler ? { ...state.handler, phase: "installed" } : null,
-              })).catch(() => undefined);
-              throw this.mapLifecycleError(error);
-            }
-          })
-        )
-      );
-    } catch (error) {
-      throw this.mapLifecycleError(error);
-    }
-  }
-
   async diagnose(): Promise<DiagnosticReport> {
     const workbenchExePath = this.config
       ? this.findWorkbenchExe() ?? join(this.config.workbenchPath, WORKBENCH_SUBDIR, WORKBENCH_EXE)
@@ -663,45 +571,38 @@ export class WorkbenchClient {
     const projectPath = this.config?.projectPath
       ? { path: this.config.projectPath, exists: existsSync(this.config.projectPath) }
       : null;
-    const bundledScripts = {
-      path: this.handlerBundle.bundleDir,
-      exists: existsSync(this.handlerBundle.bundleDir),
-    };
-    const standaloneBase = this.config?.projectPath
-      ? join(this.config.projectPath, HANDLER_FOLDER)
-      : join("<unknown>", HANDLER_FOLDER);
-    const standaloneScripts = join(standaloneBase, "Scripts", "WorkbenchGame", HANDLER_FOLDER);
-    const standaloneAddon = {
-      path: standaloneBase,
-      exists: existsSync(standaloneBase),
-      fileCount: existsSync(standaloneScripts)
-        ? readdirSync(standaloneScripts).filter((name) => name.toLowerCase().endsWith(".c")).length
-        : 0,
-    };
-    const installedMods: DiagnosticReport["installedMods"] = [];
-    if (this.config?.projectPath && existsSync(this.config.projectPath)) {
-      try {
-        for (const entry of readdirSync(this.config.projectPath, { withFileTypes: true })) {
-          if (!entry.isDirectory()) continue;
-          const modDir = join(this.config.projectPath, entry.name);
-          const handlerDir = join(modDir, "Scripts", "WorkbenchGame", HANDLER_FOLDER);
-          if (!existsSync(handlerDir)) continue;
-          installedMods.push({
-            modDir,
-            handlerDir,
-            fileCount: readdirSync(handlerDir).filter((name) => name.toLowerCase().endsWith(".c")).length,
-          });
-        }
-      } catch {
-        // Diagnostics remain best effort and non-mutating.
-      }
+    let companionAddon: DiagnosticReport["companionAddon"] = null;
+    try {
+      const verified = verifyWorkbenchHelperSource(defaultWorkbenchHelperSource());
+      companionAddon = {
+        addonId: verified.manifest.addonId,
+        addonGuid: verified.manifest.addonGuid,
+        path: verified.sourceDirectory,
+        buildIdentity: verified.manifest.buildIdentity,
+        bundleDigest: verified.manifest.bundleDigest,
+      };
+    } catch {
+      // Diagnostics are read-only and best-effort; launch reports the exact stage error.
     }
-
     let netApi: DiagnosticReport["netApi"] = "refused";
     let netApiError: string | undefined;
     try {
-      await this.rawCall("EMCP_WB_Ping", {}, { timeout: 3000, skipAutoLaunch: true });
-      netApi = "up_with_handlers";
+      const response = await this.rawCall<Record<string, unknown>>(
+        "EMCP_WB_Ping",
+        {},
+        { timeout: 3000, skipAutoLaunch: true }
+      );
+      if (response.status === "ok" &&
+          response.helperAddonId === WORKBENCH_HELPER_ADDON_ID &&
+          response.helperAddonGuid === WORKBENCH_HELPER_ADDON_GUID &&
+          response.helperAddonVersion === WORKBENCH_HELPER_ADDON_VERSION &&
+          response.helperProtocolVersion === WORKBENCH_HELPER_PROTOCOL_VERSION &&
+          response.helperBuildIdentity === WORKBENCH_HELPER_BUILD_IDENTITY) {
+        netApi = "up_with_companion";
+      } else {
+        netApi = "up_no_companion";
+        netApiError = "NET API responded without the exact managed Workbench companion identity.";
+      }
     } catch (error) {
       if (error instanceof WorkbenchError) {
         netApiError = error.message;
@@ -709,7 +610,7 @@ export class WorkbenchClient {
         else if (error.code === "TIMEOUT") netApi = "timeout";
         else if (error.code === "API_ERROR" &&
           (error.message.includes("not existing Net API function") || error.message.includes("Undefined API func"))) {
-          netApi = "up_no_handlers";
+          netApi = "up_no_companion";
         } else netApi = "error";
       } else {
         netApi = "error";
@@ -725,9 +626,7 @@ export class WorkbenchClient {
         : null,
       projectPath,
       defaultMod: this.config?.defaultMod ?? null,
-      bundledScripts,
-      standaloneAddon,
-      installedMods,
+      companionAddon,
       netApi,
       netApiError,
       lifecycle: await this.lifecycleDiagnostic(),
@@ -755,6 +654,337 @@ export class WorkbenchClient {
     this._state.lastUpdated = Date.now();
     this.extractMode(result);
     return result;
+  }
+
+  managedCompanionStatus(): WorkbenchCompanionManagedStatus {
+    if (!this.companionProvider?.status) {
+      throw new WorkbenchError(
+        "Workbench companion provider does not expose managed status.",
+        "IDENTITY_UNVERIFIABLE"
+      );
+    }
+    return this.companionProvider.status();
+  }
+
+  async ensureManagedCompanion(targetProjectPath?: string): Promise<Record<string, unknown>> {
+    if (!this.companionProvider?.verifyStaged || !this.companionProvider.status) {
+      throw new WorkbenchError(
+        "Workbench companion provider does not expose managed staging and attestation.",
+        "IDENTITY_UNVERIFIABLE"
+      );
+    }
+    try {
+      return await this.processGuard.withLifecycleLock(async (session) => {
+        const read = await session.readState();
+        if (read.kind === "valid" && read.state.phase === "running") {
+          const snapshot = await this.validateManagedRunningState(
+            session,
+            "Workbench companion setup",
+            false
+          );
+          return {
+            action: "verified_running",
+            generation: snapshot.generation,
+            companion: snapshot.companion,
+            status: this.companionProvider!.status!(),
+          };
+        }
+        if (read.kind === "valid" && read.state.phase !== "vacant") {
+          throw new WorkbenchError(
+            `Workbench companion setup requires a vacant or healthy running lifecycle; current phase is ${read.state.phase}.`,
+            "LIFECYCLE_BUSY"
+          );
+        }
+        await session.assertNoWorkbenchProcesses();
+        const staged = this.companionProvider!.ensureStaged(targetProjectPath);
+        const attested = this.companionProvider!.verifyStaged!(staged, targetProjectPath);
+        const retention = this.companionProvider!.applyRetention?.({
+          protectedDigests: [attested.bundleDigest],
+        }) ?? null;
+        return {
+          action: staged.reused ? "verified" : "staged",
+          companion: {
+            addonId: attested.addonId,
+            addonGuid: attested.addonGuid,
+            addonVersion: attested.addonVersion,
+            protocolVersion: attested.protocolVersion,
+            buildIdentity: attested.buildIdentity,
+            bundleDigest: attested.bundleDigest,
+            addonDirectory: attested.addonDirectory,
+            profilePath: attested.workbenchProfilePath,
+          },
+          retention,
+          status: this.companionProvider!.status!(),
+        };
+      });
+    } catch (error) {
+      throw this.mapLifecycleError(error);
+    }
+  }
+
+  doctorManagedCompanion(): Record<string, unknown> {
+    const status = this.managedCompanionStatus();
+    if (!status.installed || !status.stagedDigests.includes(status.currentBundleDigest)) {
+      return {
+        healthy: false,
+        status,
+        detail: "The current packaged Workbench companion digest is not staged.",
+      };
+    }
+    const roleRoot = status.roleRoot;
+    const searchRoot = join(roleRoot, "addons", status.currentBundleDigest);
+    const candidate: WorkbenchCompanionLaunch = {
+      addonId: WORKBENCH_HELPER_ADDON_ID,
+      addonGuid: WORKBENCH_HELPER_ADDON_GUID,
+      addonVersion: WORKBENCH_HELPER_ADDON_VERSION,
+      protocolVersion: WORKBENCH_HELPER_PROTOCOL_VERSION,
+      buildIdentity: WORKBENCH_HELPER_BUILD_IDENTITY,
+      bundleDigest: status.currentBundleDigest,
+      addonDirectory: join(searchRoot, WORKBENCH_HELPER_ADDON_ID),
+      addonSearchRoot: searchRoot,
+      workbenchProfilePath: join(roleRoot, "profile"),
+      reused: true,
+    };
+    if (!this.companionProvider?.verifyStaged) {
+      throw new WorkbenchError(
+        "Workbench companion provider cannot attest staged payload hashes.",
+        "IDENTITY_UNVERIFIABLE"
+      );
+    }
+    this.companionProvider.verifyStaged(candidate);
+    return { healthy: status.warnings.length === 0, status };
+  }
+
+  async applyManagedCompanionRetention(): Promise<WorkbenchCompanionRetentionResult> {
+    if (!this.companionProvider?.applyRetention) {
+      throw new WorkbenchError(
+        "Workbench companion provider does not expose managed retention.",
+        "IDENTITY_UNVERIFIABLE"
+      );
+    }
+    try {
+      return await this.processGuard.withLifecycleLock(async (session) => {
+        await session.assertNoWorkbenchProcesses();
+        const read = await session.readState();
+        if (read.kind === "valid" && read.state.phase !== "vacant") {
+          throw new WorkbenchError(
+            `Workbench companion retention requires a vacant lifecycle; current phase is ${read.state.phase}.`,
+            "LIFECYCLE_BUSY"
+          );
+        }
+        const protectedDigests = read.kind === "valid" && read.state.companion
+          ? [read.state.companion.bundleDigest]
+          : [];
+        return this.companionProvider!.applyRetention!({ protectedDigests });
+      });
+    } catch (error) {
+      throw this.mapLifecycleError(error);
+    }
+  }
+
+  async uninstallManagedCompanion(): Promise<WorkbenchCompanionUninstallResult> {
+    if (!this.companionProvider?.uninstall) {
+      throw new WorkbenchError(
+        "Workbench companion provider does not expose managed uninstall.",
+        "IDENTITY_UNVERIFIABLE"
+      );
+    }
+    try {
+      return await this.processGuard.withLifecycleLock(async (session) => {
+        await session.assertNoWorkbenchProcesses();
+        const read = await session.readState();
+        if (read.kind === "valid" && read.state.phase !== "vacant") {
+          throw new WorkbenchError(
+            `Workbench companion uninstall requires a vacant lifecycle; current phase is ${read.state.phase}.`,
+            "LIFECYCLE_BUSY"
+          );
+        }
+        const result = this.companionProvider!.uninstall!();
+        if (read.kind === "valid" && read.state.phase === "vacant" && read.state.companion) {
+          await session.transitionToVacant(stateExpected(read.state), {
+            target: read.state.target,
+            companion: null,
+          });
+        }
+        return result;
+      });
+    } catch (error) {
+      throw this.mapLifecycleError(error);
+    }
+  }
+
+  private async callManagedAndCache<T>(
+    apiFunc: string,
+    params: Record<string, unknown>,
+    options: WorkbenchCallOptions
+  ): Promise<T> {
+    try {
+      return await this.processGuard.withLifecycleLock(async (session) => {
+        const snapshot = await this.validateManagedRunningState(
+          session,
+          `Workbench call ${apiFunc}`,
+          true
+        );
+        const result = await this.callAndCache<T>(apiFunc, params, options);
+        // Detect staged payload replacement even when the NET API call itself
+        // succeeded. The machine-wide lifecycle mutex stays held throughout.
+        this.attestRecordedCompanion(snapshot);
+        return result;
+      });
+    } catch (error) {
+      throw this.mapLifecycleError(error);
+    }
+  }
+
+  private async validateManagedRunningState(
+    session: WorkbenchLifecycleSession,
+    context: string,
+    unavailableWhenVacant: boolean
+  ): Promise<WorkbenchObserverSnapshot> {
+    const read = await session.readState();
+    if (read.kind !== "valid") {
+      if (unavailableWhenVacant && read.kind === "missing") {
+        throw new WorkbenchError(
+          `${context} requires an MCP-owned Workbench, but no lifecycle record exists.`,
+          "CONNECTION_REFUSED"
+        );
+      }
+      throw new WorkbenchError(
+        `${context} requires a valid version-3 Workbench lifecycle record.`,
+        "STATE_INVALID"
+      );
+    }
+    const state = read.state;
+    if (state.phase === "vacant" && unavailableWhenVacant) {
+      throw new WorkbenchError(
+        `${context} requires an MCP-owned Workbench, but the lifecycle is vacant.`,
+        "CONNECTION_REFUSED"
+      );
+    }
+    if (state.phase !== "running" || state.operation !== null) {
+      throw new WorkbenchError(
+        `${context} requires an idle running Workbench; lifecycle phase is ${state.phase}.`,
+        "LIFECYCLE_BUSY"
+      );
+    }
+
+    const owner = state.mcpOwner;
+    const current = session.mcp;
+    if (!owner || owner.instanceId !== current.instanceId || owner.leaseId !== current.leaseId ||
+        owner.pid !== current.pid || owner.creationTime !== current.creationTime ||
+        pathKey(owner.executablePath) !== pathKey(current.executablePath) ||
+        owner.userSid !== current.userSid) {
+      throw new WorkbenchError(
+        `${context} requires the exact Workbench lifecycle lease owned by this MCP instance.`,
+        owner ? "OWNED_BY_OTHER_MCP" : "UNOWNED_WORKBENCH"
+      );
+    }
+    if (!state.target) {
+      throw new WorkbenchError(
+        `${context} requires a recorded canonical Workbench project target.`,
+        "TARGET_REQUIRED"
+      );
+    }
+    if (!state.workbench) {
+      throw new WorkbenchError(
+        `${context} requires an already-running exact owned Workbench process.`,
+        "UNOWNED_WORKBENCH"
+      );
+    }
+    if (!state.companion ||
+        state.companion.addonId !== WORKBENCH_HELPER_ADDON_ID ||
+        state.companion.addonGuid !== WORKBENCH_HELPER_ADDON_GUID ||
+        state.companion.buildIdentity !== WORKBENCH_HELPER_BUILD_IDENTITY ||
+        !/^[a-f0-9]{64}$/.test(state.companion.bundleDigest)) {
+      throw new WorkbenchError(
+        `${context} requires the exact MCP-managed Workbench companion identity.`,
+        "IDENTITY_UNVERIFIABLE"
+      );
+    }
+
+    const configuredHost = this.host.trim().toLowerCase().replace(/^\[|\]$/g, "");
+    if (state.endpoint.host !== configuredHost || state.endpoint.port !== this.port) {
+      throw new WorkbenchError(
+        `Recorded Workbench endpoint ${state.endpoint.host}:${state.endpoint.port} does not ` +
+          `match this client endpoint ${configuredHost}:${this.port}.`,
+        "ENDPOINT_CONFLICT"
+      );
+    }
+
+    const canonicalTarget = canonicalizeGproj(state.target.path);
+    if (canonicalTarget.comparisonKey !== state.target.comparisonKey) {
+      throw new WorkbenchError(
+        `Recorded Workbench target ${state.target.path} changed canonical identity.`,
+        "TARGET_CHANGED"
+      );
+    }
+    const snapshot = Object.freeze({
+      generation: state.generation,
+      companion: Object.freeze({ ...state.companion }),
+      target: Object.freeze({
+        path: canonicalTarget.displayPath,
+        comparisonKey: canonicalTarget.comparisonKey,
+      }),
+      endpoint: Object.freeze({ ...state.endpoint }),
+      process: Object.freeze({
+        pid: state.workbench.pid,
+        executablePath: state.workbench.executablePath,
+        creationTime: state.workbench.creationTime,
+        launchedAtMs: state.workbench.launchedAtMs,
+      }),
+    }) satisfies WorkbenchObserverSnapshot;
+    this.attestRecordedCompanion(snapshot);
+    if (await this.inspectRecordedWorkbench(state) !== "live") {
+      throw new WorkbenchError(
+        `Recorded exact owned Workbench exited before ${context}.`,
+        "IDENTITY_UNVERIFIABLE"
+      );
+    }
+    await this.assertEndpointOwnedByRecordedWorkbench(session, state.workbench, context);
+    if (!(await this.ping())) {
+      throw new WorkbenchError(
+        "The recorded Workbench endpoint did not prove the expected companion add-on identity.",
+        "IDENTITY_UNVERIFIABLE"
+      );
+    }
+    this.attestRecordedCompanion(snapshot);
+    return snapshot;
+  }
+
+  private attestRecordedCompanion(snapshot: WorkbenchObserverSnapshot): void {
+    const verify = this.companionProvider?.verifyStaged;
+    if (!verify) {
+      throw new WorkbenchError(
+        "Managed Workbench calls require a companion provider that can re-attest staged payload hashes.",
+        "IDENTITY_UNVERIFIABLE"
+      );
+    }
+    const candidate: WorkbenchCompanionLaunch = {
+      addonId: WORKBENCH_HELPER_ADDON_ID,
+      addonGuid: WORKBENCH_HELPER_ADDON_GUID,
+      addonVersion: WORKBENCH_HELPER_ADDON_VERSION,
+      protocolVersion: WORKBENCH_HELPER_PROTOCOL_VERSION,
+      buildIdentity: snapshot.companion.buildIdentity as typeof WORKBENCH_HELPER_BUILD_IDENTITY,
+      bundleDigest: snapshot.companion.bundleDigest,
+      addonDirectory: snapshot.companion.addonDirectory,
+      addonSearchRoot: snapshot.companion.addonSearchRoot,
+      workbenchProfilePath: snapshot.companion.profilePath,
+      reused: true,
+    };
+    try {
+      const attested = verify.call(this.companionProvider, candidate, snapshot.target.path);
+      if (attested.bundleDigest !== candidate.bundleDigest ||
+          pathKey(attested.addonDirectory) !== pathKey(candidate.addonDirectory) ||
+          pathKey(attested.addonSearchRoot) !== pathKey(candidate.addonSearchRoot) ||
+          pathKey(attested.workbenchProfilePath) !== pathKey(candidate.workbenchProfilePath)) {
+        throw new Error("attested descriptor changed recorded companion identity");
+      }
+    } catch (error) {
+      throw new WorkbenchError(
+        `Managed Workbench companion attestation failed: ${error instanceof Error ? error.message : String(error)}`,
+        "IDENTITY_UNVERIFIABLE"
+      );
+    }
   }
 
   private resetConnectionState(): void {
@@ -819,31 +1049,6 @@ export class WorkbenchClient {
     }
   }
 
-  private projectFromModDirectory(modDir: string): CanonicalProjectIdentity {
-    let canonicalMod: string;
-    try {
-      canonicalMod = realpathSync.native(resolve(modDir));
-      if (!statSync(canonicalMod).isDirectory()) throw new Error("not a directory");
-    } catch {
-      throw new WorkbenchError(`Invalid mod directory: ${resolve(modDir)}`, "INVALID_TARGET");
-    }
-    const candidates = readdirSync(canonicalMod, { withFileTypes: true })
-      .filter((entry) => entry.isFile() && extname(entry.name).toLowerCase() === ".gproj")
-      .map((entry) => canonicalizeGproj(join(canonicalMod, entry.name)));
-    const unique = new Map(candidates.map((entry) => [entry.comparisonKey, entry]));
-    if (unique.size !== 1) {
-      const paths = [...unique.values()].map((entry) => entry.displayPath).sort();
-      throw new WorkbenchError(
-        unique.size === 0
-          ? `No .gproj exists directly in mod directory ${canonicalMod}.`
-          : `Cleanup target is ambiguous; provide a mod directory containing exactly one .gproj:\n` +
-            paths.map((path) => `  - ${path}`).join("\n"),
-        unique.size === 0 ? "TARGET_REQUIRED" : "AMBIGUOUS_TARGET"
-      );
-    }
-    return [...unique.values()][0];
-  }
-
   private lifecycleTarget(project: CanonicalProjectIdentity): {
     path: string;
     comparisonKey: string;
@@ -854,7 +1059,7 @@ export class WorkbenchClient {
   private async claimState(
     session: WorkbenchLifecycleSession,
     project: CanonicalProjectIdentity | null
-  ): Promise<WorkbenchLifecycleStateV2> {
+  ): Promise<WorkbenchLifecycleStateV3> {
     const result = await session.validateAndClaim({
       endpoint: { host: this.host.trim().toLowerCase(), port: this.port },
       target: project ? this.lifecycleTarget(project) : null,
@@ -863,107 +1068,13 @@ export class WorkbenchClient {
     throw this.claimRefusal(result);
   }
 
-  private expectedTransactionError(context: string, error: unknown): WorkbenchError {
-    return new WorkbenchError(
-      `RECOVERY_REQUIRED: ${context}: ${error instanceof Error ? error.message : String(error)}`,
-      "RECOVERY_REQUIRED"
-    );
-  }
-
-  private loadExpectedTransaction(
-    handler: HandlerLifecycleState | null,
-    target: StoredLifecycleTarget | null,
-    context: string
-  ): HandlerTransactionRecord {
-    if (!handler || !target) {
-      throw this.expectedTransactionError(
-        context,
-        "the lifecycle state does not bind the transaction to a handler and target"
-      );
-    }
-    try {
-      return this.handlerBundle.loadExpectedTransaction(handler, target);
-    } catch (error) {
-      throw this.expectedTransactionError(context, error);
-    }
-  }
-
-  private restoreExpectedTransaction(
-    handler: HandlerLifecycleState | null,
-    target: StoredLifecycleTarget | null,
-    context: string
-  ): HandlerTransactionRecord {
-    if (!handler || !target) {
-      throw this.expectedTransactionError(
-        context,
-        "the lifecycle state does not bind the transaction to a handler and target"
-      );
-    }
-    try {
-      return this.handlerBundle.restoreExpectedTransaction(handler, target);
-    } catch (error) {
-      throw this.expectedTransactionError(context, error);
-    }
-  }
-
-  private commitExpectedTransaction(
-    handler: HandlerLifecycleState | null,
-    target: StoredLifecycleTarget | null,
-    context: string
-  ): void {
-    if (!handler || !target) {
-      throw this.expectedTransactionError(
-        context,
-        "the lifecycle state does not bind the transaction to a handler and target"
-      );
-    }
-    try {
-      this.handlerBundle.commitExpectedTransaction(handler, target);
-    } catch (error) {
-      if (error instanceof HandlerBundleError) throw this.expectedTransactionError(context, error);
-      throw error;
-    }
-  }
-
-  private discardExpectedTransaction(
-    handler: HandlerLifecycleState | null,
-    target: StoredLifecycleTarget | null,
-    context: string
-  ): void {
-    if (!handler || !target) {
-      throw this.expectedTransactionError(
-        context,
-        "the lifecycle state does not bind the transaction to a handler and target"
-      );
-    }
-    try {
-      this.handlerBundle.discardExpectedTransaction(handler, target);
-    } catch (error) {
-      if (error instanceof HandlerBundleError) throw this.expectedTransactionError(context, error);
-      throw error;
-    }
-  }
-
-  private abortExpectedTransaction(
-    handler: HandlerLifecycleState,
-    target: StoredLifecycleTarget,
-    context: string
-  ): void {
-    try {
-      this.handlerBundle.abortExpectedTransaction(handler, target);
-    } catch (error) {
-      if (error instanceof HandlerBundleError) throw this.expectedTransactionError(context, error);
-      throw error;
-    }
-  }
-
   private claimRefusal(result: Extract<LifecycleClaimResult, { kind: "refused" }>): WorkbenchError {
     const code = result.code === "STATE_INVALID" ? "STATE_INVALID" : result.code;
     return new WorkbenchError(`${code}: ${result.message}`, code);
   }
 
   private async inspectRecordedWorkbench(
-    state: WorkbenchLifecycleStateV2
+    state: WorkbenchLifecycleStateV3
   ): Promise<"live" | "absent"> {
     const processes = await this.processGuard.listWorkbenchProcesses();
     const expected = state.workbench;
@@ -1038,81 +1149,21 @@ export class WorkbenchClient {
 
   private async reconcileAbsentState(
     session: WorkbenchLifecycleSession,
-    state: WorkbenchLifecycleStateV2,
+    state: WorkbenchLifecycleStateV3,
     target: StoredLifecycleTarget | null
-  ): Promise<WorkbenchLifecycleStateV2> {
-    const recoveryTarget = target ?? state.target;
-    const recoveryHandler = state.handler;
-    let restoredTransaction: HandlerTransactionRecord | null = null;
-    let nextHandler = state.handler;
-    if (recoveryHandler?.backupPath && recoveryHandler.transactionId) {
-      try {
-        restoredTransaction = this.restoreExpectedTransaction(
-          recoveryHandler,
-          recoveryTarget,
-          `could not cross-bind and restore handler transaction ${recoveryHandler.transactionId}`
-        );
-        const manifest = this.handlerBundle.readManifest(restoredTransaction.modDirectory);
-        nextHandler = manifest ? {
-          modDirectory: restoredTransaction.modDirectory,
-          manifestGeneration: manifest.generation,
-          transactionId: null,
-          phase: "installed",
-          backupPath: null,
-        } : null;
-      } catch (error) {
-        if (error instanceof WorkbenchError && error.code === "RECOVERY_REQUIRED") throw error;
-        throw new WorkbenchError(
-          `RECOVERY_REQUIRED: could not roll back handler transaction ` +
-            `${recoveryHandler.transactionId}: ${error instanceof Error ? error.message : String(error)}`,
-          "RECOVERY_REQUIRED"
-        );
-      }
-    }
-    // Re-read the durable record immediately before the recovery CAS. A
-    // mismatched journal must never be hidden by transitioning lifecycle state.
-    if (restoredTransaction) {
-      this.loadExpectedTransaction(
-        recoveryHandler,
-        recoveryTarget,
-        `handler transaction ${restoredTransaction.id} changed before recovery transition`
-      );
-    }
+  ): Promise<WorkbenchLifecycleStateV3> {
     this.resetConnectionState();
-    const vacant = await session.transitionToVacant(stateExpected(state), {
-      target: recoveryTarget,
-      handler: nextHandler,
+    return session.transitionToVacant(stateExpected(state), {
+      target: target ?? state.target,
+      companion: state.companion,
     });
-    if (restoredTransaction) {
-      try {
-        this.discardExpectedTransaction(
-          recoveryHandler,
-          recoveryTarget,
-          `could not cross-bind recovered handler transaction ${restoredTransaction.id} before discard`
-        );
-      } catch (error) {
-        if (error instanceof WorkbenchError && error.code === "RECOVERY_REQUIRED") throw error;
-        logger.warn(
-          `Recovered handler transaction ${restoredTransaction.id}, but its backup could not be ` +
-            `pruned: ${error instanceof Error ? error.message : String(error)}`
-        );
-      }
-    }
-    return vacant;
   }
 
   private async reconcileForEnsure(
     session: WorkbenchLifecycleSession,
-    state: WorkbenchLifecycleStateV2,
+    state: WorkbenchLifecycleStateV3,
     project: CanonicalProjectIdentity
-  ): Promise<{ state: WorkbenchLifecycleStateV2; live: boolean }> {
-    if (state.handler?.backupPath) {
-      this.loadExpectedTransaction(
-        state.handler,
-        state.target,
-        `lifecycle ${state.phase} recovery could not cross-bind its pending handler transaction`
-      );
-    }
+  ): Promise<{ state: WorkbenchLifecycleStateV3; live: boolean }> {
     const status = await this.inspectRecordedWorkbench(state);
     if (status === "absent") {
       await this.assertNoWorkbenchProcesses(session, "Lifecycle recovery");
@@ -1143,52 +1194,10 @@ export class WorkbenchClient {
           state.workbench,
           `${state.phase} recovery`
         );
-        let nextHandler = state.handler;
-        let completedTransaction: HandlerTransactionRecord | null = null;
-        const transactionHandler = state.handler;
-        const transactionTarget = state.target;
-        if (transactionHandler?.backupPath) {
-          const record = this.loadExpectedTransaction(
-            transactionHandler,
-            transactionTarget,
-            "live Workbench recovery could not cross-bind its handler transaction"
-          );
-          if (record.phase !== "applied") {
-            throw new WorkbenchError(
-              `RECOVERY_REQUIRED: live Workbench has an un-applied handler transaction ${record.id}.`,
-              "RECOVERY_REQUIRED"
-            );
-          }
-          completedTransaction = record;
-          nextHandler = handlerState(record, "installed", false);
-        }
-        if (completedTransaction) {
-          this.loadExpectedTransaction(
-            transactionHandler,
-            transactionTarget,
-            `handler transaction ${completedTransaction.id} changed before running recovery transition`
-          );
-        }
         const running = await session.transition(stateExpected(state), stateDraft(state, {
           phase: "running",
           operation: null,
-          handler: nextHandler,
         }));
-        if (completedTransaction) {
-          try {
-            this.commitExpectedTransaction(
-              transactionHandler,
-              transactionTarget,
-              `could not cross-bind completed handler transaction ${completedTransaction.id} before commit`
-            );
-          } catch (error) {
-            if (error instanceof WorkbenchError && error.code === "RECOVERY_REQUIRED") throw error;
-            logger.warn(
-              `Handler transaction ${completedTransaction.id} was durably completed, but its ` +
-                `backup could not be pruned: ${error instanceof Error ? error.message : String(error)}`
-            );
-          }
-        }
         return { state: running, live: true };
       }
       await this.terminateExact(session, state.workbench!);
@@ -1213,17 +1222,7 @@ export class WorkbenchClient {
       if (!state.workbench || !state.target || state.target.comparisonKey !== project.comparisonKey) {
         throw new WorkbenchError("Recorded Workbench target does not match the requested project.", "TARGET_CONFLICT");
       }
-      if (!(await this.ping())) {
-        throw new WorkbenchError(
-          `Exact owned Workbench PID ${state.workbench.pid} is running but its handler endpoint is unavailable.`,
-          "LAUNCH_FAILED"
-        );
-      }
-      await this.assertEndpointOwnedByRecordedWorkbench(
-        session,
-        state.workbench,
-        "running-session reuse"
-      );
+      await this.validateManagedRunningState(session, "running-session reuse", false);
       return {
         action: "reused",
         pid: state.workbench.pid,
@@ -1241,6 +1240,9 @@ export class WorkbenchClient {
       );
     }
     const preflight = this.preflightLaunch(project);
+    this.companionProvider?.applyRetention?.({
+      protectedDigests: [preflight.companion.bundleDigest],
+    });
     const started = await this.startLocked(session, state, preflight, "starting", "launch", operationId);
     return {
       action: "launched",
@@ -1310,13 +1312,6 @@ export class WorkbenchClient {
     // the exact recorded Workbench is still safely terminable.
     let state = await this.claimState(session, null);
     const target = state.target;
-    if (state.handler?.backupPath) {
-      this.loadExpectedTransaction(
-        state.handler,
-        target,
-        `shutdown could not cross-bind lifecycle ${state.phase} handler transaction`
-      );
-    }
     const status = await this.inspectRecordedWorkbench(state);
     if (status === "absent") {
       await this.assertNoWorkbenchProcesses(session, "Shutdown");
@@ -1350,6 +1345,9 @@ export class WorkbenchClient {
       this.ownedChild = null;
     }
     const vacant = await this.reconcileAbsentState(session, state, target);
+    this.companionProvider?.applyRetention?.({
+      protectedDigests: state.companion ? [state.companion.bundleDigest] : [],
+    });
     return {
       stopped: true,
       previousPid: expected.pid,
@@ -1379,20 +1377,58 @@ export class WorkbenchClient {
         "LAUNCH_FAILED"
       );
     }
-    // Validate all arguments and the complete handler source/target before a restart stops anything.
+    if (!this.companionProvider) {
+      throw new WorkbenchError(
+        "Workbench launch requires an MCP-managed companion add-on provider.",
+        "LAUNCH_FAILED"
+      );
+    }
+    let companion: WorkbenchCompanionLaunch;
+    try {
+      companion = this.companionProvider.ensureStaged(currentProject.displayPath);
+      if (!this.companionProvider.verifyStaged) {
+        throw new Error("companion provider cannot re-attest staged payload hashes");
+      }
+      companion = this.companionProvider.verifyStaged(companion, currentProject.displayPath);
+    } catch (error) {
+      throw new WorkbenchError(
+        `Workbench companion add-on could not be staged: ${error instanceof Error ? error.message : String(error)}`,
+        "LAUNCH_FAILED"
+      );
+    }
+    for (const configuredRoot of this.config?.workbenchAddonDirs ?? []) {
+      const candidate = join(resolve(configuredRoot), companion.addonId);
+      if (!existsSync(candidate)) continue;
+      let canonicalCandidate: string;
+      try {
+        canonicalCandidate = realpathSync.native(candidate);
+      } catch (error) {
+        throw new WorkbenchError(
+          `Configured Workbench add-on root contains an unreadable companion candidate: ${candidate} ` +
+            `(${error instanceof Error ? error.message : String(error)})`,
+          "IDENTITY_UNVERIFIABLE"
+        );
+      }
+      if (pathKey(canonicalCandidate) !== pathKey(companion.addonDirectory)) {
+        throw new WorkbenchError(
+          `Configured Workbench add-on root contains a second ${companion.addonId} at ` +
+            `${canonicalCandidate}; duplicate helper identities are refused.`,
+          "IDENTITY_UNVERIFIABLE"
+        );
+      }
+    }
+    // Validate every launch argument and the staged companion before a restart stops anything.
     const args = buildWorkbenchLaunchArgs(
       currentProject.displayPath,
       this.config?.workbenchAddonDirs,
       this.config?.workbenchScriptAuthorizeAll === true,
-      true
+      true,
+      undefined,
+      companion
     );
-    try {
-      this.handlerBundle.preflight(currentProject);
-    } catch (error) {
-      throw this.mapLifecycleError(error);
-    }
     return {
       project: currentProject,
+      companion,
       executablePath,
       cwd: this.findGameDir() ?? dirname(executablePath),
       args,
@@ -1401,101 +1437,20 @@ export class WorkbenchClient {
 
   private async startLocked(
     session: WorkbenchLifecycleSession,
-    initialState: WorkbenchLifecycleStateV2,
+    initialState: WorkbenchLifecycleStateV3,
     preflight: LaunchPreflight,
     transientPhase: "starting" | "restarting",
     operationKind: "launch" | "restart",
     operationId: string
-  ): Promise<WorkbenchLifecycleStateV2> {
+  ): Promise<WorkbenchLifecycleStateV3> {
     const launchTarget = this.lifecycleTarget(preflight.project);
     let state = await session.transition(stateExpected(initialState), stateDraft(initialState, {
       phase: transientPhase,
       target: launchTarget,
       workbench: null,
+      companion: companionLifecycleState(preflight.companion),
       operation: { kind: operationKind, operationId },
     }));
-    const originalHandler = initialState.handler;
-    let transaction: PreparedHandlerTransaction;
-    try {
-      transaction = this.handlerBundle.prepare(preflight.project);
-    } catch (error) {
-      await session.transitionToVacant(stateExpected(state), {
-        target: launchTarget,
-        handler: originalHandler,
-      }).catch(() => undefined);
-      throw this.mapLifecycleError(error);
-    }
-
-    try {
-      state = await session.transition(stateExpected(state), stateDraft(state, {
-        handler: handlerState(transaction.record, "installing"),
-      }));
-    } catch (error) {
-      this.abortExpectedTransaction(
-        handlerState(transaction.record, "installing"),
-        launchTarget,
-        `could not cross-bind prepared handler transaction ${transaction.record.id} before abort`
-      );
-      throw error;
-    }
-
-    try {
-      const applied = this.handlerBundle.apply(transaction);
-      this.loadExpectedTransaction(
-        state.handler,
-        state.target,
-        `handler transaction ${applied.id} changed before installed transition`
-      );
-      state = await session.transition(stateExpected(state), stateDraft(state, {
-        handler: handlerState(applied, "installed"),
-      }));
-    } catch (error) {
-      try {
-        const rollbackHandler = state.handler;
-        const rollbackTarget = state.target;
-        const restored = this.restoreExpectedTransaction(
-          rollbackHandler,
-          rollbackTarget,
-          `could not cross-bind failed handler transaction ${transaction.record.id} before restore`
-        );
-        this.loadExpectedTransaction(
-          rollbackHandler,
-          rollbackTarget,
-          `handler transaction ${restored.id} changed before rollback transition`
-        );
-        await session.transitionToVacant(stateExpected(state), {
-          target: launchTarget,
-          handler: originalHandler,
-        });
-        try {
-          this.discardExpectedTransaction(
-            rollbackHandler,
-            rollbackTarget,
-            `could not cross-bind restored handler transaction ${restored.id} before discard`
-          );
-        } catch (discardError) {
-          if (discardError instanceof WorkbenchError && discardError.code === "RECOVERY_REQUIRED") {
-            throw discardError;
-          }
-          logger.warn(
-            `Rolled back handler transaction ${restored.id}, but its backup could not be pruned: ` +
-              `${discardError instanceof Error ? discardError.message : String(discardError)}`
-          );
-        }
-      } catch (rollbackError) {
-        throw new WorkbenchError(
-          `RECOVERY_REQUIRED: handler installation failed and rollback could not be completed. ` +
-            `Transaction ${transaction.record.id} remains durable at ` +
-            `${transaction.record.backupPath}: ` +
-            `${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`,
-          "RECOVERY_REQUIRED"
-        );
-      }
-      throw this.mapLifecycleError(error);
-    }
-
-    const completedHandler = state.handler;
-    const completedTarget = state.target;
 
     const ownerToken = this.processGuard.createOwnerToken();
     const ownerArgument = this.processGuard.ownerArgument(ownerToken);
@@ -1545,10 +1500,17 @@ export class WorkbenchClient {
         preflight.project.comparisonKey
       );
       child.unref();
-      await this.waitForHandlerReady(child, () => spawnError);
+      await this.waitForCompanionReady(child, () => spawnError, preflight.companion);
+      if (!this.companionProvider?.verifyStaged) {
+        throw new WorkbenchError(
+          "Workbench companion provider cannot re-attest the launched payload.",
+          "IDENTITY_UNVERIFIABLE"
+        );
+      }
+      this.companionProvider.verifyStaged(preflight.companion, preflight.project.displayPath);
       if (!identity) {
         throw new WorkbenchError(
-          "Workbench handler became ready without an exact recorded process identity.",
+          "Workbench companion became ready without an exact recorded process identity.",
           "IDENTITY_UNVERIFIABLE"
         );
       }
@@ -1557,34 +1519,13 @@ export class WorkbenchClient {
         identity,
         `${operationKind} readiness`
       );
-      const completedTransaction = this.loadExpectedTransaction(
-        completedHandler,
-        completedTarget,
-        `handler transaction ${transaction.record.id} changed before running transition`
-      );
-      if (completedTransaction.phase !== "applied") {
-        throw new WorkbenchError(
-          `RECOVERY_REQUIRED: handler transaction ${completedTransaction.id} is not applied at launch commit.`,
-          "RECOVERY_REQUIRED"
-        );
-      }
       state = await session.transition(stateExpected(state), stateDraft(state, {
         phase: "running",
-        handler: handlerState(completedTransaction, "installed", false),
         operation: null,
       }));
-      // This final CAS is the transaction commit point. Until it succeeds the
-      // backup remains durable and a failure terminates the exact child before
-      // rolling watched files back.
       if (childObservation) childObservation.generation = state.generation;
     } catch (error) {
-      await this.rollbackFailedLaunch(
-        session,
-        state,
-        transaction.record,
-        identity,
-        originalHandler
-      );
+      await this.rollbackFailedLaunch(session, state, identity);
       throw this.mapLifecycleError(error);
     }
 
@@ -1595,23 +1536,6 @@ export class WorkbenchClient {
         "IDENTITY_UNVERIFIABLE"
       );
     }
-    try {
-      // The lifecycle CAS above is authoritative. Removing the rollback journal
-      // is post-commit pruning, so a crash here can leave only a harmless orphan
-      // rather than state that points at a missing recovery record.
-      this.commitExpectedTransaction(
-        completedHandler,
-        completedTarget,
-        `could not cross-bind completed handler transaction ${transaction.record.id} before commit`
-      );
-    } catch (error) {
-      if (error instanceof WorkbenchError && error.code === "RECOVERY_REQUIRED") throw error;
-      logger.warn(
-        `Handler transaction ${transaction.record.id} was durably completed for Workbench PID ` +
-          `${runningIdentity.pid}, but its backup could not be pruned: ` +
-          `${error instanceof Error ? error.message : String(error)}`
-      );
-    }
     this._state.connected = true;
     this._state.lastUpdated = Date.now();
     return state;
@@ -1619,30 +1543,15 @@ export class WorkbenchClient {
 
   private async rollbackFailedLaunch(
     session: WorkbenchLifecycleSession,
-    state: WorkbenchLifecycleStateV2,
-    transaction: HandlerTransactionRecord,
-    identity: WorkbenchIdentity | null,
-    originalHandler: HandlerLifecycleState | null
+    state: WorkbenchLifecycleStateV3,
+    identity: WorkbenchIdentity | null
   ): Promise<void> {
-    const rollbackHandler = state.handler;
-    const rollbackTarget = state.target;
-    const boundTransaction = this.loadExpectedTransaction(
-      rollbackHandler,
-      rollbackTarget,
-      `failed launch could not cross-bind handler transaction ${transaction.id}`
-    );
-    if (boundTransaction.id !== transaction.id) {
-      throw this.expectedTransactionError(
-        `failed launch transaction ${transaction.id} does not match its lifecycle journal`,
-        `lifecycle references transaction ${boundTransaction.id}`
-      );
-    }
     if (identity) {
       const result = await session.verifyAndTerminate(identity, OWNED_PROCESS_EXIT_TIMEOUT_MS);
       if (result.kind === "refused") {
         throw new WorkbenchError(
           `RECOVERY_REQUIRED: launch failed and exact Workbench shutdown was refused (${result.reason}): ` +
-            `${result.message}. Handler transaction ${boundTransaction.id} was preserved.`,
+            `${result.message}. The lifecycle record was preserved for exact-owner recovery.`,
           "RECOVERY_REQUIRED"
         );
       }
@@ -1652,45 +1561,23 @@ export class WorkbenchClient {
       if (processes.length > 0) {
         throw new WorkbenchError(
           `RECOVERY_REQUIRED: launch identity was not established and Workbench PID(s) ` +
-            `${processes.map((entry) => entry.pid).join(", ")} are present. Handler transaction ` +
-            `${boundTransaction.id} was preserved; watched files were not changed again.`,
+            `${processes.map((entry) => entry.pid).join(", ")} are present. ` +
+            "The lifecycle record was preserved and no PID-only signal was attempted.",
           "RECOVERY_REQUIRED"
         );
       }
     }
-    const restored = this.restoreExpectedTransaction(
-      rollbackHandler,
-      rollbackTarget,
-      `could not cross-bind failed launch transaction ${boundTransaction.id} before restore`
-    );
-    this.loadExpectedTransaction(
-      rollbackHandler,
-      rollbackTarget,
-      `handler transaction ${restored.id} changed before failed-launch recovery transition`
-    );
     await session.transitionToVacant(stateExpected(state), {
       target: state.target,
-      handler: originalHandler,
+      companion: state.companion,
     });
-    try {
-      this.discardExpectedTransaction(
-        rollbackHandler,
-        rollbackTarget,
-        `could not cross-bind failed launch transaction ${restored.id} before discard`
-      );
-    } catch (error) {
-      if (error instanceof WorkbenchError && error.code === "RECOVERY_REQUIRED") throw error;
-      logger.warn(
-        `Rolled back failed launch transaction ${restored.id}, but its backup could not be ` +
-          `pruned: ${error instanceof Error ? error.message : String(error)}`
-      );
-    }
     this.resetConnectionState();
   }
 
-  private async waitForHandlerReady(
+  private async waitForCompanionReady(
     child: ChildProcess,
-    getSpawnError: () => Error | null
+    getSpawnError: () => Error | null,
+    expected: WorkbenchCompanionLaunch
   ): Promise<void> {
     const deadline = Date.now() + this.launchTimeoutMs;
     let lastErrorCode: WorkbenchErrorCode | undefined;
@@ -1706,16 +1593,42 @@ export class WorkbenchClient {
         );
       }
       try {
-        await this.rawCall("EMCP_WB_Ping", {}, { timeout: 3000, skipAutoLaunch: true });
+        const response = await this.rawCall<Record<string, unknown>>(
+          "EMCP_WB_Ping",
+          {},
+          { timeout: 3000, skipAutoLaunch: true }
+        );
+        const identityMatches = response.status === "ok" &&
+          response.helperAddonId === expected.addonId &&
+          response.helperAddonGuid === expected.addonGuid &&
+          response.helperAddonVersion === expected.addonVersion &&
+          response.helperProtocolVersion === expected.protocolVersion &&
+          response.helperBuildIdentity === expected.buildIdentity &&
+          response.helperAddonId === WORKBENCH_HELPER_ADDON_ID &&
+          response.helperAddonGuid === WORKBENCH_HELPER_ADDON_GUID &&
+          response.helperAddonVersion === WORKBENCH_HELPER_ADDON_VERSION &&
+          response.helperProtocolVersion === WORKBENCH_HELPER_PROTOCOL_VERSION &&
+          response.helperBuildIdentity === WORKBENCH_HELPER_BUILD_IDENTITY;
+        if (!identityMatches) {
+          throw new WorkbenchError(
+            "Workbench NET API responded, but the exact MCP companion add-on identity did not match this build.",
+            "IDENTITY_UNVERIFIABLE"
+          );
+        }
         return;
       } catch (error) {
-        if (error instanceof WorkbenchError) lastErrorCode = error.code;
+        if (error instanceof WorkbenchError) {
+          if (error.code === "IDENTITY_UNVERIFIABLE") throw error;
+          lastErrorCode = error.code;
+        }
       }
       await new Promise((resolvePromise) => setTimeout(resolvePromise, this.launchPollIntervalMs));
     }
     const hint = lastErrorCode === "API_ERROR"
-      ? "The NET API opened, but the managed handler bundle did not compile. Inspect Workbench script errors."
-      : "The NET API never became ready. Confirm that Workbench NET API is enabled.";
+      ? "The NET API opened, but the managed companion did not compile. Inspect Workbench script errors."
+      : lastErrorCode === "IDENTITY_UNVERIFIABLE"
+        ? "The endpoint loaded a missing, duplicate, or stale helper add-on identity."
+        : "The NET API never became ready. Confirm that Workbench NET API is enabled.";
     throw new WorkbenchError(
       `Workbench did not become ready within ${this.launchTimeoutMs / 1000}s. ${hint}`,
       "LAUNCH_FAILED"
@@ -1836,27 +1749,20 @@ export class WorkbenchClient {
       if (read.kind === "missing") {
         return {
           state: "missing", version: null, generation: null, phase: null, endpoint: null,
-          target: null, lease: "vacant", operation: null, handlerTransaction: null,
-        };
-      }
-      if (read.kind === "legacy") {
-        return {
-          state: "legacy", version: 1, generation: null, phase: null, endpoint: null,
-          target: null, lease: "unknown", operation: null, handlerTransaction: null,
-          detail: "A live legacy record is never adopted; close its Workbench once before migration.",
+          target: null, lease: "vacant", operation: null, companionBuildIdentity: null,
         };
       }
       if (read.kind === "malformed") {
         return {
           state: "malformed", version: null, generation: null, phase: null, endpoint: null,
-          target: null, lease: "unknown", operation: null, handlerTransaction: null,
+          target: null, lease: "unknown", operation: null, companionBuildIdentity: null,
           detail: read.message,
         };
       }
       const state = read.state;
       return {
         state: "valid",
-        version: 2,
+        version: 3,
         generation: state.generation,
         phase: state.phase,
         endpoint: `${state.endpoint.host}:${state.endpoint.port}`,
@@ -1864,12 +1770,12 @@ export class WorkbenchClient {
         lease: !state.mcpOwner ? "vacant" :
           state.mcpOwner.instanceId === this.processGuard.mcpInstanceId ? "current_mcp" : "other_mcp",
         operation: state.operation ? `${state.operation.kind}:${state.operation.operationId}` : null,
-        handlerTransaction: state.handler?.transactionId ?? null,
+        companionBuildIdentity: state.companion?.buildIdentity ?? null,
       };
     } catch (error) {
       return {
         state: "malformed", version: null, generation: null, phase: null, endpoint: null,
-        target: null, lease: "unknown", operation: null, handlerTransaction: null,
+        target: null, lease: "unknown", operation: null, companionBuildIdentity: null,
         detail: error instanceof Error ? error.message : String(error),
       };
     }
@@ -1882,12 +1788,6 @@ export class WorkbenchClient {
     }
     if (error instanceof ProjectIdentityError) {
       return new WorkbenchError(error.message, error.code);
-    }
-    if (error instanceof HandlerBundleError) {
-      const code = error.code === "HANDLER_CONFLICT" || error.code === "HANDLER_MANIFEST_INVALID"
-        ? "HANDLER_CONFLICT"
-        : "LAUNCH_FAILED";
-      return new WorkbenchError(error.message, code);
     }
     if (error instanceof LifecycleGuardError) {
       const code: WorkbenchErrorCode = error.code === "GENERATION_MISMATCH" ||

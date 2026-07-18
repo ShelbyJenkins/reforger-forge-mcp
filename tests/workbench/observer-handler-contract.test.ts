@@ -1,11 +1,12 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { REQUIRED_HANDLER_FILES } from "../../src/workbench/handler-bundle.js";
+import { WORKBENCH_HELPER_HANDLER_FILES } from "../../src/workbench/helper-addon.js";
 
 const handlerRoot = join(
   process.cwd(),
-  "mod",
+  "observer",
+  "workbench-addon",
   "Scripts",
   "WorkbenchGame",
   "EnfusionMCP"
@@ -17,7 +18,7 @@ function source(name: string): string {
 
 describe("dedicated Workbench observer handler contract", () => {
   it("ships one shared transaction and five narrowly named NET API handlers", () => {
-    const names = REQUIRED_HANDLER_FILES.filter((name) => name.includes("Observer"));
+    const names = WORKBENCH_HELPER_HANDLER_FILES.filter((name) => name.includes("Observer"));
     expect(names).toEqual([
       "EMCP_WB_ObserverCancel.c",
       "EMCP_WB_ObserverCommon.c",
@@ -86,7 +87,7 @@ describe("dedicated Workbench observer handler contract", () => {
   });
 
   it("uses only the generated native profile PNG and never generic editor execution paths", () => {
-    const observerSource = REQUIRED_HANDLER_FILES
+    const observerSource = WORKBENCH_HELPER_HANDLER_FILES
       .filter((name) => name.includes("Observer"))
       .map(source)
       .join("\n");

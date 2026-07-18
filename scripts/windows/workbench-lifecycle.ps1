@@ -907,10 +907,10 @@ function Invoke-ReplaceState
 	$nextJson = [string](Get-LifecycleProperty -Object $request -Name 'nextJson' -Default '')
 	Assert-LifecycleDeadline
 	$next = $nextJson.TrimStart([char]0xFEFF) | ConvertFrom-Json
-	if ([int](Get-LifecycleProperty -Object $next -Name 'version' -Default 0) -ne 2 -or
+	if ([int](Get-LifecycleProperty -Object $next -Name 'version' -Default 0) -ne 3 -or
 		[string]::IsNullOrWhiteSpace([string](Get-LifecycleProperty -Object $next -Name 'generation' -Default '')))
 	{
-		throw 'Replacement lifecycle state is not a valid version-2 record.'
+		throw 'Replacement lifecycle state is not a valid version-3 record.'
 	}
 
 	$exists = [IO.File]::Exists($statePath)
@@ -925,7 +925,7 @@ function Invoke-ReplaceState
 		$current = $currentJson | ConvertFrom-Json
 		$currentVersion = [int](Get-LifecycleProperty -Object $current -Name 'version' -Default 0)
 		$currentGeneration = [string](Get-LifecycleProperty -Object $current -Name 'generation' -Default '')
-		if ($currentVersion -ne 2 -or -not [StringComparer]::Ordinal.Equals([string]$expectedGeneration, $currentGeneration))
+		if ($currentVersion -ne 3 -or -not [StringComparer]::Ordinal.Equals([string]$expectedGeneration, $currentGeneration))
 		{
 			throw 'Lifecycle state generation mismatch; no state was replaced.'
 		}

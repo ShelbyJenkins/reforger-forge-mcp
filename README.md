@@ -53,22 +53,20 @@ cp reforger-forge.config.example.json reforger-forge.config.json
 
 | Key | Description |
 |-----|-------------|
-| `observer` | Optional private-agent timeouts, inline image limit, retention, managed root, profile root, and session TTL. Defaults keep observer state outside `projectPath`. |
+| `observer` | Optional evidence/log allowlists, private-agent timeouts, inline image limit, retention, managed root, profile root, and session TTL. Defaults keep observer state outside `projectPath`. |
 | `workbenchPath` | Arma Reforger Tools (Steam) install |
 | `gamePath` | Arma Reforger game install |
 | `projectPath` | Where your mods are saved |
 | `workbenchAddonDirs` | Ordered base-game and Workshop addon roots passed to Workbench as one `-addonsDir` value |
 | `workbenchScriptAuthorizeAll` | Opt in to Workbench's `-scriptAuthorizeAll` flag for trusted local projects; defaults to `false` |
-| `workbenchNoThrow` | Legacy compatibility setting; automated Workbench launches always enforce `-noThrow` so assertions cannot open modal dialogs |
 
 `workbenchScriptAuthorizeAll` suppresses prompts for protected `RunCmd`,
 `RunProcess`, `KillProcess`, and out-of-profile `FileIO` operations. Leave it
 disabled unless you trust the active project and all of its dependencies.
 
-Automated launches enforce `-noThrow` even if a legacy config sets
-`workbenchNoThrow` false. Assertions remain in the Workbench log and can still
-fail a validation gate, but they cannot block the agent behind a dialog that
-requires a person to dismiss it.
+Automated launches enforce `-noThrow`. Assertions remain in the Workbench log
+and can still fail a validation gate, but they cannot block the agent behind a
+dialog that requires a person to dismiss it.
 
 Re-run `.\scripts\install-agents.ps1` after changing paths so all agents get updated env vars.
 
@@ -81,14 +79,17 @@ rules, validation steps, and troubleshooting reference.
 
 ### Observer capture workflow
 
-The observer is a separately staged companion addon controlled by one lazy,
-private child agent per MCP process. It never injects files into a target addon
-and never launches or terminates Arma Reforger.
+The runtime observer and Workbench helper are separately staged companion
+addons. Their managed files and profiles remain outside target projects. The
+observer never launches or terminates Arma Reforger.
 
-1. Call `observer_setup` with `action="ensure"` to verify and stage the packaged addon.
-2. Call `observer_prepare_launch` with the launcher's existing argument array and an observer-exclusive profile path. Use the returned array in your own launcher.
-3. Call `observer_instances` after the instrumented runtime registers. Headless instances remain visible for diagnostics but cannot be selected to render.
-4. Call `observer_capture` for a synchronous PNG result, or set `asynchronous=true` and use `observer_job` to inspect, cancel, or release it.
+1. Call `observer_setup` with `action="ensure"` to verify and stage both packaged companion add-ons, re-attest their hashes, and sweep expired Workbench helper bundles/captures when the lifecycle is vacant.
+2. Call `observer_run` with `action="begin"`; the host creates a managed `runId` outside the project.
+3. Call `observer_prepare_launch` with the launcher's existing argument array and an observer-exclusive profile path. Use the returned array in your own launcher, or explicitly start an editor with `wb_launch`.
+4. Call `observer_instances` and record the selected `instanceId`, `worldId`, and `worldEpoch`.
+5. Call `observer_capture` with the run ID, a meaningful unique `captureLabel`, and the expected world binding. Prefer synchronous capture for immediate review.
+6. Use `observer_job action="read"` for a completed asynchronous image that fits the inline limit. Oversized images stay managed for finalization.
+7. Call `observer_run action="finalize"` to export only reviewed captures into an allowlisted evidence root, or `discard` a rejected run.
 
 The returned `profilePath` is the outer directory passed to Enfusion's
 `-profile` argument. Enfusion mounts `$profile:` at the physical
@@ -100,19 +101,27 @@ the launch argument yourself.
 The same inventory also includes a compatible, already-running exact-owned
 Workbench. Start that visible editor lifecycle explicitly with `wb_launch`;
 selecting it reuses its existing lifecycle lease and dedicated observer
-handlers. The observer tools never auto-launch Workbench.
+handlers from the managed Workbench companion. The observer tools never
+auto-launch Workbench.
 
 Synchronous capture returns one host-validated PNG image plus metadata including
 job and instance identity, world epoch, actual camera, dimensions, SHA-256,
 warnings, and contamination state. Images larger than the configured MCP inline
-limit remain retained by the agent but are not embedded in the MCP response.
+limit remain retained by the agent and can still be included by run
+finalization; private managed paths are never returned as a workaround.
 Managed uninstall requests cancellation first and returns `CAMERA_BUSY` while
-any job or runtime camera lease still requires terminal restoration; retry only
-after `observer_job` reports a terminal state.
+any job or runtime camera lease still requires terminal restoration. It also
+refuses while Workbench or its lifecycle is active; retry after `observer_job`
+is terminal and `wb_shutdown` has made the lifecycle vacant.
 
-Repository maintainers can prove an editor current screenshot, explicit pose
-restoration, and a post-restoration screenshot with the double-gated
-[Workbench screenshot harness](observer/README.md#opt-in-workbench-screenshot-acceptance).
+Repository maintainers can exercise all three supported camera views on both
+backends with double-gated five-capture harnesses: `initial-current`,
+`explicit-pose`, `post-pose-restoration-current`, `explicit-look-at`, and
+`post-look-at-restoration-current`. Use the
+[Workbench screenshot harness](observer/README.md#opt-in-workbench-screenshot-acceptance)
+for the editor path and the
+[graphical runtime screenshot harness](observer/README.md#opt-in-graphical-runtime-screenshot-acceptance)
+for an installed graphical Diag executable.
 
 ---
 
@@ -285,11 +294,12 @@ the game.
 | `observer_prepare_launch` | Merge the staged observer and exclusive profile into an existing structured argument array without spawning Enfusion. |
 | `observer_instances` | List live and stale runtime instances, capabilities, transport, world epoch, active job, and health; optionally wait for compatible renderers. |
 | `observer_capture` | Submit current-view, explicit-pose, or look-at capture. Sync mode returns one validated PNG plus metadata; async mode returns a job ID. |
-| `observer_job` | Read status, request cancellation, or release a retained managed artifact. |
+| `observer_job` | Inspect, read, cancel, or release a capture. Inline reads return a completed validated PNG; oversized captures remain available to run finalization. |
+| `observer_run` | Begin, inspect, finalize, or discard a bounded managed evidence run. Finalize exports a standardized reviewed bundle beneath an allowlisted evidence root. |
 
 ### Workbench Lifecycle, Connection & Diagnostics (Windows)
 
-Automated launch/restart/shutdown/cleanup lifecycle control is release-supported
+Automated launch/restart/shutdown lifecycle control is release-supported
 on Windows. A global named mutex serializes every mutation. A second live MCP
 cannot adopt the first MCP's Workbench; a replacement may claim the lease only
 after the prior MCP process identity is proven dead. The target is always one
@@ -297,11 +307,12 @@ canonical `.gproj`, and a different requested target is refused rather than
 reported as success. User-launched or otherwise unverifiable Workbench processes
 are never terminated. If `gprojPath` is omitted, launch succeeds only when a
 prior verified target or exactly one configured project can be resolved;
-ambiguity is refused with the candidate paths. A live version-1 owner marker
-requires one manual Workbench close before the version-2 state can be initialized.
+ambiguity is refused with the candidate paths.
 
-Automated lifecycle control requires a numeric loopback NET API endpoint. After
-handler readiness, and again before reuse or recovery, the Windows helper
+Automated lifecycle control requires a numeric loopback NET API endpoint. The
+version-3 lifecycle records the immutable companion identity and its external
+profile with the exact Workbench process. After helper readiness, and again
+before reuse or recovery, the Windows lifecycle backend
 resolves the listening socket to its owning PID and re-proves the recorded PID,
 creation time, executable, owner-token argument, and sole-Workbench condition. A
 compatible response from a foreign listener is refused and a pending launch is
@@ -310,28 +321,34 @@ rolled back.
 Lifecycle helper operations are deadline-bounded. Read-only stalls are terminated
 and reported; if mutex ownership or a mutating operation's outcome becomes
 uncertain, the MCP fails closed and stops rather than continuing with uncertain
-state. Handler recovery cross-binds the durable transaction, target, mod and
-handler directories, manifest, and generation before any mutation. Shutdown and
+state. Shutdown and
 unexpected-child-exit reconciliation use the stored target identity, so exact
 shutdown remains available if the recorded `.gproj` has been deleted or
 disconnected. Launch and restart still require current project revalidation.
 
+Before spawn, ReforgerForge digest-verifies and stages
+`ReforgerForgeWorkbenchHelper` from `observer/workbench-addon` beneath the
+external observer managed root. Workbench receives the helper search root,
+add-on GUID, and a dedicated external `-profile`. Readiness requires
+`EMCP_WB_Ping` to return the exact add-on ID, GUID, version, protocol, and build
+identity expected by the running MCP. No Workbench helper source is written to
+the target project.
+
 | Tool | What it does |
 |------|-------------|
-| `wb_launch` | Launch or reuse one exact canonical `.gproj` under the v2 MCP lease, global mutex, and transactional handler bundle. Different targets, live-other-MCP owners, occupied endpoints, and user-owned/unverifiable Workbench processes are refused. |
+| `wb_launch` | Launch or reuse one exact canonical `.gproj` under the version-3 MCP lease and verified companion identity. Different targets, live-other-MCP owners, occupied endpoints, and user-owned/unverifiable Workbench processes are refused. |
 | `wb_connect` | Test connection to Workbench NET API. Returns connection status and editor mode. |
-| `wb_diagnose` | Non-mutating diagnostic — config, handler locations, NET API, lifecycle schema/generation/phase, canonical target, endpoint, lease status, operation, and handler transaction. |
+| `wb_diagnose` | Non-mutating diagnostic — config, packaged/staged companion identity, NET API identity, lifecycle schema/generation/phase, canonical target, endpoint, lease status, and operation. |
 | `wb_restart` | Preflight a complete replacement, then terminate through the retained verified process handle and restart the same canonical `.gproj`. A live different MCP owner cannot be claimed. |
-| `wb_shutdown` | Stop only the exact verified owner process, wait for endpoint release, and transition lifecycle state to vacant. Required before cleanup; user-launched Workbench is never signalled. |
-| `wb_cleanup` | After `wb_shutdown`, remove only hash-matching manifest-owned handler files. Cleanup is blocked while Workbench may be watching the mod; modified and unrelated files are preserved. |
+| `wb_shutdown` | Stop only the exact verified owner process, wait for endpoint release, and transition lifecycle state to vacant. User-launched Workbench is never signalled. |
 | `wb_state` | Full Workbench snapshot — mode (edit/play), entity count, selection, terrain bounds, sub-scene, prefab edit status. |
 | `wb_reload` | Reload plugins only. Every in-process game-script reload is refused; use verified owner-scoped `wb_restart` for clean compilation. |
 
 #### Workbench observer adapter
 
-The managed handler transaction also installs five dedicated observer endpoints
-(`ping`, `submit`, `status`, `cancel`, and `release`) plus one non-handler common
-transaction file. They are consumed only through the same long-lived
+The Workbench companion provides five dedicated observer endpoints (`ping`,
+`submit`, `status`, `cancel`, and `release`) plus their shared transaction
+implementation. They are consumed only through the same long-lived
 `WorkbenchClient` and exact lifecycle lease used by the `wb_*` tools. Observer
 capture never launches Workbench, creates another process guard, enters Play,
 executes a menu action, saves, or reloads scripts.
@@ -358,11 +375,24 @@ and canonicalizes that regular file, validates stable length and the PNG
 signature/structure/dimensions, computes SHA-256, and returns those exact bytes
 from `observer_capture`; there is no BMP conversion step.
 
-Before owner-scoped restart, shutdown, or cleanup, active captures receive a
+Before owner-scoped restart or shutdown, active captures receive a
 bounded restoration request through the shared activity gate. If restoration
 does not finish in time, the lifecycle mutation is refused before the global
-mutex or process termination. Cleanup order remains: restore/cancel captures,
-`wb_shutdown`, wait for a vacant endpoint, then explicitly call `wb_cleanup`.
+mutex or process termination. The normal order is: restore or cancel captures,
+wait for terminal state, then call `wb_shutdown`.
+
+For project-owned scripts and CI, the packaged `reforger-forge-workbench`
+runner shares the same version-3 lifecycle and companion staging:
+
+```text
+reforger-forge-workbench editor --gproj <path> --foreground
+reforger-forge-workbench build --gproj <path> --platform PC --output <path> --timeout-ms <n>
+```
+
+Editor mode is intentionally foreground-only. Both modes publish a durable
+version-3 busy lifecycle while active and prove the exact helper Ping identity.
+Build mode is bounded, attributes the exact Workbench log directory, and returns
+a version-2 receipt bound to the companion bundle digest.
 
 ### Workbench Editor Control (Live)
 
@@ -429,13 +459,15 @@ Environment variables override config files:
 | `REFORGER_FORGE_OBSERVER_ROOT` | Managed observer root; must remain outside target projects | platform-local application/state directory |
 | `REFORGER_FORGE_OBSERVER_PROFILE_ROOT` | Approved root for observer-exclusive launch profiles | `<observer root>/profiles` |
 | `REFORGER_FORGE_OBSERVER_AGENT_PATH` | Packaged private-child entry override | `dist/observer/agent/private-child.js` |
+| `REFORGER_FORGE_OBSERVER_EVIDENCE_ROOTS` | Allowlisted existing evidence roots, separated by the platform path delimiter (`;` on Windows) | none; finalization disabled |
+| `REFORGER_FORGE_OBSERVER_SUPPORTING_LOG_ROOTS` | Allowlisted existing log roots, separated by the platform path delimiter (`;` on Windows) | managed observer log root only |
 | `REFORGER_FORGE_OBSERVER_STARTUP_TIMEOUT_MS` | Private child startup deadline | `10000` |
 | `REFORGER_FORGE_OBSERVER_REQUEST_TIMEOUT_MS` | Private control request deadline | `30000` |
 | `REFORGER_FORGE_OBSERVER_CAPTURE_TIMEOUT_MS` | Default synchronous capture/job deadline | `30000` |
 | `REFORGER_FORGE_OBSERVER_MAX_INLINE_IMAGE_BYTES` | Maximum PNG bytes embedded in an MCP result | `8388608` |
 | `REFORGER_FORGE_OBSERVER_RETENTION_INTERVAL_MS` | Agent retention sweep cadence | `60000` |
 | `REFORGER_FORGE_OBSERVER_RETENTION_MAX_AGE_MS` | Retained artifact age limit | `604800000` |
-| `REFORGER_FORGE_OBSERVER_RETENTION_MAX_BYTES` | Retained artifact total-size limit | `536870912` |
+| `REFORGER_FORGE_OBSERVER_RETENTION_MAX_BYTES` | Coordinated managed-storage limit for artifacts, runs, profiles, logs, and export scratch | `536870912` |
 | `REFORGER_FORGE_OBSERVER_SESSION_TTL_MS` | Default prepared-session lifetime | `1200000` |
 | `ENFUSION_WORKBENCH_PATH` | Arma Reforger Tools path | Steam default |
 | `ENFUSION_GAME_PATH` | Arma Reforger game path | Sibling of Tools |
@@ -445,10 +477,8 @@ Environment variables override config files:
 | `REFORGER_FORGE_DEBUG` | Enable debug logging | off |
 
 Config file search order:
-1. `reforger-forge.config.json` in the package root, falling back to the local
-   legacy `enfusion-mcp.config.json`
-2. `~/.reforger-forge/config.json` in the user home, falling back to the home
-   legacy `~/.enfusion-mcp/config.json`
+1. `reforger-forge.config.json` in the package root
+2. `~/.reforger-forge/config.json` in the user home
 
 Package-local values override user-home values; environment variables override
 both.
@@ -481,32 +511,67 @@ applications. Each requires an environment gate and an independent command-line
 confirmation:
 
 ```powershell
+$env:RFO_RUN_LIVE_RUNTIME_OBSERVER_ACCEPTANCE = "1"
+npm run observer:acceptance:runtime -- --confirm-live-run
+
 $env:RFO_RUN_LIVE_WORKBENCH_OBSERVER_ACCEPTANCE = "1"
 npm run observer:acceptance:workbench -- --confirm-live-run
 ```
 
+The runtime command defaults to Reforger's installed stock
+`{96A8AF57260A7392}worlds/MP/MpTest/MpTest.ent`. It uses an explicit
+normalized-quaternion pose at `[96, 90, -5]` with a 58-degree FOV, then a
+separate look-at view from `[64, 121, -40]` toward `[64, 10, 100]` at 70
+degrees. It loads no project add-on and keeps all managed, profile, diagnostic,
+and evidence data under an external temporary root. It launches the fixture as
+a visible graphical listen host and can optionally override it with `--world` or
+`RFO_RUNTIME_OBSERVER_WORLD`, load a fixture add-on with `--addon-dir`, append
+bounded launch tokens with repeated `--launch-arg`, override the
+executable, pose, or look-at view, require a color marker, and select an external
+artifact root or timeout. It launches only after proving all Arma and Workbench
+processes are absent; captures current, explicit pose, current-after-pose,
+explicit look-at, and current-after-look-at views; validates PNG material,
+camera/world binding, the exact requested pose matrix/position/FOV, look-at
+position/FOV, material visual displacement, and independent lease restoration
+and release from both explicit views while allowing natural current-camera
+movement or rotation; verifies bundle hashes; and terminates only its exact
+child process. The
+external finalized bundle is marked `Unreviewed` and must be visually reviewed
+before it can qualify the runtime screenshot path.
+
 The Workbench command reads installed-tool and addon-root paths from the
 gitignored `reforger-forge.config.json`. It retains its evidence outside the
 repository by default and refuses to start if an Arma Reforger or Workbench
-process is already running.
+process is already running. It creates a run-specific disposable
+`Worlds/ObserverAcceptance.ent` that inherits stock Everon
+`{853E92315D1D9EFE}worlds/Eden/Eden.ent` and exercises the same five-view
+sequence without writing helper files into the target.
 
-**Live validation status:** the Workbench screenshot harness passed on
-2026-07-16 and its retained PNGs were reviewed. Run `run-owDNnE` passed with
-three materially varied 1165x641 native PNGs whose SHA-256 values are
-`b70ee2343ea330eefcedd2fae6465385f7e8740d1812fb72dbfae4d0c2707d23`,
-`ee09b489f4bae2531d2c4d02a0b0819efd4137e7d2fc423c843d936ed40f7af8`,
-and `084844713cbfcc845fca4742abd3fcbf1ead885cefb13e169b0afad6633fc087`.
-The explicit pose moved the editor camera by `(75, 25, 50)` world units and
-increased vertical FOV by 10 degrees before exact restoration.
-Every transaction reported restoration, the exact lifecycle owner shut down,
-no Workbench process remained, and cleanup removed the unmodified managed
-handler bundle with no modified or unrelated files.
+**Runtime live validation status:** five-capture v2 automation passed on July
+17, 2026 local (July 18 UTC) against Reforger 1.7.0.54 and stock
+`{96A8AF57260A7392}worlds/MP/MpTest/MpTest.ent`. Harness run `run-kUN6is`
+finalized managed run `20260718T015727Z-cbe43230` after validating current,
+explicit pose, restored current, explicit look-at, and restored current PNGs;
+the exact requested matrices and FOVs; independent camera-lease restoration;
+and final process vacancy. All five images were visually inspected during
+implementation. The exported bundle deliberately remains `Unreviewed` with
+`imagesReviewed=false`, so formal evidence review is still pending.
 
-The summary is retained outside the repository under the run's
-`evidence/summary.json`. This pass qualifies the documented screenshot and
-camera-restoration transaction only; it does not qualify headless rendering,
-minimized/out-of-focus capture, failure injection, or remote/delegated
-rendering.
+**Workbench live validation status:** five-capture v3 automation passed on July
+17, 2026 local (July 18 UTC) with Workbench engine 1.7.0.54. Harness run
+`run-wzuGy6` finalized managed run
+`20260718T015947Z-6ec8429d` from disposable world
+`{71D11CE993734B08}Worlds/ObserverAcceptance.ent`, which inherits stock Everon.
+Workbench loaded helper digest
+`db44e43be9ec4249c23e55c0d1f19a1fb6cf72d6800c4540e938773d729d1eed`;
+both explicit views had the exact requested matrices and FOVs, differed
+materially from their preceding current views, and restored the original camera
+exactly. Finalization reported no warnings, the disposable target remained
+clean, exact-owner shutdown left zero Workbench processes, and all five images
+were visually inspected during implementation. The bundle's immutable formal
+state remains `Unreviewed` with `imagesReviewed=false`; live automation passed,
+but formal evidence review is required before calling the companion
+live-qualified.
 
 The real Workbench lifecycle smoke test is separately gated because it opens and
 closes the installed GUI against a disposable project:
@@ -521,8 +586,9 @@ Remove-Item Env:RR_LIVE_INITIAL_DWELL_MS
 Remove-Item Env:RR_LIVE_RESTART_DWELL_MS
 ```
 
-It covers launch, same-target reuse, target-conflict refusal, restart, shutdown,
-soak health checks, and manifest-scoped cleanup. The test reads `workbenchPath`,
+It covers companion staging and identity, launch, same-target reuse,
+target-conflict refusal, restart, shutdown, soak health checks, and no target
+project residue. The test reads `workbenchPath`,
 `gamePath`, and `workbenchAddonDirs` only from the repository-local, gitignored
 `reforger-forge.config.json`; keep every machine-specific path in that file. The
 test complements, but does not replace, the documented manual failure-injection
@@ -534,7 +600,9 @@ and log-review acceptance protocol.
 reforger-forge-mcp/
 ├── src/                         # TypeScript source
 ├── data/                        # API index, wiki, patterns, knowledge base
-├── mod/                         # Workbench NET API handler scripts
+├── observer/
+│   ├── addon/                   # Runtime observer companion
+│   └── workbench-addon/         # Managed Workbench helper companion
 ├── docs/AGENTS.md               # Copy-ready modding workspace instructions
 ├── configs/agents/              # Manual install templates
 ├── scripts/

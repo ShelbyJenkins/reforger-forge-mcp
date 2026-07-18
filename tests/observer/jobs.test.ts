@@ -118,6 +118,28 @@ describe("observer jobs", () => {
     expect(value.jobs.diagnostics()).toHaveLength(1);
   });
 
+  it("rejects a stale expected world before queueing camera work", () => {
+    const value = setup();
+    const base = {
+      sessionId: value.registration.sessionId,
+      deadlineAt: new Date(value.clock.now() + 10_000).toISOString(),
+      view: { kind: "current" as const },
+    };
+    expect(() => value.jobs.submit({
+      ...base,
+      idempotencyKey: "wrong-world-id",
+      expectedWorldId: "world-2",
+      expectedWorldEpoch: value.registration.worldEpoch,
+    })).toThrowError(expect.objectContaining({ code: "WORLD_CHANGED" }));
+    expect(() => value.jobs.submit({
+      ...base,
+      idempotencyKey: "wrong-world-epoch",
+      expectedWorldId: value.registration.worldId,
+      expectedWorldEpoch: value.registration.worldEpoch + 1,
+    })).toThrowError(expect.objectContaining({ code: "WORLD_CHANGED" }));
+    expect(value.jobs.diagnostics()).toHaveLength(0);
+  });
+
   it("emits a canonical decimal-string wire view for Enforce float decoding", () => {
     const value = setup();
     const job = value.jobs.submit({

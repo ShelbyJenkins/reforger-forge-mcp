@@ -14,7 +14,7 @@ import type {
   VerifyTerminateResult,
   WorkbenchIdentity,
   WorkbenchLifecycleBackend,
-  WorkbenchLifecycleStateV2,
+  WorkbenchLifecycleStateV3,
   WorkbenchProcessScan,
 } from "../../src/workbench/process-guard.js";
 
@@ -34,7 +34,7 @@ export class FakeLifecycleBackend implements WorkbenchLifecycleBackend {
   replaceFailure: ((args: {
     path: string;
     expectedGeneration: string | null;
-    next: WorkbenchLifecycleStateV2;
+    next: WorkbenchLifecycleStateV3;
   }) => Error | null) | null = null;
   maxConcurrent = 0;
   private concurrent = 0;
@@ -152,7 +152,7 @@ export class FakeLifecycleBackend implements WorkbenchLifecycleBackend {
   async replaceState(args: {
     path: string;
     expectedGeneration: string | null;
-    next: WorkbenchLifecycleStateV2;
+    next: WorkbenchLifecycleStateV3;
   }): Promise<void> {
     const failure = this.replaceFailure?.(args);
     if (failure) throw failure;

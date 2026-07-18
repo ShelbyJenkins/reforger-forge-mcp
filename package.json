@@ -4,7 +4,8 @@
   "type": "module",
   "description": "Universal MCP server for Arma Reforger modding — works with any AI agent (Cursor, Claude, Kiro, VS Code)",
   "bin": {
-    "reforger-forge-mcp": "./dist/index.js"
+    "reforger-forge-mcp": "./dist/index.js",
+    "reforger-forge-workbench": "./dist/workbench/runner-cli.js"
   },
   "scripts": {
     "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\"",
@@ -18,8 +19,10 @@
     "test": "vitest run",
     "test:integration": "vitest run tests/workbench/project-launcher-safety.test.ts tests/animation/integration-m151a2.test.ts",
     "test:observer:integration": "vitest run tests/observer/integration",
-    "observer:manifest": "node scripts/update-observer-source-manifest.mjs",
+    "addons:manifest": "node scripts/update-observer-source-manifest.mjs",
+    "observer:manifest": "npm run addons:manifest",
     "observer:acceptance:workbench": "npm run build && tsx scripts/run-workbench-observer-acceptance.ts",
+    "observer:acceptance:runtime": "npm run build && tsx scripts/run-runtime-observer-acceptance.ts",
     "test:package": "npm run build && node scripts/check-package.mjs",
     "test:watch": "vitest",
     "prepare": "npm run build"
@@ -44,8 +47,8 @@
   "files": [
     "dist",
     "data",
-    "mod",
     "observer/addon",
+    "observer/workbench-addon",
     "observer/protocol",
     "observer/README.md",
     "configs",
@@ -55,6 +58,7 @@
     "scripts/install-agents.ps1",
     "scripts/list-tools.mjs",
     "scripts/observer-live-acceptance-support.ts",
+    "scripts/run-runtime-observer-acceptance.ts",
     "scripts/run-workbench-observer-acceptance.ts",
     "scripts/update-observer-source-manifest.mjs",
     "scripts/setup.ps1",

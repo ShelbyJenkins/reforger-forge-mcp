@@ -67,7 +67,36 @@ describe("live Workbench observer acceptance contract", () => {
     expect(source).toContain("baseline.position[0] + 75");
     expect(source).toContain("Explicit pose rendered position differs");
     expect(source).toContain("Explicit pose rendered FOV differs");
+    expect(source).toContain("baseline.position[0] - right[0] * 90");
+    expect(source).toContain("Explicit look-at rendered FOV differs");
+    expect(source).toContain("Post-look-at current capture");
     expect(source).toContain('spawn(command, [...argumentsArray, "-forceUpdate"], spawnOptions)');
     expect(source).not.toMatch(/taskkill|Stop-Process|KillProcess|\.kill\s*\(/i);
+  });
+
+  it("routes live screenshots through managed runs and exports only a standardized unreviewed bundle", () => {
+    const source = readFileSync(
+      resolve("scripts/run-workbench-observer-acceptance.ts"),
+      "utf8"
+    );
+    expect(source).toContain("new ObserverCoordinator({");
+    expect(source).toContain('"dist", "observer", "agent", "private-child.js"');
+    expect(source).toContain("await coordinator.beginRun({");
+    expect(source).toContain("await coordinator.capture({");
+    expect(source).toContain("await coordinator.jobStatus(undefined, jobId)");
+    expect(source).toContain("await coordinator.readJob(undefined, jobId)");
+    expect(source).toContain("await coordinator.finalizeRun({");
+    expect(source).toContain("bundle = validateFinalizedBundle(");
+    expect(source).toContain("comparePngImages(initial.image, pose.image)");
+    expect(source).toContain("if (!poseDifference.materiallyDifferent)");
+    expect(source).toContain("comparePngImages(initial.image, lookAt.image)");
+    expect(source).toContain("if (!lookAtDifference.materiallyDifferent)");
+    expect(source).toContain('configurationId: "workbench-observer-live-acceptance-v3"');
+    expect(source).toContain('imagesReviewed: false');
+    expect(source).toContain('outcome: "Unreviewed"');
+    expect(source).toContain('releaseManagedArtifacts: true');
+    expect(source).not.toContain("await adapter.submit(");
+    expect(source).not.toContain("adapter.readCompletedArtifact(");
+    expect(source).not.toContain("writeFileSync(imagePath");
   });
 });

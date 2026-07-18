@@ -8,6 +8,7 @@ import { errorBody } from "./errors.js";
 import { JobStore } from "./jobs.js";
 import { observerLogger } from "./logger.js";
 import { InstanceRegistry } from "./registry.js";
+import { ObserverRunStore } from "./runs.js";
 import { ObserverAgentServer } from "./server.js";
 
 function option(argumentsArray: string[], name: string): string | undefined {
@@ -39,8 +40,11 @@ function createCliAgent(options: ReturnType<typeof baseOptions> & { port?: numbe
   const registry = new InstanceRegistry(control.sessions);
   const jobs = new JobStore(control.sessions, registry);
   const artifacts = new ArtifactStore(control.paths.artifacts, control.sessions, jobs);
-  const server = new ObserverAgentServer(agentInstanceId, control, registry, jobs, artifacts, options);
-  return { control, registry, jobs, artifacts, server };
+  const runs = new ObserverRunStore(control.paths.runs, control.paths.exportWork, artifacts, jobs, {
+    supportingLogRoots: [control.paths.logs],
+  });
+  const server = new ObserverAgentServer(agentInstanceId, control, registry, jobs, artifacts, runs, options);
+  return { control, registry, jobs, artifacts, runs, server };
 }
 
 export async function runCli(argumentsArray: string[]): Promise<void> {

@@ -18,6 +18,10 @@ import { registerGroupResource } from "./resources/group-resource.js";
 import { SearchEngine } from "./index/search-engine.js";
 import { PatternLibrary } from "./patterns/loader.js";
 import { WorkbenchClient } from "./workbench/client.js";
+import {
+  WorkbenchHelperStager,
+  defaultWorkbenchHelperManagedRoot,
+} from "./workbench/helper-addon.js";
 import { WorkbenchObserverAdapter } from "./workbench/observer-adapter.js";
 import { registerWbLaunch } from "./tools/wb-launch.js";
 import { registerWbConnect } from "./tools/wb-connect.js";
@@ -76,12 +80,18 @@ export function registerTools(server: McpServer, config: Config): void {
   registerLayoutCreate(server, config);
 
   // Workbench Live Control tools (Phase 4)
+  const observerConfig = config.observer;
+  const workbenchCompanion = new WorkbenchHelperStager({
+    managedRoot: observerConfig?.managedRoot ?? defaultWorkbenchHelperManagedRoot(),
+  });
   const wbClient = new WorkbenchClient(
     config.workbenchHost,
     config.workbenchPort,
-    config
+    config,
+    undefined,
+    undefined,
+    { companionProvider: workbenchCompanion }
   );
-  const observerConfig = config.observer;
   // The observer adapter deliberately shares the one Workbench client and its
   // lifecycle/activity gate with every other Workbench tool. It never owns an
   // independent connection or auto-launch path.
@@ -100,11 +110,15 @@ export function registerTools(server: McpServer, config: Config): void {
     retentionIntervalMs: observerConfig?.retentionIntervalMs,
     retentionMaxAgeMs: observerConfig?.retentionMaxAgeMs,
     retentionMaxBytes: observerConfig?.retentionMaxBytes,
+    evidenceRoots: observerConfig?.evidenceRoots,
+    supportingLogRoots: observerConfig?.supportingLogRoots,
     workbenchAdapter: workbenchObserver,
   });
   registerObserverTools(server, observerCoordinator, {
     sessionTtlMs: observerConfig?.sessionTtlMs,
     defaultCaptureTimeoutMs: observerConfig?.defaultCaptureTimeoutMs,
+    workbenchClient: wbClient,
+    projectPath: config.projectPath,
   });
   const protocolServer = (server as unknown as { server?: { onclose?: () => void } }).server;
   if (protocolServer) {

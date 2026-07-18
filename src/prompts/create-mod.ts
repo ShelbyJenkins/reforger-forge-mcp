@@ -139,7 +139,7 @@ This applies to ALL physical in-game objects: interactive props, spawn points wi
 8. Use **mod** with \`action: "validate"\` to check for structural issues.
 
 9. **Workbench Setup** (MANDATORY — automate every safe step; attended Play is the one manual exception):
-   a. **wb_launch** with \`gprojPath\` set to the addon's .gproj file — this copies handler scripts into the mod, skips the launcher, and opens the project in the World Editor with full NET API access
+   a. **wb_launch** with \`gprojPath\` set to the addon's .gproj file — this stages the private helper outside the mod and opens the project in the World Editor with verified NET API access
    b. Ask the user to enter Play mode manually in Workbench because automated \`wb_play\` is disabled. Pause and wait for the user to confirm that Play has started.
    c. After confirmation, call **wb_state** and proceed only after it reports Play mode. Verify that the world launches successfully.
    d. Use **wb_stop** to return to the World Editor. Calling it in edit mode is an idempotent success.
@@ -148,7 +148,7 @@ This applies to ALL physical in-game objects: interactive props, spawn points wi
 
 10. If further runtime testing is needed, repeat the attended manual Play, confirmation, and **wb_state** verification flow. Use **wb_stop** to return to edit mode.
 
-11. **wb_cleanup** with the addon's root directory path — Remove the temporary handler scripts before the user publishes. NEVER skip this step.
+11. Call **wb_shutdown** when live editing is complete. The MCP-managed helper and profile remain outside the addon, so no project cleanup step is required.
 
 ## STEP 2: SUMMARIZE
 

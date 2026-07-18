@@ -14,6 +14,7 @@ class RFO_ObserverService
 	protected string m_RFO_PendingStatusJson;
 	protected string m_RFO_PendingArtifactJson;
 	protected string m_RFO_LastErrorCode;
+	protected string m_RFO_PostFrameCaptureDiagnostic;
 	protected int m_RFO_LastHeartbeatUnix;
 	protected int m_RFO_HeartbeatSequence;
 	protected int m_RFO_TransportFailures;
@@ -29,6 +30,8 @@ class RFO_ObserverService
 	protected bool m_RFO_RegistrationLogged;
 	protected bool m_RFO_FallbackLogged;
 	protected bool m_RFO_ContractFailureLogged;
+	protected bool m_RFO_PostFrameCaptureArmed;
+	protected bool m_RFO_PostFrameCaptureFailed;
 
 	static RFO_ObserverService GetInstance()
 	{
@@ -68,6 +71,9 @@ class RFO_ObserverService
 		m_RFO_InstanceNonce = m_RFO_Session.launchNonce;
 		m_RFO_RuntimeDetectionReadyMs = System.GetTickCount() + 1000;
 		m_RFO_LastTransportSuccessUnix = System.GetUnixTime();
+		m_RFO_PostFrameCaptureArmed = false;
+		m_RFO_PostFrameCaptureFailed = false;
+		m_RFO_PostFrameCaptureDiagnostic = string.Empty;
 
 		RFO_ObserverRestTransport rest = new RFO_ObserverRestTransport();
 		if (rest.Initialize(m_RFO_Session, this))
@@ -123,6 +129,25 @@ class RFO_ObserverService
 			RecordFailure("TRANSPORT_UNAVAILABLE", "Observer transport was unavailable while a camera lease was held", false);
 	}
 
+	// RFO_ObserverCamera invokes this after all normal frame updates. Explicit
+	// views are committed and captured here so gameplay camera code cannot replace
+	// the requested matrix between observer verification and screenshot issuance.
+	void OnObserverCameraPostFrame(RFO_ObserverCamera camera, BaseWorld world, float timeSlice)
+	{
+		if (!m_RFO_Active || !m_RFO_ActiveJob || !m_RFO_CameraLease || !m_RFO_World)
+			return;
+		if (!m_RFO_CameraLease.CommitPostFrame(camera, world, m_RFO_World.GetEpoch(), timeSlice))
+			return;
+		if (!m_RFO_PostFrameCaptureArmed || !m_RFO_ActiveJob.IsCameraView() || m_RFO_ActiveJob.state != RFO_ObserverJobState.CAPTURING || m_RFO_ActiveJob.screenshotIssued)
+			return;
+		if (!m_RFO_Capture.IssueCommitted(m_RFO_ActiveJob, world, m_RFO_FrameCounter, m_RFO_CameraLease.GetObserverCameraId()))
+		{
+			m_RFO_PostFrameCaptureDiagnostic = m_RFO_Capture.GetLastIssueDiagnostic();
+			m_RFO_PostFrameCaptureFailed = true;
+		}
+		m_RFO_PostFrameCaptureArmed = false;
+	}
+
 	void Shutdown(BaseWorld world)
 	{
 		if (m_RFO_CameraLease && m_RFO_CameraLease.HasOutstandingLease())
@@ -168,6 +193,9 @@ class RFO_ObserverService
 		if (!job.Initialize(command, m_RFO_Session, m_RFO_World))
 			return RejectCommand(command, "CAPTURE_REJECTED", "Runtime capture validation rejected the command", false);
 		m_RFO_ActiveJob = job;
+		m_RFO_PostFrameCaptureArmed = false;
+		m_RFO_PostFrameCaptureFailed = false;
+		m_RFO_PostFrameCaptureDiagnostic = string.Empty;
 		Print(string.Format("ReforgerForge Observer: job accepted jobId=%1 view=%2", job.jobId, job.viewKind));
 		if (!CaptureRateAvailable())
 		{
@@ -398,7 +426,19 @@ class RFO_ObserverService
 			m_RFO_ActiveJob = null;
 			m_RFO_PendingStatusJson = string.Empty;
 			m_RFO_PendingArtifactJson = string.Empty;
+			m_RFO_PostFrameCaptureArmed = false;
+			m_RFO_PostFrameCaptureFailed = false;
+			m_RFO_PostFrameCaptureDiagnostic = string.Empty;
 			return;
+		}
+		if (m_RFO_PostFrameCaptureFailed && job.terminalErrorCode.IsEmpty())
+		{
+			string diagnostic = m_RFO_PostFrameCaptureDiagnostic;
+			if (diagnostic.IsEmpty())
+				diagnostic = "Committed observer screenshot request was rejected";
+			RecordFailure("CAPTURE_REJECTED", diagnostic, false);
+			m_RFO_PostFrameCaptureFailed = false;
+			m_RFO_PostFrameCaptureDiagnostic = string.Empty;
 		}
 		if (!job.statusPending && !m_RFO_PendingStatusJson.IsEmpty())
 		{
@@ -430,7 +470,16 @@ class RFO_ObserverService
 					AcquireCamera(world);
 				else
 				{
-					job.state = RFO_ObserverJobState.CAPTURING;
+					if (!m_RFO_Capture.BeginPreload(world))
+					{
+						string diagnostic = m_RFO_Capture.GetLastPreloadDiagnostic();
+						if (diagnostic.IsEmpty())
+							diagnostic = "Current gameplay camera could not begin screenshot preload";
+						RecordFailure("CAPTURE_REJECTED", diagnostic, false);
+						BeginTerminalTransition();
+						break;
+					}
+					job.state = RFO_ObserverJobState.PRELOADING;
 					PublishStatus();
 				}
 				break;
@@ -439,11 +488,28 @@ class RFO_ObserverService
 				PublishStatus();
 				break;
 			case RFO_ObserverJobState.POSITIONING:
-				if (job.settleFrames > 0)
-					job.state = RFO_ObserverJobState.SETTLING;
-				else
-					job.state = RFO_ObserverJobState.CAPTURING;
+				if (job.IsCameraView() && !m_RFO_CameraLease.MaintainRequestedView(job.jobId))
+				{
+					if (m_RFO_CameraLease.AwaitingFirstPostFrameCommit(job.jobId))
+						break;
+					RecordFailure("CAMERA_OWNERSHIP_LOST", "Observer camera view could not be confirmed before preloading", false);
+					BeginTerminalTransition();
+					break;
+				}
+				if (!m_RFO_Capture.BeginPreload(world))
+				{
+					string diagnostic = m_RFO_Capture.GetLastPreloadDiagnostic();
+					if (diagnostic.IsEmpty())
+						diagnostic = "Positioned gameplay camera could not begin screenshot preload";
+					RecordFailure("CAPTURE_REJECTED", diagnostic, false);
+					BeginTerminalTransition();
+					break;
+				}
+				job.state = RFO_ObserverJobState.PRELOADING;
 				PublishStatus();
+				break;
+			case RFO_ObserverJobState.PRELOADING:
+				AdvancePreload(world);
 				break;
 			case RFO_ObserverJobState.SETTLING:
 				if (AdvanceSettleFrame(world))
@@ -519,6 +585,24 @@ class RFO_ObserverService
 		return m_RFO_ActiveJob.settledFrames >= m_RFO_ActiveJob.settleFrames;
 	}
 
+	protected void AdvancePreload(BaseWorld world)
+	{
+		RFO_ObserverJob job = m_RFO_ActiveJob;
+		if (job.IsCameraView() && !m_RFO_CameraLease.MaintainRequestedView(job.jobId))
+		{
+			RecordFailure("CAMERA_OWNERSHIP_LOST", "Observer camera view could not be maintained while preloading", false);
+			BeginTerminalTransition();
+			return;
+		}
+		if (!m_RFO_Capture.RuntimeReady())
+			return;
+		if (job.settleFrames > 0)
+			job.state = RFO_ObserverJobState.SETTLING;
+		else
+			job.state = RFO_ObserverJobState.CAPTURING;
+		PublishStatus();
+	}
+
 	protected void AdvanceCapture(BaseWorld world)
 	{
 		RFO_ObserverJob job = m_RFO_ActiveJob;
@@ -530,9 +614,21 @@ class RFO_ObserverService
 		}
 		if (!job.screenshotIssued && job.settledFrames < job.settleFrames && !AdvanceSettleFrame(world))
 			return;
+		if (!job.screenshotIssued && !m_RFO_Capture.RuntimeReady())
+			return;
+		if (!job.screenshotIssued && job.IsCameraView())
+		{
+			// The observer camera consumes this arm in EOnPostFrame immediately
+			// after publishing its matrix to the BaseWorld render slot.
+			m_RFO_PostFrameCaptureArmed = true;
+			return;
+		}
 		if (!job.screenshotIssued && !m_RFO_Capture.Issue(job, world, m_RFO_FrameCounter))
 		{
-			RecordFailure("CAPTURE_REJECTED", "Engine screenshot request was rejected", false);
+			string diagnostic = m_RFO_Capture.GetLastIssueDiagnostic();
+			if (diagnostic.IsEmpty())
+				diagnostic = "Engine screenshot request was rejected";
+			RecordFailure("CAPTURE_REJECTED", diagnostic, false);
 			BeginTerminalTransition();
 			return;
 		}
@@ -780,6 +876,9 @@ class RFO_ObserverService
 	{
 		bool restReady = m_RFO_Transport.GetName() == "rest";
 		bool mailboxReady = m_RFO_Transport.GetName() == "mailbox";
+		// Advertise the graphical endpoint as soon as its managed capture path is
+		// available. Per-job BeginPreload/RuntimeReady owns camera readiness; using
+		// that state here would prevent the first job from initiating its preload.
 		bool captureReady = m_RFO_Capture && m_RFO_Capture.IsReady();
 		return RFO_ObserverCapabilities.Collect(m_RFO_World.Available(), restReady, mailboxReady, captureReady, captureReady && RFO_ObserverCapabilities.CAMERA_RESTORE_PROVEN && m_RFO_CameraSubsystemSafe && !m_RFO_CameraLease.HasOutstandingLease());
 	}

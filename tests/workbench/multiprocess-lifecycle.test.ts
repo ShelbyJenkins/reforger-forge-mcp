@@ -77,7 +77,7 @@ afterEach(async () => {
 });
 
 describe.runIf(platform() === "win32")("real multi-process lifecycle ownership", () => {
-  it("keeps a second live Node MCP worker out of launch, restart, shutdown, and cleanup", async () => {
+  it("keeps a second live Node MCP worker out of launch, restart, and shutdown", async () => {
     const stateRoot = mkdtempSync(join(tmpdir(), "reforger-forge-node-workers-"));
     roots.push(stateRoot);
     const projectRoot = join(stateRoot, "WorkerFixture");
@@ -113,7 +113,7 @@ describe.runIf(platform() === "win32")("real multi-process lifecycle ownership",
       results: Record<string, { kind: string; code: string }>;
     };
 
-    for (const kind of ["launch", "restart", "shutdown", "cleanup"]) {
+    for (const kind of ["launch", "restart", "shutdown"]) {
       expect(contenderMessage.results[kind]).toMatchObject({
         kind: "refused",
         code: "OWNED_BY_OTHER_MCP",

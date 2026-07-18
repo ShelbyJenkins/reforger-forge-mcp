@@ -20,6 +20,8 @@ export interface ObserverManagedPaths {
   root: string;
   addons: string;
   artifacts: string;
+  runs: string;
+  exportWork: string;
   state: string;
   logs: string;
   profiles: string;
@@ -190,6 +192,8 @@ export function createObserverPaths(rootPath = defaultObserverRoot()): ObserverM
     root,
     addons: ensureCanonicalDirectory(join(root, "addons")),
     artifacts: ensureCanonicalDirectory(join(root, "artifacts")),
+    runs: ensureCanonicalDirectory(join(root, "runs")),
+    exportWork: ensureCanonicalDirectory(join(root, "export-work")),
     state: ensureCanonicalDirectory(join(root, "state")),
     logs: ensureCanonicalDirectory(join(root, "logs")),
     profiles: ensureCanonicalDirectory(join(root, "profiles")),

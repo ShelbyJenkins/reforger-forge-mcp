@@ -5,7 +5,7 @@
   "addonId": "ReforgerForgeObserver",
   "addonGuid": "7F3A91C2E40B6D58",
   "buildIdentity": "000cec19226673ce911c68dca027dca7449ff58a604fe0cef6509afbc4d7ec22",
-  "bundleDigest": "89f629f0b618a2041f60f07ea162a0b8ec868d5ddc67f17c833933205dd48772",
+  "bundleDigest": "57c9ed1d93253ead95e1a0a060d7b8251d0ad22819346bd62512645f4325b444",
   "files": [
     {
       "path": "addon.gproj",
@@ -20,8 +20,16 @@
       "sha256": "f508228012ed724548cf62781b155397157c8023f0fb7f1b0a48def2d792fe13"
     },
     {
+      "path": "Scripts/Game/ReforgerForgeObserver/RFO_ObserverCamera.c",
+      "sha256": "bbfe64a60c65b3798194cf0afa9ca268f554446a9e87c18310747e2b724e6cf3"
+    },
+    {
       "path": "Scripts/Game/ReforgerForgeObserver/RFO_ObserverCameraLease.c",
-      "sha256": "13eedf81fa0f376cd0a5306d0eaf485e37b3253d2125ccba72de8c2d3ab65bac"
+      "sha256": "d603a101916d4abb731ad998bf87b1e4daa085832c837ae2cb28fffd618fc199"
+    },
+    {
+      "path": "Scripts/Game/ReforgerForgeObserver/RFO_ObserverCameraProjection.c",
+      "sha256": "80483f10bf3932c6626429c001c353313501fa4345e587ce96604951b635661f"
     },
     {
       "path": "Scripts/Game/ReforgerForgeObserver/RFO_ObserverCapabilities.c",
@@ -29,7 +37,7 @@
     },
     {
       "path": "Scripts/Game/ReforgerForgeObserver/RFO_ObserverCapture.c",
-      "sha256": "a8add9100d5fa69712ade15c6889b66c083c9776c8a43cdd0c652d395e3aa1d0"
+      "sha256": "d1e65b6b021962c93ad6d6824acd97194a05f7aab6d6d51ae1c1f0b1d76d2b14"
     },
     {
       "path": "Scripts/Game/ReforgerForgeObserver/RFO_ObserverJob.c",
@@ -49,7 +57,7 @@
     },
     {
       "path": "Scripts/Game/ReforgerForgeObserver/RFO_ObserverService.c",
-      "sha256": "6ebadbc68262e9e66fcf9fdd1f157924a221d8740febe5e0395532730055110e"
+      "sha256": "440799eb6aabff2cc0c444ca19ca68757ba5af09fe86373f38a5147a444b10e5"
     },
     {
       "path": "Scripts/Game/ReforgerForgeObserver/RFO_ObserverSession.c",
@@ -69,7 +77,7 @@
     },
     {
       "path": "Scripts/WorkbenchGame/README.md",
-      "sha256": "d73e8f233c64dc3341205176dcc31d11141748a1d57679ca67703aaf371d8d84"
+      "sha256": "91fd431a95bd9b80204bdefc49089edd2a8ba134b2e0b7bb0b748ed38574430a"
     }
   ]
 }

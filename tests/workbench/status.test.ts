@@ -3,6 +3,7 @@ import { createServer, type Server, type Socket } from "node:net";
 import { WorkbenchClient } from "../../src/workbench/client.js";
 import { formatConnectionStatus, requireEditMode, requirePlayMode } from "../../src/workbench/status.js";
 import { encodePascalString, decodePascalString, decodeInt32LE } from "../../src/workbench/protocol.js";
+import { WORKBENCH_HELPER_PING_RESPONSE } from "./fake-companion.js";
 
 function createMockWorkbench(
   handler: (apiFunc: string, params: Record<string, unknown>) => unknown
@@ -56,7 +57,7 @@ describe("formatConnectionStatus", () => {
   });
 
   it("shows edit mode after call with mode=edit", async () => {
-    const mock = createMockWorkbench(() => ({ mode: "edit" }));
+    const mock = createMockWorkbench(() => ({ ...WORKBENCH_HELPER_PING_RESPONSE, mode: "edit" }));
     const client = new WorkbenchClient("127.0.0.1", mock.port);
     await client.call("EMCP_WB_Ping");
     const status = formatConnectionStatus(client);
@@ -65,7 +66,7 @@ describe("formatConnectionStatus", () => {
   });
 
   it("shows play mode after call with mode=play", async () => {
-    const mock = createMockWorkbench(() => ({ mode: "play" }));
+    const mock = createMockWorkbench(() => ({ ...WORKBENCH_HELPER_PING_RESPONSE, mode: "play" }));
     const client = new WorkbenchClient("127.0.0.1", mock.port);
     await client.call("EMCP_WB_Ping");
     const status = formatConnectionStatus(client);
@@ -100,14 +101,14 @@ describe("requireEditMode", () => {
   });
 
   it("returns null when mode is edit", async () => {
-    mock = createMockWorkbench(() => ({ mode: "edit" }));
+    mock = createMockWorkbench(() => ({ ...WORKBENCH_HELPER_PING_RESPONSE, mode: "edit" }));
     client = new WorkbenchClient("127.0.0.1", mock.port);
     await client.call("EMCP_WB_Ping");
     expect(requireEditMode(client, "create entity")).toBeNull();
   });
 
   it("returns warning when mode is play", async () => {
-    mock = createMockWorkbench(() => ({ mode: "play" }));
+    mock = createMockWorkbench(() => ({ ...WORKBENCH_HELPER_PING_RESPONSE, mode: "play" }));
     client = new WorkbenchClient("127.0.0.1", mock.port);
     await client.call("EMCP_WB_Ping");
     const result = requireEditMode(client, "create entity");
@@ -134,14 +135,14 @@ describe("requirePlayMode", () => {
   });
 
   it("returns null when mode is play", async () => {
-    mock = createMockWorkbench(() => ({ mode: "play" }));
+    mock = createMockWorkbench(() => ({ ...WORKBENCH_HELPER_PING_RESPONSE, mode: "play" }));
     client = new WorkbenchClient("127.0.0.1", mock.port);
     await client.call("EMCP_WB_Ping");
     expect(requirePlayMode(client, "stop")).toBeNull();
   });
 
   it("returns warning when mode is edit", async () => {
-    mock = createMockWorkbench(() => ({ mode: "edit" }));
+    mock = createMockWorkbench(() => ({ ...WORKBENCH_HELPER_PING_RESPONSE, mode: "edit" }));
     client = new WorkbenchClient("127.0.0.1", mock.port);
     await client.call("EMCP_WB_Ping");
     const result = requirePlayMode(client, "stop play mode");

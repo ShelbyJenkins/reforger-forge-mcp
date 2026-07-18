@@ -8,6 +8,8 @@
   "workbenchHost": "127.0.0.1",
   "workbenchPort": 5775,
   "observer": {
+    "evidenceRoots": ["C:\\path\\to\\project\\screenshots"],
+    "supportingLogRoots": ["C:\\path\\to\\approved\\logs"],
     "startupTimeoutMs": 10000,
     "requestTimeoutMs": 30000,
     "defaultCaptureTimeoutMs": 30000,

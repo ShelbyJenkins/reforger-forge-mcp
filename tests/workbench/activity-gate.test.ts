@@ -7,7 +7,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import {
   afterEach,
   describe,
@@ -30,8 +30,13 @@ import { canonicalizeGproj } from "../../src/workbench/project-identity.js";
 import {
   WorkbenchProcessGuard,
   type WorkbenchIdentity,
-  type WorkbenchLifecycleStateV2,
+  type WorkbenchLifecycleStateV3,
 } from "../../src/workbench/process-guard.js";
+import {
+  companionLifecycleState,
+  createFakeCompanionLaunch,
+  fakeCompanionProvider,
+} from "./fake-companion.js";
 import { FakeLifecycleBackend } from "./fake-lifecycle-backend.js";
 
 const roots: string[] = [];
@@ -188,7 +193,7 @@ interface RunningHarness {
   guard: WorkbenchProcessGuard;
   client: WorkbenchClient;
   workbench: WorkbenchIdentity;
-  state: WorkbenchLifecycleStateV2;
+  state: WorkbenchLifecycleStateV3;
 }
 
 async function createRunningHarness(activityGate?: WorkbenchActivityGate): Promise<RunningHarness> {
@@ -217,9 +222,9 @@ async function createRunningHarness(activityGate?: WorkbenchActivityGate): Promi
   const guard = new WorkbenchProcessGuard({
     backend,
     stateDir,
-    legacyStatePath: join(root, "legacy.json"),
     mutexName: `Global\\ReforgerForge.Activity.${root}`,
   });
+  const companion = createFakeCompanionLaunch(root);
   const workbench: WorkbenchIdentity = {
     pid: 21_000,
     executablePath: join(toolsRoot, "ArmaReforgerWorkbenchSteamDiag.exe"),
@@ -228,7 +233,7 @@ async function createRunningHarness(activityGate?: WorkbenchActivityGate): Promi
     launchedAtMs: 1_000,
   };
   const project = canonicalizeGproj(projectPath);
-  let state!: WorkbenchLifecycleStateV2;
+  let state!: WorkbenchLifecycleStateV3;
   await guard.withLifecycleLock(async (session) => {
     const claim = await session.validateAndClaim({
       endpoint: { host: config.workbenchHost, port: config.workbenchPort },
@@ -245,7 +250,7 @@ async function createRunningHarness(activityGate?: WorkbenchActivityGate): Promi
       target: claim.state.target,
       mcpOwner: claim.state.mcpOwner,
       workbench,
-      handler: null,
+      companion: companionLifecycleState(companion),
       operation: null,
     });
   });
@@ -255,18 +260,19 @@ async function createRunningHarness(activityGate?: WorkbenchActivityGate): Promi
     config,
     "activity-test",
     guard,
-    { activityGate }
+    { activityGate, companionProvider: fakeCompanionProvider(companion) }
   );
+  vi.spyOn(client, "ping").mockResolvedValue(true);
   return { root, projectPath, config, backend, guard, client, workbench, state };
 }
 
 async function replaceRunningState(
   harness: RunningHarness,
   overrides: Partial<Pick<
-    WorkbenchLifecycleStateV2,
+    WorkbenchLifecycleStateV3,
     "phase" | "target" | "workbench" | "operation"
   >> = {}
-): Promise<WorkbenchLifecycleStateV2> {
+): Promise<WorkbenchLifecycleStateV3> {
   return harness.guard.withLifecycleLock(async (session) => {
     const read = await session.readState();
     if (read.kind !== "valid") throw new Error("missing running lifecycle state");
@@ -279,7 +285,7 @@ async function replaceRunningState(
       target: overrides.target === undefined ? read.state.target : overrides.target,
       mcpOwner: read.state.mcpOwner,
       workbench: overrides.workbench === undefined ? read.state.workbench : overrides.workbench,
-      handler: read.state.handler,
+      companion: read.state.companion,
       operation: overrides.operation === undefined ? null : overrides.operation,
     });
   });
@@ -295,8 +301,12 @@ describe("WorkbenchClient observer activity integration", () => {
       harness.config,
       "activity-test",
       harness.guard,
-      { spawnProcess }
+      {
+        spawnProcess,
+        companionProvider: fakeCompanionProvider(createFakeCompanionLaunch(harness.root)),
+      }
     );
+    vi.spyOn(client, "ping").mockResolvedValue(true);
 
     await expect(client.getRunningObserverSnapshot()).resolves.toMatchObject({
       generation: harness.state.generation,
@@ -315,7 +325,6 @@ describe("WorkbenchClient observer activity integration", () => {
     ["starting", "launch"],
     ["restarting", "restart"],
     ["stopping", "shutdown"],
-    ["cleaning", "cleanup"],
   ] as const)("does not admit capture during durable %s lifecycle state", async (phase, kind) => {
     const harness = await createRunningHarness();
     await replaceRunningState(harness, {
@@ -363,8 +372,6 @@ describe("WorkbenchClient observer activity integration", () => {
     ["launch", (harness: RunningHarness) => harness.client.ensureRunning(harness.projectPath)],
     ["restart", (harness: RunningHarness) => harness.client.restartOwnedWorkbench()],
     ["shutdown", (harness: RunningHarness) => harness.client.shutdownOwnedWorkbench()],
-    ["cleanup", (harness: RunningHarness) =>
-      harness.client.cleanupHandlerScripts(dirname(harness.projectPath))],
   ])("refuses %s before mutex entry or termination when restoration times out", async (
     _kind,
     invoke

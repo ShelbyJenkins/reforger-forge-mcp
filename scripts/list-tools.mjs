@@ -41,7 +41,7 @@ const offlineNames = new Set([
   "scenario_create_conflict", "animation_graph", "building_setup", "workshop_info",
 ]);
 const lifecycleNames = new Set([
-  "wb_launch", "wb_restart", "wb_shutdown", "wb_cleanup",
+  "wb_launch", "wb_restart", "wb_shutdown",
 ]);
 const connectionNames = new Set(["wb_connect", "wb_diagnose"]);
 const workbenchNames = new Set(["scenario_create"]);
@@ -52,6 +52,7 @@ const observerNames = new Set([
   "observer_instances",
   "observer_capture",
   "observer_job",
+  "observer_run",
 ]);
 const readme = readFileSync(join(root, "README.md"), "utf8");
 const toolReference = readme.split("## Complete Tool Reference")[1]?.split(/^## /m)[0] ?? "";

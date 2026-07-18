@@ -62,7 +62,6 @@ Use placeholders rather than real local paths in committed documentation:
     "<USER_OR_WORKSHOP_ADDONS_DIRECTORY>"
   ],
   "workbenchScriptAuthorizeAll": false,
-  "workbenchNoThrow": true,
   "workbenchHost": "127.0.0.1",
   "workbenchPort": 5775
 }
@@ -90,10 +89,9 @@ of its dependencies are trusted. Enabling it suppresses authorization prompts
 for protected `RunCmd`, `RunProcess`, `KillProcess`, and out-of-profile `FileIO`
 operations.
 
-Agent-launched Workbench sessions always enforce `-noThrow`, even if a legacy
-config sets `workbenchNoThrow` false. It sends assertions to the log instead of
-displaying modal dialogs, which keeps unattended validation from waiting
-forever for a person to click a button.
+Agent-launched Workbench sessions always enforce `-noThrow`. It sends assertions
+to the log instead of displaying modal dialogs, which keeps unattended
+validation from waiting forever for a person to click a button.
 
 Avoid putting a Workbench project in a cloud-synchronized or read-only
 directory. Sync clients can change attributes or lock files in ways that stop
@@ -108,28 +106,27 @@ Workbench from loading or saving resources.
 - Use `wb_diagnose` when launch or connection fails; do not guess at the cause.
 - A working bridge reports that the EnfusionMCP Workbench bridge is active.
 
-`wb_launch` copies temporary handlers into
-`Scripts/WorkbenchGame/EnfusionMCP`. Those handlers must compile as part of the
-target project. For the most reliable first connection, close an unrelated or
-stale Workbench session and call `wb_launch` with the target `gprojPath`.
-A fresh owner-scoped start installs or refreshes the hashed, transactional
-handler bundle only while Workbench is stopped; reusing an already-running
-verified target never rewrites live handler files. Automated
-lifecycle control is supported on Windows and serialized with a global named
-mutex. A second live MCP cannot adopt the first MCP's Workbench. A replacement
-MCP may claim the lease only after the prior MCP PID and exact creation identity
-are proven dead. `wb_restart` preflights the complete replacement before it
-stops anything, retains the same canonical `.gproj`, terminates through the
-verified OS process handle, waits for the NET API port to release, launches with
-`-noThrow`, and refuses different-target, user-owned, or unverifiable sessions.
+`wb_launch` digest-verifies and stages the packaged
+`ReforgerForgeWorkbenchHelper` beneath the external observer managed root. It
+loads that add-on alongside the exact target `.gproj` and gives Workbench a
+dedicated external profile. It does not place MCP helper files in the target
+project. Readiness requires `EMCP_WB_Ping` to return the exact helper add-on ID,
+GUID, version, protocol, and build identity expected by the running MCP.
 
-Keep the handlers while live automation is in use. When finished, call
-`wb_shutdown` to stop the exact owner and release the endpoint, then call
-`wb_cleanup` with the mod root. Cleanup is blocked while Workbench may be
-watching the project and removes only hash-matching manifest-owned files;
-modified and unrelated files are preserved for review.
+Automated lifecycle control is supported on Windows and serialized with the
+version-3 global named mutex and lifecycle record. A second live MCP cannot
+adopt the first MCP's Workbench. A replacement MCP may claim the lease only
+after the prior MCP PID and exact creation identity are proven dead.
+`wb_restart` preflights the complete replacement before it stops anything,
+retains the same canonical `.gproj`, terminates through the verified OS process
+handle, waits for the NET API port to release, launches with `-noThrow`, and
+refuses different-target, user-owned, unverifiable, or wrong-helper sessions.
 
-Workbench observer capture uses dedicated managed NET API handlers and the same
+When live automation is finished, restore or cancel every observer capture,
+wait for a terminal job state, and call `wb_shutdown`. The managed helper and
+profile remain outside the mod, so there is no project cleanup step.
+
+Workbench observer capture uses dedicated companion NET API handlers and the same
 long-lived client, canonical target, exact owner lease, and lifecycle generation
 as other `wb_*` operations. It never auto-launches Workbench; launch the visible
 target explicitly with `wb_launch` first. The lifecycle canonical target is the
@@ -143,8 +140,19 @@ camera slot, full matrix, measured vertical FOV, and read-only far plane.
 `BaseWorld` has no near-plane getter, so observer capture does not mutate that
 value. Workbench capture produces native PNG artifacts; do not document or
 expect a BMP conversion path. Treat `RESTORATION_UNCONFIRMED` as a hard failure.
-Restore or cancel active captures before `wb_shutdown`, then wait for vacancy
-before `wb_cleanup`.
+Restore or cancel active captures before `wb_shutdown`, then wait for vacancy.
+
+Project scripts and CI should call the packaged lifecycle runner instead of
+maintaining another process guard:
+
+```text
+reforger-forge-workbench editor --gproj <path> --foreground
+reforger-forge-workbench build --gproj <path> --platform PC --output <path> --timeout-ms <n>
+```
+
+Editor ownership is foreground-only. Build execution is deadline-bounded and
+returns a JSON receipt with the exact target, lifecycle generation, endpoint
+ownership, attributed log directory, and exit status.
 
 ## Start-of-Task Checklist
 
@@ -185,9 +193,10 @@ name below.
 | Generate Conflict scenario files | `scenario_create_conflict` (offline) |
 | Create or validate an addon | `mod` (`action=build` is retired) |
 | Stage or diagnose the observer companion addon | `observer_setup` |
+| Begin, inspect, finalize, or discard a managed evidence run | `observer_run` |
 | Prepare an instrumented runtime argument array without launching it | `observer_prepare_launch` |
 | Inventory runtime or exact-owned Workbench renderers | `observer_instances` |
-| Capture a current, explicit-pose, or look-at PNG | `observer_capture`; use `observer_job` for async status/cancel/release |
+| Capture a current, explicit-pose, or look-at PNG | `observer_capture`; use `observer_job` for async status/read/cancel/release |
 | Inspect Workbench and troubleshoot the connection | `wb_state`, `wb_connect`, `wb_diagnose` |
 | Inspect or edit placed entities | `wb_entity_list`, `wb_entity_inspect`, `wb_entity_modify`, `wb_component` |
 | Duplicate an entity already placed in a scene | `wb_entity_duplicate` |
@@ -225,7 +234,8 @@ For live editor work:
    acceptance. When attended in-editor testing is required, ask the user to
    enter Play manually because `wb_play` is disabled, pause until they confirm,
    verify Play mode with `wb_state`, and use `wb_stop` to return to edit mode.
-9. When live automation is finished, call `wb_shutdown` before `wb_cleanup`.
+9. When live automation is finished, restore or cancel active captures, wait
+   for terminal state, and call `wb_shutdown`.
 
 After changing `.c` files in a session that has loaded a world, save intentional
 editor changes manually and use `wb_restart`. Do not route a script compile
@@ -239,6 +249,35 @@ An already-running Play session may retain stale prefab or script values.
 Avoid `wb_open_resource` on a prefab while an important world is open unless
 switching into prefab edit mode is intentional; opening the resource can close
 or replace the current world-editor context.
+
+## Screenshot Evidence Flow
+
+Use `screenshots` only for finalized evidence, never for profiles, repositories,
+archives, probe logs, or raw capture work. Configure its absolute path in
+`observer.evidenceRoots`; the observer keeps all working artifacts under its
+external managed root.
+
+1. Call `observer_run action="begin"` and retain the generated `runId`.
+2. Prepare and start a runtime, or explicitly call `wb_launch` for an editor.
+3. Call `observer_instances`, choose one exact renderer, and record its
+   `instanceId`, `worldId`, and `worldEpoch`.
+4. Call `observer_capture` with the `runId`, a meaningful unique
+   `captureLabel`, and the inventory's expected-world values. These fields are
+   required for evidence captures. Prefer `view.kind="current"` first and
+   synchronous mode while reviewing interactively.
+5. Inspect the image itself. A successful capture transaction proves image
+   integrity and camera restoration, not the gameplay claim shown in the image.
+6. For asynchronous work, poll `observer_job action="status"`, then call
+   `action="read"` when complete. If it exceeds the inline limit, leave it
+   managed; `observer_run action="finalize"` can still export it.
+7. Finalize only reviewed labels into the allowlisted evidence root. The result
+   is `<evidenceRoot>/<runId>/` with `RESULT.md`, `manifest.json`, capture
+   PNG/JSON pairs, and only supplied allowlisted logs or sanitized runtime
+   configuration. Use `discard` when the run should produce no evidence.
+
+An outcome of `Passed` requires `review.imagesReviewed=true`. Record warnings,
+contamination, limitations, source revision, procedure revision, and the stable
+reviewer identity rather than inferring success from a completed job.
 
 ## Resource and GUID Rules
 
@@ -306,7 +345,7 @@ remaining validation gap. Do not describe an unrun check as passed.
 | Symptom | Check |
 |---|---|
 | `wb_connect` cannot reach Workbench | Confirm the NET API is enabled, host/port match, the correct `.gproj` is loaded, then run `wb_diagnose`. |
-| `Undefined API func` from a `wb_*` tool | The temporary handlers are missing or stale. Do not inject or reload them in a live user session. Close that Workbench, launch the target `.gproj` through `wb_launch`, then use owner-scoped `wb_restart` if another clean compile is needed. |
+| `Undefined API func` from a `wb_*` tool | The managed Workbench companion is absent, did not compile, or has the wrong identity. Close that Workbench, run `wb_diagnose`, then launch the exact `.gproj` through `wb_launch`. Use owner-scoped `wb_restart` for another clean compile. |
 | A component appears as `Unknown` | Its script did not compile in the loaded project. Fix compile errors and reload or restart before setting properties. |
 | Workbench opens without the target mod | Close any stale session and call `wb_launch` with the exact `gprojPath`; if it still fails, check direct/transitive dependencies and every configured addon root. |
 | A path is truncated near `Arma Reforger` | Preserve quoting around paths with spaces and around the full comma-separated `-addonsDir` value. |
@@ -346,7 +385,7 @@ Before reporting completion or publishing:
   acceptance cases.
 - Save editor changes and record any validation that still requires manual or
   multiplayer testing.
-- Call `wb_shutdown`, then `wb_cleanup`, so managed temporary handlers are not
-  shipped while modified or unrelated files remain protected.
+- Restore/cancel observer work and call `wb_shutdown`; confirm no MCP helper
+  files exist beneath the target addon.
 - Exclude local MCP config, logs, caches, absolute paths, usernames, and other
   machine-specific information from the commit.

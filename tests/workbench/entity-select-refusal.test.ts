@@ -40,7 +40,7 @@ describe("wb_entity_select safe refusal", () => {
 
   it("the direct Workbench handler never clears selection or reports success", () => {
     const sourcePath = fileURLToPath(new URL(
-      "../../mod/Scripts/WorkbenchGame/EnfusionMCP/EMCP_WB_SelectEntity.c",
+      "../../observer/workbench-addon/Scripts/WorkbenchGame/EnfusionMCP/EMCP_WB_SelectEntity.c",
       import.meta.url
     ));
     const source = readFileSync(sourcePath, "utf8");

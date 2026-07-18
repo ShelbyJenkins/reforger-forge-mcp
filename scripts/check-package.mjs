@@ -56,16 +56,21 @@ const requiredFiles = [
   "dist/observer/tools.js",
   "dist/observer/protocol/index.js",
   "dist/tools/wb-shutdown.js",
-  "dist/workbench/handler-bundle.js",
+  "dist/workbench/helper-addon.js",
   "dist/workbench/observer-adapter.js",
   "dist/workbench/process-guard.js",
   "dist/workbench/project-identity.js",
+  "dist/workbench/runner-cli.js",
+  "dist/workbench/runner.js",
   "configs/claude-desktop.json",
   "configs/cursor-global.json",
   "docs/AGENTS.md",
   "observer/README.md",
   "observer/addon/addon.gproj",
   "observer/addon/.reforger-forge-observer-source.json",
+  "observer/workbench-addon/addon.gproj",
+  "observer/workbench-addon/.reforger-forge-workbench-helper-source.json",
+  "observer/workbench-addon/Scripts/WorkbenchGame/EnfusionMCP/RFWB_HelperBuild.c",
   "observer/protocol/VERSION",
   "observer/protocol/schemas/session-contract.schema.json",
   "observer/protocol/schemas/instance-registration.schema.json",
@@ -80,12 +85,13 @@ const requiredFiles = [
   "scripts/install-agents.ps1",
   "scripts/list-tools.mjs",
   "scripts/observer-live-acceptance-support.ts",
+  "scripts/run-runtime-observer-acceptance.ts",
   "scripts/run-workbench-observer-acceptance.ts",
   "scripts/update-observer-source-manifest.mjs",
   "scripts/setup.ps1",
   "scripts/windows/workbench-lifecycle.ps1",
 ];
-const requiredPrefixes = ["configs/", "data/", "mod/"];
+const requiredPrefixes = ["configs/", "data/", "observer/workbench-addon/"];
 const requiredObserverScripts = [
   "Scripts/Game/ReforgerForgeObserver/RFO_ObserverBuild.c",
   "Scripts/Game/ReforgerForgeObserver/RFO_ObserverCameraLease.c",
@@ -129,19 +135,26 @@ const requiredHandlers = [
   "EMCP_WB_ScriptEditor.c",
   "EMCP_WB_SelectEntity.c",
   "EMCP_WB_Terrain.c",
-].map((name) => `mod/Scripts/WorkbenchGame/EnfusionMCP/${name}`);
+].map((name) => `observer/workbench-addon/Scripts/WorkbenchGame/EnfusionMCP/${name}`);
 
 const missingFiles = requiredFiles.filter((path) => !files.has(path));
 const missingPrefixes = requiredPrefixes.filter(
   (prefix) => ![...files].some((path) => path.startsWith(prefix))
 );
-const handlerPrefix = "mod/Scripts/WorkbenchGame/EnfusionMCP/";
+const handlerPrefix = "observer/workbench-addon/Scripts/WorkbenchGame/EnfusionMCP/";
+const requiredHelperScripts = [
+  ...requiredHandlers,
+  `${handlerPrefix}RFWB_HelperBuild.c`,
+].sort();
 const packagedHandlers = [...files]
   .filter((path) => path.startsWith(handlerPrefix) && path.toLowerCase().endsWith(".c"))
   .sort();
 const missingHandlers = requiredHandlers.filter((path) => !files.has(path));
-const unexpectedHandlers = packagedHandlers.filter((path) => !requiredHandlers.includes(path));
+const unexpectedHandlers = packagedHandlers.filter((path) => !requiredHelperScripts.includes(path));
 const missingObserverScripts = requiredObserverScripts.filter((path) => !files.has(path));
+const legacyPackagedHandlers = [...files].filter((path) =>
+  path.startsWith("mod/Scripts/WorkbenchGame/EnfusionMCP/")
+);
 const forbiddenObserverFiles = [...files].filter((path) =>
   path.startsWith("tests/observer/") ||
   path.startsWith("observer/artifacts/") ||
@@ -152,13 +165,14 @@ const forbiddenObserverFiles = [...files].filter((path) =>
   (path.startsWith("observer/") && /\.(bmp|png)$/i.test(path))
 );
 
-if (missingFiles.length || missingPrefixes.length || missingHandlers.length || unexpectedHandlers.length || missingObserverScripts.length || forbiddenObserverFiles.length) {
+if (missingFiles.length || missingPrefixes.length || missingHandlers.length || unexpectedHandlers.length || missingObserverScripts.length || legacyPackagedHandlers.length || forbiddenObserverFiles.length) {
   const details = [
     ...missingFiles.map((path) => `missing file: ${path}`),
     ...missingPrefixes.map((prefix) => `missing package content under: ${prefix}`),
     ...missingHandlers.map((path) => `missing supported handler: ${path}`),
     ...unexpectedHandlers.map((path) => `unexpected packaged handler: ${path}`),
     ...missingObserverScripts.map((path) => `missing observer addon script: ${path}`),
+    ...legacyPackagedHandlers.map((path) => `legacy project-injection handler must not be packaged: ${path}`),
     ...forbiddenObserverFiles.map((path) => `forbidden observer runtime artifact: ${path}`),
   ];
   throw new Error(`Package content check failed:\n${details.map((line) => `  - ${line}`).join("\n")}`);
@@ -175,4 +189,4 @@ if (versionCheck.status !== 0 || !/^\d+\.\d+\.\d+\s*$/.test(versionCheck.stdout)
   throw new Error("Compiled observer agent failed its non-network --version check");
 }
 
-console.log(`Package content verified: ${files.size} files, including MCP lifecycle and standalone observer artifacts.`);
+console.log(`Package content verified: ${files.size} files, including MCP lifecycle, managed Workbench helper, and standalone observer artifacts.`);

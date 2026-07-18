@@ -6,120 +6,79 @@ export function registerWbDiagnose(server: McpServer, client: WorkbenchClient): 
     "wb_diagnose",
     {
       description:
-        "Run a full diagnostic of the EnfusionMCP ↔ Workbench connection. " +
-        "Reports config, handler script locations, and NET API status without auto-launching Workbench. " +
-        "Use this when wb_launch fails or wb_connect returns errors.",
+        "Report Workbench configuration, managed companion identity, lifecycle ownership, and " +
+        "NET API health without auto-launching Workbench.",
       inputSchema: {},
     },
     async () => {
-      const r = await client.diagnose();
+      const report = await client.diagnose();
+      const lines: string[] = ["## Reforger Forge Workbench Diagnostic\n"];
 
-      const lines: string[] = ["## EnfusionMCP Diagnostic Report\n"];
-
-      // --- Config ---
       lines.push("### Configuration");
-      lines.push(`- **NET API:** ${r.host}:${r.port}`);
-      if (r.workbenchExe) {
-        const mark = r.workbenchExe.exists ? "FOUND" : "NOT FOUND";
-        lines.push(`- **Workbench Exe:** ${mark} — \`${r.workbenchExe.path}\``);
-      } else {
-        lines.push("- **Workbench Exe:** config not loaded");
-      }
-      if (r.projectPath) {
-        const mark = r.projectPath.exists ? "EXISTS" : "NOT FOUND";
-        lines.push(`- **Project Path:** ${mark} — \`${r.projectPath.path}\``);
-      } else {
-        lines.push("- **Project Path:** not configured");
-      }
-      lines.push(`- **Default Mod:** ${r.defaultMod ?? "(not set)"}`);
+      lines.push(`- **NET API:** ${report.host}:${report.port}`);
+      lines.push(report.workbenchExe
+        ? `- **Workbench executable:** ${report.workbenchExe.exists ? "FOUND" : "NOT FOUND"} — \`${report.workbenchExe.path}\``
+        : "- **Workbench executable:** config not loaded");
+      lines.push(report.projectPath
+        ? `- **Project path:** ${report.projectPath.exists ? "EXISTS" : "NOT FOUND"} — \`${report.projectPath.path}\``
+        : "- **Project path:** not configured");
+      lines.push(`- **Default mod:** ${report.defaultMod ?? "(not set)"}`);
 
-      // --- Handler Scripts ---
-      lines.push("\n### Handler Scripts");
-      {
-        const mark = r.bundledScripts.exists ? "FOUND" : "MISSING";
-        lines.push(`- **Bundled source:** ${mark} — \`${r.bundledScripts.path}\``);
-      }
-      {
-        const mark = r.standaloneAddon.exists
-          ? `EXISTS (${r.standaloneAddon.fileCount} .c files) — should be absent when injecting into a mod`
-          : "not present (correct)";
-        lines.push(`- **Standalone addon:** ${mark} — \`${r.standaloneAddon.path}\``);
-      }
-      if (r.installedMods.length === 0) {
-        lines.push("- **Installed in mods:** none found — handlers not injected into any mod");
+      lines.push("\n### Managed Workbench Companion");
+      if (report.companionAddon) {
+        lines.push(`- **Package source:** VERIFIED — \`${report.companionAddon.path}\``);
+        lines.push(`- **Add-on:** ${report.companionAddon.addonId} (${report.companionAddon.addonGuid})`);
+        lines.push(`- **Build identity:** \`${report.companionAddon.buildIdentity}\``);
+        lines.push(`- **Bundle digest:** \`${report.companionAddon.bundleDigest}\``);
       } else {
-        for (const m of r.installedMods) {
-          lines.push(`- **Installed:** ${m.fileCount} .c files → \`${m.handlerDir}\``);
-        }
+        lines.push("- **Package source:** MISSING OR INVALID");
       }
 
-      // --- NET API ---
       lines.push("\n### NET API Connection");
-      switch (r.netApi) {
-        case "up_with_handlers":
-          lines.push("- **Status:** CONNECTED — EMCP_WB_Ping responded. All wb_* tools are available.");
+      switch (report.netApi) {
+        case "up_with_companion":
+          lines.push("- **Status:** CONNECTED — the managed companion responded.");
           break;
-        case "up_no_handlers":
-          lines.push("- **Status:** PORT OPEN, HANDLERS NOT LOADED");
-          lines.push("  - Workbench NET API is reachable but EMCP_WB_Ping is not registered.");
-          lines.push("  - Handler scripts were not compiled. Check:");
-          lines.push("    1. Are handlers installed in the mod listed above?");
-          lines.push("    2. Does that mod have script errors preventing compilation?");
-          lines.push("    3. Is Workbench open with that mod's .gproj loaded?");
-          if (r.netApiError) lines.push(`  - Raw error: \`${r.netApiError}\``);
+        case "up_no_companion":
+          lines.push("- **Status:** PORT OPEN, MANAGED COMPANION NOT LOADED");
+          lines.push("  - Close the unowned session, then use wb_launch to stage and load the exact helper.");
           break;
         case "refused":
           lines.push("- **Status:** CONNECTION REFUSED — Workbench is not running or NET API is disabled.");
-          lines.push("  - Start Workbench and enable NET API: File > Options > General > Net API");
-          if (r.netApiError) lines.push(`  - Raw error: \`${r.netApiError}\``);
           break;
         case "timeout":
-          lines.push("- **Status:** TIMEOUT — connection hung. Possible firewall or port conflict.");
-          if (r.netApiError) lines.push(`  - Raw error: \`${r.netApiError}\``);
+          lines.push("- **Status:** TIMEOUT — check firewall and endpoint ownership.");
           break;
         case "error":
           lines.push("- **Status:** ERROR");
-          if (r.netApiError) lines.push(`  - Raw error: \`${r.netApiError}\``);
           break;
       }
+      if (report.netApiError) lines.push(`- **Raw error:** \`${report.netApiError}\``);
 
-      // Read-only lifecycle information. Diagnosis never claims a lease.
+      const lifecycle = report.lifecycle;
       lines.push("\n### Lifecycle State");
-      lines.push(`- **Record:** ${r.lifecycle.state}${r.lifecycle.version ? ` (schema v${r.lifecycle.version})` : ""}`);
-      lines.push(`- **Generation:** ${r.lifecycle.generation ?? "(none)"}`);
-      lines.push(`- **Phase:** ${r.lifecycle.phase ?? "(none)"}`);
-      lines.push(`- **Endpoint:** ${r.lifecycle.endpoint ?? "(none)"}`);
-      lines.push(`- **Canonical target:** ${r.lifecycle.target ? `\`${r.lifecycle.target}\`` : "(none)"}`);
-      lines.push(`- **MCP lease:** ${r.lifecycle.lease}`);
-      lines.push(`- **Operation:** ${r.lifecycle.operation ?? "(none)"}`);
-      lines.push(`- **Handler transaction:** ${r.lifecycle.handlerTransaction ?? "(none)"}`);
-      if (r.lifecycle.detail) lines.push(`- **Detail:** ${r.lifecycle.detail}`);
+      lines.push(`- **Record:** ${lifecycle.state}${lifecycle.version ? ` (schema v${lifecycle.version})` : ""}`);
+      lines.push(`- **Generation:** ${lifecycle.generation ?? "(none)"}`);
+      lines.push(`- **Phase:** ${lifecycle.phase ?? "(none)"}`);
+      lines.push(`- **Endpoint:** ${lifecycle.endpoint ?? "(none)"}`);
+      lines.push(`- **Canonical target:** ${lifecycle.target ? `\`${lifecycle.target}\`` : "(none)"}`);
+      lines.push(`- **MCP lease:** ${lifecycle.lease}`);
+      lines.push(`- **Operation:** ${lifecycle.operation ?? "(none)"}`);
+      lines.push(`- **Companion build:** ${lifecycle.companionBuildIdentity ?? "(none)"}`);
+      if (lifecycle.detail) lines.push(`- **Detail:** ${lifecycle.detail}`);
 
-      // --- Recommendations ---
-      const problems: string[] = [];
-      if (!r.bundledScripts.exists) {
-        problems.push("Bundled handler scripts are missing from the package installation. Re-install reforger-forge-mcp.");
+      const issues: string[] = [];
+      if (!report.companionAddon) {
+        issues.push("The packaged Workbench companion failed verification. Re-install reforger-forge-mcp.");
       }
-      if (r.standaloneAddon.exists && r.installedMods.length > 0) {
-        problems.push(
-          "A standalone addon AND mod-injected handlers coexist — this causes duplicate class errors. " +
-            "Automated lifecycle control never recursively deletes this legacy directory. " +
-            `Close Workbench and review it manually: \`${r.standaloneAddon.path}\``
+      if (report.netApi === "up_no_companion") {
+        issues.push(
+          "NET API is reachable without the exact managed companion. Close that Workbench, then call wb_launch."
         );
       }
-      if (r.netApi === "up_no_handlers" && r.installedMods.length === 0) {
-        problems.push(
-          "NET API is up but no handler scripts are installed anywhere. " +
-            "Do not inject them into this live session. Close this Workbench yourself, " +
-            "then call wb_launch with a gprojPath to start an owner-scoped session."
-        );
-      }
-
-      if (problems.length > 0) {
+      if (issues.length > 0) {
         lines.push("\n### Issues Detected");
-        for (const p of problems) {
-          lines.push(`- ${p}`);
-        }
+        for (const issue of issues) lines.push(`- ${issue}`);
       }
 
       return { content: [{ type: "text" as const, text: lines.join("\n") }] };

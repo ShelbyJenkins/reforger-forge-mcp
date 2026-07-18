@@ -1,0 +1,373 @@
+import { createHash } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { join, relative, sep } from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
+import { ArtifactStore } from "../../observer/agent/artifacts.js";
+import { convertBmpToPng } from "../../observer/agent/bmp.js";
+import { ObserverRunStore } from "../../observer/agent/runs.js";
+import { cleanup, temporaryDirectory } from "./helpers.js";
+
+const roots: string[] = [];
+afterEach(() => roots.splice(0).forEach(cleanup));
+
+function bmp24(width = 2, height = 2): Buffer {
+  const rowStride = Math.floor((24 * width + 31) / 32) * 4;
+  const size = 54 + rowStride * height;
+  const data = Buffer.alloc(size);
+  data.write("BM", 0, "ascii");
+  data.writeUInt32LE(size, 2);
+  data.writeUInt32LE(54, 10);
+  data.writeUInt32LE(40, 14);
+  data.writeInt32LE(width, 18);
+  data.writeInt32LE(height, 22);
+  data.writeUInt16LE(1, 26);
+  data.writeUInt16LE(24, 28);
+  data.writeUInt32LE(rowStride * height, 34);
+  for (let offset = 54; offset < size; offset += 3) {
+    data[offset] = 32;
+    if (offset + 1 < size) data[offset + 1] = 128;
+    if (offset + 2 < size) data[offset + 2] = 240;
+  }
+  return data;
+}
+
+function setup() {
+  const root = temporaryDirectory("rfo-runs-");
+  roots.push(root);
+  const evidence = join(root, "evidence");
+  const logs = join(root, "logs");
+  mkdirSync(evidence);
+  mkdirSync(logs);
+  const artifacts = new ArtifactStore(
+    join(root, "artifacts"),
+    {} as never,
+    {} as never
+  );
+  const jobs = { require: () => { throw new Error("not a runtime job"); } } as never;
+  const runs = new ObserverRunStore(join(root, "runs"), join(root, "export-work"), artifacts, jobs, {
+    evidenceRoots: [evidence],
+    supportingLogRoots: [logs],
+  });
+  return { root, evidence, logs, artifacts, runs };
+}
+
+function completedCapture(
+  value: ReturnType<typeof setup>,
+  label = "Feature -- Proof",
+  title = "Observer evidence workflow"
+) {
+  const begun = value.runs.begin({
+    title,
+    caseIds: ["RR-OBS-1"],
+    sourceRevision: "working-tree-1",
+    procedureRevision: "procedure-2",
+    idempotencyKey: "begin-one",
+  });
+  const runId = begun.runId as string;
+  value.runs.reserveCapture({
+    runId,
+    captureLabel: label,
+    purpose: "Show the expected state",
+    idempotencyKey: "capture-one",
+    expectedWorldId: "world-1",
+    expectedWorldEpoch: 3,
+    requestedView: { kind: "current" },
+    performancePolicy: "evidence",
+  });
+  value.runs.bindCapture({
+    runId,
+    captureLabel: label,
+    backend: "workbench",
+    jobId: "wb-job-1",
+    instanceId: "workbench-1",
+    worldId: "world-1",
+    worldEpoch: 3,
+  });
+  const ref = value.artifacts.importArtifact({
+    backend: "workbench",
+    jobId: "wb-job-1",
+    image: convertBmpToPng(bmp24()).png,
+    metadata: {
+      actualCamera: { position: [1, 2, 3] },
+      actualFov: 70,
+      completedAt: "2026-07-17T20:00:00.000Z",
+      contaminated: false,
+      warnings: [],
+    },
+  });
+  value.runs.attachImportedArtifact(runId, label, ref);
+  return { runId, ref };
+}
+
+function reviewedFinalizeInput(value: ReturnType<typeof setup>, runId: string) {
+  return {
+    runId,
+    evidenceRoot: value.evidence,
+    includeCaptureLabels: ["feature-proof"],
+    review: {
+      imagesReviewed: true,
+      reviewer: "image-reviewer",
+      outcome: "Passed" as const,
+      summary: "The expected world state is visible.",
+    },
+    releaseManagedArtifacts: false,
+  };
+}
+
+function regularFiles(root: string): string[] {
+  const result: string[] = [];
+  const visit = (directory: string): void => {
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      const path = join(directory, entry.name);
+      if (entry.isDirectory()) visit(path);
+      else if (entry.isFile()) result.push(relative(root, path).split(sep).join("/"));
+    }
+  };
+  visit(root);
+  return result.sort((left, right) => left.localeCompare(right));
+}
+
+describe("managed observer runs", () => {
+  it("normalizes unique labels and rejects collisions", () => {
+    const value = setup();
+    const begun = value.runs.begin({ title: "Labels" });
+    const input = {
+      runId: begun.runId as string,
+      captureLabel: "Arena / Overhead",
+      idempotencyKey: "capture-one",
+      requestedView: { kind: "current" },
+      performancePolicy: "evidence" as const,
+    };
+    const reserved = value.runs.reserveCapture(input);
+    expect(reserved).toMatchObject({ capture: { captureLabel: "arena-overhead", state: "reserved" } });
+    expect(() => value.runs.reserveCapture({ ...input, captureLabel: "arena---overhead", idempotencyKey: "capture-two" }))
+      .toThrowError(expect.objectContaining({ code: "INVALID_REQUEST" }));
+  });
+
+  it("exports a reviewed manifest-last bundle and releases managed artifacts", () => {
+    const value = setup();
+    const { runId, ref } = completedCapture(value);
+    const log = join(value.logs, "runtime.log");
+    writeFileSync(log, "ready\ntoken=do-not-export\nfinished\n", "utf8");
+    const finalized = value.runs.finalize({
+      runId,
+      evidenceRoot: value.evidence,
+      includeCaptureLabels: ["feature-proof"],
+      review: {
+        imagesReviewed: true,
+        reviewer: "image-reviewer",
+        outcome: "Passed",
+        summary: "The expected world state is visible.",
+      },
+      runtimeConfig: { configurationId: "rr-test", values: { warmupDurationSeconds: 60 } },
+      supportingFiles: [{ kind: "relevantLog", label: "runtime", path: log }],
+      releaseManagedArtifacts: true,
+    });
+    const output = join(value.evidence, runId);
+    expect(finalized).toMatchObject({ receipt: { runId, captureCount: 1, managedArtifactsReleased: true } });
+    expect(existsSync(join(output, "RESULT.md"))).toBe(true);
+    expect(existsSync(join(output, "captures", "feature-proof.png"))).toBe(true);
+    expect(existsSync(join(output, "captures", "feature-proof.json"))).toBe(true);
+    expect(existsSync(join(output, "runtime-config.json"))).toBe(true);
+    const manifest = JSON.parse(readFileSync(join(output, "manifest.json"), "utf8"));
+    expect(manifest).toMatchObject({
+      manifestVersion: 1,
+      runId,
+      review: { imagesReviewed: true, outcome: "Passed" },
+      captures: [{ label: "feature-proof", backend: "workbench", worldId: "world-1" }],
+    });
+    const members = manifest.files as Array<{ path: string; bytes: number; sha256: string }>;
+    expect(members.map((member) => member.path)).toEqual(
+      regularFiles(output).filter((path) => path !== "manifest.json")
+    );
+    for (const member of members) {
+      const bytes = readFileSync(join(output, ...member.path.split("/")));
+      expect(member).toMatchObject({
+        bytes: bytes.length,
+        sha256: createHash("sha256").update(bytes).digest("hex"),
+      });
+    }
+    expect(JSON.stringify(manifest)).not.toContain(value.root);
+    expect(readFileSync(join(output, "relevant-logs", "runtime.log"), "utf8")).toContain("token=[REDACTED]");
+    expect(value.artifacts.hasRef(ref)).toBe(false);
+
+    const retried = value.runs.finalize({
+      runId,
+      evidenceRoot: value.evidence,
+      includeCaptureLabels: ["feature-proof"],
+      review: {
+        imagesReviewed: true,
+        reviewer: "image-reviewer",
+        outcome: "Passed",
+        summary: "The expected world state is visible.",
+      },
+      runtimeConfig: { configurationId: "rr-test", values: { warmupDurationSeconds: 60 } },
+      supportingFiles: [{ kind: "relevantLog", label: "runtime", path: log }],
+      releaseManagedArtifacts: true,
+    });
+    expect(retried).toMatchObject({ receipt: { manifestSha256: finalized.receipt && (finalized.receipt as Record<string, unknown>).manifestSha256 } });
+  });
+
+  it("rejects corrupted and unmanifested members when a finalized receipt is retried", () => {
+    const value = setup();
+    const { runId, ref } = completedCapture(value);
+    const input = reviewedFinalizeInput(value, runId);
+    value.runs.finalize(input);
+    const output = join(value.evidence, runId);
+    const imagePath = join(output, "captures", "feature-proof.png");
+    const image = readFileSync(imagePath);
+
+    writeFileSync(imagePath, Buffer.from("not the attested image"));
+    expect(() => value.runs.finalize(input)).toThrowError(expect.objectContaining({ code: "ARTIFACT_INVALID" }));
+
+    writeFileSync(imagePath, image);
+    writeFileSync(join(output, "unmanifested.txt"), "must not be ignored", "utf8");
+    expect(() => value.runs.finalize(input)).toThrowError(expect.objectContaining({ code: "ARTIFACT_INVALID" }));
+    expect(value.artifacts.hasRef(ref)).toBe(true);
+  });
+
+  it("refuses a manifest-only forged recovery without releasing its managed artifact", () => {
+    const value = setup();
+    const { runId, ref } = completedCapture(value);
+    const input = reviewedFinalizeInput(value, runId);
+    const fingerprint = createHash("sha256").update(JSON.stringify(input)).digest("hex");
+    const output = join(value.evidence, runId);
+    mkdirSync(output);
+    writeFileSync(join(output, "manifest.json"), `${JSON.stringify({
+      manifestVersion: 1,
+      runId,
+      finalizedAt: "2026-07-17T20:00:00.000Z",
+      export: { requestSha256: fingerprint, managedArtifactsReleased: true },
+    }, null, 2)}\n`, "utf8");
+
+    expect(() => value.runs.finalize(input)).toThrowError(expect.objectContaining({ code: "INVALID_REQUEST" }));
+    expect(value.runs.status(runId)).toMatchObject({ state: "open" });
+    expect(value.artifacts.hasRef(ref)).toBe(true);
+  });
+
+  it("recovers a fully attested manifest-last bundle after the run-record commit was interrupted", () => {
+    const value = setup();
+    const { runId, ref } = completedCapture(value);
+    const input = reviewedFinalizeInput(value, runId);
+    value.runs.finalize(input);
+    const recordPath = join(value.root, "runs", runId, "run.json");
+    const record = JSON.parse(readFileSync(recordPath, "utf8"));
+    record.state = "open";
+    delete record.finalizedAt;
+    delete record.finalizeFingerprint;
+    delete record.exportReceipt;
+    writeFileSync(recordPath, `${JSON.stringify(record, null, 2)}\n`, "utf8");
+
+    expect(value.runs.finalize(input)).toMatchObject({
+      run: { state: "finalized" },
+      receipt: { recovered: true, managedArtifactsReleased: false },
+    });
+    expect(value.artifacts.hasRef(ref)).toBe(true);
+  });
+
+  it("refuses an evidence root that was replaced after it was allowlisted", () => {
+    const value = setup();
+    const { runId, ref } = completedCapture(value);
+    const original = `${value.evidence}-original`;
+    renameSync(value.evidence, original);
+    mkdirSync(value.evidence);
+
+    expect(() => value.runs.finalize(reviewedFinalizeInput(value, runId)))
+      .toThrowError(expect.objectContaining({ code: "ARTIFACT_INVALID" }));
+    expect(existsSync(join(value.evidence, runId))).toBe(false);
+    expect(value.artifacts.hasRef(ref)).toBe(true);
+  });
+
+  it("escapes control characters and Markdown structure in RESULT.md presentation fields", () => {
+    const value = setup();
+    const { runId } = completedCapture(value, "Feature -- Proof", "Trusted\n# Forged *Title*");
+    value.runs.finalize({
+      ...reviewedFinalizeInput(value, runId),
+      review: {
+        imagesReviewed: true,
+        reviewer: "reviewer\n## Forged Reviewer",
+        outcome: "Passed",
+        summary: "Visible\u0000\n## Forged Summary [link](https://example.invalid)",
+        limitations: ["Known\n## Forged Limitation *bold*"],
+      },
+    });
+
+    const result = readFileSync(join(value.evidence, runId, "RESULT.md"), "utf8");
+    expect(result).not.toContain("\u0000");
+    expect(result).not.toContain("\n# Forged");
+    expect(result).not.toContain("\n## Forged");
+    expect(result).toContain("\\*Title\\*");
+    expect(result).toContain("\\[link\\]\\(https://example\\.invalid\\)");
+  });
+
+  it.runIf(process.platform !== "win32")("refuses a supporting-log symlink even when its target is readable", () => {
+    const value = setup();
+    const { runId, ref } = completedCapture(value);
+    const outside = join(value.root, "outside.log");
+    const linked = join(value.logs, "linked.log");
+    writeFileSync(outside, "outside allowlist", "utf8");
+    symlinkSync(outside, linked, "file");
+
+    expect(() => value.runs.finalize({
+      ...reviewedFinalizeInput(value, runId),
+      supportingFiles: [{ kind: "relevantLog", label: "linked", path: linked }],
+    })).toThrowError(expect.objectContaining({ code: "INVALID_REQUEST" }));
+    expect(value.artifacts.hasRef(ref)).toBe(true);
+  });
+
+  it("refuses arbitrary roots, secret config, and unreviewed pass claims", () => {
+    const value = setup();
+    const { runId } = completedCapture(value);
+    const base = {
+      runId,
+      evidenceRoot: value.evidence,
+      includeCaptureLabels: ["feature-proof"],
+      review: {
+        imagesReviewed: false,
+        outcome: "Passed" as const,
+        summary: "Not actually reviewed.",
+      },
+    };
+    expect(() => value.runs.finalize(base)).toThrowError(expect.objectContaining({ code: "INVALID_REQUEST" }));
+    expect(() => value.runs.finalize({
+      ...base,
+      review: { imagesReviewed: true, reviewer: "reviewer", outcome: "Passed", summary: "Reviewed." },
+      runtimeConfig: { configurationId: "bad", values: { apiToken: "secret" } },
+    })).toThrowError(expect.objectContaining({ code: "INVALID_REQUEST" }));
+    expect(() => value.runs.finalize({
+      ...base,
+      evidenceRoot: value.root,
+      review: { imagesReviewed: true, reviewer: "reviewer", outcome: "Passed", summary: "Reviewed." },
+    })).toThrowError(expect.objectContaining({ code: "INVALID_REQUEST" }));
+  });
+
+  it("protects artifacts retained by an open run from independent release", () => {
+    const value = setup();
+    const { runId, ref } = completedCapture(value);
+    expect(value.runs.protectedStoreKeys()).toContain(ref.storeKey);
+    expect(() => value.runs.assertJobReleaseAllowed("workbench", ref.jobId))
+      .toThrowError(expect.objectContaining({ code: "INVALID_REQUEST" }));
+    expect(value.runs.discard(runId)).toMatchObject({ discarded: true, releasedCaptureLabels: ["feature-proof"] });
+    expect(value.artifacts.hasRef(ref)).toBe(false);
+  });
+
+  it("expires abandoned open runs and interrupted export work", () => {
+    const value = setup();
+    const { runId, ref } = completedCapture(value);
+    const recordPath = join(value.root, "runs", runId, "run.json");
+    const record = JSON.parse(readFileSync(recordPath, "utf8"));
+    record.updatedAt = "2020-01-01T00:00:00.000Z";
+    writeFileSync(recordPath, `${JSON.stringify(record, null, 2)}\n`, "utf8");
+    const interrupted = join(value.root, "export-work", "interrupted");
+    mkdirSync(interrupted);
+    writeFileSync(join(interrupted, "partial.png"), "partial");
+    utimesSync(interrupted, new Date(0), new Date(0));
+
+    const swept = value.runs.applyRetention(1_000);
+
+    expect(swept).toMatchObject({ expiredRuns: [runId], removedExportWork: ["interrupted"] });
+    expect(value.runs.status(runId)).toMatchObject({ state: "expired" });
+    expect(value.artifacts.hasRef(ref)).toBe(false);
+    expect(existsSync(interrupted)).toBe(false);
+  });
+});

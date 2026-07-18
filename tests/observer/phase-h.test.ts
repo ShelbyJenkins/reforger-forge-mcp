@@ -42,6 +42,8 @@ class FakeChild extends EventEmitter {
   signalCode: NodeJS.Signals | null = null;
   readonly stderr = new PassThrough();
   readonly operations: string[] = [];
+  readonly requests: Array<{ operation: string; payload: Record<string, unknown> }> = [];
+  readonly responders = new Map<string, (payload: Record<string, unknown>) => unknown>();
   killed = false;
   holdOperation: string | null = null;
   instances: Array<Record<string, unknown>> = [];
@@ -62,18 +64,38 @@ class FakeChild extends EventEmitter {
   }
 
   send(message: unknown, callback?: (error: Error | null) => void): boolean {
-    const request = message as { requestId: string; operation: string };
+    const request = message as { requestId: string; operation: string; payload?: Record<string, unknown> };
     this.operations.push(request.operation);
+    const payload = request.payload ?? {};
+    this.requests.push({ operation: request.operation, payload });
     callback?.(null);
     if (request.operation === this.holdOperation) return true;
     queueMicrotask(() => {
-      this.emit("message", {
-        protocol: CHILD_PROTOCOL,
-        type: "response",
-        requestId: request.requestId,
-        ok: true,
-        result: request.operation === "instances" ? { instances: this.instances } : { operation: request.operation },
-      });
+      try {
+        const responder = this.responders.get(request.operation);
+        const result = responder
+          ? responder(payload)
+          : request.operation === "instances" ? { instances: this.instances } : { operation: request.operation };
+        this.emit("message", {
+          protocol: CHILD_PROTOCOL,
+          type: "response",
+          requestId: request.requestId,
+          ok: true,
+          result,
+        });
+      } catch (error) {
+        const candidate = error as { code?: unknown; message?: unknown };
+        this.emit("message", {
+          protocol: CHILD_PROTOCOL,
+          type: "response",
+          requestId: request.requestId,
+          ok: false,
+          error: {
+            code: typeof candidate.code === "string" ? candidate.code : "INTERNAL_ERROR",
+            message: typeof candidate.message === "string" ? candidate.message : String(error),
+          },
+        });
+      }
       if (request.operation === "shutdown") this.exit(0);
     });
     return true;
@@ -188,9 +210,10 @@ function fakeWorkbenchAdapter(options: { unavailable?: boolean } = {}) {
         readinessMessage: "full camera APIs available",
       }];
     }),
-    submit: vi.fn(async () => {
+    submit: vi.fn(async (_input: { jobId?: string }) => {
       return workbenchJob(state) as never;
     }),
+    recover: vi.fn(async () => workbenchJob(state, 2) as never),
     status: vi.fn(async () => workbenchJob(state, 2) as never),
     cancel: vi.fn(async () => {
       state = "cancelled";
@@ -443,6 +466,8 @@ describe("Phase H observer coordinator", () => {
     const request = {
       idempotencyKey: "raw-user-key-must-not-become-a-job-path",
       view: { kind: "current" } as const,
+      expectedWorldId: "world-editor-1",
+      expectedWorldEpoch: 0,
       asynchronous: true,
       timeoutMs: 1_000,
     };
@@ -569,7 +594,7 @@ describe("Phase H observer MCP tools", () => {
     expect(result).not.toHaveProperty("contractPath");
   });
 
-  it("registers the five exact public tools", () => {
+  it("registers the six exact public tools", () => {
     const coordinator = { defaultCaptureTimeoutMs: 30_000, maxInlineImageBytes: 1_024 } as ObserverCoordinator;
     const tools = toolRegistry(coordinator);
     expect([...tools.keys()].sort()).toEqual([
@@ -577,10 +602,537 @@ describe("Phase H observer MCP tools", () => {
       "observer_instances",
       "observer_job",
       "observer_prepare_launch",
+      "observer_run",
       "observer_setup",
     ]);
     for (const tool of tools.values()) expect(tool.definition.description?.length).toBeGreaterThan(40);
   });
+
+  it("rejects stale Workbench expected-world binding before adapter submission", async () => {
+    const adapter = fakeWorkbenchAdapter();
+    const coordinator = new ObserverCoordinator({ workbenchAdapter: adapter as never });
+    await expect(coordinator.capture({
+      idempotencyKey: "stale-workbench-world",
+      instanceId: "workbench-generation-1",
+      expectedWorldId: "world-editor-previous",
+      expectedWorldEpoch: 0,
+      view: { kind: "current" },
+      asynchronous: true,
+      timeoutMs: 1_000,
+    })).rejects.toMatchObject({ code: "WORLD_CHANGED" });
+    expect(adapter.submit).not.toHaveBeenCalled();
+    await coordinator.close();
+  });
+
+  it("durably binds a managed run job before Workbench can retain camera state", async () => {
+    const runId = "20260717T195900Z-a0b1c2d3";
+    const child = new FakeChild();
+    const events: string[] = [];
+    const bindings: Array<Record<string, unknown>> = [];
+    child.responders.set("runReserveCapture", () => ({
+      runId,
+      capture: {
+        captureLabel: "prebound",
+        state: "reserved",
+        backend: null,
+        jobId: null,
+        artifactAvailable: false,
+      },
+    }));
+    child.responders.set("runBindCapture", (payload) => {
+      events.push("run-bind");
+      bindings.push(payload);
+      return { runId, capture: { state: "submitted", ...payload } };
+    });
+    const adapter = fakeWorkbenchAdapter();
+    adapter.submit.mockImplementation(async (input: { jobId?: string }) => {
+      events.push("adapter-submit");
+      return { ...workbenchJob("queued"), jobId: input.jobId } as never;
+    });
+    const coordinator = new ObserverCoordinator({
+      forkChild: fakeFork(child, { value: 0 }),
+      workbenchAdapter: adapter as never,
+    });
+
+    const result = await coordinator.capture({
+      runId,
+      captureLabel: "prebound",
+      idempotencyKey: "prebound-key",
+      instanceId: "workbench-generation-1",
+      expectedWorldId: "world-editor-1",
+      expectedWorldEpoch: 0,
+      view: { kind: "current" },
+      asynchronous: true,
+      timeoutMs: 1_000,
+    });
+
+    expect(result).toMatchObject({ asynchronous: true, job: { backend: "workbench" } });
+    const submittedJobId = (adapter.submit.mock.calls[0][0] as { jobId: string }).jobId;
+    expect(submittedJobId).toMatch(/^[0-9a-f-]{36}$/);
+    expect(bindings[0]).toMatchObject({
+      runId,
+      captureLabel: "prebound",
+      backend: "workbench",
+      jobId: submittedJobId,
+      instanceId: "workbench-generation-1",
+      worldId: "world-editor-1",
+      worldEpoch: 0,
+    });
+    expect(events.slice(0, 2)).toEqual(["run-bind", "adapter-submit"]);
+    await coordinator.close();
+  });
+
+  it("submits an already-bound durable job when restart recovery proves it never reached Workbench", async () => {
+    const runId = "20260717T195930Z-d0c1b2a3";
+    const child = new FakeChild();
+    child.responders.set("runReserveCapture", () => ({
+      runId,
+      capture: {
+        captureLabel: "restart-before-submit",
+        state: "submitted",
+        backend: "workbench",
+        jobId: "durable-job",
+        instanceId: "workbench-generation-1",
+        worldId: "world-editor-1",
+        worldEpoch: 0,
+        expectedWorldId: "world-editor-1",
+        expectedWorldEpoch: 0,
+        artifactAvailable: false,
+      },
+    }));
+    const adapter = fakeWorkbenchAdapter();
+    adapter.recover.mockRejectedValue(Object.assign(new Error("no retained handler job"), { code: "JOB_NOT_FOUND" }));
+    const durableStatus = { ...workbenchJob("queued"), jobId: "durable-job" } as never;
+    adapter.submit.mockResolvedValue(durableStatus);
+    adapter.status.mockResolvedValue(durableStatus);
+    const coordinator = new ObserverCoordinator({
+      forkChild: fakeFork(child, { value: 0 }),
+      workbenchAdapter: adapter as never,
+    });
+
+    await expect(coordinator.capture({
+      runId,
+      captureLabel: "restart-before-submit",
+      idempotencyKey: "restart-before-submit-key",
+      instanceId: "workbench-generation-1",
+      expectedWorldId: "world-editor-1",
+      expectedWorldEpoch: 0,
+      view: { kind: "current" },
+      asynchronous: true,
+      timeoutMs: 1_000,
+    })).resolves.toMatchObject({
+      asynchronous: true,
+      job: { jobId: "durable-job", state: "queued" },
+    });
+    expect(adapter.recover).toHaveBeenCalledWith({
+      jobId: "durable-job",
+      expectedInstanceId: "workbench-generation-1",
+    });
+    expect(adapter.submit).toHaveBeenCalledWith({
+      jobId: "durable-job",
+      view: { kind: "current" },
+      settlePolls: 0,
+    });
+    await coordinator.close();
+  });
+
+  it("recovers a durable run's Workbench association after coordinator restart and promotes its completed image", async () => {
+    const runId = "20260717T200000Z-a1b2c3d4";
+    const capture = {
+      captureLabel: "editor-overview",
+      state: "submitted",
+      backend: "workbench",
+      jobId: "wb-job-1",
+      instanceId: "workbench-generation-1",
+      worldId: "world-editor-1",
+      worldEpoch: 0,
+      expectedWorldId: "world-editor-1",
+      expectedWorldEpoch: 0,
+      artifactAvailable: false,
+      missingArtifact: false,
+    };
+    const child = new FakeChild();
+    child.responders.set("runStatus", () => ({
+      runId,
+      state: "open",
+      captures: [{ ...capture }],
+      warnings: [],
+    }));
+    child.responders.set("importWorkbenchArtifact", (payload) => {
+      expect(payload).toMatchObject({
+        jobId: "wb-job-1",
+        runId,
+        captureLabel: "editor-overview",
+      });
+      expect(Buffer.isBuffer(payload.image)).toBe(true);
+      capture.state = "completed";
+      capture.artifactAvailable = true;
+      return { imported: true };
+    });
+    const managedMetadata = {
+      instanceId: "workbench-generation-1",
+      worldId: "world-editor-1",
+      worldEpoch: 0,
+      viewKind: "current",
+      ownerCameraId: 4,
+      actualCamera: workbenchJob("completed").actualCamera,
+      actualFov: 70,
+      width: 1,
+      height: 1,
+      contentSha256: "b".repeat(64),
+      completedAt: "2026-07-15T12:00:00.000Z",
+      requestedView: { kind: "current" },
+    };
+    child.responders.set("inspectWorkbenchArtifact", () => ({
+      available: capture.artifactAvailable,
+      metadata: managedMetadata,
+    }));
+    child.responders.set("readWorkbenchArtifact", () => ({
+      imageBase64: png.toString("base64"),
+      metadata: managedMetadata,
+    }));
+    child.responders.set("releaseWorkbenchArtifact", () => ({ released: true }));
+    const adapter = fakeWorkbenchAdapter();
+    adapter.complete();
+    const coordinator = new ObserverCoordinator({
+      forkChild: fakeFork(child, { value: 0 }),
+      workbenchAdapter: adapter as never,
+    });
+
+    await expect(coordinator.runStatus(runId)).resolves.toMatchObject({
+      runId,
+      captures: [{
+        captureLabel: "editor-overview",
+        state: "completed",
+        artifactAvailable: true,
+      }],
+    });
+    expect(adapter.recover).toHaveBeenCalledWith({
+      jobId: "wb-job-1",
+      expectedInstanceId: "workbench-generation-1",
+    });
+    expect(adapter.submit).not.toHaveBeenCalled();
+    expect(adapter.release).toHaveBeenCalledOnce();
+    expect(child.operations).toEqual(expect.arrayContaining(["runStatus", "importWorkbenchArtifact"]));
+
+    await expect(coordinator.jobStatus(undefined, "wb-job-1")).resolves.toMatchObject({
+      state: "completed",
+      ownerCameraId: 4,
+      restorationConfirmed: true,
+      actualFov: 70,
+    });
+    await expect(coordinator.readJob(undefined, "wb-job-1")).resolves.toMatchObject({
+      image: png,
+      job: { state: "completed", ownerCameraId: 4 },
+    });
+    expect(adapter.recover).toHaveBeenCalledOnce();
+    expect(adapter.status).not.toHaveBeenCalled();
+
+    await expect(coordinator.releaseJob(undefined, "wb-job-1")).resolves.toMatchObject({
+      backend: "workbench",
+      jobId: "wb-job-1",
+      restorationConfirmed: true,
+      managedArtifactReleased: true,
+    });
+    expect(adapter.recover).toHaveBeenCalledOnce();
+    expect(adapter.release).toHaveBeenCalledOnce();
+    await coordinator.close();
+  });
+
+  it("retires each imported Workbench handler transaction so one managed run can capture sequential views", async () => {
+    const runId = "20260717T200030Z-b2c3d4e5";
+    const child = new FakeChild();
+    const captures = new Map<string, Record<string, unknown>>();
+    child.responders.set("runReserveCapture", (payload) => {
+      const label = String(payload.captureLabel);
+      let capture = captures.get(label);
+      if (!capture) {
+        capture = {
+          captureLabel: label,
+          state: "reserved",
+          backend: null,
+          jobId: null,
+          artifactAvailable: false,
+        };
+        captures.set(label, capture);
+      }
+      return { runId, capture: { ...capture } };
+    });
+    child.responders.set("runBindCapture", (payload) => {
+      const capture = captures.get(String(payload.captureLabel));
+      if (!capture) throw new Error("capture was not reserved");
+      Object.assign(capture, payload, { state: "submitted", artifactAvailable: false });
+      return { runId, capture: { ...capture } };
+    });
+    child.responders.set("importWorkbenchArtifact", (payload) => {
+      const capture = captures.get(String(payload.captureLabel));
+      if (!capture) throw new Error("capture was not bound");
+      Object.assign(capture, { state: "completed", artifactAvailable: true });
+      return { imported: true };
+    });
+    child.responders.set("inspectWorkbenchArtifact", (payload) => {
+      const capture = [...captures.values()].find((entry) => entry.jobId === payload.jobId);
+      return {
+        available: capture?.artifactAvailable === true,
+        metadata: {
+          instanceId: "workbench-generation-1",
+          worldId: "world-editor-1",
+          worldEpoch: 0,
+          width: 1,
+          height: 1,
+          contentSha256: "b".repeat(64),
+          completedAt: "2026-07-15T12:00:00.000Z",
+          requestedView: { kind: "current" },
+        },
+      };
+    });
+
+    const adapter = fakeWorkbenchAdapter();
+    let activeJobId: string | null = null;
+    const statusFor = (jobId: string, state: string) => ({
+      ...workbenchJob(state, state === "completed" ? 2 : 1),
+      jobId,
+    }) as never;
+    adapter.instances.mockImplementation(async () => [{
+      instanceId: "workbench-generation-1",
+      lifecycleGeneration: "generation-1",
+      canonicalTarget: "C:/projects/CurrentProject.gproj",
+      endpoint: { host: "127.0.0.1", port: 17777 },
+      process: { pid: 42 },
+      projectFile: "C:/projects/CurrentProject.gproj",
+      worldIdentity: "world-editor-1",
+      capabilities: ["render.capture", "camera.editor"],
+      activeJobId: null,
+      restorationApiAvailable: true,
+      readinessMessage: "full camera APIs available",
+    }]);
+    adapter.submit.mockImplementation(async (input: { jobId?: string }) => {
+      if (activeJobId) throw Object.assign(new Error("handler slot is occupied"), { code: "CAMERA_BUSY" });
+      if (!input.jobId) throw new Error("managed capture omitted its durable job ID");
+      activeJobId = input.jobId;
+      return statusFor(input.jobId, "queued");
+    });
+    adapter.status.mockImplementation(async () => {
+      if (!activeJobId) throw Object.assign(new Error("handler job is absent"), { code: "JOB_NOT_FOUND" });
+      return statusFor(activeJobId, "completed");
+    });
+    adapter.release.mockImplementation(async () => {
+      if (!activeJobId) throw Object.assign(new Error("handler job is absent"), { code: "JOB_NOT_FOUND" });
+      const jobId = activeJobId;
+      activeJobId = null;
+      return { jobId, restorationConfirmed: true, artifactRemoved: true };
+    });
+    const coordinator = new ObserverCoordinator({
+      forkChild: fakeFork(child, { value: 0 }),
+      workbenchAdapter: adapter as never,
+    });
+
+    const capture = async (label: string): Promise<string> => {
+      const submitted = await coordinator.capture({
+        runId,
+        captureLabel: label,
+        idempotencyKey: `${runId}:${label}`,
+        instanceId: "workbench-generation-1",
+        expectedWorldId: "world-editor-1",
+        expectedWorldEpoch: 0,
+        view: { kind: "current" },
+        asynchronous: true,
+        timeoutMs: 1_000,
+      });
+      if (!submitted.asynchronous || typeof submitted.job.jobId !== "string") {
+        throw new Error("managed Workbench capture returned no job ID");
+      }
+      await expect(coordinator.jobStatus(undefined, submitted.job.jobId)).resolves.toMatchObject({
+        state: "completed",
+        restorationConfirmed: true,
+      });
+      expect(activeJobId).toBeNull();
+      return submitted.job.jobId;
+    };
+
+    const firstJobId = await capture("initial-current");
+    const retriedFirstJobId = await capture("initial-current");
+    expect(retriedFirstJobId).toBe(firstJobId);
+    expect(adapter.submit).toHaveBeenCalledOnce();
+    expect(adapter.release).toHaveBeenCalledOnce();
+    const secondJobId = await capture("explicit-pose");
+    expect(secondJobId).not.toBe(firstJobId);
+    expect(adapter.submit).toHaveBeenCalledTimes(2);
+    expect(adapter.release).toHaveBeenCalledTimes(2);
+    expect(child.operations.filter((operation) => operation === "importWorkbenchArtifact")).toHaveLength(2);
+    await coordinator.close();
+  });
+
+  it("answers Workbench job status from a durable managed artifact after coordinator restart", async () => {
+    const child = new FakeChild();
+    child.responders.set("inspectWorkbenchArtifact", () => ({
+      available: true,
+      metadata: {
+        instanceId: "workbench-generation-1",
+        worldId: "world-editor-1",
+        worldEpoch: 0,
+        width: 1920,
+        height: 1080,
+        contentSha256: "b".repeat(64),
+        completedAt: "2026-07-17T20:00:00.000Z",
+      },
+    }));
+    const adapter = fakeWorkbenchAdapter();
+    const coordinator = new ObserverCoordinator({
+      forkChild: fakeFork(child, { value: 0 }),
+      workbenchAdapter: adapter as never,
+    });
+
+    await expect(coordinator.jobStatus(undefined, "wb-job-1")).resolves.toMatchObject({
+      backend: "workbench",
+      jobId: "wb-job-1",
+      state: "completed",
+      restorationConfirmed: true,
+      recoveredFromManagedArtifact: true,
+      artifact: { width: 1920, height: 1080, contentSha256: "b".repeat(64) },
+    });
+    expect(adapter.recover).not.toHaveBeenCalled();
+    await coordinator.close();
+  });
+
+  it("reuses the handler-only receipt while managed artifact release is retried", async () => {
+    const runId = "20260717T200100Z-b1c2d3e4";
+    const child = new FakeChild();
+    child.responders.set("runStatus", () => ({
+      runId,
+      state: "finalized",
+      captures: [{
+        captureLabel: "release-order",
+        state: "completed",
+        backend: "workbench",
+        jobId: "wb-job-1",
+        instanceId: "workbench-generation-1",
+        worldId: "world-editor-1",
+        worldEpoch: 0,
+        artifactAvailable: true,
+        missingArtifact: false,
+      }],
+      warnings: [],
+    }));
+    let releaseAttempts = 0;
+    const events: string[] = [];
+    child.responders.set("releaseWorkbenchArtifact", () => {
+      releaseAttempts += 1;
+      events.push(`managed-${releaseAttempts}`);
+      if (releaseAttempts === 1) {
+        throw Object.assign(new Error("managed release temporarily unavailable"), { code: "TRANSPORT_UNAVAILABLE" });
+      }
+      return { released: true };
+    });
+    const adapter = fakeWorkbenchAdapter();
+    adapter.complete();
+    adapter.recover.mockImplementation(async () => {
+      events.push("adapter-recover");
+      return workbenchJob("completed", 2) as never;
+    });
+    adapter.release.mockImplementation(async () => {
+      events.push("adapter-release");
+      return { jobId: "wb-job-1", restorationConfirmed: true, artifactRemoved: true };
+    });
+    const coordinator = new ObserverCoordinator({
+      forkChild: fakeFork(child, { value: 0 }),
+      workbenchAdapter: adapter as never,
+    });
+    await coordinator.runStatus(runId);
+    expect(events).toEqual(["adapter-recover", "adapter-release"]);
+
+    await expect(coordinator.releaseJob(undefined, "wb-job-1")).rejects.toMatchObject({
+      code: "TRANSPORT_UNAVAILABLE",
+    });
+    expect(adapter.recover).toHaveBeenCalledOnce();
+    expect(adapter.release).toHaveBeenCalledOnce();
+
+    await expect(coordinator.releaseJob(undefined, "wb-job-1")).resolves.toMatchObject({
+      backend: "workbench",
+      jobId: "wb-job-1",
+      managedArtifactReleased: true,
+    });
+    expect(events).toEqual(["adapter-recover", "adapter-release", "managed-1", "managed-2"]);
+    expect(await coordinator.releaseJob(undefined, "wb-job-1")).toMatchObject({ managedArtifactReleased: true });
+    expect(releaseAttempts).toBe(2);
+    expect(adapter.release).toHaveBeenCalledOnce();
+    await coordinator.close();
+  });
+
+  it.each(["finalize", "discard"] as const)(
+    "%s consumes the run-level managed release proof without deleting or releasing twice",
+    async (action) => {
+      const runId = action === "finalize"
+        ? "20260717T200130Z-c1d2e3f4"
+        : "20260717T200140Z-d1e2f3a4";
+      const capture = {
+        captureLabel: "release-once",
+        state: "completed",
+        backend: "workbench",
+        jobId: "wb-job-1",
+        instanceId: "workbench-generation-1",
+        worldId: "world-editor-1",
+        worldEpoch: 0,
+        artifactAvailable: true,
+        missingArtifact: false,
+      };
+      const child = new FakeChild();
+      child.responders.set("runStatus", () => ({
+        runId,
+        state: "open",
+        captures: [{ ...capture }],
+        warnings: [],
+      }));
+      let managedAvailable = true;
+      child.responders.set("runFinalize", () => {
+        managedAvailable = false;
+        return {
+          run: { runId, state: "finalized" },
+          receipt: { runId, managedArtifactsReleased: true },
+        };
+      });
+      child.responders.set("runDiscard", () => {
+        managedAvailable = false;
+        return { runId, discarded: true, releasedCaptureLabels: [capture.captureLabel] };
+      });
+      child.responders.set("inspectWorkbenchArtifact", () => ({
+        available: managedAvailable,
+        metadata: {},
+      }));
+      child.responders.set("releaseWorkbenchArtifact", () => {
+        throw new Error("run cleanup already released this managed artifact");
+      });
+
+      const adapter = fakeWorkbenchAdapter();
+      adapter.complete();
+      const coordinator = new ObserverCoordinator({
+        forkChild: fakeFork(child, { value: 0 }),
+        workbenchAdapter: adapter as never,
+      });
+
+      const result = action === "finalize"
+        ? await coordinator.finalizeRun({ runId, releaseManagedArtifacts: true })
+        : await coordinator.discardRun(runId);
+
+      expect(result).not.toHaveProperty("workbenchReleaseWarnings");
+      expect(managedAvailable).toBe(false);
+      expect(child.operations.filter((operation) => operation === "releaseWorkbenchArtifact")).toHaveLength(0);
+      expect(adapter.recover).toHaveBeenCalledOnce();
+      expect(adapter.release).toHaveBeenCalledOnce();
+
+      await expect(coordinator.releaseJob(undefined, "wb-job-1")).resolves.toMatchObject({
+        backend: "workbench",
+        jobId: "wb-job-1",
+        restorationConfirmed: true,
+        artifactRemoved: true,
+        managedArtifactReleased: true,
+      });
+      expect(adapter.recover).toHaveBeenCalledOnce();
+      expect(adapter.release).toHaveBeenCalledOnce();
+      expect(child.operations.filter((operation) => operation === "releaseWorkbenchArtifact")).toHaveLength(0);
+      await coordinator.close();
+    }
+  );
 
   it("publishes a portable fixed-length capture schema without positional items or nested refs", async () => {
     const coordinator = {
@@ -613,6 +1165,10 @@ describe("Phase H observer MCP tools", () => {
       visit(capture!.inputSchema);
 
       const view = toolRegistry(coordinator).get("observer_capture")!.definition.inputSchema!.view;
+      const captureSchema = toolRegistry(coordinator).get("observer_capture")!.definition.inputSchema!;
+      expect(captureSchema.performancePolicy.safeParse("performance").success).toBe(false);
+      expect(captureSchema.performancePolicy.safeParse("instrumented").success).toBe(true);
+      expect(captureSchema.runId.safeParse("20260717T184233Z-a1b2c3d4").success).toBe(true);
       expect(view.safeParse({
         kind: "pose",
         position: [1, 2, 3],

@@ -7,11 +7,10 @@ export function registerWbShutdown(server: McpServer, client: WorkbenchClient): 
     "wb_shutdown",
     {
       description:
-        "Stop only the exact Workbench process recorded by the version-2 lifecycle state. " +
+        "Stop only the exact Workbench process recorded by the version-3 lifecycle state. " +
         "The MCP owner lease, canonical project, executable path, exact creation time, command-line " +
         "owner token, endpoint, and Windows user must verify before termination through the retained " +
-        "OS process handle. User-launched and unverifiable Workbench processes are never signalled. " +
-        "Call this before wb_cleanup.",
+        "OS process handle. User-launched and unverifiable Workbench processes are never signalled.",
       inputSchema: {},
     },
     async () => {
@@ -36,7 +35,7 @@ export function registerWbShutdown(server: McpServer, client: WorkbenchClient): 
               `**Workbench Shut Down Safely** — exact owned PID ${result.previousPid} exited and the ` +
               `NET API endpoint was released.\n\nProject: \`${result.gprojPath ?? "unknown"}\`\n` +
               `Lifecycle generation: \`${result.generation}\`\n\n` +
-              "It is now safe to call **wb_cleanup**." +
+              "The managed companion and profile remain outside the project and require no project cleanup." +
               formatConnectionStatus(client),
           }],
         };
