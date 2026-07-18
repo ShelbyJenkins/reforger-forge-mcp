@@ -402,13 +402,14 @@ requires fresh nonempty output containing exactly one hashed
 `output: null`; an exit-zero output-proof failure carries `validationFailure`
 and makes the CLI fail while preserving both attributed log directories.
 
-Successful guarded data build is not currently supported on installed
-Workbench 1.7.0.54. Revalidation of the no-`-run`, explicit `AddonName`, and
-clean `-run` Resource Manager forms never entered `buildData` or produced
-output. The runner therefore fails closed at output attestation; neither a
-spawned child nor a zero exit is build evidence. Do not claim that `-run`
-reconciles dispatch. A successful guarded build remains unsupported until an
-engine-native dispatch path is independently verified.
+Guarded data build is supported on installed Workbench 1.7.0.54 with the exact
+Resource Manager sequence
+`-wbModule=ResourceManager -builddata PC <fresh-output> <AddonName>`; the
+`-builddata` token requires that lowercase spelling. The target invocation
+intentionally omits `-run`. This path was verified on 2026-07-18 by fresh output
+containing one hashed `resourceDatabase.rdb` and attributed logs that passed the
+diagnostic policy. The receipt requirements above remain authoritative: a
+spawned child or zero exit without fresh output proof is not build evidence.
 
 ### Workbench Editor Control (Live)
 

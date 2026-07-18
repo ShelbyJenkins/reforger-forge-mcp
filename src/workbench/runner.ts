@@ -684,8 +684,7 @@ function targetBuildArguments(
     intent.platform,
     ownerArgument,
     "-wbModule=ResourceManager",
-    "-run",
-    "-buildData",
+    "-builddata",
     intent.platform,
     outputPath,
     addonId

@@ -158,13 +158,12 @@ preflight endpoint/Ping ownership, and requires fresh nonempty output containing
 one hashed `resourceDatabase.rdb` after a zero build exit. Supply a unique empty
 output directory for every run.
 
-Treat this as supported lifecycle and receipt hardening, not as a supported
-successful data-build path on installed Workbench 1.7.0.54. The no-`-run`,
-explicit `AddonName`, and clean `-run` Resource Manager forms were revalidated;
-none entered `buildData` or produced output. The runner correctly fails closed
-when output proof is absent. Do not claim that `-run` reconciles dispatch, and
-do not accept child launch or a zero exit as build evidence. Successful guarded
-build remains unsupported until an engine-native dispatch path is verified.
+Installed Workbench 1.7.0.54 requires the exact target sequence
+`-wbModule=ResourceManager -builddata PC <fresh-output> <AddonName>`, with the
+`-builddata` token in lowercase and no target `-run`. This guarded path produced
+qualified fresh output on 2026-07-18. Keep the lifecycle and receipt checks
+intact: child launch and zero exit alone remain insufficient, and any missing or
+stale output proof must fail closed.
 
 ## Start-of-Task Checklist
 

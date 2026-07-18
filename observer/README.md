@@ -350,13 +350,13 @@ output root. It also binds the project and output-database SHA-256 values.
 Timeout, nonzero exit, and output-attestation failure remain machine-readable
 without being promoted to success.
 
-That lifecycle and receipt hardening is supported, but successful guarded data
-build is not supported on installed Workbench 1.7.0.54. Revalidation of the
-no-`-run`, explicit `AddonName`, and clean `-run` Resource Manager forms never
-entered `buildData` or produced output. The wrapper fails closed when output
-proof is absent; do not treat child launch, zero exit, or `-run` as evidence that
-Resource Manager dispatched a build. A successful guarded build remains
-unsupported pending a verified engine-native dispatch path.
+Installed Workbench 1.7.0.54 successfully dispatches the guarded build with the
+exact sequence
+`-wbModule=ResourceManager -builddata PC <fresh-output> <AddonName>`, with the
+`-builddata` token in lowercase and no target `-run`.
+The path was verified with qualified fresh output on 2026-07-18. The wrapper
+still fails closed when output proof is absent; child launch and a zero exit
+alone are never evidence of a completed Resource Manager build.
 
 ## Opt-in Workbench screenshot acceptance
 

@@ -448,24 +448,26 @@ describe("standalone Workbench lifecycle runner", () => {
     expect(buildOwner).toBeGreaterThan(-1);
     expect(buildOwner).toBeLessThan(buildArgs.indexOf("-wbModule=ResourceManager"));
     expect(buildArgs).not.toContain("-addons");
-    expect(buildArgs.filter((arg) => arg === "-run")).toHaveLength(1);
+    expect(buildArgs).not.toContain("-run");
+    expect(buildArgs).not.toContain("-buildData");
+    expect(buildArgs).not.toContain("-build-data");
+    expect(buildArgs.filter((arg) => arg === "-builddata")).toHaveLength(1);
     expect(buildArgs).not.toContain("-wbSilent");
     expect(buildArgs).not.toContain("-loadBuiltData");
     const buildModuleIndex = buildArgs.indexOf("-wbModule=ResourceManager");
-    expect(buildArgs.slice(buildModuleIndex, buildModuleIndex + 3)).toEqual([
+    expect(buildArgs.slice(buildModuleIndex, buildModuleIndex + 2)).toEqual([
       "-wbModule=ResourceManager",
-      "-run",
-      "-buildData",
+      "-builddata",
     ]);
     expect(buildArgs[buildArgs.indexOf("-addonsDir") + 1].split(",")).toEqual([
       harness.addonRoot,
       join(harness.root, "addons"),
     ]);
-    expect(buildArgs.slice(buildArgs.indexOf("-buildData"), buildArgs.indexOf("-buildData") + 4))
-      .toEqual(["-buildData", "PC", harness.outputPath, "ExampleMod"]);
+    expect(buildArgs.slice(buildArgs.indexOf("-builddata"), buildArgs.indexOf("-builddata") + 4))
+      .toEqual(["-builddata", "PC", harness.outputPath, "ExampleMod"]);
   });
 
-  it("uses the last safely tested installed-1.7 argument form without claiming output", async () => {
+  it("uses the documented installed-1.7 no-run argument form without claiming output", async () => {
     const harness = createHarness();
     let targetArguments: readonly string[] = [];
     const spawner = createBuildSpawner(harness, {
@@ -484,18 +486,21 @@ describe("standalone Workbench lifecycle runner", () => {
       timeoutMs: 1_000,
     }, runnerDependencies(harness, spawner.spawnProcess));
 
-    const buildDataIndex = targetArguments.indexOf("-buildData");
+    const buildDataIndex = targetArguments.indexOf("-builddata");
     expect(buildDataIndex).toBeGreaterThan(-1);
-    expect(targetArguments.slice(buildDataIndex - 2, buildDataIndex + 4)).toEqual([
+    expect(targetArguments).not.toContain("-run");
+    expect(targetArguments).not.toContain("-buildData");
+    expect(targetArguments).not.toContain("-build-data");
+    expect(targetArguments.filter((arg) => arg === "-builddata")).toHaveLength(1);
+    expect(targetArguments.slice(buildDataIndex - 1, buildDataIndex + 4)).toEqual([
       "-wbModule=ResourceManager",
-      "-run",
-      "-buildData",
+      "-builddata",
       "PC",
       harness.outputPath,
       "ExampleMod",
     ]);
     expect(targetArguments.slice(buildDataIndex, buildDataIndex + 4)).toEqual([
-      "-buildData",
+      "-builddata",
       "PC",
       harness.outputPath,
       "ExampleMod",

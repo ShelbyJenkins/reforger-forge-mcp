@@ -208,13 +208,14 @@ preflight, and returns to `vacant` only after exact child absence is proven. Thi
 two-phase lifecycle and receipt hardening is supported and fails closed when the
 target child does not produce the required output proof.
 
-Successful guarded data build remains unsupported on installed Workbench
-1.7.0.54. Revalidation covered the no-`-run`, explicit `AddonName`, and clean
-`-run` Resource Manager forms; none entered `buildData` or produced output.
-Consequently, no tested form is documented as reconciling global module
-dispatch with the Resource Manager build action. Child launch and zero exit are
-not build evidence. A successful guarded build requires a separately verified
-engine-native dispatch path before this plan can claim support.
+Superseded 2026-07-18: the earlier revalidation did not exercise Workbench's
+exact lowercase `-builddata` token. The installed 1.7.0.54 parser is
+case-sensitive. The guarded runner now uses
+`-wbModule=ResourceManager -builddata PC <fresh-output> <AddonName>` without a
+target `-run`; that form produced qualified fresh output and attributed logs
+that passed the diagnostic policy. The original safety conclusion still holds:
+child launch and zero exit without the hashed fresh-output receipt are not build
+evidence.
 
 ### Workbench observer adapter
 
