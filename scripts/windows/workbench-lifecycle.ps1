@@ -176,9 +176,15 @@ public sealed class LifecycleProcessHandle : IDisposable
         if (!QueryFullProcessImageName(handle, 0, path, ref capacity))
         {
             int error = Marshal.GetLastWin32Error();
-            string reason = error == 5 ? "access_denied" : "helper_failure";
+            if (error == 5)
+                throw new LifecycleProcessException("access_denied", "Windows denied access to the process image path.");
+            if (HasExited())
+                throw new LifecycleProcessException("pid_not_found", "The process exited before its executable path could be read.");
+            string reason = "helper_failure";
             throw new LifecycleProcessException(reason, "QueryFullProcessImageName failed with Windows error " + error.ToString(CultureInfo.InvariantCulture) + ".");
         }
+        if (path.Length == 0 && HasExited())
+            throw new LifecycleProcessException("pid_not_found", "The process exited before its executable path could be read.");
         if (path.Length == 0)
             throw new LifecycleProcessException("helper_failure", "Windows returned an empty executable path.");
         return path.ToString();
@@ -194,9 +200,15 @@ public sealed class LifecycleProcessHandle : IDisposable
         if (!GetProcessTimes(handle, out creation, out exit, out kernel, out user))
         {
             int error = Marshal.GetLastWin32Error();
-            string reason = error == 5 ? "access_denied" : "helper_failure";
+            if (error == 5)
+                throw new LifecycleProcessException("access_denied", "Windows denied access to the process timestamps.");
+            if (HasExited())
+                throw new LifecycleProcessException("pid_not_found", "The process exited before its creation time could be read.");
+            string reason = "helper_failure";
             throw new LifecycleProcessException(reason, "GetProcessTimes failed with Windows error " + error.ToString(CultureInfo.InvariantCulture) + ".");
         }
+        if (creation <= 0 && HasExited())
+            throw new LifecycleProcessException("pid_not_found", "The process exited before its creation time could be read.");
         if (creation <= 0)
             throw new LifecycleProcessException("helper_failure", "Windows returned an invalid process creation time.");
         return creation.ToString(CultureInfo.InvariantCulture);
@@ -207,6 +219,8 @@ public sealed class LifecycleProcessHandle : IDisposable
         EnsureOpen();
         int required;
         int initialStatus = NtQueryInformationProcess(handle, PROCESS_COMMAND_LINE_INFORMATION, IntPtr.Zero, 0, out required);
+        if (required <= 0 && HasExited())
+            throw new LifecycleProcessException("pid_not_found", "The process exited before its command line could be read.");
         if (required <= 0)
             throw new LifecycleProcessException("command_line_unverifiable", "Windows did not provide a command-line buffer size (NTSTATUS 0x" + initialStatus.ToString("X8", CultureInfo.InvariantCulture) + ").");
 
@@ -215,12 +229,18 @@ public sealed class LifecycleProcessHandle : IDisposable
         {
             int returned;
             int status = NtQueryInformationProcess(handle, PROCESS_COMMAND_LINE_INFORMATION, buffer, required, out returned);
+            if (status != 0 && HasExited())
+                throw new LifecycleProcessException("pid_not_found", "The process exited before its command line could be read.");
             if (status != 0)
                 throw new LifecycleProcessException("command_line_unverifiable", "Windows denied exact command-line inspection (NTSTATUS 0x" + status.ToString("X8", CultureInfo.InvariantCulture) + ").");
             UNICODE_STRING value = (UNICODE_STRING)Marshal.PtrToStructure(buffer, typeof(UNICODE_STRING));
+            if ((value.Buffer == IntPtr.Zero || value.Length == 0) && HasExited())
+                throw new LifecycleProcessException("pid_not_found", "The process exited before its command line could be read.");
             if (value.Buffer == IntPtr.Zero || value.Length == 0)
                 throw new LifecycleProcessException("command_line_unverifiable", "Windows returned an empty process command line.");
             string commandLine = Marshal.PtrToStringUni(value.Buffer, value.Length / 2);
+            if (String.IsNullOrWhiteSpace(commandLine) && HasExited())
+                throw new LifecycleProcessException("pid_not_found", "The process exited before its command line could be read.");
             if (String.IsNullOrWhiteSpace(commandLine))
                 throw new LifecycleProcessException("command_line_unverifiable", "Windows returned an empty process command line.");
             return commandLine;

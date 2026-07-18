@@ -45,6 +45,13 @@ describe("bundled Windows Workbench lifecycle helper", () => {
     expect(helper).not.toContain("$_.Exception.Reason");
   });
 
+  it("classifies query races as absent only after the retained handle signals exit", () => {
+    expect(helper).toContain("if (HasExited())");
+    expect(helper).toContain("The process exited before its executable path could be read.");
+    expect(helper).toContain("The process exited before its creation time could be read.");
+    expect(helper).toContain("The process exited before its command line could be read.");
+  });
+
   it("generation-checks, flushes, and atomically replaces lifecycle state", () => {
     expect(helper).toContain("expectedGeneration");
     expect(helper).toContain("Lifecycle state generation mismatch");
