@@ -20,13 +20,14 @@ afterEach(() => {
 });
 
 const readyGate: OwnedRuntimeObserverGate = {
-  reserveRuntimeStop: async () => ({
+  reserveRuntimeStop: async (_sessionId, proposedReservationId) => ({
     sessionKnown: true,
     ready: true,
     reserved: true,
     activeJobIds: [],
     cameraLeaseJobIds: [],
     restorationPendingJobIds: [],
+    reservationId: proposedReservationId,
   }),
   releaseRuntimeStop: async () => ({ released: true }),
   completeRuntimeStop: async () => ({ completed: true }),

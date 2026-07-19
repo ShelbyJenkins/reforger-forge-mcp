@@ -11,6 +11,7 @@ import { runObserverSetup } from "./setup.js";
 import type { WorkbenchClient } from "../workbench/client.js";
 import type { OwnedRuntimeManager } from "./owned-runtime-manager.js";
 import { registerObserverRuntime } from "../tools/observer-runtime.js";
+import { canonicalPublicObserverError, PUBLIC_OBSERVER_CAPABILITIES } from "./public-contract.js";
 
 const finite = () => z.number().finite();
 
@@ -52,18 +53,6 @@ const viewSchema = z.union([
     value.target[2] - value.position[2]
   ) > 0.000001, { message: "lookAt position and target must differ", path: ["target"] }),
 ]);
-const capabilities = [
-  "render.capture",
-  "camera.runtime",
-  "camera.editor",
-  "world.query",
-  "entity.resolve",
-  "authority.server",
-  "server.coordinate",
-  "transport.rest",
-  "transport.mailbox",
-] as const;
-
 export interface ObserverToolDefaults {
   sessionTtlMs?: number;
   defaultCaptureTimeoutMs?: number;
@@ -77,8 +66,11 @@ function jsonText(heading: string, value: unknown): string {
 }
 
 function toolError(error: unknown) {
-  const code = error instanceof ObserverCoordinatorError ? error.code : "INTERNAL_ERROR";
-  const message = error instanceof Error ? error.message : "Observer operation failed";
+  const publicError = canonicalPublicObserverError(
+    error instanceof ObserverCoordinatorError ? error.code : "INTERNAL_ERROR",
+    error instanceof Error ? error.message : undefined
+  );
+  const { code, message } = publicError;
   const details = error instanceof ObserverCoordinatorError ? error.details : undefined;
   return {
     content: [{
@@ -195,7 +187,7 @@ export function registerObserverTools(
         "List live and stale observer runtime instances with capabilities, transport, world epoch, active job, and health. Optionally wait for compatible live instances. Headless runtimes are excluded whenever renderersOnly is true.",
       inputSchema: {
         sessionId: z.string().min(1).max(96).optional(),
-        requiredCapabilities: z.array(z.enum(capabilities)).max(capabilities.length).default([]),
+        requiredCapabilities: z.array(z.enum(PUBLIC_OBSERVER_CAPABILITIES)).max(PUBLIC_OBSERVER_CAPABILITIES.length).default([]),
         renderersOnly: z.boolean().default(false),
         waitMs: z.number().int().min(0).max(5 * 60 * 1_000).default(0),
       },
@@ -227,7 +219,7 @@ export function registerObserverTools(
         timeoutMs: z.number().int().min(1_000).max(5 * 60 * 1_000)
           .default(defaults.defaultCaptureTimeoutMs ?? coordinator.defaultCaptureTimeoutMs),
         settleFrames: z.number().int().min(0).max(30).default(0),
-        expectedWorldId: z.string().min(1).max(512).describe(
+        expectedWorldId: z.string().min(1).max(512).nullable().optional().describe(
           "Exact world ID returned by the immediately preceding observer_instances inventory."
         ),
         expectedWorldEpoch: z.number().int().nonnegative().describe(

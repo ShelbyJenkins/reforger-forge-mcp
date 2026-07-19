@@ -17,8 +17,6 @@ const PROCESS_CAPTURE_TIMEOUT_MS = 5_000;
 const PROCESS_POLL_MS = 100;
 const LIFECYCLE_VERSION = 3;
 
-export type LifecycleFailStop = (message: string) => never;
-
 export interface ExactProcessIdentity {
   pid: number;
   executablePath: string;
@@ -165,7 +163,17 @@ export type VerifyEndpointOwnerResult =
 
 export type VerifyEndpointVacantResult =
   | { kind: "vacant" }
-  | { kind: "refused"; listenerPid?: number; message: string };
+  | { kind: "occupied"; listenerPid: number; message: string }
+  | {
+      kind: "unverifiable";
+      reason:
+        | "endpoint_not_loopback"
+        | "listener_ambiguous"
+        | "access_denied"
+        | "timeout"
+        | "helper_failure";
+      message: string;
+    };
 
 export interface WorkbenchLifecycleBackend {
   readonly platform: "win32" | "test";
@@ -173,6 +181,7 @@ export interface WorkbenchLifecycleBackend {
     name: string;
     timeoutMs: number;
     action: () => Promise<T>;
+    onLeaseLost?: (error: LifecycleGuardError) => void;
   }): Promise<T>;
   inspectCurrentProcess(pid: number): Promise<ExactProcessIdentity & { userSid: string }>;
   inspectProcess(pid: number, expectedOwnerTokenArgument?: string): Promise<ProcessInspection | null>;
@@ -205,7 +214,8 @@ export type LifecycleGuardErrorCode =
   | "STATE_INVALID"
   | "GENERATION_MISMATCH"
   | "LIFECYCLE_BUSY"
-  | "HELPER_FAILURE";
+  | "HELPER_FAILURE"
+  | "RECOVERY_REQUIRED";
 
 export class LifecycleGuardError extends Error {
   constructor(message: string, public readonly code: LifecycleGuardErrorCode) {
@@ -216,6 +226,7 @@ export class LifecycleGuardError extends Error {
 
 export interface WorkbenchLifecycleSession {
   readonly mcp: McpOwnerIdentity;
+  assertActive(): void;
   readState(): Promise<LifecycleStateRead>;
   validateAndClaim(args: {
     endpoint: LifecycleEndpoint;
@@ -409,13 +420,11 @@ function defaultStateDir(): string {
 
 export interface WindowsLifecycleBackendOptions {
   helperTimeoutMs?: number;
-  failStop?: LifecycleFailStop;
 }
 
 export class WindowsLifecycleBackend implements WorkbenchLifecycleBackend {
   readonly platform = "win32" as const;
   private readonly helperTimeoutMs: number;
-  private readonly failStop: LifecycleFailStop;
 
   constructor(
     private readonly helperPath: string,
@@ -425,13 +434,6 @@ export class WindowsLifecycleBackend implements WorkbenchLifecycleBackend {
     if (!Number.isInteger(this.helperTimeoutMs) || this.helperTimeoutMs <= 0) {
       throw new LifecycleGuardError("Windows lifecycle helper timeout must be positive.", "STATE_INVALID");
     }
-    this.failStop = options.failStop ?? ((message): never => {
-      try {
-        process.stderr.write(`ReforgerForge lifecycle fail-stop: ${message}\n`);
-      } finally {
-        process.abort();
-      }
-    });
   }
 
   private assertSupported(): void {
@@ -468,7 +470,8 @@ export class WindowsLifecycleBackend implements WorkbenchLifecycleBackend {
     child: ChildProcessWithoutNullStreams,
     closePromise: Promise<number | null>,
     context: string,
-    killImmediately: boolean
+    killImmediately: boolean,
+    outcomeUncertain = false
   ): Promise<void> {
     if (killImmediately) child.kill();
     let timer: NodeJS.Timeout | undefined;
@@ -477,13 +480,11 @@ export class WindowsLifecycleBackend implements WorkbenchLifecycleBackend {
       new Promise<never>((_resolve, reject) => {
         timer = setTimeout(() => {
           child.kill();
-          try {
-            this.failStop(
-              `${context}; the mutex helper did not exit within ${this.helperTimeoutMs}ms.`
-            );
-          } catch (error) {
-            reject(error);
-          }
+          reject(new LifecycleGuardError(
+            `${context}; the mutex helper did not exit within ${this.helperTimeoutMs}ms. ` +
+              "Durable lifecycle state was preserved for recovery.",
+            outcomeUncertain ? "RECOVERY_REQUIRED" : "HELPER_FAILURE"
+          ));
         }, this.helperTimeoutMs);
         timer.unref();
       }),
@@ -516,15 +517,12 @@ export class WindowsLifecycleBackend implements WorkbenchLifecycleBackend {
         settled = true;
         child.kill();
         const message = `Windows lifecycle helper mode ${mode} exceeded its ${timeoutMs}ms deadline.`;
-        if (mutationOutcomeUncertainOnTimeout) {
-          try {
-            this.failStop(message);
-          } catch (error) {
-            reject(error);
-          }
-          return;
-        }
-        reject(new LifecycleGuardError(message, "HELPER_FAILURE"));
+        reject(new LifecycleGuardError(
+          mutationOutcomeUncertainOnTimeout
+            ? `${message} The mutation outcome is uncertain; durable lifecycle state was preserved for recovery.`
+            : message,
+          mutationOutcomeUncertainOnTimeout ? "RECOVERY_REQUIRED" : "HELPER_FAILURE"
+        ));
       }, timeoutMs);
       timer.unref();
       child.stdout.setEncoding("utf8");
@@ -580,6 +578,7 @@ export class WindowsLifecycleBackend implements WorkbenchLifecycleBackend {
     name: string;
     timeoutMs: number;
     action: () => Promise<T>;
+    onLeaseLost?: (error: LifecycleGuardError) => void;
   }): Promise<T> {
     this.assertSupported();
     const acquisitionBudgetMs = args.timeoutMs + this.helperTimeoutMs;
@@ -688,10 +687,13 @@ export class WindowsLifecycleBackend implements WorkbenchLifecycleBackend {
     let released = false;
     const holderFailure = closePromise.then((code) => {
       if (!released) {
-        // JavaScript callbacks cannot be safely cancelled after the OS mutex
-        // has been abandoned. Fail-stop the MCP process so no background
-        // lifecycle action can continue after another MCP acquires the mutex.
-        this.failStop(`Lifecycle mutex holder exited unexpectedly with code ${code}.`);
+        const error = new LifecycleGuardError(
+          `Lifecycle mutex holder exited unexpectedly with code ${code}; ` +
+            "durable lifecycle state was preserved for recovery.",
+          "RECOVERY_REQUIRED"
+        );
+        try { args.onLeaseLost?.(error); } catch { /* retain the canonical recovery result */ }
+        throw error;
       }
       return new Promise<never>(() => undefined);
     });
@@ -704,7 +706,8 @@ export class WindowsLifecycleBackend implements WorkbenchLifecycleBackend {
         child,
         closePromise,
         "Lifecycle mutex holder did not release",
-        false
+        false,
+        true
       );
     }
   }
@@ -826,14 +829,30 @@ export class WindowsLifecycleBackend implements WorkbenchLifecycleBackend {
   async verifyEndpointVacant(endpoint: LifecycleEndpoint): Promise<VerifyEndpointVacantResult> {
     const normalized = normalizedEndpoint(endpoint);
     if (!isLoopbackLifecycleHost(normalized.host)) {
-      return { kind: "refused", message: "Endpoint vacancy requires a numeric loopback endpoint." };
+      return {
+        kind: "unverifiable",
+        reason: "endpoint_not_loopback",
+        message: "Endpoint vacancy requires a numeric loopback endpoint.",
+      };
     }
     const response = await this.invoke("VerifyEndpointVacant", { endpoint: normalized });
     if (response.ok === true && response.status === "vacant") return { kind: "vacant" };
     const listenerPid = Number(response.listenerPid);
+    if (response.reason === "listener_present" && Number.isInteger(listenerPid) && listenerPid > 0) {
+      return {
+        kind: "occupied",
+        listenerPid,
+        message: response.message ?? `The Workbench endpoint is owned by PID ${listenerPid}.`,
+      };
+    }
+    const reason = response.reason === "endpoint_not_loopback" ||
+        response.reason === "listener_ambiguous" || response.reason === "access_denied" ||
+        response.reason === "timeout"
+      ? response.reason
+      : "helper_failure";
     return {
-      kind: "refused",
-      ...(Number.isInteger(listenerPid) && listenerPid > 0 ? { listenerPid } : {}),
+      kind: "unverifiable",
+      reason,
       message: response.message ?? "The Workbench endpoint is not provably vacant.",
     };
   }
@@ -897,18 +916,21 @@ export class WindowsLifecycleBackend implements WorkbenchLifecycleBackend {
 
 class LifecycleSession implements WorkbenchLifecycleSession {
   private active = true;
+  private leaseLoss: LifecycleGuardError | null = null;
 
   constructor(
     private readonly guard: WorkbenchProcessGuard,
     readonly mcp: McpOwnerIdentity
   ) {}
 
-  close(): void {
+  close(reason?: LifecycleGuardError): void {
+    this.leaseLoss ??= reason ?? null;
     this.active = false;
   }
 
-  private assertActive(): void {
+  assertActive(): void {
     if (!this.active) {
+      if (this.leaseLoss) throw this.leaseLoss;
       throw new LifecycleGuardError(
         "Lifecycle session cannot be used after the machine-wide mutex is released.",
         "STATE_INVALID"
@@ -967,41 +989,7 @@ class LifecycleSession implements WorkbenchLifecycleSession {
     launchedAtMs: number;
   }): Promise<WorkbenchIdentity> {
     this.assertActive();
-    const deadline = Date.now() + PROCESS_CAPTURE_TIMEOUT_MS;
-    let lastError: unknown;
-    while (Date.now() < deadline) {
-      let inspection: ProcessInspection | null = null;
-      try {
-        inspection = await this.guard.backend.inspectProcess(args.pid, args.ownerTokenArgument);
-      } catch (error) {
-        lastError = error;
-      }
-      if (inspection?.identity.pid !== undefined && inspection.identity.pid !== args.pid) {
-        throw new LifecycleGuardError(
-          `Process inspection for spawned PID ${args.pid} returned PID ${inspection.identity.pid}.`,
-          "IDENTITY_UNVERIFIABLE"
-        );
-      }
-      if (inspection && normalizedPath(inspection.identity.executablePath) !== normalizedPath(args.executablePath)) {
-        throw new LifecycleGuardError(
-          `Spawned PID ${args.pid} executable path does not match Workbench.`,
-          "IDENTITY_UNVERIFIABLE"
-        );
-      }
-      if (inspection?.ownerArgumentMatched === true) {
-        return {
-          ...inspection.identity,
-          ownerTokenArgument: args.ownerTokenArgument,
-          launchedAtMs: args.launchedAtMs,
-        };
-      }
-      await sleep(PROCESS_POLL_MS);
-    }
-    throw new LifecycleGuardError(
-      `Could not verify spawned Workbench PID ${args.pid} by exact handle identity and owner argument` +
-        `${lastError instanceof Error ? `: ${lastError.message}` : "."}`,
-      "IDENTITY_UNVERIFIABLE"
-    );
+    return this.guard.inspectSpawnedWorkbench(args);
   }
 
   async verifyEndpointOwner(
@@ -1009,24 +997,12 @@ class LifecycleSession implements WorkbenchLifecycleSession {
     expected: WorkbenchIdentity
   ): Promise<VerifyEndpointOwnerResult> {
     this.assertActive();
-    const normalized = normalizedEndpoint(endpoint);
-    if (!isLoopbackLifecycleHost(normalized.host)) {
-      return {
-        kind: "refused",
-        reason: "endpoint_not_loopback",
-        message: `Automated Workbench lifecycle endpoint ${normalized.host}:${normalized.port} is not loopback.`,
-      };
-    }
-    return this.guard.backend.verifyEndpointOwner(normalized, expected);
+    return this.guard.verifyEndpointOwner(endpoint, expected);
   }
 
   async verifyEndpointVacant(endpoint: LifecycleEndpoint): Promise<VerifyEndpointVacantResult> {
     this.assertActive();
-    const normalized = normalizedEndpoint(endpoint);
-    if (!isLoopbackLifecycleHost(normalized.host)) {
-      return { kind: "refused", message: "Endpoint vacancy requires a numeric loopback endpoint." };
-    }
-    return this.guard.backend.verifyEndpointVacant(normalized);
+    return this.guard.verifyEndpointVacant(endpoint);
   }
 
   async verifyAndTerminate(
@@ -1034,19 +1010,12 @@ class LifecycleSession implements WorkbenchLifecycleSession {
     timeoutMs: number
   ): Promise<VerifyTerminateResult> {
     this.assertActive();
-    return this.guard.backend.verifyAndTerminate(expected, timeoutMs);
+    return this.guard.verifyAndTerminate(expected, timeoutMs);
   }
 
   async assertNoWorkbenchProcesses(): Promise<void> {
     this.assertActive();
-    const processes = await this.guard.scanStrict();
-    if (processes.length > 0) {
-      throw new LifecycleGuardError(
-        `Workbench PID(s) ${processes.map((entry) => entry.pid).join(", ")} are already running; ` +
-          "absence of an external owner cannot be proven.",
-        "IDENTITY_UNVERIFIABLE"
-      );
-    }
+    return this.guard.assertNoWorkbenchProcesses();
   }
 }
 
@@ -1087,9 +1056,11 @@ export class WorkbenchProcessGuard {
     action: (session: WorkbenchLifecycleSession) => Promise<T>
   ): Promise<T> {
     const identity = await this.currentIdentity();
+    let activeSession: LifecycleSession | null = null;
     return this.backend.withMachineMutex({
       name: this.mutexName,
       timeoutMs: this.lockTimeoutMs,
+      onLeaseLost: (error) => activeSession?.close(error),
       action: async () => {
         mkdirSync(this.stateDir, { recursive: true });
         const session = new LifecycleSession(this, {
@@ -1098,10 +1069,12 @@ export class WorkbenchProcessGuard {
           leaseId: this.leaseId,
           claimedAtMs: Date.now(),
         });
+        activeSession = session;
         try {
           return await action(session);
         } finally {
           session.close();
+          if (activeSession === session) activeSession = null;
         }
       },
     });
@@ -1145,6 +1118,99 @@ export class WorkbenchProcessGuard {
 
   async listWorkbenchProcesses(): Promise<ExactProcessIdentity[]> {
     return this.scanStrict();
+  }
+
+  /**
+   * Capture the exact spawned identity without retaining the machine mutex.
+   * Callers must first publish a durable launch reservation and CAS that
+   * reservation again before committing this identity.
+   */
+  async inspectSpawnedWorkbench(args: {
+    pid: number;
+    executablePath: string;
+    ownerTokenArgument: string;
+    launchedAtMs: number;
+  }): Promise<WorkbenchIdentity> {
+    const deadline = Date.now() + PROCESS_CAPTURE_TIMEOUT_MS;
+    let lastError: unknown;
+    while (Date.now() < deadline) {
+      let inspection: ProcessInspection | null = null;
+      try {
+        inspection = await this.backend.inspectProcess(args.pid, args.ownerTokenArgument);
+      } catch (error) {
+        lastError = error;
+      }
+      if (inspection?.identity.pid !== undefined && inspection.identity.pid !== args.pid) {
+        throw new LifecycleGuardError(
+          `Process inspection for spawned PID ${args.pid} returned PID ${inspection.identity.pid}.`,
+          "IDENTITY_UNVERIFIABLE"
+        );
+      }
+      if (inspection && normalizedPath(inspection.identity.executablePath) !== normalizedPath(args.executablePath)) {
+        throw new LifecycleGuardError(
+          `Spawned PID ${args.pid} executable path does not match Workbench.`,
+          "IDENTITY_UNVERIFIABLE"
+        );
+      }
+      if (inspection?.ownerArgumentMatched === true) {
+        return {
+          ...inspection.identity,
+          ownerTokenArgument: args.ownerTokenArgument,
+          launchedAtMs: args.launchedAtMs,
+        };
+      }
+      await sleep(PROCESS_POLL_MS);
+    }
+    throw new LifecycleGuardError(
+      `Could not verify spawned Workbench PID ${args.pid} by exact handle identity and owner argument` +
+        `${lastError instanceof Error ? `: ${lastError.message}` : "."}`,
+      "IDENTITY_UNVERIFIABLE"
+    );
+  }
+
+  async verifyEndpointOwner(
+    endpoint: LifecycleEndpoint,
+    expected: WorkbenchIdentity
+  ): Promise<VerifyEndpointOwnerResult> {
+    const normalized = normalizedEndpoint(endpoint);
+    if (!isLoopbackLifecycleHost(normalized.host)) {
+      return {
+        kind: "refused",
+        reason: "endpoint_not_loopback",
+        message: `Automated Workbench lifecycle endpoint ${normalized.host}:${normalized.port} is not loopback.`,
+      };
+    }
+    return this.backend.verifyEndpointOwner(normalized, expected);
+  }
+
+  async verifyEndpointVacant(endpoint: LifecycleEndpoint): Promise<VerifyEndpointVacantResult> {
+    const normalized = normalizedEndpoint(endpoint);
+    if (!isLoopbackLifecycleHost(normalized.host)) {
+      return {
+        kind: "unverifiable",
+        reason: "endpoint_not_loopback",
+        message: "Endpoint vacancy requires a numeric loopback endpoint.",
+      };
+    }
+    return this.backend.verifyEndpointVacant(normalized);
+  }
+
+  async verifyAndTerminate(
+    expected: WorkbenchIdentity,
+    timeoutMs: number
+  ): Promise<VerifyTerminateResult> {
+    return this.backend.verifyAndTerminate(expected, timeoutMs);
+  }
+
+  async assertNoWorkbenchProcesses(): Promise<void> {
+    const processes = await this.scanStrict();
+    if (processes.length > 0) {
+      throw new LifecycleGuardError(
+        `Workbench PID(s) ${processes.map((entry) => entry.pid).join(", ")} are already running; ` +
+          "absence of an external owner cannot be proven.",
+        "IDENTITY_UNVERIFIABLE"
+      );
+    }
   }
 
   async inspectOwnedWorkbench(expected: WorkbenchIdentity): Promise<"live" | "absent"> {

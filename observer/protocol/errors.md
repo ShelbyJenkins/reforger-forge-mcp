@@ -1,5 +1,75 @@
 # Observer protocol errors
 
-Consumers branch on the stable `error.code` value exported by `constants.ts`; message prose is diagnostic only. Authentication failures intentionally avoid saying whether a session exists. Protocol-major mismatch is fatal. Runtime, artifact, and camera failures never authorize the agent to signal or terminate an Enfusion process.
+Generated contract view of `ERROR_REGISTRY` in `registry.ts`. Consumers branch
+on the stable code; diagnostic prose is bounded to 512 characters. A `fixed`
+message policy suppresses backend prose. Backend-private Workbench handler and
+lifecycle values are accepted only at the adapter boundary and mapped to their
+host equivalents before MCP publication.
 
-`RESTORATION_UNCONFIRMED` is distinct from ordinary capture failure: the runtime could not prove that the observer still owned the camera and therefore did not blindly overwrite another camera. Callers must treat the renderer as unavailable until a later heartbeat or explicit release proves a safe state.
+| Code | Message policy | Retryable | Applicable backends | Public/fallback message |
+|---|---|---:|---|---|
+| PROTOCOL_MISMATCH | bounded-diagnostic | no | protocol, runtime, host | Observer protocol versions are incompatible. |
+| SESSION_NOT_FOUND | bounded-diagnostic | no | runtime, host | Observer session was not found. |
+| SESSION_EXPIRED | bounded-diagnostic | no | runtime, host | Observer session has expired. |
+| SESSION_MISMATCH | bounded-diagnostic | no | runtime, workbench, host | Observer operation belongs to a different session. |
+| SESSION_UNVERIFIABLE | bounded-diagnostic | no | owned-runtime | Observer session ownership could not be verified. |
+| SESSION_COMPLETION_FAILED | bounded-diagnostic | yes | owned-runtime | Observer session cleanup could not be completed. |
+| UNAUTHORIZED | fixed | no | protocol, runtime, host | Observer request was not authorized. |
+| PROFILE_CONFLICT | bounded-diagnostic | no | runtime, host | Observer profile is already leased or unverifiable. |
+| ADDON_STAGE_FAILED | bounded-diagnostic | yes | host | Observer companion staging failed. |
+| STAGED_ADDON_CONFLICT | bounded-diagnostic | no | host | Staged observer companion identity conflicts with the requested build. |
+| ARGUMENT_CONFLICT | bounded-diagnostic | no | host, owned-runtime | Observer launch arguments conflict with managed arguments. |
+| INSTANCE_NOT_FOUND | bounded-diagnostic | yes | runtime, host | Observer instance was not found. |
+| INSTANCE_STALE | bounded-diagnostic | yes | runtime, host | Observer instance heartbeat is stale. |
+| INSTANCE_CONFLICT | bounded-diagnostic | no | runtime, host | Observer instance selection is conflicting. |
+| STALE_INSTANCE | bounded-diagnostic | yes | workbench, host | Selected renderer belongs to a stale lifecycle instance. |
+| AMBIGUOUS_INSTANCE | bounded-diagnostic | no | workbench, host | More than one compatible observer instance is available. |
+| NO_RENDER_ENDPOINT | bounded-diagnostic | yes | runtime, workbench, host | No compatible renderer is available. |
+| CAPABILITY_UNAVAILABLE | bounded-diagnostic | no | runtime, workbench, host | The selected backend cannot prove the requested capability. |
+| WORKBENCH_ADAPTER_UNAVAILABLE | bounded-diagnostic | yes | workbench, host | Workbench observer adapter is unavailable. |
+| HANDLER_UNAVAILABLE | bounded-diagnostic | yes | workbench | Workbench observer handler is unavailable. |
+| HANDLER_REJECTED | bounded-diagnostic | no | workbench | Workbench observer handler rejected the request. |
+| STALE_LIFECYCLE | bounded-diagnostic | yes | workbench | Workbench observer belongs to a stale lifecycle. |
+| WORKBENCH_EXITED | bounded-diagnostic | yes | workbench | Workbench exited during the observer transaction. |
+| JOB_NOT_FOUND | bounded-diagnostic | no | runtime, workbench, host | Observer job was not found. |
+| JOB_RELEASED | bounded-diagnostic | no | runtime, workbench, host | Observer job has already been released. |
+| IDEMPOTENCY_CONFLICT | bounded-diagnostic | no | runtime, workbench, owned-runtime, evidence, host | Idempotency key was reused with different input. |
+| UNSUPPORTED_VIEW | bounded-diagnostic | no | runtime, workbench | Requested capture view is not supported. |
+| INVALID_REQUEST | bounded-diagnostic | no | protocol, runtime, workbench, owned-runtime, evidence, host | Observer request is invalid. |
+| WORLD_UNAVAILABLE | bounded-diagnostic | yes | runtime, workbench | No active world is available for this operation. |
+| WORLD_CHANGED | bounded-diagnostic | yes | runtime, workbench, host | Renderer world identity changed during capture. |
+| CAMERA_BUSY | bounded-diagnostic | yes | runtime, workbench, host | Observer camera is busy or awaiting restoration. |
+| CAMERA_OWNERSHIP_LOST | bounded-diagnostic | no | runtime | Observer camera ownership was lost. |
+| RESTORATION_UNCONFIRMED | bounded-diagnostic | no | runtime, workbench, host | Observer camera restoration could not be confirmed. |
+| CAPTURE_REJECTED | bounded-diagnostic | yes | runtime, workbench, host | Observer capture was rejected. |
+| CAPTURE_TIMEOUT | bounded-diagnostic | yes | runtime, workbench, host | Observer capture exceeded its deadline. |
+| ARTIFACT_INCOMPLETE | bounded-diagnostic | yes | runtime, workbench, evidence, host | Observer artifact is not complete. |
+| ARTIFACT_INVALID | bounded-diagnostic | no | runtime, workbench, evidence, host | Observer artifact failed validation. |
+| ARTIFACT_TOO_LARGE | bounded-diagnostic | no | runtime, workbench, evidence, host | Observer artifact exceeds the configured size limit. |
+| TRANSPORT_UNAVAILABLE | bounded-diagnostic | yes | runtime, host | Observer transport is unavailable. |
+| PERFORMANCE_POLICY_BLOCKED | bounded-diagnostic | no | runtime, workbench, host | Capture is incompatible with the selected performance policy. |
+| CANCELLED | bounded-diagnostic | yes | runtime, workbench, owned-runtime, host | Observer operation was cancelled. |
+| LIFECYCLE_CLOSING | bounded-diagnostic | yes | owned-runtime | Observer lifecycle is shutting down. |
+| IDENTITY_MISMATCH | bounded-diagnostic | no | owned-runtime | Owned process identity no longer matches its receipt. |
+| IDENTITY_UNVERIFIABLE | bounded-diagnostic | no | owned-runtime | Owned process identity could not be verified. |
+| STORAGE_CONFLICT | bounded-diagnostic | yes | owned-runtime | Observer lifecycle storage changed concurrently. |
+| STORAGE_UNVERIFIABLE | fixed | no | owned-runtime | Observer lifecycle storage could not be verified. |
+| STORE_CAPACITY_EXCEEDED | bounded-diagnostic | yes | owned-runtime | Observer lifecycle storage capacity is exhausted. |
+| PREPARE_FAILED | bounded-diagnostic | yes | owned-runtime | Prepared runtime launch could not be recorded. |
+| RETENTION_FAILED | bounded-diagnostic | yes | owned-runtime | Owned runtime retention could not be completed. |
+| PREPARED_LAUNCH_CONSUMED | bounded-diagnostic | no | owned-runtime | Prepared observer launch has already been consumed. |
+| PREPARED_LAUNCH_EXPIRED | bounded-diagnostic | no | owned-runtime | Prepared observer launch has expired. |
+| PREPARED_LAUNCH_STALE | bounded-diagnostic | no | owned-runtime | Prepared observer launch belongs to a stale lifecycle. |
+| START_UNVERIFIABLE | bounded-diagnostic | no | owned-runtime | Owned runtime start could not be verified. |
+| START_FAILED | bounded-diagnostic | yes | owned-runtime | Owned runtime start failed. |
+| STOP_FAILED | bounded-diagnostic | yes | owned-runtime | Owned runtime stop failed. |
+| SHUTDOWN_SEAL_FAILED | bounded-diagnostic | yes | owned-runtime | Owned runtime shutdown sealing failed. |
+| RUNTIME_NOT_FOUND | bounded-diagnostic | no | owned-runtime | Owned runtime receipt was not found. |
+| SPAWN_FAILED | bounded-diagnostic | yes | owned-runtime | Owned process could not be started and verified. |
+| RECOVERY_REQUIRED | bounded-diagnostic | yes | workbench, owned-runtime | Lifecycle recovery remains pending and requires a later retry. |
+| TERMINATION_REFUSED | bounded-diagnostic | no | owned-runtime | Exact owned-process termination was refused. |
+| TERMINATION_UNVERIFIABLE | bounded-diagnostic | yes | owned-runtime | Owned-process termination could not be verified. |
+| INTERNAL_ERROR | fixed | yes | protocol, runtime, workbench, owned-runtime, evidence, host | Observer operation failed. |
+
+`RESTORATION_UNCONFIRMED` is a hard safety failure: the renderer remains
+unavailable until a later explicit state proves safe restoration.

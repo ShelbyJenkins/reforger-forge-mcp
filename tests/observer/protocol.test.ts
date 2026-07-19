@@ -1,8 +1,11 @@
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   ERROR_CODES,
+  ERROR_REGISTRY,
+  CAPABILITIES,
+  CAPABILITY_REGISTRY,
   JOB_STATES,
   artifactManifestSchema,
   cameraLeaseStatusSchema,
@@ -108,6 +111,107 @@ describe("observer protocol", () => {
     expect(ERROR_CODES).toContain("WORLD_CHANGED");
     expect(ERROR_CODES).toContain("CAMERA_OWNERSHIP_LOST");
     expect(ERROR_CODES).toContain("STAGED_ADDON_CONFLICT");
+  });
+
+  it("keeps generated error/capability artifacts and documentation in registry order", () => {
+    const protocolRoot = join(repositoryRoot, "observer", "protocol");
+    expect(JSON.parse(readFileSync(join(protocolRoot, "generated", "error-codes.json"), "utf8")))
+      .toEqual([...ERROR_CODES]);
+    expect(JSON.parse(readFileSync(join(protocolRoot, "generated", "capabilities.json"), "utf8")))
+      .toEqual([...CAPABILITIES]);
+    expect(JSON.parse(readFileSync(join(protocolRoot, "generated", "fixed-error-messages.json"), "utf8")))
+      .toEqual(Object.fromEntries(ERROR_CODES
+        .filter((code) => ERROR_REGISTRY[code].publicMessagePolicy === "fixed")
+        .map((code) => [code, ERROR_REGISTRY[code].publicMessage])));
+
+    const errorSchema = JSON.parse(readFileSync(join(protocolRoot, "schemas", "error.schema.json"), "utf8"));
+    const jobSchema = JSON.parse(readFileSync(join(protocolRoot, "schemas", "job-status.schema.json"), "utf8"));
+    expect(errorSchema.properties.error.properties.code.enum).toEqual([...ERROR_CODES]);
+    expect(jobSchema.properties.errorCode.enum).toEqual([...ERROR_CODES]);
+
+    const errorRows = readFileSync(join(protocolRoot, "errors.md"), "utf8").split(/\r?\n/)
+      .filter((line) => /^\| [A-Z][A-Z0-9_]+ \|/.test(line))
+      .map((line) => line.split("|").slice(1, -1).map((part) => part.trim()));
+    const capabilityRows = readFileSync(join(protocolRoot, "capabilities.md"), "utf8").split(/\r?\n/)
+      .filter((line) => /^\| `[^`]+` \|/.test(line))
+      .map((line) => line.split("|").slice(1, -1).map((part) => part.trim()));
+    expect(errorRows).toEqual(ERROR_CODES.map((code) => {
+      const definition = ERROR_REGISTRY[code];
+      return [
+        code,
+        definition.publicMessagePolicy,
+        definition.retryable ? "yes" : "no",
+        definition.backends.join(", "),
+        definition.publicMessage,
+      ];
+    }));
+    expect(capabilityRows).toEqual(CAPABILITIES.map((capability) => [
+      `\`${capability}\``,
+      CAPABILITY_REGISTRY[capability].backends.join(", "),
+      CAPABILITY_REGISTRY[capability].proof,
+    ]));
+  });
+
+  it("registers metadata for every public code and only proven capabilities", () => {
+    for (const code of ERROR_CODES) {
+      expect(ERROR_REGISTRY[code].backends.length).toBeGreaterThan(0);
+      expect(ERROR_REGISTRY[code].publicMessage.length).toBeGreaterThan(0);
+      expect(["bounded-diagnostic", "fixed"]).toContain(ERROR_REGISTRY[code].publicMessagePolicy);
+      expect(typeof ERROR_REGISTRY[code].retryable).toBe("boolean");
+    }
+    expect(CAPABILITIES).toContain("camera.editor");
+    expect(CAPABILITIES).not.toContain("entity.resolve" as (typeof CAPABILITIES)[number]);
+    expect(CAPABILITIES).not.toContain("server.coordinate" as (typeof CAPABILITIES)[number]);
+    expect(CAPABILITY_REGISTRY["camera.editor"].backends).toEqual(["workbench"]);
+    expect(CAPABILITY_REGISTRY["camera.runtime"].backends).toEqual(["runtime"]);
+  });
+
+  it("contains every statically emitted observer host/adapter error", () => {
+    const sourceRoots = [
+      join(repositoryRoot, "observer", "agent"),
+      join(repositoryRoot, "src", "observer"),
+    ];
+    const files: string[] = [
+      join(repositoryRoot, "src", "tools", "observer-runtime.ts"),
+      join(repositoryRoot, "src", "workbench", "observer-adapter.ts"),
+    ];
+    const visit = (directory: string): void => {
+      for (const entry of readdirSync(directory, { withFileTypes: true })) {
+        const path = join(directory, entry.name);
+        if (entry.isDirectory()) visit(path);
+        else if (entry.isFile() && path.endsWith(".ts")) files.push(path);
+      }
+    };
+    sourceRoots.forEach(visit);
+    const emitted = new Set<string>();
+    for (const path of files) {
+      const source = readFileSync(path, "utf8");
+      for (const match of source.matchAll(
+        /(?:ObserverError|ObserverCoordinatorError|OwnedRuntimeError|WorkbenchObserverAdapterError)\(\s*["']([A-Z][A-Z0-9_]*)["']/g
+      )) emitted.add(match[1]);
+      for (const match of source.matchAll(/normalizeError\([^,]+,\s*["']([A-Z][A-Z0-9_]*)["']/g)) {
+        emitted.add(match[1]);
+      }
+    }
+    expect([...emitted].filter((code) => !(code in ERROR_REGISTRY)).sort()).toEqual([]);
+  });
+
+  it("contains every capability emitted by its proving backend", () => {
+    const runtimeSource = readFileSync(join(
+      repositoryRoot, "observer", "addon", "Scripts", "Game",
+      "ReforgerForgeObserver", "RFO_ObserverCapabilities.c"
+    ), "utf8");
+    const workbenchSource = readFileSync(join(repositoryRoot, "src", "workbench", "observer-adapter.ts"), "utf8");
+    const runtimeCapabilities = [...runtimeSource.matchAll(/result\.Insert\("([a-z.]+)"\)/g)].map((match) => match[1]);
+    const workbenchCapabilities = [...workbenchSource.matchAll(/capabilities\.push\("([a-z.]+)"\)/g)].map((match) => match[1]);
+    for (const capability of runtimeCapabilities) {
+      expect(capability in CAPABILITY_REGISTRY).toBe(true);
+      expect(CAPABILITY_REGISTRY[capability as keyof typeof CAPABILITY_REGISTRY].backends).toContain("runtime");
+    }
+    for (const capability of workbenchCapabilities) {
+      expect(capability in CAPABILITY_REGISTRY).toBe(true);
+      expect(CAPABILITY_REGISTRY[capability as keyof typeof CAPABILITY_REGISTRY].backends).toContain("workbench");
+    }
   });
 
   it("accepts every failure code emitted by the runtime addon", () => {

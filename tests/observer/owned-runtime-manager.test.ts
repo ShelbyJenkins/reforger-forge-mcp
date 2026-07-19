@@ -24,6 +24,7 @@ import {
   type OwnedRuntimeProcessBackend,
   type RuntimeStopPreflight,
 } from "../../src/observer/owned-runtime-manager.js";
+import { LifecycleGuardError } from "../../src/workbench/process-guard.js";
 import type { ObserverLaunchInput, ObserverPreparedLaunch } from "../../src/observer/launch.js";
 
 interface FakeProcess {
@@ -39,8 +40,14 @@ class FakeBackend implements OwnedRuntimeProcessBackend {
   currentCreation = "900001";
   currentUserSid = "S-1-5-21-test-owner";
   beforeTerminate: (() => void) | null = null;
+  refuseTermination = false;
+  mutexFailures = 0;
 
   async withMachineMutex<T>(args: { action: () => Promise<T> }): Promise<T> {
+    if (this.mutexFailures > 0) {
+      this.mutexFailures -= 1;
+      throw new Error("fixture mutex failure");
+    }
     return args.action();
   }
 
@@ -71,6 +78,9 @@ class FakeBackend implements OwnedRuntimeProcessBackend {
   }) {
     this.beforeTerminate?.();
     this.terminateCalls.push({ ...expected });
+    if (this.refuseTermination) {
+      return { kind: "refused" as const, reason: "access_denied" as const, message: "fixture refusal" };
+    }
     const value = this.processes.get(expected.pid);
     if (!value) return { kind: "already_exited" as const };
     if (value.identity.executablePath !== expected.executablePath) {
@@ -89,7 +99,7 @@ class FakeBackend implements OwnedRuntimeProcessBackend {
 
 class QueuedBackend extends FakeBackend {
   private mutexTail: Promise<void> = Promise.resolve();
-  private firstEntry = true;
+  private entryCount = 0;
   private markFirstEntryBlocked!: () => void;
   private releaseFirstEntry!: () => void;
   readonly firstEntryBlocked: Promise<void>;
@@ -111,8 +121,10 @@ class QueuedBackend extends FakeBackend {
     this.mutexTail = new Promise((resolve) => { releaseCurrent = resolve; });
     await prior;
     try {
-      if (this.firstEntry) {
-        this.firstEntry = false;
+      this.entryCount += 1;
+      // Preparation now owns a short direct-index transaction. Block the
+      // following start transaction, which is the race this fixture models.
+      if (this.entryCount === 2) {
         this.markFirstEntryBlocked();
         await this.firstEntryRelease;
       }
@@ -120,6 +132,84 @@ class QueuedBackend extends FakeBackend {
     } finally {
       releaseCurrent();
     }
+  }
+}
+
+class SerialBackend extends FakeBackend {
+  private mutexTail: Promise<void> = Promise.resolve();
+
+  override async withMachineMutex<T>(args: { action: () => Promise<T> }): Promise<T> {
+    const prior = this.mutexTail;
+    let releaseCurrent!: () => void;
+    const current = new Promise<void>((resolve) => { releaseCurrent = resolve; });
+    this.mutexTail = prior.then(() => current);
+    await prior;
+    try {
+      return await args.action();
+    } finally {
+      releaseCurrent();
+    }
+  }
+}
+
+class HookedSerialBackend extends SerialBackend {
+  entryCount = 0;
+  beforeAction: ((entry: number) => void) | null = null;
+
+  override withMachineMutex<T>(args: { action: () => Promise<T> }): Promise<T> {
+    return super.withMachineMutex({
+      action: async () => {
+        this.entryCount += 1;
+        this.beforeAction?.(this.entryCount);
+        return args.action();
+      },
+    });
+  }
+}
+
+class LeaseLosingBackend extends FakeBackend {
+  loseOnCurrentInspection = false;
+  loseAfterTermination = false;
+  private activeLeaseLoss: ((error: LifecycleGuardError) => void) | null = null;
+
+  override async withMachineMutex<T>(args: {
+    action: () => Promise<T>;
+    onLeaseLost?: (error: LifecycleGuardError) => void;
+  }): Promise<T> {
+    const prior = this.activeLeaseLoss;
+    this.activeLeaseLoss = args.onLeaseLost ?? null;
+    try {
+      return await args.action();
+    } finally {
+      this.activeLeaseLoss = prior;
+    }
+  }
+
+  override async inspectCurrentProcess(pid: number) {
+    const result = await super.inspectCurrentProcess(pid);
+    if (this.loseOnCurrentInspection && this.activeLeaseLoss) {
+      this.loseOnCurrentInspection = false;
+      this.activeLeaseLoss(new LifecycleGuardError(
+        "fixture lifecycle mutex holder exited",
+        "RECOVERY_REQUIRED"
+      ));
+    }
+    return result;
+  }
+
+  override async verifyAndTerminate(expected: OwnedRuntimeExactIdentity & {
+    ownerTokenArgument: string;
+    launchedAtMs: number;
+  }) {
+    const result = await super.verifyAndTerminate(expected);
+    if (this.loseAfterTermination && this.activeLeaseLoss) {
+      this.loseAfterTermination = false;
+      this.activeLeaseLoss(new LifecycleGuardError(
+        "fixture lifecycle mutex holder exited during termination",
+        "RECOVERY_REQUIRED"
+      ));
+    }
+    return result;
   }
 }
 
@@ -144,12 +234,18 @@ class FakeChild extends EventEmitter {
 
 class FakeGate implements OwnedRuntimeObserverGate {
   readonly released: string[] = [];
+  readonly releasedReservations: string[] = [];
   readonly completed: string[] = [];
+  readonly completedReservations: Array<string | undefined> = [];
+  readonly completedExactVacancies: boolean[] = [];
   preflights: RuntimeStopPreflight[] = [];
   completeFailures = 0;
 
-  async reserveRuntimeStop(): Promise<RuntimeStopPreflight> {
-    return this.preflights.shift() ?? {
+  async reserveRuntimeStop(
+    _sessionId: string,
+    proposedReservationId: string
+  ): Promise<RuntimeStopPreflight> {
+    const result: RuntimeStopPreflight = this.preflights.shift() ?? {
       sessionKnown: true,
       ready: true,
       reserved: true,
@@ -157,19 +253,29 @@ class FakeGate implements OwnedRuntimeObserverGate {
       cameraLeaseJobIds: [],
       restorationPendingJobIds: [],
     };
+    return result.reserved && !result.reservationId
+      ? { ...result, reservationId: proposedReservationId }
+      : result;
   }
 
-  async releaseRuntimeStop(sessionId: string): Promise<unknown> {
+  async releaseRuntimeStop(sessionId: string, reservationId: string): Promise<unknown> {
     this.released.push(sessionId);
+    this.releasedReservations.push(reservationId);
     return { released: true };
   }
 
-  async completeRuntimeStop(sessionId: string): Promise<unknown> {
+  async completeRuntimeStop(
+    sessionId: string,
+    reservationId?: string,
+    exactRuntimeVacant = false
+  ): Promise<unknown> {
     if (this.completeFailures > 0) {
       this.completeFailures -= 1;
       throw new Error("fixture completion failure");
     }
     this.completed.push(sessionId);
+    this.completedReservations.push(reservationId);
+    this.completedExactVacancies.push(exactRuntimeVacant);
     return { completed: true, revoked: true };
   }
 }
@@ -198,6 +304,10 @@ function makeHarness(options: {
   advanceClock?: boolean;
   backend?: FakeBackend;
   root?: string;
+  receiptRetentionMs?: number;
+  maxStoreRecords?: number;
+  maxStoreBytes?: number;
+  maxRecordBytes?: number;
 } = {}): Harness {
   const root = options.root ?? mkdtempSync(join(tmpdir(), "rfo-owned-runtime-"));
   if (!options.root) roots.push(root);
@@ -240,6 +350,10 @@ function makeHarness(options: {
     inspectionTimeoutMs: 500,
     terminationTimeoutMs: 500,
     lockTimeoutMs: 500,
+    ...(options.receiptRetentionMs === undefined ? {} : { receiptRetentionMs: options.receiptRetentionMs }),
+    ...(options.maxStoreRecords === undefined ? {} : { maxStoreRecords: options.maxStoreRecords }),
+    ...(options.maxStoreBytes === undefined ? {} : { maxStoreBytes: options.maxStoreBytes }),
+    ...(options.maxRecordBytes === undefined ? {} : { maxRecordBytes: options.maxRecordBytes }),
   });
   const prepare = async (argumentsArray = ["-window", "-noSplash"], idempotencyKey?: string) => {
     const input: ObserverLaunchInput = {
@@ -302,6 +416,249 @@ describe("OwnedRuntimeManager", () => {
     expect(later.id).not.toBe(prepared.id);
   });
 
+  it("uses a direct session index and isolates an unrelated corrupt prepared descriptor", async () => {
+    const value = makeHarness();
+    const first = await value.prepare(["-indexed"]);
+    writeFileSync(
+      join(
+        value.manager.storageRoot,
+        "prepared",
+        "pl-ffffffff-ffff-4fff-8fff-ffffffffffff.json"
+      ),
+      "{\n"
+    );
+
+    const replay = await value.manager.recordPreparedLaunch({
+      runtimeKind: "listenServer",
+      arguments: ["-indexed"],
+      profilePath: first.prepared.profilePath,
+      sessionTtlMs: 60_000,
+      transportPreference: ["rest", "mailbox"],
+      forceUpdate: false,
+    }, {
+      arguments: ["-indexed"],
+      sessionId: first.prepared.sessionId,
+      expiresAt: first.prepared.expiresAt,
+      bundleDigest: first.prepared.bundleDigest,
+      profilePath: first.prepared.profilePath,
+      warnings: [],
+    });
+    const later = await value.prepare(["-later"]);
+
+    expect(replay).toBe(first.id);
+    expect(later.id).not.toBe(first.id);
+    expect(readdirSync(join(value.manager.storageRoot, "prepared-index"))).toHaveLength(2);
+  });
+
+  it("enforces per-record, aggregate-byte, and record-count budgets with diagnostics", async () => {
+    const perRecord = makeHarness({ maxRecordBytes: 1_024, maxStoreBytes: 4_096 });
+    await expect(perRecord.prepare(["x".repeat(2_000)]))
+      .rejects.toMatchObject({ code: "STORE_CAPACITY_EXCEEDED" });
+    expect(perRecord.manager.diagnosticStorageStats()).toMatchObject({ records: 0, maxRecordBytes: 1_024 });
+
+    const aggregate = makeHarness({ maxRecordBytes: 4_096, maxStoreBytes: 4_096 });
+    await expect(aggregate.prepare(["x".repeat(1_400)])).resolves.toBeDefined();
+    await expect(aggregate.prepare(["y".repeat(1_400)]))
+      .rejects.toMatchObject({ code: "STORE_CAPACITY_EXCEEDED" });
+    expect(aggregate.manager.diagnosticStorageStats().bytes).toBeLessThanOrEqual(4_096);
+
+    const countBound = makeHarness({ maxStoreRecords: 8 });
+    countBound.manager.diagnosticStorageStats();
+    for (let index = 0; index < 8; index += 1) {
+      writeFileSync(join(countBound.manager.storageRoot, "prepared", `forensic-${index}.json`), "{}\n");
+    }
+    await expect(countBound.prepare()).rejects.toMatchObject({ code: "STORE_CAPACITY_EXCEEDED" });
+    expect(countBound.manager.diagnosticStorageStats()).toMatchObject({ records: 8, maxRecords: 8 });
+  });
+
+  it("reserves the complete recovery lifecycle before spawn at a tight record bound", async () => {
+    const insufficient = makeHarness({ maxStoreRecords: 8 });
+    const prepared = await insufficient.prepare();
+    await expect(insufficient.manager.start({
+      preparedLaunchId: prepared.id,
+      idempotencyKey: "tight-start",
+    })).rejects.toMatchObject({ code: "STORE_CAPACITY_EXCEEDED" });
+    expect(insufficient.spawnCalls).toEqual([]);
+    expect(readdirSync(join(insufficient.manager.storageRoot, "consumed"))).toEqual([]);
+    expect(readdirSync(join(insufficient.manager.storageRoot, "pending-starts"))).toEqual([]);
+    expect(readdirSync(join(insufficient.manager.storageRoot, "idempotency"))).toEqual([]);
+
+    const sufficient = makeHarness({ maxStoreRecords: 11 });
+    const sufficientPrepared = await sufficient.prepare();
+    const started = await sufficient.manager.start({
+      preparedLaunchId: sufficientPrepared.id,
+      idempotencyKey: "reserved-start",
+    });
+    // At the exact 6-record + 5-record recovery bound, best-effort receipt
+    // replacements must not borrow the fsynced temporary-file slot. A crash
+    // could otherwise consume mandatory recovery headroom for the retention
+    // window.
+    const tightStartAttempt = JSON.parse(readFileSync(join(
+      sufficient.manager.storageRoot,
+      "idempotency",
+      `start-${createHash("sha256").update("reserved-start").digest("hex")}.json`
+    ), "utf8"));
+    expect(tightStartAttempt.state).toBe("starting");
+    expect(sufficient.manager.diagnosticStorageStats()).toMatchObject({
+      records: 6,
+      reservedMutationRecords: 5,
+    });
+    await expect(sufficient.manager.stop({
+      runtimeId: started.runtimeId,
+      waitForRestorationMs: 0,
+      idempotencyKey: "reserved-stop",
+    })).resolves.toMatchObject({ terminationComplete: true, observerCleanupPending: false });
+    const stats = sufficient.manager.diagnosticStorageStats();
+    expect(stats.records).toBeLessThanOrEqual(11);
+    expect(stats.reservedMutationRecords).toBe(0);
+  });
+
+  it("sweeps completed clusters while preserving live ownership obligations", async () => {
+    const unused = makeHarness({ receiptRetentionMs: 1_000 });
+    const unusedPrepared = await unused.prepare(["-unused"]);
+    unused.setClock(Date.parse(unusedPrepared.prepared.expiresAt) + 1_001);
+    await expect(unused.manager.sweep()).resolves.toMatchObject({
+      removedPreparedLaunchIds: [unusedPrepared.id],
+      removedRuntimeIds: [],
+    });
+
+    const completed = makeHarness({ receiptRetentionMs: 1_000 });
+    const prepared = await completed.prepare();
+    const started = await completed.manager.start({
+      preparedLaunchId: prepared.id,
+      idempotencyKey: "retention-start",
+    });
+    const stopped = await completed.manager.stop({
+      runtimeId: started.runtimeId,
+      waitForRestorationMs: 0,
+      idempotencyKey: "retention-stop",
+    });
+    completed.setClock(Date.parse(stopped.stoppedAt!) + 1_001);
+
+    await expect(completed.manager.sweep()).resolves.toMatchObject({
+      removedRuntimeIds: [started.runtimeId],
+      removedPreparedLaunchIds: [prepared.id],
+    });
+    expect(completed.manager.diagnosticStorageStats()).toMatchObject({
+      prepared: 0,
+      activeOrRecoverableRuntimes: 0,
+      completedRuntimes: 0,
+    });
+
+    const live = makeHarness({ receiptRetentionMs: 0 });
+    const livePrepared = await live.prepare();
+    const liveStarted = await live.manager.start({
+      preparedLaunchId: livePrepared.id,
+      idempotencyKey: "live-retention-start",
+    });
+    live.setClock(Date.parse(livePrepared.prepared.expiresAt) + 60_000);
+    await live.manager.sweep();
+    expect(existsSync(join(live.manager.storageRoot, "runtimes", `${liveStarted.runtimeId}.json`))).toBe(true);
+    expect(live.manager.diagnosticStorageStats().activeOrRecoverableRuntimes).toBe(1);
+  });
+
+  it("resumes partial terminal cleanup and preserves descriptors referenced by broken live links", async () => {
+    const completed = makeHarness({ receiptRetentionMs: 0 });
+    const prepared = await completed.prepare();
+    const started = await completed.manager.start({
+      preparedLaunchId: prepared.id,
+      idempotencyKey: "partial-cleanup-start",
+    });
+    await completed.manager.stop({
+      runtimeId: started.runtimeId,
+      waitForRestorationMs: 0,
+      idempotencyKey: "partial-cleanup-stop",
+    });
+    rmSync(join(completed.manager.storageRoot, "runtimes", `${started.runtimeId}.json`));
+    rmSync(join(completed.manager.storageRoot, "stops", `${started.runtimeId}.json`));
+    await expect(completed.manager.sweep()).resolves.toMatchObject({
+      removedRuntimeIds: [started.runtimeId],
+      removedPreparedLaunchIds: [prepared.id],
+    });
+    expect(existsSync(join(
+      completed.manager.storageRoot,
+      "stop-completions",
+      `${started.runtimeId}.json`
+    ))).toBe(false);
+
+    const live = makeHarness({ receiptRetentionMs: 0 });
+    const livePrepared = await live.prepare();
+    const liveStarted = await live.manager.start({
+      preparedLaunchId: livePrepared.id,
+      idempotencyKey: "broken-link-start",
+    });
+    rmSync(join(live.manager.storageRoot, "consumed", `${livePrepared.id}.json`));
+    live.setClock(Date.parse(livePrepared.prepared.expiresAt) + 1);
+    await live.manager.sweep();
+    expect(existsSync(join(live.manager.storageRoot, "prepared", `${livePrepared.id}.json`))).toBe(true);
+    expect(existsSync(join(live.manager.storageRoot, "runtimes", `${liveStarted.runtimeId}.json`))).toBe(true);
+  });
+
+  it("scopes a corrupt live forward receipt to its consumed preparation", async () => {
+    const value = makeHarness({ receiptRetentionMs: 0 });
+    const livePrepared = await value.prepare(["-live-corrupt"]);
+    const live = await value.manager.start({
+      preparedLaunchId: livePrepared.id,
+      idempotencyKey: "corrupt-forward-live",
+    });
+    const unused = await value.prepare(["-unrelated-unused"]);
+
+    rmSync(join(value.manager.storageRoot, "pending-starts", `${live.runtimeId}.json`));
+    writeFileSync(join(value.manager.storageRoot, "runtimes", `${live.runtimeId}.json`), "{\n");
+    value.setClock(Math.max(
+      Date.parse(livePrepared.prepared.expiresAt),
+      Date.parse(unused.prepared.expiresAt)
+    ) + 1);
+
+    await expect(value.manager.sweep()).resolves.toMatchObject({
+      removedPreparedLaunchIds: [unused.id],
+    });
+    expect(existsSync(join(value.manager.storageRoot, "prepared", `${unused.id}.json`))).toBe(false);
+    expect(existsSync(join(value.manager.storageRoot, "prepared", `${livePrepared.id}.json`))).toBe(true);
+    expect(existsSync(join(value.manager.storageRoot, "consumed", `${livePrepared.id}.json`))).toBe(true);
+    expect(existsSync(join(value.manager.storageRoot, "runtimes", `${live.runtimeId}.json`))).toBe(true);
+  });
+
+  it("keeps the terminal cleanup trigger when an idempotency unlink fails", async () => {
+    const value = makeHarness({ receiptRetentionMs: 0 });
+    const prepared = await value.prepare();
+    const started = await value.manager.start({
+      preparedLaunchId: prepared.id,
+      idempotencyKey: "retryable-unlink-start",
+    });
+    await value.manager.stop({
+      runtimeId: started.runtimeId,
+      waitForRestorationMs: 0,
+      idempotencyKey: "retryable-unlink-stop",
+    });
+
+    const manager = value.manager as unknown as {
+      unlinkOwnedFile(target: string): void;
+    };
+    const unlinkOwnedFile = manager.unlinkOwnedFile.bind(value.manager);
+    let failIdempotencyUnlink = true;
+    manager.unlinkOwnedFile = (target) => {
+      if (failIdempotencyUnlink && target.includes(`${join("", "idempotency")}`)) {
+        throw Object.assign(new Error("fixture unlink failure"), { code: "EPERM" });
+      }
+      unlinkOwnedFile(target);
+    };
+
+    await expect(value.manager.sweep()).resolves.toMatchObject({ removedRuntimeIds: [] });
+    const completionPath = join(
+      value.manager.storageRoot,
+      "stop-completions",
+      `${started.runtimeId}.json`
+    );
+    expect(existsSync(completionPath)).toBe(true);
+
+    failIdempotencyUnlink = false;
+    await expect(value.manager.sweep()).resolves.toMatchObject({
+      removedRuntimeIds: [started.runtimeId],
+    });
+    expect(existsSync(completionPath)).toBe(false);
+  });
+
   it("spawns exact structured arguments visibly without a shell and publishes a complete restrictive receipt", async () => {
     const value = makeHarness();
     const argumentsArray = ["-window", "-screenWidth", "1280"];
@@ -344,6 +701,52 @@ describe("OwnedRuntimeManager", () => {
     expect(receipt.argvSha256).toBe(createHash("sha256").update(JSON.stringify(call.arguments)).digest("hex"));
     expect(started).not.toHaveProperty("ownerTokenArgument");
     if (process.platform !== "win32") expect(statSync(receiptPath).mode & 0o077).toBe(0);
+  });
+
+  it("fences start before spawn and ownership publication when the mutex lease is lost", async () => {
+    const backend = new LeaseLosingBackend();
+    const value = makeHarness({ backend });
+    const prepared = await value.prepare([], "lease-loss-start-prepare");
+    backend.loseOnCurrentInspection = true;
+
+    await expect(value.manager.start({
+      preparedLaunchId: prepared.id,
+      idempotencyKey: "lease-loss-start",
+    })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+
+    expect(value.spawnCalls).toHaveLength(0);
+    expect(readdirSync(join(value.manager.storageRoot, "runtimes"))).toEqual([]);
+  });
+
+  it("removes naturally exited children and reconciles exact exit evidence durably", async () => {
+    const value = makeHarness();
+    const prepared = await value.prepare();
+    const started = await value.manager.start({
+      preparedLaunchId: prepared.id,
+      idempotencyKey: "natural-exit-start",
+    });
+    expect(value.manager.diagnosticSupervisedChildCount()).toBe(1);
+    const child = value.spawnCalls[0].child;
+    value.backend.processes.delete(started.pid);
+    child.exitCode = 0;
+    child.emit("exit", 0, null);
+    expect(value.manager.diagnosticSupervisedChildCount()).toBe(0);
+
+    const exitPath = join(value.manager.storageRoot, "child-exits", `${started.runtimeId}.json`);
+    for (let attempt = 0; attempt < 50 && !existsSync(exitPath); attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 2));
+    }
+    expect(JSON.parse(readFileSync(exitPath, "utf8"))).toMatchObject({
+      runtimeId: started.runtimeId,
+      sessionId: started.sessionId,
+      pid: started.pid,
+      exitCode: 0,
+    });
+    expect(await value.manager.status(started.runtimeId)).toMatchObject({
+      state: "exited",
+      exactOwned: true,
+      reason: expect.stringMatching(/Direct child exit/),
+    });
   });
 
   it("makes prepared launches one-shot while replaying exact start idempotency", async () => {
@@ -448,6 +851,21 @@ describe("OwnedRuntimeManager", () => {
     })).rejects.toMatchObject({ code: "CAMERA_BUSY" });
     expect(value.backend.processes.has(started.pid)).toBe(true);
     expect(value.backend.terminateCalls).toHaveLength(0);
+    value.gate.preflights.push({
+      sessionKnown: true,
+      ready: false,
+      reserved: false,
+      activeJobIds: ["job-camera"],
+      cameraLeaseJobIds: ["job-camera"],
+      restorationPendingJobIds: ["job-camera"],
+    });
+    await expect(value.manager.stop({
+      runtimeId: started.runtimeId,
+      waitForRestorationMs: 0,
+      idempotencyKey: "camera-stop-other",
+    })).rejects.toMatchObject({ code: "CAMERA_BUSY" });
+    expect(readdirSync(join(value.manager.storageRoot, "idempotency"))
+      .filter((name) => name.startsWith("stop-"))).toEqual([]);
 
     const stopped = await value.manager.stop({
       runtimeId: started.runtimeId,
@@ -468,6 +886,40 @@ describe("OwnedRuntimeManager", () => {
     expect(value.backend.terminateCalls).toHaveLength(1);
   });
 
+  it("does not publish vacancy after losing the mutex lease during exact termination", async () => {
+    const backend = new LeaseLosingBackend();
+    const value = makeHarness({ backend });
+    const prepared = await value.prepare([], "lease-loss-stop-prepare");
+    const started = await value.manager.start({
+      preparedLaunchId: prepared.id,
+      idempotencyKey: "lease-loss-stop-start",
+    });
+    backend.loseAfterTermination = true;
+
+    await expect(value.manager.stop({
+      runtimeId: started.runtimeId,
+      waitForRestorationMs: 0,
+      idempotencyKey: "lease-loss-stop",
+    })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+
+    expect(backend.terminateCalls).toHaveLength(1);
+    expect(existsSync(join(value.manager.storageRoot, "stops", `${started.runtimeId}.json`))).toBe(false);
+    await expect(value.manager.status(started.runtimeId)).resolves.toMatchObject({
+      state: "stopping",
+      terminationComplete: false,
+    });
+
+    await expect(value.manager.stop({
+      runtimeId: started.runtimeId,
+      waitForRestorationMs: 0,
+      idempotencyKey: "lease-loss-stop",
+    })).resolves.toMatchObject({
+      state: "exited",
+      terminationComplete: true,
+      observerCleanupPending: false,
+    });
+  });
+
   it("waits for terminal restoration when requested", async () => {
     const value = makeHarness();
     const prepared = await value.prepare();
@@ -486,6 +938,242 @@ describe("OwnedRuntimeManager", () => {
       idempotencyKey: "wait-stop",
     });
     expect(stopped.identityVacant).toBe(true);
+  });
+
+  it("retains the exact observer lease after a pre-signal refusal and recovers with the same key", async () => {
+    const value = makeHarness();
+    const prepared = await value.prepare();
+    const started = await value.manager.start({
+      preparedLaunchId: prepared.id,
+      idempotencyKey: "reservation-cas-start",
+    });
+    value.backend.refuseTermination = true;
+    const release = vi.spyOn(value.gate, "releaseRuntimeStop").mockImplementation(
+      async () => ({ released: true })
+    );
+
+    await expect(value.manager.stop({
+      runtimeId: started.runtimeId,
+      waitForRestorationMs: 0,
+      idempotencyKey: "reservation-cas-stop",
+    })).rejects.toMatchObject({ code: "TERMINATION_REFUSED" });
+    expect(release).not.toHaveBeenCalled();
+    const proofPath = join(
+      value.manager.storageRoot,
+      "restoration-proofs",
+      `${started.runtimeId}.json`
+    );
+    const proof = JSON.parse(readFileSync(proofPath, "utf8"));
+    expect(proof).toMatchObject({
+      kind: "live_stop_reservation",
+      stopIdempotencyHash: createHash("sha256").update("reservation-cas-stop").digest("hex"),
+    });
+    expect(value.backend.processes.has(started.pid)).toBe(true);
+
+    value.backend.refuseTermination = false;
+    await expect(value.manager.stop({
+      runtimeId: started.runtimeId,
+      waitForRestorationMs: 0,
+      idempotencyKey: "reservation-cas-stop",
+    })).resolves.toMatchObject({ termination: "terminated", identityVacant: true });
+    expect(value.gate.completedReservations.at(-1)).toBe(proof.reservationId);
+  });
+
+  it("adopts the same deterministic observer lease after ambiguous proof publication", async () => {
+    const backend = new FakeBackend();
+    const value = makeHarness({ backend });
+    const prepared = await value.prepare();
+    const started = await value.manager.start({
+      preparedLaunchId: prepared.id,
+      idempotencyKey: "ambiguous-proof-start",
+    });
+    const proposals: string[] = [];
+    let incumbent: string | null = null;
+    value.gate.reserveRuntimeStop = vi.fn(async (_sessionId, proposedReservationId) => {
+      proposals.push(proposedReservationId);
+      incumbent ??= proposedReservationId;
+      if (proposals.length === 1) backend.mutexFailures = 2;
+      return {
+        sessionKnown: true,
+        ready: incumbent === proposedReservationId,
+        reserved: incumbent === proposedReservationId,
+        activeJobIds: [],
+        cameraLeaseJobIds: [],
+        restorationPendingJobIds: [],
+        ...(incumbent === proposedReservationId ? { reservationId: incumbent } : {}),
+      };
+    });
+
+    await expect(value.manager.stop({
+      runtimeId: started.runtimeId,
+      waitForRestorationMs: 0,
+      idempotencyKey: "ambiguous-proof-stop",
+    })).rejects.toMatchObject({ code: "STOP_FAILED" });
+    expect(backend.processes.has(started.pid)).toBe(true);
+
+    await expect(value.manager.stop({
+      runtimeId: started.runtimeId,
+      waitForRestorationMs: 0,
+      idempotencyKey: "ambiguous-proof-stop",
+    })).resolves.toMatchObject({ termination: "terminated", identityVacant: true });
+    expect(proposals).toHaveLength(2);
+    expect(new Set(proposals).size).toBe(1);
+    expect(value.gate.completedReservations.at(-1)).toBe(incumbent);
+  });
+
+  it("switches to exact-vacancy completion when the process exits during restoration wait", async () => {
+    const value = makeHarness();
+    const prepared = await value.prepare();
+    const started = await value.manager.start({
+      preparedLaunchId: prepared.id,
+      idempotencyKey: "restoration-exit-start",
+    });
+    const vacancyArguments: boolean[] = [];
+    value.gate.reserveRuntimeStop = vi.fn(async (_sessionId, proposedReservationId, exactRuntimeVacant = false) => {
+      vacancyArguments.push(exactRuntimeVacant);
+      if (!exactRuntimeVacant) {
+        value.backend.processes.delete(started.pid);
+        return {
+          sessionKnown: true,
+          ready: false,
+          reserved: false,
+          activeJobIds: ["job-restoring"],
+          cameraLeaseJobIds: [],
+          restorationPendingJobIds: ["job-restoring"],
+        };
+      }
+      return {
+        sessionKnown: true,
+        ready: true,
+        reserved: true,
+        activeJobIds: [],
+        cameraLeaseJobIds: [],
+        restorationPendingJobIds: [],
+        reservationId: proposedReservationId,
+      };
+    });
+
+    await expect(value.manager.stop({
+      runtimeId: started.runtimeId,
+      waitForRestorationMs: 1_000,
+      idempotencyKey: "restoration-exit-stop",
+    })).resolves.toMatchObject({ termination: "already_exited", identityVacant: true });
+    expect(vacancyArguments).toEqual([false, true]);
+    expect(value.backend.terminateCalls).toEqual([]);
+    expect(value.gate.completedExactVacancies).toEqual([true]);
+  });
+
+  it("does not hold the machine mutex while waiting for restoration readiness", async () => {
+    const backend = new SerialBackend();
+    const value = makeHarness({ backend });
+    const prepared = await value.prepare();
+    const started = await value.manager.start({
+      preparedLaunchId: prepared.id,
+      idempotencyKey: "unlocked-wait-start",
+    });
+    let releasePreflight!: () => void;
+    const preflightRelease = new Promise<void>((resolve) => { releasePreflight = resolve; });
+    let preflightCalled!: () => void;
+    const didCallPreflight = new Promise<void>((resolve) => { preflightCalled = resolve; });
+    value.gate.reserveRuntimeStop = vi.fn(async (_sessionId, proposedReservationId) => {
+      preflightCalled();
+      await preflightRelease;
+      return {
+        sessionKnown: true,
+        ready: true,
+        reserved: true,
+        activeJobIds: [],
+        cameraLeaseJobIds: [],
+        restorationPendingJobIds: [],
+        reservationId: proposedReservationId,
+      };
+    });
+
+    const stopping = value.manager.stop({
+      runtimeId: started.runtimeId,
+      waitForRestorationMs: 1_000,
+      idempotencyKey: "unlocked-wait-stop",
+    });
+    await didCallPreflight;
+    let contenderEntered = false;
+    await expect(Promise.race([
+      backend.withMachineMutex({ action: async () => { contenderEntered = true; } })
+        .then(() => "entered" as const),
+      new Promise<"timed_out">((resolve) => setTimeout(() => resolve("timed_out"), 100)),
+    ])).resolves.toBe("entered");
+    expect(contenderEntered).toBe(true);
+
+    releasePreflight();
+    await expect(stopping).resolves.toMatchObject({ state: "exited", identityVacant: true });
+  });
+
+  it("does not hold the machine mutex while observer stop completion is pending", async () => {
+    const backend = new SerialBackend();
+    const value = makeHarness({ backend });
+    const prepared = await value.prepare();
+    const started = await value.manager.start({
+      preparedLaunchId: prepared.id,
+      idempotencyKey: "unlocked-completion-start",
+    });
+    let acknowledgeCompletion!: () => void;
+    const completionAcknowledgement = new Promise<void>((resolve) => { acknowledgeCompletion = resolve; });
+    let completionCalled!: () => void;
+    const didCallCompletion = new Promise<void>((resolve) => { completionCalled = resolve; });
+    value.gate.completeRuntimeStop = vi.fn(async () => {
+      completionCalled();
+      await completionAcknowledgement;
+      return { completed: true, revoked: true };
+    });
+
+    const stopping = value.manager.stop({
+      runtimeId: started.runtimeId,
+      waitForRestorationMs: 0,
+      idempotencyKey: "unlocked-completion-stop",
+    });
+    await didCallCompletion;
+    expect(existsSync(join(value.manager.storageRoot, "stops", `${started.runtimeId}.json`))).toBe(true);
+    expect(existsSync(join(value.manager.storageRoot, "stop-completions", `${started.runtimeId}.json`))).toBe(false);
+    await expect(Promise.race([
+      backend.withMachineMutex({ action: async () => "entered" as const }),
+      new Promise<"timed_out">((resolve) => setTimeout(() => resolve("timed_out"), 100)),
+    ])).resolves.toBe("entered");
+
+    acknowledgeCompletion();
+    await expect(stopping).resolves.toMatchObject({
+      state: "exited",
+      terminationComplete: true,
+      observerCleanupPending: false,
+    });
+  });
+
+  it("revalidates the durable restoration reservation after reacquiring the mutex", async () => {
+    const backend = new HookedSerialBackend();
+    const value = makeHarness({ backend });
+    const prepared = await value.prepare();
+    const started = await value.manager.start({
+      preparedLaunchId: prepared.id,
+      idempotencyKey: "proof-race-start",
+    });
+    backend.beforeAction = () => {
+      const proofPath = join(
+        value.manager.storageRoot,
+        "restoration-proofs",
+        `${started.runtimeId}.json`
+      );
+      if (!existsSync(proofPath)) return;
+      backend.beforeAction = null;
+      const proof = JSON.parse(readFileSync(proofPath, "utf8"));
+      proof.reservationId = "00000000-0000-4000-8000-999999999999";
+      writeFileSync(proofPath, JSON.stringify(proof));
+    };
+
+    await expect(value.manager.stop({
+      runtimeId: started.runtimeId,
+      waitForRestorationMs: 0,
+      idempotencyKey: "proof-race-stop",
+    })).rejects.toMatchObject({ code: "STORAGE_UNVERIFIABLE" });
+    expect(backend.terminateCalls).toHaveLength(0);
+    expect(backend.processes.has(started.pid)).toBe(true);
   });
 
   it("refuses PID reuse and leaves the replacement process untouched", async () => {
@@ -600,6 +1288,25 @@ describe("OwnedRuntimeManager", () => {
       .rejects.toMatchObject({ code: "ARGUMENT_CONFLICT" });
     expect(readdirSync(join(oversized.manager.storageRoot, "consumed"))).toEqual([]);
     expect(oversized.spawnCalls).toEqual([]);
+
+    const oversizedProfile = makeHarness();
+    const profilePath = "p".repeat(32_769);
+    await expect(oversizedProfile.manager.recordPreparedLaunch({
+      runtimeKind: "listenServer",
+      arguments: ["-window"],
+      profilePath,
+      sessionTtlMs: 60_000,
+      transportPreference: ["rest", "mailbox"],
+      forceUpdate: false,
+    }, {
+      arguments: ["-window"],
+      sessionId: "session-oversized-profile",
+      expiresAt: new Date("2026-07-18T12:01:00.000Z").toISOString(),
+      bundleDigest: "a".repeat(64),
+      profilePath,
+      warnings: [],
+    })).rejects.toMatchObject({ code: "PREPARE_FAILED" });
+    expect(oversizedProfile.spawnCalls).toEqual([]);
   });
 
   it("keeps durable non-success evidence when retained-child cleanup cannot be proved", async () => {
@@ -661,14 +1368,39 @@ describe("OwnedRuntimeManager", () => {
     expect(value.backend.terminateCalls).toHaveLength(1);
     expect(existsSync(join(value.manager.storageRoot, "stops", `${started.runtimeId}.json`))).toBe(true);
     expect(existsSync(join(value.manager.storageRoot, "stop-completions", `${started.runtimeId}.json`))).toBe(false);
+    expect(await value.manager.status(started.runtimeId)).toMatchObject({
+      state: "stopping",
+      exactOwned: true,
+      identityVacant: true,
+      terminationComplete: true,
+      observerCleanupPending: true,
+    });
+
+    // Simulate a legacy/racing tokenless vacancy receipt. The durable proof
+    // remains the completion authority and must converge the observer lease.
+    const proof = JSON.parse(readFileSync(join(
+      value.manager.storageRoot,
+      "restoration-proofs",
+      `${started.runtimeId}.json`
+    ), "utf8"));
+    const stopPath = join(value.manager.storageRoot, "stops", `${started.runtimeId}.json`);
+    const tokenlessStop = JSON.parse(readFileSync(stopPath, "utf8"));
+    delete tokenlessStop.restorationReservationId;
+    writeFileSync(stopPath, JSON.stringify(tokenlessStop));
 
     const replay = await value.manager.stop({
       runtimeId: started.runtimeId,
       waitForRestorationMs: 0,
       idempotencyKey: "proof-stop",
     });
-    expect(replay).toMatchObject({ state: "exited", identityVacant: true });
+    expect(replay).toMatchObject({
+      state: "exited",
+      identityVacant: true,
+      terminationComplete: true,
+      observerCleanupPending: false,
+    });
     expect(value.backend.terminateCalls).toHaveLength(1);
+    expect(value.gate.completedReservations).toEqual([proof.reservationId]);
     const stopped = JSON.parse(readFileSync(join(value.manager.storageRoot, "stops", `${started.runtimeId}.json`), "utf8"));
     expect(stopped).toMatchObject({
       sessionId: started.sessionId,
@@ -690,7 +1422,7 @@ describe("OwnedRuntimeManager", () => {
       runtimeId: started.runtimeId,
       waitForRestorationMs: 0,
       idempotencyKey: "late-error-stop",
-    })).rejects.toMatchObject({ code: "STOP_FAILED" });
+    })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
     expect(existsSync(join(
       value.manager.storageRoot,
       "restoration-proofs",
@@ -698,6 +1430,11 @@ describe("OwnedRuntimeManager", () => {
     ))).toBe(true);
     expect(value.gate.released).toEqual([]);
     expect(existsSync(join(value.manager.storageRoot, "stops", `${started.runtimeId}.json`))).toBe(false);
+    expect(await value.manager.status(started.runtimeId)).toMatchObject({
+      state: "stopping",
+      terminationComplete: false,
+      observerCleanupPending: false,
+    });
   });
 
   it("refuses recovery under a different installation or Windows owner", async () => {
@@ -768,6 +1505,65 @@ describe("OwnedRuntimeManager", () => {
     expect(value.spawnCalls).toEqual([]);
   });
 
+  it("keeps coordinator shutdown unsafe when the runtime receipt directory disappears", async () => {
+    const value = makeHarness();
+    const prepared = await value.prepare();
+    const started = await value.manager.start({
+      preparedLaunchId: prepared.id,
+      idempotencyKey: "missing-inventory-start",
+    });
+    rmSync(join(value.manager.storageRoot, "runtimes"), { recursive: true, force: true });
+
+    await expect(value.manager.close()).resolves.toMatchObject({
+      sealedRuntimeIds: [],
+      busyRuntimeIds: [],
+      errorRuntimes: [expect.objectContaining({
+        runtimeId: "inventory",
+        reason: expect.stringContaining("receipt directory is missing"),
+      })],
+      coordinatorCloseSafe: false,
+    });
+    expect(value.backend.processes.has(started.pid)).toBe(true);
+  });
+
+  it.each(["symbolic link", "directory"] as const)(
+    "keeps coordinator shutdown unsafe for a %s runtime inventory entry",
+    async (entryKind) => {
+      const value = makeHarness();
+      const prepared = await value.prepare();
+      const started = await value.manager.start({
+        preparedLaunchId: prepared.id,
+        idempotencyKey: `non-file-inventory-${entryKind}`,
+      });
+      const receiptPath = join(
+        value.manager.storageRoot,
+        "runtimes",
+        `${started.runtimeId}.json`
+      );
+      rmSync(receiptPath);
+      if (entryKind === "symbolic link") {
+        const target = join(value.root, "replacement-runtime-receipt.json");
+        writeFileSync(target, "{}\n");
+        symlinkSync(target, receiptPath, "file");
+      } else {
+        mkdirSync(receiptPath);
+      }
+      const reserve = vi.spyOn(value.gate, "reserveRuntimeStop");
+
+      await expect(value.manager.close()).resolves.toMatchObject({
+        sealedRuntimeIds: [],
+        busyRuntimeIds: [],
+        errorRuntimes: [expect.objectContaining({
+          runtimeId: started.runtimeId,
+          reason: expect.stringContaining("not a regular file"),
+        })],
+        coordinatorCloseSafe: false,
+      });
+      expect(reserve).not.toHaveBeenCalled();
+      expect(value.backend.processes.has(started.pid)).toBe(true);
+    }
+  );
+
   it("cross-binds runtime filenames and isolates shutdown sealing across corrupt receipts", async () => {
     const value = makeHarness();
     const firstPrepared = await value.prepare(["-first"]);
@@ -784,6 +1580,31 @@ describe("OwnedRuntimeManager", () => {
     });
   });
 
+  it("does not let a cross-bound completion receipt consume live-runtime recovery reserve", async () => {
+    const value = makeHarness();
+    const prepared = await value.prepare();
+    const started = await value.manager.start({
+      preparedLaunchId: prepared.id,
+      idempotencyKey: "completion-binding-start",
+    });
+    expect(value.manager.diagnosticStorageStats().reservedMutationRecords).toBe(5);
+    writeFileSync(join(
+      value.manager.storageRoot,
+      "stop-completions",
+      `${started.runtimeId}.json`
+    ), JSON.stringify({
+      version: 1,
+      runtimeId: "rt-ffffffff-ffff-4fff-8fff-ffffffffffff",
+      sessionId: started.sessionId,
+      preparedLaunchId: started.preparedLaunchId,
+      completedAt: "2026-07-18T12:00:00.000Z",
+      observerCompleted: true,
+      sessionRevoked: true,
+    }));
+
+    expect(value.manager.diagnosticStorageStats().reservedMutationRecords).toBe(5);
+  });
+
   it("seals owned runtime restoration before closing the observer coordinator", async () => {
     const order: string[] = [];
     const result = await closeObserverRuntimeLifecycle({
@@ -791,13 +1612,27 @@ describe("OwnedRuntimeManager", () => {
         order.push("manager:start");
         await Promise.resolve();
         order.push("manager:sealed");
-        return { sealedRuntimeIds: ["rt-fixture"] };
+        return { sealedRuntimeIds: ["rt-fixture"], coordinatorCloseSafe: true };
       },
     }, {
       close: async () => { order.push("coordinator:closed"); },
     });
-    expect(result).toEqual({ sealedRuntimeIds: ["rt-fixture"] });
+    expect(result).toEqual({ sealedRuntimeIds: ["rt-fixture"], coordinatorCloseSafe: true });
     expect(order).toEqual(["manager:start", "manager:sealed", "coordinator:closed"]);
+  });
+
+  it("keeps the observer coordinator alive when shutdown sealing is incomplete", async () => {
+    const coordinatorClose = vi.fn(async () => undefined);
+    await expect(closeObserverRuntimeLifecycle({
+      close: async () => ({
+        sealedRuntimeIds: [],
+        busyRuntimeIds: ["rt-ffffffff-ffff-4fff-8fff-ffffffffffff"],
+        coordinatorCloseSafe: false,
+      }),
+    }, {
+      close: coordinatorClose,
+    })).rejects.toMatchObject({ code: "SHUTDOWN_SEAL_FAILED" });
+    expect(coordinatorClose).not.toHaveBeenCalled();
   });
 
   it("contains no name-based, command-shell, process-tree, or PID-only production termination path", () => {

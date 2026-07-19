@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ADDON_VERSION, OBSERVER_BUILD_IDENTITY, PROTOCOL_VERSION, type InstanceRegistration } from "../../observer/protocol/index.js";
-import { type Clock, SessionStore } from "../../observer/agent/sessions.js";
+import { type Clock, SessionStore, type SessionStoreOptions } from "../../observer/agent/sessions.js";
 
 export const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
 export const observerAddonSource = join(repositoryRoot, "observer", "addon");
@@ -26,8 +26,8 @@ export class FakeClock implements Clock {
   advance(milliseconds: number): void { this.value += milliseconds; }
 }
 
-export function createSessionFixture(root: string, clock = new FakeClock()) {
-  const store = new SessionStore(clock);
+export function createSessionFixture(root: string, clock = new FakeClock(), options: SessionStoreOptions = {}) {
+  const store = new SessionStore(clock, options);
   const profilePath = join(root, "profiles", "run-1");
   mkdirSync(profilePath, { recursive: true });
   const created = store.create({

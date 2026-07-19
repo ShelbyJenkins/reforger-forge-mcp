@@ -1,22 +1,21 @@
 # Observer protocol capabilities
 
-Protocol 1.0 uses capabilities as initialized-behavior claims, not executable labels.
+Generated contract view of `CAPABILITY_REGISTRY` in `registry.ts`. A capability
+is routable only on a backend listed below and only after that backend's
+producer proves initialization. Unknown claims remain diagnostic and are never
+used for routing.
 
-- `render.capture`: the selected backend initialized current-view screenshot
-  output and its readiness checks.
-- `camera.runtime`: camera snapshot, installation, ownership, and exact restoration are available.
-- `camera.editor`: the exact running Workbench process has completed a
-  current-view transaction and proved restoration of its viewport and
-  camera-owner transforms, camera IDs, vertical FOV, and near/far planes.
-- `world.query`: an active world can be identified and epoch-tracked.
-- `entity.resolve`: stable entity resolution is initialized.
-- `authority.server` and `server.coordinate`: authority/coordination facts only; neither implies rendering.
-- `transport.rest` and `transport.mailbox`: the named transport initialized successfully.
+| Capability | Proving backend | Required proof |
+|---|---|---|
+| `render.capture` | runtime, workbench | Initialized native PNG capture with backend readiness checks. |
+| `camera.runtime` | runtime | Runtime camera lease, ownership, and exact restoration transaction. |
+| `camera.editor` | workbench | Per-lifecycle current-view transaction proves exact editor-camera restoration. |
+| `world.query` | runtime | Runtime reports nullable world identity and monotonic world epoch. |
+| `authority.server` | runtime | Runtime replication API proves active server authority. |
+| `transport.rest` | runtime | Runtime REST transport completed initialization. |
+| `transport.mailbox` | runtime | Runtime mailbox transport completed initialization and bounded disposition handling. |
 
-Unknown capabilities are retained in diagnostics and ignored for routing.
-Graphical runtime instances never advertise render/camera claims solely because
-their compile-time gates are enabled; the corresponding subsystem must also be
-initialized. Dedicated/headless instances strip render and camera claims.
-Workbench advertises `render.capture` only when current-view output is ready and
-resets `camera.editor` after every lifecycle generation change until that exact
-process proves a current-view restoration transaction.
+`entity.resolve` and `server.coordinate` are deliberately absent until an
+implementation and conformance test can prove them. Headless runtimes also
+strip render/camera claims; a runtime can never route `camera.editor` merely
+because that capability is globally known for Workbench.

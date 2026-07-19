@@ -13,7 +13,14 @@ import {
   isPathContained,
   type ObserverManagedPaths,
 } from "./paths.js";
-import { SessionStore, type AgentLeaseProbeResult, type Clock, systemClock } from "./sessions.js";
+import {
+  SESSION_TOMBSTONE_RETENTION_MS,
+  SessionStore,
+  type AgentLeaseProbeResult,
+  type Clock,
+  type SessionStoreOptions,
+  systemClock,
+} from "./sessions.js";
 import { StagingManager, verifySourceBundle } from "./staging.js";
 
 const prepareLaunchSchema = z.object({
@@ -52,6 +59,10 @@ export interface ObserverControlOptions {
   clock?: Clock;
   agentInstanceId?: string;
   recoveryProbe?: (contract: SessionContract) => Promise<AgentLeaseProbeResult>;
+  sessionStore?: SessionStoreOptions;
+  preparedReceiptRetentionMs?: number;
+  preparedMaxRecords?: number;
+  preparedMaxEstimatedBytes?: number;
 }
 
 function packageRootFromModule(): string {
@@ -127,16 +138,40 @@ export class ObserverControlApi {
   readonly agentInstanceId: string;
   private endpoint: { host: "127.0.0.1" | "::1"; port: number; instanceId: string } | null = null;
   private readonly recoveryProbe: (contract: SessionContract) => Promise<AgentLeaseProbeResult>;
-  private readonly prepared = new Map<string, { fingerprint: string; result: PreparedLaunch }>();
+  private readonly clock: Clock;
+  private readonly preparedReceiptRetentionMs: number;
+  private readonly preparedMaxRecords: number;
+  private readonly preparedMaxEstimatedBytes: number;
+  private readonly prepared = new Map<string, {
+    fingerprint: string;
+    result: PreparedLaunch;
+    retainUntil: number;
+  }>();
 
   constructor(options: ObserverControlOptions = {}) {
     this.paths = createObserverPaths(options.root);
+    this.clock = options.clock ?? systemClock;
+    this.preparedReceiptRetentionMs = this.boundedStoreOption(
+      options.preparedReceiptRetentionMs,
+      SESSION_TOMBSTONE_RETENTION_MS,
+      0,
+      24 * 60 * 60_000,
+      "Prepared launch receipt retention"
+    );
+    this.preparedMaxRecords = this.boundedStoreOption(options.preparedMaxRecords, 1_024, 1, 100_000, "Prepared launch record limit");
+    this.preparedMaxEstimatedBytes = this.boundedStoreOption(
+      options.preparedMaxEstimatedBytes,
+      32 * 1024 * 1024,
+      1_024,
+      1024 * 1024 * 1024,
+      "Prepared launch store byte limit"
+    );
     this.agentInstanceId = options.agentInstanceId ?? `agent-${randomBytes(16).toString("hex")}`;
     this.recoveryProbe = options.recoveryProbe ?? probeAgentLease;
     this.profileRoot = ensureCanonicalDirectory(options.profileRoot ?? this.paths.profiles);
     const packageRoot = options.sourceDirectory ? null : packageRootFromModule();
     const source = options.sourceDirectory ?? join(packageRoot!, "observer", "addon");
-    this.sessions = new SessionStore(options.clock ?? systemClock);
+    this.sessions = new SessionStore(this.clock, options.sessionStore);
     this.staging = new StagingManager(this.paths.root, source);
   }
 
@@ -170,6 +205,7 @@ export class ObserverControlApi {
   async prepareLaunch(input: PrepareLaunchRequest): Promise<PreparedLaunch> {
     if (!this.endpoint) throw new ObserverError("TRANSPORT_UNAVAILABLE", "Observer agent endpoint is not listening", 503);
     const request = prepareLaunchSchema.parse(input);
+    this.sweepPrepared(this.clock.now());
     const fingerprint = createHash("sha256").update(JSON.stringify(request)).digest("hex");
     if (request.idempotencyKey) {
       const existing = this.prepared.get(request.idempotencyKey);
@@ -177,6 +213,7 @@ export class ObserverControlApi {
         if (existing.fingerprint !== fingerprint) throw new ObserverError("ARGUMENT_CONFLICT", "Launch idempotency key was reused with different input", 409);
         return existing.result;
       }
+      this.assertPreparedCapacity(Buffer.byteLength(JSON.stringify(request), "utf8") + 4_096);
     }
 
     const staged = this.staging.ensureStaged();
@@ -216,8 +253,49 @@ export class ObserverControlApi {
         reused: staged.reused,
       },
     };
-    if (request.idempotencyKey) this.prepared.set(request.idempotencyKey, { fingerprint, result });
+    if (request.idempotencyKey) {
+      const entry = {
+        fingerprint,
+        result,
+        retainUntil: Date.parse(created.contract.expiresAt) + this.preparedReceiptRetentionMs,
+      };
+      try {
+        this.assertPreparedCapacity(this.preparedEntryBytes(entry));
+      } catch (error) {
+        this.sessions.revoke(created.record.sessionId);
+        throw error;
+      }
+      this.prepared.set(request.idempotencyKey, entry);
+    }
     return result;
+  }
+
+  sweepPrepared(now = this.clock.now(), pinnedSessionIds: ReadonlySet<string> = new Set()): string[] {
+    const removed: string[] = [];
+    for (const [key, entry] of this.prepared) {
+      if (entry.retainUntil > now || pinnedSessionIds.has(entry.result.session.sessionId) || this.sessions.isPinned(entry.result.session.sessionId)) {
+        continue;
+      }
+      this.prepared.delete(key);
+      removed.push(key);
+    }
+    return removed;
+  }
+
+  preparedStats(): Record<string, number> {
+    return {
+      records: this.prepared.size,
+      estimatedBytes: [...this.prepared.values()].reduce((total, entry) => total + this.preparedEntryBytes(entry), 0),
+      maxRecords: this.preparedMaxRecords,
+      maxEstimatedBytes: this.preparedMaxEstimatedBytes,
+      receiptRetentionMs: this.preparedReceiptRetentionMs,
+    };
+  }
+
+  preparedSessionIds(now = this.clock.now()): Set<string> {
+    return new Set([...this.prepared.values()]
+      .filter((entry) => entry.retainUntil > now)
+      .map((entry) => entry.result.session.sessionId));
   }
 
   revokeSession(sessionId: string): boolean {
@@ -242,11 +320,31 @@ export class ObserverControlApi {
       profileRoot: this.profileRoot,
       sourceManifest,
       sessions: this.sessions.diagnostics(),
+      preparedStore: this.preparedStats(),
       promises: {
         launchesProcesses: false,
         signalsProcesses: false,
         mutatesWorkbenchHandlers: false,
       },
     };
+  }
+
+  private assertPreparedCapacity(incomingBytes: number): void {
+    const estimatedBytes = [...this.prepared.values()].reduce((total, entry) => total + this.preparedEntryBytes(entry), 0);
+    if (this.prepared.size >= this.preparedMaxRecords || estimatedBytes + incomingBytes > this.preparedMaxEstimatedBytes) {
+      throw new ObserverError("TRANSPORT_UNAVAILABLE", "Prepared launch receipt store retention budget is exhausted", 503);
+    }
+  }
+
+  private preparedEntryBytes(entry: { fingerprint: string; result: PreparedLaunch; retainUntil: number }): number {
+    return Buffer.byteLength(JSON.stringify(entry), "utf8");
+  }
+
+  private boundedStoreOption(value: number | undefined, fallback: number, minimum: number, maximum: number, label: string): number {
+    const selected = value ?? fallback;
+    if (!Number.isSafeInteger(selected) || selected < minimum || selected > maximum) {
+      throw new ObserverError("INVALID_REQUEST", `${label} must be an integer from ${minimum} through ${maximum}`);
+    }
+    return selected;
   }
 }

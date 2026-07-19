@@ -135,7 +135,7 @@ export class FakeLifecycleBackend implements WorkbenchLifecycleBackend {
     if (this.workbenchPids.size === 0) return { kind: "vacant" };
     const listenerPid = [...this.workbenchPids][0];
     return {
-      kind: "refused",
+      kind: "occupied",
       listenerPid,
       message: `Fake endpoint is still owned by PID ${listenerPid}.`,
     };

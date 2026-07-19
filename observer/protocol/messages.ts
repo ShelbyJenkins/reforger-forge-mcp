@@ -10,6 +10,7 @@ import {
   runtimeCommandEnvelopeSchema,
   sessionContractSchema,
 } from "./schemas.js";
+import type { ObserverErrorCode } from "./registry.js";
 
 export type ObserverLimits = z.infer<typeof limitsSchema>;
 export type SessionContract = z.infer<typeof sessionContractSchema>;
@@ -25,7 +26,7 @@ export type ArtifactManifest = z.infer<typeof artifactManifestSchema>;
 export interface ProtocolErrorBody {
   protocolVersion: "1.0";
   error: {
-    code: string;
+    code: ObserverErrorCode;
     message: string;
   };
 }

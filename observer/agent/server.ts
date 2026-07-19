@@ -10,7 +10,7 @@ import { ObserverControlApi } from "./control-api.js";
 import { asObserverError, errorBody, ObserverError } from "./errors.js";
 import { JobStore } from "./jobs.js";
 import { observerLogger } from "./logger.js";
-import { MailboxCoordinator } from "./mailbox-coordinator.js";
+import { MailboxCoordinator, type MailboxCoordinatorOptions, type MailboxSweepResult } from "./mailbox-coordinator.js";
 import { InstanceRegistry } from "./registry.js";
 import { ObserverRuntimeApi } from "./runtime-api.js";
 import { ObserverRunStore } from "./runs.js";
@@ -23,6 +23,19 @@ export interface ObserverAgentServerOptions {
   retentionIntervalMs?: number;
   retentionMaxAgeMs?: number;
   retentionMaxBytes?: number;
+  sweepIntervalMs?: number;
+  mailbox?: MailboxCoordinatorOptions;
+}
+
+export interface ObserverApplicationSweepResult {
+  at: string;
+  expiredJobIds: string[];
+  jobs: ReturnType<JobStore["sweep"]>;
+  sessions: ReturnType<ObserverControlApi["sessions"]["sweep"]>;
+  instances: ReturnType<InstanceRegistry["sweep"]>;
+  mailbox: MailboxSweepResult;
+  removedPreparedReceiptKeys: string[];
+  retentionApplied: boolean;
 }
 
 export interface StartupDescriptor {
@@ -102,8 +115,10 @@ export class ObserverAgentServer {
   private readonly runtime: ObserverRuntimeApi;
   private readonly mailbox: MailboxCoordinator;
   private sweepTimer: NodeJS.Timeout | null = null;
-  private mailboxPollActive = false;
+  private mailboxPollPromise: Promise<void> | null = null;
+  private closePromise: Promise<void> | null = null;
   private lastRetentionAt = 0;
+  private lastSweep: ObserverApplicationSweepResult | null = null;
 
   constructor(
     readonly agentInstanceId: string,
@@ -115,11 +130,13 @@ export class ObserverAgentServer {
     private readonly options: ObserverAgentServerOptions = {}
   ) {
     this.runtime = new ObserverRuntimeApi(control.sessions, registry, jobs, artifacts);
-    this.mailbox = new MailboxCoordinator(control.sessions, registry, jobs, artifacts);
+    this.mailbox = new MailboxCoordinator(control.sessions, registry, jobs, artifacts, options.mailbox);
   }
 
   async start(): Promise<StartupDescriptor> {
     if (this.server) return this.descriptor!;
+    if (this.closePromise) await this.closePromise;
+    this.closePromise = null;
     const host = this.options.host ?? "127.0.0.1";
     if (host !== "127.0.0.1" && host !== "::1") throw new ObserverError("INVALID_REQUEST", "Observer agent may bind only to a loopback address");
     const port = this.options.port ?? 0;
@@ -160,39 +177,87 @@ export class ObserverAgentServer {
       controlHttpEnabled: this.options.enableControlHttp ?? false,
       ...(this.options.enableControlHttp ? { controlToken: this.control.controlToken } : {}),
     };
+    const sweepIntervalMs = this.boundedOption(this.options.sweepIntervalMs, 1_000, 100, 60_000, "Observer sweep interval");
     this.sweepTimer = setInterval(() => {
-      this.control.sessions.sweepExpired();
-      this.jobs.sweepDeadlines();
-      const now = Date.now();
-      const retentionIntervalMs = this.options.retentionIntervalMs ?? 60_000;
-      if (now - this.lastRetentionAt >= retentionIntervalMs) {
-        this.lastRetentionAt = now;
-        try {
-          const maxAgeMs = this.options.retentionMaxAgeMs ?? 7 * 24 * 60 * 60 * 1_000;
-          const maxBytes = this.options.retentionMaxBytes ?? 512 * 1024 * 1024;
-          this.runs.applyRetention(maxAgeMs);
-          const auxiliaryBytes = this.sweepAuxiliaryStorage(maxAgeMs, maxBytes) +
-            this.directoryUsage(this.control.paths.runs).bytes;
-          this.artifacts.applyRetention(
-            maxAgeMs,
-            Math.max(0, maxBytes - auxiliaryBytes),
-            this.runs.protectedStoreKeys()
-          );
-        } catch (error) {
-          observerLogger.warn("artifact retention sweep failed", {
-            errorCode: error instanceof ObserverError ? error.code : "INTERNAL_ERROR",
-          });
-        }
+      try {
+        this.sweep(Date.now());
+      } catch (error) {
+        observerLogger.warn("observer application sweep failed", {
+          errorCode: error instanceof ObserverError ? error.code : "INTERNAL_ERROR",
+        });
       }
-      if (!this.mailboxPollActive) {
-        this.mailboxPollActive = true;
-        void this.mailbox.pollOnce()
-          .catch((error) => observerLogger.warn("mailbox poll failed", { errorCode: error instanceof ObserverError ? error.code : "INTERNAL_ERROR" }))
-          .finally(() => { this.mailboxPollActive = false; });
-      }
-    }, 1_000);
+      this.scheduleMailboxPoll();
+    }, sweepIntervalMs);
     this.sweepTimer.unref();
     return this.descriptor;
+  }
+
+  sweep(now = Date.now(), forceRetention = false): ObserverApplicationSweepResult {
+    const expiredJobIds = this.jobs.sweepDeadlines(now);
+    const protectedJobIds = this.runs.protectedRuntimeJobIds();
+    const jobs = this.jobs.sweep(now, { pinnedJobIds: protectedJobIds });
+    const authoritativeObligationJobIds = this.jobs.obligationJobIds(protectedJobIds);
+    const obligationSessionIds = this.obligationSessionIds(protectedJobIds, authoritativeObligationJobIds);
+
+    // First mark expiry while every extant child store still pins its owner.
+    // Then remove only obligation-free instances/transports and make a second
+    // pass that can retire the now-unowned session tombstone.
+    const firstPassPins = new Set([
+      ...obligationSessionIds,
+      ...this.control.preparedSessionIds(now),
+      ...this.registry.sessionIds(),
+      ...this.mailbox.sessionIds(),
+    ]);
+    const firstSessions = this.control.sessions.sweep(now, firstPassPins);
+    const instances = this.registry.sweep(now, obligationSessionIds, authoritativeObligationJobIds);
+    const mailbox = this.mailbox.sweep(now, obligationSessionIds);
+    const finalPins = new Set([
+      ...this.obligationSessionIds(protectedJobIds, authoritativeObligationJobIds),
+      ...this.control.preparedSessionIds(now),
+      ...this.registry.sessionIds(),
+      ...this.mailbox.sessionIds(),
+    ]);
+    const finalSessions = this.control.sessions.sweep(now, finalPins);
+    const removedPreparedReceiptKeys = this.control.sweepPrepared(now, finalPins);
+
+    const retentionIntervalMs = this.boundedOption(
+      this.options.retentionIntervalMs,
+      60_000,
+      1_000,
+      24 * 60 * 60_000,
+      "Observer retention interval"
+    );
+    const retentionApplied = forceRetention || now - this.lastRetentionAt >= retentionIntervalMs;
+    if (retentionApplied) {
+      this.lastRetentionAt = now;
+      this.applyDiskRetention(now, finalPins);
+    }
+    const result: ObserverApplicationSweepResult = {
+      at: new Date(now).toISOString(),
+      expiredJobIds,
+      jobs,
+      sessions: {
+        expiredSessionIds: [...new Set([...firstSessions.expiredSessionIds, ...finalSessions.expiredSessionIds])],
+        removedSessionIds: [...new Set([...firstSessions.removedSessionIds, ...finalSessions.removedSessionIds])],
+      },
+      instances,
+      mailbox,
+      removedPreparedReceiptKeys,
+      retentionApplied,
+    };
+    this.lastSweep = result;
+    return result;
+  }
+
+  storeDiagnostics(): Record<string, unknown> {
+    return {
+      sessions: this.control.sessions.stats(),
+      instances: this.registry.stats(),
+      jobs: this.jobs.stats(),
+      mailbox: this.mailbox.stats(),
+      preparedLaunches: this.control.preparedStats(),
+      lastSweep: this.lastSweep,
+    };
   }
 
   managedStorageDiagnostics(): Record<string, unknown> {
@@ -203,7 +268,63 @@ export class ObserverAgentServer {
       exportWork: this.directoryUsage(this.control.paths.exportWork),
       logs: this.directoryUsage(this.control.paths.logs),
       runStore: this.runs.diagnostics(),
+      stores: this.storeDiagnostics(),
     };
+  }
+
+  private scheduleMailboxPoll(): void {
+    if (this.mailboxPollPromise) return;
+    this.mailboxPollPromise = this.mailbox.pollOnce()
+      .catch((error) => observerLogger.warn("mailbox poll failed", {
+        errorCode: error instanceof ObserverError ? error.code : "INTERNAL_ERROR",
+      }))
+      .finally(() => { this.mailboxPollPromise = null; });
+  }
+
+  private obligationSessionIds(
+    protectedJobIds: ReadonlySet<string>,
+    authoritativeObligationJobIds = this.jobs.obligationJobIds(protectedJobIds)
+  ): Set<string> {
+    const result = this.jobs.sessionPins(protectedJobIds);
+    for (const sessionId of this.runs.protectedSessionIds()) result.add(sessionId);
+    for (const job of this.jobs.diagnostics()) {
+      const lease = job.cameraLease && typeof job.cameraLease === "object"
+        ? job.cameraLease as Record<string, unknown>
+        : null;
+      if (typeof job.sessionId === "string" && lease?.everHeld === true &&
+          lease.restorationConfirmed !== true &&
+          lease.vacancyDisposition !== "exact_runtime_vacant") {
+        result.add(job.sessionId);
+      }
+    }
+    for (const instance of this.registry.diagnostics()) {
+      const reportedJobIds = [instance.activeJobId, instance.cameraLeaseJobId]
+        .filter((jobId): jobId is string => typeof jobId === "string");
+      if (typeof instance.sessionId === "string" &&
+          reportedJobIds.some((jobId) => authoritativeObligationJobIds.has(jobId))) {
+        result.add(instance.sessionId);
+      }
+    }
+    return result;
+  }
+
+  private applyDiskRetention(now: number, protectedSessionIds: ReadonlySet<string>): void {
+    try {
+      const maxAgeMs = this.options.retentionMaxAgeMs ?? 7 * 24 * 60 * 60 * 1_000;
+      const maxBytes = this.options.retentionMaxBytes ?? 512 * 1024 * 1024;
+      this.runs.applyRetention(maxAgeMs);
+      const auxiliaryBytes = this.sweepAuxiliaryStorage(maxAgeMs, maxBytes, now, protectedSessionIds) +
+        this.directoryUsage(this.control.paths.runs).bytes;
+      this.artifacts.applyRetention(
+        maxAgeMs,
+        Math.max(0, maxBytes - auxiliaryBytes),
+        this.runs.protectedStoreKeys()
+      );
+    } catch (error) {
+      observerLogger.warn("artifact retention sweep failed", {
+        errorCode: error instanceof ObserverError ? error.code : "INTERNAL_ERROR",
+      });
+    }
   }
 
   private directoryUsage(root: string): { bytes: number; files: number; directories: number } {
@@ -226,8 +347,15 @@ export class ObserverAgentServer {
     return result;
   }
 
-  private sweepAuxiliaryStorage(maxAgeMs: number, maxBytes: number): number {
-    const activeProfiles = new Set(this.control.sessions.activeRecords().map((record) =>
+  private sweepAuxiliaryStorage(
+    maxAgeMs: number,
+    maxBytes: number,
+    now: number,
+    protectedSessionIds: ReadonlySet<string>
+  ): number {
+    const protectedProfiles = new Set(this.control.sessions.diagnostics().filter((record) =>
+      record.revokedAt === null || protectedSessionIds.has(record.sessionId) || this.control.sessions.isPinned(record.sessionId)
+    ).map((record) =>
       process.platform === "win32" ? record.profilePath.toLowerCase() : record.profilePath
     ));
     const candidates: Array<{ path: string; bytes: number; mtimeMs: number; protected: boolean }> = [];
@@ -247,13 +375,12 @@ export class ObserverAgentServer {
           path,
           bytes: info.isDirectory() ? this.directoryUsage(path).bytes : info.size,
           mtimeMs: info.mtimeMs,
-          protected: protectProfiles && [...activeProfiles].some((active) => active === key || active.startsWith(`${key}${sep}`)),
+          protected: protectProfiles && [...protectedProfiles].some((active) => active === key || active.startsWith(`${key}${sep}`)),
         });
       }
     }
     candidates.sort((left, right) => left.mtimeMs - right.mtimeMs);
     let total = candidates.reduce((sum, item) => sum + item.bytes, 0);
-    const now = Date.now();
     for (const item of candidates) {
       if (item.protected) continue;
       if (now - item.mtimeMs <= maxAgeMs && total <= maxBytes) continue;
@@ -265,14 +392,37 @@ export class ObserverAgentServer {
   }
 
   async close(): Promise<void> {
+    if (this.closePromise) return this.closePromise;
+    this.closePromise = this.closeInternal();
+    return this.closePromise;
+  }
+
+  private async closeInternal(): Promise<void> {
     if (this.sweepTimer) clearInterval(this.sweepTimer);
     this.sweepTimer = null;
+    const pendingMailboxPoll = this.mailboxPollPromise;
+    if (pendingMailboxPoll) await pendingMailboxPoll;
+    try {
+      this.sweep(Date.now(), true);
+    } catch (error) {
+      observerLogger.warn("observer shutdown sweep failed", {
+        errorCode: error instanceof ObserverError ? error.code : "INTERNAL_ERROR",
+      });
+    }
     const server = this.server;
     this.server = null;
     this.descriptor = null;
     this.control.clearEndpoint();
     if (!server) return;
     await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  }
+
+  private boundedOption(value: number | undefined, fallback: number, minimum: number, maximum: number, label: string): number {
+    const selected = value ?? fallback;
+    if (!Number.isSafeInteger(selected) || selected < minimum || selected > maximum) {
+      throw new ObserverError("INVALID_REQUEST", `${label} must be an integer from ${minimum} through ${maximum}`);
+    }
+    return selected;
   }
 
   private async handle(request: IncomingMessage, response: ServerResponse, maxBodyBytes: number): Promise<void> {
@@ -321,7 +471,12 @@ export class ObserverAgentServer {
     const token = bearer(request);
     if (!token || !constantTimeToken(token, this.control.controlToken)) throw new ObserverError("UNAUTHORIZED", "Control credential is invalid", 401);
     if (request.method === "GET" && url.pathname === "/v1/control/status") {
-      json(response, 200, { ...this.control.diagnostics(), instances: this.registry.diagnostics(), jobs: this.jobs.diagnostics() });
+      json(response, 200, {
+        ...this.control.diagnostics(),
+        instances: this.registry.diagnostics(),
+        jobs: this.jobs.diagnostics(),
+        stores: this.storeDiagnostics(),
+      });
       return;
     }
     if (request.method === "GET" && url.pathname === "/v1/control/instances") {

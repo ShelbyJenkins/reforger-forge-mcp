@@ -178,6 +178,7 @@ function runnerDependencies(
     logAttributionTimeoutMs: 50,
     logPollMs: 1,
     terminationTimeoutMs: 5,
+    recoveryTimeoutMs: 50,
     ...overrides,
   };
 }
@@ -326,7 +327,7 @@ describe("standalone Workbench lifecycle runner", () => {
     });
   });
 
-  it("holds the shared machine mutex until the foreground child exits", async () => {
+  it("releases the machine mutex during foreground lifetime while durable state stays busy", async () => {
     const harness = createHarness();
     let child!: FakeRunnerChild;
     let ownerArgument = "";
@@ -349,10 +350,15 @@ describe("standalone Workbench lifecycle runner", () => {
     }));
     await didSpawn;
 
-    const busyState = await harness.guard.readLifecycleState();
+    let busyState = await harness.guard.readLifecycleState();
+    while (busyState.kind !== "valid" || busyState.state.phase !== "running") {
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 1));
+      busyState = await harness.guard.readLifecycleState();
+    }
     expect(busyState.kind).toBe("valid");
     if (busyState.kind !== "valid") throw new Error("runner did not record lifecycle state");
-    expect(["starting", "running"]).toContain(busyState.state.phase);
+    expect(busyState.state.phase).toBe("running");
+    expect(busyState.state.workbench?.pid).toBe(child.pid);
     expect(busyState.state.target?.path).toBe(harness.projectPath);
     expect(busyState.state.companion?.buildIdentity).toBe(WORKBENCH_HELPER_BUILD_IDENTITY);
     expect(busyState.state.mcpOwner).not.toBeNull();
@@ -360,18 +366,132 @@ describe("standalone Workbench lifecycle runner", () => {
     let contenderEntered = false;
     const contender = harness.guard.withLifecycleLock(async () => {
       contenderEntered = true;
+      return harness.guard.readLifecycleState();
     });
-    await new Promise((resolvePromise) => setTimeout(resolvePromise, 10));
-    expect(contenderEntered).toBe(false);
+    const observedByContender = await contender;
+    expect(contenderEntered).toBe(true);
+    expect(observedByContender).toMatchObject({
+      kind: "valid",
+      state: { phase: "running", workbench: { pid: child.pid } },
+    });
 
     addAttributedLog(harness.logRoot, "guarded-editor", ownerArgument);
     harness.backend.processes.delete(child.pid);
     harness.backend.workbenchPids.delete(child.pid);
     child.close(0);
     await run;
-    await contender;
-    expect(contenderEntered).toBe(true);
     expect(harness.backend.maxConcurrent).toBe(1);
+  });
+
+  it("releases the machine mutex during readiness after publishing exact starting ownership", async () => {
+    const harness = createHarness();
+    let child!: FakeRunnerChild;
+    let ownerArgument = "";
+    let readinessEntered!: () => void;
+    let releaseReadiness!: () => void;
+    const didEnterReadiness = new Promise<void>((resolve) => { readinessEntered = resolve; });
+    const readinessRelease = new Promise<void>((resolve) => { releaseReadiness = resolve; });
+    const originalVerify = harness.backend.verifyEndpointOwner.bind(harness.backend);
+    harness.backend.verifyEndpointOwner = vi.fn(async (endpoint, expected) => {
+      readinessEntered();
+      await readinessRelease;
+      return originalVerify(endpoint, expected);
+    });
+
+    const run = runWorkbenchIntent(harness.config, {
+      kind: "editor",
+      gprojPath: harness.projectPath,
+      foreground: true,
+    }, runnerDependencies(harness, (command, args) => {
+      child = new FakeRunnerChild(21_102);
+      ownerArgument = args.find((arg) => arg.startsWith("-reforgerForgeOwnerToken="))!;
+      harness.backend.addWorkbench({
+        pid: child.pid,
+        executablePath: command,
+        creationTime: "133900000000021102",
+      }, ownerArgument);
+      return child as unknown as ChildProcess;
+    }));
+
+    await didEnterReadiness;
+    const observedByContender = await harness.guard.withLifecycleLock(() =>
+      harness.guard.readLifecycleState()
+    );
+    expect(observedByContender).toMatchObject({
+      kind: "valid",
+      state: {
+        phase: "starting",
+        workbench: { pid: child.pid, creationTime: "133900000000021102" },
+        operation: { kind: "launch" },
+      },
+    });
+
+    releaseReadiness();
+    for (;;) {
+      const state = await harness.guard.readLifecycleState();
+      if (state.kind === "valid" && state.state.phase === "running") break;
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 1));
+    }
+    addAttributedLog(harness.logRoot, "readiness-editor", ownerArgument);
+    harness.backend.processes.delete(child.pid);
+    harness.backend.workbenchPids.delete(child.pid);
+    child.close(0);
+    await expect(run).resolves.toMatchObject({ pid: child.pid, intent: "editor" });
+  });
+
+  it("refuses a stale post-lifetime commit after lifecycle generation changes", async () => {
+    const harness = createHarness();
+    let child!: FakeRunnerChild;
+    const run = runWorkbenchIntent(harness.config, {
+      kind: "editor",
+      gprojPath: harness.projectPath,
+      foreground: true,
+    }, runnerDependencies(harness, (command, args) => {
+      child = new FakeRunnerChild(21_202);
+      const ownerArgument = args.find((arg) => arg.startsWith("-reforgerForgeOwnerToken="))!;
+      harness.backend.addWorkbench({
+        pid: child.pid,
+        executablePath: command,
+        creationTime: "133900000000021202",
+      }, ownerArgument);
+      return child as unknown as ChildProcess;
+    }));
+
+    const runningState = await (async () => {
+      for (;;) {
+        const read = await harness.guard.readLifecycleState();
+        if (read.kind === "valid" && read.state.phase === "running") return read.state;
+        await new Promise((resolvePromise) => setTimeout(resolvePromise, 1));
+      }
+    })();
+    const interfered = await harness.guard.withLifecycleLock(async (session) =>
+      session.transition({
+        generation: runningState.generation,
+        leaseId: runningState.mcpOwner?.leaseId ?? null,
+      }, {
+        phase: "stopping",
+        endpoint: runningState.endpoint,
+        target: runningState.target,
+        mcpOwner: runningState.mcpOwner,
+        workbench: runningState.workbench,
+        companion: runningState.companion,
+        operation: { kind: "recovery", operationId: "interfering-recovery" },
+      })
+    );
+
+    harness.backend.processes.delete(child.pid);
+    harness.backend.workbenchPids.delete(child.pid);
+    child.close(0);
+    await expect(run).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    expect(await harness.guard.readLifecycleState()).toMatchObject({
+      kind: "valid",
+      state: {
+        generation: interfered.generation,
+        phase: "stopping",
+        workbench: { pid: child.pid },
+        operation: { kind: "recovery", operationId: "interfering-recovery" },
+      },
+    });
   });
 
   it("terminates only the exact build child when its bounded timeout expires", async () => {
@@ -599,7 +719,7 @@ describe("standalone Workbench lifecycle runner", () => {
   it("refuses an occupied companion endpoint after preflight absence and never spawns the build", async () => {
     const harness = createHarness();
     harness.backend.endpointVacancyResult = {
-      kind: "refused",
+      kind: "occupied",
       listenerPid: 42_424,
       message: "another listener remains",
     };
@@ -628,7 +748,7 @@ describe("standalone Workbench lifecycle runner", () => {
       if (vacancyIndex++ === 0) return originalVacancy(endpoint);
       harness.backend.endpointVacancyCalls.push(endpoint);
       return {
-        kind: "refused" as const,
+        kind: "occupied" as const,
         listenerPid: 42_425,
         message: "listener appeared after target exit",
       };
@@ -661,7 +781,7 @@ describe("standalone Workbench lifecycle runner", () => {
     const harness = createHarness();
     const spawner = createBuildSpawner(harness, { pidBase: 22_110 });
     harness.backend.replaceFailure = ({ next }) => {
-      if (next.phase === "vacant" && spawner.spawnCount() === 1) {
+      if (next.phase === "starting" && next.workbench === null && spawner.spawnCount() === 1) {
         writeFileSync(harness.projectPath, [
           "GameProject {",
           " ID MutatedMod",
@@ -692,7 +812,7 @@ describe("standalone Workbench lifecycle runner", () => {
     let currentSourceDigest = harness.companion.bundleDigest;
     harness.companionProvider.verifySourceDigest = vi.fn(() => currentSourceDigest);
     harness.backend.replaceFailure = ({ next }) => {
-      if (next.phase === "vacant" && spawner.spawnCount() === 1) {
+      if (next.phase === "starting" && next.workbench === null && spawner.spawnCount() === 1) {
         currentSourceDigest = "b".repeat(64);
       }
       return null;
@@ -792,6 +912,118 @@ describe("standalone Workbench lifecycle runner", () => {
       code: "OUTPUT_ATTESTATION_FAILED",
     });
     expect(spawnProcess).not.toHaveBeenCalled();
+  });
+
+  it("rejects build output that overlaps the target mod or managed companion roots", async () => {
+    const targetHarness = createHarness();
+    const targetOutput = join(targetHarness.root, "addons", "ExampleMod", "build-output");
+    await expect(runWorkbenchIntent(targetHarness.config, {
+      kind: "build",
+      gprojPath: targetHarness.projectPath,
+      platform: "PC",
+      outputPath: targetOutput,
+      timeoutMs: 1_000,
+    }, runnerDependencies(targetHarness, vi.fn()))).rejects.toMatchObject({ code: "INVALID_INTENT" });
+
+    const managedHarness = createHarness();
+    const managedOutput = join(managedHarness.companion.workbenchProfilePath, "build-output");
+    await expect(runWorkbenchIntent(managedHarness.config, {
+      kind: "build",
+      gprojPath: managedHarness.projectPath,
+      platform: "PC",
+      outputPath: managedOutput,
+      timeoutMs: 1_000,
+    }, runnerDependencies(managedHarness, vi.fn()))).rejects.toMatchObject({ code: "INVALID_INTENT" });
+  });
+
+  it("rejects a filesystem alias whose canonical output overlaps the target mod", async () => {
+    const harness = createHarness();
+    const outputAlias = join(harness.root, "aliased-build-output");
+    symlinkSync(join(harness.root, "addons", "ExampleMod"), outputAlias, "junction");
+
+    await expect(runWorkbenchIntent(harness.config, {
+      kind: "build",
+      gprojPath: harness.projectPath,
+      platform: "PC",
+      outputPath: outputAlias,
+      timeoutMs: 1_000,
+    }, runnerDependencies(harness, vi.fn()))).rejects.toMatchObject({ code: "INVALID_INTENT" });
+  });
+
+  it("revalidates output after lifecycle reservation and before companion preflight spawn", async () => {
+    const harness = createHarness();
+    const replaceState = harness.backend.replaceState.bind(harness.backend);
+    vi.spyOn(harness.backend, "replaceState").mockImplementation(async (args) => {
+      await replaceState(args);
+      if (args.next.phase === "starting" && args.next.workbench === null) {
+        writeFileSync(join(harness.outputPath, "raced-after-reservation.txt"), "occupied");
+      }
+    });
+    const spawnProcess = vi.fn();
+
+    await expect(runWorkbenchIntent(harness.config, {
+      kind: "build",
+      gprojPath: harness.projectPath,
+      platform: "PC",
+      outputPath: harness.outputPath,
+      timeoutMs: 1_000,
+    }, runnerDependencies(harness, spawnProcess))).rejects.toMatchObject({
+      code: "OUTPUT_ATTESTATION_FAILED",
+    });
+
+    expect(spawnProcess).not.toHaveBeenCalled();
+    expect(await harness.guard.readLifecycleState()).toMatchObject({
+      kind: "valid",
+      state: { phase: "vacant", workbench: null, operation: null },
+    });
+  });
+
+  it("reserves a shared empty output immediately after the mutex and blocks loser preflight", async () => {
+    const harness = createHarness();
+    let spawnCount = 0;
+    let releaseBuild!: () => void;
+    const buildRelease = new Promise<void>((resolve) => { releaseBuild = resolve; });
+    let targetSpawned!: () => void;
+    const targetDidSpawn = new Promise<void>((resolve) => { targetSpawned = resolve; });
+    const spawnProcess: NonNullable<WorkbenchRunnerDependencies["spawnProcess"]> =
+      (command, args) => {
+        const index = spawnCount++;
+        const child = new FakeRunnerChild(23_000 + index);
+        const ownerArgument = args.find((arg) => arg.startsWith("-reforgerForgeOwnerToken="))!;
+        harness.backend.addWorkbench({
+          pid: child.pid,
+          executablePath: command,
+          creationTime: `1339000000000${String(child.pid).padStart(5, "0")}`,
+        }, ownerArgument);
+        addAttributedLog(harness.logRoot, `reservation-${index}`, ownerArgument);
+        if (index === 1) {
+          targetSpawned();
+          void buildRelease.then(() => {
+            const artifactRoot = join(harness.outputPath, "ExampleMod");
+            mkdirSync(artifactRoot, { recursive: true });
+            writeFileSync(join(artifactRoot, "resourceDatabase.rdb"), "reserved output");
+            harness.backend.processes.delete(child.pid);
+            harness.backend.workbenchPids.delete(child.pid);
+            child.close(0);
+          });
+        }
+        return child as unknown as ChildProcess;
+      };
+    const intent = {
+      kind: "build" as const,
+      gprojPath: harness.projectPath,
+      platform: "PC" as const,
+      outputPath: harness.outputPath,
+      timeoutMs: 1_000,
+    };
+    const first = runWorkbenchIntent(harness.config, intent, runnerDependencies(harness, spawnProcess));
+    await targetDidSpawn;
+    const second = runWorkbenchIntent(harness.config, intent, runnerDependencies(harness, spawnProcess));
+
+    await expect(second).rejects.toMatchObject({ code: "LIFECYCLE_CONFLICT" });
+    expect(spawnCount).toBe(2);
+    releaseBuild();
+    await expect(first).resolves.toMatchObject({ intent: "build", output: expect.any(Object) });
   });
 
   it("returns a diagnostic receipt when exit zero produces no resource database", async () => {
@@ -1007,7 +1239,7 @@ describe("standalone Workbench lifecycle runner", () => {
     });
   });
 
-  it("keeps the mutex and guardian alive when exact timeout termination is refused", async () => {
+  it("releases the mutex during exact-child recovery while durable state stays stopping", async () => {
     const harness = createHarness();
     let targetChild!: FakeRunnerChild;
     let spawnIndex = 0;
@@ -1041,7 +1273,10 @@ describe("standalone Workbench lifecycle runner", () => {
       }
       return child as unknown as ChildProcess;
     }));
-    const rejection = expect(run).rejects.toMatchObject({ code: "TERMINATION_REFUSED" });
+    const rejection = run.then(
+      () => { throw new Error("expected exact termination refusal"); },
+      (error: unknown) => error
+    );
     while (harness.backend.terminationCalls.length < 2) {
       await new Promise((resolvePromise) => setTimeout(resolvePromise, 1));
     }
@@ -1049,16 +1284,74 @@ describe("standalone Workbench lifecycle runner", () => {
     let contenderEntered = false;
     const contender = harness.guard.withLifecycleLock(async () => {
       contenderEntered = true;
+      return harness.guard.readLifecycleState();
     });
-    await new Promise((resolvePromise) => setTimeout(resolvePromise, 10));
-    expect(contenderEntered).toBe(false);
+    const observedByContender = await contender;
+    expect(contenderEntered).toBe(true);
+    expect(observedByContender).toMatchObject({
+      kind: "valid",
+      state: {
+        phase: "stopping",
+        workbench: { pid: targetChild.pid },
+        operation: { kind: "shutdown" },
+      },
+    });
 
     harness.backend.processes.delete(targetChild.pid);
     harness.backend.workbenchPids.delete(targetChild.pid);
     targetChild.close(0);
-    await rejection;
-    await contender;
-    expect(contenderEntered).toBe(true);
+    expect(await rejection).toMatchObject({ code: "TERMINATION_REFUSED" });
+  });
+
+  it("returns RECOVERY_REQUIRED within the hard recovery bound and preserves stopping identity", async () => {
+    const harness = createHarness();
+    let spawnIndex = 0;
+    let targetPid = 0;
+    const startedAt = Date.now();
+    const run = runWorkbenchIntent(harness.config, {
+      kind: "build",
+      gprojPath: harness.projectPath,
+      platform: "PC",
+      outputPath: harness.outputPath,
+      timeoutMs: 100,
+    }, runnerDependencies(harness, (command, args) => {
+      const current = spawnIndex++;
+      const child = new FakeRunnerChild(current === 0 ? 21_105 : 21_115);
+      const ownerArgument = args.find((arg) => arg.startsWith("-reforgerForgeOwnerToken="))!;
+      harness.backend.addWorkbench({
+        pid: child.pid,
+        executablePath: command,
+        creationTime: current === 0 ? "133900000000021105" : "133900000000021115",
+      }, ownerArgument);
+      addAttributedLog(harness.logRoot, `bounded-recovery-${current}`, ownerArgument);
+      if (current === 1) {
+        targetPid = child.pid;
+        harness.backend.terminationResult = {
+          kind: "refused",
+          reason: "access_denied",
+          message: "fixture refuses exact termination",
+        };
+      }
+      return child as unknown as ChildProcess;
+    }, { recoveryTimeoutMs: 100 }));
+
+    while (harness.backend.terminationCalls.length < 2) {
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 1));
+    }
+    const observedDuringRecovery = await harness.guard.withLifecycleLock(() =>
+      harness.guard.readLifecycleState()
+    );
+    expect(observedDuringRecovery).toMatchObject({
+      kind: "valid",
+      state: {
+        phase: "stopping",
+        workbench: { pid: targetPid },
+        operation: { kind: "shutdown" },
+      },
+    });
+    await expect(run).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    expect(Date.now() - startedAt).toBeLessThan(500);
+    expect(await harness.guard.readLifecycleState()).toMatchObject(observedDuringRecovery);
   });
 
   it("exact-terminates the child before reporting ambiguous endpoint ownership", async () => {
@@ -1163,16 +1456,19 @@ describe("standalone Workbench lifecycle runner", () => {
     let contenderEntered = false;
     const contender = harness.guard.withLifecycleLock(async () => {
       contenderEntered = true;
+      return harness.guard.readLifecycleState();
     });
-    await new Promise((resolvePromise) => setTimeout(resolvePromise, 10));
-    expect(contenderEntered).toBe(false);
+    const observedByContender = await contender;
+    expect(contenderEntered).toBe(true);
+    expect(observedByContender).toMatchObject({
+      kind: "valid",
+      state: { phase: "stopping", workbench: { pid: child.pid } },
+    });
 
     harness.backend.processes.delete(child.pid);
     harness.backend.workbenchPids.delete(child.pid);
     child.close(1);
     await expect(run).rejects.toMatchObject({ code: "TERMINATION_REFUSED" });
-    await contender;
-    expect(contenderEntered).toBe(true);
     expect(await harness.guard.readLifecycleState()).toMatchObject({
       kind: "valid",
       state: { phase: "vacant", workbench: null, operation: null },

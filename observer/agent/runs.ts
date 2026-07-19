@@ -627,6 +627,28 @@ export class ObserverRunStore {
     return result;
   }
 
+  protectedRuntimeJobIds(): Set<string> {
+    const result = new Set<string>();
+    for (const record of this.records()) {
+      if (record.state !== "open") continue;
+      for (const capture of record.captures) {
+        if (capture.backend === "runtime" && capture.jobId) result.add(capture.jobId);
+      }
+    }
+    return result;
+  }
+
+  protectedSessionIds(): Set<string> {
+    const result = new Set<string>();
+    for (const record of this.records()) {
+      if (record.state !== "open") continue;
+      for (const capture of record.captures) {
+        if (capture.backend === "runtime" && capture.sessionId) result.add(capture.sessionId);
+      }
+    }
+    return result;
+  }
+
   assertJobReleaseAllowed(backend: "runtime" | "workbench", jobId: string, sessionId?: string): void {
     for (const record of this.records()) {
       if (record.state !== "open") continue;

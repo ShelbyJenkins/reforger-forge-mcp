@@ -3,20 +3,21 @@ import { pathToFileURL } from "node:url";
 import { AGENT_VERSION } from "../protocol/index.js";
 import { ArtifactStore } from "./artifacts.js";
 import { ObserverControlApi, type ObserverControlOptions } from "./control-api.js";
-import { JobStore } from "./jobs.js";
+import { JobStore, type JobStoreOptions } from "./jobs.js";
 import { InstanceRegistry, type RegistryOptions } from "./registry.js";
 import { ObserverRunStore, type RunStoreOptions } from "./runs.js";
 import { ObserverAgentServer, type ObserverAgentServerOptions } from "./server.js";
 
 export interface CreateObserverAgentOptions extends ObserverControlOptions, ObserverAgentServerOptions, RunStoreOptions {
   registry?: RegistryOptions;
+  jobs?: JobStoreOptions;
 }
 
 export function createObserverAgent(options: CreateObserverAgentOptions = {}) {
   const agentInstanceId = randomUUID();
   const control = new ObserverControlApi({ ...options, agentInstanceId });
-  const registry = new InstanceRegistry(control.sessions, options.registry);
-  const jobs = new JobStore(control.sessions, registry, options.clock);
+  const registry = new InstanceRegistry(control.sessions, { clock: options.clock, ...options.registry });
+  const jobs = new JobStore(control.sessions, registry, options.clock, options.jobs);
   const artifacts = new ArtifactStore(control.paths.artifacts, control.sessions, jobs);
   const runs = new ObserverRunStore(control.paths.runs, control.paths.exportWork, artifacts, jobs, {
     evidenceRoots: options.evidenceRoots,

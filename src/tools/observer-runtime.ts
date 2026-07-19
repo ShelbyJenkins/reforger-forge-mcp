@@ -4,14 +4,18 @@ import {
   OwnedRuntimeError,
   type OwnedRuntimeManager,
 } from "../observer/owned-runtime-manager.js";
+import { canonicalPublicObserverError } from "../observer/public-contract.js";
 
 function jsonText(heading: string, value: unknown): string {
   return `${heading}\n\n\`\`\`json\n${JSON.stringify(value, null, 2)}\n\`\`\``;
 }
 
 function toolError(error: unknown) {
-  const code = error instanceof OwnedRuntimeError ? error.code : "INTERNAL_ERROR";
-  const message = error instanceof Error ? error.message : "Owned runtime operation failed";
+  const publicError = canonicalPublicObserverError(
+    error instanceof OwnedRuntimeError ? error.code : "INTERNAL_ERROR",
+    error instanceof Error ? error.message : undefined
+  );
+  const { code, message } = publicError;
   const details = error instanceof OwnedRuntimeError ? error.details : undefined;
   return {
     content: [{

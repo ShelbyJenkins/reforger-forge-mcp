@@ -10,18 +10,19 @@ export const OBSERVER_BUILD_IDENTITY = "000cec19226673ce911c68dca027dca7449ff58a
 export const SESSION_DIRECTORY_NAME = "ReforgerForgeObserver" as const;
 export const SESSION_CONTRACT_NAME = "session.json" as const;
 
-export const CAPABILITIES = [
-  "render.capture",
-  "camera.runtime",
-  "world.query",
-  "entity.resolve",
-  "authority.server",
-  "server.coordinate",
-  "transport.rest",
-  "transport.mailbox",
-] as const;
-
-export type ObserverCapability = (typeof CAPABILITIES)[number];
+export {
+  CAPABILITIES,
+  CAPABILITY_REGISTRY,
+  ERROR_CODES,
+  ERROR_REGISTRY,
+  publicErrorMessage,
+  type ObserverBackend,
+  type ObserverCapability,
+  type ObserverCapabilityDefinition,
+  type ObserverErrorCode,
+  type ObserverErrorDefinition,
+  type PublicMessagePolicy,
+} from "./registry.js";
 
 export const TRANSPORTS = ["rest", "mailbox"] as const;
 export type ObserverTransport = (typeof TRANSPORTS)[number];
@@ -77,40 +78,6 @@ export function isRuntimeJobTransition(from: ObserverJobState, to: ObserverJobSt
 
 /** Duration of one command-delivery lease before a new attempt/token is issued. */
 export const COMMAND_DELIVERY_LEASE_MS = 5_000;
-
-export const ERROR_CODES = [
-  "PROTOCOL_MISMATCH",
-  "SESSION_NOT_FOUND",
-  "SESSION_EXPIRED",
-  "UNAUTHORIZED",
-  "PROFILE_CONFLICT",
-  "ADDON_STAGE_FAILED",
-  "STAGED_ADDON_CONFLICT",
-  "ARGUMENT_CONFLICT",
-  "INSTANCE_NOT_FOUND",
-  "INSTANCE_STALE",
-  "INSTANCE_CONFLICT",
-  "NO_RENDER_ENDPOINT",
-  "CAPABILITY_UNAVAILABLE",
-  "UNSUPPORTED_VIEW",
-  "INVALID_REQUEST",
-  "WORLD_UNAVAILABLE",
-  "WORLD_CHANGED",
-  "CAMERA_BUSY",
-  "CAMERA_OWNERSHIP_LOST",
-  "RESTORATION_UNCONFIRMED",
-  "CAPTURE_REJECTED",
-  "CAPTURE_TIMEOUT",
-  "ARTIFACT_INCOMPLETE",
-  "ARTIFACT_INVALID",
-  "ARTIFACT_TOO_LARGE",
-  "TRANSPORT_UNAVAILABLE",
-  "PERFORMANCE_POLICY_BLOCKED",
-  "CANCELLED",
-  "INTERNAL_ERROR",
-] as const;
-
-export type ObserverErrorCode = (typeof ERROR_CODES)[number];
 
 export const DEFAULT_LIMITS = Object.freeze({
   maxPendingJobs: 4,

@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ArtifactStore } from "../../observer/agent/artifacts.js";
 import { convertBmpToPng, validatePng } from "../../observer/agent/bmp.js";
-import { JobStore } from "../../observer/agent/jobs.js";
+import { JobStore, type JobStoreOptions } from "../../observer/agent/jobs.js";
 import { InstanceRegistry } from "../../observer/agent/registry.js";
 import { cleanup, createSessionFixture, FakeClock, graphicalRegistration, temporaryDirectory } from "./helpers.js";
 
@@ -32,7 +32,7 @@ function bmp24(width = 2, height = 2): Buffer {
   return data;
 }
 
-function setup() {
+function setup(jobOptions: JobStoreOptions = {}) {
   const root = temporaryDirectory();
   roots.push(root);
   const clock = new FakeClock();
@@ -40,7 +40,7 @@ function setup() {
   const registry = new InstanceRegistry(fixture.store, { clock });
   const registration = graphicalRegistration(fixture.created);
   registry.register(registration, fixture.created.contract.sessionToken);
-  const jobs = new JobStore(fixture.store, registry, clock);
+  const jobs = new JobStore(fixture.store, registry, clock, jobOptions);
   const artifacts = new ArtifactStore(join(root, "artifacts"), fixture.store, jobs, { stableIntervalMs: 2, stableTimeoutMs: 100 });
   return { root, ...fixture, registry, registration, jobs, artifacts };
 }
@@ -127,7 +127,53 @@ describe("observer artifacts", () => {
     expect(await value.artifacts.intake(manifest, value.created.contract.sessionToken)).toEqual(stored);
     expect(existsSync(sourcePath)).toBe(true);
     expect(value.artifacts.release(value.registration.sessionId, job.request.jobId)).toEqual({ released: true });
-    expect(value.artifacts.release(value.registration.sessionId, job.request.jobId)).toEqual({ released: false });
+    expect(value.artifacts.release(value.registration.sessionId, job.request.jobId)).toEqual({ released: true });
+    expect(value.jobs.stats()).toMatchObject({ releaseTombstones: 1 });
+    expect(() => value.jobs.completeArtifact(
+      value.registration.sessionId,
+      job.request.jobId,
+      manifest,
+      stored.imagePath
+    )).toThrowError(expect.objectContaining({ code: "JOB_RELEASED" }));
+  });
+
+  it("retains a bounded release receipt after terminal job metadata is swept", async () => {
+    const value = setup({ terminalJobRetentionMs: 1, idempotencyReceiptRetentionMs: 1 });
+    const job = value.jobs.submit({
+      sessionId: value.registration.sessionId,
+      idempotencyKey: "late-artifact-release",
+      deadlineAt: new Date(value.clock.now() + 10_000).toISOString(),
+      view: { kind: "current" },
+    });
+    advanceCurrentJob(value, job.request.jobId);
+    const captureRoot = join(value.profilePath, "profile", "ReforgerForgeObserver", "captures");
+    const source = bmp24();
+    writeFileSync(join(captureRoot, `${job.request.jobId}.bmp`), source);
+    await value.artifacts.intake({
+      protocolVersion: "1.0",
+      sessionId: value.registration.sessionId,
+      instanceId: value.registration.instanceId,
+      instanceNonce: value.registration.instanceNonce,
+      jobId: job.request.jobId,
+      artifactId: "late-artifact-release",
+      relativeScreenshotFilename: `${job.request.jobId}.bmp`,
+      screenshotIssuedAt: new Date(value.clock.now()).toISOString(),
+      completedAt: new Date(value.clock.now() + 1).toISOString(),
+      expectedByteCount: source.length,
+      worldId: value.registration.worldId,
+      worldEpoch: value.registration.worldEpoch,
+      actualCamera: {},
+      requestedSettleFrames: 0,
+      actualSettleFrames: 0,
+      contaminated: false,
+      warnings: [],
+    }, value.created.contract.sessionToken);
+    value.clock.advance(10_002);
+    expect(value.jobs.sweep(value.clock.now()).removedJobs).toContain(job.request.jobId);
+
+    expect(value.artifacts.release(value.registration.sessionId, job.request.jobId)).toEqual({ released: true });
+    expect(value.artifacts.release(value.registration.sessionId, job.request.jobId)).toEqual({ released: true });
+    expect(value.jobs.stats()).toMatchObject({ jobs: 0, releaseTombstones: 1 });
   });
 
   it("retries job completion after atomic promotion without duplicating the artifact", async () => {

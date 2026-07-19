@@ -11,12 +11,24 @@ import type {
   WorkbenchObserverJobStatus,
 } from "../workbench/observer-adapter.js";
 import type { RuntimeStopPreflight } from "./owned-runtime-manager.js";
+import { canonicalPublicObserverErrorCode } from "./public-contract.js";
 
 const CHILD_PROTOCOL = "rfo-observer-child-v1" as const;
 const TERMINAL_STATES = new Set(["completed", "failed", "cancelled"]);
 const MAX_WORKBENCH_RELEASE_RECEIPTS = 1_024;
 const SOURCE_MANIFEST_NAME = ".reforger-forge-observer-source.json";
 const MAX_READ_ONLY_MANIFEST_BYTES = 2 * 1024 * 1024;
+const WORKBENCH_PUBLIC_ERROR_MAP: Readonly<Record<string, string>> = Object.freeze({
+  HANDLER_UNAVAILABLE: "WORKBENCH_ADAPTER_UNAVAILABLE",
+  HANDLER_REJECTED: "CAPTURE_REJECTED",
+  STALE_LIFECYCLE: "STALE_INSTANCE",
+  WORKBENCH_EXITED: "STALE_INSTANCE",
+});
+
+function canonicalWorkbenchErrorCode(value: unknown): string {
+  const mapped = typeof value === "string" ? (WORKBENCH_PUBLIC_ERROR_MAP[value] ?? value) : undefined;
+  return canonicalPublicObserverErrorCode(mapped, "WORKBENCH_ADAPTER_UNAVAILABLE");
+}
 
 export class ObserverCoordinatorError extends Error {
   constructor(
@@ -491,9 +503,17 @@ export class ObserverCoordinator {
     return asRecord(await this.request("revoke", { sessionId }), "Observer session revocation");
   }
 
-  async reserveRuntimeStop(sessionId: string): Promise<RuntimeStopPreflight> {
+  async reserveRuntimeStop(
+    sessionId: string,
+    proposedReservationId: string,
+    exactRuntimeVacant = false
+  ): Promise<RuntimeStopPreflight> {
     const response = asRecord(
-      await this.request("runtimeStopPreflight", { sessionId }),
+      await this.request("runtimeStopPreflight", {
+        sessionId,
+        reservationId: proposedReservationId,
+        exactRuntimeVacant,
+      }),
       "Observer runtime stop preflight"
     );
     const strings = (value: unknown): string[] => Array.isArray(value)
@@ -506,20 +526,29 @@ export class ObserverCoordinator {
       activeJobIds: strings(response.activeJobIds),
       cameraLeaseJobIds: strings(response.cameraLeaseJobIds),
       restorationPendingJobIds: strings(response.restorationPendingJobIds),
+      ...(typeof response.reservationId === "string" ? { reservationId: response.reservationId } : {}),
       ...(typeof response.reason === "string" ? { reason: response.reason } : {}),
     };
   }
 
-  async releaseRuntimeStop(sessionId: string): Promise<Record<string, unknown>> {
+  async releaseRuntimeStop(sessionId: string, reservationId: string): Promise<Record<string, unknown>> {
     return asRecord(
-      await this.request("runtimeStopRelease", { sessionId }),
+      await this.request("runtimeStopRelease", { sessionId, reservationId }),
       "Observer runtime stop release"
     );
   }
 
-  async completeRuntimeStop(sessionId: string): Promise<Record<string, unknown>> {
+  async completeRuntimeStop(
+    sessionId: string,
+    reservationId?: string,
+    exactRuntimeVacant = false
+  ): Promise<Record<string, unknown>> {
     return asRecord(
-      await this.request("runtimeStopComplete", { sessionId }),
+      await this.request("runtimeStopComplete", {
+        sessionId,
+        ...(reservationId ? { reservationId } : {}),
+        exactRuntimeVacant,
+      }),
       "Observer runtime stop completion"
     );
   }
@@ -720,7 +749,7 @@ export class ObserverCoordinator {
           return { asynchronous: false, ...completed };
         }
         const retained: WorkbenchIdempotencyRecord = {
-          fingerprint: this.workbenchCaptureFingerprint(input),
+          fingerprint: this.workbenchCaptureFingerprint(input, timeoutMs),
           submission: this.recoverOrSubmitBoundWorkbench(input, jobId, tracked.instanceId),
         };
         this.workbenchIdempotency.set(workbenchIdempotencyKey, retained);
@@ -740,7 +769,9 @@ export class ObserverCoordinator {
       return await this.captureRuntime(input as ObserverCaptureInput & { sessionId: string }, timeoutMs);
     } catch (error) {
       if (input.runId && input.captureLabel) {
-        const code = error instanceof ObserverCoordinatorError ? error.code : "INTERNAL_ERROR";
+        const code = canonicalPublicObserverErrorCode(
+          error instanceof ObserverCoordinatorError ? error.code : "INTERNAL_ERROR"
+        );
         const message = error instanceof Error ? error.message : "Observer capture failed";
         await this.request("runFailCapture", {
           runId: input.runId,
@@ -763,6 +794,7 @@ export class ObserverCoordinator {
       idempotencyKey: input.idempotencyKey,
       ...(input.instanceId ? { instanceId: input.instanceId } : {}),
       deadlineAt,
+      deadlinePolicyMs: timeoutMs,
       view: input.view,
       settleFrames: input.settleFrames ?? 0,
       performancePolicy: input.performancePolicy ?? "evidence",
@@ -805,7 +837,7 @@ export class ObserverCoordinator {
 
     if (job.state !== "completed") {
       const code = typeof job.terminalErrorCode === "string"
-        ? job.terminalErrorCode
+        ? canonicalPublicObserverErrorCode(job.terminalErrorCode)
         : job.state === "cancelled" ? "CANCELLED" : "CAPTURE_REJECTED";
       const message = typeof job.terminalMessage === "string"
         ? job.terminalMessage
@@ -909,7 +941,7 @@ export class ObserverCoordinator {
   ): Promise<ObserverCaptureResult> {
     const adapter = this.workbenchAdapter;
     if (!adapter) throw new ObserverCoordinatorError("NO_RENDER_ENDPOINT", "Workbench observer adapter is unavailable");
-    const fingerprint = this.workbenchCaptureFingerprint(input);
+    const fingerprint = this.workbenchCaptureFingerprint(input, timeoutMs);
     let retained = this.workbenchIdempotency.get(idempotencyKey);
     if (retained && retained.fingerprint !== fingerprint) {
       throw new ObserverCoordinatorError(
@@ -1078,7 +1110,9 @@ export class ObserverCoordinator {
 
     if (status.state !== "completed") {
       throw new ObserverCoordinatorError(
-        status.terminalErrorCode ?? (status.state === "cancelled" ? "CANCELLED" : "CAPTURE_REJECTED"),
+        status.terminalErrorCode
+          ? canonicalWorkbenchErrorCode(status.terminalErrorCode)
+          : (status.state === "cancelled" ? "CANCELLED" : "CAPTURE_REJECTED"),
         status.message,
         { job }
       );
@@ -1222,7 +1256,9 @@ export class ObserverCoordinator {
       viewKind: status.viewKind,
       state: status.state,
       sequence: status.sequence,
-      terminalErrorCode: status.terminalErrorCode,
+      terminalErrorCode: status.terminalErrorCode
+        ? canonicalWorkbenchErrorCode(status.terminalErrorCode)
+        : undefined,
       terminalMessage: status.message,
       cameraLeaseHeld: status.cameraLeaseHeld,
       restorationConfirmed: status.restorationConfirmed,
@@ -1236,7 +1272,7 @@ export class ObserverCoordinator {
   private mapWorkbenchError(error: unknown, details?: Record<string, unknown>): ObserverCoordinatorError {
     const candidate = error as { code?: unknown; message?: unknown };
     return new ObserverCoordinatorError(
-      typeof candidate?.code === "string" ? candidate.code : "WORKBENCH_ADAPTER_UNAVAILABLE",
+      canonicalWorkbenchErrorCode(candidate?.code),
       typeof candidate?.message === "string" ? candidate.message : "Workbench observer operation failed",
       details
     );
@@ -1248,13 +1284,14 @@ export class ObserverCoordinator {
     return createHash("sha256").update(value, "utf8").digest("hex");
   }
 
-  private workbenchCaptureFingerprint(input: ObserverCaptureInput): string {
+  private workbenchCaptureFingerprint(input: ObserverCaptureInput, timeoutMs: number): string {
     const canonical = JSON.stringify({
       sessionId: input.sessionId ?? null,
       instanceId: input.instanceId ?? null,
       view: input.view,
       settleFrames: input.settleFrames ?? 0,
       performancePolicy: input.performancePolicy ?? "evidence",
+      timeoutMs,
       runId: input.runId ?? null,
       captureLabel: input.captureLabel ?? null,
       purpose: input.purpose ?? null,
@@ -1568,7 +1605,9 @@ export class ObserverCoordinator {
           await this.request("runFailCapture", {
             runId: workbench.runId,
             captureLabel: workbench.captureLabel,
-            code: status.terminalErrorCode ?? (status.state === "cancelled" ? "CANCELLED" : "CAPTURE_REJECTED"),
+            code: status.terminalErrorCode
+              ? canonicalWorkbenchErrorCode(status.terminalErrorCode)
+              : (status.state === "cancelled" ? "CANCELLED" : "CAPTURE_REJECTED"),
             message: status.message.slice(0, 512),
           }).catch(() => undefined);
         }
@@ -1794,7 +1833,9 @@ export class ObserverCoordinator {
         await this.request("runFailCapture", {
           runId: tracked.runId,
           captureLabel: tracked.captureLabel,
-          code: status.terminalErrorCode ?? (status.state === "cancelled" ? "CANCELLED" : "CAPTURE_REJECTED"),
+          code: status.terminalErrorCode
+            ? canonicalWorkbenchErrorCode(status.terminalErrorCode)
+            : (status.state === "cancelled" ? "CANCELLED" : "CAPTURE_REJECTED"),
           message: status.message.slice(0, 512),
         }).catch(() => undefined);
       }
@@ -1966,7 +2007,7 @@ export class ObserverCoordinator {
       const reject = this.rejectStartup;
       this.rejectStartup = null;
       reject?.(new ObserverCoordinatorError(
-        typeof error.code === "string" ? error.code : "TRANSPORT_UNAVAILABLE",
+        canonicalPublicObserverErrorCode(error.code, "TRANSPORT_UNAVAILABLE"),
         typeof error.message === "string" ? error.message : "Private observer agent failed during startup"
       ));
       this.child?.kill();
@@ -1983,7 +2024,7 @@ export class ObserverCoordinator {
     }
     const error = isRecord(message.error) ? message.error : {};
     pending.reject(new ObserverCoordinatorError(
-      typeof error.code === "string" ? error.code : "INTERNAL_ERROR",
+      canonicalPublicObserverErrorCode(error.code),
       typeof error.message === "string" ? error.message : "Observer operation failed"
     ));
   }

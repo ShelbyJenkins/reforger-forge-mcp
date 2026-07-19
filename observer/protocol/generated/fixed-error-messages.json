@@ -1,0 +1,5 @@
+{
+  "UNAUTHORIZED": "Observer request was not authorized.",
+  "STORAGE_UNVERIFIABLE": "Observer lifecycle storage could not be verified.",
+  "INTERNAL_ERROR": "Observer operation failed."
+}

@@ -16,8 +16,16 @@ import {
 import { registerObserverTools } from "../../src/observer/tools.js";
 import { prepareObserverLaunch } from "../../src/observer/launch.js";
 import type { OwnedRuntimeManager } from "../../src/observer/owned-runtime-manager.js";
-import { uninstallManagedObserver } from "../../observer/agent/private-child.js";
+import {
+  claimRuntimeStopReservation,
+  releaseRuntimeStopReservation,
+  uninstallManagedObserver,
+} from "../../observer/agent/private-child.js";
 import { ObserverError } from "../../observer/agent/errors.js";
+import {
+  captureRequestFingerprint,
+  type SubmitJobInput,
+} from "../../observer/agent/jobs.js";
 
 const CHILD_PROTOCOL = "rfo-observer-child-v1";
 
@@ -34,6 +42,38 @@ describe("observer child diagnostic redaction", () => {
     expect(credentialLine).not.toContain("instance-secret");
     expect(credentialLine).not.toContain("abc.def");
     expect(credentialLine).toContain("[REDACTED]");
+  });
+});
+
+describe("observer runtime-stop lease generations", () => {
+  it("keeps caller proposals exclusive and rejects delayed stale releases", () => {
+    const reservations = new Map<string, string>();
+    const sessionId = "session-lease";
+    const first = "00000000-0000-4000-8000-000000000001";
+    const second = "00000000-0000-4000-8000-000000000002";
+
+    expect(claimRuntimeStopReservation(reservations, sessionId, first)).toEqual({
+      reserved: true,
+      reservationId: first,
+      created: true,
+    });
+    expect(claimRuntimeStopReservation(reservations, sessionId, first)).toEqual({
+      reserved: true,
+      reservationId: first,
+      created: false,
+    });
+    expect(claimRuntimeStopReservation(reservations, sessionId, second)).toEqual({
+      reserved: false,
+      created: false,
+    });
+    expect(releaseRuntimeStopReservation(reservations, sessionId, second)).toBe(false);
+    expect(releaseRuntimeStopReservation(reservations, sessionId, first)).toBe(true);
+    expect(claimRuntimeStopReservation(reservations, sessionId, second)).toMatchObject({
+      reserved: true,
+      reservationId: second,
+    });
+    expect(releaseRuntimeStopReservation(reservations, sessionId, first)).toBe(false);
+    expect(reservations.get(sessionId)).toBe(second);
   });
 });
 
@@ -491,12 +531,70 @@ describe("Phase H observer coordinator", () => {
     }));
     await expect(coordinator.capture({
       ...request,
+      timeoutMs: 2_000,
+    })).rejects.toMatchObject({ code: "IDEMPOTENCY_CONFLICT" });
+    await expect(coordinator.capture({
+      ...request,
       view: { kind: "lookAt", position: [0, 0, 0], target: [1, 0, 0], fov: 60 },
     })).rejects.toMatchObject({ code: "IDEMPOTENCY_CONFLICT" });
     await coordinator.cancelJob(undefined, "wb-job-1");
     await coordinator.releaseJob(undefined, "wb-job-1");
     await expect(coordinator.capture(request)).rejects.toMatchObject({ code: "JOB_RELEASED" });
     expect(adapter.submit).toHaveBeenCalledOnce();
+    await coordinator.close();
+  });
+
+  it("replays runtime capture when the same timeout policy derives a later wall-clock deadline", async () => {
+    const child = new FakeChild();
+    let retainedFingerprint: string | null = null;
+    const submittedPayloads: Record<string, unknown>[] = [];
+    child.responders.set("submitJob", (payload) => {
+      submittedPayloads.push(payload);
+      const fingerprint = captureRequestFingerprint(payload as unknown as SubmitJobInput);
+      if (retainedFingerprint !== null && retainedFingerprint !== fingerprint) {
+        throw Object.assign(new Error("runtime idempotency conflict"), {
+          code: "IDEMPOTENCY_CONFLICT",
+        });
+      }
+      retainedFingerprint = fingerprint;
+      return {
+        jobId: "runtime-job-1",
+        sessionId: payload.sessionId,
+        instanceId: "runtime-instance-1",
+        state: "queued",
+        worldId: null,
+        worldEpoch: 0,
+      };
+    });
+    const coordinator = new ObserverCoordinator({
+      agentPath: "private-child.js",
+      forkChild: fakeFork(child, { value: 0 }),
+      startupTimeoutMs: 1_000,
+      requestTimeoutMs: 1_000,
+    });
+    await coordinator.ensureSetup();
+    const request = {
+      sessionId: "runtime-session-1",
+      idempotencyKey: "runtime-relative-deadline",
+      view: { kind: "current" } as const,
+      asynchronous: true,
+      timeoutMs: 1_000,
+    };
+
+    await expect(coordinator.capture(request)).resolves.toMatchObject({
+      asynchronous: true,
+      job: { jobId: "runtime-job-1" },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    await expect(coordinator.capture(request)).resolves.toMatchObject({
+      asynchronous: true,
+      job: { jobId: "runtime-job-1" },
+    });
+    expect(submittedPayloads).toHaveLength(2);
+    expect(submittedPayloads[0].deadlineAt).not.toBe(submittedPayloads[1].deadlineAt);
+    expect(submittedPayloads.map((payload) => payload.deadlinePolicyMs)).toEqual([1_000, 1_000]);
+    await expect(coordinator.capture({ ...request, timeoutMs: 2_000 }))
+      .rejects.toMatchObject({ code: "IDEMPOTENCY_CONFLICT" });
     await coordinator.close();
   });
 
@@ -1264,6 +1362,63 @@ describe("Phase H observer MCP tools", () => {
       await client.close();
       await server.close();
     }
+  });
+
+  it("accepts an inventory-null world for current-view capture through the public tool", async () => {
+    const coordinator = {
+      defaultCaptureTimeoutMs: 30_000,
+      maxInlineImageBytes: 1_024,
+      instances: vi.fn(async () => ({
+        instances: [{
+          instanceId: "runtime-null-world",
+          sessionId: "session-1",
+          worldId: null,
+          worldEpoch: 7,
+          capabilities: ["render.capture"],
+        }],
+        compatibleCount: 1,
+        waitedMs: 0,
+        timedOut: false,
+      })),
+      capture: vi.fn(async () => ({
+        asynchronous: true,
+        job: { jobId: "job-null-world", worldId: null, worldEpoch: 7, state: "queued" },
+      })),
+    } as unknown as ObserverCoordinator;
+    const tools = toolRegistry(coordinator);
+    const signal = new AbortController().signal;
+    const inventory = await tools.get("observer_instances")!.handler({
+      sessionId: "session-1",
+      requiredCapabilities: ["render.capture"],
+      renderersOnly: true,
+      waitMs: 0,
+    }, { signal });
+    expect(inventory.isError).not.toBe(true);
+    expect(inventory.content[0].text).toContain('"worldId": null');
+
+    const expectedWorldId = tools.get("observer_capture")!.definition.inputSchema!.expectedWorldId;
+    expect(expectedWorldId.safeParse(null).success).toBe(true);
+    expect(expectedWorldId.safeParse(undefined).success).toBe(true);
+    const capture = await tools.get("observer_capture")!.handler({
+      runId: "20260717T184233Z-a1b2c3d4",
+      captureLabel: "null-world-current",
+      sessionId: "session-1",
+      instanceId: "runtime-null-world",
+      idempotencyKey: "null-world-current",
+      view: { kind: "current" },
+      asynchronous: true,
+      timeoutMs: 30_000,
+      settleFrames: 0,
+      expectedWorldId: null,
+      expectedWorldEpoch: 7,
+      performancePolicy: "evidence",
+    }, { signal });
+    expect(capture.isError).not.toBe(true);
+    expect(coordinator.capture).toHaveBeenCalledWith(expect.objectContaining({
+      expectedWorldId: null,
+      expectedWorldEpoch: 7,
+      view: { kind: "current" },
+    }));
   });
 
   it("formats one validated PNG image and one concise text metadata item", async () => {

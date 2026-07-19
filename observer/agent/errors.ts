@@ -1,4 +1,4 @@
-import { PROTOCOL_VERSION, type ObserverErrorCode } from "../protocol/index.js";
+import { PROTOCOL_VERSION, publicErrorMessage, type ObserverErrorCode } from "../protocol/index.js";
 
 export class ObserverError extends Error {
   constructor(
@@ -23,6 +23,6 @@ export function errorBody(error: unknown): {
   const observerError = asObserverError(error);
   return {
     protocolVersion: PROTOCOL_VERSION,
-    error: { code: observerError.code, message: observerError.message.slice(0, 512) },
+    error: { code: observerError.code, message: publicErrorMessage(observerError.code, observerError.message) },
   };
 }

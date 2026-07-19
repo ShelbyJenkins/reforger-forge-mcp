@@ -1,4 +1,4 @@
-import { existsSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { SESSION_CONTRACT_NAME, SESSION_DIRECTORY_NAME } from "../../observer/protocol/index.js";
@@ -45,5 +45,20 @@ describe("observer orphaned contract recovery", () => {
 
     expect(fixture.store.revoke(fixture.created.contract.sessionId)).toBe(true);
     expect(existsSync(engineProfile)).toBe(false);
+  });
+
+  it("commits revocation even when the on-disk contract is malformed", () => {
+    const root = temporaryDirectory();
+    roots.push(root);
+    const fixture = createSessionFixture(root);
+    const sessionId = fixture.created.contract.sessionId;
+    const contractPath = join(fixture.profilePath, "profile", SESSION_DIRECTORY_NAME, SESSION_CONTRACT_NAME);
+    writeFileSync(contractPath, "{\n");
+
+    expect(fixture.store.revoke(sessionId)).toBe(true);
+    expect(fixture.store.peek(sessionId)?.revokedAt).not.toBeNull();
+    expect(() => fixture.store.get(sessionId))
+      .toThrowError(expect.objectContaining({ code: "SESSION_EXPIRED" }));
+    expect(existsSync(contractPath)).toBe(true);
   });
 });

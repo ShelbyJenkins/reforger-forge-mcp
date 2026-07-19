@@ -22,6 +22,33 @@ export interface Clock {
 
 export const systemClock: Clock = { now: () => Date.now() };
 
+export const SESSION_TOMBSTONE_RETENTION_MS = 5 * 60_000;
+export const DEFAULT_SESSION_MAX_RECORDS = 1_024;
+export const DEFAULT_SESSION_MAX_BYTES = 8 * 1024 * 1024;
+
+export interface SessionStoreOptions {
+  terminalRetentionMs?: number;
+  maxRecords?: number;
+  maxEstimatedBytes?: number;
+}
+
+export interface SessionSweepResult {
+  expiredSessionIds: string[];
+  removedSessionIds: string[];
+}
+
+export interface SessionStoreStats {
+  records: number;
+  active: number;
+  terminal: number;
+  pinned: number;
+  estimatedBytes: number;
+  actualBytes: number;
+  maxRecords: number;
+  maxEstimatedBytes: number;
+  terminalRetentionMs: number;
+}
+
 export interface CreateSessionInput {
   bundleDigest: string;
   stagedAddonPath: string;
@@ -98,8 +125,34 @@ function parseExistingContract(contractPath: string): SessionContract {
 
 export class SessionStore {
   private readonly sessions = new Map<string, SessionRecord>();
+  private readonly retentionPins = new Map<string, Set<string>>();
+  readonly terminalRetentionMs: number;
+  readonly maxRecords: number;
+  readonly maxEstimatedBytes: number;
 
-  constructor(private readonly clock: Clock = systemClock) {}
+  constructor(private readonly clock: Clock = systemClock, options: SessionStoreOptions = {}) {
+    this.terminalRetentionMs = this.boundedOption(
+      options.terminalRetentionMs,
+      SESSION_TOMBSTONE_RETENTION_MS,
+      0,
+      24 * 60 * 60_000,
+      "Session terminal retention"
+    );
+    this.maxRecords = this.boundedOption(
+      options.maxRecords,
+      DEFAULT_SESSION_MAX_RECORDS,
+      1,
+      100_000,
+      "Session record limit"
+    );
+    this.maxEstimatedBytes = this.boundedOption(
+      options.maxEstimatedBytes,
+      DEFAULT_SESSION_MAX_BYTES,
+      1_024,
+      1024 * 1024 * 1024,
+      "Session store byte limit"
+    );
+  }
 
   async recoverProfileContract(
     profilePathInput: string,
@@ -188,7 +241,6 @@ export class SessionStore {
       profileDirectoryName: SESSION_DIRECTORY_NAME,
       limits,
     });
-    atomicWriteJson(profilePath, contractPath, contract);
     const record: SessionRecord = {
       sessionId,
       launchNonce,
@@ -207,8 +259,41 @@ export class SessionStore {
       allowMultipleInstances: input.allowMultipleInstances ?? false,
       revokedAt: null,
     };
+    this.assertCapacity(record);
+    atomicWriteJson(profilePath, contractPath, contract);
     this.sessions.set(sessionId, record);
     return { contract, record, contractPath };
+  }
+
+  peek(sessionId: string): SessionRecord | undefined {
+    return this.sessions.get(sessionId);
+  }
+
+  isTerminal(sessionId: string, now = this.clock.now()): boolean {
+    const record = this.sessions.get(sessionId);
+    return !record || record.revokedAt !== null || record.expiresAt <= now;
+  }
+
+  pin(sessionId: string, owner: string): boolean {
+    if (!this.sessions.has(sessionId)) return false;
+    if (!/^[A-Za-z0-9_.:-]{1,128}$/.test(owner)) {
+      throw new ObserverError("INVALID_REQUEST", "Session retention pin owner is invalid");
+    }
+    const owners = this.retentionPins.get(sessionId) ?? new Set<string>();
+    owners.add(owner);
+    this.retentionPins.set(sessionId, owners);
+    return true;
+  }
+
+  unpin(sessionId: string, owner: string): boolean {
+    const owners = this.retentionPins.get(sessionId);
+    if (!owners || !owners.delete(owner)) return false;
+    if (owners.size === 0) this.retentionPins.delete(sessionId);
+    return true;
+  }
+
+  isPinned(sessionId: string, externallyPinned: ReadonlySet<string> = new Set()): boolean {
+    return externallyPinned.has(sessionId) || (this.retentionPins.get(sessionId)?.size ?? 0) > 0;
   }
 
   get(sessionId: string): SessionRecord {
@@ -238,31 +323,43 @@ export class SessionStore {
     if (record.registeredInstanceNonce && record.registeredInstanceNonce !== instanceNonce) {
       throw new ObserverError("INSTANCE_CONFLICT", "A different process-lifetime nonce is already registered for this launch", 409);
     }
+    const next = { ...record, registeredInstanceNonce: instanceNonce };
+    this.assertCapacity(next, false);
     record.registeredInstanceNonce = instanceNonce;
   }
 
   revoke(sessionId: string): boolean {
     const record = this.sessions.get(sessionId);
     if (!record) return false;
-    if (record.revokedAt === null) record.revokedAt = this.clock.now();
+    if (record.revokedAt === null) {
+      const next = { ...record, revokedAt: this.clock.now() };
+      this.assertCapacity(next, false);
+      record.revokedAt = next.revokedAt;
+    }
     // Revocation is cleanup, not launch preparation. If the exclusive launch
     // root was already removed, commit the in-memory revocation without
     // recreating any part of the engine profile mount.
     if (!existsSync(record.profilePath)) return true;
-    const engineProfileDirectory = resolveEngineProfileDirectory(record.profilePath);
-    const contractPath = join(engineProfileDirectory, SESSION_DIRECTORY_NAME, SESSION_CONTRACT_NAME);
-    assertManagedPath(record.profilePath, contractPath);
-    if (existsSync(contractPath)) {
-      const existing = parseExistingContract(contractPath);
-      if (existing.sessionId === record.sessionId && existing.launchNonce === record.launchNonce) unlinkSync(contractPath);
+    try {
+      const engineProfileDirectory = resolveEngineProfileDirectory(record.profilePath);
+      const contractPath = join(engineProfileDirectory, SESSION_DIRECTORY_NAME, SESSION_CONTRACT_NAME);
+      assertManagedPath(record.profilePath, contractPath);
+      if (existsSync(contractPath)) {
+        const existing = parseExistingContract(contractPath);
+        if (existing.sessionId === record.sessionId && existing.launchNonce === record.launchNonce) unlinkSync(contractPath);
+      }
+    } catch {
+      // revokedAt is the committed authority. A malformed/replaced contract is
+      // preserved for forensic cleanup, but must not keep a completed runtime
+      // stop reservation pinned forever. Repeated revoke calls may retry.
     }
     return true;
   }
 
-  sweepExpired(): string[] {
-    const expired: string[] = [];
+  sweep(now = this.clock.now(), externallyPinned: ReadonlySet<string> = new Set()): SessionSweepResult {
+    const expiredSessionIds: string[] = [];
     for (const record of this.sessions.values()) {
-      if (record.revokedAt === null && record.expiresAt <= this.clock.now()) {
+      if (record.revokedAt === null && record.expiresAt <= now) {
         try {
           this.revoke(record.sessionId);
         } catch {
@@ -270,10 +367,24 @@ export class SessionStore {
           // or replaced contract is preserved for review without stopping the
           // remaining expiry sweep.
         }
-        expired.push(record.sessionId);
+        expiredSessionIds.push(record.sessionId);
       }
     }
-    return expired;
+    const removedSessionIds: string[] = [];
+    for (const record of this.sessions.values()) {
+      const terminalAt = record.revokedAt;
+      if (terminalAt === null || now - terminalAt < this.terminalRetentionMs || this.isPinned(record.sessionId, externallyPinned)) {
+        continue;
+      }
+      this.sessions.delete(record.sessionId);
+      this.retentionPins.delete(record.sessionId);
+      removedSessionIds.push(record.sessionId);
+    }
+    return { expiredSessionIds, removedSessionIds };
+  }
+
+  sweepExpired(): string[] {
+    return this.sweep().expiredSessionIds;
   }
 
   activeBundleDigests(): Set<string> {
@@ -290,5 +401,58 @@ export class SessionStore {
 
   activeRecords(): SessionRecord[] {
     return [...this.sessions.values()].filter((record) => record.revokedAt === null && record.expiresAt > this.clock.now());
+  }
+
+  stats(now = this.clock.now()): SessionStoreStats {
+    const records = [...this.sessions.values()];
+    const active = records.filter((record) => record.revokedAt === null && record.expiresAt > now).length;
+    return {
+      records: records.length,
+      active,
+      terminal: records.length - active,
+      pinned: [...this.retentionPins.values()].filter((owners) => owners.size > 0).length,
+      estimatedBytes: records.reduce((total, record) => total + this.budgetedRecordBytes(record), 0),
+      actualBytes: records.reduce((total, record) => total + this.recordBytes(record), 0),
+      maxRecords: this.maxRecords,
+      maxEstimatedBytes: this.maxEstimatedBytes,
+      terminalRetentionMs: this.terminalRetentionMs,
+    };
+  }
+
+  private assertCapacity(record: SessionRecord, sweep = true): void {
+    // Admission cannot see the application-level evidence/run pins supplied
+    // to the coordinated sweep. Never perform an unpinned retention mutation
+    // from this local capacity check.
+    void sweep;
+    const replacing = this.sessions.get(record.sessionId);
+    const nextRecords = this.sessions.size + (replacing ? 0 : 1);
+    const currentBytes = [...this.sessions.values()].reduce((total, existing) => total + this.budgetedRecordBytes(existing), 0);
+    const nextBytes = currentBytes - (replacing ? this.budgetedRecordBytes(replacing) : 0) + this.budgetedRecordBytes(record);
+    if (nextRecords > this.maxRecords || nextBytes > this.maxEstimatedBytes) {
+      throw new ObserverError("TRANSPORT_UNAVAILABLE", "Observer session store retention budget is exhausted", 503);
+    }
+  }
+
+  private recordBytes(record: SessionRecord): number {
+    return Buffer.byteLength(JSON.stringify(record), "utf8");
+  }
+
+  private budgetedRecordBytes(record: SessionRecord): number {
+    // Charge the worst possible mutable shape at admission. Binding and
+    // revocation can then never fail merely because null fields grew during
+    // mandatory lifecycle cleanup.
+    return this.recordBytes({
+      ...record,
+      registeredInstanceNonce: "x".repeat(256),
+      revokedAt: Number.MAX_SAFE_INTEGER,
+    });
+  }
+
+  private boundedOption(value: number | undefined, fallback: number, minimum: number, maximum: number, label: string): number {
+    const selected = value ?? fallback;
+    if (!Number.isSafeInteger(selected) || selected < minimum || selected > maximum) {
+      throw new ObserverError("INVALID_REQUEST", `${label} must be an integer from ${minimum} through ${maximum}`);
+    }
+    return selected;
   }
 }

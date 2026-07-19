@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import {
   COMMAND_DELIVERY_LEASE_MS,
@@ -26,6 +26,118 @@ const TERMINAL = new Set<string>(TERMINAL_JOB_STATES);
 const CAMERA_EXECUTION_STATES = new Set<ObserverJobState>(["positioning", "settling", "capturing", "awaitingArtifact"]);
 const RESTORATION_STATES = new Set<ObserverJobState>(["restoring", "failed", "cancelled"]);
 const CAPTURE_RATE_WINDOW_MS = 60_000;
+export const DEFAULT_IDEMPOTENCY_RECEIPT_RETENTION_MS = 10 * 60_000;
+export const DEFAULT_TERMINAL_JOB_RETENTION_MS = 10 * 60_000;
+export const DEFAULT_JOB_MAX_RECORDS = 16_384;
+export const DEFAULT_JOB_MAX_ESTIMATED_BYTES = 64 * 1024 * 1024;
+export const DEFAULT_JOB_MAX_RECORD_ESTIMATED_BYTES = 512 * 1024;
+/** Kept unused per live record so dispatch/cancel/terminal bookkeeping cannot deadlock cleanup. */
+export const JOB_MUTATION_RESERVE_BYTES = 2 * 1024;
+
+export interface JobStoreOptions {
+  /** Retain a replay receipt this long after its canonical capture deadline. */
+  idempotencyReceiptRetentionMs?: number;
+  terminalJobRetentionMs?: number;
+  /** Per-collection hard bound for jobs, receipts, and queued references. */
+  maxRecords?: number;
+  /** Aggregate in-memory JSON-size estimate across all JobStore collections. */
+  maxEstimatedBytes?: number;
+  /** Maximum JSON-size estimate for one mutable job record. */
+  maxRecordEstimatedBytes?: number;
+}
+
+export interface NormalizedCaptureRequest {
+  sessionId: string;
+  instanceId: string | null;
+  deadlineAt: string;
+  deadlinePolicy:
+    | { kind: "absolute"; deadlineAt: string }
+    | { kind: "relative"; timeoutMs: number };
+  view: CaptureView;
+  settleFrames: number;
+  performancePolicy: "evidence" | "instrumented" | "performance";
+  expectedWorld: { kind: "any" } | { kind: "exact"; worldId: string | null };
+  expectedWorldEpoch: number | null;
+}
+
+interface IdempotencyReceipt {
+  jobId: string;
+  fingerprint: string;
+  expiresAt: number;
+}
+
+interface ArtifactReleaseReceipt {
+  sessionId: string;
+  jobId: string;
+  released: boolean;
+  expiresAt: number;
+}
+
+function canonicalNumber(value: number): number {
+  if (!Number.isFinite(value)) {
+    throw new ObserverError("INVALID_REQUEST", "Capture view contains a non-finite number");
+  }
+  return Object.is(value, -0) ? 0 : value;
+}
+
+/** Canonical logical request; transport-only values (for example AbortSignal) are absent. */
+export function normalizeCaptureRequest(input: SubmitJobInput): NormalizedCaptureRequest {
+  const deadline = Date.parse(input.deadlineAt);
+  if (!Number.isFinite(deadline)) {
+    throw new ObserverError("INVALID_REQUEST", "Capture deadline is invalid");
+  }
+  if (input.deadlinePolicyMs !== undefined &&
+      (!Number.isSafeInteger(input.deadlinePolicyMs) || input.deadlinePolicyMs < 1_000 ||
+        input.deadlinePolicyMs > 5 * 60_000)) {
+    throw new ObserverError("INVALID_REQUEST", "Capture deadline policy is invalid");
+  }
+  const deadlineAt = new Date(deadline).toISOString();
+  const view: CaptureView = input.view.kind === "current"
+    ? { kind: "current" }
+    : input.view.kind === "pose"
+      ? {
+          kind: "pose",
+          position: input.view.position.map(canonicalNumber) as [number, number, number],
+          orientation: input.view.orientation.map(canonicalNumber) as [number, number, number, number],
+          fov: canonicalNumber(input.view.fov),
+        }
+      : {
+          kind: "lookAt",
+          position: input.view.position.map(canonicalNumber) as [number, number, number],
+          target: input.view.target.map(canonicalNumber) as [number, number, number],
+          fov: canonicalNumber(input.view.fov),
+        };
+  return {
+    sessionId: input.sessionId,
+    instanceId: input.instanceId ?? null,
+    deadlineAt,
+    // Direct agent callers own an absolute deadline. The MCP coordinator owns
+    // a relative timeout policy and necessarily derives a fresh wall-clock
+    // deadline on retry; fingerprint the policy while retaining the original
+    // admitted deadline in the job itself.
+    deadlinePolicy: input.deadlinePolicyMs === undefined
+      ? { kind: "absolute", deadlineAt }
+      : { kind: "relative", timeoutMs: input.deadlinePolicyMs },
+    view,
+    settleFrames: input.settleFrames ?? 0,
+    performancePolicy: input.performancePolicy ?? "evidence",
+    expectedWorld: input.expectedWorldId === undefined
+      ? { kind: "any" }
+      : { kind: "exact", worldId: input.expectedWorldId },
+    expectedWorldEpoch: input.expectedWorldEpoch ?? null,
+  };
+}
+
+export function captureRequestFingerprint(input: SubmitJobInput): string {
+  return normalizedCaptureRequestFingerprint(normalizeCaptureRequest(input));
+}
+
+function normalizedCaptureRequestFingerprint(input: NormalizedCaptureRequest): string {
+  const { deadlineAt: _derivedDeadlineAt, ...logicalRequest } = input;
+  return createHash("sha256")
+    .update(JSON.stringify(logicalRequest), "utf8")
+    .digest("hex");
+}
 
 function decimalWireValue(value: number): string {
   if (!Number.isFinite(value) || Math.abs(value) > 1_000_000_000) {
@@ -56,6 +168,8 @@ export interface SubmitJobInput {
   idempotencyKey: string;
   instanceId?: string;
   deadlineAt: string;
+  /** Host-private relative deadline policy used for semantic retry identity. */
+  deadlinePolicyMs?: number;
   view: CaptureView;
   settleFrames?: number;
   performancePolicy?: "evidence" | "instrumented" | "performance";
@@ -76,6 +190,8 @@ export interface CameraLeaseRecord {
   leaseId: string | null;
   observerCameraId: string | number | null;
   restorationConfirmed: boolean;
+  /** Host-only terminal evidence when the exact runtime process is vacant. */
+  vacancyDisposition?: "exact_runtime_vacant";
 }
 
 export interface JobRecord {
@@ -100,6 +216,8 @@ export interface JobRecord {
   terminalMessage: string | null;
   artifact: ArtifactManifest | null;
   artifactPath: string | null;
+  /** Equal-width retained disposition doubles as the bounded release tombstone. */
+  artifactReleaseDisposition: "unseen" | "erased" | "absent";
 }
 
 export interface ArtifactCompletionPreflight {
@@ -109,14 +227,53 @@ export interface ArtifactCompletionPreflight {
 
 export class JobStore {
   private readonly jobs = new Map<string, JobRecord>();
-  private readonly idempotency = new Map<string, string>();
+  private readonly idempotency = new Map<string, IdempotencyReceipt>();
+  private readonly artifactReleaseReceipts = new Map<string, ArtifactReleaseReceipt>();
   private readonly pendingByInstance = new Map<string, string[]>();
+  private readonly idempotencyReceiptRetentionMs: number;
+  private readonly terminalJobRetentionMs: number;
+  readonly maxRecords: number;
+  readonly maxEstimatedBytes: number;
+  readonly maxRecordEstimatedBytes: number;
 
   constructor(
     private readonly sessions: SessionStore,
     private readonly registry: InstanceRegistry,
-    private readonly clock: Clock = systemClock
-  ) {}
+    private readonly clock: Clock = systemClock,
+    options: JobStoreOptions = {}
+  ) {
+    this.idempotencyReceiptRetentionMs = this.retentionOption(
+      options.idempotencyReceiptRetentionMs,
+      DEFAULT_IDEMPOTENCY_RECEIPT_RETENTION_MS,
+      "Idempotency receipt retention"
+    );
+    this.terminalJobRetentionMs = this.retentionOption(
+      options.terminalJobRetentionMs,
+      DEFAULT_TERMINAL_JOB_RETENTION_MS,
+      "Terminal job retention"
+    );
+    this.maxRecords = this.integerOption(
+      options.maxRecords,
+      DEFAULT_JOB_MAX_RECORDS,
+      1,
+      1_000_000,
+      "Job store record limit"
+    );
+    this.maxEstimatedBytes = this.integerOption(
+      options.maxEstimatedBytes,
+      DEFAULT_JOB_MAX_ESTIMATED_BYTES,
+      1_024,
+      1024 * 1024 * 1024,
+      "Job store byte limit"
+    );
+    this.maxRecordEstimatedBytes = this.integerOption(
+      options.maxRecordEstimatedBytes,
+      Math.min(DEFAULT_JOB_MAX_RECORD_ESTIMATED_BYTES, this.maxEstimatedBytes),
+      512,
+      this.maxEstimatedBytes,
+      "Job record byte limit"
+    );
+  }
 
   submit(input: SubmitJobInput): JobRecord {
     const session = this.sessions.get(input.sessionId);
@@ -128,16 +285,31 @@ export class JobStore {
         (!Number.isSafeInteger(input.expectedWorldEpoch) || input.expectedWorldEpoch < 0)) {
       throw new ObserverError("INVALID_REQUEST", "Expected world epoch is invalid");
     }
-    const idempotencyKey = `${input.sessionId}\0${input.idempotencyKey}`;
-    const originalId = this.idempotency.get(idempotencyKey);
-    if (originalId) return this.require(input.sessionId, originalId);
+    const normalized = normalizeCaptureRequest(input);
+    const fingerprint = normalizedCaptureRequestFingerprint(normalized);
+    const idempotencyKey = this.idempotencyLookupKey(input.sessionId, input.idempotencyKey);
+    const retained = this.idempotency.get(idempotencyKey);
+    if (retained && retained.expiresAt > this.clock.now()) {
+      if (retained.fingerprint !== fingerprint) {
+        throw new ObserverError(
+          "IDEMPOTENCY_CONFLICT",
+          "Observer capture idempotency key was reused with a different request",
+          409
+        );
+      }
+      return this.require(input.sessionId, retained.jobId);
+    }
+    if (retained) this.idempotency.delete(idempotencyKey);
     if (input.performancePolicy === "performance") {
       throw new ObserverError("PERFORMANCE_POLICY_BLOCKED", "Performance capture requires an external measurement coordinator", 409);
     }
 
-    const deadline = Date.parse(input.deadlineAt);
+    const deadline = Date.parse(normalized.deadlineAt);
     if (!Number.isFinite(deadline) || deadline <= this.clock.now()) {
       throw new ObserverError("CAPTURE_TIMEOUT", "Capture deadline has already expired", 408);
+    }
+    if (deadline > session.expiresAt) {
+      throw new ObserverError("CAPTURE_TIMEOUT", "Capture deadline exceeds the observer session lifetime", 408);
     }
     this.assertSessionCaptureLimits(session.limits, input);
     const recentCaptureCount = [...this.jobs.values()].filter((job) =>
@@ -172,10 +344,10 @@ export class JobStore {
       idempotencyKey: input.idempotencyKey,
       instanceId: instance.registration.instanceId,
       worldEpoch: instance.worldEpoch,
-      deadlineAt: new Date(deadline).toISOString(),
-      view: input.view,
-      settleFrames: input.settleFrames ?? 0,
-      performancePolicy: input.performancePolicy ?? "evidence",
+      deadlineAt: normalized.deadlineAt,
+      view: normalized.view,
+      settleFrames: normalized.settleFrames,
+      performancePolicy: normalized.performancePolicy,
     });
     const now = this.clock.now();
     const record: JobRecord = {
@@ -205,10 +377,19 @@ export class JobStore {
       terminalMessage: null,
       artifact: null,
       artifactPath: null,
+      artifactReleaseDisposition: "unseen",
     };
-    this.jobs.set(jobId, record);
-    this.idempotency.set(idempotencyKey, jobId);
+    const receipt: IdempotencyReceipt = {
+      jobId,
+      fingerprint,
+      // A retry window begins at the semantic deadline and can never outlive
+      // the owning session, so even an abandoned receipt has a hard bound.
+      expiresAt: Math.min(session.expiresAt, deadline + this.idempotencyReceiptRetentionMs),
+    };
     const queueKey = this.instanceKey(input.sessionId, record.selectedInstanceId);
+    this.assertCapacity({ jobId, record, idempotencyKey, receipt, queueKey });
+    this.jobs.set(jobId, record);
+    this.idempotency.set(idempotencyKey, receipt);
     const queue = this.pendingByInstance.get(queueKey) ?? [];
     queue.push(jobId);
     this.pendingByInstance.set(queueKey, queue);
@@ -243,11 +424,20 @@ export class JobStore {
       return null;
     }
     if (reportedJobs.size > 0) return null;
+    // A terminal RESTORATION_UNCONFIRMED report is still authoritative camera
+    // state. A later heartbeat with cleared job IDs cannot reopen this
+    // instance to a queued successor until restoration or exact process
+    // vacancy disposes the obligation.
+    if ([...this.jobs.values()].some((record) =>
+      record.sessionId === sessionId && record.selectedInstanceId === instanceId &&
+      this.hasRestorationObligation(record))) return null;
 
-    const queue = this.pendingByInstance.get(this.instanceKey(sessionId, instanceId)) ?? [];
-    for (const jobId of queue) {
-      const record = this.require(sessionId, jobId);
-      if (record.state !== "queued") continue;
+    const queueKey = this.instanceKey(sessionId, instanceId);
+    const queue = this.pendingByInstance.get(queueKey) ?? [];
+    while (queue.length > 0) {
+      const jobId = queue.shift()!;
+      const record = this.jobs.get(jobId);
+      if (!record || record.sessionId !== sessionId || record.state !== "queued") continue;
       if (record.cancellationRequestedAt !== null) {
         this.finish(record, "cancelled", "CANCELLED", "Capture was cancelled before delivery");
         continue;
@@ -256,10 +446,19 @@ export class JobStore {
         this.finish(record, "failed", "CAPTURE_TIMEOUT", "Capture deadline expired before delivery");
         continue;
       }
-      record.state = "dispatched";
-      record.updatedAt = this.clock.now();
-      return this.commandEnvelope(record, "capture");
+      try {
+        const command = this.commandEnvelope(record, "capture", "dispatched");
+        if (queue.length === 0) this.pendingByInstance.delete(queueKey);
+        return command;
+      } catch (error) {
+        // Dispatch admission is failure-atomic: restore the exact queue head if
+        // the mutable record would exceed its retained-store budget.
+        queue.unshift(jobId);
+        this.pendingByInstance.set(queueKey, queue);
+        throw error;
+      }
     }
+    this.pendingByInstance.delete(queueKey);
     return null;
   }
 
@@ -291,17 +490,25 @@ export class JobStore {
       throw new ObserverError("INVALID_REQUEST", "RESTORATION_UNCONFIRMED requires a recorded camera lease and restoring state", 409);
     }
     const cameraLease = this.validateCameraLeaseEvidence(record, status.cameraLease, status.state, restorationUnconfirmed);
+    const candidate = structuredClone(record);
     if (status.worldEpoch !== record.worldEpoch || status.worldId !== record.worldId) {
-      record.cameraLease = cameraLease;
-      record.cameraWasAcquired = cameraLease.everHeld;
+      candidate.cameraLease = cameraLease;
+      candidate.cameraWasAcquired = cameraLease.everHeld;
       if (cameraLease.everHeld && !cameraLease.restorationConfirmed) {
         // Preserve the validated execution phase so a subsequent explicit
         // restoration report remains reachable even though the world changed.
-        record.state = status.state;
-        record.statusSequence = status.sequence;
-        record.updatedAt = this.clock.now();
+        candidate.state = status.state;
+        candidate.statusSequence = status.sequence;
+        candidate.updatedAt = this.clock.now();
+        candidate.cancellationRequestedAt ??= this.clock.now();
+      } else {
+        candidate.state = "failed";
+        candidate.terminalErrorCode = "WORLD_CHANGED";
+        candidate.terminalMessage = "World identity changed during capture";
+        candidate.updatedAt = this.clock.now();
       }
-      this.failWorldChange(record);
+      this.commitRecordMutation(record, candidate);
+      if (TERMINAL.has(record.state)) this.removePendingReference(record);
       throw new ObserverError("WORLD_CHANGED", "Runtime world identity changed during capture", 409);
     }
     if ((status.state === "failed" || status.state === "cancelled") && cameraLease.everHeld &&
@@ -309,36 +516,73 @@ export class JobStore {
       throw new ObserverError("CAMERA_BUSY", "A job that held a camera lease must explicitly confirm restoration before becoming terminal", 409);
     }
 
-    this.acknowledgeDelivery(record, status);
-    record.cameraLease = cameraLease;
-    record.cameraWasAcquired = cameraLease.everHeld;
-    record.state = status.state;
-    record.statusSequence = status.sequence;
-    record.updatedAt = this.clock.now();
-    if (status.state === "awaitingArtifact") record.artifactAwaited = true;
+    this.acknowledgeDelivery(candidate, status);
+    candidate.cameraLease = cameraLease;
+    candidate.cameraWasAcquired = cameraLease.everHeld;
+    candidate.state = status.state;
+    candidate.statusSequence = status.sequence;
+    candidate.updatedAt = this.clock.now();
+    if (status.state === "awaitingArtifact") candidate.artifactAwaited = true;
     if (status.state === "failed") {
-      record.terminalErrorCode = status.errorCode ?? "INTERNAL_ERROR";
-      record.terminalMessage = status.message ?? "Runtime capture failed";
+      candidate.terminalErrorCode = status.errorCode ?? "INTERNAL_ERROR";
+      candidate.terminalMessage = status.message ?? "Runtime capture failed";
     } else if (status.state === "cancelled") {
-      record.terminalErrorCode = "CANCELLED";
-      record.terminalMessage = status.message ?? "Capture cancelled";
+      candidate.terminalErrorCode = "CANCELLED";
+      candidate.terminalMessage = status.message ?? "Capture cancelled";
     }
+    this.commitRecordMutation(record, candidate);
+    if (TERMINAL.has(record.state)) this.removePendingReference(record);
     return record;
   }
 
   cancel(sessionId: string, jobId: string): JobRecord {
     const record = this.require(sessionId, jobId);
     if (TERMINAL.has(record.state)) return record;
-    record.cancellationRequestedAt ??= this.clock.now();
-    record.updatedAt = this.clock.now();
-    if (record.state === "queued") {
-      this.finish(record, "cancelled", "CANCELLED", "Capture cancelled before dispatch");
+    const candidate = structuredClone(record);
+    candidate.cancellationRequestedAt ??= this.clock.now();
+    candidate.updatedAt = this.clock.now();
+    if (candidate.state === "queued") {
+      candidate.state = "cancelled";
+      candidate.terminalErrorCode = "CANCELLED";
+      candidate.terminalMessage = "Capture cancelled before dispatch";
     }
+    this.commitRecordMutation(record, candidate);
+    if (TERMINAL.has(record.state)) this.removePendingReference(record);
     return record;
+  }
+
+  /**
+   * Terminalize work that can no longer report restoration because the host
+   * has independently proved the exact runtime process vacant. This is not a
+   * restoration claim: the distinct disposition preserves what happened.
+   */
+  vacateSession(sessionId: string): string[] {
+    const disposedJobIds: string[] = [];
+    for (const record of this.jobs.values()) {
+      if (record.sessionId !== sessionId ||
+          record.cameraLease.vacancyDisposition === "exact_runtime_vacant") continue;
+      const candidate = structuredClone(record);
+      candidate.cameraLease.held = false;
+      candidate.cameraLease.vacancyDisposition = "exact_runtime_vacant";
+      candidate.updatedAt = this.clock.now();
+      if (!TERMINAL.has(candidate.state)) {
+        candidate.state = "failed";
+        candidate.cancellationRequestedAt ??= candidate.updatedAt;
+        candidate.terminalErrorCode = "INSTANCE_STALE";
+        candidate.terminalMessage = "Exact observer runtime process exited before capture completion";
+      }
+      this.commitRecordMutation(record, candidate);
+      this.removePendingReference(record);
+      disposedJobIds.push(record.request.jobId);
+    }
+    return disposedJobIds;
   }
 
   preflightArtifact(sessionId: string, jobId: string, manifest: ArtifactManifest): ArtifactCompletionPreflight {
     const record = this.require(sessionId, jobId);
+    if (record.artifactReleaseDisposition !== "unseen") {
+      throw new ObserverError("JOB_RELEASED", "Observer job artifact has already been released", 410);
+    }
     this.assertArtifactIdentity(record, manifest);
     if (record.state === "completed") {
       if (record.artifact && isDeepStrictEqual(record.artifact, manifest)) {
@@ -369,27 +613,162 @@ export class JobStore {
       }
       return record;
     }
-    record.artifact = manifest;
-    record.artifactPath = artifactPath;
-    record.state = "completed";
-    record.updatedAt = this.clock.now();
+    const candidate = structuredClone(record);
+    candidate.artifact = manifest;
+    candidate.artifactPath = artifactPath;
+    candidate.state = "completed";
+    candidate.updatedAt = this.clock.now();
+    this.commitRecordMutation(record, candidate);
     return record;
   }
 
-  sweepDeadlines(): string[] {
+  artifactReleaseReceipt(sessionId: string, jobId: string): { released: boolean } | null {
+    this.sweepArtifactReleaseReceipts(this.clock.now());
+    const retained = this.artifactReleaseReceipts.get(this.artifactReleaseKey(sessionId, jobId));
+    if (retained && retained.sessionId === sessionId && retained.jobId === jobId) {
+      return { released: retained.released };
+    }
+    const record = this.jobs.get(jobId);
+    if (!record || record.sessionId !== sessionId || record.artifactReleaseDisposition === "unseen") return null;
+    return { released: record.artifactReleaseDisposition === "erased" };
+  }
+
+  preflightArtifactRelease(sessionId: string, jobId: string): { released: boolean } | null {
+    const retained = this.artifactReleaseReceipt(sessionId, jobId);
+    if (retained) return retained;
+    const receipt: ArtifactReleaseReceipt = {
+      sessionId,
+      jobId,
+      released: false,
+      expiresAt: this.clock.now() + this.terminalJobRetentionMs,
+    };
+    const key = this.artifactReleaseKey(sessionId, jobId);
+    if (this.artifactReleaseReceipts.size + 1 > this.maxRecords ||
+        this.estimatedStoreBytes(undefined, [key, receipt]) +
+          this.jobs.size * JOB_MUTATION_RESERVE_BYTES > this.maxEstimatedBytes) {
+      throw new ObserverError(
+        "TRANSPORT_UNAVAILABLE",
+        "Observer artifact-release receipt budget is exhausted",
+        503
+      );
+    }
+    return null;
+  }
+
+  recordArtifactRelease(sessionId: string, jobId: string, released: boolean): void {
+    if (this.preflightArtifactRelease(sessionId, jobId)) return;
+    this.artifactReleaseReceipts.set(this.artifactReleaseKey(sessionId, jobId), {
+      sessionId,
+      jobId,
+      released,
+      expiresAt: this.clock.now() + this.terminalJobRetentionMs,
+    });
+    const record = this.jobs.get(jobId);
+    if (!record || record.sessionId !== sessionId || record.artifactReleaseDisposition !== "unseen") return;
+    const candidate = structuredClone(record);
+    candidate.artifactReleaseDisposition = released ? "erased" : "absent";
+    candidate.updatedAt = this.clock.now();
+    this.commitRecordMutation(record, candidate);
+  }
+
+  sweepDeadlines(now = this.clock.now()): string[] {
     const failed: string[] = [];
     for (const record of this.jobs.values()) {
-      if (TERMINAL.has(record.state) || Date.parse(record.request.deadlineAt) > this.clock.now()) continue;
-      if (record.state !== "queued" && (!record.artifactAwaited ||
+      if (TERMINAL.has(record.state) || Date.parse(record.request.deadlineAt) > now) continue;
+      if (record.state !== "queued" && record.request.view.kind !== "current" && (!record.artifactAwaited ||
         (record.cameraLease.everHeld && !record.cameraLease.restorationConfirmed))) {
-        record.cancellationRequestedAt ??= this.clock.now();
-        record.updatedAt = this.clock.now();
+        const candidate = structuredClone(record);
+        candidate.cancellationRequestedAt ??= now;
+        candidate.updatedAt = now;
+        this.commitRecordMutation(record, candidate);
         continue;
       }
       this.finish(record, "failed", "CAPTURE_TIMEOUT", "Capture deadline expired");
       failed.push(record.request.jobId);
     }
     return failed;
+  }
+
+  sweep(
+    now = this.clock.now(),
+    options: { pinnedJobIds?: ReadonlySet<string> } = {}
+  ): { removedJobs: string[]; removedIdempotency: number; removedReleaseReceipts: number; removedQueueEntries: number } {
+    this.sweepDeadlines(now);
+    let removedIdempotency = 0;
+    for (const [key, receipt] of this.idempotency) {
+      if (receipt.expiresAt <= now) {
+        this.idempotency.delete(key);
+        removedIdempotency += 1;
+      }
+    }
+    const removedReleaseReceipts = this.sweepArtifactReleaseReceipts(now);
+    const retainedReceiptJobs = new Set([...this.idempotency.values()].map((receipt) => receipt.jobId));
+    const removedJobs: string[] = [];
+    for (const [jobId, record] of this.jobs) {
+      if (!TERMINAL.has(record.state) || record.updatedAt + this.terminalJobRetentionMs > now ||
+          retainedReceiptJobs.has(jobId) || options.pinnedJobIds?.has(jobId) ||
+          this.hasRestorationObligation(record)) continue;
+      this.jobs.delete(jobId);
+      removedJobs.push(jobId);
+    }
+    let removedQueueEntries = 0;
+    for (const [key, queue] of this.pendingByInstance) {
+      const retained = queue.filter((jobId) => this.jobs.get(jobId)?.state === "queued");
+      removedQueueEntries += queue.length - retained.length;
+      if (retained.length === 0) this.pendingByInstance.delete(key);
+      else this.pendingByInstance.set(key, retained);
+    }
+    return { removedJobs, removedIdempotency, removedReleaseReceipts, removedQueueEntries };
+  }
+
+  stats(): {
+    jobs: number;
+    terminalJobs: number;
+    restorationObligations: number;
+    releaseTombstones: number;
+    idempotencyReceipts: number;
+    pendingQueues: number;
+    pendingQueueEntries: number;
+    approximateBytes: number;
+    maxRecords: number;
+    maxEstimatedBytes: number;
+    maxRecordEstimatedBytes: number;
+    reservedMutationBytes: number;
+  } {
+    const pendingQueueEntries = [...this.pendingByInstance.values()]
+      .reduce((total, queue) => total + queue.length, 0);
+    const records = [...this.jobs.values()];
+    const approximateBytes = this.estimatedStoreBytes();
+    return {
+      jobs: this.jobs.size,
+      terminalJobs: records.filter((record) => TERMINAL.has(record.state)).length,
+      restorationObligations: records.filter((record) => this.hasRestorationObligation(record)).length,
+      releaseTombstones: this.artifactReleaseReceipts.size,
+      idempotencyReceipts: this.idempotency.size,
+      pendingQueues: this.pendingByInstance.size,
+      pendingQueueEntries,
+      approximateBytes,
+      maxRecords: this.maxRecords,
+      maxEstimatedBytes: this.maxEstimatedBytes,
+      maxRecordEstimatedBytes: this.maxRecordEstimatedBytes,
+      reservedMutationBytes: this.jobs.size * JOB_MUTATION_RESERVE_BYTES,
+    };
+  }
+
+  obligationJobIds(pinnedJobIds: ReadonlySet<string> = new Set()): Set<string> {
+    return new Set([...this.jobs.values()]
+      .filter((record) =>
+        pinnedJobIds.has(record.request.jobId) ||
+        !TERMINAL.has(record.state) ||
+        this.hasRestorationObligation(record))
+      .map((record) => record.request.jobId));
+  }
+
+  sessionPins(pinnedJobIds: ReadonlySet<string> = new Set()): Set<string> {
+    const obligationJobIds = this.obligationJobIds(pinnedJobIds);
+    return new Set([...this.jobs.values()]
+      .filter((record) => obligationJobIds.has(record.request.jobId))
+      .map((record) => record.sessionId));
   }
 
   require(sessionId: string, jobId: string): JobRecord {
@@ -412,6 +791,7 @@ export class JobStore {
       cancellationRequested: record.cancellationRequestedAt !== null,
       terminalErrorCode: record.terminalErrorCode,
       artifactPath: record.artifactPath,
+      artifactReleaseDisposition: record.artifactReleaseDisposition,
       captureDeliveryAttempt: record.captureDelivery?.attempt ?? 0,
       captureDeliveryAcknowledged: record.captureDelivery?.acknowledgedAt !== null && record.captureDelivery !== null,
       cancellationDeliveryAttempt: record.cancellationDelivery?.attempt ?? 0,
@@ -421,9 +801,15 @@ export class JobStore {
     }));
   }
 
-  private commandEnvelope(record: JobRecord, commandKind: "capture" | "cancel"): RuntimeCommandEnvelope {
+  private commandEnvelope(
+    record: JobRecord,
+    commandKind: "capture" | "cancel",
+    nextState?: ObserverJobState
+  ): RuntimeCommandEnvelope {
+    const candidate = structuredClone(record);
+    if (nextState) candidate.state = nextState;
     const deliveryKey = commandKind === "capture" ? "captureDelivery" : "cancellationDelivery";
-    let delivery = record[deliveryKey];
+    let delivery = candidate[deliveryKey];
     if (!delivery) {
       delivery = {
         attempt: 1,
@@ -431,8 +817,8 @@ export class JobStore {
         leaseExpiresAt: this.clock.now() + COMMAND_DELIVERY_LEASE_MS,
         acknowledgedAt: null,
       };
-      record[deliveryKey] = delivery;
-      record.updatedAt = this.clock.now();
+      candidate[deliveryKey] = delivery;
+      candidate.updatedAt = this.clock.now();
     } else if (delivery.acknowledgedAt === null && delivery.leaseExpiresAt <= this.clock.now()) {
       // Keep the acknowledgement identity stable across delivery retries. A
       // runtime may have received the command and be retrying an accepted
@@ -440,19 +826,21 @@ export class JobStore {
       // make that valid acknowledgement permanently stale.
       delivery.attempt += 1;
       delivery.leaseExpiresAt = this.clock.now() + COMMAND_DELIVERY_LEASE_MS;
-      record.updatedAt = this.clock.now();
+      candidate.updatedAt = this.clock.now();
     }
-    return runtimeCommandEnvelopeSchema.parse({
-      ...record.request,
+    const command = runtimeCommandEnvelopeSchema.parse({
+      ...candidate.request,
       commandKind,
       deliveryAttempt: delivery.attempt,
       deliveryToken: delivery.token,
       deliveryLeaseExpiresAt: new Date(delivery.leaseExpiresAt).toISOString(),
-      wireView: runtimeWireView(record.request.view),
-      ...(commandKind === "cancel" && record.cancellationRequestedAt !== null
-        ? { cancellationRequestedAt: new Date(record.cancellationRequestedAt).toISOString() }
+      wireView: runtimeWireView(candidate.request.view),
+      ...(commandKind === "cancel" && candidate.cancellationRequestedAt !== null
+        ? { cancellationRequestedAt: new Date(candidate.cancellationRequestedAt).toISOString() }
         : {}),
     });
+    this.commitRecordMutation(record, candidate);
+    return command;
   }
 
   private acknowledgeDelivery(record: JobRecord, status: JobStatus): void {
@@ -585,23 +973,139 @@ export class JobStore {
     }
   }
 
-  private failWorldChange(record: JobRecord): void {
-    if (record.cameraLease.everHeld && !record.cameraLease.restorationConfirmed) {
-      record.cancellationRequestedAt ??= this.clock.now();
-      record.updatedAt = this.clock.now();
-      return;
-    }
-    this.finish(record, "failed", "WORLD_CHANGED", "World identity changed during capture");
-  }
-
   private finish(record: JobRecord, state: "failed" | "cancelled", code: ObserverErrorCode, message: string): void {
     if (record.cameraLease.everHeld && (record.cameraLease.held || !record.cameraLease.restorationConfirmed)) {
       throw new ObserverError("CAMERA_BUSY", "Camera restoration must be explicitly confirmed before host termination", 409);
     }
-    record.state = state;
-    record.terminalErrorCode = code;
-    record.terminalMessage = message;
-    record.updatedAt = this.clock.now();
+    const candidate = structuredClone(record);
+    candidate.state = state;
+    candidate.terminalErrorCode = code;
+    candidate.terminalMessage = message;
+    candidate.updatedAt = this.clock.now();
+    this.commitRecordMutation(record, candidate);
+    this.removePendingReference(record);
+  }
+
+  private removePendingReference(record: JobRecord): void {
+    const key = this.instanceKey(record.sessionId, record.selectedInstanceId);
+    const queue = this.pendingByInstance.get(key);
+    if (!queue) return;
+    const retained = queue.filter((jobId) => jobId !== record.request.jobId);
+    if (retained.length === 0) this.pendingByInstance.delete(key);
+    else this.pendingByInstance.set(key, retained);
+  }
+
+  private idempotencyLookupKey(sessionId: string, idempotencyKey: string): string {
+    return createHash("sha256").update(`${sessionId}\0${idempotencyKey}`, "utf8").digest("hex");
+  }
+
+  private assertCapacity(
+    addition: {
+      jobId: string;
+      record: JobRecord;
+      idempotencyKey: string;
+      receipt: IdempotencyReceipt;
+      queueKey: string;
+    }
+  ): void {
+    const pendingQueueEntries = [...this.pendingByInstance.values()]
+      .reduce((total, queue) => total + queue.length, 0);
+    if (this.jobs.size + 1 > this.maxRecords ||
+        this.idempotency.size + 1 > this.maxRecords ||
+        pendingQueueEntries + 1 > this.maxRecords ||
+        this.jobRecordBytes(addition.record) > this.maxRecordEstimatedBytes ||
+        this.estimatedStoreBytes(addition) +
+          (this.jobs.size + 1) * JOB_MUTATION_RESERVE_BYTES > this.maxEstimatedBytes) {
+      throw new ObserverError(
+        "TRANSPORT_UNAVAILABLE",
+        "Observer job store retention budget is exhausted",
+        503
+      );
+    }
+  }
+
+  private commitRecordMutation(record: JobRecord, candidate: JobRecord): void {
+    const candidateBytes = this.jobRecordBytes(candidate);
+    const projectedBytes = this.estimatedStoreBytes() - this.jobRecordBytes(record) + candidateBytes;
+    if (candidateBytes > this.maxRecordEstimatedBytes ||
+        projectedBytes + this.jobs.size * JOB_MUTATION_RESERVE_BYTES > this.maxEstimatedBytes) {
+      throw new ObserverError(
+        "TRANSPORT_UNAVAILABLE",
+        "Observer job store retention budget is exhausted",
+        503
+      );
+    }
+    Object.assign(record, candidate);
+  }
+
+  private jobRecordBytes(record: JobRecord): number {
+    return Buffer.byteLength(JSON.stringify(record), "utf8");
+  }
+
+  private estimatedStoreBytes(addition?: {
+    jobId: string;
+    record: JobRecord;
+    idempotencyKey: string;
+    receipt: IdempotencyReceipt;
+    queueKey: string;
+  }, releaseAddition?: [string, ArtifactReleaseReceipt]): number {
+    const jobs: Array<[string, JobRecord]> = [...this.jobs.entries()];
+    const idempotency: Array<[string, IdempotencyReceipt]> = [...this.idempotency.entries()];
+    const artifactReleaseReceipts: Array<[string, ArtifactReleaseReceipt]> = [
+      ...this.artifactReleaseReceipts.entries(),
+    ];
+    const queues: Array<[string, string[]]> = [...this.pendingByInstance.entries()]
+      .map(([key, values]): [string, string[]] => [key, [...values]]);
+    if (addition) {
+      jobs.push([addition.jobId, addition.record]);
+      idempotency.push([addition.idempotencyKey, addition.receipt]);
+      const queue = queues.find(([key]) => key === addition.queueKey);
+      if (queue) queue[1].push(addition.jobId);
+      else queues.push([addition.queueKey, [addition.jobId]]);
+    }
+    if (releaseAddition) artifactReleaseReceipts.push(releaseAddition);
+    return Buffer.byteLength(JSON.stringify({ jobs, idempotency, artifactReleaseReceipts, queues }), "utf8");
+  }
+
+  private artifactReleaseKey(sessionId: string, jobId: string): string {
+    return createHash("sha256").update(`${sessionId}\0${jobId}`, "utf8").digest("hex");
+  }
+
+  private sweepArtifactReleaseReceipts(now: number): number {
+    let removed = 0;
+    for (const [key, receipt] of this.artifactReleaseReceipts) {
+      if (receipt.expiresAt > now) continue;
+      this.artifactReleaseReceipts.delete(key);
+      removed += 1;
+    }
+    return removed;
+  }
+
+  private hasRestorationObligation(record: JobRecord): boolean {
+    return record.cameraLease.everHeld && !record.cameraLease.restorationConfirmed &&
+      record.cameraLease.vacancyDisposition !== "exact_runtime_vacant";
+  }
+
+  private retentionOption(value: number | undefined, fallback: number, label: string): number {
+    const result = value ?? fallback;
+    if (!Number.isSafeInteger(result) || result < 1 || result > 24 * 60 * 60_000) {
+      throw new ObserverError("INVALID_REQUEST", `${label} must be from 1 through 86400000 milliseconds`);
+    }
+    return result;
+  }
+
+  private integerOption(
+    value: number | undefined,
+    fallback: number,
+    minimum: number,
+    maximum: number,
+    label: string
+  ): number {
+    const result = value ?? fallback;
+    if (!Number.isSafeInteger(result) || result < minimum || result > maximum) {
+      throw new ObserverError("INVALID_REQUEST", `${label} must be from ${minimum} through ${maximum}`);
+    }
+    return result;
   }
 
   private instanceKey(sessionId: string, instanceId: string): string {

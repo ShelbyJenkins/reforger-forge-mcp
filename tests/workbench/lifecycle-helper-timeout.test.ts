@@ -33,13 +33,6 @@ function helper(body: string): string {
   return path;
 }
 
-function failStopRecorder(calls: string[]): (message: string) => never {
-  return (message): never => {
-    calls.push(message);
-    throw new Error(`TEST_FAIL_STOP: ${message}`);
-  };
-}
-
 const expectedWorkbench: WorkbenchIdentity = {
   pid: 4242,
   executablePath: "C:\\Tools\\Workbench.exe",
@@ -110,46 +103,40 @@ describe.runIf(platform() === "win32")("Windows lifecycle helper parent deadline
     })).rejects.toMatchObject({ code: "HELPER_FAILURE" });
   }, 10_000);
 
-  it("fail-stops when a refusing mutex helper ignores stdin and never exits", async () => {
-    const failStops: string[] = [];
+  it("bounds a refusing mutex helper that ignores stdin without aborting the parent", async () => {
     const backend = new WindowsLifecycleBackend(helper([
       "[Console]::Out.WriteLine('{\"ok\":false,\"status\":\"timeout\"}')",
       "[Console]::Out.Flush()",
       "Start-Sleep -Seconds 30",
     ].join("\r\n")), {
       helperTimeoutMs: 1_000,
-      failStop: failStopRecorder(failStops),
     });
 
     await expect(backend.withMachineMutex({
       name: `Global\\ReforgerForge.Timeout.Refusal.${process.pid}.${Date.now()}`,
       timeoutMs: 1_000,
       action: async () => undefined,
-    })).rejects.toThrow("TEST_FAIL_STOP");
-    expect(failStops).toHaveLength(1);
+    })).rejects.toMatchObject({ code: "HELPER_FAILURE" });
   }, 10_000);
 
-  it("fail-stops when an acquired mutex helper ignores release", async () => {
-    const failStops: string[] = [];
+  it("returns durable recovery when an acquired mutex helper ignores release", async () => {
     const backend = new WindowsLifecycleBackend(helper([
       "[Console]::Out.WriteLine('{\"ok\":true,\"status\":\"acquired\"}')",
       "[Console]::Out.Flush()",
       "Start-Sleep -Seconds 30",
     ].join("\r\n")), {
       helperTimeoutMs: 1_000,
-      failStop: failStopRecorder(failStops),
     });
 
     await expect(backend.withMachineMutex({
       name: `Global\\ReforgerForge.Timeout.Release.${process.pid}.${Date.now()}`,
       timeoutMs: 1_000,
       action: async () => undefined,
-    })).rejects.toThrow("TEST_FAIL_STOP");
-    expect(failStops).toHaveLength(1);
+    })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
   }, 10_000);
 
-  it("fail-stops when the mutex holder exits during an active callback", async () => {
-    const failStops: string[] = [];
+  it("invalidates active work and returns durable recovery when the mutex holder exits", async () => {
+    let leaseLoss: LifecycleGuardError | null = null;
     const backend = new WindowsLifecycleBackend(helper([
       "[Console]::Out.WriteLine('{\"ok\":true,\"status\":\"acquired\"}')",
       "[Console]::Out.Flush()",
@@ -157,15 +144,15 @@ describe.runIf(platform() === "win32")("Windows lifecycle helper parent deadline
       "exit 0",
     ].join("\r\n")), {
       helperTimeoutMs: 1_000,
-      failStop: failStopRecorder(failStops),
     });
 
     await expect(backend.withMachineMutex({
       name: `Global\\ReforgerForge.Timeout.HolderExit.${process.pid}.${Date.now()}`,
       timeoutMs: 1_000,
+      onLeaseLost: (error) => { leaseLoss = error; },
       action: () => new Promise<never>(() => undefined),
-    })).rejects.toThrow("TEST_FAIL_STOP");
-    expect(failStops).toHaveLength(1);
+    })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    expect(leaseLoss).toMatchObject({ code: "RECOVERY_REQUIRED" });
   }, 10_000);
 
   it("bounds a helper hung during process inspection without fail-stopping", async () => {
@@ -176,32 +163,25 @@ describe.runIf(platform() === "win32")("Windows lifecycle helper parent deadline
     await expect(backend.inspectProcess(4242)).rejects.toBeInstanceOf(LifecycleGuardError);
   }, 10_000);
 
-  it("fail-stops when lifecycle state replacement does not return", async () => {
-    const failStops: string[] = [];
+  it("returns durable recovery when lifecycle state replacement does not return", async () => {
     const backend = new WindowsLifecycleBackend(helper("Start-Sleep -Seconds 30"), {
       helperTimeoutMs: 1_000,
-      failStop: failStopRecorder(failStops),
     });
 
     await expect(backend.replaceState({
       path: join(roots[0], "state.json"),
       expectedGeneration: null,
       next: vacantState,
-    })).rejects.toThrow("TEST_FAIL_STOP");
-    expect(failStops).toHaveLength(1);
+    })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
   }, 10_000);
 
-  it("fail-stops when exact termination does not return", async () => {
-    const failStops: string[] = [];
+  it("returns durable recovery when exact termination does not return", async () => {
     const backend = new WindowsLifecycleBackend(helper("Start-Sleep -Seconds 30"), {
       helperTimeoutMs: 1_000,
-      failStop: failStopRecorder(failStops),
     });
 
-    await expect(backend.verifyAndTerminate(expectedWorkbench, 50)).rejects.toThrow(
-      "TEST_FAIL_STOP"
-    );
-    expect(failStops).toHaveLength(1);
+    await expect(backend.verifyAndTerminate(expectedWorkbench, 50))
+      .rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
   }, 10_000);
 });
 

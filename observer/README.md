@@ -84,6 +84,22 @@ until the host has validated the regular PNG file, dimensions, stable size,
 digest, and session/job binding. Status and doctor remain non-mutating while the
 private child is idle.
 
+The agent sweeps in-memory ownership stores every second and once more during
+controlled shutdown. By default, revoked session tombstones remain replayable
+for five minutes, terminal jobs and idempotency receipts for ten minutes, and
+stale instances for five minutes after the liveness threshold. Nonterminal or
+restoration-pending jobs, runtime-stop reservations, and captures referenced by
+an open evidence run pin their owning records. Store diagnostics report current
+counts, estimated bytes, and configured ceilings.
+
+Mailbox remains a supported fallback. Accepted files are deleted, permanent
+rejections move immediately to quarantine, and transient failures have an
+eight-attempt/30-second budget. Polling rotates beyond the 256-file work batch,
+so an earlier poison set cannot starve later commands. Each quarantine keeps at
+most 128 records, 4 MiB, and 24 hours of evidence; the agent also enforces a
+64-MiB aggregate mailbox-state ceiling and substitutes a bounded disposition
+summary when retaining an original would exceed it.
+
 Explicit runtime views restore in two phases. The normal update stages the
 original camera owner and state; the still-live observer entity then reapplies
 and verifies that state from POSTFRAME, after gameplay camera updates. The
@@ -139,6 +155,20 @@ fails closed. `stale` reports that the observer session expired while the exact
 process may remain owned; session expiry never causes an automatic stop.
 Multiple runtimes remain independent under their own `runtimeId` receipts.
 
+Prepared launches use one hashed session index, so replay never scans or parses
+unrelated descriptors. The durable lifecycle store admits at most 16,384
+records and 512 MiB by default, with a 128-MiB per-record ceiling. Completed
+runtime clusters, cleanup-verified failed starts, and expired unused
+preparations retain their retry evidence for 24 hours before an explicit or
+shutdown sweep removes them. Live children, cleanup-pending stops,
+cleanup-required starts, and any other unresolved exact-ownership obligation
+are never evicted; capacity exhaustion fails closed and is visible through
+bounded storage diagnostics. Admission also reserves the temporary-file peak
+and the complete mutation headroom needed to publish later exact-exit and stop
+evidence. The prepared-ID-keyed consumption receipt scopes a malformed live
+record to its own lifecycle/session, so it does not stop independent
+preparation or sweeping.
+
 Capturing is a separate transaction. Inventory binds the runtime instance and
 world; capture may acquire a camera lease; completion, cancellation, or failure
 must reach terminal restoration. Only then should the caller request stop:
@@ -158,8 +188,11 @@ restoration cannot be proved. It then reopens and reverifies the exact identity,
 terminates only that verified process through the native handle backend, waits
 for exact-process exit, proves the identity vacant, and preserves an idempotent
 stop-result receipt. A successful restoration reservation seals the session
-against new capture submissions and is persisted before native termination.
-The stop receipt records that proof; observer-session completion is separately
+against new capture submissions. Each caller proposes an exclusive lease
+generation; a competing caller cannot learn or release the incumbent lease.
+The lease is persisted before native termination and retained after any
+pre-signal failure, so recovery must reuse the same stop idempotency key. The
+stop receipt records that proof; observer-session completion is separately
 acknowledged and retried idempotently before stop reports success. It never
 invokes `taskkill`, `Stop-Process`, process-name enumeration, PID-only
 termination, or broad tree termination.

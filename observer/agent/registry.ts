@@ -1,5 +1,5 @@
 import {
-  CAPABILITIES,
+  CAPABILITY_REGISTRY,
   PROTOCOL_MAJOR,
   heartbeatSchema,
   instanceRegistrationSchema,
@@ -12,7 +12,11 @@ import {
 import { ObserverError } from "./errors.js";
 import { type Clock, SessionStore, systemClock } from "./sessions.js";
 
-const KNOWN_CAPABILITIES = new Set<string>(CAPABILITIES);
+const RUNTIME_CAPABILITIES = new Set<string>(
+  Object.entries(CAPABILITY_REGISTRY)
+    .filter(([, definition]) => definition.backends.includes("runtime" as never))
+    .map(([capability]) => capability)
+);
 
 export interface InstanceRecord {
   registration: InstanceRegistration;
@@ -31,17 +35,47 @@ export interface InstanceRecord {
 
 export interface RegistryOptions {
   staleAfterMs?: number;
+  staleRetentionMs?: number;
+  maxRecords?: number;
+  maxEstimatedBytes?: number;
   clock?: Clock;
+}
+
+export interface RegistrySweepResult {
+  removedInstanceKeys: string[];
+}
+
+export interface InstanceRegistryStats {
+  records: number;
+  stale: number;
+  restorationObligations: number;
+  estimatedBytes: number;
+  maxRecords: number;
+  maxEstimatedBytes: number;
+  staleAfterMs: number;
+  staleRetentionMs: number;
 }
 
 export class InstanceRegistry {
   private readonly instances = new Map<string, InstanceRecord>();
   private readonly clock: Clock;
   readonly staleAfterMs: number;
+  readonly staleRetentionMs: number;
+  readonly maxRecords: number;
+  readonly maxEstimatedBytes: number;
 
   constructor(private readonly sessions: SessionStore, options: RegistryOptions = {}) {
     this.clock = options.clock ?? systemClock;
-    this.staleAfterMs = options.staleAfterMs ?? 15_000;
+    this.staleAfterMs = this.boundedOption(options.staleAfterMs, 15_000, 1_000, 24 * 60 * 60_000, "Instance stale threshold");
+    this.staleRetentionMs = this.boundedOption(options.staleRetentionMs, 5 * 60_000, 0, 24 * 60 * 60_000, "Stale instance retention");
+    this.maxRecords = this.boundedOption(options.maxRecords, 4_096, 1, 100_000, "Instance record limit");
+    this.maxEstimatedBytes = this.boundedOption(
+      options.maxEstimatedBytes,
+      16 * 1024 * 1024,
+      1_024,
+      1024 * 1024 * 1024,
+      "Instance registry byte limit"
+    );
   }
 
   register(input: unknown, token: string): InstanceRecord {
@@ -66,7 +100,6 @@ export class InstanceRegistry {
     if (otherLiveInstance && !session.allowMultipleInstances) {
       throw new ObserverError("INSTANCE_CONFLICT", "This launch nonce already has an active runtime instance", 409);
     }
-    this.sessions.bindInstance(registration.sessionId, registration.instanceNonce);
     const mapKey = this.key(registration.sessionId, registration.instanceId);
     const existing = this.instances.get(mapKey);
     if (existing && existing.registration.instanceNonce !== registration.instanceNonce && !this.isStale(existing)) {
@@ -74,8 +107,8 @@ export class InstanceRegistry {
     }
 
     const unique = [...new Set(registration.capabilities)];
-    const known = unique.filter((capability): capability is ObserverCapability => KNOWN_CAPABILITIES.has(capability));
-    const unknown = unique.filter((capability) => !KNOWN_CAPABILITIES.has(capability));
+    const known = unique.filter((capability): capability is ObserverCapability => RUNTIME_CAPABILITIES.has(capability));
+    const unknown = unique.filter((capability) => !RUNTIME_CAPABILITIES.has(capability));
     if (registration.headless) {
       for (const forbidden of ["render.capture", "camera.runtime"] as const) {
         const index = known.indexOf(forbidden);
@@ -97,6 +130,11 @@ export class InstanceRegistry {
       transportHealthy: true,
       lastErrorCode: null,
     };
+    this.assertCapacity(mapKey, record, now);
+    // Commit the cross-store session binding only after registry admission is
+    // known to succeed. A rejected candidate must leave the launch nonce free
+    // for a corrected registration retry.
+    this.sessions.bindInstance(registration.sessionId, registration.instanceNonce);
     this.instances.set(mapKey, record);
     return record;
   }
@@ -112,17 +150,25 @@ export class InstanceRegistry {
     const sentAt = Date.parse(heartbeat.sentAt);
     if (sentAt > this.clock.now() + 60_000) throw new ObserverError("INVALID_REQUEST", "Heartbeat timestamp is too far in the future");
     const unique = [...new Set(heartbeat.capabilities)];
-    record.knownCapabilities = unique.filter((capability): capability is ObserverCapability => KNOWN_CAPABILITIES.has(capability));
-    if (record.registration.headless) record.knownCapabilities = record.knownCapabilities.filter((capability) => capability !== "render.capture" && capability !== "camera.runtime");
-    record.unknownCapabilities = unique.filter((capability) => !KNOWN_CAPABILITIES.has(capability));
-    record.lastHeartbeatAtMs = this.clock.now();
-    record.lastHeartbeatSequence = heartbeat.sequence;
-    record.worldId = heartbeat.worldId;
-    record.worldEpoch = heartbeat.worldEpoch;
-    record.activeJobId = heartbeat.activeJobId ?? null;
-    record.cameraLeaseJobId = heartbeat.cameraLeaseJobId ?? null;
-    record.transportHealthy = heartbeat.transportHealthy;
-    record.lastErrorCode = heartbeat.lastErrorCode ?? null;
+    let knownCapabilities = unique.filter((capability): capability is ObserverCapability => RUNTIME_CAPABILITIES.has(capability));
+    if (record.registration.headless) {
+      knownCapabilities = knownCapabilities.filter((capability) => capability !== "render.capture" && capability !== "camera.runtime");
+    }
+    const next: InstanceRecord = {
+      ...record,
+      knownCapabilities,
+      unknownCapabilities: unique.filter((capability) => !RUNTIME_CAPABILITIES.has(capability)),
+      lastHeartbeatAtMs: this.clock.now(),
+      lastHeartbeatSequence: heartbeat.sequence,
+      worldId: heartbeat.worldId,
+      worldEpoch: heartbeat.worldEpoch,
+      activeJobId: heartbeat.activeJobId ?? null,
+      cameraLeaseJobId: heartbeat.cameraLeaseJobId ?? null,
+      transportHealthy: heartbeat.transportHealthy,
+      lastErrorCode: heartbeat.lastErrorCode ?? null,
+    };
+    this.assertCapacity(this.key(heartbeat.sessionId, heartbeat.instanceId), next, next.lastHeartbeatAtMs, false);
+    Object.assign(record, next);
     return record;
   }
 
@@ -152,8 +198,49 @@ export class InstanceRegistry {
     return [...this.instances.values()].filter((record) => record.registration.sessionId === sessionId);
   }
 
+  sessionIds(): Set<string> {
+    return new Set([...this.instances.values()].map((record) => record.registration.sessionId));
+  }
+
+  /** Remove runtime-instance claims after the host proves the exact process vacant. */
+  vacateSession(sessionId: string): number {
+    let removed = 0;
+    for (const [key, record] of this.instances) {
+      if (record.registration.sessionId !== sessionId) continue;
+      this.instances.delete(key);
+      removed += 1;
+    }
+    return removed;
+  }
+
   isStale(record: InstanceRecord): boolean {
     return this.clock.now() - record.lastHeartbeatAtMs > this.staleAfterMs;
+  }
+
+  sweep(
+    now = this.clock.now(),
+    pinnedSessionIds: ReadonlySet<string> = new Set(),
+    authoritativeObligationJobIds?: ReadonlySet<string>
+  ): RegistrySweepResult {
+    const removedInstanceKeys: string[] = [];
+    for (const [key, record] of this.instances) {
+      const sessionId = record.registration.sessionId;
+      const reportedObligationJobIds = [record.activeJobId, record.cameraLeaseJobId]
+        .filter((jobId): jobId is string => jobId !== null);
+      // Standalone registry users remain conservative. The composed agent
+      // supplies JobStore's authoritative set so stale heartbeat fields cannot
+      // retain a revoked session after its real obligation is terminal/gone.
+      const restorationObligation = authoritativeObligationJobIds === undefined
+        ? reportedObligationJobIds.length > 0
+        : reportedObligationJobIds.some((jobId) => authoritativeObligationJobIds.has(jobId));
+      if (restorationObligation || pinnedSessionIds.has(sessionId) || this.sessions.isPinned(sessionId, pinnedSessionIds)) continue;
+      const sessionTerminal = this.sessions.isTerminal(sessionId, now);
+      const staleBeyondRetention = now - record.lastHeartbeatAtMs > this.staleAfterMs + this.staleRetentionMs;
+      if (!sessionTerminal && !staleBeyondRetention) continue;
+      this.instances.delete(key);
+      removedInstanceKeys.push(key);
+    }
+    return { removedInstanceKeys };
   }
 
   diagnostics(): Array<Record<string, unknown>> {
@@ -177,6 +264,20 @@ export class InstanceRegistry {
     }));
   }
 
+  stats(now = this.clock.now()): InstanceRegistryStats {
+    const records = [...this.instances.values()];
+    return {
+      records: records.length,
+      stale: records.filter((record) => now - record.lastHeartbeatAtMs > this.staleAfterMs).length,
+      restorationObligations: records.filter((record) => record.activeJobId !== null || record.cameraLeaseJobId !== null).length,
+      estimatedBytes: records.reduce((total, record) => total + this.recordBytes(record), 0),
+      maxRecords: this.maxRecords,
+      maxEstimatedBytes: this.maxEstimatedBytes,
+      staleAfterMs: this.staleAfterMs,
+      staleRetentionMs: this.staleRetentionMs,
+    };
+  }
+
   private assertRoutable(record: InstanceRecord, required: readonly ObserverCapability[]): void {
     if (this.isStale(record)) throw new ObserverError("INSTANCE_STALE", "Requested observer runtime instance is stale", 409);
     if (!record.transportHealthy) throw new ObserverError("TRANSPORT_UNAVAILABLE", "Requested observer runtime transport is unhealthy", 409);
@@ -187,5 +288,28 @@ export class InstanceRegistry {
 
   private key(sessionId: string, instanceId: string): string {
     return `${sessionId}\0${instanceId}`;
+  }
+
+  private assertCapacity(key: string, record: InstanceRecord, now: number, sweep = true): void {
+    if (sweep) this.sweep(now);
+    const replacing = this.instances.get(key);
+    const nextRecords = this.instances.size + (replacing ? 0 : 1);
+    const currentBytes = [...this.instances.values()].reduce((total, existing) => total + this.recordBytes(existing), 0);
+    const nextBytes = currentBytes - (replacing ? this.recordBytes(replacing) : 0) + this.recordBytes(record);
+    if (nextRecords > this.maxRecords || nextBytes > this.maxEstimatedBytes) {
+      throw new ObserverError("TRANSPORT_UNAVAILABLE", "Observer instance registry retention budget is exhausted", 503);
+    }
+  }
+
+  private recordBytes(record: InstanceRecord): number {
+    return Buffer.byteLength(JSON.stringify(record), "utf8");
+  }
+
+  private boundedOption(value: number | undefined, fallback: number, minimum: number, maximum: number, label: string): number {
+    const selected = value ?? fallback;
+    if (!Number.isSafeInteger(selected) || selected < minimum || selected > maximum) {
+      throw new ObserverError("INVALID_REQUEST", `${label} must be an integer from ${minimum} through ${maximum}`);
+    }
+    return selected;
   }
 }

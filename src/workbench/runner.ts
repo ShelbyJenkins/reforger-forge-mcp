@@ -49,6 +49,7 @@ const DEFAULT_ENDPOINT_POLL_MS = 200;
 const DEFAULT_LOG_ATTRIBUTION_TIMEOUT_MS = 10_000;
 const DEFAULT_LOG_POLL_MS = 200;
 const DEFAULT_TERMINATION_TIMEOUT_MS = 15_000;
+const DEFAULT_RECOVERY_TIMEOUT_MS = 15_000;
 const MAX_BUILD_TIMEOUT_MS = 60 * 60 * 1_000;
 const LOG_CLOCK_SKEW_MS = 2_000;
 const NET_API_CLIENT_ID = "ReforgerForgeWorkbenchRunner";
@@ -64,6 +65,7 @@ export type WorkbenchRunnerErrorCode =
   | "IDENTITY_UNVERIFIABLE"
   | "ENDPOINT_UNVERIFIABLE"
   | "TERMINATION_REFUSED"
+  | "RECOVERY_REQUIRED"
   | "LOG_ATTRIBUTION_FAILED"
   | "OUTPUT_ATTESTATION_FAILED"
   | "BUILD_DEADLINE_EXCEEDED"
@@ -190,6 +192,8 @@ export interface WorkbenchRunnerDependencies {
   logAttributionTimeoutMs?: number;
   logPollMs?: number;
   terminationTimeoutMs?: number;
+  /** Hard post-termination bound for proving exact child absence. */
+  recoveryTimeoutMs?: number;
 }
 
 interface ChildExit {
@@ -362,7 +366,10 @@ function validateEndpoint(config: Pick<Config, "workbenchHost" | "workbenchPort"
   return { host, port };
 }
 
-function validateBuildOutput(intent: WorkbenchBuildIntent): string {
+function validateBuildOutput(
+  intent: WorkbenchBuildIntent,
+  protectedRoots: ReadonlyArray<{ label: string; path: string }> = []
+): string {
   if (intent.platform !== "PC") {
     throw new WorkbenchRunnerError(
       "The structured Workbench build runner currently supports only platform PC.",
@@ -374,9 +381,13 @@ function validateBuildOutput(intent: WorkbenchBuildIntent): string {
     throw new WorkbenchRunnerError("Build outputPath must be non-empty.", "INVALID_INTENT");
   }
   const output = resolve(intent.outputPath.trim());
+  assertBuildOutputIsolated(output, protectedRoots);
   try {
     mkdirSync(output, { recursive: true });
     const canonical = canonicalDirectory(output, "Workbench build output");
+    // Recheck after filesystem canonicalization so a junction/symlinked parent
+    // cannot make a lexically separate output alias a protected lifecycle root.
+    assertBuildOutputIsolated(canonical, protectedRoots);
     assertEmptyBuildOutput(canonical);
     return canonical;
   } catch (error) {
@@ -395,6 +406,20 @@ function assertEmptyBuildOutput(root: string): void {
       `Workbench build output must be a unique empty directory before launch: ${root}`,
       "OUTPUT_ATTESTATION_FAILED"
     );
+  }
+}
+
+function assertBuildOutputIsolated(
+  output: string,
+  protectedRoots: ReadonlyArray<{ label: string; path: string }>
+): void {
+  for (const protectedRoot of protectedRoots) {
+    if (pathsOverlap(output, protectedRoot.path)) {
+      throw new WorkbenchRunnerError(
+        `Workbench build output must not overlap ${protectedRoot.label}: ${protectedRoot.path}`,
+        "INVALID_INTENT"
+      );
+    }
   }
 }
 
@@ -822,7 +847,7 @@ function abortPromise(signal: AbortSignal | undefined): Promise<"aborted"> {
 }
 
 async function inspectSpawnedIdentity(
-  session: WorkbenchLifecycleSession,
+  guard: WorkbenchProcessGuard,
   child: ChildProcess,
   childExit: ChildObservation,
   executablePath: string,
@@ -836,7 +861,7 @@ async function inspectSpawnedIdentity(
     );
   }
   return Promise.race([
-    session.inspectSpawnedWorkbench({
+    guard.inspectSpawnedWorkbench({
       pid: child.pid,
       executablePath,
       ownerTokenArgument: ownerArgument,
@@ -853,7 +878,7 @@ async function inspectSpawnedIdentity(
 }
 
 async function probeEndpointOwnership(args: {
-  session: WorkbenchLifecycleSession;
+  guard: WorkbenchProcessGuard;
   endpoint: LifecycleEndpoint;
   identity: WorkbenchIdentity;
   childExit: ChildObservation;
@@ -865,7 +890,7 @@ async function probeEndpointOwnership(args: {
   while (!args.childExit.hasClosed() && !args.signal?.aborted) {
     const childError = args.childExit.getError();
     if (childError) throw childError;
-    const result = await args.session.verifyEndpointOwner(args.endpoint, args.identity);
+    const result = await args.guard.verifyEndpointOwner(args.endpoint, args.identity);
     if (result.kind === "owned") return "verified";
     if (result.reason !== "listener_not_found") {
       const exitedDuringInspection = await Promise.race([
@@ -1059,6 +1084,70 @@ function lifecycleDraft(
   };
 }
 
+function sameWorkbenchIdentity(
+  left: WorkbenchIdentity | null,
+  right: WorkbenchIdentity | null
+): boolean {
+  if (!left || !right) return left === right;
+  return left.pid === right.pid &&
+    pathKey(left.executablePath) === pathKey(right.executablePath) &&
+    left.creationTime === right.creationTime &&
+    left.ownerTokenArgument === right.ownerTokenArgument &&
+    left.launchedAtMs === right.launchedAtMs;
+}
+
+function sameLifecycleOwner(
+  left: WorkbenchLifecycleStateV3["mcpOwner"],
+  right: WorkbenchLifecycleStateV3["mcpOwner"]
+): boolean {
+  if (!left || !right) return left === right;
+  return left.pid === right.pid &&
+    pathKey(left.executablePath) === pathKey(right.executablePath) &&
+    left.creationTime === right.creationTime &&
+    left.userSid === right.userSid &&
+    left.instanceId === right.instanceId &&
+    left.leaseId === right.leaseId;
+}
+
+async function requireReservedLifecycle(
+  session: WorkbenchLifecycleSession,
+  expected: WorkbenchLifecycleStateV3
+): Promise<WorkbenchLifecycleStateV3> {
+  const read = await session.readState();
+  if (read.kind !== "valid" || read.state.generation !== expected.generation ||
+      !sameLifecycleOwner(read.state.mcpOwner, expected.mcpOwner) ||
+      !sameWorkbenchIdentity(read.state.workbench, expected.workbench)) {
+    throw new WorkbenchRunnerError(
+      "RECOVERY_REQUIRED: lifecycle generation or exact owner changed while the runner mutex " +
+        "was released. The stale transition was refused and durable state was preserved.",
+      "RECOVERY_REQUIRED"
+    );
+  }
+  return read.state;
+}
+
+async function transitionReservedLifecycle(
+  guard: WorkbenchProcessGuard,
+  expected: WorkbenchLifecycleStateV3,
+  overrides: Partial<LifecycleStateDraft>
+): Promise<WorkbenchLifecycleStateV3> {
+  return guard.withLifecycleLock(async (session) => {
+    const current = await requireReservedLifecycle(session, expected);
+    return session.transition(expectedState(current), lifecycleDraft(current, overrides));
+  });
+}
+
+async function vacateReservedLifecycle(
+  guard: WorkbenchProcessGuard,
+  expected: WorkbenchLifecycleStateV3,
+  overrides: Partial<Pick<LifecycleStateDraft, "endpoint" | "target" | "companion">>
+): Promise<WorkbenchLifecycleStateV3> {
+  return guard.withLifecycleLock(async (session) => {
+    const current = await requireReservedLifecycle(session, expected);
+    return session.transitionToVacant(expectedState(current), overrides);
+  });
+}
+
 function companionState(companion: WorkbenchCompanionLaunch): WorkbenchCompanionLifecycleState {
   return {
     addonId: companion.addonId,
@@ -1150,20 +1239,21 @@ async function waitForExitOrControl(args: {
 }
 
 interface ExactAbsenceResult {
-  exit: ChildExit;
+  exit: ChildExit | null;
+  absent: boolean;
   error?: WorkbenchRunnerError;
 }
 
 async function terminateExactAndObserve(args: {
-  session: WorkbenchLifecycleSession;
   guard: WorkbenchProcessGuard;
   identity: WorkbenchIdentity;
   childExit: ChildObservation;
   timeoutMs: number;
+  recoveryTimeoutMs: number;
 }): Promise<ExactAbsenceResult> {
   let refusal: WorkbenchRunnerError | undefined;
   try {
-    const result = await args.session.verifyAndTerminate(args.identity, args.timeoutMs);
+    const result = await args.guard.verifyAndTerminate(args.identity, args.timeoutMs);
     if (result.kind === "refused") {
       refusal = new WorkbenchRunnerError(
         `Exact Workbench termination was refused (${result.reason}): ${result.message}`,
@@ -1180,27 +1270,39 @@ async function terminateExactAndObserve(args: {
   let exit: ChildExit | null = args.childExit.hasClosed()
     ? await args.childExit.closePromise
     : null;
-  // On refusal or uncertain helper outcome, keep the lifecycle lock until the
-  // exact identity disappears naturally. ChildProcess error is not an exit.
-  const pollMs = Math.max(1, Math.min(250, args.timeoutMs));
-  for (;;) {
-    let status: "live" | "absent";
-    try {
-      status = await args.guard.inspectOwnedWorkbench(args.identity);
-    } catch (error) {
-      const observed = await args.childExit.closePromise;
+  // A refused or uncertain native termination must not monopolize the
+  // machine-wide lifecycle mutex forever. Preserve the durable stopping
+  // identity and return a recovery result after this separate hard bound.
+  const recoveryDeadline = Date.now() + args.recoveryTimeoutMs;
+  const pollMs = Math.max(1, Math.min(250, args.recoveryTimeoutMs));
+  while (Date.now() < recoveryDeadline) {
+    const remainingMs = Math.max(1, recoveryDeadline - Date.now());
+    const inspection = await Promise.race([
+      args.guard.inspectOwnedWorkbench(args.identity)
+        .then((status) => ({ kind: "status" as const, status }))
+        .catch((error: unknown) => ({ kind: "error" as const, error })),
+      delay(remainingMs).then(() => ({ kind: "deadline" as const })),
+    ]);
+    if (inspection.kind !== "status") {
+      const detail = inspection.kind === "error"
+        ? (inspection.error instanceof Error ? inspection.error.message : String(inspection.error))
+        : `inspection exceeded the remaining ${remainingMs}ms recovery budget`;
       return {
-        exit: observed,
-        error: refusal ?? new WorkbenchRunnerError(
-          `Exact Workbench absence became unverifiable: ` +
-            `${error instanceof Error ? error.message : String(error)}`,
-          "IDENTITY_UNVERIFIABLE"
+        exit,
+        absent: false,
+        error: new WorkbenchRunnerError(
+          `RECOVERY_REQUIRED: exact Workbench absence became unverifiable during bounded ` +
+            `recovery (${detail}). ` +
+            "The durable lifecycle remains stopping with its exact owner identity.",
+          "RECOVERY_REQUIRED"
         ),
       };
     }
+    const status = inspection.status;
     if (status === "absent") {
       return {
         exit: exit ?? { code: null, signal: null },
+        absent: true,
         ...(refusal ? { error: refusal } : {}),
       };
     }
@@ -1210,45 +1312,47 @@ async function terminateExactAndObserve(args: {
     ]);
     if (observed.kind === "close") exit = observed.value;
   }
+  return {
+    exit,
+    absent: false,
+    error: new WorkbenchRunnerError(
+      `RECOVERY_REQUIRED: exact Workbench PID ${args.identity.pid} remained live or ` +
+        `unverifiable after the ${args.recoveryTimeoutMs}ms recovery deadline. ` +
+        "The durable lifecycle remains stopping with its exact owner identity.",
+      "RECOVERY_REQUIRED"
+    ),
+  };
 }
 
 async function ensureExactChildAbsent(args: {
-  session: WorkbenchLifecycleSession;
   guard: WorkbenchProcessGuard;
   identity: WorkbenchIdentity | null;
   childExit: ChildObservation;
   timeoutMs: number;
+  recoveryTimeoutMs: number;
 }): Promise<ExactAbsenceResult> {
   if (!args.identity) {
-    return { exit: await args.childExit.closePromise };
-  }
-  try {
-    const status = await args.guard.inspectOwnedWorkbench(args.identity);
-    if (status === "absent") {
-      return {
-        exit: args.childExit.hasClosed()
-          ? await args.childExit.closePromise
-          : { code: null, signal: null },
-      };
-    }
-  } catch (error) {
-    // If exact OS inspection becomes contradictory, the retained ChildProcess
-    // close event is the only safe proof that this spawned child is gone.
+    const result = await Promise.race([
+      args.childExit.closePromise.then((exit) => ({ kind: "exit" as const, exit })),
+      delay(args.recoveryTimeoutMs).then(() => ({ kind: "deadline" as const })),
+    ]);
+    if (result.kind === "exit") return { exit: result.exit, absent: true };
     return {
-      exit: await args.childExit.closePromise,
+      exit: null,
+      absent: false,
       error: new WorkbenchRunnerError(
-        `Exact Workbench absence became unverifiable: ` +
-          `${error instanceof Error ? error.message : String(error)}`,
-        "IDENTITY_UNVERIFIABLE"
+        `RECOVERY_REQUIRED: spawned Workbench did not exit within the ` +
+          `${args.recoveryTimeoutMs}ms recovery deadline before exact identity publication.`,
+        "RECOVERY_REQUIRED"
       ),
     };
   }
   return terminateExactAndObserve(args as {
-    session: WorkbenchLifecycleSession;
     guard: WorkbenchProcessGuard;
     identity: WorkbenchIdentity;
     childExit: ChildObservation;
     timeoutMs: number;
+    recoveryTimeoutMs: number;
   });
 }
 
@@ -1269,8 +1373,8 @@ function safeSpawn(
 }
 
 interface BuildCompanionPreflightArgs {
-  session: WorkbenchLifecycleSession;
   guard: WorkbenchProcessGuard;
+  reservation: WorkbenchLifecycleStateV3;
   config: Config;
   executablePath: string;
   target: CanonicalProjectIdentity;
@@ -1288,6 +1392,7 @@ interface BuildCompanionPreflightArgs {
   logAttributionTimeoutMs: number;
   logPollMs: number;
   terminationTimeoutMs: number;
+  recoveryTimeoutMs: number;
   deadlineMs: number;
   signal?: AbortSignal;
 }
@@ -1295,17 +1400,13 @@ interface BuildCompanionPreflightArgs {
 interface BuildCompanionPreflightResult {
   proof: WorkbenchBuildPreflightProof;
   companionIdentity: WorkbenchRunnerCompanionIdentity;
+  reservation: WorkbenchLifecycleStateV3;
 }
 
 async function runBuildCompanionPreflight(
   args: BuildCompanionPreflightArgs
 ): Promise<BuildCompanionPreflightResult> {
-  let lifecycle = await claimExternalRunLifecycle(
-    args.session,
-    args.endpoint,
-    args.target,
-    args.companion
-  );
+  let lifecycle = args.reservation;
   let child: ChildProcess | null = null;
   let childExit: ChildObservation | null = null;
   let identity: WorkbenchIdentity | null = null;
@@ -1319,6 +1420,7 @@ async function runBuildCompanionPreflight(
   let cleanupError: unknown = null;
   let absenceProven = false;
   let endpointVacant = false;
+  let targetReservation: WorkbenchLifecycleStateV3 | null = null;
 
   try {
     if (args.signal?.aborted) {
@@ -1333,7 +1435,7 @@ async function runBuildCompanionPreflight(
         "BUILD_DEADLINE_EXCEEDED"
       );
     }
-    await args.session.assertNoWorkbenchProcesses();
+    await args.guard.assertNoWorkbenchProcesses();
     args.reattestTarget();
     args.reattestCompanion();
     args.companionProvider.applyRetention?.({ protectedDigests: [args.companion.bundleDigest] });
@@ -1370,19 +1472,19 @@ async function runBuildCompanionPreflight(
     });
     childExit = observeChild(child);
     identity = await inspectSpawnedIdentity(
-      args.session,
+      args.guard,
       child,
       childExit,
       args.executablePath,
       ownerArgument,
       launchedAtMs
     );
-    lifecycle = await args.session.transition(expectedState(lifecycle), lifecycleDraft(lifecycle, {
+    lifecycle = await transitionReservedLifecycle(args.guard, lifecycle, {
       phase: "starting",
       workbench: identity,
-    }));
+    });
     endpointOwnership = await probeEndpointOwnership({
-      session: args.session,
+      guard: args.guard,
       endpoint: args.endpoint,
       identity,
       childExit,
@@ -1400,12 +1502,12 @@ async function runBuildCompanionPreflight(
       signal: args.signal,
     });
     args.reattestCompanion();
-    lifecycle = await args.session.transition(expectedState(lifecycle), lifecycleDraft(lifecycle, {
+    lifecycle = await transitionReservedLifecycle(args.guard, lifecycle, {
       phase: "running",
       workbench: identity,
       companion: companionState(args.companion),
       operation: null,
-    }));
+    });
     lifecycleGeneration = lifecycle.generation;
   } catch (error) {
     primaryError = error;
@@ -1413,11 +1515,11 @@ async function runBuildCompanionPreflight(
 
   try {
     if (lifecycle.phase !== "vacant") {
-      lifecycle = await args.session.transition(expectedState(lifecycle), lifecycleDraft(lifecycle, {
+      lifecycle = await transitionReservedLifecycle(args.guard, lifecycle, {
         phase: "stopping",
         workbench: identity,
         operation: { kind: "shutdown", operationId: randomUUID() },
-      }));
+      });
     }
   } catch (error) {
     cleanupError = error;
@@ -1425,14 +1527,22 @@ async function runBuildCompanionPreflight(
 
   if (childExit) {
     const absence = await ensureExactChildAbsent({
-      session: args.session,
       guard: args.guard,
       identity,
       childExit,
       timeoutMs: args.terminationTimeoutMs,
+      recoveryTimeoutMs: args.recoveryTimeoutMs,
     });
     cleanupError ??= absence.error ?? null;
-    absenceProven = !absence.error;
+    absenceProven = absence.absent;
+  }
+  if (!childExit) {
+    try {
+      await args.guard.assertNoWorkbenchProcesses();
+      absenceProven = true;
+    } catch (error) {
+      cleanupError ??= error;
+    }
   }
 
   if (!primaryError && !cleanupError && beforeLogs && ownerToken) {
@@ -1452,10 +1562,13 @@ async function runBuildCompanionPreflight(
 
   if (absenceProven) {
     try {
-      const vacancy = await args.session.verifyEndpointVacant(args.endpoint);
+      const vacancy = await args.guard.verifyEndpointVacant(args.endpoint);
       if (vacancy.kind !== "vacant") {
+        const detail = vacancy.kind === "occupied"
+          ? `listener PID ${vacancy.listenerPid}: ${vacancy.message}`
+          : `${vacancy.reason}: ${vacancy.message}`;
         throw new WorkbenchRunnerError(
-          `Workbench companion endpoint remained occupied after exact child absence: ${vacancy.message}`,
+          `Workbench companion endpoint vacancy could not be proven after exact child absence (${detail}).`,
           "ENDPOINT_UNVERIFIABLE"
         );
       }
@@ -1467,20 +1580,35 @@ async function runBuildCompanionPreflight(
     }
   }
 
-  try {
-    lifecycle = await args.session.transitionToVacant(expectedState(lifecycle), {
-      endpoint: args.endpoint,
-      target: args.target,
-      companion: companionState(args.companion),
-    });
-  } catch (error) {
-    cleanupError ??= error;
+  if (absenceProven && endpointVacant) {
+    try {
+      if (!primaryError && !cleanupError) {
+        targetReservation = await transitionReservedLifecycle(args.guard, lifecycle, {
+          phase: "starting",
+          endpoint: args.endpoint,
+          target: args.target,
+          workbench: null,
+          companion: companionState(args.companion),
+          operation: { kind: "launch", operationId: randomUUID() },
+        });
+        lifecycle = targetReservation;
+      } else {
+        lifecycle = await vacateReservedLifecycle(args.guard, lifecycle, {
+          endpoint: args.endpoint,
+          target: args.target,
+          companion: companionState(args.companion),
+        });
+      }
+    } catch (error) {
+      cleanupError ??= error;
+    }
   }
 
   if (cleanupError) throw cleanupError;
   if (primaryError) throw primaryError;
   if (!identity || !verifiedCompanion || !lifecycleGeneration ||
-      endpointOwnership !== "verified" || !logDirectory || !absenceProven || !endpointVacant) {
+      endpointOwnership !== "verified" || !logDirectory || !absenceProven || !endpointVacant ||
+      !targetReservation) {
     throw new WorkbenchRunnerError(
       "Workbench companion preflight completed without a fully identity-bound proof.",
       "IDENTITY_UNVERIFIABLE"
@@ -1497,11 +1625,11 @@ async function runBuildCompanionPreflight(
       logDirectory,
     },
     companionIdentity: verifiedCompanion,
+    reservation: targetReservation,
   };
 }
 
 interface TargetBuildStageArgs {
-  session: WorkbenchLifecycleSession;
   guard: WorkbenchProcessGuard;
   config: Config;
   intent: WorkbenchBuildIntent;
@@ -1521,17 +1649,13 @@ interface TargetBuildStageArgs {
   logAttributionTimeoutMs: number;
   logPollMs: number;
   terminationTimeoutMs: number;
+  recoveryTimeoutMs: number;
   deadlineMs: number;
   signal?: AbortSignal;
 }
 
 async function runTargetBuildStage(args: TargetBuildStageArgs): Promise<WorkbenchBuildRunnerReceipt> {
-  let lifecycle = await claimExternalRunLifecycle(
-    args.session,
-    args.endpoint,
-    args.target,
-    args.companion
-  );
+  let lifecycle = args.preflight.reservation;
   let child: ChildProcess | null = null;
   let childExit: ChildObservation | null = null;
   let identity: WorkbenchIdentity | null = null;
@@ -1551,7 +1675,7 @@ async function runTargetBuildStage(args: TargetBuildStageArgs): Promise<Workbenc
   let endpointVacant = false;
 
   try {
-    await args.session.assertNoWorkbenchProcesses();
+    await args.guard.assertNoWorkbenchProcesses();
     if (args.signal?.aborted) {
       throw new WorkbenchRunnerError(
         "Workbench build was aborted after companion preflight and before target spawn.",
@@ -1605,23 +1729,23 @@ async function runTargetBuildStage(args: TargetBuildStageArgs): Promise<Workbenc
     });
     childExit = observeChild(child);
     identity = await inspectSpawnedIdentity(
-      args.session,
+      args.guard,
       child,
       childExit,
       args.executablePath,
       ownerArgument,
       launchedAtMs
     );
-    lifecycle = await args.session.transition(expectedState(lifecycle), lifecycleDraft(lifecycle, {
+    lifecycle = await transitionReservedLifecycle(args.guard, lifecycle, {
       phase: "starting",
       workbench: identity,
-    }));
-    lifecycle = await args.session.transition(expectedState(lifecycle), lifecycleDraft(lifecycle, {
+    });
+    lifecycle = await transitionReservedLifecycle(args.guard, lifecycle, {
       phase: "running",
       workbench: identity,
       companion: companionState(args.companion),
       operation: null,
-    }));
+    });
     lifecycleGeneration = lifecycle.generation;
 
     const completion = await waitForExitOrControl({
@@ -1644,11 +1768,11 @@ async function runTargetBuildStage(args: TargetBuildStageArgs): Promise<Workbenc
 
   try {
     if (lifecycle.phase !== "vacant") {
-      lifecycle = await args.session.transition(expectedState(lifecycle), lifecycleDraft(lifecycle, {
+      lifecycle = await transitionReservedLifecycle(args.guard, lifecycle, {
         phase: "stopping",
         workbench: identity,
         operation: { kind: "shutdown", operationId: randomUUID() },
-      }));
+      });
     }
   } catch (error) {
     cleanupError = error;
@@ -1656,15 +1780,23 @@ async function runTargetBuildStage(args: TargetBuildStageArgs): Promise<Workbenc
 
   if (childExit) {
     const absence = await ensureExactChildAbsent({
-      session: args.session,
       guard: args.guard,
       identity,
       childExit,
       timeoutMs: args.terminationTimeoutMs,
+      recoveryTimeoutMs: args.recoveryTimeoutMs,
     });
     exit ??= absence.exit;
     cleanupError ??= absence.error ?? null;
-    absenceProven = !absence.error;
+    absenceProven = absence.absent;
+  }
+  if (!childExit) {
+    try {
+      await args.guard.assertNoWorkbenchProcesses();
+      absenceProven = true;
+    } catch (error) {
+      cleanupError ??= error;
+    }
   }
 
   if (absenceProven) {
@@ -1692,10 +1824,13 @@ async function runTargetBuildStage(args: TargetBuildStageArgs): Promise<Workbenc
       primaryError ??= error;
     }
     try {
-      const vacancy = await args.session.verifyEndpointVacant(args.endpoint);
+      const vacancy = await args.guard.verifyEndpointVacant(args.endpoint);
       if (vacancy.kind !== "vacant") {
+        const detail = vacancy.kind === "occupied"
+          ? `listener PID ${vacancy.listenerPid}: ${vacancy.message}`
+          : `${vacancy.reason}: ${vacancy.message}`;
         throw new WorkbenchRunnerError(
-          `Workbench endpoint was occupied after exact target-build child absence: ${vacancy.message}`,
+          `Workbench endpoint vacancy could not be proven after exact target-build child absence (${detail}).`,
           "ENDPOINT_UNVERIFIABLE"
         );
       }
@@ -1720,14 +1855,16 @@ async function runTargetBuildStage(args: TargetBuildStageArgs): Promise<Workbenc
     }
   }
 
-  try {
-    lifecycle = await args.session.transitionToVacant(expectedState(lifecycle), {
-      endpoint: args.endpoint,
-      target: args.target,
-      companion: companionState(args.companion),
-    });
-  } catch (error) {
-    cleanupError ??= error;
+  if (absenceProven && endpointVacant) {
+    try {
+      lifecycle = await vacateReservedLifecycle(args.guard, lifecycle, {
+        endpoint: args.endpoint,
+        target: args.target,
+        companion: companionState(args.companion),
+      });
+    } catch (error) {
+      cleanupError ??= error;
+    }
   }
 
   if (cleanupError) throw cleanupError;
@@ -1769,13 +1906,12 @@ async function runTargetBuildStage(args: TargetBuildStageArgs): Promise<Workbenc
 }
 
 /**
- * Run a structured Workbench purpose while retaining the shared machine mutex
- * and exact child ownership for the complete process lifetime.
+ * Run a structured Workbench purpose under a durable version-3 reservation.
  *
- * The runner claims the version-3 lifecycle as its own exact process, records
- * the staged companion and spawned Workbench, and returns it to vacant only
- * after exact child absence. A concurrent MCP therefore sees durable busy
- * state in addition to the machine mutex.
+ * The machine mutex is held only to reserve or CAS lifecycle state. Readiness,
+ * foreground lifetime, and bounded recovery run without the mutex; each later
+ * commit reacquires it and revalidates the reserved generation plus exact MCP
+ * and Workbench owner identities.
  */
 export async function runWorkbenchIntent(
   config: Config,
@@ -1893,7 +2029,22 @@ export async function runWorkbenchIntent(
   const logRoot = dependencies.logRoot
     ? canonicalDirectory(dependencies.logRoot, "Workbench log root")
     : canonicalDirectory(managedLogRoot, "Workbench log root");
-  const outputPath = intent.kind === "build" ? validateBuildOutput(intent) : null;
+  const protectedOutputRoots = [
+    { label: "the target mod", path: project.modDirectory },
+    { label: "the companion add-on search root", path: companion.addonSearchRoot },
+    { label: "the companion profile", path: companion.workbenchProfilePath },
+  ];
+  const managedRootPath = config.observer?.managedRoot ??
+    (dependencies.companionProvider ? null : defaultWorkbenchHelperManagedRoot());
+  if (managedRootPath) {
+    protectedOutputRoots.push({
+      label: "the observer managed root",
+      path: canonicalDirectory(managedRootPath, "Observer managed root"),
+    });
+  }
+  const outputPath = intent.kind === "build"
+    ? validateBuildOutput(intent, protectedOutputRoots)
+    : null;
   if (intent.kind === "editor" && intent.foreground !== true) {
     throw new WorkbenchRunnerError(
       "Editor intent must be foreground; detached mode has no persistent guardian.",
@@ -1921,73 +2072,102 @@ export async function runWorkbenchIntent(
     dependencies.terminationTimeoutMs ?? DEFAULT_TERMINATION_TIMEOUT_MS,
     "Termination timeout"
   );
+  const recoveryTimeoutMs = positiveInteger(
+    dependencies.recoveryTimeoutMs ?? DEFAULT_RECOVERY_TIMEOUT_MS,
+    "Recovery timeout"
+  );
   const guard = dependencies.processGuard ?? new WorkbenchProcessGuard();
   const spawnProcess = dependencies.spawnProcess ?? ((command, args, options) =>
     spawnChild(command, [...args], options));
 
-  return guard.withLifecycleLock(async (session) => {
-    const target: CanonicalProjectIdentity = {
-      path: project.displayPath,
-      comparisonKey: project.comparisonKey,
-    };
-    if (intent.kind === "build") {
-      if (!buildProject || !outputPath) {
-        throw new WorkbenchRunnerError(
-          "Workbench build project metadata or output was not prepared.",
-          "INVALID_INTENT"
-        );
-      }
-      const deadlineMs = Date.now() + intent.timeoutMs;
-      const preflight = await runBuildCompanionPreflight({
-        session,
-        guard,
-        config,
-        executablePath,
-        target,
-        companion,
-        companionProvider,
-        reattestCompanion,
-        reattestTarget: reattestBuildTarget,
-        addonDirectories: preflightAddonDirectories,
-        endpoint,
-        logRoot,
-        spawnProcess,
-        endpointProbeTimeoutMs,
-        endpointPollMs,
-        companionProbe: dependencies.companionProbe ?? rawCompanionPing,
-        logAttributionTimeoutMs,
-        logPollMs,
-        terminationTimeoutMs,
-        deadlineMs,
-        signal: dependencies.signal,
-      });
-      return runTargetBuildStage({
-        session,
-        guard,
-        config,
-        intent,
-        executablePath,
-        target,
-        buildProject,
-        companion,
-        companionProvider,
-        reattestCompanion,
-        reattestTarget: reattestBuildTarget,
-        addonDirectories: buildAddonDirectories,
-        endpoint,
-        logRoot,
-        outputPath,
-        preflight,
-        spawnProcess,
-        logAttributionTimeoutMs,
-        logPollMs,
-        terminationTimeoutMs,
-        deadlineMs,
-        signal: dependencies.signal,
-      });
+  const target: CanonicalProjectIdentity = {
+    path: project.displayPath,
+    comparisonKey: project.comparisonKey,
+  };
+  if (intent.kind === "build") {
+    if (!buildProject || !outputPath) {
+      throw new WorkbenchRunnerError(
+        "Workbench build project metadata or output was not prepared.",
+        "INVALID_INTENT"
+      );
     }
+    // Empty output is checked while publishing the durable busy reservation.
+    // The mutex is then released; contenders can inspect that state but cannot
+    // claim or spawn while this exact generation/owner remains reserved.
+    const reservation = await guard.withLifecycleLock(async (session) => {
+      assertEmptyBuildOutput(outputPath);
+      return claimExternalRunLifecycle(session, endpoint, target, companion);
+    });
+    try {
+      // The claim above is the serialization point. Recheck after it has
+      // committed, before even the companion preflight can spawn, so a writer
+      // racing the initially empty directory cannot consume a Workbench
+      // lifecycle merely to be rejected after preflight.
+      assertEmptyBuildOutput(outputPath);
+    } catch (error) {
+      // No child has been spawned yet, so the exact reservation can be
+      // returned directly to vacant after revalidating its generation/owner.
+      await vacateReservedLifecycle(guard, reservation, {
+        endpoint,
+        target,
+        companion: companionState(companion),
+      });
+      throw error;
+    }
+    const deadlineMs = Date.now() + intent.timeoutMs;
+    const preflight = await runBuildCompanionPreflight({
+      guard,
+      reservation,
+      config,
+      executablePath,
+      target,
+      companion,
+      companionProvider,
+      reattestCompanion,
+      reattestTarget: reattestBuildTarget,
+      addonDirectories: preflightAddonDirectories,
+      endpoint,
+      logRoot,
+      spawnProcess,
+      endpointProbeTimeoutMs,
+      endpointPollMs,
+      companionProbe: dependencies.companionProbe ?? rawCompanionPing,
+      logAttributionTimeoutMs,
+      logPollMs,
+      terminationTimeoutMs,
+      recoveryTimeoutMs,
+      deadlineMs,
+      signal: dependencies.signal,
+    });
+    return runTargetBuildStage({
+      guard,
+      config,
+      intent,
+      executablePath,
+      target,
+      buildProject,
+      companion,
+      companionProvider,
+      reattestCompanion,
+      reattestTarget: reattestBuildTarget,
+      addonDirectories: buildAddonDirectories,
+      endpoint,
+      logRoot,
+      outputPath,
+      preflight,
+      spawnProcess,
+      logAttributionTimeoutMs,
+      logPollMs,
+      terminationTimeoutMs,
+      recoveryTimeoutMs,
+      deadlineMs,
+      signal: dependencies.signal,
+    });
+  }
     const editorIntent = intent;
-    let lifecycle = await claimExternalRunLifecycle(session, endpoint, target, companion);
+    let lifecycle = await guard.withLifecycleLock((session) =>
+      claimExternalRunLifecycle(session, endpoint, target, companion)
+    );
     let child: ChildProcess | null = null;
     let childExit: ChildObservation | null = null;
     let identity: WorkbenchIdentity | null = null;
@@ -2003,9 +2183,10 @@ export async function runWorkbenchIntent(
     let cleanupError: unknown = null;
     let logDirectory: string | null = null;
     let absenceProven = false;
+    let endpointVacant = false;
 
     try {
-      await session.assertNoWorkbenchProcesses();
+      await guard.assertNoWorkbenchProcesses();
       reattestCompanion();
       companionProvider.applyRetention?.({ protectedDigests: [companion.bundleDigest] });
       beforeLogs = snapshotLogDirectories(logRoot);
@@ -2028,20 +2209,20 @@ export async function runWorkbenchIntent(
       });
       childExit = observeChild(child);
       identity = await inspectSpawnedIdentity(
-        session,
+        guard,
         child,
         childExit,
         executablePath,
         ownerArgument,
         launchedAtMs
       );
-      lifecycle = await session.transition(expectedState(lifecycle), lifecycleDraft(lifecycle, {
+      lifecycle = await transitionReservedLifecycle(guard, lifecycle, {
         phase: "starting",
         workbench: identity,
-      }));
+      });
 
       endpointOwnership = await probeEndpointOwnership({
-        session,
+        guard,
         endpoint,
         identity,
         childExit,
@@ -2059,12 +2240,12 @@ export async function runWorkbenchIntent(
         signal: dependencies.signal,
       });
       reattestCompanion();
-      lifecycle = await session.transition(expectedState(lifecycle), lifecycleDraft(lifecycle, {
+      lifecycle = await transitionReservedLifecycle(guard, lifecycle, {
         phase: "running",
         workbench: identity,
         companion: companionState(companion),
         operation: null,
-      }));
+      });
       lifecycleGeneration = lifecycle.generation;
 
       const completion = await waitForExitOrControl({
@@ -2087,11 +2268,11 @@ export async function runWorkbenchIntent(
 
     try {
       if (lifecycle.phase !== "vacant") {
-        lifecycle = await session.transition(expectedState(lifecycle), lifecycleDraft(lifecycle, {
+        lifecycle = await transitionReservedLifecycle(guard, lifecycle, {
           phase: "stopping",
           workbench: identity,
           operation: { kind: "shutdown", operationId: randomUUID() },
-        }));
+        });
       }
     } catch (error) {
       cleanupError = error;
@@ -2099,20 +2280,44 @@ export async function runWorkbenchIntent(
 
     if (childExit) {
       const absence = await ensureExactChildAbsent({
-        session,
         guard,
         identity,
         childExit,
         timeoutMs: terminationTimeoutMs,
+        recoveryTimeoutMs,
       });
       exit ??= absence.exit;
       cleanupError ??= absence.error ?? null;
-      absenceProven = !absence.error;
+      absenceProven = absence.absent;
+    }
+
+    if (!childExit) {
+      try {
+        await guard.assertNoWorkbenchProcesses();
+        absenceProven = true;
+      } catch (error) {
+        cleanupError ??= error;
+      }
     }
 
     if (absenceProven) {
       try {
         reattestCompanion();
+      } catch (error) {
+        primaryError ??= error;
+      }
+      try {
+        const vacancy = await guard.verifyEndpointVacant(endpoint);
+        if (vacancy.kind !== "vacant") {
+          const detail = vacancy.kind === "occupied"
+            ? `listener PID ${vacancy.listenerPid}: ${vacancy.message}`
+            : `${vacancy.reason}: ${vacancy.message}`;
+          throw new WorkbenchRunnerError(
+            `Workbench endpoint vacancy could not be proven after exact child absence (${detail}).`,
+            "ENDPOINT_UNVERIFIABLE"
+          );
+        }
+        endpointVacant = true;
       } catch (error) {
         primaryError ??= error;
       }
@@ -2133,20 +2338,23 @@ export async function runWorkbenchIntent(
       }
     }
 
-    try {
-      lifecycle = await session.transitionToVacant(expectedState(lifecycle), {
-        endpoint,
-        target,
-        companion: companionState(companion),
-      });
-    } catch (error) {
-      cleanupError ??= error;
+    if (absenceProven && endpointVacant) {
+      try {
+        lifecycle = await vacateReservedLifecycle(guard, lifecycle, {
+          endpoint,
+          target,
+          companion: companionState(companion),
+        });
+      } catch (error) {
+        cleanupError ??= error;
+      }
     }
 
     if (cleanupError) throw cleanupError;
     if (primaryError) throw primaryError;
     if (!identity || !verifiedCompanion || !lifecycleGeneration ||
-        endpointOwnership !== "verified" || !reason || !exit || !logDirectory || !absenceProven) {
+        endpointOwnership !== "verified" || !reason || !exit || !logDirectory ||
+        !absenceProven || !endpointVacant) {
       throw new WorkbenchRunnerError(
         "Workbench runner completed without a fully identity-bound receipt.",
         "IDENTITY_UNVERIFIABLE"
@@ -2168,7 +2376,6 @@ export async function runWorkbenchIntent(
         timedOut: reason === "timed_out",
       },
     };
-  });
 }
 
 export type ParsedWorkbenchRunnerCommand = WorkbenchRunnerIntent;

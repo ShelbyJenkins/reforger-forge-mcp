@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { JobStore, type JobRecord } from "../../observer/agent/jobs.js";
+import { JobStore, type JobRecord, type JobStoreOptions } from "../../observer/agent/jobs.js";
 import { InstanceRegistry } from "../../observer/agent/registry.js";
 import { COMMAND_DELIVERY_LEASE_MS, type ArtifactManifest, type CameraLeaseStatus } from "../../observer/protocol/index.js";
 import { cleanup, createSessionFixture, FakeClock, graphicalRegistration, temporaryDirectory } from "./helpers.js";
@@ -7,15 +7,18 @@ import { cleanup, createSessionFixture, FakeClock, graphicalRegistration, tempor
 const roots: string[] = [];
 afterEach(() => roots.splice(0).forEach(cleanup));
 
-function setup() {
+function setup(
+  jobOptions: JobStoreOptions = {},
+  registrationOverrides: NonNullable<Parameters<typeof graphicalRegistration>[1]> = {}
+) {
   const root = temporaryDirectory();
   roots.push(root);
   const clock = new FakeClock();
   const fixture = createSessionFixture(root, clock);
   const registry = new InstanceRegistry(fixture.store, { clock });
-  const registration = graphicalRegistration(fixture.created);
+  const registration = graphicalRegistration(fixture.created, registrationOverrides);
   registry.register(registration, fixture.created.contract.sessionToken);
-  const jobs = new JobStore(fixture.store, registry, clock);
+  const jobs = new JobStore(fixture.store, registry, clock, jobOptions);
   return { ...fixture, registry, registration, jobs, clock };
 }
 
@@ -118,6 +121,146 @@ describe("observer jobs", () => {
     expect(value.jobs.diagnostics()).toHaveLength(1);
   });
 
+  it("replays equivalent canonical capture requests", () => {
+    const value = setup();
+    const first = value.jobs.submit({
+      sessionId: value.registration.sessionId,
+      idempotencyKey: "canonical-replay",
+      deadlineAt: "2026-07-16T20:01:00.000Z",
+      view: { kind: "pose", position: [-0, 1, 2], orientation: [0, 0, 0, 1], fov: 60 },
+    });
+    const replay = value.jobs.submit({
+      sessionId: value.registration.sessionId,
+      idempotencyKey: "canonical-replay",
+      deadlineAt: "2026-07-16T13:01:00-07:00",
+      view: { kind: "pose", position: [0, 1, 2], orientation: [-0, 0, 0, 1], fov: 60 },
+      settleFrames: 0,
+      performancePolicy: "evidence",
+    });
+    expect(replay).toBe(first);
+    expect(value.jobs.stats()).toMatchObject({ jobs: 1, idempotencyReceipts: 1 });
+  });
+
+  it("replays a policy-derived deadline and conflicts when its timeout policy changes", () => {
+    const value = setup();
+    const first = value.jobs.submit({
+      sessionId: value.registration.sessionId,
+      idempotencyKey: "relative-deadline-replay",
+      deadlineAt: new Date(value.clock.now() + 10_000).toISOString(),
+      deadlinePolicyMs: 10_000,
+      view: { kind: "current" },
+    });
+    const replay = value.jobs.submit({
+      sessionId: value.registration.sessionId,
+      idempotencyKey: "relative-deadline-replay",
+      deadlineAt: new Date(value.clock.now() + 10_025).toISOString(),
+      deadlinePolicyMs: 10_000,
+      view: { kind: "current" },
+    });
+
+    expect(replay).toBe(first);
+    expect(() => value.jobs.submit({
+      sessionId: value.registration.sessionId,
+      idempotencyKey: "relative-deadline-replay",
+      deadlineAt: new Date(value.clock.now() + 20_000).toISOString(),
+      deadlinePolicyMs: 20_000,
+      view: { kind: "current" },
+    })).toThrowError(expect.objectContaining({ code: "IDEMPOTENCY_CONFLICT" }));
+  });
+
+  it.each([
+    ["instance", { instanceId: "instance-2" }],
+    ["deadline", { deadlineAt: "2026-07-16T20:01:00.001Z" }],
+    ["view", { view: { kind: "lookAt" as const, position: [0, 1, 0] as [number, number, number], target: [1, 1, 0] as [number, number, number], fov: 60 } }],
+    ["settle policy", { settleFrames: 1 }],
+    ["performance policy", { performancePolicy: "instrumented" as const }],
+    ["nullable world expectation", { expectedWorldId: null }],
+    ["world epoch", { expectedWorldEpoch: 1 }],
+  ])("rejects idempotency-key reuse after changing %s", (_label, changed) => {
+    const value = setup();
+    const base = {
+      sessionId: value.registration.sessionId,
+      idempotencyKey: "semantic-conflict",
+      deadlineAt: "2026-07-16T20:01:00.000Z",
+      view: { kind: "current" as const },
+    };
+    value.jobs.submit(base);
+    expect(() => value.jobs.submit({ ...base, ...changed }))
+      .toThrowError(expect.objectContaining({ code: "IDEMPOTENCY_CONFLICT" }));
+    expect(value.jobs.stats()).toMatchObject({ jobs: 1, idempotencyReceipts: 1 });
+  });
+
+  it("allows a key to name a new request after its bounded receipt expires", () => {
+    const value = setup({ idempotencyReceiptRetentionMs: 100 });
+    const first = value.jobs.submit({
+      sessionId: value.registration.sessionId,
+      idempotencyKey: "expired-receipt",
+      deadlineAt: new Date(value.clock.now() + 1_000).toISOString(),
+      view: { kind: "current" },
+    });
+    value.clock.advance(1_101);
+    const second = value.jobs.submit({
+      sessionId: value.registration.sessionId,
+      idempotencyKey: "expired-receipt",
+      deadlineAt: new Date(value.clock.now() + 1_000).toISOString(),
+      view: { kind: "current" },
+      settleFrames: 1,
+    });
+    expect(second.request.jobId).not.toBe(first.request.jobId);
+    expect(value.jobs.stats()).toMatchObject({ jobs: 2, idempotencyReceipts: 1 });
+  });
+
+  it("fails closed before exceeding the retained-record budget", () => {
+    const value = setup({ maxRecords: 1 });
+    submitCurrent(value, "bounded-record-1");
+
+    expect(() => submitCurrent(value, "bounded-record-2"))
+      .toThrowError(expect.objectContaining({ code: "TRANSPORT_UNAVAILABLE" }));
+    expect(value.jobs.stats()).toMatchObject({
+      jobs: 1,
+      idempotencyReceipts: 1,
+      pendingQueueEntries: 1,
+      maxRecords: 1,
+    });
+  });
+
+  it("fails closed without partial insertion when the byte budget is exhausted", () => {
+    const value = setup({ maxEstimatedBytes: 1_024 });
+
+    expect(() => submitCamera(value, "bounded-byte-budget"))
+      .toThrowError(expect.objectContaining({ code: "TRANSPORT_UNAVAILABLE" }));
+    expect(value.jobs.stats()).toMatchObject({
+      jobs: 0,
+      idempotencyReceipts: 0,
+      pendingQueueEntries: 0,
+      maxEstimatedBytes: 1_024,
+    });
+  });
+
+  it("rejects an oversized mutable job record without partially completing it", () => {
+    const value = setup({
+      maxEstimatedBytes: 64 * 1024,
+      maxRecordEstimatedBytes: 2 * 1024,
+    });
+    const job = submitCurrent(value, "bounded-record-mutation");
+    accept(value, job);
+    value.jobs.update(status(value, job.request.jobId, 2, "capturing"), value.created.contract.sessionToken);
+    value.jobs.update(status(value, job.request.jobId, 3, "awaitingArtifact"), value.created.contract.sessionToken);
+    const oversized = {
+      ...manifest(value, job),
+      forwardCompatibleDiagnostic: "x".repeat(4 * 1024),
+    } as ArtifactManifest;
+
+    expect(() => value.jobs.completeArtifact(
+      value.registration.sessionId,
+      job.request.jobId,
+      oversized,
+      "C:\\managed\\artifact.png"
+    )).toThrowError(expect.objectContaining({ code: "TRANSPORT_UNAVAILABLE" }));
+    expect(job).toMatchObject({ state: "awaitingArtifact", artifact: null, artifactPath: null });
+    expect(value.jobs.stats().approximateBytes).toBeLessThanOrEqual(64 * 1024);
+  });
+
   it("rejects a stale expected world before queueing camera work", () => {
     const value = setup();
     const base = {
@@ -138,6 +281,19 @@ describe("observer jobs", () => {
       expectedWorldEpoch: value.registration.worldEpoch + 1,
     })).toThrowError(expect.objectContaining({ code: "WORLD_CHANGED" }));
     expect(value.jobs.diagnostics()).toHaveLength(0);
+  });
+
+  it("captures the current view when inventory explicitly reports no world", () => {
+    const value = setup({}, { worldId: null, worldEpoch: 7 });
+    const job = value.jobs.submit({
+      sessionId: value.registration.sessionId,
+      idempotencyKey: "null-world-current",
+      deadlineAt: new Date(value.clock.now() + 10_000).toISOString(),
+      view: { kind: "current" },
+      expectedWorldId: null,
+      expectedWorldEpoch: 7,
+    });
+    expect(job).toMatchObject({ worldId: null, worldEpoch: 7, state: "queued" });
   });
 
   it("emits a canonical decimal-string wire view for Enforce float decoding", () => {
@@ -270,8 +426,8 @@ describe("observer jobs", () => {
     });
   });
 
-  it("records ownership loss as a distinct bounded restoration failure", () => {
-    const value = setup();
+  it("pins an unresolved restoration obligation past normal terminal retention", () => {
+    const value = setup({ terminalJobRetentionMs: 1, idempotencyReceiptRetentionMs: 1 });
     const job = submitCamera(value, "restoration-unconfirmed");
     accept(value, job);
     value.jobs.update(status(value, job.request.jobId, 2, "acquiringCamera", {
@@ -289,6 +445,79 @@ describe("observer jobs", () => {
       terminalErrorCode: "RESTORATION_UNCONFIRMED",
       cameraLease: { everHeld: true, held: false, restorationConfirmed: false },
     });
+    value.clock.advance(30_002);
+    value.jobs.sweep(value.clock.now());
+    expect(value.jobs.require(value.registration.sessionId, job.request.jobId)).toBe(job);
+    expect(value.jobs.stats()).toMatchObject({ jobs: 1, restorationObligations: 1 });
+    expect(value.jobs.sessionPins()).toContain(value.registration.sessionId);
+  });
+
+  it("does not dispatch a queued successor past terminal unconfirmed restoration", () => {
+    const value = setup();
+    const first = submitCamera(value, "unconfirmed-first");
+    accept(value, first);
+    value.jobs.update(status(value, first.request.jobId, 2, "acquiringCamera", {
+      cameraLease: heldCamera(),
+    }), value.created.contract.sessionToken);
+    const successor = submitCamera(value, "unconfirmed-successor");
+    value.jobs.update(status(value, first.request.jobId, 3, "restoring", {
+      cameraLease: { held: false, restorationConfirmed: false },
+    }), value.created.contract.sessionToken);
+    value.jobs.update(status(value, first.request.jobId, 4, "failed", {
+      errorCode: "RESTORATION_UNCONFIRMED",
+      cameraLease: { held: false, restorationConfirmed: false },
+    }), value.created.contract.sessionToken);
+
+    expect(first).toMatchObject({
+      state: "failed",
+      terminalErrorCode: "RESTORATION_UNCONFIRMED",
+      cameraLease: { everHeld: true, restorationConfirmed: false },
+    });
+    expect(successor.state).toBe("queued");
+    expect(value.jobs.nextCommand(
+      value.registration.sessionId,
+      value.registration.instanceId,
+      value.registration.instanceNonce
+    )).toBeNull();
+  });
+
+  it("terminalizes an accepted current-view job when its deadline expires", () => {
+    const value = setup({ terminalJobRetentionMs: 1, idempotencyReceiptRetentionMs: 1 });
+    const job = submitCurrent(value, "expired-current-view");
+    accept(value, job);
+    value.clock.advance(30_001);
+
+    expect(value.jobs.sweepDeadlines(value.clock.now())).toEqual([job.request.jobId]);
+    expect(job).toMatchObject({ state: "failed", terminalErrorCode: "CAPTURE_TIMEOUT" });
+    value.clock.advance(2);
+    expect(value.jobs.sweep(value.clock.now()).removedJobs).toContain(job.request.jobId);
+  });
+
+  it("disposes unresolved work only after the host proves exact runtime vacancy", () => {
+    const value = setup();
+    const job = submitCamera(value, "exact-runtime-vacancy");
+    accept(value, job);
+    value.jobs.update(status(value, job.request.jobId, 2, "acquiringCamera", {
+      cameraLease: heldCamera(),
+    }), value.created.contract.sessionToken);
+    value.jobs.update(status(value, job.request.jobId, 3, "restoring", {
+      cameraLease: { held: false, restorationConfirmed: false },
+    }), value.created.contract.sessionToken);
+
+    expect(value.jobs.vacateSession(value.registration.sessionId)).toEqual([job.request.jobId]);
+    expect(job).toMatchObject({
+      state: "failed",
+      terminalErrorCode: "INSTANCE_STALE",
+      cameraLease: {
+        everHeld: true,
+        held: false,
+        restorationConfirmed: false,
+        vacancyDisposition: "exact_runtime_vacant",
+      },
+    });
+    expect(value.jobs.stats().restorationObligations).toBe(0);
+    expect(value.jobs.sessionPins()).not.toContain(value.registration.sessionId);
+    expect(value.jobs.vacateSession(value.registration.sessionId)).toEqual([]);
   });
 
   it("enforces per-session rate, FOV, settle-frame, and capture-distance limits before routing", () => {

@@ -26,6 +26,7 @@ import {
   type WorkbenchActivityGateTiming,
 } from "./activity-gate.js";
 import { decodeResponse, encodeRequest } from "./protocol.js";
+import { ChildSupervisor } from "./child-supervisor.js";
 import {
   WORKBENCH_HELPER_ADDON_GUID,
   WORKBENCH_HELPER_ADDON_ID,
@@ -370,6 +371,7 @@ function companionLifecycleState(
 export class WorkbenchClient {
   private activeLifecycle: ActiveLifecycleOperation | null = null;
   private ownedChild: OwnedChildObservation | null = null;
+  private readonly childSupervisor = new ChildSupervisor();
   private _state: WorkbenchState = { connected: false, mode: "unknown", lastUpdated: 0 };
   private readonly spawnProcess: WorkbenchClientDependencies["spawnProcess"];
   private readonly companionProvider: WorkbenchCompanionProvider | undefined;
@@ -1175,7 +1177,7 @@ export class WorkbenchClient {
     if (state.phase === "stopping") {
       const stopped = await this.terminateExact(session, state.workbench!);
       if (!stopped) throw new WorkbenchError("Exact Workbench shutdown could not be proven.", "RECOVERY_REQUIRED");
-      await this.waitForPortRelease();
+      await this.waitForPortRelease(session);
       return {
         state: await this.reconcileAbsentState(session, state, this.lifecycleTarget(project)),
         live: false,
@@ -1201,7 +1203,7 @@ export class WorkbenchClient {
         return { state: running, live: true };
       }
       await this.terminateExact(session, state.workbench!);
-      await this.waitForPortRelease();
+      await this.waitForPortRelease(session);
       return {
         state: await this.reconcileAbsentState(session, state, this.lifecycleTarget(project)),
         live: false,
@@ -1232,11 +1234,19 @@ export class WorkbenchClient {
     }
 
     await this.assertNoWorkbenchProcesses(session, "Launch");
-    if (await this.isPortListening()) {
+    const vacancy = await session.verifyEndpointVacant({ host: this.host, port: this.port });
+    if (vacancy.kind === "occupied") {
       throw new WorkbenchError(
         `UNOWNED_WORKBENCH: NET API endpoint ${this.host}:${this.port} is occupied without the exact ` +
-          "recorded Workbench identity.",
+          `recorded Workbench identity (listener PID ${vacancy.listenerPid}).`,
         "UNOWNED_WORKBENCH"
+      );
+    }
+    if (vacancy.kind === "unverifiable") {
+      throw new WorkbenchError(
+        `IDENTITY_UNVERIFIABLE: NET API endpoint ${this.host}:${this.port} vacancy could not be ` +
+          `proved (${vacancy.reason}): ${vacancy.message}`,
+        "IDENTITY_UNVERIFIABLE"
       );
     }
     const preflight = this.preflightLaunch(project);
@@ -1282,7 +1292,7 @@ export class WorkbenchClient {
       throw error;
     }
     this.resetConnectionState();
-    await this.waitForPortRelease();
+    await this.waitForPortRelease(session);
     state = await session.transition(stateExpected(state), stateDraft(state, {
       phase: "restarting",
       workbench: null,
@@ -1337,11 +1347,12 @@ export class WorkbenchClient {
       })).catch(() => undefined);
       throw error;
     }
-    await this.waitForPortRelease();
+    await this.waitForPortRelease(session);
     this.resetConnectionState();
     const observedChild = this.ownedChild;
     if (observedChild && observedChild.identity.pid === expected.pid &&
         observedChild.identity.creationTime === expected.creationTime) {
+      this.childSupervisor.forget("owned-workbench", observedChild.child);
       this.ownedChild = null;
     }
     const vacant = await this.reconcileAbsentState(session, state, target);
@@ -1466,6 +1477,7 @@ export class WorkbenchClient {
     let childObservation: OwnedChildObservation | null = null;
     let spawnError: Error | null = null;
     try {
+      session.assertActive();
       const launchedAtMs = Date.now();
       child = this.spawnProcess!(preflight.executablePath, args, {
         detached: true,
@@ -1555,7 +1567,7 @@ export class WorkbenchClient {
           "RECOVERY_REQUIRED"
         );
       }
-      await this.waitForPortRelease();
+      await this.waitForPortRelease(session);
     } else {
       const processes = await this.processGuard.listWorkbenchProcesses();
       if (processes.length > 0) {
@@ -1658,7 +1670,7 @@ export class WorkbenchClient {
   ): OwnedChildObservation {
     const observation: OwnedChildObservation = { child, identity, generation, targetKey };
     this.ownedChild = observation;
-    child.once("exit", () => {
+    this.childSupervisor.supervise("owned-workbench", child, { onExit: async () => {
       if (this.ownedChild !== observation) return;
       this.activityGate.invalidateForUnexpectedExit({
         generation: observation.generation,
@@ -1671,7 +1683,7 @@ export class WorkbenchClient {
       });
       this.resetConnectionState();
       this.ownedChild = null;
-      void this.activityGate.runLifecycle("recovery", () =>
+      await this.activityGate.runLifecycle("recovery", () =>
         this.coordinateLifecycle("recovery", targetKey, async () =>
           this.processGuard.withLifecycleLock(async (session) => {
             const read = await session.readState();
@@ -1685,7 +1697,7 @@ export class WorkbenchClient {
       ).catch((error) => logger.warn(
         `Workbench exit reconciliation failed: ${error instanceof Error ? error.message : String(error)}`
       ));
-    });
+    } });
     return observation;
   }
 
@@ -1713,34 +1725,25 @@ export class WorkbenchClient {
     return candidates.find((candidate) => existsSync(join(candidate, "addons"))) ?? null;
   }
 
-  private async waitForPortRelease(): Promise<void> {
+  private async waitForPortRelease(session: WorkbenchLifecycleSession): Promise<void> {
     const deadline = Date.now() + PORT_RELEASE_TIMEOUT_MS;
     while (Date.now() < deadline) {
-      if (!(await this.isPortListening())) return;
+      const vacancy = await session.verifyEndpointVacant({ host: this.host, port: this.port });
+      if (vacancy.kind === "vacant") return;
+      if (vacancy.kind === "unverifiable") {
+        throw new WorkbenchError(
+          `RECOVERY_REQUIRED: NET API endpoint ${this.host}:${this.port} vacancy is unverifiable ` +
+            `(${vacancy.reason}): ${vacancy.message}`,
+          "RECOVERY_REQUIRED"
+        );
+      }
       await new Promise((resolvePromise) => setTimeout(resolvePromise, PORT_RELEASE_POLL_MS));
     }
     throw new WorkbenchError(
-      `NET API endpoint ${this.host}:${this.port} remained occupied after exact Workbench exit.`,
-      "IDENTITY_UNVERIFIABLE"
+      `RECOVERY_REQUIRED: NET API endpoint ${this.host}:${this.port} remained occupied after ` +
+        "exact Workbench exit; the durable lifecycle state was preserved for recovery.",
+      "RECOVERY_REQUIRED"
     );
-  }
-
-  private isPortListening(timeoutMs = 500): Promise<boolean> {
-    return new Promise((resolvePromise) => {
-      const socket = new Socket();
-      let settled = false;
-      const finish = (listening: boolean): void => {
-        if (settled) return;
-        settled = true;
-        socket.destroy();
-        resolvePromise(listening);
-      };
-      socket.setTimeout(timeoutMs);
-      socket.once("connect", () => finish(true));
-      socket.once("timeout", () => finish(false));
-      socket.once("error", () => finish(false));
-      socket.connect(this.port, this.host);
-    });
   }
 
   private async lifecycleDiagnostic(): Promise<LifecycleDiagnostic> {

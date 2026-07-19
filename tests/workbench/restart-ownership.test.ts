@@ -14,7 +14,6 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { createServer, type Server } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Config } from "../../src/config.js";
@@ -135,8 +134,6 @@ function createHarness(): Harness {
 
   // Process ownership and state transitions remain real; only external TCP
   // readiness timing is removed from these hermetic lifecycle tests.
-  (client as unknown as { isPortListening: () => Promise<boolean> }).isPortListening =
-    vi.fn().mockResolvedValue(false);
   (client as unknown as {
     waitForCompanionReady: (
       child: ChildProcess,
@@ -144,9 +141,6 @@ function createHarness(): Harness {
       companion: unknown
     ) => Promise<void>;
   }).waitForCompanionReady = vi.fn().mockResolvedValue(undefined);
-  (client as unknown as { waitForPortRelease: () => Promise<void> }).waitForPortRelease =
-    vi.fn().mockResolvedValue(undefined);
-
   return {
     root,
     modDirectory,
@@ -161,27 +155,6 @@ function createHarness(): Harness {
     spawnOptions,
     spawnArgs,
   };
-}
-
-function listen(server: Server): Promise<number> {
-  return new Promise((resolvePromise, reject) => {
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", () => {
-      server.off("error", reject);
-      const address = server.address();
-      if (!address || typeof address === "string") {
-        reject(new Error("test server did not receive a TCP port"));
-        return;
-      }
-      resolvePromise(address.port);
-    });
-  });
-}
-
-function close(server: Server): Promise<void> {
-  return new Promise((resolvePromise, reject) => {
-    server.close((error) => error ? reject(error) : resolvePromise());
-  });
 }
 
 function addProject(harness: Harness, name: string): string {
@@ -455,6 +428,30 @@ describe("exact owner-scoped Workbench restart", () => {
       expect((error as Error).message).toMatch(/no exact owned Workbench/i);
     }
     expect(harness.backend.terminationCalls).toHaveLength(0);
+  });
+
+  it("spawns only after native vacancy proof and distinguishes occupied from unverifiable", async () => {
+    const occupied = createHarness();
+    occupied.backend.endpointVacancyResult = {
+      kind: "occupied",
+      listenerPid: 55_101,
+      message: "foreign listener",
+    };
+    await expect(occupied.client.ensureRunning(occupied.projectPath)).rejects.toMatchObject({
+      code: "UNOWNED_WORKBENCH",
+    });
+    expect(occupied.children).toHaveLength(0);
+
+    const unverifiable = createHarness();
+    unverifiable.backend.endpointVacancyResult = {
+      kind: "unverifiable",
+      reason: "timeout",
+      message: "native endpoint probe timed out",
+    };
+    await expect(unverifiable.client.ensureRunning(unverifiable.projectPath)).rejects.toMatchObject({
+      code: "IDENTITY_UNVERIFIABLE",
+    });
+    expect(unverifiable.children).toHaveLength(0);
   });
 
   it("re-proves the live owner token before reporting target reuse", async () => {
@@ -739,24 +736,26 @@ describe("exact owner-scoped Workbench restart", () => {
     }
   });
 
-  it("waits until the NET API port is actually released", async () => {
-    const server = createServer((socket) => socket.destroy());
-    const port = await listen(server);
+  it("waits for native endpoint vacancy proof and fails closed on unverifiable probes", async () => {
     const harness = createHarness();
-    const client = new WorkbenchClient("127.0.0.1", port, {
-      ...harness.config,
-      workbenchPort: port,
+    const verifyEndpointVacant = vi.fn()
+      .mockResolvedValueOnce({ kind: "occupied", listenerPid: 9001, message: "still bound" })
+      .mockResolvedValueOnce({ kind: "vacant" });
+    const client = harness.client as unknown as {
+      waitForPortRelease(session: {
+        verifyEndpointVacant: typeof verifyEndpointVacant;
+      }): Promise<void>;
+    };
+    await expect(client.waitForPortRelease({ verifyEndpointVacant })).resolves.toBeUndefined();
+    expect(verifyEndpointVacant).toHaveBeenCalledTimes(2);
+
+    const unverifiable = vi.fn().mockResolvedValue({
+      kind: "unverifiable",
+      reason: "access_denied",
+      message: "TCP owner table access denied",
     });
-
-    let settled = false;
-    const waiting = (client as unknown as { waitForPortRelease: () => Promise<void> })
-      .waitForPortRelease()
-      .then(() => { settled = true; });
-    await new Promise((resolvePromise) => setTimeout(resolvePromise, 25));
-    expect(settled).toBe(false);
-
-    await close(server);
-    await expect(waiting).resolves.toBeUndefined();
-    expect(settled).toBe(true);
+    await expect(client.waitForPortRelease({ verifyEndpointVacant: unverifiable }))
+      .rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    expect(unverifiable).toHaveBeenCalledTimes(1);
   });
 });

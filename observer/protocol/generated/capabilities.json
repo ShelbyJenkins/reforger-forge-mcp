@@ -1,0 +1,9 @@
+[
+  "render.capture",
+  "camera.runtime",
+  "camera.editor",
+  "world.query",
+  "authority.server",
+  "transport.rest",
+  "transport.mailbox"
+]

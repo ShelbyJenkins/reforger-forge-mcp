@@ -255,9 +255,17 @@ export class ArtifactStore {
   release(sessionId: string, jobId: string): { released: boolean } {
     assertIdentifier(sessionId, "Session ID");
     assertIdentifier(jobId, "Job ID");
+    const retainedReceipt = this.jobs.artifactReleaseReceipt(sessionId, jobId);
+    if (retainedReceipt) return retainedReceipt;
+    // Reserve the bounded tombstone before any filesystem mutation. A late
+    // release remains idempotent even after its terminal JobRecord was swept.
+    this.jobs.preflightArtifactRelease(sessionId, jobId);
     const root = join(this.artifactsRoot, sessionId, jobId);
     assertManagedPath(this.artifactsRoot, root);
-    if (!existsSync(root)) return { released: false };
+    if (!existsSync(root)) {
+      this.jobs.recordArtifactRelease(sessionId, jobId, false);
+      return { released: false };
+    }
     const entry = lstatSync(root);
     if (entry.isSymbolicLink() || !entry.isDirectory()) {
       throw new ObserverError("ARTIFACT_INVALID", "Retained artifact path is not a managed directory", 409);
@@ -270,6 +278,7 @@ export class ArtifactStore {
     const unrelated = readdirSync(root).filter((name) => name !== "image.png" && name !== "metadata.json");
     if (unrelated.length > 0) throw new ObserverError("ARTIFACT_INVALID", "Retained artifact directory contains unrelated files", 409);
     rmSync(root, { recursive: true, force: false });
+    this.jobs.recordArtifactRelease(sessionId, jobId, true);
     return { released: true };
   }
 

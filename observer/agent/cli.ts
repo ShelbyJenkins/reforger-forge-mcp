@@ -61,7 +61,12 @@ export async function runCli(argumentsArray: string[]): Promise<void> {
     }
     if (command === "doctor") {
       const agent = createCliAgent(baseOptions(argumentsArray));
-      print({ ...agent.control.diagnostics(), instances: agent.registry.diagnostics(), jobs: agent.jobs.diagnostics() });
+      print({
+        ...agent.control.diagnostics(),
+        instances: agent.registry.diagnostics(),
+        jobs: agent.jobs.diagnostics(),
+        stores: agent.server.storeDiagnostics(),
+      });
       return;
     }
     if (command === "prepare-launch") {

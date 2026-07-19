@@ -55,6 +55,41 @@ function requiredString(payload: Record<string, unknown>, name: string): string 
   return value;
 }
 
+function requiredUuid(payload: Record<string, unknown>, name: string): string {
+  const value = requiredString(payload, name);
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value)) {
+    throw new ObserverError("INVALID_REQUEST", `${name} must be a version-4 UUID`);
+  }
+  return value.toLowerCase();
+}
+
+/** Serialized caller-proposed lease CAS used by the private child and tests. */
+export function claimRuntimeStopReservation(
+  reservations: Map<string, string>,
+  sessionId: string,
+  proposedReservationId: string
+): { reserved: boolean; reservationId?: string; created: boolean } {
+  const current = reservations.get(sessionId);
+  if (current) {
+    return current === proposedReservationId
+      ? { reserved: true, reservationId: current, created: false }
+      : { reserved: false, created: false };
+  }
+  reservations.set(sessionId, proposedReservationId);
+  return { reserved: true, reservationId: proposedReservationId, created: true };
+}
+
+/** Exact-generation release; a delayed foreign release cannot reopen capture. */
+export function releaseRuntimeStopReservation(
+  reservations: Map<string, string>,
+  sessionId: string,
+  reservationId: string
+): boolean {
+  if (reservations.get(sessionId) !== reservationId) return false;
+  reservations.delete(sessionId);
+  return true;
+}
+
 function serializeJob(record: JobRecord): Record<string, unknown> {
   return {
     jobId: record.request.jobId,
@@ -163,7 +198,8 @@ export async function runPrivateObserverChild(argumentsArray: string[]): Promise
   };
   const agent = createObserverAgent(options);
   const descriptor = await agent.server.start();
-  const runtimeStopReservations = new Set<string>();
+  const runtimeStopReservations = new Map<string, string>();
+  const runtimeStopPinOwner = "runtime-stop-reservation";
   let closing = false;
 
   const close = async (): Promise<void> => {
@@ -201,14 +237,28 @@ export async function runPrivateObserverChild(argumentsArray: string[]): Promise
     if (name === "instances") return { instances: agent.registry.diagnostics() };
     if (name === "runtimeStopPreflight") {
       const sessionId = requiredString(payload, "sessionId");
-      if (runtimeStopReservations.has(sessionId)) {
+      const proposedReservationId = requiredUuid(payload, "reservationId");
+      if (payload.exactRuntimeVacant !== undefined &&
+          typeof payload.exactRuntimeVacant !== "boolean") {
+        throw new ObserverError("INVALID_REQUEST", "exactRuntimeVacant must be boolean");
+      }
+      const exactRuntimeVacant = payload.exactRuntimeVacant === true;
+      const existingReservationId = runtimeStopReservations.get(sessionId);
+      if (existingReservationId) {
+        const claim = claimRuntimeStopReservation(
+          runtimeStopReservations,
+          sessionId,
+          proposedReservationId
+        );
         return {
           sessionKnown: true,
           ready: true,
-          reserved: true,
+          reserved: claim.reserved,
           activeJobIds: [],
           cameraLeaseJobIds: [],
           restorationPendingJobIds: [],
+          ...(claim.reservationId ? { reservationId: claim.reservationId } : {}),
+          ...(!claim.reserved ? { reason: "runtime_stop_reserved" } : {}),
         };
       }
       const sessionKnown = agent.control.sessions.diagnostics().some((session) =>
@@ -238,31 +288,81 @@ export async function runPrivateObserverChild(argumentsArray: string[]): Promise
         const lease = job.cameraLease && typeof job.cameraLease === "object"
           ? job.cameraLease as Record<string, unknown>
           : null;
-        return lease?.everHeld === true && lease.restorationConfirmed !== true;
+        return lease?.everHeld === true && lease.restorationConfirmed !== true &&
+          lease.vacancyDisposition !== "exact_runtime_vacant";
       }).map((job) => String(job.jobId));
-      const ready = sessionKnown && activeJobIds.length === 0 && cameraLeaseJobIds.length === 0 &&
-        restorationPendingJobIds.length === 0;
-      if (ready) runtimeStopReservations.add(sessionId);
+      const ready = sessionKnown && (exactRuntimeVacant || (
+        activeJobIds.length === 0 && cameraLeaseJobIds.length === 0 &&
+        restorationPendingJobIds.length === 0
+      ));
+      let claim: ReturnType<typeof claimRuntimeStopReservation> | null = null;
+      if (ready) {
+        claim = claimRuntimeStopReservation(
+          runtimeStopReservations,
+          sessionId,
+          proposedReservationId
+        );
+        if (claim.created) agent.control.sessions.pin(sessionId, runtimeStopPinOwner);
+      }
       return {
         sessionKnown,
         ready,
-        reserved: ready,
+        reserved: claim?.reserved === true,
         activeJobIds,
         cameraLeaseJobIds,
         restorationPendingJobIds,
+        ...(claim?.reservationId ? { reservationId: claim.reservationId } : {}),
         ...(!sessionKnown ? { reason: "observer_session_unknown" } : {}),
       };
     }
     if (name === "runtimeStopRelease") {
+      const sessionId = requiredString(payload, "sessionId");
+      const reservationId = requiredUuid(payload, "reservationId");
+      const released = releaseRuntimeStopReservation(
+        runtimeStopReservations,
+        sessionId,
+        reservationId
+      );
+      if (released) {
+        agent.control.sessions.unpin(sessionId, runtimeStopPinOwner);
+      }
       return {
-        released: runtimeStopReservations.delete(requiredString(payload, "sessionId")),
+        released,
       };
     }
     if (name === "runtimeStopComplete") {
       const sessionId = requiredString(payload, "sessionId");
+      if (payload.exactRuntimeVacant !== undefined &&
+          typeof payload.exactRuntimeVacant !== "boolean") {
+        throw new ObserverError("INVALID_REQUEST", "exactRuntimeVacant must be boolean");
+      }
+      const exactRuntimeVacant = payload.exactRuntimeVacant === true;
+      const reservationId = typeof payload.reservationId === "string"
+        ? requiredUuid(payload, "reservationId")
+        : null;
+      const currentReservationId = runtimeStopReservations.get(sessionId) ?? null;
+      if (currentReservationId && currentReservationId !== reservationId) {
+        throw new ObserverError(
+          "SESSION_MISMATCH",
+          "Observer runtime stop completion reservation is stale",
+          409
+        );
+      }
+      const vacancyDisposedJobIds = exactRuntimeVacant
+        ? agent.jobs.vacateSession(sessionId)
+        : [];
+      const vacancyRemovedInstances = exactRuntimeVacant
+        ? agent.registry.vacateSession(sessionId)
+        : 0;
       const revoked = agent.control.revokeSession(sessionId);
       runtimeStopReservations.delete(sessionId);
-      return { completed: true, revoked };
+      agent.control.sessions.unpin(sessionId, runtimeStopPinOwner);
+      return {
+        completed: true,
+        revoked,
+        vacancyDisposedJobIds,
+        vacancyRemovedInstances,
+      };
     }
     if (name === "submitJob") {
       const sessionId = requiredString(payload, "sessionId");
