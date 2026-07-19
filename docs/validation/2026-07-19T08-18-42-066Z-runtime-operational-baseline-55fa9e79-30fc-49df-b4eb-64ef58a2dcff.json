@@ -1,0 +1,645 @@
+{
+  "schemaVersion": 1,
+  "kind": "reforger_forge_runtime_operational_baseline",
+  "backend": "runtime",
+  "result": "passed",
+  "startedAt": "2026-07-19T08:18:42.066Z",
+  "finishedAt": "2026-07-19T08:19:23.687Z",
+  "durationMs": 41620.513,
+  "environment": {
+    "node": {
+      "version": "v26.4.0",
+      "architecture": "x64"
+    },
+    "operatingSystem": {
+      "platform": "win32",
+      "release": "10.0.26200",
+      "architecture": "x64"
+    },
+    "machineClass": {
+      "cpuModel": "13th Gen Intel(R) Core(TM) i5-13600K",
+      "logicalCpuCount": 20,
+      "totalMemoryGiB": 31.7
+    },
+    "workbench": null,
+    "game": {
+      "executable": "ArmaReforgerSteamDiag.exe",
+      "version": "1.7.0.54",
+      "fileVersion": "1.7.0.54",
+      "discovery": "windows_file_metadata"
+    }
+  },
+  "workload": {
+    "procedureRevision": "runtime-observer-acceptance-v2",
+    "runtimeKind": "listenServer",
+    "overallTimeoutMs": 600000,
+    "worldResource": "{96A8AF57260A7392}worlds/MP/MpTest/MpTest.ent",
+    "fixture": null,
+    "capture": {
+      "labels": [
+        "initial-current",
+        "explicit-pose",
+        "post-pose-restoration-current",
+        "explicit-look-at",
+        "post-look-at-restoration-current"
+      ],
+      "settleFrames": 3,
+      "performancePolicy": "evidence",
+      "asynchronous": false,
+      "configurationSha256": "7b3fe69f82e27dfb1ae8a3e1fa6ec6c3869b0ae2afe10bc6154cb676c629a03f"
+    },
+    "launchArguments": {
+      "observed": true,
+      "count": 18,
+      "sha256": "f5d67c7a69368c71b222258e0811f17e17519f67318151c1225aafcc2b5d0869",
+      "normalization": "absolute_paths_and_owner_tokens_redacted_v1"
+    }
+  },
+  "source": {
+    "harness": {
+      "path": "scripts/run-runtime-observer-acceptance.ts",
+      "sha256": "5cb927ca4214411fd0cd44a63360961b9e7445d85c674bf793bf0bb43c87229f"
+    },
+    "recorder": {
+      "path": "scripts/observer-live-acceptance-support.ts",
+      "sha256": "b16e131983af5558c75743347d3fbc9d0a3706495e0e482096d9dbb109f96ea3"
+    },
+    "measured": [
+      {
+        "path": "dist/observer/agent/**/*.js",
+        "sha256": "84465c44a14c493fdc924bdd9c92b22503486890a2408168f9b3b595ca78c510"
+      },
+      {
+        "path": "dist/observer/agent/private-child.js",
+        "sha256": "12cdfb7b5db5287ee775ef6642249b3b33c359f8431093c739abdf8c10e61907"
+      },
+      {
+        "path": "dist/observer/protocol/**/*.js",
+        "sha256": "884ae5f4eb3bc60fda0d035579921debcf513333aa6d4f4181efc68abb5c0900"
+      },
+      {
+        "path": "observer/addon/**/*.c",
+        "sha256": "2f9d4cf281b71acbd3c5a044848c01dc3903be91953b1780e8de17e69a490436"
+      },
+      {
+        "path": "observer/addon/.reforger-forge-observer-source.json",
+        "sha256": "05a0db8a8be7b5853021b525b776a45a6a437eaf4bc6e1dfe581602b5a0fbc47"
+      },
+      {
+        "path": "observer/addon/addon.gproj",
+        "sha256": "5606e5810d5a82c09ef7e148454f23d80b9e69d728bd5994132aad3cc82af086"
+      },
+      {
+        "path": "observer/agent/**/*.ts",
+        "sha256": "2a4fb79872ff33fa337fac556202b1e512078b14ad55ff682aaf1d8ddc6f5e03"
+      },
+      {
+        "path": "observer/agent/private-child.ts",
+        "sha256": "a569968bf341308b7cb9115597b4aa5318743607b7be41a8508e831736617677"
+      },
+      {
+        "path": "observer/protocol/**/*.ts",
+        "sha256": "9f00b660bb1c09cd7ccbcc9263a15bbfadb4d37ce35f492f27599d966113c593"
+      },
+      {
+        "path": "package-lock.json",
+        "sha256": "21d7b2f72cda2eff6b97c6f3b06fe2036b174edb9603bd9827d955c49b84b093"
+      },
+      {
+        "path": "package.json",
+        "sha256": "2339752a330b229b7f204a1595be76ff80b7ecaa3106c7d01fbea37e779e1ee1"
+      },
+      {
+        "path": "scripts/windows/workbench-lifecycle.ps1",
+        "sha256": "85cbde1ff6b7fee0a5a7df213bc26426a8ce7f412aa6527a90ced64533cc903b"
+      },
+      {
+        "path": "src/**/*.ts",
+        "sha256": "623bef4c714fc072f1c21b67bf23b81d790f52d8e71bbca9adc72a02e6680a09"
+      },
+      {
+        "path": "src/observer/coordinator.ts",
+        "sha256": "15fe93ef168e9adb78eab78bfe3e03d69bb1f6261612f06b0d2d890ce659039d"
+      },
+      {
+        "path": "src/observer/launch.ts",
+        "sha256": "26bcde18ceb2e56929a8b05c14b40a272907e94894b848c312061061a5ae66e5"
+      },
+      {
+        "path": "src/observer/owned-runtime-manager.ts",
+        "sha256": "cb2bd097605eae719d1e1c1e702a5a712546d05a4555479e2a01d1e3ef07cfdb"
+      },
+      {
+        "path": "src/workbench/child-supervisor.ts",
+        "sha256": "0388890bfaa9dd9737e62a2b0ecf8d0c38ffdff8c5d21b77d7780c10394008da"
+      },
+      {
+        "path": "src/workbench/process-guard.ts",
+        "sha256": "dc23af98fae227216909821eca7d956e9160a6aedff2bf42928391b403696e55"
+      }
+    ]
+  },
+  "measurements": [
+    {
+      "boundary": "managed_call",
+      "operation": "OwnedRuntimeManager.status",
+      "phase": "representative_status_api",
+      "startedAt": "2026-07-19T08:18:44.569Z",
+      "finishedAt": "2026-07-19T08:18:45.386Z",
+      "durationMs": 816.697,
+      "outcome": "passed",
+      "processCountBefore": {
+        "active": 2,
+        "reconciling": 0,
+        "total": 2
+      },
+      "processCountAfter": {
+        "active": 2,
+        "reconciling": 0,
+        "total": 2
+      }
+    },
+    {
+      "boundary": "launch",
+      "operation": "OwnedRuntimeManager.start/status(running)",
+      "phase": "running_confirmation",
+      "startedAt": "2026-07-19T08:18:43.237Z",
+      "finishedAt": "2026-07-19T08:18:45.386Z",
+      "durationMs": 2148.985,
+      "outcome": "passed",
+      "processCountBefore": {
+        "active": 1,
+        "reconciling": 0,
+        "total": 1
+      },
+      "processCountAfter": {
+        "active": 2,
+        "reconciling": 0,
+        "total": 2
+      }
+    },
+    {
+      "boundary": "managed_call",
+      "operation": "ObserverCoordinator.instances(renderersOnly)",
+      "phase": "representative_observer_api",
+      "startedAt": "2026-07-19T08:18:45.386Z",
+      "finishedAt": "2026-07-19T08:18:49.411Z",
+      "durationMs": 4024.596,
+      "outcome": "passed",
+      "processCountBefore": {
+        "active": 2,
+        "reconciling": 0,
+        "total": 2
+      },
+      "processCountAfter": {
+        "active": 2,
+        "reconciling": 0,
+        "total": 2
+      }
+    },
+    {
+      "boundary": "capture",
+      "operation": "ObserverCoordinator.capture(initial-current)",
+      "phase": "initial-current",
+      "startedAt": "2026-07-19T08:18:49.411Z",
+      "finishedAt": "2026-07-19T08:18:54.846Z",
+      "durationMs": 5435.257,
+      "outcome": "passed",
+      "processCountBefore": {
+        "active": 2,
+        "reconciling": 0,
+        "total": 2
+      },
+      "processCountAfter": {
+        "active": 2,
+        "reconciling": 0,
+        "total": 2
+      }
+    },
+    {
+      "boundary": "capture",
+      "operation": "ObserverCoordinator.capture(explicit-pose)",
+      "phase": "explicit-pose",
+      "startedAt": "2026-07-19T08:18:54.851Z",
+      "finishedAt": "2026-07-19T08:19:02.774Z",
+      "durationMs": 7923.031,
+      "outcome": "passed",
+      "processCountBefore": {
+        "active": 2,
+        "reconciling": 0,
+        "total": 2
+      },
+      "processCountAfter": {
+        "active": 2,
+        "reconciling": 0,
+        "total": 2
+      }
+    },
+    {
+      "boundary": "capture",
+      "operation": "ObserverCoordinator.capture(post-pose-restoration-current)",
+      "phase": "post-pose-restoration-current",
+      "startedAt": "2026-07-19T08:19:02.896Z",
+      "finishedAt": "2026-07-19T08:19:07.854Z",
+      "durationMs": 4957.906,
+      "outcome": "passed",
+      "processCountBefore": {
+        "active": 2,
+        "reconciling": 0,
+        "total": 2
+      },
+      "processCountAfter": {
+        "active": 2,
+        "reconciling": 0,
+        "total": 2
+      }
+    },
+    {
+      "boundary": "capture",
+      "operation": "ObserverCoordinator.capture(explicit-look-at)",
+      "phase": "explicit-look-at",
+      "startedAt": "2026-07-19T08:19:07.924Z",
+      "finishedAt": "2026-07-19T08:19:12.831Z",
+      "durationMs": 4907.027,
+      "outcome": "passed",
+      "processCountBefore": {
+        "active": 2,
+        "reconciling": 0,
+        "total": 2
+      },
+      "processCountAfter": {
+        "active": 2,
+        "reconciling": 0,
+        "total": 2
+      }
+    },
+    {
+      "boundary": "capture",
+      "operation": "ObserverCoordinator.capture(post-look-at-restoration-current)",
+      "phase": "post-look-at-restoration-current",
+      "startedAt": "2026-07-19T08:19:12.954Z",
+      "finishedAt": "2026-07-19T08:19:17.798Z",
+      "durationMs": 4844.513,
+      "outcome": "passed",
+      "processCountBefore": {
+        "active": 2,
+        "reconciling": 0,
+        "total": 2
+      },
+      "processCountAfter": {
+        "active": 2,
+        "reconciling": 0,
+        "total": 2
+      }
+    },
+    {
+      "boundary": "shutdown",
+      "operation": "OwnedRuntimeManager.stop",
+      "phase": "termination",
+      "startedAt": "2026-07-19T08:19:18.420Z",
+      "finishedAt": "2026-07-19T08:19:22.859Z",
+      "durationMs": 4439,
+      "outcome": "passed",
+      "processCountBefore": {
+        "active": 2,
+        "reconciling": 0,
+        "total": 2
+      },
+      "processCountAfter": {
+        "active": 1,
+        "reconciling": 0,
+        "total": 1
+      },
+      "observations": {
+        "terminationComplete": true,
+        "identityVacant": true,
+        "durableStoppedAt": true
+      }
+    },
+    {
+      "boundary": "shutdown",
+      "operation": "OwnedRuntimeManager.stop",
+      "phase": "observer_cleanup",
+      "startedAt": "2026-07-19T08:19:18.420Z",
+      "finishedAt": "2026-07-19T08:19:23.387Z",
+      "durationMs": 4966.449,
+      "outcome": "passed",
+      "processCountBefore": {
+        "active": 2,
+        "reconciling": 0,
+        "total": 2
+      },
+      "processCountAfter": {
+        "active": 1,
+        "reconciling": 0,
+        "total": 1
+      },
+      "observations": {
+        "observerCleanupPending": false
+      }
+    },
+    {
+      "boundary": "managed_call",
+      "operation": "OwnedRuntimeManager.status(after stop)",
+      "phase": "shutdown_status_confirmation",
+      "startedAt": "2026-07-19T08:19:23.387Z",
+      "finishedAt": "2026-07-19T08:19:23.389Z",
+      "durationMs": 2.089,
+      "outcome": "passed",
+      "processCountBefore": {
+        "active": 1,
+        "reconciling": 0,
+        "total": 1
+      },
+      "processCountAfter": {
+        "active": 1,
+        "reconciling": 0,
+        "total": 1
+      }
+    },
+    {
+      "boundary": "shutdown",
+      "operation": "ObserverCoordinator.revokeSession",
+      "phase": "observer_cleanup_confirmation",
+      "startedAt": "2026-07-19T08:19:23.389Z",
+      "finishedAt": "2026-07-19T08:19:23.391Z",
+      "durationMs": 2.692,
+      "outcome": "passed",
+      "processCountBefore": {
+        "active": 1,
+        "reconciling": 0,
+        "total": 1
+      },
+      "processCountAfter": {
+        "active": 1,
+        "reconciling": 0,
+        "total": 1
+      }
+    },
+    {
+      "boundary": "shutdown",
+      "operation": "ObserverCoordinator.close",
+      "phase": "observer_process_cleanup",
+      "startedAt": "2026-07-19T08:19:23.391Z",
+      "finishedAt": "2026-07-19T08:19:23.424Z",
+      "durationMs": 32.607,
+      "outcome": "passed",
+      "processCountBefore": {
+        "active": 1,
+        "reconciling": 0,
+        "total": 1
+      },
+      "processCountAfter": {
+        "active": 0,
+        "reconciling": 0,
+        "total": 0
+      }
+    },
+    {
+      "boundary": "shutdown",
+      "operation": "waitForOperationalBaselineProcessVacancy",
+      "phase": "supervised_exit_settle",
+      "startedAt": "2026-07-19T08:19:23.623Z",
+      "finishedAt": "2026-07-19T08:19:23.624Z",
+      "durationMs": 0.215,
+      "outcome": "passed",
+      "processCountBefore": {
+        "active": 0,
+        "reconciling": 0,
+        "total": 0
+      },
+      "processCountAfter": {
+        "active": 0,
+        "reconciling": 0,
+        "total": 0
+      },
+      "observations": {
+        "vacant": true,
+        "polls": 1,
+        "waitedMs": 0.003,
+        "finalActive": 0,
+        "finalReconciling": 0,
+        "finalTotal": 0
+      }
+    }
+  ],
+  "processCounts": [
+    {
+      "label": "rest.beforeLaunch",
+      "at": "2026-07-19T08:18:42.285Z",
+      "active": 0,
+      "reconciling": 0,
+      "total": 0
+    },
+    {
+      "label": "launch.running_confirmation.OwnedRuntimeManager.start/status(running).before",
+      "at": "2026-07-19T08:18:43.237Z",
+      "active": 1,
+      "reconciling": 0,
+      "total": 1
+    },
+    {
+      "label": "managed_call.representative_status_api.OwnedRuntimeManager.status.before",
+      "at": "2026-07-19T08:18:44.569Z",
+      "active": 2,
+      "reconciling": 0,
+      "total": 2
+    },
+    {
+      "label": "managed_call.representative_status_api.OwnedRuntimeManager.status.after",
+      "at": "2026-07-19T08:18:45.386Z",
+      "active": 2,
+      "reconciling": 0,
+      "total": 2
+    },
+    {
+      "label": "launch.running_confirmation.OwnedRuntimeManager.start/status(running).after",
+      "at": "2026-07-19T08:18:45.386Z",
+      "active": 2,
+      "reconciling": 0,
+      "total": 2
+    },
+    {
+      "label": "managed_call.representative_observer_api.ObserverCoordinator.instances(renderersOnly).before",
+      "at": "2026-07-19T08:18:45.386Z",
+      "active": 2,
+      "reconciling": 0,
+      "total": 2
+    },
+    {
+      "label": "managed_call.representative_observer_api.ObserverCoordinator.instances(renderersOnly).after",
+      "at": "2026-07-19T08:18:49.411Z",
+      "active": 2,
+      "reconciling": 0,
+      "total": 2
+    },
+    {
+      "label": "capture.initial-current.ObserverCoordinator.capture(initial-current).before",
+      "at": "2026-07-19T08:18:49.411Z",
+      "active": 2,
+      "reconciling": 0,
+      "total": 2
+    },
+    {
+      "label": "capture.initial-current.ObserverCoordinator.capture(initial-current).after",
+      "at": "2026-07-19T08:18:54.846Z",
+      "active": 2,
+      "reconciling": 0,
+      "total": 2
+    },
+    {
+      "label": "capture.explicit-pose.ObserverCoordinator.capture(explicit-pose).before",
+      "at": "2026-07-19T08:18:54.851Z",
+      "active": 2,
+      "reconciling": 0,
+      "total": 2
+    },
+    {
+      "label": "capture.explicit-pose.ObserverCoordinator.capture(explicit-pose).after",
+      "at": "2026-07-19T08:19:02.774Z",
+      "active": 2,
+      "reconciling": 0,
+      "total": 2
+    },
+    {
+      "label": "capture.post-pose-restoration-current.ObserverCoordinator.capture(post-pose-restoration-current).before",
+      "at": "2026-07-19T08:19:02.896Z",
+      "active": 2,
+      "reconciling": 0,
+      "total": 2
+    },
+    {
+      "label": "capture.post-pose-restoration-current.ObserverCoordinator.capture(post-pose-restoration-current).after",
+      "at": "2026-07-19T08:19:07.854Z",
+      "active": 2,
+      "reconciling": 0,
+      "total": 2
+    },
+    {
+      "label": "capture.explicit-look-at.ObserverCoordinator.capture(explicit-look-at).before",
+      "at": "2026-07-19T08:19:07.924Z",
+      "active": 2,
+      "reconciling": 0,
+      "total": 2
+    },
+    {
+      "label": "capture.explicit-look-at.ObserverCoordinator.capture(explicit-look-at).after",
+      "at": "2026-07-19T08:19:12.831Z",
+      "active": 2,
+      "reconciling": 0,
+      "total": 2
+    },
+    {
+      "label": "capture.post-look-at-restoration-current.ObserverCoordinator.capture(post-look-at-restoration-current).before",
+      "at": "2026-07-19T08:19:12.954Z",
+      "active": 2,
+      "reconciling": 0,
+      "total": 2
+    },
+    {
+      "label": "capture.post-look-at-restoration-current.ObserverCoordinator.capture(post-look-at-restoration-current).after",
+      "at": "2026-07-19T08:19:17.798Z",
+      "active": 2,
+      "reconciling": 0,
+      "total": 2
+    },
+    {
+      "label": "shutdown.termination.OwnedRuntimeManager.stop.before",
+      "at": "2026-07-19T08:19:18.420Z",
+      "active": 2,
+      "reconciling": 0,
+      "total": 2
+    },
+    {
+      "label": "shutdown.observer_cleanup.OwnedRuntimeManager.stop.before",
+      "at": "2026-07-19T08:19:18.420Z",
+      "active": 2,
+      "reconciling": 0,
+      "total": 2
+    },
+    {
+      "label": "shutdown.termination.OwnedRuntimeManager.stop.after",
+      "at": "2026-07-19T08:19:23.387Z",
+      "active": 1,
+      "reconciling": 0,
+      "total": 1
+    },
+    {
+      "label": "shutdown.observer_cleanup.OwnedRuntimeManager.stop.after",
+      "at": "2026-07-19T08:19:23.387Z",
+      "active": 1,
+      "reconciling": 0,
+      "total": 1
+    },
+    {
+      "label": "managed_call.shutdown_status_confirmation.OwnedRuntimeManager.status(after stop).before",
+      "at": "2026-07-19T08:19:23.387Z",
+      "active": 1,
+      "reconciling": 0,
+      "total": 1
+    },
+    {
+      "label": "managed_call.shutdown_status_confirmation.OwnedRuntimeManager.status(after stop).after",
+      "at": "2026-07-19T08:19:23.389Z",
+      "active": 1,
+      "reconciling": 0,
+      "total": 1
+    },
+    {
+      "label": "shutdown.observer_cleanup_confirmation.ObserverCoordinator.revokeSession.before",
+      "at": "2026-07-19T08:19:23.389Z",
+      "active": 1,
+      "reconciling": 0,
+      "total": 1
+    },
+    {
+      "label": "shutdown.observer_cleanup_confirmation.ObserverCoordinator.revokeSession.after",
+      "at": "2026-07-19T08:19:23.391Z",
+      "active": 1,
+      "reconciling": 0,
+      "total": 1
+    },
+    {
+      "label": "shutdown.observer_process_cleanup.ObserverCoordinator.close.before",
+      "at": "2026-07-19T08:19:23.391Z",
+      "active": 1,
+      "reconciling": 0,
+      "total": 1
+    },
+    {
+      "label": "shutdown.observer_process_cleanup.ObserverCoordinator.close.after",
+      "at": "2026-07-19T08:19:23.424Z",
+      "active": 0,
+      "reconciling": 0,
+      "total": 0
+    },
+    {
+      "label": "shutdown.supervised_exit_settle.waitForOperationalBaselineProcessVacancy.before",
+      "at": "2026-07-19T08:19:23.623Z",
+      "active": 0,
+      "reconciling": 0,
+      "total": 0
+    },
+    {
+      "label": "shutdown.supervised_exit_settle.waitForOperationalBaselineProcessVacancy.after",
+      "at": "2026-07-19T08:19:23.624Z",
+      "active": 0,
+      "reconciling": 0,
+      "total": 0
+    },
+    {
+      "label": "rest.afterShutdown",
+      "at": "2026-07-19T08:19:23.687Z",
+      "active": 0,
+      "reconciling": 0,
+      "total": 0
+    }
+  ],
+  "limitations": [
+    "Descriptive controlled-run baseline only; no timing or process-count thresholds are applied.",
+    "Supervised counts combine ChildSupervisor-managed owned-runtime children with count-only ObserverCoordinator private-child tracking through actual child exit.",
+    "The termination duration ends at the durable stoppedAt timestamp; observer-cleanup duration ends only after stop returns observerCleanupPending=false."
+  ],
+  "failure": null,
+  "thresholds": null
+}

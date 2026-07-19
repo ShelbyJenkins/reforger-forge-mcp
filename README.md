@@ -96,6 +96,12 @@ graphical runtime that ReforgerForge starts and proves it owns exactly.
 8. Cancel unfinished work when necessary and wait for every capture to reach terminal camera restoration. If the runtime was lifecycle-managed, call `observer_runtime action="stop"` with its `runtimeId`, a unique `idempotencyKey`, and a bounded `waitForRestorationMs`.
 9. Call `observer_run action="finalize"` to export only reviewed captures into an allowlisted evidence root, or `discard` a rejected run.
 
+A completed capture proves a structurally valid, world-bound PNG and terminal
+camera restoration; it does not prove the gameplay claim shown in the image.
+`Passed` requires `review.imagesReviewed=true` from an image-capable reviewer.
+Use `Failed`, `Inconclusive`, or `Unreviewed` when the available evidence does
+not support a pass.
+
 The returned `profilePath` is the outer directory passed to Enfusion's
 `-profile` argument. Enfusion mounts `$profile:` at the physical
 `<profilePath>/profile` child (`<profilePath>\profile` on Windows), so the
@@ -558,6 +564,9 @@ both.
 
 ```bash
 npm run build                  # Compile TypeScript
+npm run observer:manifest      # Regenerate Workbench helper identity/manifest after helper changes
+npm run observer:validate:enforce                 # Compile the production observer addon in Workbench
+npm run observer:acceptance:enforce-mailbox       # Execute the five-case real Enforce mailbox gate
 npm test                       # Run hermetic default unit/contract suite
 npm run test:integration       # Run explicitly gated environment integration tests
 npm run test:package           # Verify published-package contents
@@ -566,16 +575,27 @@ node scripts/list-tools.mjs    # Verify every required tool registers
 .\scripts\install-agents.ps1 -All   # Push config to all agents
 ```
 
-The observer screenshot harnesses are opt-in because they launch installed GUI
-applications. Each requires an environment gate and an independent command-line
-confirmation:
+After changing anything under `observer/workbench-addon`, run
+`npm run observer:manifest`, then `npm run test:package`. The first command
+regenerates the compiled helper identity and source manifest; the second checks
+that the complete helper payload is packaged correctly.
+
+The two Enforce commands require Windows, an installed Arma Reforger Workbench,
+and Steam initialization. They refuse an existing Workbench process and use an
+isolated profile. See [the observer validation guide](observer/README.md#bounded-mailbox-and-retention-behavior)
+for the compile-only versus behavioral evidence contract.
+
+The observer screenshot harnesses are repository-development commands and are
+not shipped in the npm package. They are opt-in because they launch installed
+GUI applications. Each requires an environment gate and an independent
+command-line confirmation from a source checkout with dev dependencies:
 
 ```powershell
 $env:RFO_RUN_LIVE_RUNTIME_OBSERVER_ACCEPTANCE = "1"
-npm run observer:acceptance:runtime -- --confirm-live-run
+npm run dev:observer:acceptance:runtime -- --confirm-live-run
 
 $env:RFO_RUN_LIVE_WORKBENCH_OBSERVER_ACCEPTANCE = "1"
-npm run observer:acceptance:workbench -- --confirm-live-run
+npm run dev:observer:acceptance:workbench -- --confirm-live-run
 ```
 
 The runtime command defaults to Reforger's installed stock
@@ -628,10 +648,12 @@ both explicit views had the exact requested matrices and FOVs, differed
 materially from their preceding current views, and restored the original camera
 exactly. Finalization reported no warnings, the disposable target remained
 clean, exact-owner shutdown left zero Workbench processes, and all five images
-were visually inspected during implementation. The bundle's immutable formal
-state remains `Unreviewed` with `imagesReviewed=false`; live automation passed,
-but formal evidence review is required before calling the companion
-live-qualified.
+were formally inspected at original resolution. The finalized manifest's
+recorded state remains `Unreviewed` with `imagesReviewed=false`; the separate
+[hash-bound formal review](docs/validation/2026-07-19-workbench-observer-evidence-review.json)
+records a `Passed` outcome under its stated warning and limitations. The
+companion editor path is therefore live-qualified for this Workbench 1.7.0.54
+procedure.
 
 The real Workbench lifecycle smoke test is separately gated because it opens and
 closes the installed GUI against a disposable project:

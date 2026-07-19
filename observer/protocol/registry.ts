@@ -115,7 +115,7 @@ export const ERROR_REGISTRY = {
     publicMessagePolicy: "bounded-diagnostic", publicMessage: "Renderer world identity changed during capture.", retryable: true, backends: ["runtime", "workbench", "host"],
   },
   CAMERA_BUSY: {
-    publicMessagePolicy: "bounded-diagnostic", publicMessage: "Observer camera is busy or awaiting restoration.", retryable: true, backends: ["runtime", "workbench", "host"],
+    publicMessagePolicy: "bounded-diagnostic", publicMessage: "Observer camera is busy or awaiting restoration.", retryable: true, backends: ["runtime", "workbench", "owned-runtime", "host"],
   },
   CAMERA_OWNERSHIP_LOST: {
     publicMessagePolicy: "bounded-diagnostic", publicMessage: "Observer camera ownership was lost.", retryable: false, backends: ["runtime"],
@@ -256,6 +256,12 @@ export type ObserverCapability = keyof typeof CAPABILITY_REGISTRY;
 
 export const ERROR_CODES = Object.freeze(
   Object.keys(ERROR_REGISTRY) as ObserverErrorCode[]
+) as readonly [ObserverErrorCode, ...ObserverErrorCode[]];
+
+/** Error vocabulary that an engine-runtime heartbeat or job status may emit. */
+export const RUNTIME_ERROR_CODES = Object.freeze(
+  ERROR_CODES.filter((code) =>
+    (ERROR_REGISTRY[code].backends as readonly ObserverBackend[]).includes("runtime"))
 ) as readonly [ObserverErrorCode, ...ObserverErrorCode[]];
 
 export const CAPABILITIES = Object.freeze(

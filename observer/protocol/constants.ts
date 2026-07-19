@@ -15,6 +15,7 @@ export {
   CAPABILITY_REGISTRY,
   ERROR_CODES,
   ERROR_REGISTRY,
+  RUNTIME_ERROR_CODES,
   publicErrorMessage,
   type ObserverBackend,
   type ObserverCapability,

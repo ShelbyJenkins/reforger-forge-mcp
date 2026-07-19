@@ -8,6 +8,7 @@ import {
   JOB_STATES,
   PROTOCOL_MAJOR,
   PROTOCOL_VERSION,
+  RUNTIME_ERROR_CODES,
   SESSION_DIRECTORY_NAME,
   SHA256_PATTERN,
   TERMINAL_JOB_STATES,
@@ -96,7 +97,7 @@ export const heartbeatSchema = z.object({
   activeJobId: identifier.nullable().optional(),
   cameraLeaseJobId: identifier.nullable().optional(),
   transportHealthy: z.boolean(),
-  lastErrorCode: z.enum(ERROR_CODES).nullable().optional(),
+  lastErrorCode: z.enum(RUNTIME_ERROR_CODES).nullable().optional(),
 }).passthrough();
 
 export const currentViewSchema = z.object({ kind: z.literal("current") }).passthrough();
@@ -214,7 +215,7 @@ export const jobStatusSchema = z.object({
   deliveryToken: deliveryToken.optional(),
   /** Required by JobStore; camera ownership is never inferred from `state`. */
   cameraLease: cameraLeaseStatusSchema.optional(),
-  errorCode: z.enum(ERROR_CODES).optional(),
+  errorCode: z.enum(RUNTIME_ERROR_CODES).optional(),
   message: boundedString.optional(),
 }).passthrough().superRefine((value, context) => {
   if (value.state === "failed" && !value.errorCode) {

@@ -1,8 +1,8 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { execFileSync, spawn } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { platform, tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   LifecycleGuardError,
@@ -14,6 +14,9 @@ import {
 const roots: string[] = [];
 const lifecycleHelperPath = fileURLToPath(
   new URL("../../scripts/windows/workbench-lifecycle.ps1", import.meta.url)
+);
+const failStopWorkerPath = fileURLToPath(
+  new URL("./fixtures/mutex-holder-failstop-worker.ts", import.meta.url)
 );
 
 afterEach(() => {
@@ -135,24 +138,30 @@ describe.runIf(platform() === "win32")("Windows lifecycle helper parent deadline
     })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
   }, 10_000);
 
-  it("invalidates active work and returns durable recovery when the mutex holder exits", async () => {
-    let leaseLoss: LifecycleGuardError | null = null;
-    const backend = new WindowsLifecycleBackend(helper([
+  it("fail-stops the MCP before a callback can mutate after its mutex holder exits", async () => {
+    const helperPath = helper([
       "[Console]::Out.WriteLine('{\"ok\":true,\"status\":\"acquired\"}')",
       "[Console]::Out.Flush()",
       "Start-Sleep -Milliseconds 250",
       "exit 0",
-    ].join("\r\n")), {
-      helperTimeoutMs: 1_000,
-    });
+    ].join("\r\n"));
+    const markerPath = join(roots[roots.length - 1], "late-mutation.txt");
+    const worker = spawn(process.execPath, [
+      "--import", "tsx", failStopWorkerPath,
+      helperPath,
+      markerPath,
+      `Global\\ReforgerForge.Timeout.HolderExit.${process.pid}.${Date.now()}`,
+    ], { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
 
-    await expect(backend.withMachineMutex({
-      name: `Global\\ReforgerForge.Timeout.HolderExit.${process.pid}.${Date.now()}`,
-      timeoutMs: 1_000,
-      onLeaseLost: (error) => { leaseLoss = error; },
-      action: () => new Promise<never>(() => undefined),
-    })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
-    expect(leaseLoss).toMatchObject({ code: "RECOVERY_REQUIRED" });
+    const exit = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
+      (resolveExit, reject) => {
+        worker.once("error", reject);
+        worker.once("exit", (code, signal) => resolveExit({ code, signal }));
+      }
+    );
+    expect(exit).toEqual({ code: 86, signal: null });
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 800));
+    expect(existsSync(markerPath)).toBe(false);
   }, 10_000);
 
   it("bounds a helper hung during process inspection without fail-stopping", async () => {
@@ -161,6 +170,32 @@ describe.runIf(platform() === "win32")("Windows lifecycle helper parent deadline
     });
 
     await expect(backend.inspectProcess(4242)).rejects.toBeInstanceOf(LifecycleGuardError);
+  }, 10_000);
+
+  it("maps a hung endpoint-vacancy helper into the total unverifiable result", async () => {
+    const backend = new WindowsLifecycleBackend(helper("Start-Sleep -Seconds 30"), {
+      helperTimeoutMs: 1_000,
+    });
+
+    await expect(backend.verifyEndpointVacant({ host: "127.0.0.1", port: 5775 }))
+      .resolves.toMatchObject({ kind: "unverifiable", reason: "timeout" });
+  }, 10_000);
+
+  it("maps invalid endpoint-vacancy helper JSON into the total unverifiable result", async () => {
+    const backend = new WindowsLifecycleBackend(helper(
+      "[Console]::Out.WriteLine('not-json')"
+    ), { helperTimeoutMs: 1_000 });
+
+    await expect(backend.verifyEndpointVacant({ host: "127.0.0.1", port: 5775 }))
+      .resolves.toMatchObject({ kind: "unverifiable", reason: "helper_failure" });
+  }, 10_000);
+
+  it("maps endpoint-vacancy helper launch failure into the total unverifiable result", async () => {
+    const missing = join(dirname(helper("exit 0")), "missing-helper.ps1");
+    const backend = new WindowsLifecycleBackend(missing, { helperTimeoutMs: 1_000 });
+
+    await expect(backend.verifyEndpointVacant({ host: "127.0.0.1", port: 5775 }))
+      .resolves.toMatchObject({ kind: "unverifiable", reason: "helper_failure" });
   }, 10_000);
 
   it("returns durable recovery when lifecycle state replacement does not return", async () => {

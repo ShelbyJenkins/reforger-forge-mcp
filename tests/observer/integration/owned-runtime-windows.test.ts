@@ -20,6 +20,8 @@ afterEach(() => {
 });
 
 const readyGate: OwnedRuntimeObserverGate = {
+  retainRuntimeLifecycle: async (_sessionId, _runtimeId, generation) => ({ retained: true, generation }),
+  releaseRuntimeLifecycle: async (_sessionId, _runtimeId, generation) => ({ released: true, generation }),
   reserveRuntimeStop: async (_sessionId, proposedReservationId) => ({
     sessionKnown: true,
     ready: true,

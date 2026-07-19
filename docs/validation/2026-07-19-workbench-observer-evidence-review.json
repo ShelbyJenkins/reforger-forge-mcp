@@ -1,0 +1,159 @@
+{
+  "schemaVersion": 1,
+  "kind": "reforger_forge_workbench_observer_evidence_review",
+  "runId": "20260718T015947Z-6ec8429d",
+  "result": "passed",
+  "reviewedAt": "2026-07-19T07:26:22.305Z",
+  "reviewer": {
+    "id": "openai-codex",
+    "displayName": "OpenAI Codex",
+    "capability": "image-capable",
+    "modelFamily": "GPT-5"
+  },
+  "engine": {
+    "product": "Arma Reforger Workbench",
+    "executable": "ArmaReforgerWorkbenchSteamDiag.exe",
+    "productVersion": "1.7.0.54",
+    "fileVersion": "1.7.0.54",
+    "provenance": "Contemporaneous automation documentation plus review-time product/file metadata from the installed executable; the version is not a field in the finalized manifest."
+  },
+  "procedure": {
+    "caseId": "WB-OBSERVER-LIVE-CAPTURE",
+    "revision": "workbench-observer-live-acceptance-v3",
+    "worldResource": "{71D11CE993734B08}Worlds/ObserverAcceptance.ent",
+    "baseWorldResource": "{853E92315D1D9EFE}worlds/Eden/Eden.ent",
+    "captureCount": 5,
+    "provenance": {
+      "procedureRevisionAndWorldResourceBoundByExport": true,
+      "baseWorldResource": "Contemporaneous harness summary/documentation; not a field in the finalized manifest or runtime-config.json.",
+      "sourceRevision": null
+    }
+  },
+  "sourceBundle": {
+    "originalReviewState": {
+      "imagesReviewed": false,
+      "outcome": "Unreviewed"
+    },
+    "sourceManifestUnmodifiedAtReview": true,
+    "retention": "machine_local_temporary_bundle",
+    "durableBundleArchiveRecorded": false,
+    "exportCompletionMarker": "manifest.json",
+    "exportRequestSha256": "3c5d8f3bac42faf11e6f2c74c657da1225d3f438bb597be9b95132977e52c2b7"
+  },
+  "review": {
+    "imagesReviewed": true,
+    "outcome": "Passed",
+    "summary": "All five original-resolution captures are coherent Workbench renders of the expected Everon-derived scene. The pose and look-at captures are visibly distinct from their preceding current views, and both following current captures return to the initial composition without visible corruption or contamination.",
+    "captures": [
+      {
+        "label": "initial-current",
+        "outcome": "Passed",
+        "observation": "Coherent ground-level editor view of the expected rural and industrial terrain; no blank frame, decode artifact, or foreign-window contamination is visible."
+      },
+      {
+        "label": "explicit-pose",
+        "outcome": "Passed",
+        "observation": "Coherent elevated forest-and-field view that is materially distinct from the initial current view."
+      },
+      {
+        "label": "post-pose-restoration-current",
+        "outcome": "Passed",
+        "observation": "Returns to the same ground-level composition as the initial current capture, consistent with successful camera restoration."
+      },
+      {
+        "label": "explicit-look-at",
+        "outcome": "Passed",
+        "observation": "Coherent elevated oblique view centered toward the industrial compound; materially distinct from the preceding restored current view."
+      },
+      {
+        "label": "post-look-at-restoration-current",
+        "outcome": "Passed",
+        "observation": "Returns to the same ground-level composition as the initial current capture, consistent with successful camera restoration."
+      }
+    ],
+    "warnings": [
+      "Expected Workbench editor overlays are visible, including the orientation widget, axis indicator, and world-region labels; some labels are cropped at frame edges. These do not obscure the camera-path evidence but the captures are not presentation screenshots."
+    ],
+    "limitations": [
+      "The review establishes render integrity, visible view displacement, and visible restoration consistency; it does not make a gameplay or editorial-content claim.",
+      "The finalized manifest was unmodified at review and remains Unreviewed with imagesReviewed=false. This separate record supplies the formal image review and is bound to that export by SHA-256.",
+      "This is one controlled Workbench 1.7.0.54 run on one machine; minimized, out-of-focus, headless, world-unload, agent-loss, and remote/delegated behavior are outside its scope.",
+      "The exported bundle supplied no relevant logs, so this visual review does not independently assess engine log warnings.",
+      "The hash-bound source bundle is retained only as machine-local temporary evidence and may become unavailable. This repository record preserves the review, manifest/member attestations, and hashes, not the image bytes.",
+      "Workbench version, base-world inheritance, and source-under-test provenance are not cryptographically bound inside the finalized manifest; their provenance is stated separately above, and sourceRevision was null."
+    ]
+  },
+  "hashVerification": {
+    "algorithm": "SHA-256",
+    "computedManifestSha256": "1c82d84a34bde8f9ea5e5da5602314ada318d96df8778beb428a2aa3fda2f8b2",
+    "receiptManifestSha256": "1c82d84a34bde8f9ea5e5da5602314ada318d96df8778beb428a2aa3fda2f8b2",
+    "manifestMatchesReceipt": true,
+    "listedFileCount": 12,
+    "actualFileCountIncludingManifest": 13,
+    "fileSetMatchesManifest": true,
+    "allDeclaredByteCountsMatch": true,
+    "allDeclaredHashesMatch": true,
+    "verifiedFiles": [
+      {
+        "path": "captures/explicit-look-at.json",
+        "bytes": 1448,
+        "sha256": "7e90b4fe1f7c1c4a5eab6f2b3d89b7834d3ceaf37aa5dc69fae9546716394418"
+      },
+      {
+        "path": "captures/explicit-look-at.png",
+        "bytes": 1114626,
+        "sha256": "363adae626b252298d80d55ed358e0e92797d4365340fb4bf4dc8ebc9842358e"
+      },
+      {
+        "path": "captures/explicit-pose.json",
+        "bytes": 1377,
+        "sha256": "415e1e882e1f5c652d3c03ce68e9ae6455aeed0fd3965967226f799a5253d37a"
+      },
+      {
+        "path": "captures/explicit-pose.png",
+        "bytes": 942473,
+        "sha256": "8d7e272a0822ab9b31c9c2f95b3a788c8ad20edbe3d84f70015f176222317d91"
+      },
+      {
+        "path": "captures/initial-current.json",
+        "bytes": 1234,
+        "sha256": "4e2c5405420c3fe51116147cb5f288e417666a88b080182d2dedab4086672d88"
+      },
+      {
+        "path": "captures/initial-current.png",
+        "bytes": 1264262,
+        "sha256": "d2c7fad5e0ac8df150e77ddaf78aba7a99ed9889e2bfdd6c91490ee38c2a074c"
+      },
+      {
+        "path": "captures/post-look-at-restoration-current.json",
+        "bytes": 1300,
+        "sha256": "4f723d353299eb20139d0c090bab0b7dfbe858c562233c4fe6f02b598d624afe"
+      },
+      {
+        "path": "captures/post-look-at-restoration-current.png",
+        "bytes": 1265247,
+        "sha256": "ea73962329c805395b42c67160f724dc8247cf0b54e3cef871e90fe2cfa6688f"
+      },
+      {
+        "path": "captures/post-pose-restoration-current.json",
+        "bytes": 1288,
+        "sha256": "d1bd7659272182446b39a03aa3ec0ded57e8728f478ca9f8c81fbe20f31b1955"
+      },
+      {
+        "path": "captures/post-pose-restoration-current.png",
+        "bytes": 1263409,
+        "sha256": "f8abe2b2f0e2b6de65705954f8da5c8bdae66e83605d9dbee1e0d72c5f92aab6"
+      },
+      {
+        "path": "RESULT.md",
+        "bytes": 858,
+        "sha256": "84bcc7b47e5c1ed07df5da79b531aa4f7c0ec77b5495edcf23730ee06a6c1eaf"
+      },
+      {
+        "path": "runtime-config.json",
+        "bytes": 371,
+        "sha256": "cfb20c3f96761ad710b77b61d19af0bd4adf3e6f124023bbcf9360e021265873"
+      }
+    ]
+  }
+}

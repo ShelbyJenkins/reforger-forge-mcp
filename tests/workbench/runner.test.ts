@@ -550,7 +550,7 @@ describe("standalone Workbench lifecycle runner", () => {
       executablePath: harness.executablePath,
       creationTime: "133900000000021004",
     });
-    expect(harness.backend.endpointVacancyCalls).toHaveLength(2);
+    expect(harness.backend.endpointVacancyCalls).toHaveLength(5);
 
     const [preflightArgs, buildArgs] = observedArguments;
     const preflightOwner = preflightArgs.findIndex((arg) => arg.startsWith("-reforgerForgeOwnerToken="));
@@ -707,7 +707,7 @@ describe("standalone Workbench lifecycle runner", () => {
       exitStatus: { reason: "exited", exitCode: 0, timedOut: false },
     });
     expect(receipt.output?.freshBytes).toBeGreaterThan(0);
-    expect(harness.backend.endpointVacancyCalls).toHaveLength(2);
+    expect(harness.backend.endpointVacancyCalls).toHaveLength(5);
     expect(reattestationAbsence.at(-1)).toBe(true);
     expect(JSON.stringify(receipt)).not.toContain("reforgerForgeOwnerToken");
     expect(await harness.guard.readLifecycleState()).toMatchObject({
@@ -716,7 +716,7 @@ describe("standalone Workbench lifecycle runner", () => {
     });
   });
 
-  it("refuses an occupied companion endpoint after preflight absence and never spawns the build", async () => {
+  it("refuses an occupied endpoint before the companion preflight can spawn", async () => {
     const harness = createHarness();
     harness.backend.endpointVacancyResult = {
       kind: "occupied",
@@ -735,17 +735,40 @@ describe("standalone Workbench lifecycle runner", () => {
       code: "ENDPOINT_UNVERIFIABLE",
     });
 
-    expect(spawner.spawnCount()).toBe(1);
-    expect(harness.backend.terminationCalls).toHaveLength(1);
+    expect(spawner.spawnCount()).toBe(0);
+    expect(harness.backend.terminationCalls).toHaveLength(0);
     expect(harness.backend.endpointVacancyCalls).toHaveLength(1);
+    expect(await harness.guard.readLifecycleState()).toMatchObject({ kind: "missing" });
   });
 
-  it("refuses an endpoint that becomes occupied after exact target-build absence", async () => {
+  it("maps a thrown native vacancy-helper failure and keeps build spawn count at zero", async () => {
+    const harness = createHarness();
+    harness.backend.verifyEndpointVacant = vi.fn().mockRejectedValue(
+      new Error("native vacancy helper returned invalid JSON")
+    );
+    const spawner = createBuildSpawner(harness, { pidBase: 22_102 });
+
+    await expect(runWorkbenchIntent(harness.config, {
+      kind: "build",
+      gprojPath: harness.projectPath,
+      platform: "PC",
+      outputPath: harness.outputPath,
+      timeoutMs: 1_000,
+    }, runnerDependencies(harness, spawner.spawnProcess))).rejects.toMatchObject({
+      code: "ENDPOINT_UNVERIFIABLE",
+    });
+
+    expect(spawner.spawnCount()).toBe(0);
+    expect(harness.backend.terminationCalls).toHaveLength(0);
+    expect(await harness.guard.readLifecycleState()).toMatchObject({ kind: "missing" });
+  });
+
+  it("refuses an endpoint that becomes occupied before the target build can spawn", async () => {
     const harness = createHarness();
     const originalVacancy = harness.backend.verifyEndpointVacant.bind(harness.backend);
     let vacancyIndex = 0;
     harness.backend.verifyEndpointVacant = vi.fn(async (endpoint) => {
-      if (vacancyIndex++ === 0) return originalVacancy(endpoint);
+      if (vacancyIndex++ < 3) return originalVacancy(endpoint);
       harness.backend.endpointVacancyCalls.push(endpoint);
       return {
         kind: "occupied" as const,
@@ -772,8 +795,8 @@ describe("standalone Workbench lifecycle runner", () => {
       code: "ENDPOINT_UNVERIFIABLE",
     });
 
-    expect(spawner.spawnCount()).toBe(2);
-    expect(harness.backend.endpointVacancyCalls).toHaveLength(2);
+    expect(spawner.spawnCount()).toBe(1);
+    expect(harness.backend.endpointVacancyCalls).toHaveLength(5);
     expect(harness.backend.workbenchPids.size).toBe(0);
   });
 
@@ -1519,6 +1542,27 @@ describe("standalone Workbench lifecycle runner", () => {
       code: "LIFECYCLE_CONFLICT",
     });
     expect(spawnProcess).not.toHaveBeenCalled();
+  });
+
+  it("refuses an occupied endpoint before the foreground editor can spawn", async () => {
+    const harness = createHarness();
+    harness.backend.endpointVacancyResult = {
+      kind: "occupied",
+      listenerPid: 42_426,
+      message: "foreign listener owns the endpoint",
+    };
+    const spawnProcess = vi.fn();
+
+    await expect(runWorkbenchIntent(harness.config, {
+      kind: "editor",
+      gprojPath: harness.projectPath,
+      foreground: true,
+    }, runnerDependencies(harness, spawnProcess))).rejects.toMatchObject({
+      code: "ENDPOINT_UNVERIFIABLE",
+    });
+    expect(spawnProcess).not.toHaveBeenCalled();
+    expect(harness.backend.endpointVacancyCalls).toHaveLength(1);
+    expect(await harness.guard.readLifecycleState()).toMatchObject({ kind: "missing" });
   });
 
   it("rejects a custom companion provider whose managed paths overlap the target", async () => {

@@ -10,7 +10,11 @@ import type {
   WorkbenchObserverInstance,
   WorkbenchObserverJobStatus,
 } from "../workbench/observer-adapter.js";
-import type { RuntimeStopPreflight } from "./owned-runtime-manager.js";
+import type {
+  OwnedRuntimeLifecycleAuthority,
+  OwnedRuntimeLifecycleIdentity,
+  RuntimeStopPreflight,
+} from "./owned-runtime-manager.js";
 import { canonicalPublicObserverErrorCode } from "./public-contract.js";
 
 const CHILD_PROTOCOL = "rfo-observer-child-v1" as const;
@@ -109,6 +113,10 @@ export interface ObserverCoordinatorOptions {
   retentionIntervalMs?: number;
   retentionMaxAgeMs?: number;
   retentionMaxBytes?: number;
+  /** Test/embedded-host override for private-child application sweeping. */
+  privateChildSweepIntervalMs?: number;
+  /** Test/embedded-host override for released session/authority retention. */
+  privateChildSessionTerminalRetentionMs?: number;
   evidenceRoots?: string[];
   supportingLogRoots?: string[];
   pollIntervalMs?: number;
@@ -377,6 +385,7 @@ export class ObserverCoordinator {
     idempotencyKey?: string;
     result: Record<string, unknown>;
   }>();
+  private readonly livePrivateChildren = new Set<ChildProcess>();
   private child: ChildProcess | null = null;
   private descriptor: ObserverChildDescriptor | null = null;
   private startPromise: Promise<ObserverChildDescriptor> | null = null;
@@ -418,6 +427,11 @@ export class ObserverCoordinator {
     this.workbenchAdapter = options.workbenchAdapter;
   }
 
+  /** Count-only diagnostic; intentionally exposes no child identity or command line. */
+  diagnosticPrivateChildCount(): number {
+    return this.livePrivateChildren.size;
+  }
+
   async ensureStarted(): Promise<ObserverChildDescriptor> {
     if (this.closed || this.closing) {
       throw new ObserverCoordinatorError("TRANSPORT_UNAVAILABLE", "Observer coordinator is shutting down");
@@ -435,6 +449,8 @@ export class ObserverCoordinator {
     addOption("--retention-interval-ms", this.options.retentionIntervalMs);
     addOption("--retention-max-age-ms", this.options.retentionMaxAgeMs);
     addOption("--retention-max-bytes", this.options.retentionMaxBytes);
+    addOption("--sweep-interval-ms", this.options.privateChildSweepIntervalMs);
+    addOption("--session-terminal-retention-ms", this.options.privateChildSessionTerminalRetentionMs);
     for (const root of this.options.evidenceRoots ?? []) addOption("--evidence-root", root);
     for (const root of this.options.supportingLogRoots ?? []) addOption("--supporting-log-root", root);
 
@@ -444,6 +460,7 @@ export class ObserverCoordinator {
       env: { ...process.env },
       serialization: "advanced",
     });
+    this.livePrivateChildren.add(child);
     this.child = child;
     this.descriptor = null;
     this.attachChild(child);
@@ -503,16 +520,53 @@ export class ObserverCoordinator {
     return asRecord(await this.request("revoke", { sessionId }), "Observer session revocation");
   }
 
+  async retainRuntimeLifecycle(
+    sessionId: string,
+    runtimeId: string,
+    generation: string,
+    authority: OwnedRuntimeLifecycleAuthority
+  ): Promise<Record<string, unknown>> {
+    return asRecord(
+      await this.request("runtimeLifecycleRetain", {
+        sessionId,
+        runtimeId,
+        generation,
+        authority,
+      }),
+      "Observer runtime lifecycle retention"
+    );
+  }
+
+  async releaseRuntimeLifecycle(
+    sessionId: string,
+    runtimeId: string,
+    generation: string
+  ): Promise<Record<string, unknown>> {
+    return asRecord(
+      await this.request("runtimeLifecycleRelease", { sessionId, runtimeId, generation }),
+      "Observer runtime lifecycle release"
+    );
+  }
+
   async reserveRuntimeStop(
     sessionId: string,
     proposedReservationId: string,
-    exactRuntimeVacant = false
+    exactRuntimeVacant = false,
+    lifecycle?: OwnedRuntimeLifecycleIdentity
   ): Promise<RuntimeStopPreflight> {
+    if (!lifecycle) {
+      throw new ObserverCoordinatorError(
+        "INVALID_REQUEST",
+        "Observer runtime stop reservation requires an exact lifecycle generation"
+      );
+    }
     const response = asRecord(
       await this.request("runtimeStopPreflight", {
         sessionId,
         reservationId: proposedReservationId,
         exactRuntimeVacant,
+        runtimeId: lifecycle.runtimeId,
+        generation: lifecycle.generation,
       }),
       "Observer runtime stop preflight"
     );
@@ -531,9 +585,24 @@ export class ObserverCoordinator {
     };
   }
 
-  async releaseRuntimeStop(sessionId: string, reservationId: string): Promise<Record<string, unknown>> {
+  async releaseRuntimeStop(
+    sessionId: string,
+    reservationId: string,
+    lifecycle?: OwnedRuntimeLifecycleIdentity
+  ): Promise<Record<string, unknown>> {
+    if (!lifecycle) {
+      throw new ObserverCoordinatorError(
+        "INVALID_REQUEST",
+        "Observer runtime stop release requires an exact lifecycle generation"
+      );
+    }
     return asRecord(
-      await this.request("runtimeStopRelease", { sessionId, reservationId }),
+      await this.request("runtimeStopRelease", {
+        sessionId,
+        reservationId,
+        runtimeId: lifecycle.runtimeId,
+        generation: lifecycle.generation,
+      }),
       "Observer runtime stop release"
     );
   }
@@ -541,13 +610,22 @@ export class ObserverCoordinator {
   async completeRuntimeStop(
     sessionId: string,
     reservationId?: string,
-    exactRuntimeVacant = false
+    exactRuntimeVacant = false,
+    lifecycle?: { runtimeId: string; generation: string }
   ): Promise<Record<string, unknown>> {
+    if (!lifecycle) {
+      throw new ObserverCoordinatorError(
+        "INVALID_REQUEST",
+        "Observer runtime stop completion requires an exact lifecycle generation"
+      );
+    }
     return asRecord(
       await this.request("runtimeStopComplete", {
         sessionId,
         ...(reservationId ? { reservationId } : {}),
         exactRuntimeVacant,
+        runtimeId: lifecycle.runtimeId,
+        generation: lifecycle.generation,
       }),
       "Observer runtime stop completion"
     );
@@ -1981,6 +2059,8 @@ export class ObserverCoordinator {
     });
     child.on("message", (message: unknown) => this.onMessage(message));
     child.once("error", (error) => {
+      // A failed fork with no OS process will not necessarily emit `exit`.
+      if (child.pid === undefined) this.livePrivateChildren.delete(child);
       if (this.child !== child) return;
       this.rejectStartup?.(new ObserverCoordinatorError("TRANSPORT_UNAVAILABLE", `Private observer agent failed: ${error.message}`));
       this.descriptor = null;
@@ -1988,6 +2068,7 @@ export class ObserverCoordinator {
       child.kill();
     });
     child.once("exit", (code, signal) => {
+      this.livePrivateChildren.delete(child);
       if (this.child !== child) return;
       if (stderrBuffer.trim()) logger.warn(`observer child: ${redactChildLine(stderrBuffer.trim())}`);
       this.child = null;

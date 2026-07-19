@@ -1,11 +1,11 @@
-import { existsSync, lstatSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync, readdirSync, renameSync, unlinkSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { DEFAULT_LIMITS } from "../protocol/index.js";
 import { ArtifactStore } from "./artifacts.js";
 import { ObserverError } from "./errors.js";
 import { JobStore } from "./jobs.js";
 import { observerLogger } from "./logger.js";
-import { MailboxTransport } from "./mailbox.js";
+import { MailboxTransport, type MailboxCleanupFailure } from "./mailbox.js";
 import { assertManagedPath, atomicWriteJson, ensureCanonicalDirectory } from "./paths.js";
 import { InstanceRegistry } from "./registry.js";
 import { type Clock, SessionStore, systemClock } from "./sessions.js";
@@ -20,6 +20,21 @@ interface RetryRecord {
   dataName: string;
 }
 
+interface CleanupSweep {
+  removed: number;
+  retainedFailures: number;
+  reliable: boolean;
+}
+
+interface AggregateCleanupSweep extends CleanupSweep {
+  estimatedBytes: number;
+}
+
+interface QuarantineInventory {
+  files: Array<{ path: string; bytes: number; mtimeMs: number }>;
+  reliable: boolean;
+}
+
 export interface MailboxCoordinatorOptions {
   clock?: Clock;
   maxIngressPerPoll?: number;
@@ -31,11 +46,15 @@ export interface MailboxCoordinatorOptions {
   quarantineMaxRecords?: number;
   quarantineMaxBytes?: number;
   quarantineMaxAgeMs?: number;
+  orphanIngressMaxAgeMs?: number;
+  removeFile?: (path: string) => void;
 }
 
 export interface MailboxSweepResult {
   removedTransportSessionIds: string[];
   removedQuarantineFiles: number;
+  removedOrphanIngressFiles: number;
+  retainedCleanupFailures: number;
 }
 
 export interface MailboxCoordinatorStats {
@@ -57,14 +76,18 @@ export interface MailboxCoordinatorStats {
   quarantineMaxAgeMs: number;
   commandFiles: number;
   commandBytes: number;
+  commandUsageReliable: boolean;
+  orphanIngressRemoved: number;
+  cleanupFailures: number;
+  lastCleanupFailure: MailboxCleanupFailure | null;
 }
 
 export class MailboxCoordinator {
   private readonly transports = new Map<string, MailboxTransport>();
   private readonly rejectionAttempts = new Map<string, RetryRecord>();
   private readonly pollCursors = new Map<string, string>();
-  private readonly quarantineIndex = new Map<string, Array<{ path: string; bytes: number; mtimeMs: number }>>();
   private readonly commandUsageBySession = new Map<string, { files: number; bytes: number }>();
+  private quarantineInventoryScope: Map<string, QuarantineInventory> | null = null;
   private readonly clock: Clock;
   private readonly maxIngressPerPoll: number;
   private readonly maxRetryAttempts: number;
@@ -75,7 +98,12 @@ export class MailboxCoordinator {
   private readonly quarantineMaxRecords: number;
   private readonly quarantineMaxBytes: number;
   private readonly quarantineMaxAgeMs: number;
+  private readonly orphanIngressMaxAgeMs: number;
+  private readonly removeFile: (path: string) => void;
   private dispositionSequence = 0;
+  private orphanIngressRemoved = 0;
+  private cleanupFailures = 0;
+  private lastCleanupFailure: MailboxCleanupFailure | null = null;
   private dispositionCounts = {
     accepted: 0,
     permanentRejected: 0,
@@ -107,56 +135,130 @@ export class MailboxCoordinator {
     this.quarantineMaxRecords = this.boundedOption(options.quarantineMaxRecords, 128, 1, 100_000, "Mailbox quarantine record limit");
     this.quarantineMaxBytes = this.boundedOption(options.quarantineMaxBytes, 4 * 1024 * 1024, 1_024, 1024 * 1024 * 1024, "Mailbox quarantine byte limit");
     this.quarantineMaxAgeMs = this.boundedOption(options.quarantineMaxAgeMs, 24 * 60 * 60_000, 0, 30 * 24 * 60 * 60_000, "Mailbox quarantine age limit");
+    this.orphanIngressMaxAgeMs = this.boundedOption(options.orphanIngressMaxAgeMs, 30_000, 0, 24 * 60 * 60_000, "Mailbox orphan ingress age limit");
+    this.removeFile = options.removeFile ?? unlinkSync;
   }
 
   async pollOnce(): Promise<void> {
-    for (const session of this.sessions.activeRecords()) {
-      if (!session.transportPreference.includes("mailbox")) continue;
-      try {
-        let transport = this.transports.get(session.sessionId);
-        if (!transport) {
-          if (this.transports.size >= this.maxTransports) {
-            throw new ObserverError("TRANSPORT_UNAVAILABLE", "Mailbox transport retention budget is exhausted", 503);
+    const previousScope = this.quarantineInventoryScope;
+    this.quarantineInventoryScope = new Map();
+    try {
+      for (const session of this.sessions.activeRecords()) {
+        if (!session.transportPreference.includes("mailbox")) continue;
+        try {
+          let transport = this.transports.get(session.sessionId);
+          if (!transport) {
+            if (this.transports.size >= this.maxTransports) {
+              throw new ObserverError("TRANSPORT_UNAVAILABLE", "Mailbox transport retention budget is exhausted", 503);
+            }
+            transport = new MailboxTransport(session.profilePath, {
+              removeFile: this.removeFile,
+              onCleanupFailure: (failure) => this.recordCleanupFailure(failure),
+            });
+            const usage = transport.stats();
+            if (!usage.commandUsageReliable) {
+              throw new ObserverError("TRANSPORT_UNAVAILABLE", "Mailbox command retention usage cannot be proven", 503);
+            }
+            this.admitTransport(session.sessionId, transport, {
+              files: usage.commandFiles,
+              bytes: usage.commandBytes,
+            });
           }
-          transport = new MailboxTransport(session.profilePath);
-          const usage = transport.stats();
-          this.admitTransport(session.sessionId, transport, {
-            files: usage.commandFiles,
-            bytes: usage.commandBytes,
+          await this.consumeIngress(session.sessionId, transport.statusDirectory);
+          this.publishCommands(session.sessionId, transport);
+        } catch (error) {
+          observerLogger.warn("mailbox session poll failed", {
+            sessionId: session.sessionId,
+            errorCode: error instanceof ObserverError ? error.code : "INTERNAL_ERROR",
           });
         }
-        await this.consumeIngress(session.sessionId, transport.statusDirectory);
-        this.publishCommands(session.sessionId, transport);
-      } catch (error) {
-        observerLogger.warn("mailbox session poll failed", {
-          sessionId: session.sessionId,
-          errorCode: error instanceof ObserverError ? error.code : "INTERNAL_ERROR",
-        });
       }
+    } finally {
+      this.quarantineInventoryScope = previousScope;
     }
   }
 
   sweep(now = this.clock.now(), retainedSessionIds: ReadonlySet<string> = new Set()): MailboxSweepResult {
-    const removedTransportSessionIds: string[] = [];
-    let removedQuarantineFiles = 0;
-    for (const [sessionId, transport] of this.transports) {
-      const commandSweep = transport.sweepCommands(now);
-      this.commandUsageBySession.set(sessionId, { files: commandSweep.files, bytes: commandSweep.bytes });
-      removedQuarantineFiles += this.pruneQuarantine(transport.statusDirectory, now, 0);
-      if (!this.sessions.isTerminal(sessionId, now) || retainedSessionIds.has(sessionId) || this.sessions.isPinned(sessionId, retainedSessionIds)) {
-        continue;
+    const previousScope = this.quarantineInventoryScope;
+    this.quarantineInventoryScope = new Map();
+    try {
+      const removedTransportSessionIds: string[] = [];
+      let removedQuarantineFiles = 0;
+      let removedOrphanIngressFiles = 0;
+      let retainedCleanupFailures = 0;
+      for (const [sessionId, transport] of this.transports) {
+        let cleanupBlocked = false;
+        const writerIsDurablyInactive = this.sessions.isTerminal(sessionId, now) &&
+          !retainedSessionIds.has(sessionId) &&
+          !this.sessions.isPinned(sessionId, retainedSessionIds);
+        try {
+          const commandSweep = transport.sweepCommands(now);
+          this.commandUsageBySession.set(sessionId, { files: commandSweep.files, bytes: commandSweep.bytes });
+          if (!commandSweep.usageReliable || commandSweep.retainedFailures > 0) {
+            cleanupBlocked = true;
+            retainedCleanupFailures += commandSweep.retainedFailures + (commandSweep.usageReliable ? 0 : 1);
+          }
+        } catch (error) {
+          cleanupBlocked = true;
+          retainedCleanupFailures += 1;
+          this.recordCleanupError("sweep_commands", sessionId, error);
+        }
+        // Runtime publication is data -> marker and Enforce has no atomic
+        // rename. A markerless data file may therefore belong to a live writer
+        // paused immediately before marker publication. Runtime-side writes
+        // reclaim their own prior crash remnants while serialized; the host may
+        // reclaim only after durable session authority proves the writer is no
+        // longer active.
+        if (writerIsDurablyInactive) {
+          try {
+            const orphanSweep = this.pruneOrphanIngress(transport.statusDirectory, now);
+            removedOrphanIngressFiles += orphanSweep.removed;
+            if (!orphanSweep.reliable || orphanSweep.retainedFailures > 0) {
+              cleanupBlocked = true;
+              retainedCleanupFailures += orphanSweep.retainedFailures + (orphanSweep.reliable ? 0 : 1);
+            }
+          } catch (error) {
+            cleanupBlocked = true;
+            retainedCleanupFailures += 1;
+            this.recordCleanupError("sweep_orphan_ingress", sessionId, error);
+          }
+        }
+        try {
+          const quarantineSweep = this.pruneQuarantine(transport.statusDirectory, now, 0);
+          removedQuarantineFiles += quarantineSweep.removed;
+          if (!quarantineSweep.reliable || quarantineSweep.retainedFailures > 0) {
+            cleanupBlocked = true;
+            retainedCleanupFailures += quarantineSweep.retainedFailures + (quarantineSweep.reliable ? 0 : 1);
+          }
+        } catch (error) {
+          cleanupBlocked = true;
+          retainedCleanupFailures += 1;
+          this.recordCleanupError("sweep_quarantine", sessionId, error);
+        }
+        if (!writerIsDurablyInactive) continue;
+        // A busy or uninspectable exact file keeps only its own transport pinned
+        // for a later retry. It cannot abort or pin unrelated session cleanup.
+        if (cleanupBlocked) continue;
+        this.transports.delete(sessionId);
+        this.pollCursors.delete(sessionId);
+        this.commandUsageBySession.delete(sessionId);
+        for (const [path, retry] of this.rejectionAttempts) {
+          if (retry.sessionId === sessionId) this.rejectionAttempts.delete(path);
+        }
+        removedTransportSessionIds.push(sessionId);
       }
-      this.transports.delete(sessionId);
-      this.pollCursors.delete(sessionId);
-      this.commandUsageBySession.delete(sessionId);
-      this.quarantineIndex.delete(join(transport.statusDirectory, "quarantine"));
-      for (const [path, retry] of this.rejectionAttempts) {
-        if (retry.sessionId === sessionId) this.rejectionAttempts.delete(path);
+      try {
+        const aggregate = this.pruneAggregateQuarantine(now, 0);
+        removedQuarantineFiles += aggregate.removed;
+        retainedCleanupFailures += aggregate.retainedFailures + (aggregate.reliable ? 0 : 1);
+      } catch (error) {
+        retainedCleanupFailures += 1;
+        this.recordCleanupError("sweep_aggregate_quarantine", "aggregate", error);
       }
-      removedTransportSessionIds.push(sessionId);
+      return { removedTransportSessionIds, removedQuarantineFiles, removedOrphanIngressFiles, retainedCleanupFailures };
+    } finally {
+      this.quarantineInventoryScope = previousScope;
     }
-    removedQuarantineFiles += this.pruneAggregateQuarantine(now, 0);
-    return { removedTransportSessionIds, removedQuarantineFiles };
   }
 
   stats(): MailboxCoordinatorStats {
@@ -164,11 +266,14 @@ export class MailboxCoordinator {
     let quarantineBytes = 0;
     let commandFiles = 0;
     let commandBytes = 0;
+    let commandUsageReliable = true;
     for (const [sessionId, transport] of this.transports) {
       const quarantine = this.quarantineUsage(transport.statusDirectory);
       quarantineFiles += quarantine.files;
       quarantineBytes += quarantine.bytes;
-      const commands = this.commandUsageBySession.get(sessionId) ?? { files: transport.stats().commandFiles, bytes: transport.stats().commandBytes };
+      const transportStats = transport.stats();
+      commandUsageReliable = commandUsageReliable && transportStats.commandUsageReliable && quarantine.reliable;
+      const commands = this.commandUsageBySession.get(sessionId) ?? { files: transportStats.commandFiles, bytes: transportStats.commandBytes };
       commandFiles += commands.files;
       commandBytes += commands.bytes;
     }
@@ -187,6 +292,10 @@ export class MailboxCoordinator {
       quarantineMaxAgeMs: this.quarantineMaxAgeMs,
       commandFiles,
       commandBytes,
+      commandUsageReliable,
+      orphanIngressRemoved: this.orphanIngressRemoved,
+      cleanupFailures: this.cleanupFailures,
+      lastCleanupFailure: this.lastCleanupFailure,
     };
   }
 
@@ -195,6 +304,10 @@ export class MailboxCoordinator {
   }
 
   private async consumeIngress(sessionId: string, statusDirectory: string): Promise<void> {
+    // Do not reclaim markerless runtime output here. Even an old data file can
+    // belong to a live writer paused before its completion marker. The runtime
+    // serializes reclamation with its next publication; terminal-session sweep
+    // is the only host-side reclamation path.
     const entries = readdirSync(statusDirectory, { withFileTypes: true })
       .filter((entry) => (entry.isFile() || entry.isSymbolicLink()) && entry.name.endsWith(".complete"))
       .sort((a, b) => this.eventSequence(a.name) - this.eventSequence(b.name) || a.name.localeCompare(b.name));
@@ -235,12 +348,12 @@ export class MailboxCoordinator {
         else await this.artifacts.intake(body, token);
         // Remove the completion marker first. If data cleanup is interrupted,
         // the accepted message cannot be delivered a second time.
-        unlinkSync(markerPath);
+        if (!this.disposeFile(markerPath, "accept_marker")) {
+          throw new ObserverError("TRANSPORT_UNAVAILABLE", "Mailbox acceptance marker cleanup is busy", 503);
+        }
         this.rejectionAttempts.delete(markerPath);
         this.dispositionCounts.accepted += 1;
-        try {
-          if (existsSync(path)) unlinkSync(path);
-        } catch {
+        if (!this.disposeFile(path, "accept_data")) {
           // Marker deletion is the acceptance commit. Residual data is cleanup
           // evidence, never another message eligible for delivery.
           this.quarantine(statusDirectory, dataName, path, markerPath, "ACCEPTED_CLEANUP", this.clock.now());
@@ -337,8 +450,17 @@ export class MailboxCoordinator {
     errorCode: string,
     now: number
   ): void {
-    const quarantine = ensureCanonicalDirectory(join(statusDirectory, "quarantine"));
-    assertManagedPath(statusDirectory, quarantine);
+    let quarantine: string;
+    try {
+      quarantine = ensureCanonicalDirectory(join(statusDirectory, "quarantine"));
+      assertManagedPath(statusDirectory, quarantine);
+    } catch (error) {
+      this.recordCleanupError("prepare_quarantine", dataName, error);
+      this.disposeFile(markerPath, "drop_marker_without_quarantine");
+      this.disposeFile(path, "drop_data_without_quarantine");
+      this.dispositionCounts.quarantineDropped += 1;
+      return;
+    }
     this.dispositionSequence += 1;
     const sourceInfo = this.safeFileInfo(path);
     const safeCode = errorCode.replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 48) || "REJECTED";
@@ -354,17 +476,23 @@ export class MailboxCoordinator {
     let retainOriginal = sourceInfo !== null && sourceInfo.size <= DEFAULT_LIMITS.maxRequestBodyBytes &&
       sourceInfo.size <= this.quarantineMaxBytes && sourceInfo.size <= this.maxEstimatedBytes;
     let incomingBytes = retainOriginal ? sourceInfo!.size : summaryBytes;
-    this.pruneQuarantine(statusDirectory, now, incomingBytes);
-    this.pruneAggregateQuarantine(now, incomingBytes);
-    if (this.estimatedStoreBytes() + incomingBytes > this.maxEstimatedBytes) {
+    let localPrune = this.pruneQuarantine(statusDirectory, now, incomingBytes);
+    let aggregatePrune = this.pruneAggregateQuarantine(now, incomingBytes);
+    let estimatedBytes = aggregatePrune.estimatedBytes;
+    let retentionReliable = localPrune.reliable && aggregatePrune.reliable &&
+      localPrune.retainedFailures === 0 && aggregatePrune.retainedFailures === 0;
+    if (retainOriginal && estimatedBytes + incomingBytes > this.maxEstimatedBytes) {
       retainOriginal = false;
       incomingBytes = summaryBytes;
-      this.pruneQuarantine(statusDirectory, now, incomingBytes);
-      this.pruneAggregateQuarantine(now, incomingBytes);
+      localPrune = this.pruneQuarantine(statusDirectory, now, incomingBytes);
+      aggregatePrune = this.pruneAggregateQuarantine(now, incomingBytes);
+      estimatedBytes = aggregatePrune.estimatedBytes;
+      retentionReliable = retentionReliable && localPrune.reliable && aggregatePrune.reliable &&
+        localPrune.retainedFailures === 0 && aggregatePrune.retainedFailures === 0;
     }
-    if (this.estimatedStoreBytes() + incomingBytes > this.maxEstimatedBytes || incomingBytes > this.quarantineMaxBytes) {
-      try { if (existsSync(markerPath) || this.isSymlink(markerPath)) unlinkSync(markerPath); } catch { /* exact-path best effort */ }
-      try { if (existsSync(path) || this.isSymlink(path)) unlinkSync(path); } catch { /* exact-path best effort */ }
+    if (!retentionReliable || estimatedBytes + incomingBytes > this.maxEstimatedBytes || incomingBytes > this.quarantineMaxBytes) {
+      this.disposeFile(markerPath, "drop_over_budget_marker");
+      this.disposeFile(path, "drop_over_budget_data");
       this.dispositionCounts.quarantineDropped += 1;
       return;
     }
@@ -376,106 +504,159 @@ export class MailboxCoordinator {
     try {
       // The marker is only a commit signal and carries no forensic payload.
       // Delete it first so a partial quarantine operation cannot redeliver.
-      if (existsSync(markerPath) || this.isSymlink(markerPath)) unlinkSync(markerPath);
+      if (!this.disposeFile(markerPath, "quarantine_marker")) {
+        this.dispositionCounts.quarantineDropped += 1;
+        return;
+      }
       if (retainOriginal) {
         renameSync(path, target);
       } else {
-        if (existsSync(path) || this.isSymlink(path)) unlinkSync(path);
+        if (!this.disposeFile(path, "quarantine_source")) {
+          this.dispositionCounts.quarantineDropped += 1;
+          return;
+        }
         atomicWriteJson(quarantine, target, summary);
       }
+      // Inspect the exact published target before declaring retention. The
+      // poll/sweep-scoped inventory is updated for this mutation and is
+      // invalidated on any later cleanup failure.
+      const retainedInfo = lstatSync(target);
+      if (retainedInfo.isSymbolicLink() || !retainedInfo.isFile()) {
+        throw Object.assign(new Error("unsafe published quarantine entry"), { code: "EUNSAFE" });
+      }
+      this.addScopedQuarantineFile(target, retainedInfo.size, retainedInfo.mtimeMs);
+      const localUsage = this.quarantineUsage(statusDirectory);
+      const aggregateUsage = this.estimatedStoreBytes();
+      if (!localUsage.reliable || localUsage.files > this.quarantineMaxRecords ||
+          localUsage.bytes > this.quarantineMaxBytes || aggregateUsage > this.maxEstimatedBytes) {
+        throw Object.assign(new Error("published quarantine entry exceeded a verified bound"), { code: "EBOUNDS" });
+      }
       this.dispositionCounts.quarantined += 1;
-      const retainedInfo = statSync(target);
-      this.addQuarantineFile(target, retainedInfo.size, retainedInfo.mtimeMs);
     } catch (error) {
       // Quarantine is deliberately fail-safe for liveness: exact ingress files
       // are discarded if bounded evidence cannot be retained.
-      try { if (existsSync(markerPath) || this.isSymlink(markerPath)) unlinkSync(markerPath); } catch { /* exact-path best effort */ }
-      try { if (existsSync(path) || this.isSymlink(path)) unlinkSync(path); } catch { /* exact-path best effort */ }
+      this.disposeFile(markerPath, "quarantine_failure_marker");
+      this.disposeFile(path, "quarantine_failure_data");
+      this.disposeFile(target, "quarantine_failure_target");
+      this.invalidateScopedQuarantineFile(target);
       this.dispositionCounts.quarantineDropped += 1;
+      this.recordCleanupError("retain_quarantine", dataName, error);
       observerLogger.warn("mailbox quarantine evidence dropped", {
         file: dataName,
         errorCode: error instanceof ObserverError ? error.code : "INTERNAL_ERROR",
       });
     }
-    this.pruneQuarantine(statusDirectory, now, 0);
-    this.pruneAggregateQuarantine(now, 0);
   }
 
-  private pruneAggregateQuarantine(now: number, incomingBytes: number): number {
+  private pruneAggregateQuarantine(now: number, incomingBytes: number): AggregateCleanupSweep {
+    let reliable = true;
+    let quarantineBytes = 0;
     const files = [...this.transports.values()].flatMap((transport) => {
       const quarantine = join(transport.statusDirectory, "quarantine");
-      return existsSync(quarantine) ? this.quarantineFiles(quarantine) : [];
+      const inventory = this.quarantineFiles(quarantine);
+      reliable = reliable && inventory.reliable;
+      quarantineBytes += inventory.files.reduce((total, item) => total + item.bytes, 0);
+      return inventory.files;
     }).sort((left, right) => left.mtimeMs - right.mtimeMs || left.path.localeCompare(right.path));
-    let total = this.estimatedStoreBytes();
+    let commandBytes = 0;
+    for (const [sessionId, transport] of this.transports) {
+      const transportStats = transport.stats();
+      reliable = reliable && transportStats.commandUsageReliable;
+      commandBytes += (this.commandUsageBySession.get(sessionId) ?? {
+        files: transportStats.commandFiles,
+        bytes: transportStats.commandBytes,
+      }).bytes;
+    }
+    const metadataBytes = this.metadataBytes();
+    let total = commandBytes + quarantineBytes + metadataBytes;
     let removed = 0;
+    let retainedFailures = 0;
     for (const item of files) {
       if (total + incomingBytes <= this.maxEstimatedBytes && now - item.mtimeMs <= this.quarantineMaxAgeMs) break;
-      unlinkSync(item.path);
-      this.removeQuarantineFile(item.path);
-      total -= item.bytes;
-      removed += 1;
+      if (this.disposeFile(item.path, "prune_aggregate_quarantine")) {
+        total -= item.bytes;
+        removed += 1;
+      } else {
+        retainedFailures += 1;
+      }
     }
-    return removed;
+    return {
+      removed,
+      retainedFailures,
+      reliable,
+      estimatedBytes: reliable ? total : Math.max(total, this.maxEstimatedBytes + 1),
+    };
   }
 
-  private pruneQuarantine(statusDirectory: string, now: number, incomingBytes: number): number {
+  private pruneQuarantine(statusDirectory: string, now: number, incomingBytes: number): CleanupSweep {
     const quarantine = join(statusDirectory, "quarantine");
-    if (!existsSync(quarantine)) return 0;
     assertManagedPath(statusDirectory, quarantine);
-    const files = [...this.quarantineFiles(quarantine)];
+    const inventory = this.quarantineFiles(quarantine);
+    const files = inventory.files;
     let total = files.reduce((sum, item) => sum + item.bytes, 0);
     let count = files.length;
     let removed = 0;
+    let retainedFailures = 0;
     for (const item of files) {
       const expired = now - item.mtimeMs > this.quarantineMaxAgeMs;
       const overCount = count + (incomingBytes > 0 ? 1 : 0) > this.quarantineMaxRecords;
       const overBytes = total + incomingBytes > this.quarantineMaxBytes;
       if (!expired && !overCount && !overBytes) continue;
-      unlinkSync(item.path);
-      this.removeQuarantineFile(item.path);
-      total -= item.bytes;
-      count -= 1;
-      removed += 1;
+      if (this.disposeFile(item.path, "prune_quarantine")) {
+        total -= item.bytes;
+        count -= 1;
+        removed += 1;
+      } else {
+        retainedFailures += 1;
+      }
     }
-    return removed;
+    return { removed, retainedFailures, reliable: inventory.reliable };
   }
 
-  private quarantineUsage(statusDirectory: string): { files: number; bytes: number } {
+  private quarantineUsage(statusDirectory: string): { files: number; bytes: number; reliable: boolean } {
     const quarantine = join(statusDirectory, "quarantine");
-    if (!existsSync(quarantine)) return { files: 0, bytes: 0 };
-    const files = this.quarantineFiles(quarantine);
-    return { files: files.length, bytes: files.reduce((total, item) => total + item.bytes, 0) };
+    const inventory = this.quarantineFiles(quarantine);
+    return {
+      files: inventory.files.length,
+      bytes: inventory.files.reduce((total, item) => total + item.bytes, 0),
+      reliable: inventory.reliable,
+    };
   }
 
-  private quarantineFiles(quarantine: string): Array<{ path: string; bytes: number; mtimeMs: number }> {
-    const cached = this.quarantineIndex.get(quarantine);
-    if (cached) return cached;
+  private quarantineFiles(quarantine: string): QuarantineInventory {
+    const cached = this.quarantineInventoryScope?.get(quarantine);
+    if (cached) return { files: [...cached.files], reliable: cached.reliable };
     const files: Array<{ path: string; bytes: number; mtimeMs: number }> = [];
-    for (const entry of readdirSync(quarantine, { withFileTypes: true })) {
-      if (!entry.isFile() || entry.isSymbolicLink()) continue;
+    let entries;
+    try {
+      entries = readdirSync(quarantine, { withFileTypes: true });
+    } catch (error) {
+      if (this.isMissing(error)) return { files, reliable: true };
+      this.recordCleanupError("scan_quarantine", quarantine, error);
+      return { files, reliable: false };
+    }
+    let reliable = true;
+    for (const entry of entries) {
       const path = join(quarantine, entry.name);
       assertManagedPath(quarantine, path);
-      const info = statSync(path);
-      files.push({ path, bytes: info.size, mtimeMs: info.mtimeMs });
+      try {
+        const info = lstatSync(path);
+        if (entry.isSymbolicLink() || info.isSymbolicLink() || !entry.isFile() || !info.isFile()) {
+          reliable = false;
+          this.recordCleanupError("inspect_quarantine", path, Object.assign(new Error("unsafe quarantine entry"), { code: "EUNSAFE" }));
+          continue;
+        }
+        files.push({ path, bytes: info.size, mtimeMs: info.mtimeMs });
+      } catch (error) {
+        if (this.isMissing(error)) continue;
+        reliable = false;
+        this.recordCleanupError("inspect_quarantine", path, error);
+      }
     }
     files.sort((left, right) => left.mtimeMs - right.mtimeMs || left.path.localeCompare(right.path));
-    this.quarantineIndex.set(quarantine, files);
-    return files;
-  }
-
-  private addQuarantineFile(path: string, bytes: number, mtimeMs: number): void {
-    const quarantine = dirname(path);
-    const files = this.quarantineIndex.get(quarantine) ?? [];
-    files.push({ path, bytes, mtimeMs });
-    files.sort((left, right) => left.mtimeMs - right.mtimeMs || left.path.localeCompare(right.path));
-    this.quarantineIndex.set(quarantine, files);
-  }
-
-  private removeQuarantineFile(path: string): void {
-    const files = this.quarantineIndex.get(dirname(path));
-    if (!files) return;
-    const index = files.findIndex((item) => item.path === path);
-    if (index >= 0) files.splice(index, 1);
+    const inventory = { files, reliable };
+    if (reliable) this.quarantineInventoryScope?.set(quarantine, inventory);
+    return { files: [...files], reliable };
   }
 
   private safeFileInfo(path: string): { size: number } | null {
@@ -487,19 +668,122 @@ export class MailboxCoordinator {
     }
   }
 
+  private pruneOrphanIngress(statusDirectory: string, now: number): CleanupSweep {
+    let entries;
+    try {
+      entries = readdirSync(statusDirectory, { withFileTypes: true });
+    } catch (error) {
+      if (this.isMissing(error)) return { removed: 0, retainedFailures: 0, reliable: true };
+      this.recordCleanupError("scan_orphan_ingress", statusDirectory, error);
+      return { removed: 0, retainedFailures: 0, reliable: false };
+    }
+    const names = new Set(entries.map((entry) => entry.name));
+    let removed = 0;
+    let retainedFailures = 0;
+    let reliable = true;
+    for (const entry of entries) {
+      const isTemporary = /^\d{12}-(?:registration|heartbeat|status|artifact)-[A-Za-z0-9_.-]+\.json\.tmp$/.test(entry.name);
+      const isMarkerlessData = /^\d{12}-(?:registration|heartbeat|status|artifact)-[A-Za-z0-9_.-]+\.json$/.test(entry.name) &&
+        !names.has(`${entry.name}.complete`);
+      if (!isTemporary && !isMarkerlessData) continue;
+      const path = join(statusDirectory, entry.name);
+      assertManagedPath(statusDirectory, path);
+      let info;
+      try {
+        info = lstatSync(path);
+      } catch (error) {
+        if (this.isMissing(error)) {
+          removed += 1;
+          continue;
+        }
+        reliable = false;
+        this.recordCleanupError("inspect_orphan_ingress", path, error);
+        continue;
+      }
+      if (now - info.mtimeMs < this.orphanIngressMaxAgeMs) continue;
+      if (this.disposeFile(path, "prune_orphan_ingress")) {
+        removed += 1;
+        this.orphanIngressRemoved += 1;
+      } else {
+        retainedFailures += 1;
+      }
+    }
+    return { removed, retainedFailures, reliable };
+  }
+
+  private disposeFile(path: string, operation: string): boolean {
+    try {
+      this.removeFile(path);
+      this.removeScopedQuarantineFile(path);
+      return true;
+    } catch (error) {
+      if (this.isMissing(error)) {
+        this.removeScopedQuarantineFile(path);
+        return true;
+      }
+      this.invalidateScopedQuarantineFile(path);
+      this.recordCleanupError(operation, path, error);
+      return false;
+    }
+  }
+
+  private addScopedQuarantineFile(path: string, bytes: number, mtimeMs: number): void {
+    const inventory = this.quarantineInventoryScope?.get(dirname(path));
+    if (!inventory) return;
+    inventory.files = inventory.files.filter((item) => item.path !== path);
+    inventory.files.push({ path, bytes, mtimeMs });
+    inventory.files.sort((left, right) => left.mtimeMs - right.mtimeMs || left.path.localeCompare(right.path));
+  }
+
+  private removeScopedQuarantineFile(path: string): void {
+    const inventory = this.quarantineInventoryScope?.get(dirname(path));
+    if (!inventory) return;
+    inventory.files = inventory.files.filter((item) => item.path !== path);
+  }
+
+  private invalidateScopedQuarantineFile(path: string): void {
+    this.quarantineInventoryScope?.delete(dirname(path));
+  }
+
+  private recordCleanupFailure(failure: MailboxCleanupFailure): void {
+    this.cleanupFailures += 1;
+    this.lastCleanupFailure = failure;
+    observerLogger.warn("mailbox cleanup retained busy entry", { ...failure });
+  }
+
+  private recordCleanupError(operation: string, path: string, error: unknown): void {
+    this.recordCleanupFailure({
+      operation,
+      file: basename(path) || "unknown",
+      errorCode: (error as NodeJS.ErrnoException)?.code ?? "UNKNOWN",
+    });
+  }
+
+  private isMissing(error: unknown): boolean {
+    return (error as NodeJS.ErrnoException)?.code === "ENOENT";
+  }
+
   private estimatedStoreBytes(): number {
     const commandBytes = [...this.commandUsageBySession.values()].reduce((total, usage) => total + usage.bytes, 0);
     let quarantineBytes = 0;
+    let reliable = true;
     for (const transport of this.transports.values()) {
-      quarantineBytes += this.quarantineUsage(transport.statusDirectory).bytes;
+      const usage = this.quarantineUsage(transport.statusDirectory);
+      quarantineBytes += usage.bytes;
+      reliable = reliable && usage.reliable && transport.stats().commandUsageReliable;
     }
-    const metadataBytes = Buffer.byteLength(JSON.stringify({
+    const metadataBytes = this.metadataBytes();
+    const knownBytes = commandBytes + quarantineBytes + metadataBytes;
+    return reliable ? knownBytes : Math.max(knownBytes, this.maxEstimatedBytes + 1);
+  }
+
+  private metadataBytes(): number {
+    return Buffer.byteLength(JSON.stringify({
       transports: [...this.transports.entries()].map(([sessionId, transport]) => ({ sessionId, profilePath: transport.profilePath })),
       retries: [...this.rejectionAttempts.entries()],
       cursors: [...this.pollCursors.entries()],
       dispositions: this.dispositionCounts,
     }), "utf8");
-    return commandBytes + quarantineBytes + metadataBytes;
   }
 
   private admitTransport(
@@ -520,13 +804,8 @@ export class MailboxCoordinator {
       this.transports.delete(sessionId);
       this.commandUsageBySession.delete(sessionId);
       this.pollCursors.delete(sessionId);
-      this.quarantineIndex.delete(join(transport.statusDirectory, "quarantine"));
       throw error;
     }
-  }
-
-  private isSymlink(path: string): boolean {
-    try { return lstatSync(path).isSymbolicLink(); } catch { return false; }
   }
 
   private boundedOption(value: number | undefined, fallback: number, minimum: number, maximum: number, label: string): number {

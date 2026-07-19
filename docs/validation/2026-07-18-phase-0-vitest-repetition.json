@@ -1,0 +1,79 @@
+{
+  "schemaVersion": 1,
+  "kind": "reforger_forge_phase_0_vitest_repetition",
+  "result": "passed",
+  "environment": {
+    "platform": "win32",
+    "osVersion": "Microsoft Windows NT 10.0.26200.0",
+    "architecture": "x64",
+    "logicalProcessors": 20,
+    "nodeVersion": "v26.4.0",
+    "vitestVersion": "3.2.6"
+  },
+  "sourceIdentity": {
+    "tests/observer/owned-runtime-manager.test.ts": "449ba07c401e6d103754e5b966c331dda7d5187fb067ae35596761b6baf00f8e",
+    "tests/observer/artifacts.test.ts": "21345d4dd51945c6cb846b9a805a9f89a74f5f5bc5c21664205369fe82b588e3",
+    "tests/observer/private-child-owned-runtime-recovery.test.ts": "9a9efcfc51c1eca3b38f44fb23ae1f60092ea46d2996e7081e79a489d124e921",
+    "package-lock.json": "21d7b2f72cda2eff6b97c6f3b06fe2036b174edb9603bd9827d955c49b84b093"
+  },
+  "acceptance": {
+    "requiredConsecutiveRuns": 10,
+    "completedConsecutiveRuns": 10,
+    "retries": 0,
+    "shuffle": true,
+    "seeds": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+    "commandTemplate": "npm test -- --retry=0 --sequence.shuffle --sequence.seed=<seed> --reporter=json",
+    "testSuitesPerRun": 262,
+    "testsPerRun": 981,
+    "passedPerRun": 977,
+    "failedPerRun": 0,
+    "skippedPerRun": 4
+  },
+  "contentionGate": {
+    "result": "passed",
+    "fullSuite": {
+      "startedAt": "2026-07-19T06:55:08.633Z",
+      "finishedAt": "2026-07-19T06:55:26.073Z",
+      "durationMs": 17440,
+      "testSuites": 262,
+      "tests": 981,
+      "passed": 977,
+      "failed": 0,
+      "skipped": 4
+    },
+    "parallelFocusedRepetitions": {
+      "repetitions": 20,
+      "passedRepetitions": 20,
+      "failedRepetitions": 0,
+      "casesPerRepetition": 3,
+      "cases": [
+        "returns recovery-required with exact vacancy evidence when observer completion never settles",
+        "bounds lifecycle release within the aggregate shutdown deadline",
+        "reports one bounded inventory remainder after the aggregate shutdown deadline"
+      ]
+    }
+  },
+  "runs": [
+    { "sequence": 1, "seed": 1, "startedAt": "2026-07-19T07:16:45.990Z", "finishedAt": "2026-07-19T07:17:02.200Z", "durationMs": 16211, "result": "passed", "reportSha256": "f73ad738eac3aedbfbbebb08ddecbd7686f818dbf4132e4ad90fe57087401681" },
+    { "sequence": 2, "seed": 2, "startedAt": "2026-07-19T07:17:03.201Z", "finishedAt": "2026-07-19T07:17:20.205Z", "durationMs": 17005, "result": "passed", "reportSha256": "ab2a6ecce2fc63dc200bac568ea772620a402eb04f07e1d48631d8181ba5b3d2" },
+    { "sequence": 3, "seed": 3, "startedAt": "2026-07-19T07:17:21.191Z", "finishedAt": "2026-07-19T07:17:38.337Z", "durationMs": 17146, "result": "passed", "reportSha256": "7bdca9a425938f1a65d2619331418fe49cb3af1c9c02f9ad6e02e160bea67987" },
+    { "sequence": 4, "seed": 4, "startedAt": "2026-07-19T07:17:39.329Z", "finishedAt": "2026-07-19T07:17:55.921Z", "durationMs": 16593, "result": "passed", "reportSha256": "20f59853698e4da228a8f2a55ae0983b12c23f695b66b7ffb8b34ff3e72c58de" },
+    { "sequence": 5, "seed": 5, "startedAt": "2026-07-19T07:17:56.932Z", "finishedAt": "2026-07-19T07:18:13.373Z", "durationMs": 16441, "result": "passed", "reportSha256": "1686a55415887d7122be8646d5947d39e4f7daa9a816f6f3ada2aa2ea8cafb01" },
+    { "sequence": 6, "seed": 6, "startedAt": "2026-07-19T07:18:14.403Z", "finishedAt": "2026-07-19T07:18:31.300Z", "durationMs": 16897, "result": "passed", "reportSha256": "e201c0d665775cfd05ca7d251d56ca5b7de0a7a9216d017901b4d80cec31d4a2" },
+    { "sequence": 7, "seed": 7, "startedAt": "2026-07-19T07:18:32.329Z", "finishedAt": "2026-07-19T07:18:48.896Z", "durationMs": 16567, "result": "passed", "reportSha256": "c2699f90f12d0a0d7e54ed5222bcc386683063341d998576e148003f17048603" },
+    { "sequence": 8, "seed": 8, "startedAt": "2026-07-19T07:18:49.948Z", "finishedAt": "2026-07-19T07:19:07.537Z", "durationMs": 17589, "result": "passed", "reportSha256": "f711c771ce2de6545a100415dfeb10a60ab018c8f7dd198aea1c4c66637191b6" },
+    { "sequence": 9, "seed": 9, "startedAt": "2026-07-19T07:19:08.559Z", "finishedAt": "2026-07-19T07:19:25.920Z", "durationMs": 17362, "result": "passed", "reportSha256": "7f938fa3736ff3b272f6a4131e6a4f1c8a5d5bdbcf6fa63eb2a79bf2952a488f" },
+    { "sequence": 10, "seed": 10, "startedAt": "2026-07-19T07:19:26.935Z", "finishedAt": "2026-07-19T07:19:46.279Z", "durationMs": 19345, "result": "passed", "reportSha256": "e4cae31f6949fd3966e918f521e22ff33ed835c5102cdd5395de1a1eec409674" }
+  ],
+  "rawReports": {
+    "locationPattern": ".artifacts/phase0-final-seed-<seed>.json",
+    "committed": false,
+    "ignoredLocalEvidence": true,
+    "note": "Each local JSON report is bound above by SHA-256; the durable record contains its result, timing, seed, and source identities without machine-local paths."
+  },
+  "scope": {
+    "productionChangeRequired": false,
+    "workbenchAcceptanceRerunRequired": false,
+    "reason": "The fixes only remove real-clock assumptions from test fixtures; V5 fail-closed production behavior and the V10 compiled-addon evidence are unchanged."
+  }
+}

@@ -9,6 +9,7 @@ import {
   type InstanceRegistration,
   type ObserverCapability,
 } from "../protocol/index.js";
+import { z } from "zod";
 import { ObserverError } from "./errors.js";
 import { type Clock, SessionStore, systemClock } from "./sessions.js";
 
@@ -32,6 +33,25 @@ export interface InstanceRecord {
   transportHealthy: boolean;
   lastErrorCode: string | null;
 }
+
+const durableInstanceRecordSchema = z.object({
+  registration: instanceRegistrationSchema,
+  knownCapabilities: z.array(z.string().min(1).max(64)).max(64),
+  unknownCapabilities: z.array(z.string().min(1).max(64)).max(64),
+  registeredAtMs: z.number().int().nonnegative(),
+  lastHeartbeatAtMs: z.number().int().nonnegative(),
+  lastHeartbeatSequence: z.number().int().min(-1),
+  worldId: z.string().min(1).max(512).nullable(),
+  worldEpoch: z.number().int().nonnegative(),
+  activeJobId: z.string().min(1).max(96).nullable(),
+  cameraLeaseJobId: z.string().min(1).max(96).nullable(),
+  transportHealthy: z.boolean(),
+  lastErrorCode: z.string().min(1).max(64).nullable(),
+});
+
+export type RegistryDurableMutation =
+  | { kind: "upsert"; sessionId: string; record: InstanceRecord }
+  | { kind: "remove"; sessionId: string; instanceId: string };
 
 export interface RegistryOptions {
   staleAfterMs?: number;
@@ -63,6 +83,7 @@ export class InstanceRegistry {
   readonly staleRetentionMs: number;
   readonly maxRecords: number;
   readonly maxEstimatedBytes: number;
+  private durableMutationHook: ((mutation: RegistryDurableMutation) => void) | null = null;
 
   constructor(private readonly sessions: SessionStore, options: RegistryOptions = {}) {
     this.clock = options.clock ?? systemClock;
@@ -76,6 +97,82 @@ export class InstanceRegistry {
       1024 * 1024 * 1024,
       "Instance registry byte limit"
     );
+  }
+
+  setDurableMutationHook(hook: ((mutation: RegistryDurableMutation) => void) | null): void {
+    this.durableMutationHook = hook;
+  }
+
+  durableSnapshot(
+    sessionId: string,
+    mutation?: RegistryDurableMutation
+  ): InstanceRecord[] {
+    const records = new Map(
+      this.forSession(sessionId).map((record): [string, InstanceRecord] => [
+        record.registration.instanceId,
+        structuredClone(record),
+      ])
+    );
+    if (mutation?.sessionId === sessionId) {
+      if (mutation.kind === "upsert") {
+        records.set(mutation.record.registration.instanceId, structuredClone(mutation.record));
+      } else {
+        records.delete(mutation.instanceId);
+      }
+    }
+    return [...records.values()]
+      .sort((left, right) => left.registration.instanceId.localeCompare(right.registration.instanceId))
+      .map((record) => durableInstanceRecordSchema.parse(record) as InstanceRecord);
+  }
+
+  restoreDurable(sessionId: string, recordsInput: unknown): void {
+    const session = this.sessions.get(sessionId);
+    const inputs = z.array(durableInstanceRecordSchema).max(this.maxRecords).parse(recordsInput);
+    const parsed = inputs.map((record) => structuredClone(record) as InstanceRecord);
+    const seen = new Set<string>();
+    for (const record of parsed) {
+      const registration = record.registration;
+      if (registration.sessionId !== sessionId || seen.has(registration.instanceId) ||
+          registration.launchNonce !== session.launchNonce ||
+          registration.bundleDigest !== session.bundleDigest ||
+          registration.buildIdentity !== session.buildIdentity ||
+          registration.agentInstanceId !== session.agentInstanceId ||
+          registration.runtimeKind !== session.expectedRuntimeKind) {
+        throw new ObserverError(
+          "SESSION_MISMATCH",
+          "Durable observer instance does not match its exact session",
+          409
+        );
+      }
+      seen.add(registration.instanceId);
+      const key = this.key(sessionId, registration.instanceId);
+      const existing = this.instances.get(key);
+      if (existing && JSON.stringify(existing) !== JSON.stringify(record)) {
+        throw new ObserverError(
+          "SESSION_MISMATCH",
+          "Durable observer instance conflicts with current in-memory state",
+          409
+        );
+      }
+    }
+    const additions = parsed.filter((record) =>
+      !this.instances.has(this.key(sessionId, record.registration.instanceId))
+    );
+    const projectedRecords = this.instances.size + additions.length;
+    const projectedBytes = [...this.instances.values()].reduce(
+      (total, record) => total + this.recordBytes(record),
+      0
+    ) + additions.reduce((total, record) => total + this.recordBytes(record), 0);
+    if (projectedRecords > this.maxRecords || projectedBytes > this.maxEstimatedBytes) {
+      throw new ObserverError(
+        "TRANSPORT_UNAVAILABLE",
+        "Durable observer instances exceed the recovery store budget",
+        503
+      );
+    }
+    for (const record of additions) {
+      this.instances.set(this.key(sessionId, record.registration.instanceId), record);
+    }
   }
 
   register(input: unknown, token: string): InstanceRecord {
@@ -131,6 +228,11 @@ export class InstanceRegistry {
       lastErrorCode: null,
     };
     this.assertCapacity(mapKey, record, now);
+    this.durableMutationHook?.({
+      kind: "upsert",
+      sessionId: registration.sessionId,
+      record,
+    });
     // Commit the cross-store session binding only after registry admission is
     // known to succeed. A rejected candidate must leave the launch nonce free
     // for a corrected registration retry.
@@ -168,6 +270,11 @@ export class InstanceRegistry {
       lastErrorCode: heartbeat.lastErrorCode ?? null,
     };
     this.assertCapacity(this.key(heartbeat.sessionId, heartbeat.instanceId), next, next.lastHeartbeatAtMs, false);
+    this.durableMutationHook?.({
+      kind: "upsert",
+      sessionId: heartbeat.sessionId,
+      record: next,
+    });
     Object.assign(record, next);
     return record;
   }
@@ -207,6 +314,11 @@ export class InstanceRegistry {
     let removed = 0;
     for (const [key, record] of this.instances) {
       if (record.registration.sessionId !== sessionId) continue;
+      this.durableMutationHook?.({
+        kind: "remove",
+        sessionId,
+        instanceId: record.registration.instanceId,
+      });
       this.instances.delete(key);
       removed += 1;
     }
@@ -237,6 +349,11 @@ export class InstanceRegistry {
       const sessionTerminal = this.sessions.isTerminal(sessionId, now);
       const staleBeyondRetention = now - record.lastHeartbeatAtMs > this.staleAfterMs + this.staleRetentionMs;
       if (!sessionTerminal && !staleBeyondRetention) continue;
+      this.durableMutationHook?.({
+        kind: "remove",
+        sessionId,
+        instanceId: record.registration.instanceId,
+      });
       this.instances.delete(key);
       removedInstanceKeys.push(key);
     }

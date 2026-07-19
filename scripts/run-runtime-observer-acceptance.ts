@@ -25,10 +25,18 @@ import {
 import { prepareObserverLaunch } from "../src/observer/launch.js";
 import { OwnedRuntimeManager } from "../src/observer/owned-runtime-manager.js";
 import {
+  OperationalBaselineRecorder,
   analyzePngMaterial,
   comparePngImages,
   detectPngColorMarker,
   inspectBlockingProcesses,
+  operationalBaselineDirectoryIdentity,
+  operationalBaselineEnvironment,
+  operationalBaselineLaunchArgumentIdentity,
+  operationalBaselineProcedureSha256,
+  operationalBaselineSource,
+  waitForOperationalBaselineProcessVacancy,
+  writeOperationalBaselineArtifact,
   type ColorMarkerEvidence,
   type NormalizedImageRegion,
   type PngComparisonEvidence,
@@ -55,6 +63,28 @@ export const DEFAULT_RUNTIME_OBSERVER_LOOK_AT_FOV = 70;
 
 const SCRIPT_PATH = fileURLToPath(import.meta.url);
 const REPOSITORY_ROOT = resolve(dirname(SCRIPT_PATH), "..");
+const RUNTIME_OPERATIONAL_BASELINE_SOURCES = [
+  "dist/observer/agent/private-child.js",
+  "observer/addon/.reforger-forge-observer-source.json",
+  "observer/addon/addon.gproj",
+  "observer/agent/private-child.ts",
+  "package-lock.json",
+  "package.json",
+  "scripts/windows/workbench-lifecycle.ps1",
+  "src/observer/coordinator.ts",
+  "src/observer/launch.ts",
+  "src/observer/owned-runtime-manager.ts",
+  "src/workbench/child-supervisor.ts",
+  "src/workbench/process-guard.ts",
+] as const;
+const OBSERVER_OPERATIONAL_BASELINE_SOURCE_CLOSURES = [
+  { path: "dist/observer/agent/**/*.js", directory: "dist/observer/agent", extension: ".js" },
+  { path: "dist/observer/protocol/**/*.js", directory: "dist/observer/protocol", extension: ".js" },
+  { path: "observer/addon/**/*.c", directory: "observer/addon", extension: ".c" },
+  { path: "observer/agent/**/*.ts", directory: "observer/agent", extension: ".ts" },
+  { path: "observer/protocol/**/*.ts", directory: "observer/protocol", extension: ".ts" },
+  { path: "src/**/*.ts", directory: "src", extension: ".ts" },
+] as const;
 const PRIVATE_CHILD_PATH = join(
   REPOSITORY_ROOT,
   "dist",
@@ -71,6 +101,9 @@ const CAPTURE_LABELS = [
   "post-pose-restoration-current",
   "explicit-look-at",
   "post-look-at-restoration-current",
+] as const;
+const RUNTIME_FIXTURE_SOURCE_EXTENSIONS = [
+  ".c", ".conf", ".ent", ".gproj", ".json", ".layer", ".layout", ".meta",
 ] as const;
 
 type Vector3 = [number, number, number];
@@ -94,6 +127,8 @@ export interface RuntimeObserverAcceptanceOptions {
   confirmed: boolean;
   environment?: NodeJS.ProcessEnv;
   artifactRoot?: string;
+  /** Defaults to the repository's docs/validation directory. */
+  validationRoot?: string;
   timeoutMs?: number;
   worldResource?: string;
   addonDirectory?: string;
@@ -112,6 +147,7 @@ export interface RuntimeObserverAcceptanceResult {
   runDirectory: string;
   summaryPath: string;
   evidenceDirectory: string;
+  baselinePath: string;
   summary: Record<string, unknown>;
 }
 
@@ -485,7 +521,7 @@ function validateCapture(
   return { label, job, metadata, image: result.image, png };
 }
 
-async function captureIntoRun(
+async function captureIntoRunUnmeasured(
   coordinator: ObserverCoordinator,
   input: {
     runId: string;
@@ -515,6 +551,29 @@ async function captureIntoRun(
     timeoutMs: input.timeoutMs,
   });
   return validateCapture(result, input.label, input);
+}
+
+async function captureIntoRun(
+  coordinator: ObserverCoordinator,
+  input: {
+    runId: string;
+    label: typeof CAPTURE_LABELS[number];
+    purpose: string;
+    sessionId: string;
+    instanceId: string;
+    worldId: string;
+    worldEpoch: number;
+    view: ObserverCaptureView;
+    timeoutMs: number;
+  },
+  baseline: OperationalBaselineRecorder
+): Promise<RetainedCapture> {
+  return baseline.measure(
+    "capture",
+    `ObserverCoordinator.capture(${input.label})`,
+    () => captureIntoRunUnmeasured(coordinator, input),
+    input.label
+  );
 }
 
 function retainDiagnosticCapture(root: string, capture: RetainedCapture): Record<string, unknown> {
@@ -753,6 +812,33 @@ export async function runRuntimeObserverAcceptance(
   const lookAtView = validateLookAt(options);
   const fixture = inspectAddonFixture(options.addonDirectory);
   const executable = findRuntimeExecutable(options.executablePath);
+  const baseArguments = launchArguments(worldResource, fixture, options.launchArguments);
+  let baselineLaunchArguments = operationalBaselineLaunchArgumentIdentity(baseArguments, false);
+  const baselineFixtureContent = fixture
+    ? operationalBaselineDirectoryIdentity(fixture.addonDirectory, RUNTIME_FIXTURE_SOURCE_EXTENSIONS)
+    : null;
+  const markerConfiguration = options.marker ? {
+    color: [...options.marker.color],
+    roi: options.marker.roi ? { ...options.marker.roi } : null,
+    channelTolerance: options.marker.channelTolerance ?? null,
+    minimumMatchingPixels: options.marker.minimumMatchingPixels ?? null,
+    minimumMatchRatio: options.marker.minimumMatchRatio ?? null,
+  } : null;
+  const baselineCaptureConfigurationSha256 = operationalBaselineProcedureSha256({
+    poseView,
+    lookAtView,
+    marker: markerConfiguration,
+    materialDifferencePolicy: {
+      channelTolerance: 8,
+      minimumChangedPixelRatio: 0.01,
+      minimumMeanAbsoluteError: 1.5,
+    },
+    restorationImagePolicy: {
+      acceptanceRole: "diagnostic-only",
+      maximumChangedPixelRatioForSimilarity: 0.25,
+      maximumMeanAbsoluteErrorForSimilarity: 12,
+    },
+  });
   if (!existsSync(PRIVATE_CHILD_PATH)) {
     throw new Error("Compiled observer private child is missing; run npm run build before live acceptance");
   }
@@ -766,6 +852,9 @@ export async function runRuntimeObserverAcceptance(
   const diagnosticsRoot = join(runDirectory, "diagnostics");
   for (const directory of [managedRoot, profileRoot, evidenceRoot]) mkdirSync(directory);
   const summaryPath = join(runDirectory, "acceptance-summary.json");
+  const validationRoot = resolve(
+    options.validationRoot ?? join(REPOSITORY_ROOT, "docs", "validation")
+  );
   const deadline = Date.now() + timeoutMs;
   const coordinator = new ObserverCoordinator({
     agentPath: PRIVATE_CHILD_PATH,
@@ -786,10 +875,32 @@ export async function runRuntimeObserverAcceptance(
     observerGate: coordinator,
     executableResolver: () => executable,
   });
+  const readBaselineProcessCounts = () => {
+    const runtimeChildren = runtimeManager.diagnosticSupervisedChildCounts();
+    const observerPrivateChildren = coordinator.diagnosticPrivateChildCount();
+    return {
+      active: runtimeChildren.active + observerPrivateChildren,
+      reconciling: runtimeChildren.reconciling,
+      total: runtimeChildren.total + observerPrivateChildren,
+    };
+  };
+  const baseline = new OperationalBaselineRecorder({
+    backend: "runtime",
+    readSupervisedProcessCounts: readBaselineProcessCounts,
+  });
+  const baselineEnvironment = operationalBaselineEnvironment({ gameExecutable: executable });
+  const baselineSource = operationalBaselineSource(
+    SCRIPT_PATH,
+    "scripts/run-runtime-observer-acceptance.ts",
+    REPOSITORY_ROOT,
+    RUNTIME_OPERATIONAL_BASELINE_SOURCES,
+    OBSERVER_OPERATIONAL_BASELINE_SOURCE_CLOSURES
+  );
+  baseline.sampleProcessCounts("rest.beforeLaunch");
   const summary: Record<string, unknown> = {
     version: 1,
     status: "running",
-    startedAt: new Date().toISOString(),
+    startedAt: baseline.startedAt,
     runDirectory,
     worldResource,
     executable: basename(executable),
@@ -806,6 +917,7 @@ export async function runRuntimeObserverAcceptance(
   let managedRunId: string | null = null;
   let finalized = false;
   let evidenceDirectory = "";
+  let baselinePath = "";
   let failure: unknown = null;
   try {
     summary.setup = await coordinator.ensureSetup();
@@ -819,7 +931,6 @@ export async function runRuntimeObserverAcceptance(
     managedRunId = begun.runId;
     summary.observerRunId = managedRunId;
 
-    const baseArguments = launchArguments(worldResource, fixture, options.launchArguments);
     const prepared = await prepareObserverLaunch(coordinator, {
       runtimeKind: "listenServer",
       arguments: baseArguments,
@@ -833,6 +944,10 @@ export async function runRuntimeObserverAcceptance(
     if (!prepared.preparedLaunchId) {
       throw new Error("Observer launch preparation returned no owned-runtime handle");
     }
+    baselineLaunchArguments = operationalBaselineLaunchArgumentIdentity([
+      ...prepared.arguments,
+      "-reforgerForgeOwnerToken=<redacted>",
+    ]);
     summary.preparedLaunch = {
       preparedLaunchId: prepared.preparedLaunchId,
       sessionId,
@@ -844,30 +959,49 @@ export async function runRuntimeObserverAcceptance(
     };
 
     assertArmaVacant("Live runtime observer acceptance launch");
-    const startedRuntime = await runtimeManager.start({
-      preparedLaunchId: prepared.preparedLaunchId,
-      idempotencyKey: `runtime-start-${randomUUID()}`,
-    });
-    runtimeId = startedRuntime.runtimeId;
-    if (startedRuntime.state !== "running" || startedRuntime.exactOwned !== true ||
-        startedRuntime.sessionId !== sessionId) {
-      throw new Error("Owned runtime did not start with an exact session-bound identity");
-    }
+    const launch = await baseline.measure(
+      "launch",
+      "OwnedRuntimeManager.start/status(running)",
+      async () => {
+        const startedRuntime = await runtimeManager.start({
+          preparedLaunchId: prepared.preparedLaunchId,
+          idempotencyKey: `runtime-start-${randomUUID()}`,
+        });
+        runtimeId = startedRuntime.runtimeId;
+        if (startedRuntime.state !== "running" || startedRuntime.exactOwned !== true ||
+            startedRuntime.sessionId !== sessionId) {
+          throw new Error("Owned runtime did not start with an exact session-bound identity");
+        }
+        const runningRuntime = await baseline.measure(
+          "managed_call",
+          "OwnedRuntimeManager.status",
+          () => runtimeManager.status(startedRuntime.runtimeId),
+          "representative_status_api"
+        );
+        if (runningRuntime.state !== "running" || runningRuntime.exactOwned !== true ||
+            runningRuntime.sessionId !== sessionId) {
+          throw new Error("Owned runtime status did not confirm the exact running process");
+        }
+        return { startedRuntime, runningRuntime };
+      },
+      "running_confirmation"
+    );
+    const { startedRuntime, runningRuntime } = launch;
     summary.runtimeStart = startedRuntime;
     summary.ownedRuntimePid = startedRuntime.pid;
-    const runningRuntime = await runtimeManager.status(runtimeId);
-    if (runningRuntime.state !== "running" || runningRuntime.exactOwned !== true ||
-        runningRuntime.sessionId !== sessionId) {
-      throw new Error("Owned runtime status did not confirm the exact running process");
-    }
     summary.runtimeStatus = runningRuntime;
     const remainingForInventory = Math.max(1_000, deadline - Date.now());
-    const inventory = await coordinator.instances({
-      sessionId,
-      requiredCapabilities: ["render.capture", "camera.runtime"],
-      renderersOnly: true,
-      waitMs: remainingForInventory,
-    });
+    const inventory = await baseline.measure(
+      "managed_call",
+      "ObserverCoordinator.instances(renderersOnly)",
+      () => coordinator.instances({
+        sessionId,
+        requiredCapabilities: ["render.capture", "camera.runtime"],
+        renderersOnly: true,
+        waitMs: remainingForInventory,
+      }),
+      "representative_observer_api"
+    );
     const compatible = inventory.instances.filter((instance) =>
       instance.backend !== "workbench" && instance.sessionId === sessionId &&
       instance.runtimeKind === "listenServer" &&
@@ -902,7 +1036,7 @@ export async function runRuntimeObserverAcceptance(
       label: "initial-current",
       purpose: "Prove the initialized graphical runtime can produce a material current-view PNG",
       view: { kind: "current" },
-    });
+    }, baseline);
     const diagnosticCaptures: Record<string, unknown>[] = [];
     diagnosticCaptures.push(retainDiagnosticCapture(diagnosticsRoot, initial));
     summary.diagnosticCaptures = diagnosticCaptures;
@@ -911,7 +1045,7 @@ export async function runRuntimeObserverAcceptance(
       label: "explicit-pose",
       purpose: "Prove explicit quaternion pose capture and its independent transactional restoration",
       view: poseView,
-    });
+    }, baseline);
     diagnosticCaptures.push(retainDiagnosticCapture(diagnosticsRoot, pose));
     const poseLease = record(pose.job.cameraLease, "Explicit pose camera lease");
     if (poseLease.everHeld !== true || poseLease.held !== false ||
@@ -932,7 +1066,7 @@ export async function runRuntimeObserverAcceptance(
       label: "post-pose-restoration-current",
       purpose: "Prove the runtime current camera was restored after the explicit pose capture",
       view: { kind: "current" },
-    });
+    }, baseline);
     diagnosticCaptures.push(retainDiagnosticCapture(diagnosticsRoot, postPose));
     const postPoseDistanceMeters = assertCurrentViewReleasedFromDisplaced(
       poseMatrix,
@@ -961,7 +1095,7 @@ export async function runRuntimeObserverAcceptance(
       label: "explicit-look-at",
       purpose: "Prove explicit look-at capture and its independent transactional restoration",
       view: lookAtView,
-    });
+    }, baseline);
     diagnosticCaptures.push(retainDiagnosticCapture(diagnosticsRoot, lookAt));
     const lookAtLease = record(lookAt.job.cameraLease, "Explicit look-at camera lease");
     if (lookAtLease.everHeld !== true || lookAtLease.held !== false ||
@@ -998,7 +1132,7 @@ export async function runRuntimeObserverAcceptance(
       label: "post-look-at-restoration-current",
       purpose: "Prove the runtime current camera was restored after the explicit look-at capture",
       view: { kind: "current" },
-    });
+    }, baseline);
     diagnosticCaptures.push(retainDiagnosticCapture(diagnosticsRoot, postLookAt));
     const postLookAtDistanceMeters = assertCurrentViewReleasedFromDisplaced(
       lookAtMatrix,
@@ -1135,6 +1269,18 @@ export async function runRuntimeObserverAcceptance(
     }
     let exactRuntimeVacancy = runtimeId === null;
     if (runtimeId) {
+      const terminationSpan = baseline.start(
+        "shutdown",
+        "OwnedRuntimeManager.stop",
+        "termination"
+      );
+      const observerCleanupSpan = baseline.start(
+        "shutdown",
+        "OwnedRuntimeManager.stop",
+        "observer_cleanup"
+      );
+      let terminationRecorded = false;
+      let observerCleanupRecorded = false;
       try {
         const stoppedRuntime = await runtimeManager.stop({
           runtimeId,
@@ -1142,15 +1288,62 @@ export async function runRuntimeObserverAcceptance(
           idempotencyKey: `runtime-stop-${randomUUID()}`,
         });
         summary.runtimeShutdown = stoppedRuntime;
-        const vacantRuntime = await runtimeManager.status(runtimeId);
-        summary.runtimeVacancy = vacantRuntime;
         if (stoppedRuntime.state !== "exited" || stoppedRuntime.exactOwned !== true ||
-            stoppedRuntime.identityVacant !== true || vacantRuntime.state !== "exited" ||
-            vacantRuntime.exactOwned !== true || vacantRuntime.identityVacant !== true) {
+            stoppedRuntime.identityVacant !== true || stoppedRuntime.terminationComplete !== true ||
+            stoppedRuntime.observerCleanupPending !== false || !stoppedRuntime.stoppedAt) {
+          throw new Error(
+            "Owned runtime stop did not prove exact termination and completed observer cleanup"
+          );
+        }
+        const terminationFinishedMs = Date.parse(stoppedRuntime.stoppedAt);
+        const terminationStartedMs = Date.parse(terminationSpan.startedAt);
+        if (!Number.isFinite(terminationFinishedMs) || terminationFinishedMs < terminationStartedMs) {
+          throw new Error("Owned runtime stop returned an invalid durable termination timestamp");
+        }
+        baseline.finish(terminationSpan, {
+          finishedAt: new Date(terminationFinishedMs).toISOString(),
+          durationMs: terminationFinishedMs - terminationStartedMs,
+          observations: {
+            terminationComplete: true,
+            identityVacant: true,
+            durableStoppedAt: true,
+          },
+        });
+        terminationRecorded = true;
+        baseline.finish(observerCleanupSpan, {
+          observations: { observerCleanupPending: false },
+        });
+        observerCleanupRecorded = true;
+        const vacantRuntime = await baseline.measure(
+          "managed_call",
+          "OwnedRuntimeManager.status(after stop)",
+          () => runtimeManager.status(runtimeId),
+          "shutdown_status_confirmation"
+        );
+        summary.runtimeVacancy = vacantRuntime;
+        if (vacantRuntime.state !== "exited" || vacantRuntime.exactOwned !== true ||
+            vacantRuntime.identityVacant !== true || vacantRuntime.terminationComplete !== true ||
+            vacantRuntime.observerCleanupPending !== false) {
           throw new Error("Owned runtime stop did not prove exact-process vacancy");
         }
         exactRuntimeVacancy = true;
       } catch (error) {
+        if (!terminationRecorded) {
+          try {
+            baseline.finish(terminationSpan, {
+              outcome: "failed",
+              errorName: error instanceof Error ? error.name : "NonErrorThrow",
+            });
+          } catch { /* the primary shutdown failure remains authoritative */ }
+        }
+        if (!observerCleanupRecorded) {
+          try {
+            baseline.finish(observerCleanupSpan, {
+              outcome: "failed",
+              errorName: error instanceof Error ? error.name : "NonErrorThrow",
+            });
+          } catch { /* the primary shutdown failure remains authoritative */ }
+        }
         failure ??= error;
         summary.runtimeShutdown = error instanceof Error ? error.message : String(error);
         summary.status = "failed";
@@ -1159,7 +1352,12 @@ export async function runRuntimeObserverAcceptance(
     if (sessionId) {
       if (exactRuntimeVacancy) {
         try {
-          summary.sessionRevoke = await coordinator.revokeSession(sessionId);
+          summary.sessionRevoke = await baseline.measure(
+            "shutdown",
+            "ObserverCoordinator.revokeSession",
+            () => coordinator.revokeSession(sessionId),
+            "observer_cleanup_confirmation"
+          );
         } catch (error) {
           failure ??= error;
           summary.sessionRevoke = error instanceof Error ? error.message : String(error);
@@ -1170,7 +1368,12 @@ export async function runRuntimeObserverAcceptance(
       }
     }
     try {
-      await coordinator.close();
+      await baseline.measure(
+        "shutdown",
+        "ObserverCoordinator.close",
+        () => coordinator.close(),
+        "observer_process_cleanup"
+      );
       summary.coordinatorShutdown = "complete";
     } catch (error) {
       failure ??= error;
@@ -1185,6 +1388,48 @@ export async function runRuntimeObserverAcceptance(
       summary.processVacancy = error instanceof Error ? error.message : String(error);
       summary.status = "failed";
     }
+    let supervisedProcessVacancy: Awaited<ReturnType<
+      typeof waitForOperationalBaselineProcessVacancy
+    >> | null = null;
+    try {
+      supervisedProcessVacancy = await baseline.measure(
+        "shutdown",
+        "waitForOperationalBaselineProcessVacancy",
+        async () => {
+          const evidence = await waitForOperationalBaselineProcessVacancy(
+            readBaselineProcessCounts
+          );
+          supervisedProcessVacancy = evidence;
+          if (!evidence.vacant) {
+            const error = new Error(
+              `Supervised process vacancy was not observed within ${evidence.timeoutMs} ms ` +
+              `(active=${evidence.counts.active}, reconciling=${evidence.counts.reconciling}, ` +
+              `total=${evidence.counts.total})`
+            );
+            error.name = "SupervisedProcessVacancyTimeoutError";
+            throw error;
+          }
+          return evidence;
+        },
+        "supervised_exit_settle",
+        (evidence) => ({
+          vacant: evidence.vacant,
+          polls: evidence.polls,
+          waitedMs: evidence.waitedMs,
+          finalActive: evidence.counts.active,
+          finalReconciling: evidence.counts.reconciling,
+          finalTotal: evidence.counts.total,
+        })
+      );
+      summary.supervisedProcessVacancy = supervisedProcessVacancy;
+    } catch (error) {
+      failure ??= error;
+      summary.status = "failed";
+      summary.supervisedProcessVacancy = {
+        ...(supervisedProcessVacancy ?? {}),
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
     if (!failure && summary.status === "passed") {
       try {
         summary.scratchCleanup = {
@@ -1198,6 +1443,54 @@ export async function runRuntimeObserverAcceptance(
         summary.status = "failed";
       }
     }
+    baseline.sampleProcessCounts("rest.afterShutdown");
+    try {
+      const baselineFailed = Boolean(failure) || summary.status !== "passed";
+      const artifact = baseline.artifact({
+        result: baselineFailed ? "failed" : "passed",
+        environment: baselineEnvironment,
+        workload: {
+          procedureRevision: "runtime-observer-acceptance-v2",
+          runtimeKind: "listenServer",
+          overallTimeoutMs: timeoutMs,
+          worldResource,
+          fixture: fixture && baselineFixtureContent ? {
+            kind: "addon",
+            id: fixture.addonId,
+            guid: fixture.addonGuid,
+            sourceFileCount: baselineFixtureContent.fileCount,
+            sourceSha256: baselineFixtureContent.sha256,
+          } : null,
+          capture: {
+            labels: [...CAPTURE_LABELS],
+            settleFrames: 3,
+            performancePolicy: "evidence",
+            asynchronous: false,
+            configurationSha256: baselineCaptureConfigurationSha256,
+          },
+          launchArguments: baselineLaunchArguments,
+        },
+        source: baselineSource,
+        limitations: [
+          "Descriptive controlled-run baseline only; no timing or process-count thresholds are applied.",
+          "Supervised counts combine ChildSupervisor-managed owned-runtime children with count-only ObserverCoordinator private-child tracking through actual child exit.",
+          "The termination duration ends at the durable stoppedAt timestamp; observer-cleanup duration ends only after stop returns observerCleanupPending=false.",
+        ],
+        ...(baselineFailed ? {
+          failureName: failure instanceof Error ? failure.name : "AcceptanceFailed",
+        } : {}),
+      });
+      baselinePath = writeOperationalBaselineArtifact(validationRoot, artifact);
+      summary.operationalBaseline = {
+        artifact: relative(REPOSITORY_ROOT, baselinePath).replace(/\\/g, "/"),
+        result: artifact.result,
+        kind: artifact.kind,
+      };
+    } catch (error) {
+      failure ??= error;
+      summary.operationalBaseline = error instanceof Error ? error.message : String(error);
+      summary.status = "failed";
+    }
     summary.finishedAt = new Date().toISOString();
     writeSummary(summaryPath, summary);
   }
@@ -1206,7 +1499,7 @@ export async function runRuntimeObserverAcceptance(
     error.message = `${error.message}. Retained runtime observer acceptance summary: ${summaryPath}`;
     throw error;
   }
-  return { runDirectory, summaryPath, evidenceDirectory, summary };
+  return { runDirectory, summaryPath, evidenceDirectory, baselinePath, summary };
 }
 
 function readOption(name: string): string | undefined {
@@ -1269,8 +1562,9 @@ function parseMarker(environment: NodeJS.ProcessEnv): RuntimeObserverMarkerExpec
 
 function usage(): string {
   return [
-    "Usage: npm run observer:acceptance:runtime -- --confirm-live-run [--world <resource>]",
+    "Usage: npm run dev:observer:acceptance:runtime -- --confirm-live-run [--world <resource>]",
     "       [--addon-dir <directory>] [--executable <file>] [--artifact-root <directory>]",
+    "       [--validation-root <directory>]",
     "       [--timeout-ms <60000..900000>] [--launch-arg <token>]...",
     "       [--pose-position <x,y,z>] [--pose-orientation <x,y,z,w>] [--pose-fov <degrees>]",
     "       [--look-at-position <x,y,z>] [--look-at-target <x,y,z>] [--look-at-fov <degrees>]",
@@ -1304,6 +1598,7 @@ if (process.argv[1] && resolve(process.argv[1]) === resolve(SCRIPT_PATH)) {
         addonDirectory: readOption("--addon-dir") ?? environment.RFO_RUNTIME_OBSERVER_ADDON_DIR,
         executablePath: readOption("--executable") ?? environment.RFO_RUNTIME_OBSERVER_EXECUTABLE,
         artifactRoot: readOption("--artifact-root") ?? environment.RFO_RUNTIME_OBSERVER_ARTIFACT_ROOT,
+        validationRoot: readOption("--validation-root"),
         timeoutMs: timeout ? Number(timeout) : undefined,
         launchArguments: readOptions("--launch-arg"),
         posePosition: posePosition ? parseVector3(posePosition, "Pose position") : undefined,
@@ -1319,7 +1614,8 @@ if (process.argv[1] && resolve(process.argv[1]) === resolve(SCRIPT_PATH)) {
       process.stdout.write(
         `Runtime observer acceptance passed.\n` +
         `RFO_RUNTIME_OBSERVER_ACCEPTANCE_RESULT=${result.summaryPath}\n` +
-        `RFO_RUNTIME_OBSERVER_EVIDENCE=${result.evidenceDirectory}\n`
+        `RFO_RUNTIME_OBSERVER_EVIDENCE=${result.evidenceDirectory}\n` +
+        `RFO_RUNTIME_OPERATIONAL_BASELINE=${result.baselinePath}\n`
       );
     } catch (error) {
       process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);

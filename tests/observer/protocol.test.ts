@@ -4,17 +4,20 @@ import { describe, expect, it } from "vitest";
 import {
   ERROR_CODES,
   ERROR_REGISTRY,
+  RUNTIME_ERROR_CODES,
   CAPABILITIES,
   CAPABILITY_REGISTRY,
   JOB_STATES,
   artifactManifestSchema,
   cameraLeaseStatusSchema,
   captureRequestSchema,
+  heartbeatSchema,
   instanceRegistrationSchema,
   isRuntimeJobTransition,
   parseProtocolMessage,
   runtimeCommandEnvelopeSchema,
   sessionContractSchema,
+  jobStatusSchema,
 } from "../../observer/protocol/index.js";
 import { redactForDiagnostics } from "../../observer/agent/logger.js";
 import { repositoryRoot } from "./helpers.js";
@@ -113,10 +116,55 @@ describe("observer protocol", () => {
     expect(ERROR_CODES).toContain("STAGED_ADDON_CONFLICT");
   });
 
+  it("restricts runtime-originated status errors to the registry's runtime backend", () => {
+    const heartbeat = {
+      protocolVersion: "1.0",
+      sessionId: "session-1",
+      instanceId: "instance-1",
+      instanceNonce: "instance_nonce_123456789012345678901234",
+      sequence: 1,
+      sentAt: "2026-07-18T12:00:00.000Z",
+      worldId: null,
+      worldEpoch: 0,
+      capabilities: ["render.capture"],
+      transportHealthy: false,
+      lastErrorCode: "CAMERA_BUSY",
+    };
+    const failedStatus = {
+      protocolVersion: "1.0",
+      sessionId: "session-1",
+      instanceId: "instance-1",
+      instanceNonce: heartbeat.instanceNonce,
+      jobId: "job-1",
+      sequence: 2,
+      state: "failed",
+      worldId: null,
+      worldEpoch: 0,
+      timestamp: "2026-07-18T12:00:01.000Z",
+      deliveryToken: "delivery_token_1234567890",
+      cameraLease: { held: false, restorationConfirmed: true },
+      errorCode: "CAMERA_BUSY",
+    };
+    expect(heartbeatSchema.safeParse(heartbeat).success).toBe(true);
+    expect(jobStatusSchema.safeParse(failedStatus).success).toBe(true);
+    expect(heartbeatSchema.safeParse({
+      ...heartbeat,
+      lastErrorCode: "STORAGE_UNVERIFIABLE",
+    }).success).toBe(false);
+    expect(jobStatusSchema.safeParse({
+      ...failedStatus,
+      errorCode: "STORAGE_UNVERIFIABLE",
+    }).success).toBe(false);
+    expect(RUNTIME_ERROR_CODES.every((code) =>
+      ERROR_REGISTRY[code].backends.includes("runtime" as never))).toBe(true);
+  });
+
   it("keeps generated error/capability artifacts and documentation in registry order", () => {
     const protocolRoot = join(repositoryRoot, "observer", "protocol");
     expect(JSON.parse(readFileSync(join(protocolRoot, "generated", "error-codes.json"), "utf8")))
       .toEqual([...ERROR_CODES]);
+    expect(JSON.parse(readFileSync(join(protocolRoot, "generated", "runtime-error-codes.json"), "utf8")))
+      .toEqual([...RUNTIME_ERROR_CODES]);
     expect(JSON.parse(readFileSync(join(protocolRoot, "generated", "capabilities.json"), "utf8")))
       .toEqual([...CAPABILITIES]);
     expect(JSON.parse(readFileSync(join(protocolRoot, "generated", "fixed-error-messages.json"), "utf8")))
@@ -126,8 +174,15 @@ describe("observer protocol", () => {
 
     const errorSchema = JSON.parse(readFileSync(join(protocolRoot, "schemas", "error.schema.json"), "utf8"));
     const jobSchema = JSON.parse(readFileSync(join(protocolRoot, "schemas", "job-status.schema.json"), "utf8"));
+    const heartbeatSchemaJson = JSON.parse(readFileSync(join(protocolRoot, "schemas", "heartbeat.schema.json"), "utf8"));
+    const vocabularySchema = JSON.parse(readFileSync(join(protocolRoot, "schemas", "vocabulary.schema.json"), "utf8"));
+    expect(vocabularySchema.$defs.errorCode.enum).toEqual([...ERROR_CODES]);
+    expect(vocabularySchema.$defs.runtimeErrorCode.enum).toEqual([...RUNTIME_ERROR_CODES]);
+    expect(vocabularySchema.$defs.capability.enum).toEqual([...CAPABILITIES]);
     expect(errorSchema.properties.error.properties.code.enum).toEqual([...ERROR_CODES]);
-    expect(jobSchema.properties.errorCode.enum).toEqual([...ERROR_CODES]);
+    expect(jobSchema.properties.errorCode.enum).toEqual([...RUNTIME_ERROR_CODES]);
+    expect(heartbeatSchemaJson.properties.lastErrorCode.oneOf[0].enum)
+      .toEqual([...RUNTIME_ERROR_CODES]);
 
     const errorRows = readFileSync(join(protocolRoot, "errors.md"), "utf8").split(/\r?\n/)
       .filter((line) => /^\| [A-Z][A-Z0-9_]+ \|/.test(line))
@@ -164,6 +219,7 @@ describe("observer protocol", () => {
     expect(CAPABILITIES).not.toContain("server.coordinate" as (typeof CAPABILITIES)[number]);
     expect(CAPABILITY_REGISTRY["camera.editor"].backends).toEqual(["workbench"]);
     expect(CAPABILITY_REGISTRY["camera.runtime"].backends).toEqual(["runtime"]);
+    expect(ERROR_REGISTRY.CAMERA_BUSY.backends).toContain("owned-runtime");
   });
 
   it("contains every statically emitted observer host/adapter error", () => {
@@ -235,6 +291,9 @@ describe("observer protocol", () => {
     expect([...new Set(emittedCodes)].filter((code) => !ERROR_CODES.includes(
       code as (typeof ERROR_CODES)[number]
     ))).toEqual([]);
+    for (const code of new Set(emittedCodes)) {
+      expect(ERROR_REGISTRY[code as keyof typeof ERROR_REGISTRY].backends).toContain("runtime");
+    }
   });
 
   it("redacts contract bodies, nonce credentials, bearer headers, and named token values from diagnostics", () => {

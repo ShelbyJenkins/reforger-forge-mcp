@@ -60,17 +60,33 @@ describe("live Workbench observer acceptance contract", () => {
       "utf8"
     );
     expect(source).toContain("skipAutoLaunch: true");
-    expect(source).toContain("await adapter.restoreAll()");
-    expect(source).toContain("await client.shutdownOwnedWorkbench()");
-    expect(source).toContain("summary.shutdownRecovery = await cleanupClient.shutdownOwnedWorkbench()");
+    expect(source).toContain("() => adapter.restoreAll()");
+    expect(source).toContain("const result = await client.shutdownOwnedWorkbench()");
+    expect(source).toContain("() => cleanupClient.shutdownOwnedWorkbench()");
     expect(source).toContain("same persisted exact-owner guard");
-    expect(source).toContain("baseline.position[0] + 75");
+    expect(source).toContain("baselineCamera.position[0] + 75");
     expect(source).toContain("Explicit pose rendered position differs");
     expect(source).toContain("Explicit pose rendered FOV differs");
-    expect(source).toContain("baseline.position[0] - right[0] * 90");
+    expect(source).toContain("baselineCamera.position[0] - right[0] * 90");
     expect(source).toContain("Explicit look-at rendered FOV differs");
     expect(source).toContain("Post-look-at current capture");
-    expect(source).toContain('spawn(command, [...argumentsArray, "-forceUpdate"], spawnOptions)');
+    expect(source).toContain('const actualArguments = [...argumentsArray, "-forceUpdate"]');
+    expect(source).toContain("operationalBaselineLaunchArgumentIdentity(actualArguments)");
+    expect(source).toContain('procedureRevision: "workbench-observer-live-acceptance-v3"');
+    expect(source).toContain("labels: [...WORKBENCH_CAPTURE_LABELS]");
+    expect(source).toContain("worldResource: BASE_EVERON_WORLD");
+    expect(source).toContain('"WorkbenchObserverAdapter.ping(EMCP_WB_Ping)"');
+    expect(source).toContain('baseline.sampleProcessCounts("rest.beforeLaunch")');
+    expect(source).toContain('baseline.sampleProcessCounts("rest.afterShutdown")');
+    expect(source).toContain('"supervised_exit_settle"');
+    expect(source).toContain('error.name = "SupervisedProcessVacancyTimeoutError"');
+    const exitSettleIndex = source.indexOf('"supervised_exit_settle"');
+    const restAfterShutdownIndex = source.indexOf(
+      'baseline.sampleProcessCounts("rest.afterShutdown")'
+    );
+    expect(exitSettleIndex).toBeGreaterThan(-1);
+    expect(restAfterShutdownIndex).toBeGreaterThan(exitSettleIndex);
+    expect(source).toContain("writeOperationalBaselineArtifact(validationRoot, artifact)");
     expect(source).not.toMatch(/taskkill|Stop-Process|KillProcess|\.kill\s*\(/i);
   });
 

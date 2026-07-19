@@ -41,6 +41,7 @@ import {
   type WorkbenchIdentity,
   type WorkbenchLifecycleSession,
   type WorkbenchLifecycleStateV3,
+  type VerifyEndpointVacantResult,
 } from "./process-guard.js";
 
 const WORKBENCH_SUBDIRECTORY = "Workbench";
@@ -1372,6 +1373,49 @@ function safeSpawn(
   }
 }
 
+function endpointVacancyDetail(result: Exclude<VerifyEndpointVacantResult, { kind: "vacant" }>): string {
+  return result.kind === "occupied"
+    ? `listener PID ${result.listenerPid}: ${result.message}`
+    : `${result.reason}: ${result.message}`;
+}
+
+async function assertEndpointVacantBeforeSpawn(
+  guard: WorkbenchProcessGuard,
+  endpoint: LifecycleEndpoint,
+  stage: string
+): Promise<void> {
+  let vacancy: VerifyEndpointVacantResult;
+  try {
+    vacancy = await guard.verifyEndpointVacant(endpoint);
+  } catch (error) {
+    throw new WorkbenchRunnerError(
+      `${stage} refused because endpoint vacancy inspection failed: ${error instanceof Error ? error.message : String(error)}`,
+      "ENDPOINT_UNVERIFIABLE"
+    );
+  }
+  if (vacancy.kind !== "vacant") {
+    throw new WorkbenchRunnerError(
+      `${stage} refused because Workbench endpoint vacancy is not proven (${endpointVacancyDetail(vacancy)}).`,
+      "ENDPOINT_UNVERIFIABLE"
+    );
+  }
+}
+
+async function assertNoWorkbenchBeforeReservation(
+  guard: WorkbenchProcessGuard,
+  stage: string
+): Promise<void> {
+  try {
+    await guard.assertNoWorkbenchProcesses();
+  } catch (error) {
+    throw new WorkbenchRunnerError(
+      `${stage} refused because another Workbench process is present or its identity cannot be proven: ` +
+        `${error instanceof Error ? error.message : String(error)}`,
+      "LIFECYCLE_CONFLICT"
+    );
+  }
+}
+
 interface BuildCompanionPreflightArgs {
   guard: WorkbenchProcessGuard;
   reservation: WorkbenchLifecycleStateV3;
@@ -1463,6 +1507,11 @@ async function runBuildCompanionPreflight(
     }
     args.reattestTarget();
     args.reattestCompanion();
+    await assertEndpointVacantBeforeSpawn(
+      args.guard,
+      args.endpoint,
+      "Workbench companion preflight spawn"
+    );
     const launchedAtMs = Date.now();
     child = safeSpawn(args.spawnProcess, args.executablePath, launchArguments, {
       cwd: dirname(args.executablePath),
@@ -1720,6 +1769,11 @@ async function runTargetBuildStage(args: TargetBuildStageArgs): Promise<Workbenc
     }
     args.reattestTarget();
     args.reattestCompanion();
+    await assertEndpointVacantBeforeSpawn(
+      args.guard,
+      args.endpoint,
+      "Workbench target-build spawn"
+    );
     launchedAtMs = Date.now();
     child = safeSpawn(args.spawnProcess, args.executablePath, launchArguments, {
       cwd: dirname(args.executablePath),
@@ -2091,6 +2145,20 @@ export async function runWorkbenchIntent(
         "INVALID_INTENT"
       );
     }
+    // Preserve lifecycle-conflict semantics for an existing Workbench while
+    // avoiding a durable reservation for a foreign endpoint listener.
+    await assertNoWorkbenchBeforeReservation(
+      guard,
+      "Workbench build lifecycle reservation"
+    );
+    // Avoid consuming a durable lifecycle reservation for a pre-existing
+    // foreign listener. The spawn stage rechecks after reservation to close
+    // the claim/check race.
+    await assertEndpointVacantBeforeSpawn(
+      guard,
+      endpoint,
+      "Workbench build lifecycle reservation"
+    );
     // Empty output is checked while publishing the durable busy reservation.
     // The mutex is then released; contenders can inspect that state but cannot
     // claim or spawn while this exact generation/owner remains reserved.
@@ -2165,6 +2233,15 @@ export async function runWorkbenchIntent(
     });
   }
     const editorIntent = intent;
+    await assertNoWorkbenchBeforeReservation(
+      guard,
+      "Workbench editor lifecycle reservation"
+    );
+    await assertEndpointVacantBeforeSpawn(
+      guard,
+      endpoint,
+      "Workbench editor lifecycle reservation"
+    );
     let lifecycle = await guard.withLifecycleLock((session) =>
       claimExternalRunLifecycle(session, endpoint, target, companion)
     );
@@ -2199,6 +2276,11 @@ export async function runWorkbenchIntent(
         preflightAddonDirectories,
         companion,
         ownerArgument
+      );
+      await assertEndpointVacantBeforeSpawn(
+        guard,
+        endpoint,
+        "Workbench editor spawn"
       );
       launchedAtMs = Date.now();
       child = safeSpawn(spawnProcess, executablePath, args, {

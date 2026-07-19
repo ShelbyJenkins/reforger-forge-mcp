@@ -106,6 +106,7 @@ export class WorkbenchActivityGate {
   private readonly createLeaseId: () => string;
   private readonly records = new WeakMap<CaptureActivityLease, CaptureRecord>();
   private activeCapture: CaptureRecord | null = null;
+  private managedActivities = 0;
   private lifecycleRequests = 0;
 
   constructor(options: WorkbenchActivityGateOptions = {}) {
@@ -209,9 +210,35 @@ export class WorkbenchActivityGate {
     return true;
   }
 
+  /**
+   * Hold a process-local read/activity lease for ordinary managed NET work.
+   * The machine-wide mutex is deliberately not involved: lifecycle intent is
+   * recorded synchronously and either side is admitted, never raced.
+   */
+  async runManaged<T>(description: string, action: () => Promise<T>): Promise<T> {
+    if (this.lifecycleRequests > 0) {
+      throw new WorkbenchActivityError(
+        `Workbench ${description} cannot start while a lifecycle mutation is pending or active.`,
+        "LIFECYCLE_BUSY"
+      );
+    }
+    this.managedActivities += 1;
+    try {
+      return await action();
+    } finally {
+      this.managedActivities -= 1;
+    }
+  }
+
   async runLifecycle<T>(kind: string, action: () => Promise<T>): Promise<T> {
     this.lifecycleRequests += 1;
     try {
+      if (this.managedActivities > 0) {
+        throw new WorkbenchActivityError(
+          `Workbench lifecycle ${kind} cannot race ${this.managedActivities} active managed request(s).`,
+          "LIFECYCLE_BUSY"
+        );
+      }
       const capture = this.activeCapture;
       if (capture) {
         if (!capture.abortController.signal.aborted) {

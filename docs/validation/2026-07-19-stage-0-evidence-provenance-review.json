@@ -1,0 +1,196 @@
+{
+  "schemaVersion": 1,
+  "kind": "reforger_forge_stage_0_evidence_provenance_review",
+  "reviewedAt": "2026-07-19T07:47:12.892Z",
+  "reviewer": {
+    "id": "openai-codex",
+    "displayName": "OpenAI Codex"
+  },
+  "assessment": "internally_consistent_provenance_limited",
+  "historicalRecordsModified": false,
+  "records": [
+    {
+      "path": "docs/validation/2026-07-18-phase-0-vitest-repetition.json",
+      "bytes": 4990,
+      "sha256": "59a36c08aae6e16caa22bc5bf8ca7eee2cde54a761801bb4fef2b1296160f42b"
+    },
+    {
+      "path": "docs/validation/2026-07-18-observer-enforce-compile.json",
+      "bytes": 4570,
+      "sha256": "c006b2abd212640533ed50ab21b9d374da057fd23e76e385e11ee9a457dc4ce1"
+    },
+    {
+      "path": "docs/validation/2026-07-18-observer-enforce-mailbox-acceptance.json",
+      "bytes": 15855,
+      "sha256": "9c1b3333dbbfbbb290dad1ef5add5c0b3f561eb1d1c4a23b27478eabf8850a20"
+    }
+  ],
+  "phase0Repetition": {
+    "listedSourceIdentitySubsetVerifiedAtCloseout": true,
+    "rawReports": {
+      "machineLocal": true,
+      "durable": false,
+      "committed": false,
+      "privacy": "The raw Vitest JSON contains machine-local paths and remains uncommitted; this record retains only path-free counts and hashes.",
+      "allTenSeedReportsPresentAndVerifiedAtCloseout": true,
+      "reports": [
+        {
+          "seed": 1,
+          "sha256": "f73ad738eac3aedbfbbebb08ddecbd7686f818dbf4132e4ad90fe57087401681",
+          "testSuites": 262,
+          "tests": 981,
+          "passed": 977,
+          "failed": 0,
+          "skipped": 4
+        },
+        {
+          "seed": 2,
+          "sha256": "ab2a6ecce2fc63dc200bac568ea772620a402eb04f07e1d48631d8181ba5b3d2",
+          "testSuites": 262,
+          "tests": 981,
+          "passed": 977,
+          "failed": 0,
+          "skipped": 4
+        },
+        {
+          "seed": 3,
+          "sha256": "7bdca9a425938f1a65d2619331418fe49cb3af1c9c02f9ad6e02e160bea67987",
+          "testSuites": 262,
+          "tests": 981,
+          "passed": 977,
+          "failed": 0,
+          "skipped": 4
+        },
+        {
+          "seed": 4,
+          "sha256": "20f59853698e4da228a8f2a55ae0983b12c23f695b66b7ffb8b34ff3e72c58de",
+          "testSuites": 262,
+          "tests": 981,
+          "passed": 977,
+          "failed": 0,
+          "skipped": 4
+        },
+        {
+          "seed": 5,
+          "sha256": "1686a55415887d7122be8646d5947d39e4f7daa9a816f6f3ada2aa2ea8cafb01",
+          "testSuites": 262,
+          "tests": 981,
+          "passed": 977,
+          "failed": 0,
+          "skipped": 4
+        },
+        {
+          "seed": 6,
+          "sha256": "e201c0d665775cfd05ca7d251d56ca5b7de0a7a9216d017901b4d80cec31d4a2",
+          "testSuites": 262,
+          "tests": 981,
+          "passed": 977,
+          "failed": 0,
+          "skipped": 4
+        },
+        {
+          "seed": 7,
+          "sha256": "c2699f90f12d0a0d7e54ed5222bcc386683063341d998576e148003f17048603",
+          "testSuites": 262,
+          "tests": 981,
+          "passed": 977,
+          "failed": 0,
+          "skipped": 4
+        },
+        {
+          "seed": 8,
+          "sha256": "f711c771ce2de6545a100415dfeb10a60ab018c8f7dd198aea1c4c66637191b6",
+          "testSuites": 262,
+          "tests": 981,
+          "passed": 977,
+          "failed": 0,
+          "skipped": 4
+        },
+        {
+          "seed": 9,
+          "sha256": "7f938fa3736ff3b272f6a4131e6a4f1c8a5d5bdbcf6fa63eb2a79bf2952a488f",
+          "testSuites": 262,
+          "tests": 981,
+          "passed": 977,
+          "failed": 0,
+          "skipped": 4
+        },
+        {
+          "seed": 10,
+          "sha256": "e4cae31f6949fd3966e918f521e22ff33ed835c5102cdd5395de1a1eec409674",
+          "testSuites": 262,
+          "tests": 981,
+          "passed": 977,
+          "failed": 0,
+          "skipped": 4
+        }
+      ]
+    },
+    "contentionFullReport": {
+      "machineLocal": true,
+      "durable": false,
+      "bytes": 304955,
+      "sha256": "02fb3ff9ad2a0c6202f055efbedf0fde63bd41286391e7abc7416fc6ed58fb40",
+      "testSuites": 262,
+      "tests": 981,
+      "passed": 977,
+      "failed": 0,
+      "skipped": 4
+    },
+    "focused20": {
+      "reportedRepetitions": 20,
+      "rawEvidenceRetained": false,
+      "commandHashRetained": false,
+      "independentlyVerified": false
+    },
+    "historicalSourceIdentity": {
+      "gitCommit": null,
+      "treeHash": null,
+      "dirtyDiffHash": null,
+      "fullSourceClosure": null,
+      "scope": "The original record binds three repaired test files and package-lock.json, not a full repository snapshot."
+    }
+  },
+  "enforceEvidence": {
+    "currentEvaluators": [
+      {
+        "path": "scripts/validate-observer-enforce.mjs",
+        "bytes": 14544,
+        "sha256": "bf1aa9cb9acd0605be8b507ca0d2f0df856f085595c79f4c97ce89c526fcb8da",
+        "observedAtCloseoutOnly": true,
+        "historicalRunBinding": false
+      },
+      {
+        "path": "scripts/run-observer-enforce-mailbox-acceptance.mjs",
+        "bytes": 56730,
+        "sha256": "d5b97689aa0d5c4cde82e6080447cacd3008198917866eef9f4666a7e1920513",
+        "observedAtCloseoutOnly": true,
+        "historicalRunBinding": false
+      }
+    ],
+    "fileShareHelper": {
+      "implementation": "Embedded PowerShell in scripts/run-observer-enforce-mailbox-acceptance.mjs",
+      "separateHistoricalHash": false,
+      "coveredOnlyByCloseoutEvaluatorHash": true
+    },
+    "historicalEvaluatorBinding": {
+      "gitCommit": null,
+      "treeHash": null,
+      "dirtyDiffHash": null,
+      "evaluatorHashesCapturedAtRun": false
+    },
+    "diagnostics": {
+      "fullBytesRetainedInRepository": false,
+      "digestsAndScanAssertionsRetained": true,
+      "boundedSanitizedProcessTailsRetainedWhereApplicable": true,
+      "independentlyRescannableFromRepository": false
+    }
+  },
+  "limitations": [
+    "This append-only record documents historical provenance gaps; it does not retroactively bind missing source, evaluator, command, or diagnostic bytes to the original runs.",
+    "Machine-local raw Vitest reports were present and hash/count-verified at closeout but are not durably archived by the repository.",
+    "The 20 focused contention repetitions have only their original aggregate summary; their raw outputs and exact command hashes were not retained and cannot be independently reconstructed.",
+    "Current evaluator hashes identify the files observed during closeout only and do not prove those exact bytes produced the historical Enforce artifacts.",
+    "These provenance limitations do not alter the original internally consistent pass results."
+  ]
+}

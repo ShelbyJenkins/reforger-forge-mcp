@@ -182,18 +182,18 @@ describe("live graphical runtime observer acceptance contract", () => {
     expect(source).toContain("executableResolver: () => executable");
     expect(source).toContain("findRuntimeExecutable(options.executablePath)");
     expect(source).toContain("await runtimeManager.start({");
-    expect(source.match(/await runtimeManager\.status\(runtimeId\)/g)).toHaveLength(2);
+    expect(source.match(/runtimeManager\.status\(/g)).toHaveLength(2);
     expect(source).toContain("await runtimeManager.stop({");
     expect(source).toContain("stoppedRuntime.identityVacant !== true");
     expect(source).toContain("vacantRuntime.identityVacant !== true");
     expect(source).toContain('runtimeKind: "listenServer"');
     expect(source).toContain('"-server", worldResource');
     expect(source).toContain("await coordinator.beginRun(");
-    expect(source).toContain("await coordinator.instances(");
+    expect(source).toContain("coordinator.instances({");
     expect(source).toContain("await coordinator.capture(");
     expect(source).toContain("await coordinator.finalizeRun(");
     const stopIndex = source.indexOf("await runtimeManager.stop({");
-    const revokeIndex = source.indexOf("await coordinator.revokeSession(sessionId)");
+    const revokeIndex = source.indexOf("coordinator.revokeSession(sessionId)");
     expect(stopIndex).toBeGreaterThan(-1);
     expect(revokeIndex).toBeGreaterThan(stopIndex);
     expect(source).toContain("preserved because exact-process vacancy was not proven");
@@ -218,6 +218,28 @@ describe("live graphical runtime observer acceptance contract", () => {
     expect(source).toContain("postLookAtDistanceMeters");
     expect(source).toContain('writeFileSync(imagePath, capture.image, { flag: "wx" })');
     expect(source).toContain('diagnostics: removeOwnedScratch(runDirectory, diagnosticsRoot');
+    expect(source).toContain('"OwnedRuntimeManager.start/status(running)"');
+    expect(source).toContain("stoppedRuntime.terminationComplete !== true");
+    expect(source).toContain("stoppedRuntime.observerCleanupPending !== false");
+    expect(source).toContain('baseline.sampleProcessCounts("rest.beforeLaunch")');
+    expect(source).toContain('baseline.sampleProcessCounts("rest.afterShutdown")');
+    expect(source).toContain('"supervised_exit_settle"');
+    expect(source).toContain('error.name = "SupervisedProcessVacancyTimeoutError"');
+    const exitSettleIndex = source.indexOf('"supervised_exit_settle"');
+    const scratchCleanupIndex = source.indexOf(
+      'profiles: removeOwnedScratch(runDirectory, profileRoot'
+    );
+    const restAfterShutdownIndex = source.indexOf(
+      'baseline.sampleProcessCounts("rest.afterShutdown")'
+    );
+    expect(exitSettleIndex).toBeGreaterThan(-1);
+    expect(scratchCleanupIndex).toBeGreaterThan(exitSettleIndex);
+    expect(restAfterShutdownIndex).toBeGreaterThan(scratchCleanupIndex);
+    expect(source).toContain("writeOperationalBaselineArtifact(validationRoot, artifact)");
+    expect(source).toContain('procedureRevision: "runtime-observer-acceptance-v2"');
+    expect(source).toContain("operationalBaselineDirectoryIdentity(fixture.addonDirectory");
+    expect(source).toContain("operationalBaselineLaunchArgumentIdentity([");
+    expect(source).toContain("configurationSha256: baselineCaptureConfigurationSha256");
     expect(source).not.toMatch(/spawnOwnedRuntime|stopOwnedRuntime|ChildProcess|\.kill\(/);
     expect(source).not.toMatch(/taskkill|Stop-Process|KillProcess|execSync|shell:\s*true/i);
   });

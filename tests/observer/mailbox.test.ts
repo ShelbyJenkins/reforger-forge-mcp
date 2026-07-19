@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { MailboxTransport } from "../../observer/agent/mailbox.js";
@@ -6,10 +6,30 @@ import { MailboxCoordinator } from "../../observer/agent/mailbox-coordinator.js"
 import { ArtifactStore } from "../../observer/agent/artifacts.js";
 import { JobStore } from "../../observer/agent/jobs.js";
 import { InstanceRegistry } from "../../observer/agent/registry.js";
-import { cleanup, createSessionFixture, graphicalRegistration, temporaryDirectory } from "./helpers.js";
+import { atomicWriteFile } from "../../observer/agent/paths.js";
+import { cleanup, createSessionFixture, graphicalRegistration, observerAddonSource, temporaryDirectory } from "./helpers.js";
 
 const roots: string[] = [];
 afterEach(() => roots.splice(0).forEach(cleanup));
+
+function errno(code: string): NodeJS.ErrnoException {
+  return Object.assign(new Error(code), { code });
+}
+
+function enforceMethod(source: string, signature: string): string {
+  const start = source.indexOf(signature);
+  if (start < 0) throw new Error(`Missing Enforce method: ${signature}`);
+  const open = source.indexOf("{", start);
+  let depth = 0;
+  for (let index = open; index < source.length; index += 1) {
+    if (source[index] === "{") depth += 1;
+    else if (source[index] === "}") {
+      depth -= 1;
+      if (depth === 0) return source.slice(start, index + 1);
+    }
+  }
+  throw new Error(`Unclosed Enforce method: ${signature}`);
+}
 
 describe("observer mailbox", () => {
   it("writes generated ordered commands and reads status in sequence order", () => {
@@ -402,7 +422,7 @@ describe("observer mailbox", () => {
     const coordinator = new MailboxCoordinator(fixture.store, registry, jobs, artifacts, {
       clock: fixture.clock,
       maxIngressPerPoll: 256,
-      quarantineMaxRecords: 32,
+      quarantineMaxRecords: 4,
       quarantineMaxBytes: 64 * 1024,
     });
 
@@ -418,10 +438,10 @@ describe("observer mailbox", () => {
       accepted: 1,
       permanentRejected: 300,
       trackedRetries: 0,
-      quarantineMaxRecords: 32,
+      quarantineMaxRecords: 4,
       quarantineMaxBytes: 64 * 1024,
     });
-    expect(coordinator.stats().quarantineFiles).toBeLessThanOrEqual(32);
+    expect(coordinator.stats().quarantineFiles).toBeLessThanOrEqual(4);
     expect(coordinator.stats().quarantineBytes).toBeLessThanOrEqual(64 * 1024);
 
     expect(coordinator.stats().transports).toBe(1);
@@ -430,5 +450,379 @@ describe("observer mailbox", () => {
     expect(coordinator.stats().transports).toBe(1);
     coordinator.sweep(fixture.clock.now());
     expect(coordinator.stats().transports).toBe(0);
+  }, 20_000);
+
+  it("isolates raced and busy command cleanup so unrelated transport retention continues", async () => {
+    const root = temporaryDirectory();
+    roots.push(root);
+    const fixture = createSessionFixture(root);
+    const secondProfile = join(root, "profiles", "run-2");
+    mkdirSync(secondProfile, { recursive: true });
+    const second = fixture.store.create({
+      bundleDigest: fixture.created.record.bundleDigest,
+      stagedAddonPath: fixture.created.record.stagedAddonPath,
+      profilePath: secondProfile,
+      agent: { host: "127.0.0.1", port: 47831, instanceId: "agent-test-1" },
+      buildIdentity: fixture.created.record.buildIdentity,
+      expectedRuntimeKind: "client",
+      ttlMs: 20 * 60 * 1_000,
+      transportPreference: ["mailbox"],
+    });
+    const registry = new InstanceRegistry(fixture.store, { clock: fixture.clock });
+    const jobs = new JobStore(fixture.store, registry, fixture.clock);
+    const artifacts = new ArtifactStore(join(root, "artifacts"), fixture.store, jobs);
+    const busyName = "000000000001-capture-busy-job-1.json";
+    const racedName = "000000000001-capture-raced-job-1.json";
+    const removeFile = (path: string) => {
+      if (path.endsWith(busyName)) throw errno("EBUSY");
+      if (path.endsWith(racedName)) {
+        if (existsSync(path)) unlinkSync(path);
+        throw errno("ENOENT");
+      }
+      unlinkSync(path);
+    };
+    const coordinator = new MailboxCoordinator(fixture.store, registry, jobs, artifacts, {
+      clock: fixture.clock,
+      removeFile,
+    });
+    await coordinator.pollOnce();
+    const firstMailbox = new MailboxTransport(fixture.profilePath);
+    const secondMailbox = new MailboxTransport(secondProfile);
+    const expired = JSON.stringify({ deliveryLeaseExpiresAt: new Date(fixture.clock.now() - 1).toISOString() });
+    const busyPath = join(firstMailbox.commandsDirectory, busyName);
+    const racedPath = join(secondMailbox.commandsDirectory, racedName);
+    writeFileSync(busyPath, expired);
+    writeFileSync(racedPath, expired);
+    fixture.store.revoke(fixture.created.contract.sessionId);
+    fixture.store.revoke(second.contract.sessionId);
+
+    const sweep = coordinator.sweep(fixture.clock.now());
+
+    expect(sweep.removedTransportSessionIds).toEqual([second.contract.sessionId]);
+    expect(sweep.retainedCleanupFailures).toBeGreaterThanOrEqual(1);
+    expect(existsSync(busyPath)).toBe(true);
+    expect(existsSync(racedPath)).toBe(false);
+    expect(coordinator.sessionIds()).toEqual(new Set([fixture.created.contract.sessionId]));
+    expect(coordinator.stats()).toMatchObject({
+      transports: 1,
+      cleanupFailures: 1,
+      lastCleanupFailure: { operation: "expire_command", file: busyName, errorCode: "EBUSY" },
+    });
+  });
+
+  it("does not reclaim a live writer paused before marker publication", async () => {
+    const root = temporaryDirectory();
+    roots.push(root);
+    const fixture = createSessionFixture(root);
+    const registry = new InstanceRegistry(fixture.store, { clock: fixture.clock });
+    const jobs = new JobStore(fixture.store, registry, fixture.clock);
+    const artifacts = new ArtifactStore(join(root, "artifacts"), fixture.store, jobs);
+    const coordinator = new MailboxCoordinator(fixture.store, registry, jobs, artifacts, {
+      clock: fixture.clock,
+      orphanIngressMaxAgeMs: 1_000,
+    });
+    await coordinator.pollOnce();
+    const mailbox = new MailboxTransport(fixture.profilePath);
+    const registration = graphicalRegistration(fixture.created, {
+      selectedTransport: "mailbox",
+      capabilities: ["render.capture", "transport.mailbox"],
+    });
+    const name = `000000000001-registration-${registration.sessionId}.json`;
+    const dataPath = join(mailbox.statusDirectory, name);
+    writeFileSync(dataPath, JSON.stringify({
+      ...registration,
+      sessionToken: fixture.created.contract.sessionToken,
+    }));
+    const pausedAt = new Date(fixture.clock.now() - 60_000);
+    utimesSync(dataPath, pausedAt, pausedAt);
+
+    // The data copy is old enough for cleanup, but its session still owns an
+    // active writer. Neither polling nor an ordinary sweep may delete it.
+    expect(coordinator.sweep(fixture.clock.now()).removedOrphanIngressFiles).toBe(0);
+    await coordinator.pollOnce();
+    expect(existsSync(dataPath)).toBe(true);
+
+    // Resume the writer at its next instruction: publish the marker. The exact
+    // payload is then consumed once, intact, and cannot be redelivered.
+    writeFileSync(`${dataPath}.complete`, "ready");
+    await coordinator.pollOnce();
+    expect(registry.require(registration.sessionId, registration.instanceId).registration.instanceId)
+      .toBe(registration.instanceId);
+    expect(existsSync(dataPath)).toBe(false);
+    expect(existsSync(`${dataPath}.complete`)).toBe(false);
+    expect(coordinator.stats().accepted).toBe(1);
+    await coordinator.pollOnce();
+    expect(coordinator.stats().accepted).toBe(1);
+  });
+
+  it("reclaims more than the runtime egress cap only after writer authority is terminal", async () => {
+    const root = temporaryDirectory();
+    roots.push(root);
+    const fixture = createSessionFixture(root);
+    const registry = new InstanceRegistry(fixture.store, { clock: fixture.clock });
+    const jobs = new JobStore(fixture.store, registry, fixture.clock);
+    const artifacts = new ArtifactStore(join(root, "artifacts"), fixture.store, jobs);
+    const coordinator = new MailboxCoordinator(fixture.store, registry, jobs, artifacts, {
+      clock: fixture.clock,
+      orphanIngressMaxAgeMs: 1_000,
+    });
+    await coordinator.pollOnce();
+    const mailbox = new MailboxTransport(fixture.profilePath);
+    const old = new Date(fixture.clock.now() - 60_000);
+    for (let sequence = 1; sequence <= 513; sequence += 1) {
+      const suffix = sequence % 2 === 0 ? ".json.tmp" : ".json";
+      const path = join(mailbox.statusDirectory, `${String(sequence).padStart(12, "0")}-status-orphan-${sequence}${suffix}`);
+      writeFileSync(path, "{}");
+      utimesSync(path, old, old);
+    }
+    const committedName = "000000000999-status-committed.json";
+    const committedPath = join(mailbox.statusDirectory, committedName);
+    writeFileSync(committedPath, "{}");
+    writeFileSync(`${committedPath}.complete`, "ready");
+    utimesSync(committedPath, old, old);
+
+    fixture.store.revoke(fixture.created.contract.sessionId);
+
+    const sweep = coordinator.sweep(fixture.clock.now());
+
+    expect(sweep.removedOrphanIngressFiles).toBe(513);
+    expect(readdirSync(mailbox.statusDirectory).filter((name) => name.endsWith(".json") || name.endsWith(".json.tmp")))
+      .toEqual([committedName]);
+    expect(existsSync(`${committedPath}.complete`)).toBe(true);
+    expect(coordinator.stats()).toMatchObject({ orphanIngressRemoved: 513, cleanupFailures: 0 });
+  });
+
+  it("retains a busy quarantine file and refuses new evidence instead of exceeding its bound", async () => {
+    const root = temporaryDirectory();
+    roots.push(root);
+    const fixture = createSessionFixture(root);
+    const registry = new InstanceRegistry(fixture.store, { clock: fixture.clock });
+    const jobs = new JobStore(fixture.store, registry, fixture.clock);
+    const artifacts = new ArtifactStore(join(root, "artifacts"), fixture.store, jobs);
+    let quarantineBusy = false;
+    const removeFile = (path: string) => {
+      if (quarantineBusy && path.includes(`${join("status", "quarantine")}`)) throw errno("EBUSY");
+      unlinkSync(path);
+    };
+    const coordinator = new MailboxCoordinator(fixture.store, registry, jobs, artifacts, {
+      clock: fixture.clock,
+      quarantineMaxRecords: 1,
+      removeFile,
+    });
+    const mailbox = new MailboxTransport(fixture.profilePath);
+    const poison = (sequence: number) => {
+      const name = `${String(sequence).padStart(12, "0")}-status-poison-${sequence}.json`;
+      writeFileSync(join(mailbox.statusDirectory, name), "{not-json");
+      writeFileSync(join(mailbox.statusDirectory, `${name}.complete`), "ready");
+    };
+    poison(1);
+    await coordinator.pollOnce();
+    quarantineBusy = true;
+    poison(2);
+
+    await coordinator.pollOnce();
+
+    const quarantineDirectory = join(mailbox.statusDirectory, "quarantine");
+    expect(readdirSync(quarantineDirectory)).toHaveLength(1);
+    expect(coordinator.stats()).toMatchObject({
+      quarantineFiles: 1,
+      quarantineMaxRecords: 1,
+      quarantineDropped: 1,
+      cleanupFailures: 1,
+      lastCleanupFailure: { operation: "prune_quarantine", errorCode: "EBUSY" },
+    });
+  });
+
+  it("rescans quarantine disk state before reserving space for new evidence", async () => {
+    const root = temporaryDirectory();
+    roots.push(root);
+    const fixture = createSessionFixture(root);
+    const registry = new InstanceRegistry(fixture.store, { clock: fixture.clock });
+    const jobs = new JobStore(fixture.store, registry, fixture.clock);
+    const artifacts = new ArtifactStore(join(root, "artifacts"), fixture.store, jobs);
+    const mailbox = new MailboxTransport(fixture.profilePath);
+    const quarantineDirectory = join(mailbox.statusDirectory, "quarantine");
+    mkdirSync(quarantineDirectory);
+    const racedName = "externally-retained-evidence.json";
+    const racedPath = join(quarantineDirectory, racedName);
+    const removeFile = (path: string) => {
+      if (path === racedPath) throw errno("EBUSY");
+      unlinkSync(path);
+    };
+    const coordinator = new MailboxCoordinator(fixture.store, registry, jobs, artifacts, {
+      clock: fixture.clock,
+      quarantineMaxRecords: 1,
+      removeFile,
+    });
+    // Admit while the quarantine directory is empty, then race in an exact
+    // on-disk entry. A trusted cached inventory would miss this file.
+    await coordinator.pollOnce();
+    writeFileSync(racedPath, "retained");
+    const poisonName = "000000000001-status-raced-poison.json";
+    writeFileSync(join(mailbox.statusDirectory, poisonName), "{not-json");
+    writeFileSync(join(mailbox.statusDirectory, `${poisonName}.complete`), "ready");
+
+    await coordinator.pollOnce();
+
+    expect(readdirSync(quarantineDirectory)).toEqual([racedName]);
+    expect(existsSync(join(mailbox.statusDirectory, poisonName))).toBe(false);
+    expect(existsSync(join(mailbox.statusDirectory, `${poisonName}.complete`))).toBe(false);
+    expect(coordinator.stats()).toMatchObject({
+      quarantineFiles: 1,
+      quarantineDropped: 1,
+      cleanupFailures: 1,
+      lastCleanupFailure: { operation: "prune_quarantine", file: racedName, errorCode: "EBUSY" },
+    });
+  });
+
+  it("retains and accounts for a busy command temporary without allocating another", () => {
+    const root = temporaryDirectory();
+    roots.push(root);
+    const fixture = createSessionFixture(root);
+    const initial = new MailboxTransport(fixture.profilePath);
+    const temporaryName = ".00000000-0000-4000-8000-000000000001.tmp";
+    const temporaryPath = join(initial.commandsDirectory, temporaryName);
+    writeFileSync(temporaryPath, "incomplete");
+    let busy = true;
+    const mailbox = new MailboxTransport(fixture.profilePath, {
+      removeFile: (path) => {
+        if (busy && path === temporaryPath) throw errno("EBUSY");
+        unlinkSync(path);
+      },
+    });
+    const command = {
+      protocolVersion: "1.0" as const,
+      jobId: "job-after-temporary",
+      idempotencyKey: "capture-after-temporary",
+      instanceId: "instance-1",
+      worldEpoch: 1,
+      deadlineAt: new Date(fixture.clock.now() + 10_000).toISOString(),
+      view: { kind: "current" as const },
+      settleFrames: 0,
+      performancePolicy: "evidence" as const,
+      commandKind: "capture" as const,
+      deliveryAttempt: 1,
+      deliveryToken: "delivery_token_after_temporary_1234",
+      deliveryLeaseExpiresAt: new Date(fixture.clock.now() + 5_000).toISOString(),
+      wireView: { position: [], orientation: [], target: [], fov: "0" },
+    };
+
+    expect(mailbox.stats()).toMatchObject({ commandFiles: 1, commandUsageReliable: false });
+    expect(() => mailbox.writeCommand(command)).toThrowError(expect.objectContaining({ code: "TRANSPORT_UNAVAILABLE" }));
+    expect(readdirSync(mailbox.commandsDirectory)).toEqual([temporaryName]);
+
+    busy = false;
+    expect(mailbox.writeCommand(command)).toMatch(/000000000001-capture-job-after-temporary-1\.json$/);
+    expect(readdirSync(mailbox.commandsDirectory).filter((name) => name.endsWith(".tmp"))).toEqual([]);
+    expect(mailbox.stats()).toMatchObject({ commandFiles: 1, commandUsageReliable: true });
+  });
+
+  it("cleans an atomic-write temporary when final publication fails", () => {
+    const root = temporaryDirectory();
+    roots.push(root);
+    const occupiedTarget = join(root, "occupied.json");
+    mkdirSync(occupiedTarget);
+
+    expect(() => atomicWriteFile(root, occupiedTarget, "payload")).toThrow();
+
+    expect(readdirSync(root)).toEqual(["occupied.json"]);
+  });
+
+  it("models locked-file fairness beyond one 256-entry Enforce work batch", () => {
+    const source = readFileSync(join(observerAddonSource, "Scripts", "Game", "ReforgerForgeObserver", "RFO_ObserverMailboxTransport.c"), "utf8");
+    const poll = enforceMethod(source, "override bool PollCommand()");
+    const cap = Number(/MAX_COMMAND_FILES\s*=\s*(\d+)/.exec(source)?.[1]);
+    expect(cap).toBe(256);
+    expect(poll).toContain("inspected < MAX_COMMAND_FILES");
+    expect(poll).toContain("m_RFO_CommandCursor = files[index]");
+    expect(source).toContain("enum RFO_ObserverMailboxDisposition");
+    expect(source).toContain("RETAINED_FOR_RETRY");
+    expect(source).toContain("STORAGE_UNAVAILABLE");
+    expect(poll).not.toContain("m_RFO_Initialized = false");
+    expect(poll).toContain("RecordIngressDisposition");
+
+    // Behavioral model of the source-verified sorted/cursor/capped loop. The
+    // controlled V10 Workbench gate executes this case against compiled
+    // Enforce; this fast model remains supplementary architecture coverage.
+    let files = Array.from({ length: 300 }, (_, index) => `${String(index + 1).padStart(12, "0")}-capture-poison-${index + 1}.json`);
+    const locked = files[0];
+    const valid = "000000000301-capture-valid-1.json";
+    files.push(valid);
+    let cursor = "";
+    let accepted = false;
+    let lockHeld = true;
+    let heartbeatPublications = 0;
+    const quarantine: string[] = [];
+    const retainEvidence = (name: string) => {
+      if (!quarantine.includes(name)) quarantine.push(name);
+      while (quarantine.length > 128) quarantine.shift();
+    };
+    const pollModel = () => {
+      const snapshot = [...files].sort();
+      const cursorIndex = cursor ? snapshot.indexOf(cursor) : -1;
+      const start = cursorIndex >= 0 ? (cursorIndex + 1) % snapshot.length : 0;
+      for (let offset = 0; offset < snapshot.length && offset < cap; offset += 1) {
+        const name = snapshot[(start + offset) % snapshot.length];
+        cursor = name;
+        if (name === valid) {
+          accepted = true;
+          files = files.filter((candidate) => candidate !== name);
+          return;
+        }
+        retainEvidence(name);
+        if (name === locked && lockHeld) continue;
+        files = files.filter((candidate) => candidate !== name);
+      }
+    };
+    pollModel();
+    heartbeatPublications += 1;
+    expect(accepted).toBe(false);
+    pollModel();
+    heartbeatPublications += 1;
+    expect(accepted).toBe(true);
+    expect(files).toContain(locked);
+    expect(quarantine.length).toBeLessThanOrEqual(128);
+    expect(new Set(quarantine).size).toBe(quarantine.length);
+    expect(heartbeatPublications).toBe(2);
+
+    lockHeld = false;
+    pollModel();
+    heartbeatPublications += 1;
+    expect(files).not.toContain(locked);
+    expect(new Set(quarantine).size).toBe(quarantine.length);
+    expect(heartbeatPublications).toBe(3);
+  });
+
+  it("supplements behavioral coverage with Enforce writer serialization and idempotent quarantine architecture checks", () => {
+    const source = readFileSync(join(observerAddonSource, "Scripts", "Game", "ReforgerForgeObserver", "RFO_ObserverMailboxTransport.c"), "utf8");
+    const writeOwned = enforceMethod(source, "protected bool WriteOwned(string kind, string data)");
+    const reclaim = enforceMethod(source, "protected bool ReclaimOrphanStatusFiles()");
+    const quarantine = enforceMethod(source, "protected RFO_ObserverMailboxDisposition QuarantineCommand(string name, string path, string reason, int length)");
+    const trim = enforceMethod(source, "protected RFO_ObserverMailboxDisposition TrimQuarantine(int incomingBytes)");
+    const deleteOrAbsent = enforceMethod(source, "protected RFO_ObserverMailboxDisposition DeleteOrAbsent(string path, string name, string directory, string extension)");
+    const evidenceName = enforceMethod(source, "protected string NewQuarantineEvidenceName(string name)");
+    const evidenceBytes = enforceMethod(source, "protected int QuarantineEvidenceBytes(string name)");
+
+    expect(writeOwned.indexOf("ReclaimOrphanStatusFiles()")).toBeLessThan(writeOwned.indexOf("existingFiles.Count() >= MAX_STATUS_FILES"));
+    expect(writeOwned).toContain("m_RFO_EgressHealthy = false");
+    expect(reclaim).toContain("markerNames.Contains(dataName + \".complete\")");
+    expect(reclaim).toContain("temporaryName.EndsWith(\".json.tmp\")");
+    expect(quarantine).toContain("QuarantineEvidenceBytes(name)");
+    expect(quarantine).toContain("RFO_ObserverMailboxDisposition.STORAGE_UNAVAILABLE");
+    expect(trim).toContain("MAX_QUARANTINE_FILES");
+    expect(trim).toContain("MAX_QUARANTINE_BYTES");
+    expect(trim).toContain('FileIO.FindFiles(longNameFiles.Insert, QUARANTINE_DIRECTORY, ".rfoq")');
+    expect(evidenceName).toContain('name.Substring(0, name.Length() - 5) + ".rfoq"');
+    expect(evidenceBytes).toContain("candidateName.Length() == name.Length() + 13");
+    expect(evidenceBytes).toContain("candidateName.Substring(13, name.Length()) == name");
+    expect(evidenceBytes).not.toContain("EndsWith(suffix)");
+    expect(evidenceBytes).toContain("if (!evidence)");
+    expect(evidenceBytes).toContain("if (length <= 0 || length > 65536)");
+    expect(evidenceBytes).toContain("envelope.LoadFromFile(evidencePath)");
+    expect(evidenceBytes).toContain("return -3");
+    expect(evidenceBytes).toContain("DeleteOrAbsent(evidencePath, candidateName, QUARANTINE_DIRECTORY, extension)");
+    expect(evidenceBytes).toContain("envelope.sourceName != name");
+    expect(deleteOrAbsent).toContain("if (BaseName(candidatePath) == name)");
+    expect(deleteOrAbsent).toContain("RFO_ObserverMailboxDisposition.RETAINED_FOR_RETRY");
   });
 });

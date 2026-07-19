@@ -114,7 +114,7 @@ included. A double-gated Workbench live harness is also included:
 
 ```powershell
 $env:RFO_RUN_LIVE_WORKBENCH_OBSERVER_ACCEPTANCE = "1"
-npm run observer:acceptance:workbench -- --confirm-live-run
+npm run dev:observer:acceptance:workbench -- --confirm-live-run
 ```
 
 The transaction passed on 2026-07-16 and its retained images were reviewed.

@@ -110,7 +110,9 @@ function visit(addonRoot, manifestName, directory, files) {
       throw new Error(`Observer addon payload contains an unsupported filesystem entry: ${absolutePath}`);
     }
     const relativePath = relative(addonRoot, absolutePath).split(sep).join("/");
-    if (relativePath !== manifestName) files.push(relativePath);
+    // Workbench writes this binary cache into every opened addon. It is local
+    // derived state, not source payload, and must never affect bundle identity.
+    if (relativePath !== manifestName && entry.name !== "resourceDatabase.rdb") files.push(relativePath);
   }
 }
 

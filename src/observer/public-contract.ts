@@ -41,9 +41,15 @@ export function canonicalPublicObserverError(
   value: unknown,
   diagnostic: unknown,
   fallback = "INTERNAL_ERROR"
-): { code: string; message: string } {
+): { code: string; message: string; diagnosticDetailsAllowed: boolean } {
   const code = canonicalPublicObserverErrorCode(value, fallback);
   const fixed = FIXED_ERROR_MESSAGES[code];
   const bounded = typeof diagnostic === "string" ? diagnostic.trim().slice(0, 512) : "";
-  return { code, message: (fixed ?? bounded) || "Observer operation failed." };
+  return {
+    code,
+    message: (fixed ?? bounded) || "Observer operation failed.",
+    // A fixed-message policy is a complete diagnostic redaction boundary.
+    // Verbatim structured details must not reintroduce the hidden diagnostic.
+    diagnosticDetailsAllowed: fixed === undefined,
+  };
 }

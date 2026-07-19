@@ -12,12 +12,13 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   OWNED_RUNTIME_OWNER_ARGUMENT_PREFIX,
   closeObserverRuntimeLifecycle,
   OwnedRuntimeManager,
+  type OwnedRuntimeLifecycleAuthority,
   type OwnedRuntimeExactIdentity,
   type OwnedRuntimeInspection,
   type OwnedRuntimeObserverGate,
@@ -26,6 +27,15 @@ import {
 } from "../../src/observer/owned-runtime-manager.js";
 import { LifecycleGuardError } from "../../src/workbench/process-guard.js";
 import type { ObserverLaunchInput, ObserverPreparedLaunch } from "../../src/observer/launch.js";
+import { createObserverAgent } from "../../observer/agent/index.js";
+import { runtimeStopObligations } from "../../observer/agent/private-child.js";
+import { OBSERVER_BUILD_IDENTITY } from "../../observer/protocol/index.js";
+import {
+  FakeClock,
+  graphicalRegistration,
+  observerAddonSource,
+  testBundleDigest,
+} from "./helpers.js";
 
 interface FakeProcess {
   identity: OwnedRuntimeExactIdentity;
@@ -167,6 +177,35 @@ class HookedSerialBackend extends SerialBackend {
   }
 }
 
+class DeadlineBackend extends FakeBackend {
+  hangNextMutexAfterAction = false;
+  hangNextInspection = false;
+  mutexEntries = 0;
+  inspectionCalls = 0;
+
+  override async withMachineMutex<T>(args: { action: () => Promise<T> }): Promise<T> {
+    this.mutexEntries += 1;
+    const result = await args.action();
+    if (this.hangNextMutexAfterAction) {
+      this.hangNextMutexAfterAction = false;
+      await new Promise<void>(() => undefined);
+    }
+    return result;
+  }
+
+  override async inspectProcess(
+    pid: number,
+    expectedOwnerTokenArgument?: string
+  ): Promise<OwnedRuntimeInspection | null> {
+    this.inspectionCalls += 1;
+    if (this.hangNextInspection) {
+      this.hangNextInspection = false;
+      return new Promise<OwnedRuntimeInspection | null>(() => undefined);
+    }
+    return super.inspectProcess(pid, expectedOwnerTokenArgument);
+  }
+}
+
 class LeaseLosingBackend extends FakeBackend {
   loseOnCurrentInspection = false;
   loseAfterTermination = false;
@@ -233,6 +272,8 @@ class FakeChild extends EventEmitter {
 }
 
 class FakeGate implements OwnedRuntimeObserverGate {
+  readonly retainedLifecycles: Array<{ sessionId: string; runtimeId: string; generation: string }> = [];
+  readonly releasedLifecycles: Array<{ sessionId: string; runtimeId: string; generation: string }> = [];
   readonly released: string[] = [];
   readonly releasedReservations: string[] = [];
   readonly completed: string[] = [];
@@ -240,6 +281,36 @@ class FakeGate implements OwnedRuntimeObserverGate {
   readonly completedExactVacancies: boolean[] = [];
   preflights: RuntimeStopPreflight[] = [];
   completeFailures = 0;
+  releaseLifecycleFailures = 0;
+  releaseLifecycleAttempts = 0;
+
+  async retainRuntimeLifecycle(
+    sessionId: string,
+    runtimeId: string,
+    generation: string,
+    _authority: OwnedRuntimeLifecycleAuthority
+  ): Promise<unknown> {
+    const existing = this.retainedLifecycles.find((entry) => entry.runtimeId === runtimeId);
+    if (!existing) this.retainedLifecycles.push({ sessionId, runtimeId, generation });
+    return { retained: true, alreadyRetained: existing !== undefined, generation };
+  }
+
+  async releaseRuntimeLifecycle(sessionId: string, runtimeId: string, generation: string): Promise<unknown> {
+    this.releaseLifecycleAttempts += 1;
+    if (this.releaseLifecycleFailures > 0) {
+      this.releaseLifecycleFailures -= 1;
+      throw new Error("fixture lifecycle release unavailable");
+    }
+    const existing = this.releasedLifecycles.find((entry) =>
+      entry.sessionId === sessionId && entry.runtimeId === runtimeId && entry.generation === generation
+    );
+    if (!existing) this.releasedLifecycles.push({ sessionId, runtimeId, generation });
+    return {
+      released: existing === undefined,
+      alreadyReleased: existing !== undefined,
+      generation,
+    };
+  }
 
   async reserveRuntimeStop(
     _sessionId: string,
@@ -267,7 +338,8 @@ class FakeGate implements OwnedRuntimeObserverGate {
   async completeRuntimeStop(
     sessionId: string,
     reservationId?: string,
-    exactRuntimeVacant = false
+    exactRuntimeVacant = false,
+    _lifecycle?: { runtimeId: string; generation: string }
   ): Promise<unknown> {
     if (this.completeFailures > 0) {
       this.completeFailures -= 1;
@@ -277,6 +349,104 @@ class FakeGate implements OwnedRuntimeObserverGate {
     this.completedReservations.push(reservationId);
     this.completedExactVacancies.push(exactRuntimeVacant);
     return { completed: true, revoked: true };
+  }
+}
+
+class AgentBackedGate extends FakeGate {
+  constructor(private readonly agent: ReturnType<typeof createObserverAgent>) {
+    super();
+  }
+
+  override retainRuntimeLifecycle(
+    sessionId: string,
+    runtimeId: string,
+    generation: string,
+    authority: OwnedRuntimeLifecycleAuthority
+  ): Promise<unknown> {
+    return Promise.resolve(this.agent.server.retainOwnedRuntimeLifecycle(
+      sessionId,
+      runtimeId,
+      generation,
+      authority
+    ));
+  }
+
+  override releaseRuntimeLifecycle(sessionId: string, runtimeId: string, generation: string): Promise<unknown> {
+    return Promise.resolve(this.agent.server.releaseOwnedRuntimeLifecycle(sessionId, runtimeId, generation));
+  }
+
+  override async reserveRuntimeStop(
+    sessionId: string,
+    proposedReservationId: string,
+    exactRuntimeVacant = false,
+    lifecycle?: { runtimeId: string; generation: string }
+  ): Promise<RuntimeStopPreflight> {
+    if (!lifecycle) throw new Error("fixture exact lifecycle is required");
+    const existingReservationId = this.agent.server.ownedRuntimeStopReservation(
+      sessionId,
+      lifecycle.runtimeId,
+      lifecycle.generation
+    );
+    if (existingReservationId) {
+      const claim = this.agent.server.claimOwnedRuntimeStopReservation(
+        sessionId,
+        lifecycle.runtimeId,
+        lifecycle.generation,
+        proposedReservationId
+      );
+      return {
+        sessionKnown: true,
+        ready: true,
+        reserved: claim.reserved,
+        activeJobIds: [],
+        cameraLeaseJobIds: [],
+        restorationPendingJobIds: [],
+        ...(claim.reservationId ? { reservationId: claim.reservationId } : {}),
+      };
+    }
+    const known = this.agent.control.sessions.peek(sessionId) !== undefined;
+    const obligations = runtimeStopObligations(
+      this.agent.jobs.diagnostics(sessionId),
+      this.agent.registry.diagnostics().filter((instance) => instance.sessionId === sessionId),
+      this.agent.jobs.obligationJobIds()
+    );
+    const ready = known && (exactRuntimeVacant || Object.values(obligations).every((ids) => ids.length === 0));
+    const claim = ready
+      ? this.agent.server.claimOwnedRuntimeStopReservation(
+        sessionId,
+        lifecycle.runtimeId,
+        lifecycle.generation,
+        proposedReservationId
+      )
+      : null;
+    return {
+      sessionKnown: known,
+      ready,
+      reserved: claim?.reserved === true,
+      ...obligations,
+      ...(claim?.reservationId ? { reservationId: claim.reservationId } : {}),
+    };
+  }
+
+  override async completeRuntimeStop(
+    sessionId: string,
+    _reservationId?: string,
+    _exactRuntimeVacant = false,
+    lifecycle?: { runtimeId: string; generation: string }
+  ): Promise<unknown> {
+    if (!lifecycle) throw new Error("fixture exact lifecycle is required");
+    this.agent.server.assertOwnedRuntimeLifecycle(
+      sessionId,
+      lifecycle.runtimeId,
+      lifecycle.generation
+    );
+    const revoked = this.agent.control.revokeSession(sessionId);
+    const released = this.agent.server.releaseOwnedRuntimeLifecycle(
+      sessionId,
+      lifecycle.runtimeId,
+      lifecycle.generation
+    );
+    return { completed: true, revoked, lifecycleReleased: released.released };
   }
 }
 
@@ -308,13 +478,20 @@ function makeHarness(options: {
   maxStoreRecords?: number;
   maxStoreBytes?: number;
   maxRecordBytes?: number;
+  inspectionTimeoutMs?: number;
+  terminationTimeoutMs?: number;
+  lockTimeoutMs?: number;
+  gate?: FakeGate;
+  preparedSessionId?: string;
+  preparedExpiresAt?: string;
+  preparedProfilePath?: string;
 } = {}): Harness {
   const root = options.root ?? mkdtempSync(join(tmpdir(), "rfo-owned-runtime-"));
   if (!options.root) roots.push(root);
   const executable = join(root, "ArmaReforgerSteamDiag.exe");
   if (!options.root) writeFileSync(executable, "fixture");
   const backend = options.backend ?? new FakeBackend();
-  const gate = new FakeGate();
+  const gate = options.gate ?? new FakeGate();
   const spawnCalls: Harness["spawnCalls"] = [];
   let pid = 4100;
   let clock = Date.parse("2026-07-18T12:00:00.000Z");
@@ -347,9 +524,9 @@ function makeHarness(options: {
     clock: () => options.advanceClock ? (clock += 100) : clock,
     ownerToken: () => `owner_${String(id).padStart(58, "0")}`,
     randomId,
-    inspectionTimeoutMs: 500,
-    terminationTimeoutMs: 500,
-    lockTimeoutMs: 500,
+    inspectionTimeoutMs: options.inspectionTimeoutMs ?? 500,
+    terminationTimeoutMs: options.terminationTimeoutMs ?? 500,
+    lockTimeoutMs: options.lockTimeoutMs ?? 500,
     ...(options.receiptRetentionMs === undefined ? {} : { receiptRetentionMs: options.receiptRetentionMs }),
     ...(options.maxStoreRecords === undefined ? {} : { maxStoreRecords: options.maxStoreRecords }),
     ...(options.maxStoreBytes === undefined ? {} : { maxStoreBytes: options.maxStoreBytes }),
@@ -359,7 +536,7 @@ function makeHarness(options: {
     const input: ObserverLaunchInput = {
       runtimeKind: "listenServer",
       arguments: argumentsArray,
-      profilePath: join(root, "profiles", `profile-${id}`),
+      profilePath: options.preparedProfilePath ?? join(root, "profiles", `profile-${id}`),
       sessionTtlMs: 60_000,
       transportPreference: ["rest", "mailbox"],
       forceUpdate: false,
@@ -367,8 +544,8 @@ function makeHarness(options: {
     };
     const prepared: ObserverPreparedLaunch = {
       arguments: argumentsArray,
-      sessionId: `session-${id}`,
-      expiresAt: new Date(clock + 60_000).toISOString(),
+      sessionId: options.preparedSessionId ?? `session-${id}`,
+      expiresAt: options.preparedExpiresAt ?? new Date(clock + 60_000).toISOString(),
       bundleDigest: "a".repeat(64),
       profilePath: input.profilePath,
       warnings: [],
@@ -404,16 +581,55 @@ describe("OwnedRuntimeManager", () => {
     expect(value.spawnCalls[0].arguments.slice(0, -1)).toEqual(normalizedArguments);
   });
 
-  it("can reopen the largest public prepared-argument payload without poisoning later preparation", async () => {
+  it("reopens a command-line-boundary payload without poisoning later preparation", async () => {
     const value = makeHarness();
-    const maximumToken = "x".repeat(32_768);
-    const prepared = await value.prepare(Array.from({ length: 512 }, () => maximumToken));
+    const windowsCommandLineMaxUtf16Units = 32_767;
+    const prepared = await value.prepare(["x".repeat(windowsCommandLineMaxUtf16Units)]);
     const descriptorPath = join(value.manager.storageRoot, "prepared", `${prepared.id}.json`);
-    expect(statSync(descriptorPath).size).toBeGreaterThan(4 * 1024 * 1024);
-    await expect(value.manager.start({ preparedLaunchId: prepared.id, idempotencyKey: "maximum-payload" }))
+    expect(statSync(descriptorPath).size).toBeGreaterThan(windowsCommandLineMaxUtf16Units);
+    await expect(value.manager.start({ preparedLaunchId: prepared.id, idempotencyKey: "boundary-payload" }))
       .rejects.toMatchObject({ code: "ARGUMENT_CONFLICT" });
     const later = await value.prepare(["-later"]);
     expect(later.id).not.toBe(prepared.id);
+  });
+
+  it("round-trips the maximum-escape launch-boundary aggregate at every descriptor bound", async () => {
+    const windowsCommandLineMaxUtf16Units = 32_767;
+    const normalizedArgumentMaxCount = 519;
+    const worstCaseEscapedUnit = "\u0001";
+    const unitsPerArgument = Math.floor(
+      windowsCommandLineMaxUtf16Units / normalizedArgumentMaxCount
+    );
+    const remainder = windowsCommandLineMaxUtf16Units % normalizedArgumentMaxCount;
+    const argumentsArray = Array.from(
+      { length: normalizedArgumentMaxCount },
+      (_, index) => worstCaseEscapedUnit.repeat(unitsPerArgument + (index < remainder ? 1 : 0))
+    );
+    const value = makeHarness({
+      preparedProfilePath: worstCaseEscapedUnit.repeat(32_768),
+      preparedSessionId: worstCaseEscapedUnit.repeat(96),
+    });
+
+    const prepared = await value.prepare(argumentsArray, "maximum-escape-descriptor");
+    const descriptorPath = join(value.manager.storageRoot, "prepared", `${prepared.id}.json`);
+    expect(statSync(descriptorPath).size).toBeGreaterThan(390_000);
+
+    // Reusing the exact session takes the indexed replay path, which reopens,
+    // parses, and fingerprints the bounded descriptor before returning its id.
+    const replay = await value.prepare(argumentsArray, "maximum-escape-descriptor");
+    expect(replay.id).toBe(prepared.id);
+  });
+
+  it("applies the derived prepared-descriptor bound before publishing either record", async () => {
+    const value = makeHarness();
+    const windowsCommandLineMaxUtf16Units = 32_767;
+    const jsonWorstCaseBoundaryToken = "\0".repeat(windowsCommandLineMaxUtf16Units);
+
+    await expect(value.prepare(Array.from({ length: 3 }, () => jsonWorstCaseBoundaryToken)))
+      .rejects.toMatchObject({ code: "STORE_CAPACITY_EXCEEDED" });
+    expect(readdirSync(join(value.manager.storageRoot, "prepared"))).toEqual([]);
+    expect(readdirSync(join(value.manager.storageRoot, "prepared-index"))).toEqual([]);
+    await expect(value.prepare(["-later"])).resolves.toBeDefined();
   });
 
   it("uses a direct session index and isolates an unrelated corrupt prepared descriptor", async () => {
@@ -555,6 +771,330 @@ describe("OwnedRuntimeManager", () => {
     await live.manager.sweep();
     expect(existsSync(join(live.manager.storageRoot, "runtimes", `${liveStarted.runtimeId}.json`))).toBe(true);
     expect(live.manager.diagnosticStorageStats().activeOrRecoverableRuntimes).toBe(1);
+  });
+
+  it("keeps a live exact runtime stoppable past session TTL across manager reconciliation", async () => {
+    const root = mkdtempSync(join(tmpdir(), "rfo-owned-runtime-agent-lease-"));
+    roots.push(root);
+    const executable = join(root, "ArmaReforgerSteamDiag.exe");
+    writeFileSync(executable, "fixture");
+    const clock = new FakeClock(Date.parse("2026-07-18T12:00:00.000Z"));
+    const profileRoot = join(root, "agent-profiles");
+    mkdirSync(profileRoot, { recursive: true });
+    const agent = createObserverAgent({
+      root: join(root, "agent-managed"),
+      profileRoot,
+      sourceDirectory: observerAddonSource,
+      clock,
+      sessionStore: { terminalRetentionMs: 0 },
+      registry: { staleAfterMs: 1_000, staleRetentionMs: 0 },
+    });
+    const profilePath = join(profileRoot, "runtime-profile");
+    mkdirSync(profilePath, { recursive: true });
+    const created = agent.control.sessions.create({
+      bundleDigest: testBundleDigest,
+      stagedAddonPath: join(root, "addons", testBundleDigest, "ReforgerForgeObserver"),
+      profilePath,
+      agent: { host: "127.0.0.1", port: 47831, instanceId: agent.control.agentInstanceId },
+      buildIdentity: OBSERVER_BUILD_IDENTITY,
+      expectedRuntimeKind: "listenServer",
+      ttlMs: 1_000,
+      transportPreference: ["rest", "mailbox"],
+    });
+    const registration = graphicalRegistration(created, {
+      agentInstanceId: agent.control.agentInstanceId,
+      runtimeKind: "listenServer",
+    });
+    agent.registry.register(registration, created.contract.sessionToken);
+    const backend = new FakeBackend();
+    const gate = new AgentBackedGate(agent);
+    const value = makeHarness({
+      root,
+      backend,
+      gate,
+      preparedSessionId: created.record.sessionId,
+      preparedExpiresAt: created.contract.expiresAt,
+      preparedProfilePath: profilePath,
+    });
+    value.setExecutable(executable);
+    const prepared = await value.prepare(["-window"]); // prepare idempotency remains optional
+    const started = await value.manager.start({
+      preparedLaunchId: prepared.id,
+      idempotencyKey: "agent-lease-start",
+    });
+    expect(agent.server.storeDiagnostics()).toMatchObject({
+      sessions: { lifecycleLeased: 1 },
+      ownedRuntimeLifecyclePins: { records: 1 },
+    });
+
+    clock.advance(1_000 + 5 * 60_000 + 1);
+    value.setClock(clock.now());
+    const retained = agent.server.sweep(clock.now());
+    expect(retained.sessions.expiredSessionIds).toEqual([]);
+    expect(retained.sessions.removedSessionIds).toEqual([]);
+    expect(retained.instances.removedInstanceKeys).toEqual([]);
+    expect(agent.control.sessions.get(created.record.sessionId)).toBeDefined();
+    expect(agent.control.revokeSession(created.record.sessionId)).toBe(true);
+    expect(() => agent.control.sessions.get(created.record.sessionId))
+      .toThrow(expect.objectContaining({ code: "SESSION_EXPIRED" }));
+
+    const recovered = makeHarness({ root, backend, gate });
+    recovered.setClock(clock.now());
+    recovered.setExecutable(executable);
+    await expect(recovered.manager.status(started.runtimeId)).resolves.toMatchObject({
+      state: "stale",
+      exactOwned: true,
+    });
+    await expect(recovered.manager.stop({
+      runtimeId: started.runtimeId,
+      waitForRestorationMs: 0,
+      idempotencyKey: "agent-lease-stop",
+    })).resolves.toMatchObject({
+      state: "exited",
+      terminationComplete: true,
+      observerCleanupPending: false,
+    });
+    expect(backend.processes.has(started.pid)).toBe(false);
+    expect(agent.server.storeDiagnostics()).toMatchObject({
+      ownedRuntimeLifecyclePins: { records: 0 },
+    });
+
+    const released = agent.server.sweep(clock.now());
+    expect(released.sessions.removedSessionIds).toEqual([created.record.sessionId]);
+    expect(released.instances.removedInstanceKeys).toHaveLength(1);
+
+    const naturalProfilePath = join(profileRoot, "natural-exit-profile");
+    mkdirSync(naturalProfilePath, { recursive: true });
+    const naturalSession = agent.control.sessions.create({
+      bundleDigest: testBundleDigest,
+      stagedAddonPath: join(root, "addons", testBundleDigest, "ReforgerForgeObserver"),
+      profilePath: naturalProfilePath,
+      agent: { host: "127.0.0.1", port: 47831, instanceId: agent.control.agentInstanceId },
+      buildIdentity: OBSERVER_BUILD_IDENTITY,
+      expectedRuntimeKind: "listenServer",
+      ttlMs: 1_000,
+      transportPreference: ["rest"],
+    });
+    agent.registry.register(graphicalRegistration(naturalSession, {
+      agentInstanceId: agent.control.agentInstanceId,
+      runtimeKind: "listenServer",
+      instanceId: "instance-natural-exit",
+      instanceNonce: "instance_nonce_natural_exit_123456789",
+    }), naturalSession.contract.sessionToken);
+    const naturalInput: ObserverLaunchInput = {
+      runtimeKind: "listenServer",
+      arguments: ["-window"],
+      profilePath: naturalProfilePath,
+      sessionTtlMs: 1_000,
+      transportPreference: ["rest"],
+      forceUpdate: false,
+    };
+    const naturalPrepared: ObserverPreparedLaunch = {
+      arguments: ["-window"],
+      sessionId: naturalSession.record.sessionId,
+      expiresAt: naturalSession.contract.expiresAt,
+      bundleDigest: naturalSession.contract.bundleDigest,
+      profilePath: naturalProfilePath,
+      warnings: [],
+    };
+    value.setClock(clock.now());
+    const naturalPreparedId = await value.manager.recordPreparedLaunch(naturalInput, naturalPrepared);
+    const naturalRuntime = await value.manager.start({
+      preparedLaunchId: naturalPreparedId,
+      idempotencyKey: "agent-natural-exit-start",
+    });
+    clock.advance(1_001);
+    value.setClock(clock.now());
+    expect(agent.server.sweep(clock.now()).sessions.expiredSessionIds).toEqual([]);
+    backend.processes.delete(naturalRuntime.pid);
+    const naturalChild = value.spawnCalls.at(-1)!.child;
+    naturalChild.exitCode = 0;
+    naturalChild.emit("exit", 0, null);
+    for (let attempt = 0; attempt < 50; attempt += 1) {
+      const diagnostics = agent.server.storeDiagnostics() as {
+        ownedRuntimeLifecyclePins: { records: number };
+      };
+      if (diagnostics.ownedRuntimeLifecyclePins.records === 0) break;
+      await new Promise((resolve) => setTimeout(resolve, 2));
+    }
+    expect(agent.server.storeDiagnostics()).toMatchObject({
+      ownedRuntimeLifecyclePins: { records: 0 },
+    });
+    const naturalReleased = agent.server.sweep(clock.now());
+    expect(naturalReleased.sessions.removedSessionIds).toEqual([naturalSession.record.sessionId]);
+    expect(naturalReleased.instances.removedInstanceKeys).toHaveLength(1);
+    await agent.server.close();
+  });
+
+  it("reconstructs an expired exact session and camera-restoration obligation after agent loss", async () => {
+    const root = mkdtempSync(join(tmpdir(), "rfo-owned-runtime-crash-recovery-"));
+    roots.push(root);
+    const executable = join(root, "ArmaReforgerSteamDiag.exe");
+    writeFileSync(executable, "fixture");
+    const clock = new FakeClock(Date.parse("2026-07-18T12:00:00.000Z"));
+    const agentRoot = join(root, "agent-managed");
+    const profileRoot = join(root, "agent-profiles");
+    const profilePath = join(profileRoot, "runtime-profile");
+    const stagedAddonPath = join(agentRoot, "addons", testBundleDigest, "ReforgerForgeObserver");
+    mkdirSync(profilePath, { recursive: true });
+    mkdirSync(stagedAddonPath, { recursive: true });
+    const firstAgent = createObserverAgent({
+      root: agentRoot,
+      profileRoot,
+      sourceDirectory: observerAddonSource,
+      clock,
+      sessionStore: { terminalRetentionMs: 0 },
+      registry: { staleAfterMs: 1_000, staleRetentionMs: 0 },
+      jobs: { terminalJobRetentionMs: 1, idempotencyReceiptRetentionMs: 1 },
+    });
+    const created = firstAgent.control.sessions.create({
+      bundleDigest: testBundleDigest,
+      stagedAddonPath,
+      profilePath,
+      agent: { host: "127.0.0.1", port: 47831, instanceId: firstAgent.control.agentInstanceId },
+      buildIdentity: OBSERVER_BUILD_IDENTITY,
+      expectedRuntimeKind: "listenServer",
+      ttlMs: 1_000,
+      transportPreference: ["rest", "mailbox"],
+    });
+    const registration = graphicalRegistration(created, {
+      agentInstanceId: firstAgent.control.agentInstanceId,
+      runtimeKind: "listenServer",
+    });
+    firstAgent.registry.register(registration, created.contract.sessionToken);
+    const backend = new FakeBackend();
+    const first = makeHarness({
+      root,
+      backend,
+      gate: new AgentBackedGate(firstAgent),
+      receiptRetentionMs: 0,
+      preparedSessionId: created.record.sessionId,
+      preparedExpiresAt: created.contract.expiresAt,
+      preparedProfilePath: profilePath,
+    });
+    first.setExecutable(executable);
+    const prepared = await first.prepare(["-window"]);
+    const started = await first.manager.start({
+      preparedLaunchId: prepared.id,
+      idempotencyKey: "crash-recovery-start",
+    });
+
+    const job = firstAgent.jobs.submit({
+      sessionId: created.record.sessionId,
+      instanceId: registration.instanceId,
+      idempotencyKey: "crash-camera-job",
+      deadlineAt: new Date(clock.now() + 900).toISOString(),
+      view: { kind: "lookAt", position: [0, 1, 0], target: [1, 1, 0], fov: 60 },
+    });
+    const command = firstAgent.jobs.nextCommand(
+      created.record.sessionId,
+      registration.instanceId,
+      registration.instanceNonce
+    )!;
+    const status = (
+      sequence: number,
+      state: string,
+      cameraLease: Record<string, unknown>,
+      extra: Record<string, unknown> = {}
+    ) => ({
+      protocolVersion: "1.0",
+      sessionId: created.record.sessionId,
+      instanceId: registration.instanceId,
+      instanceNonce: registration.instanceNonce,
+      jobId: job.request.jobId,
+      sequence,
+      state,
+      worldId: registration.worldId,
+      worldEpoch: registration.worldEpoch,
+      timestamp: new Date(clock.now()).toISOString(),
+      cameraLease,
+      ...extra,
+    });
+    firstAgent.jobs.update(status(1, "accepted", {
+      held: false,
+      restorationConfirmed: false,
+    }, { deliveryToken: command.deliveryToken }), created.contract.sessionToken);
+    firstAgent.jobs.update(status(2, "acquiringCamera", {
+      held: true,
+      leaseId: "lease-crash",
+      observerCameraId: 42,
+    }), created.contract.sessionToken);
+    firstAgent.jobs.update(status(3, "restoring", {
+      held: false,
+      restorationConfirmed: false,
+    }), created.contract.sessionToken);
+
+    // Simulate an unclean private-child loss by abandoning the first composed
+    // agent without its close/seal path, then pass beyond both TTL and normal
+    // zero-retention tombstones before constructing the replacement.
+    clock.advance(2_000);
+    first.setClock(clock.now());
+    const replacementAgent = createObserverAgent({
+      root: agentRoot,
+      profileRoot,
+      sourceDirectory: observerAddonSource,
+      clock,
+      sessionStore: { terminalRetentionMs: 0 },
+      registry: { staleAfterMs: 1_000, staleRetentionMs: 0 },
+      jobs: { terminalJobRetentionMs: 1, idempotencyReceiptRetentionMs: 1 },
+    });
+    const recovered = makeHarness({
+      root,
+      backend,
+      gate: new AgentBackedGate(replacementAgent),
+      receiptRetentionMs: 0,
+    });
+    recovered.setClock(clock.now());
+    recovered.setExecutable(executable);
+
+    await expect(recovered.manager.status(started.runtimeId)).resolves.toMatchObject({
+      state: "stale",
+      exactOwned: true,
+    });
+    expect(replacementAgent.server.storeDiagnostics()).toMatchObject({
+      sessions: { records: 1, lifecycleLeased: 1 },
+      jobs: { jobs: 1, restorationObligations: 1 },
+      instances: { records: 1 },
+      ownedRuntimeAuthorities: { records: 1, retained: 1 },
+    });
+    await expect(recovered.manager.stop({
+      runtimeId: started.runtimeId,
+      waitForRestorationMs: 0,
+      idempotencyKey: "crash-recovery-stop",
+    })).rejects.toMatchObject({
+      code: "CAMERA_BUSY",
+      details: { restorationPendingJobIds: [job.request.jobId] },
+    });
+
+    replacementAgent.jobs.update(status(4, "restoring", {
+      held: false,
+      restorationConfirmed: true,
+    }), created.contract.sessionToken);
+    replacementAgent.jobs.update(status(5, "failed", {
+      held: false,
+      restorationConfirmed: true,
+    }, { errorCode: "CAMERA_BUSY" }), created.contract.sessionToken);
+    await expect(recovered.manager.stop({
+      runtimeId: started.runtimeId,
+      waitForRestorationMs: 0,
+      idempotencyKey: "crash-recovery-stop",
+    })).resolves.toMatchObject({
+      state: "exited",
+      terminationComplete: true,
+      observerCleanupPending: false,
+    });
+    await recovered.manager.sweep(clock.now());
+    replacementAgent.server.sweep(clock.now());
+    expect(recovered.manager.diagnosticStorageStats()).toMatchObject({
+      records: 0,
+      activeOrRecoverableRuntimes: 0,
+    });
+    expect(replacementAgent.server.storeDiagnostics()).toMatchObject({
+      sessions: { records: 0, lifecycleLeased: 0 },
+      ownedRuntimeLifecyclePins: { records: 0 },
+      ownedRuntimeAuthorities: { records: 0, retained: 0 },
+    });
+    await replacementAgent.server.close();
   });
 
   it("resumes partial terminal cleanup and preserves descriptors referenced by broken live links", async () => {
@@ -726,6 +1266,11 @@ describe("OwnedRuntimeManager", () => {
       idempotencyKey: "natural-exit-start",
     });
     expect(value.manager.diagnosticSupervisedChildCount()).toBe(1);
+    expect(value.manager.diagnosticSupervisedChildCounts()).toEqual({
+      active: 1,
+      reconciling: 0,
+      total: 1,
+    });
     const child = value.spawnCalls[0].child;
     value.backend.processes.delete(started.pid);
     child.exitCode = 0;
@@ -742,6 +1287,12 @@ describe("OwnedRuntimeManager", () => {
       pid: started.pid,
       exitCode: 0,
     });
+    for (let attempt = 0; attempt < 50 && value.gate.releasedLifecycles.length === 0; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 2));
+    }
+    expect(value.gate.releasedLifecycles).toEqual([
+      expect.objectContaining({ runtimeId: started.runtimeId, sessionId: started.sessionId }),
+    ]);
     expect(await value.manager.status(started.runtimeId)).toMatchObject({
       state: "exited",
       exactOwned: true,
@@ -781,7 +1332,124 @@ describe("OwnedRuntimeManager", () => {
       "pending-starts",
       readdirSync(join(failed.manager.storageRoot, "pending-starts"))[0]
     ), "utf8"));
-    expect(pending).toMatchObject({ state: "cleanup_verified", preparedLaunchId: prepared.id });
+    expect(pending).toMatchObject({ state: "release_acknowledged", preparedLaunchId: prepared.id });
+  });
+
+  it("releases the exact lifecycle pin when start fails after pin acquisition but before publication", async () => {
+    const value = makeHarness();
+    const prepared = await value.prepare();
+    const manager = value.manager as unknown as {
+      atomicWrite(root: string, target: string, record: unknown, exclusive: boolean, durable?: boolean): void;
+    };
+    const atomicWrite = manager.atomicWrite.bind(value.manager);
+    manager.atomicWrite = (root, target, record, exclusive, durable) => {
+      if (dirname(target) === join(value.manager.storageRoot, "runtimes") && target.endsWith(".json")) {
+        throw new Error("fixture runtime publication failure");
+      }
+      atomicWrite(root, target, record, exclusive, durable);
+    };
+
+    await expect(value.manager.start({
+      preparedLaunchId: prepared.id,
+      idempotencyKey: "post-pin-publication-failure",
+    })).rejects.toMatchObject({ code: "SPAWN_FAILED" });
+    expect(value.gate.retainedLifecycles).toHaveLength(1);
+    expect(value.gate.releasedLifecycles).toEqual(value.gate.retainedLifecycles);
+    expect(readdirSync(join(value.manager.storageRoot, "runtimes"))).toEqual([]);
+  });
+
+  it("retains an unpublished exact lifecycle until a same-key retry proves child vacancy", async () => {
+    const value = makeHarness({ refuseKill: true });
+    const prepared = await value.prepare();
+    const manager = value.manager as unknown as {
+      atomicWrite(root: string, target: string, record: unknown, exclusive: boolean, durable?: boolean): void;
+    };
+    const atomicWrite = manager.atomicWrite.bind(value.manager);
+    manager.atomicWrite = (root, target, record, exclusive, durable) => {
+      if (dirname(target) === join(value.manager.storageRoot, "runtimes") && target.endsWith(".json")) {
+        throw new Error("fixture runtime publication failure");
+      }
+      atomicWrite(root, target, record, exclusive, durable);
+    };
+
+    await expect(value.manager.start({
+      preparedLaunchId: prepared.id,
+      idempotencyKey: "uncertain-post-pin-publication",
+    })).rejects.toMatchObject({ code: "SPAWN_FAILED" });
+    const pendingName = readdirSync(join(value.manager.storageRoot, "pending-starts"))[0];
+    const pendingPath = join(value.manager.storageRoot, "pending-starts", pendingName);
+    expect(JSON.parse(readFileSync(pendingPath, "utf8"))).toMatchObject({
+      state: "cleanup_required",
+      lifecycleGeneration: expect.stringMatching(/^[a-f0-9]{64}$/),
+      launchedAtMs: expect.any(Number),
+      pid: value.spawnCalls[0].child.pid,
+    });
+    expect(value.gate.retainedLifecycles).toHaveLength(1);
+    expect(value.gate.releasedLifecycles).toEqual([]);
+    expect(value.backend.processes.has(value.spawnCalls[0].child.pid)).toBe(true);
+
+    await expect(value.manager.start({
+      preparedLaunchId: prepared.id,
+      idempotencyKey: "uncertain-post-pin-publication",
+    })).rejects.toMatchObject({
+      code: "START_UNVERIFIABLE",
+      details: { state: "release_required", pid: value.spawnCalls[0].child.pid },
+    });
+    expect(value.backend.processes.has(value.spawnCalls[0].child.pid)).toBe(false);
+    expect(value.gate.releasedLifecycles).toEqual(value.gate.retainedLifecycles);
+    expect(JSON.parse(readFileSync(pendingPath, "utf8"))).toMatchObject({ state: "release_acknowledged" });
+  });
+
+  it("keeps durable unpublished-exit cleanup retryable when lifecycle release IPC fails", async () => {
+    const value = makeHarness({ refuseKill: true });
+    const prepared = await value.prepare();
+    const manager = value.manager as unknown as {
+      atomicWrite(root: string, target: string, record: unknown, exclusive: boolean, durable?: boolean): void;
+    };
+    const atomicWrite = manager.atomicWrite.bind(value.manager);
+    manager.atomicWrite = (root, target, record, exclusive, durable) => {
+      if (dirname(target) === join(value.manager.storageRoot, "runtimes") && target.endsWith(".json")) {
+        throw new Error("fixture runtime publication failure");
+      }
+      atomicWrite(root, target, record, exclusive, durable);
+    };
+
+    await expect(value.manager.start({
+      preparedLaunchId: prepared.id,
+      idempotencyKey: "unpublished-natural-exit",
+    })).rejects.toMatchObject({ code: "SPAWN_FAILED" });
+    expect(value.gate.releasedLifecycles).toEqual([]);
+
+    const child = value.spawnCalls[0].child;
+    const pendingName = readdirSync(join(value.manager.storageRoot, "pending-starts"))[0];
+    const pendingPath = join(value.manager.storageRoot, "pending-starts", pendingName);
+    value.gate.releaseLifecycleFailures = 1;
+    value.backend.processes.delete(child.pid);
+    child.exitCode = 0;
+    child.emit("exit", 0, null);
+    for (let attempt = 0; attempt < 50; attempt += 1) {
+      if (JSON.parse(readFileSync(pendingPath, "utf8")).state === "release_required" &&
+          value.gate.releaseLifecycleAttempts === 1) break;
+      await new Promise((resolve) => setTimeout(resolve, 2));
+    }
+
+    expect(value.gate.releaseLifecycleAttempts).toBe(1);
+    expect(value.gate.releasedLifecycles).toEqual([]);
+    expect(JSON.parse(readFileSync(pendingPath, "utf8"))).toMatchObject({
+      state: "release_required",
+      pid: child.pid,
+    });
+    await expect(value.manager.start({
+      preparedLaunchId: prepared.id,
+      idempotencyKey: "unpublished-natural-exit",
+    })).rejects.toMatchObject({
+      code: "START_UNVERIFIABLE",
+      details: { state: "release_required", pid: child.pid },
+    });
+    expect(value.gate.releasedLifecycles).toEqual(value.gate.retainedLifecycles);
+    expect(JSON.parse(readFileSync(pendingPath, "utf8"))).toMatchObject({
+      state: "release_acknowledged",
+    });
   });
 
   it("distinguishes running, stale, exited, identity mismatch, and unverifiable states", async () => {
@@ -807,6 +1475,12 @@ describe("OwnedRuntimeManager", () => {
     value.backend.inspectFailure = null;
     value.backend.processes.delete(started.pid);
     expect((await value.manager.status(started.runtimeId)).state).toBe("exited");
+    expect(existsSync(join(
+      value.manager.storageRoot,
+      "child-exits",
+      `${started.runtimeId}.json`
+    ))).toBe(true);
+    expect(value.gate.releasedLifecycles.at(-1)).toMatchObject({ runtimeId: started.runtimeId });
   });
 
   it("fails closed on configured executable path drift", async () => {
@@ -1146,6 +1820,160 @@ describe("OwnedRuntimeManager", () => {
     });
   });
 
+  it("bounds a never-settling restoration gate even when no restoration wait was requested", async () => {
+    const value = makeHarness({
+      inspectionTimeoutMs: 100,
+      terminationTimeoutMs: 100,
+      lockTimeoutMs: 100,
+    });
+    const prepared = await value.prepare();
+    const started = await value.manager.start({
+      preparedLaunchId: prepared.id,
+      idempotencyKey: "deadline-restoration-start",
+    });
+    value.gate.reserveRuntimeStop = vi.fn(
+      async () => new Promise<RuntimeStopPreflight>(() => undefined)
+    );
+
+    const beganAt = Date.now();
+    await expect(value.manager.stop({
+      runtimeId: started.runtimeId,
+      waitForRestorationMs: 0,
+      idempotencyKey: "deadline-restoration-stop",
+    })).rejects.toMatchObject({
+      code: "RECOVERY_REQUIRED",
+      details: {
+        runtimeId: started.runtimeId,
+        state: "stopping",
+        wallDeadlineExpired: true,
+      },
+    });
+    expect(Date.now() - beganAt).toBeLessThan(1_000);
+    expect(value.backend.terminateCalls).toEqual([]);
+    expect(value.backend.processes.has(started.pid)).toBe(true);
+
+    const attemptHash = createHash("sha256")
+      .update("deadline-restoration-stop")
+      .digest("hex");
+    expect(JSON.parse(readFileSync(join(
+      value.manager.storageRoot,
+      "idempotency",
+      `stop-${attemptHash}.json`
+    ), "utf8"))).toMatchObject({
+      action: "stop",
+      runtimeId: started.runtimeId,
+      state: "starting",
+    });
+  });
+
+  it("returns recovery-required with exact vacancy evidence when observer completion never settles", async () => {
+    const value = makeHarness({
+      inspectionTimeoutMs: 100,
+      terminationTimeoutMs: 100,
+      lockTimeoutMs: 100,
+    });
+    const prepared = await value.prepare();
+    const started = await value.manager.start({
+      preparedLaunchId: prepared.id,
+      idempotencyKey: "deadline-completion-start",
+    });
+    let markCompletionEntered!: () => void;
+    const completionEntered = new Promise<void>((resolve) => { markCompletionEntered = resolve; });
+    value.gate.completeRuntimeStop = vi.fn(async () => {
+      markCompletionEntered();
+      return new Promise<unknown>(() => undefined);
+    });
+
+    vi.useFakeTimers();
+    try {
+      const beganAt = Date.now();
+      const stopping = value.manager.stop({
+        runtimeId: started.runtimeId,
+        waitForRestorationMs: 0,
+        idempotencyKey: "deadline-completion-stop",
+      });
+      const rejection = expect(stopping).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+      await completionEntered;
+      await vi.advanceTimersByTimeAsync(300);
+      await rejection;
+
+      expect(Date.now() - beganAt).toBe(300);
+      expect(value.backend.processes.has(started.pid)).toBe(false);
+      expect(existsSync(join(
+        value.manager.storageRoot,
+        "stops",
+        `${started.runtimeId}.json`
+      ))).toBe(true);
+      expect(existsSync(join(
+        value.manager.storageRoot,
+        "stop-completions",
+        `${started.runtimeId}.json`
+      ))).toBe(false);
+      await expect(value.manager.status(started.runtimeId)).resolves.toMatchObject({
+        state: "stopping",
+        identityVacant: true,
+        terminationComplete: true,
+        observerCleanupPending: true,
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not call the observer gate after mutex acquisition consumes the stop budget", async () => {
+    const backend = new DeadlineBackend();
+    const value = makeHarness({
+      backend,
+      inspectionTimeoutMs: 100,
+      terminationTimeoutMs: 100,
+      lockTimeoutMs: 100,
+    });
+    const prepared = await value.prepare();
+    const started = await value.manager.start({
+      preparedLaunchId: prepared.id,
+      idempotencyKey: "deadline-mutex-start",
+    });
+    const reserve = vi.spyOn(value.gate, "reserveRuntimeStop");
+    backend.hangNextMutexAfterAction = true;
+
+    const beganAt = Date.now();
+    await expect(value.manager.stop({
+      runtimeId: started.runtimeId,
+      waitForRestorationMs: 0,
+      idempotencyKey: "deadline-mutex-stop",
+    })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    expect(Date.now() - beganAt).toBeLessThan(1_000);
+    expect(reserve).not.toHaveBeenCalled();
+    expect(backend.terminateCalls).toEqual([]);
+  });
+
+  it("does not reserve or terminate after exact inspection consumes the stop budget", async () => {
+    const backend = new DeadlineBackend();
+    const value = makeHarness({
+      backend,
+      inspectionTimeoutMs: 100,
+      terminationTimeoutMs: 100,
+      lockTimeoutMs: 100,
+    });
+    const prepared = await value.prepare();
+    const started = await value.manager.start({
+      preparedLaunchId: prepared.id,
+      idempotencyKey: "deadline-inspection-start",
+    });
+    const reserve = vi.spyOn(value.gate, "reserveRuntimeStop");
+    backend.hangNextInspection = true;
+
+    const beganAt = Date.now();
+    await expect(value.manager.stop({
+      runtimeId: started.runtimeId,
+      waitForRestorationMs: 0,
+      idempotencyKey: "deadline-inspection-stop",
+    })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    expect(Date.now() - beganAt).toBeLessThan(1_000);
+    expect(reserve).not.toHaveBeenCalled();
+    expect(backend.terminateCalls).toEqual([]);
+  });
+
   it("revalidates the durable restoration reservation after reacquiring the mutex", async () => {
     const backend = new HookedSerialBackend();
     const value = makeHarness({ backend });
@@ -1224,6 +2052,46 @@ describe("OwnedRuntimeManager", () => {
     expect(value.backend.processes.has(one.pid)).toBe(false);
     expect(value.backend.processes.has(two.pid)).toBe(true);
     expect(await recovered.manager.status(two.runtimeId)).toMatchObject({ state: "running", exactOwned: true });
+  });
+
+  it("uses a durable restart seal without requiring a new child to re-retain the old session", async () => {
+    const value = makeHarness();
+    const prepared = await value.prepare();
+    const started = await value.manager.start({
+      preparedLaunchId: prepared.id,
+      idempotencyKey: "sealed-restart-start",
+    });
+    await expect(value.manager.close()).resolves.toMatchObject({
+      sealedRuntimeIds: [started.runtimeId],
+      coordinatorCloseSafe: true,
+    });
+
+    const recovered = makeHarness({ root: value.root, backend: value.backend });
+    recovered.setExecutable(value.executable);
+    recovered.gate.retainRuntimeLifecycle = vi.fn(async () => {
+      throw new Error("replacement private child has no old session");
+    });
+    recovered.gate.preflights.push({
+      sessionKnown: false,
+      ready: false,
+      reserved: false,
+      activeJobIds: [],
+      cameraLeaseJobIds: [],
+      restorationPendingJobIds: [],
+    });
+
+    await expect(recovered.manager.status(started.runtimeId)).resolves.toMatchObject({
+      state: "running",
+      exactOwned: true,
+    });
+    await expect(recovered.manager.stop({
+      runtimeId: started.runtimeId,
+      waitForRestorationMs: 0,
+      idempotencyKey: "sealed-restart-stop",
+    })).resolves.toMatchObject({ state: "exited", terminationComplete: true });
+    expect(recovered.gate.retainRuntimeLifecycle).not.toHaveBeenCalled();
+    expect(recovered.gate.preflights).toHaveLength(1);
+    expect(value.backend.processes.has(started.pid)).toBe(false);
   });
 
   it("refuses concurrent adoption while the prior exact MCP owner is still live", async () => {
@@ -1503,6 +2371,106 @@ describe("OwnedRuntimeManager", () => {
     await expect(startPromise).rejects.toMatchObject({ code: "LIFECYCLE_CLOSING" });
     await expect(closePromise).resolves.toMatchObject({ sealedRuntimeIds: [] });
     expect(value.spawnCalls).toEqual([]);
+  });
+
+  it("bounds lifecycle release within the aggregate shutdown deadline", async () => {
+    const value = makeHarness({
+      inspectionTimeoutMs: 5_000,
+      terminationTimeoutMs: 5_000,
+      lockTimeoutMs: 5_000,
+    });
+    const prepared = await value.prepare();
+    const started = await value.manager.start({
+      preparedLaunchId: prepared.id,
+      idempotencyKey: "deadline-close-start",
+    });
+    await value.manager.stop({
+      runtimeId: started.runtimeId,
+      waitForRestorationMs: 0,
+      idempotencyKey: "deadline-close-stop",
+    });
+    let markReleaseEntered!: () => void;
+    const releaseEntered = new Promise<void>((resolve) => { markReleaseEntered = resolve; });
+    value.gate.releaseRuntimeLifecycle = vi.fn(async () => {
+      markReleaseEntered();
+      return new Promise<unknown>(() => undefined);
+    });
+
+    vi.useFakeTimers();
+    try {
+      const beganAt = Date.now();
+      const closing = value.manager.close() as Promise<{
+        coordinatorCloseSafe: boolean;
+        errorRuntimes: Array<{ runtimeId: string; reason: string }>;
+      }>;
+      await releaseEntered;
+      await vi.advanceTimersByTimeAsync(5_000);
+      const result = await closing;
+      const runtimeError = result.errorRuntimes.find((entry) => entry.runtimeId === started.runtimeId);
+
+      expect(Date.now() - beganAt).toBe(5_000);
+      expect(result.coordinatorCloseSafe).toBe(false);
+      expect(runtimeError?.reason).toContain("aggregate wall-clock deadline");
+      expect(value.gate.releaseRuntimeLifecycle).toHaveBeenCalledTimes(1);
+      expect(existsSync(join(
+        value.manager.storageRoot,
+        "stop-completions",
+        `${started.runtimeId}.json`
+      ))).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("reports one bounded inventory remainder after the aggregate shutdown deadline", async () => {
+    const value = makeHarness({
+      inspectionTimeoutMs: 5_000,
+      terminationTimeoutMs: 5_000,
+      lockTimeoutMs: 5_000,
+    });
+    const runtimeIds: string[] = [];
+    for (let index = 0; index < 6; index += 1) {
+      const prepared = await value.prepare([`-deadline-inventory-${index}`]);
+      const started = await value.manager.start({
+        preparedLaunchId: prepared.id,
+        idempotencyKey: `deadline-inventory-start-${index}`,
+      });
+      runtimeIds.push(started.runtimeId);
+      await value.manager.stop({
+        runtimeId: started.runtimeId,
+        waitForRestorationMs: 0,
+        idempotencyKey: `deadline-inventory-stop-${index}`,
+      });
+    }
+    const releaseRuntimeLifecycle = value.gate.releaseRuntimeLifecycle.bind(value.gate);
+    let wallNow = Date.now();
+    const wallClock = vi.spyOn(Date, "now").mockImplementation(() => wallNow);
+    value.gate.releaseRuntimeLifecycle = vi.fn(async (...argumentsArray) => {
+      const acknowledgement = await releaseRuntimeLifecycle(...argumentsArray);
+      // Deterministically consume the aggregate shutdown budget after one
+      // inspected runtime; setup timing and scheduler load are irrelevant.
+      wallNow += 5_000;
+      return acknowledgement;
+    });
+
+    try {
+      const beganAt = Date.now();
+      const result = await value.manager.close() as {
+        errorRuntimes: Array<{ runtimeId: string; reason: string }>;
+        coordinatorCloseSafe: boolean;
+      };
+      const inventoryErrors = result.errorRuntimes.filter((entry) => entry.runtimeId === "inventory");
+
+      expect(Date.now() - beganAt).toBe(5_000);
+      expect(result.coordinatorCloseSafe).toBe(false);
+      expect(inventoryErrors).toHaveLength(1);
+      expect(inventoryErrors[0].reason).toContain("5 runtime(s) were not inspected");
+      expect(result.errorRuntimes).toEqual(inventoryErrors);
+      expect(value.gate.releaseRuntimeLifecycle).toHaveBeenCalledTimes(1);
+      expect(runtimeIds).toHaveLength(6);
+    } finally {
+      wallClock.mockRestore();
+    }
   });
 
   it("keeps coordinator shutdown unsafe when the runtime receipt directory disappears", async () => {

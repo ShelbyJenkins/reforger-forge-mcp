@@ -1,10 +1,14 @@
 import { createHash, randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
+import { z } from "zod";
 import {
   COMMAND_DELIVERY_LEASE_MS,
+  ERROR_CODES,
+  JOB_STATES,
   PROTOCOL_VERSION,
   TERMINAL_JOB_STATES,
   captureRequestSchema,
+  artifactManifestSchema,
   isRuntimeJobTransition,
   jobStatusSchema,
   parseProtocolMessage,
@@ -220,6 +224,48 @@ export interface JobRecord {
   artifactReleaseDisposition: "unseen" | "erased" | "absent";
 }
 
+const deliveryRecordSchema = z.object({
+  attempt: z.number().int().positive(),
+  token: z.string().min(1).max(256),
+  leaseExpiresAt: z.number().int().nonnegative(),
+  acknowledgedAt: z.number().int().nonnegative().nullable(),
+});
+
+const durableJobRecordSchema = z.object({
+  request: captureRequestSchema,
+  sessionId: z.string().min(1).max(96),
+  selectedInstanceId: z.string().min(1).max(96),
+  selectedInstanceNonce: z.string().min(32).max(256),
+  worldId: z.string().min(1).max(512).nullable(),
+  worldEpoch: z.number().int().nonnegative(),
+  state: z.enum(JOB_STATES),
+  statusSequence: z.number().int().min(-1),
+  createdAt: z.number().int().nonnegative(),
+  updatedAt: z.number().int().nonnegative(),
+  cancellationRequestedAt: z.number().int().nonnegative().nullable(),
+  captureDelivery: deliveryRecordSchema.nullable(),
+  cancellationDelivery: deliveryRecordSchema.nullable(),
+  cameraLease: z.object({
+    everHeld: z.boolean(),
+    held: z.boolean(),
+    leaseId: z.string().min(1).max(96).nullable(),
+    observerCameraId: z.union([z.string().min(1).max(96), z.number().int().nonnegative()]).nullable(),
+    restorationConfirmed: z.boolean(),
+    vacancyDisposition: z.literal("exact_runtime_vacant").optional(),
+  }),
+  cameraWasAcquired: z.boolean(),
+  artifactAwaited: z.boolean(),
+  terminalErrorCode: z.enum(ERROR_CODES).nullable(),
+  terminalMessage: z.string().max(512).nullable(),
+  artifact: artifactManifestSchema.nullable(),
+  artifactPath: z.string().min(1).max(32_768).nullable(),
+  artifactReleaseDisposition: z.enum(["unseen", "erased", "absent"]),
+});
+
+export type JobStoreDurableMutation =
+  | { kind: "upsert"; sessionId: string; record: JobRecord }
+  | { kind: "remove"; sessionId: string; jobId: string };
+
 export interface ArtifactCompletionPreflight {
   record: JobRecord;
   alreadyCompleted: boolean;
@@ -235,6 +281,7 @@ export class JobStore {
   readonly maxRecords: number;
   readonly maxEstimatedBytes: number;
   readonly maxRecordEstimatedBytes: number;
+  private durableMutationHook: ((mutation: JobStoreDurableMutation) => void) | null = null;
 
   constructor(
     private readonly sessions: SessionStore,
@@ -273,6 +320,84 @@ export class JobStore {
       this.maxEstimatedBytes,
       "Job record byte limit"
     );
+  }
+
+  setDurableMutationHook(hook: ((mutation: JobStoreDurableMutation) => void) | null): void {
+    this.durableMutationHook = hook;
+  }
+
+  durableSnapshot(
+    sessionId: string,
+    mutation?: JobStoreDurableMutation
+  ): JobRecord[] {
+    const records = new Map(
+      [...this.jobs.values()]
+        .filter((record) => record.sessionId === sessionId)
+        .map((record): [string, JobRecord] => [record.request.jobId, structuredClone(record)])
+    );
+    if (mutation?.sessionId === sessionId) {
+      if (mutation.kind === "upsert") {
+        records.set(mutation.record.request.jobId, structuredClone(mutation.record));
+      } else {
+        records.delete(mutation.jobId);
+      }
+    }
+    return [...records.values()]
+      .sort((left, right) => left.request.jobId.localeCompare(right.request.jobId))
+      .map((record) => durableJobRecordSchema.parse(record) as JobRecord);
+  }
+
+  restoreDurable(sessionId: string, recordsInput: unknown): void {
+    this.sessions.get(sessionId);
+    const inputs = z.array(durableJobRecordSchema).max(this.maxRecords).parse(recordsInput);
+    const parsed = inputs.map((record) => structuredClone(record) as JobRecord);
+    const seen = new Set<string>();
+    for (const record of parsed) {
+      if (record.sessionId !== sessionId || seen.has(record.request.jobId)) {
+        throw new ObserverError(
+          "SESSION_MISMATCH",
+          "Durable observer jobs do not belong to one exact session",
+          409
+        );
+      }
+      seen.add(record.request.jobId);
+      if (this.jobRecordBytes(record) > this.maxRecordEstimatedBytes) {
+        throw new ObserverError(
+          "TRANSPORT_UNAVAILABLE",
+          "Durable observer job exceeds its recovery budget",
+          503
+        );
+      }
+      const existing = this.jobs.get(record.request.jobId);
+      if (existing && JSON.stringify(existing) !== JSON.stringify(record)) {
+        throw new ObserverError(
+          "SESSION_MISMATCH",
+          "Durable observer job conflicts with current in-memory state",
+          409
+        );
+      }
+    }
+    const newRecords = parsed.filter((record) => !this.jobs.has(record.request.jobId));
+    const projectedRecords = this.jobs.size + newRecords.length;
+    const projectedBytes = this.estimatedStoreBytes() +
+      newRecords.reduce((total, record) => total + this.jobRecordBytes(record), 0);
+    if (projectedRecords > this.maxRecords ||
+        projectedBytes + projectedRecords * JOB_MUTATION_RESERVE_BYTES > this.maxEstimatedBytes) {
+      throw new ObserverError(
+        "TRANSPORT_UNAVAILABLE",
+        "Durable observer jobs exceed the recovery store budget",
+        503
+      );
+    }
+    for (const record of newRecords) {
+      this.jobs.set(record.request.jobId, record);
+      if (record.state === "queued") {
+        const key = this.instanceKey(record.sessionId, record.selectedInstanceId);
+        const queue = this.pendingByInstance.get(key) ?? [];
+        if (!queue.includes(record.request.jobId)) queue.push(record.request.jobId);
+        this.pendingByInstance.set(key, queue);
+      }
+    }
   }
 
   submit(input: SubmitJobInput): JobRecord {
@@ -388,6 +513,7 @@ export class JobStore {
     };
     const queueKey = this.instanceKey(input.sessionId, record.selectedInstanceId);
     this.assertCapacity({ jobId, record, idempotencyKey, receipt, queueKey });
+    this.durableMutationHook?.({ kind: "upsert", sessionId: record.sessionId, record });
     this.jobs.set(jobId, record);
     this.idempotency.set(idempotencyKey, receipt);
     const queue = this.pendingByInstance.get(queueKey) ?? [];
@@ -708,6 +834,7 @@ export class JobStore {
       if (!TERMINAL.has(record.state) || record.updatedAt + this.terminalJobRetentionMs > now ||
           retainedReceiptJobs.has(jobId) || options.pinnedJobIds?.has(jobId) ||
           this.hasRestorationObligation(record)) continue;
+      this.durableMutationHook?.({ kind: "remove", sessionId: record.sessionId, jobId });
       this.jobs.delete(jobId);
       removedJobs.push(jobId);
     }
@@ -1035,6 +1162,7 @@ export class JobStore {
         503
       );
     }
+    this.durableMutationHook?.({ kind: "upsert", sessionId: candidate.sessionId, record: candidate });
     Object.assign(record, candidate);
   }
 

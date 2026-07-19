@@ -1,5 +1,26 @@
 import { spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import {
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
+import {
+  arch,
+  cpus,
+  platform,
+  release,
+  totalmem,
+} from "node:os";
+import { basename, isAbsolute, join, resolve } from "node:path";
+import { performance } from "node:perf_hooks";
+import { setTimeout as delay } from "node:timers/promises";
+import { fileURLToPath } from "node:url";
 import { inflateSync } from "node:zlib";
 
 const PNG_SIGNATURE = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
@@ -20,6 +41,1004 @@ const BLOCKING_PROCESS_NAMES = new Set([
   "armareforgerworkbenchsteam",
   "armareforgerworkbenchsteamdiag",
 ]);
+
+export type OperationalBaselineBackend = "workbench" | "runtime";
+export type OperationalBaselineBoundary =
+  | "launch"
+  | "managed_call"
+  | "capture"
+  | "shutdown";
+
+export interface AcceptanceSupervisedProcessCounts {
+  active: number;
+  reconciling: number;
+  total: number;
+}
+
+export interface OperationalBaselineVacancyWaitResult {
+  vacant: boolean;
+  timeoutMs: number;
+  pollIntervalMs: number;
+  polls: number;
+  waitedMs: number;
+  counts: AcceptanceSupervisedProcessCounts;
+}
+
+export interface OperationalBaselineProcessSample extends AcceptanceSupervisedProcessCounts {
+  label: string;
+  at: string;
+}
+
+export interface OperationalBaselineMeasurement {
+  boundary: OperationalBaselineBoundary;
+  operation: string;
+  phase: string;
+  startedAt: string;
+  finishedAt: string;
+  durationMs: number;
+  outcome: "passed" | "failed";
+  processCountBefore: AcceptanceSupervisedProcessCounts;
+  processCountAfter: AcceptanceSupervisedProcessCounts;
+  observations?: Record<string, string | number | boolean | null>;
+  errorName?: string;
+}
+
+export interface ExecutableVersionEvidence {
+  executable: string;
+  version: string | null;
+  fileVersion: string | null;
+  discovery: "windows_file_metadata" | "unavailable";
+}
+
+export interface OperationalBaselineEnvironment {
+  node: {
+    version: string;
+    architecture: string;
+  };
+  operatingSystem: {
+    platform: string;
+    release: string;
+    architecture: string;
+  };
+  machineClass: {
+    cpuModel: string;
+    logicalCpuCount: number;
+    totalMemoryGiB: number;
+  };
+  workbench: ExecutableVersionEvidence | null;
+  game: ExecutableVersionEvidence | null;
+}
+
+export interface OperationalBaselineSourceIdentity {
+  path: string;
+  sha256: string;
+}
+
+export interface OperationalBaselineSourceClosure {
+  /** Repository-relative glob-like label written to the artifact. */
+  path: string;
+  /** Repository-relative directory whose matching files form the closure. */
+  directory: string;
+  extension: `.${string}`;
+}
+
+export interface OperationalBaselineLaunchArguments {
+  observed: boolean;
+  count: number;
+  sha256: string;
+  normalization: "absolute_paths_and_owner_tokens_redacted_v1";
+}
+
+export interface OperationalBaselineFixtureIdentity {
+  kind: "disposable_workbench_world" | "addon";
+  id: string;
+  guid: string | null;
+  sourceFileCount: number;
+  sourceSha256: string;
+}
+
+export interface OperationalBaselineWorkload {
+  procedureRevision: string;
+  runtimeKind: "workbench" | "listenServer";
+  overallTimeoutMs: number;
+  worldResource: string;
+  fixture: OperationalBaselineFixtureIdentity | null;
+  capture: {
+    labels: string[];
+    settleFrames: number;
+    performancePolicy: "evidence";
+    asynchronous: boolean;
+    configurationSha256: string;
+  };
+  launchArguments: OperationalBaselineLaunchArguments;
+}
+
+export interface OperationalBaselineArtifact {
+  schemaVersion: 1;
+  kind:
+    | "reforger_forge_workbench_operational_baseline"
+    | "reforger_forge_runtime_operational_baseline";
+  backend: OperationalBaselineBackend;
+  result: "passed" | "failed";
+  startedAt: string;
+  finishedAt: string;
+  durationMs: number;
+  environment: OperationalBaselineEnvironment;
+  workload: OperationalBaselineWorkload;
+  source: {
+    harness: OperationalBaselineSourceIdentity;
+    recorder: OperationalBaselineSourceIdentity;
+    measured: OperationalBaselineSourceIdentity[];
+  };
+  measurements: OperationalBaselineMeasurement[];
+  processCounts: OperationalBaselineProcessSample[];
+  thresholds: null;
+  limitations: string[];
+  failure: { name: string } | null;
+}
+
+export interface OperationalBaselineClock {
+  wallNow(): Date;
+  monotonicNow(): number;
+}
+
+export interface OperationalBaselineSpan {
+  boundary: OperationalBaselineBoundary;
+  operation: string;
+  phase: string;
+  startedAt: string;
+  startedMonotonicMs: number;
+  processCountBefore: AcceptanceSupervisedProcessCounts;
+}
+
+export interface CompleteSpanOptions {
+  outcome?: "passed" | "failed";
+  errorName?: string;
+  /** Use only for a durable event timestamp observed when the operation resolves. */
+  finishedAt?: string;
+  durationMs?: number;
+  observations?: Record<string, string | number | boolean | null>;
+}
+
+export interface OperationalBaselineRecorderOptions {
+  backend: OperationalBaselineBackend;
+  readSupervisedProcessCounts: () => AcceptanceSupervisedProcessCounts;
+  clock?: OperationalBaselineClock;
+}
+
+const SYSTEM_CLOCK: OperationalBaselineClock = {
+  wallNow: () => new Date(),
+  monotonicNow: () => performance.now(),
+};
+
+function finiteNonNegative(value: number, label: string): number {
+  if (!Number.isFinite(value) || value < 0) throw new Error(`${label} must be finite and non-negative`);
+  return value;
+}
+
+function processCounts(
+  value: AcceptanceSupervisedProcessCounts
+): AcceptanceSupervisedProcessCounts {
+  const active = finiteNonNegative(value.active, "Active supervised process count");
+  const reconciling = finiteNonNegative(
+    value.reconciling,
+    "Reconciling supervised process count"
+  );
+  const total = finiteNonNegative(value.total, "Total supervised process count");
+  if (![active, reconciling, total].every(Number.isSafeInteger) || total !== active + reconciling) {
+    throw new Error("Supervised process counts must be safe integers whose total equals active plus reconciling");
+  }
+  return { active, reconciling, total };
+}
+
+export async function waitForOperationalBaselineProcessVacancy(
+  readCounts: () => AcceptanceSupervisedProcessCounts,
+  options: {
+    timeoutMs?: number;
+    pollIntervalMs?: number;
+    monotonicNow?: () => number;
+    wait?: (milliseconds: number) => Promise<void>;
+  } = {}
+): Promise<OperationalBaselineVacancyWaitResult> {
+  const timeoutMs = options.timeoutMs ?? 5_000;
+  const pollIntervalMs = options.pollIntervalMs ?? 25;
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 30_000 ||
+      !Number.isSafeInteger(pollIntervalMs) || pollIntervalMs < 1 || pollIntervalMs > timeoutMs) {
+    throw new Error("Operational baseline vacancy-wait bounds are invalid");
+  }
+  const monotonicNow = options.monotonicNow ?? (() => performance.now());
+  const wait = options.wait ?? (async (milliseconds: number) => delay(milliseconds));
+  const startedAt = monotonicNow();
+  if (!Number.isFinite(startedAt)) throw new Error("Operational baseline vacancy-wait clock is invalid");
+  let polls = 0;
+  for (;;) {
+    const counts = processCounts(readCounts());
+    polls += 1;
+    const now = monotonicNow();
+    if (!Number.isFinite(now) || now < startedAt) {
+      throw new Error("Operational baseline vacancy-wait clock moved backwards");
+    }
+    const waitedMs = Number((now - startedAt).toFixed(3));
+    if (counts.total === 0 || waitedMs >= timeoutMs) {
+      return {
+        vacant: counts.total === 0,
+        timeoutMs,
+        pollIntervalMs,
+        polls,
+        waitedMs,
+        counts,
+      };
+    }
+    await wait(Math.min(pollIntervalMs, timeoutMs - waitedMs));
+  }
+}
+
+function isoTimestamp(value: string, label: string): number {
+  const parsed = Date.parse(value);
+  if (!Number.isFinite(parsed) || new Date(parsed).toISOString() !== value) {
+    throw new Error(`${label} must be a canonical ISO timestamp`);
+  }
+  return parsed;
+}
+
+function portableIsAbsolute(path: string): boolean {
+  return isAbsolute(path) || /^[A-Za-z]:[\\/]/.test(path) || /^\\\\/.test(path);
+}
+
+function validRepositoryRelativeSourcePath(path: string): boolean {
+  return Boolean(path) && path.length <= 160 && path === path.replace(/\\/g, "/") &&
+    !portableIsAbsolute(path) && !/[\0\r\n]/.test(path) &&
+    path.split("/").every((segment) => Boolean(segment) && segment !== "." && segment !== "..");
+}
+
+function validateSourceIdentity(source: OperationalBaselineSourceIdentity): void {
+  if (!/^[a-f0-9]{64}$/.test(source.sha256) ||
+      !validRepositoryRelativeSourcePath(source.path)) {
+    throw new Error("Operational baseline source identity is invalid");
+  }
+}
+
+function compareSourcePath(
+  left: OperationalBaselineSourceIdentity,
+  right: OperationalBaselineSourceIdentity
+): number {
+  return left.path < right.path ? -1 : left.path > right.path ? 1 : 0;
+}
+
+function canonicalJson(value: unknown, depth = 0): string {
+  if (depth > 12) throw new Error("Operational baseline canonical value is too deeply nested");
+  if (value === null) return "null";
+  if (typeof value === "boolean") return value ? "true" : "false";
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) throw new Error("Operational baseline canonical number must be finite");
+    return JSON.stringify(Object.is(value, -0) ? 0 : value);
+  }
+  if (typeof value === "string") {
+    if (value.length > 32_768 || /\0/.test(value)) {
+      throw new Error("Operational baseline canonical string is invalid");
+    }
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) {
+    if (value.length > 512) throw new Error("Operational baseline canonical array is too large");
+    return `[${value.map((item) => canonicalJson(item, depth + 1)).join(",")}]`;
+  }
+  if (!value || typeof value !== "object" ||
+      ![Object.prototype, null].includes(Object.getPrototypeOf(value))) {
+    throw new Error("Operational baseline canonical value must contain plain data");
+  }
+  const entries = Object.entries(value as Record<string, unknown>);
+  if (entries.length > 128) throw new Error("Operational baseline canonical object is too large");
+  entries.sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0);
+  return `{${entries.map(([key, item]) => {
+    if (!key || key.length > 160 || /[\0\r\n]/.test(key) || item === undefined) {
+      throw new Error("Operational baseline canonical object key or value is invalid");
+    }
+    return `${JSON.stringify(key)}:${canonicalJson(item, depth + 1)}`;
+  }).join(",")}}`;
+}
+
+export function operationalBaselineProcedureSha256(value: unknown): string {
+  return createHash("sha256")
+    .update("rfo-operational-baseline-procedure-v1\0")
+    .update(canonicalJson(value))
+    .digest("hex");
+}
+
+export function operationalBaselineLaunchArgumentIdentity(
+  argumentsArray: readonly string[],
+  observed = true
+): OperationalBaselineLaunchArguments {
+  if (!Array.isArray(argumentsArray) || argumentsArray.length > 512 ||
+      argumentsArray.some((token) => typeof token !== "string" || token.length > 32_768 || /[\0\r\n]/.test(token))) {
+    throw new Error("Operational baseline launch arguments are invalid");
+  }
+  const redactAbsoluteValue = (value: string): string | null => {
+    const list = value.split(",");
+    if (list.length > 1 && list.every((item) => portableIsAbsolute(item))) {
+      return `<absolute-path-list:${list.length}>`;
+    }
+    return portableIsAbsolute(value) ? "<absolute-path>" : null;
+  };
+  const canonicalArguments = argumentsArray.map((token) => {
+    if (token.toLowerCase().startsWith("-reforgerforgeownertoken=")) {
+      return "-reforgerForgeOwnerToken=<redacted>";
+    }
+    const redactedToken = redactAbsoluteValue(token);
+    if (redactedToken) return redactedToken;
+    const equals = token.indexOf("=");
+    if (equals > 0) {
+      const redactedValue = redactAbsoluteValue(token.slice(equals + 1));
+      if (redactedValue) return `${token.slice(0, equals + 1)}${redactedValue}`;
+    }
+    return token;
+  });
+  const sha256 = createHash("sha256")
+    .update("rfo-operational-baseline-launch-arguments-v1\0")
+    .update(canonicalJson(canonicalArguments))
+    .digest("hex");
+  return {
+    observed,
+    count: argumentsArray.length,
+    sha256,
+    normalization: "absolute_paths_and_owner_tokens_redacted_v1",
+  };
+}
+
+function aggregateContentMembers(
+  members: Array<{ path: string; sha256: string }>,
+  domain: string
+): string {
+  members.sort(compareSourcePath);
+  const hash = createHash("sha256");
+  hash.update(`${domain}\0`);
+  for (const member of members) {
+    hash.update(member.path);
+    hash.update("\0");
+    hash.update(member.sha256);
+    hash.update("\0");
+  }
+  return hash.digest("hex");
+}
+
+export function operationalBaselineDirectoryIdentity(
+  directoryPath: string,
+  extensions: readonly `.${string}`[]
+): { fileCount: number; sha256: string } {
+  const normalizedExtensions = [...new Set(extensions.map((extension) => extension.toLowerCase()))]
+    .sort();
+  if (normalizedExtensions.length < 1 || normalizedExtensions.length > 32 ||
+      normalizedExtensions.some((extension) => !/^\.[a-z0-9]+$/.test(extension))) {
+    throw new Error("Operational baseline content extensions are invalid");
+  }
+  const root = resolve(directoryPath);
+  const rootEntry = lstatSync(root);
+  if (!rootEntry.isDirectory() || rootEntry.isSymbolicLink()) {
+    throw new Error("Operational baseline content root must be a non-symlink directory");
+  }
+  const members: Array<{ path: string; sha256: string }> = [];
+  let totalBytes = 0;
+  const visit = (absoluteDirectory: string, relativeDirectory: string): void => {
+    for (const entry of readdirSync(absoluteDirectory, { withFileTypes: true })) {
+      const memberPath = relativeDirectory ? `${relativeDirectory}/${entry.name}` : entry.name;
+      const absoluteMemberPath = join(absoluteDirectory, entry.name);
+      if (entry.isSymbolicLink()) {
+        throw new Error("Operational baseline content root must not contain symbolic links");
+      }
+      if (entry.isDirectory()) {
+        visit(absoluteMemberPath, memberPath);
+        continue;
+      }
+      if (!entry.isFile() || !normalizedExtensions.some((extension) =>
+        entry.name.toLowerCase().endsWith(extension))) continue;
+      if (!memberPath || memberPath.length > 512 || /[\0\r\n]/.test(memberPath) ||
+          memberPath.split("/").some((segment) => !segment || segment === "." || segment === "..")) {
+        throw new Error("Operational baseline content member path is invalid");
+      }
+      const memberEntry = lstatSync(absoluteMemberPath);
+      if (!memberEntry.isFile() || memberEntry.isSymbolicLink() || memberEntry.size > 64 * 1024 * 1024) {
+        throw new Error("Operational baseline content member is not a bounded regular file");
+      }
+      totalBytes += memberEntry.size;
+      if (totalBytes > 256 * 1024 * 1024 || members.length >= 512) {
+        throw new Error("Operational baseline content closure is too large");
+      }
+      members.push({
+        path: memberPath.replace(/\\/g, "/"),
+        sha256: createHash("sha256").update(readFileSync(absoluteMemberPath)).digest("hex"),
+      });
+    }
+  };
+  visit(root, "");
+  if (members.length < 1) throw new Error("Operational baseline content closure is empty");
+  return {
+    fileCount: members.length,
+    sha256: aggregateContentMembers(members, "rfo-operational-baseline-content-closure-v1"),
+  };
+}
+
+function assertExactObjectKeys(
+  value: unknown,
+  expected: readonly string[],
+  label: string
+): asserts value is Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`${label} must be an object`);
+  }
+  const actual = Object.keys(value).sort();
+  const canonicalExpected = [...expected].sort();
+  if (actual.length !== canonicalExpected.length ||
+      actual.some((key, index) => key !== canonicalExpected[index])) {
+    throw new Error(`${label} has unexpected or missing fields`);
+  }
+}
+
+function validateWorkload(
+  workload: OperationalBaselineWorkload,
+  backend: OperationalBaselineBackend,
+  result: "passed" | "failed"
+): void {
+  assertExactObjectKeys(workload, [
+    "procedureRevision",
+    "runtimeKind",
+    "overallTimeoutMs",
+    "worldResource",
+    "fixture",
+    "capture",
+    "launchArguments",
+  ], "Operational baseline workload");
+  if (!/^[a-z0-9][a-z0-9._-]{0,95}$/.test(workload.procedureRevision) ||
+      !Number.isSafeInteger(workload.overallTimeoutMs) ||
+      workload.overallTimeoutMs < 60_000 || workload.overallTimeoutMs > 900_000 ||
+      !workload.worldResource || workload.worldResource.length > 1_024 ||
+      /[\0\r\n]/.test(workload.worldResource) || portableIsAbsolute(workload.worldResource) ||
+      workload.worldResource.replace(/\\/g, "/").split("/").includes("..")) {
+    throw new Error("Operational baseline workload identity is invalid");
+  }
+  if ((backend === "workbench" && workload.runtimeKind !== "workbench") ||
+      (backend === "runtime" && workload.runtimeKind !== "listenServer")) {
+    throw new Error("Operational baseline workload runtime kind disagrees with its backend");
+  }
+  if (workload.fixture === null) {
+    if (backend === "workbench") {
+      throw new Error("Workbench operational baseline requires a disposable fixture identity");
+    }
+  } else {
+    assertExactObjectKeys(workload.fixture, [
+      "kind", "id", "guid", "sourceFileCount", "sourceSha256",
+    ], "Operational baseline fixture identity");
+    if ((backend === "workbench" && workload.fixture.kind !== "disposable_workbench_world") ||
+        (backend === "runtime" && workload.fixture.kind !== "addon") ||
+        !/^[A-Za-z0-9._-]{1,128}$/.test(workload.fixture.id) ||
+        (workload.fixture.guid !== null && !/^[A-F0-9]{16}$/.test(workload.fixture.guid)) ||
+        !Number.isSafeInteger(workload.fixture.sourceFileCount) ||
+        workload.fixture.sourceFileCount < 1 || workload.fixture.sourceFileCount > 512 ||
+        !/^[a-f0-9]{64}$/.test(workload.fixture.sourceSha256)) {
+      throw new Error("Operational baseline fixture identity is invalid");
+    }
+  }
+  assertExactObjectKeys(workload.capture, [
+    "labels", "settleFrames", "performancePolicy", "asynchronous", "configurationSha256",
+  ], "Operational baseline capture workload");
+  if (!Array.isArray(workload.capture.labels) || workload.capture.labels.length < 1 ||
+      workload.capture.labels.length > 16 ||
+      workload.capture.labels.some((label) =>
+        typeof label !== "string" || !/^[A-Za-z0-9._-]{1,80}$/.test(label)) ||
+      new Set(workload.capture.labels).size !== workload.capture.labels.length ||
+      !Number.isSafeInteger(workload.capture.settleFrames) ||
+      workload.capture.settleFrames < 0 || workload.capture.settleFrames > 1_000 ||
+      workload.capture.performancePolicy !== "evidence" ||
+      typeof workload.capture.asynchronous !== "boolean" ||
+      !/^[a-f0-9]{64}$/.test(workload.capture.configurationSha256)) {
+    throw new Error("Operational baseline capture workload is invalid");
+  }
+  assertExactObjectKeys(workload.launchArguments, [
+    "observed", "count", "sha256", "normalization",
+  ], "Operational baseline launch-argument identity");
+  if (typeof workload.launchArguments.observed !== "boolean" ||
+      !Number.isSafeInteger(workload.launchArguments.count) ||
+      workload.launchArguments.count < 0 || workload.launchArguments.count > 512 ||
+      !/^[a-f0-9]{64}$/.test(workload.launchArguments.sha256) ||
+      workload.launchArguments.normalization !== "absolute_paths_and_owner_tokens_redacted_v1" ||
+      (result === "passed" && (!workload.launchArguments.observed ||
+        workload.launchArguments.count < 1))) {
+    throw new Error("Operational baseline launch-argument identity is invalid");
+  }
+}
+
+/**
+ * Small, acceptance-only measurement collector. It records observations but
+ * deliberately contains no thresholds, aggregation, or production hooks.
+ */
+export class OperationalBaselineRecorder {
+  readonly backend: OperationalBaselineBackend;
+  readonly startedAt: string;
+  private readonly startedMonotonicMs: number;
+  private readonly readCounts: () => AcceptanceSupervisedProcessCounts;
+  private readonly clock: OperationalBaselineClock;
+  private readonly measurements: OperationalBaselineMeasurement[] = [];
+  private readonly samples: OperationalBaselineProcessSample[] = [];
+
+  constructor(options: OperationalBaselineRecorderOptions) {
+    this.backend = options.backend;
+    this.readCounts = options.readSupervisedProcessCounts;
+    this.clock = options.clock ?? SYSTEM_CLOCK;
+    this.startedAt = this.clock.wallNow().toISOString();
+    this.startedMonotonicMs = this.clock.monotonicNow();
+  }
+
+  sampleProcessCounts(label: string): AcceptanceSupervisedProcessCounts {
+    if (!label || label.length > 512 || /[\0\r\n]/.test(label)) {
+      throw new Error("Process-count sample label is invalid");
+    }
+    const counts = processCounts(this.readCounts());
+    this.samples.push({ label, at: this.clock.wallNow().toISOString(), ...counts });
+    return counts;
+  }
+
+  start(
+    boundary: OperationalBaselineBoundary,
+    operation: string,
+    phase = "complete"
+  ): OperationalBaselineSpan {
+    if (!operation || operation.length > 240 || /[\0\r\n]/.test(operation) ||
+        !phase || phase.length > 80 || /[\0\r\n]/.test(phase)) {
+      throw new Error("Operational baseline measurement labels are invalid");
+    }
+    const startedAt = this.clock.wallNow().toISOString();
+    const startedMonotonicMs = this.clock.monotonicNow();
+    return {
+      boundary,
+      operation,
+      phase,
+      startedAt,
+      startedMonotonicMs,
+      processCountBefore: this.sampleProcessCounts(`${boundary}.${phase}.${operation}.before`),
+    };
+  }
+
+  finish(
+    span: OperationalBaselineSpan,
+    options: CompleteSpanOptions = {}
+  ): OperationalBaselineMeasurement {
+    const observedFinishedAt = this.clock.wallNow().toISOString();
+    const durationMs = Number((options.durationMs ??
+      (this.clock.monotonicNow() - span.startedMonotonicMs)).toFixed(3));
+    finiteNonNegative(durationMs, "Operational baseline duration");
+    const finishedAt = options.finishedAt ?? observedFinishedAt;
+    const startedMs = isoTimestamp(span.startedAt, "Measurement start");
+    const finishedMs = isoTimestamp(finishedAt, "Measurement finish");
+    if (finishedMs < startedMs) throw new Error("Operational baseline measurement finished before it started");
+    const measurement: OperationalBaselineMeasurement = {
+      boundary: span.boundary,
+      operation: span.operation,
+      phase: span.phase,
+      startedAt: span.startedAt,
+      finishedAt,
+      durationMs,
+      outcome: options.outcome ?? "passed",
+      processCountBefore: span.processCountBefore,
+      processCountAfter: this.sampleProcessCounts(
+        `${span.boundary}.${span.phase}.${span.operation}.after`
+      ),
+      ...(options.observations ? { observations: { ...options.observations } } : {}),
+      ...(options.errorName ? { errorName: options.errorName } : {}),
+    };
+    this.measurements.push(measurement);
+    return measurement;
+  }
+
+  async measure<T>(
+    boundary: OperationalBaselineBoundary,
+    operation: string,
+    action: () => Promise<T>,
+    phase = "complete",
+    observations?: (result: T) => Record<string, string | number | boolean | null>
+  ): Promise<T> {
+    const span = this.start(boundary, operation, phase);
+    try {
+      const result = await action();
+      this.finish(span, observations ? { observations: observations(result) } : undefined);
+      return result;
+    } catch (error) {
+      this.finish(span, {
+        outcome: "failed",
+        errorName: error instanceof Error ? error.name : "NonErrorThrow",
+      });
+      throw error;
+    }
+  }
+
+  artifact(input: {
+    result: "passed" | "failed";
+    environment: OperationalBaselineEnvironment;
+    workload: OperationalBaselineWorkload;
+    source: OperationalBaselineArtifact["source"];
+    limitations: string[];
+    failureName?: string;
+  }): OperationalBaselineArtifact {
+    const finishedAt = this.clock.wallNow().toISOString();
+    const durationMs = Number((this.clock.monotonicNow() - this.startedMonotonicMs).toFixed(3));
+    return buildOperationalBaselineArtifact({
+      backend: this.backend,
+      result: input.result,
+      startedAt: this.startedAt,
+      finishedAt,
+      durationMs,
+      environment: input.environment,
+      workload: input.workload,
+      source: input.source,
+      measurements: this.measurements,
+      processCounts: this.samples,
+      limitations: input.limitations,
+      failure: input.failureName ? { name: input.failureName } : null,
+    });
+  }
+}
+
+export function buildOperationalBaselineArtifact(input: Omit<
+  OperationalBaselineArtifact,
+  "schemaVersion" | "kind" | "thresholds"
+>): OperationalBaselineArtifact {
+  const started = isoTimestamp(input.startedAt, "Baseline start");
+  const finished = isoTimestamp(input.finishedAt, "Baseline finish");
+  if (finished < started) throw new Error("Operational baseline finished before it started");
+  finiteNonNegative(input.durationMs, "Operational baseline duration");
+  validateWorkload(input.workload, input.backend, input.result);
+  validateSourceIdentity(input.source.harness);
+  validateSourceIdentity(input.source.recorder);
+  if (!Array.isArray(input.source.measured) || input.source.measured.length < 1 ||
+      input.source.measured.length > 32) {
+    throw new Error("Operational baseline measured-source identity list is invalid");
+  }
+  const measuredPathKeys = new Set<string>();
+  let previousMeasuredPath: string | null = null;
+  for (const source of input.source.measured) {
+    validateSourceIdentity(source);
+    const pathKey = source.path.toLocaleLowerCase("en-US");
+    if (measuredPathKeys.has(pathKey)) {
+      throw new Error("Operational baseline measured-source identities contain a duplicate path");
+    }
+    measuredPathKeys.add(pathKey);
+    if (previousMeasuredPath !== null && previousMeasuredPath >= source.path) {
+      throw new Error("Operational baseline measured-source identities are not in canonical path order");
+    }
+    previousMeasuredPath = source.path;
+  }
+  if ((input.result === "passed" && input.failure !== null) ||
+      (input.result === "failed" && !input.failure?.name)) {
+    throw new Error("Operational baseline failure classification disagrees with its result");
+  }
+  if (input.result === "passed" && input.measurements.some((item) => item.outcome === "failed")) {
+    throw new Error("A passed operational baseline cannot contain a failed measurement");
+  }
+  for (const measurement of input.measurements) {
+    const measurementStart = isoTimestamp(measurement.startedAt, "Measurement start");
+    const measurementFinish = isoTimestamp(measurement.finishedAt, "Measurement finish");
+    if (measurementFinish < measurementStart) {
+      throw new Error("Operational baseline measurement finished before it started");
+    }
+    finiteNonNegative(measurement.durationMs, "Operational baseline measurement duration");
+    processCounts(measurement.processCountBefore);
+    processCounts(measurement.processCountAfter);
+    if (measurement.observations) {
+      for (const [key, value] of Object.entries(measurement.observations)) {
+        if (!key || key.length > 80 || /[\0\r\n]/.test(key) ||
+            (typeof value === "number" && !Number.isFinite(value)) ||
+            (typeof value === "string" && (value.length > 160 || /[\0\r\n]/.test(value)))) {
+          throw new Error("Operational baseline measurement observation is invalid");
+        }
+      }
+    }
+  }
+  for (const sample of input.processCounts) {
+    isoTimestamp(sample.at, "Process-count sample timestamp");
+    processCounts(sample);
+  }
+  for (const executable of [input.environment.workbench, input.environment.game]) {
+    if (executable && (!executable.executable ||
+        portableBasename(executable.executable) !== executable.executable)) {
+      throw new Error("Operational baseline executable identity must not contain a path");
+    }
+  }
+  if (input.result === "passed") {
+    const engine = input.backend === "workbench"
+      ? input.environment.workbench
+      : input.environment.game;
+    if (!engine || engine.discovery !== "windows_file_metadata" ||
+        (boundedVersion(engine.version) === null && boundedVersion(engine.fileVersion) === null)) {
+      throw new Error(
+        `A passed operational baseline requires ${input.backend === "workbench" ? "Workbench" : "game"} ` +
+        "Windows file metadata with a product or file version"
+      );
+    }
+    const passed = (
+      boundary: OperationalBaselineBoundary,
+      operation: string,
+      phase: string
+    ): OperationalBaselineMeasurement | undefined => input.measurements.find((measurement) =>
+      measurement.outcome === "passed" && measurement.boundary === boundary &&
+      measurement.operation === operation && measurement.phase === phase);
+    const restBefore = input.processCounts.find((sample) => sample.label === "rest.beforeLaunch");
+    const restAfter = input.processCounts.find((sample) => sample.label === "rest.afterShutdown");
+    if (!restBefore || !restAfter || restBefore.total !== 0 || restAfter.total !== 0) {
+      throw new Error("A passed operational baseline requires zero supervised processes at both rest boundaries");
+    }
+    const supervisedExitSettle = passed(
+      "shutdown",
+      "waitForOperationalBaselineProcessVacancy",
+      "supervised_exit_settle"
+    );
+    if (!supervisedExitSettle || supervisedExitSettle.observations?.vacant !== true ||
+        supervisedExitSettle.observations?.finalTotal !== 0) {
+      throw new Error(
+        "A passed operational baseline requires measured supervised exit-settle vacancy evidence"
+      );
+    }
+    const capture = input.measurements.find((measurement) =>
+      measurement.outcome === "passed" && measurement.boundary === "capture");
+    const observerClose = input.measurements.find((measurement) =>
+      measurement.outcome === "passed" && measurement.boundary === "shutdown" &&
+      measurement.operation === "ObserverCoordinator.close");
+    if (!capture || !observerClose) {
+      throw new Error("A passed operational baseline requires capture availability and observer cleanup evidence");
+    }
+    if (input.backend === "workbench") {
+      const launch = passed("launch", "WorkbenchClient.ensureRunning", "running_confirmation");
+      const managed = passed(
+        "managed_call",
+        "WorkbenchObserverAdapter.ping(EMCP_WB_Ping)",
+        "representative_net_api"
+      );
+      const termination = passed(
+        "shutdown",
+        "WorkbenchClient.shutdownOwnedWorkbench",
+        "termination"
+      );
+      if (!launch || !managed || !termination ||
+          termination.observations?.stopped !== true) {
+        throw new Error("A passed Workbench baseline is missing required lifecycle/NET API evidence");
+      }
+    } else {
+      const launch = passed(
+        "launch",
+        "OwnedRuntimeManager.start/status(running)",
+        "running_confirmation"
+      );
+      const managed = passed(
+        "managed_call",
+        "OwnedRuntimeManager.status",
+        "representative_status_api"
+      );
+      const termination = passed("shutdown", "OwnedRuntimeManager.stop", "termination");
+      const cleanup = passed("shutdown", "OwnedRuntimeManager.stop", "observer_cleanup");
+      if (!launch || !managed || !termination || !cleanup ||
+          termination.observations?.terminationComplete !== true ||
+          termination.observations?.identityVacant !== true ||
+          cleanup.observations?.observerCleanupPending !== false) {
+        throw new Error("A passed runtime baseline is missing required lifecycle/cleanup evidence");
+      }
+    }
+  }
+  return {
+    schemaVersion: 1,
+    kind: input.backend === "workbench"
+      ? "reforger_forge_workbench_operational_baseline"
+      : "reforger_forge_runtime_operational_baseline",
+    ...input,
+    workload: {
+      ...input.workload,
+      fixture: input.workload.fixture ? { ...input.workload.fixture } : null,
+      capture: {
+        ...input.workload.capture,
+        labels: [...input.workload.capture.labels],
+      },
+      launchArguments: { ...input.workload.launchArguments },
+    },
+    source: {
+      harness: { ...input.source.harness },
+      recorder: { ...input.source.recorder },
+      measured: input.source.measured.map((source) => ({ ...source })),
+    },
+    measurements: input.measurements.map((measurement) => ({ ...measurement })),
+    processCounts: input.processCounts.map((sample) => ({ ...sample })),
+    thresholds: null,
+    limitations: [...input.limitations],
+  };
+}
+
+function boundedVersion(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed && trimmed.length <= 128 && !/[\0\r\n]/.test(trimmed) ? trimmed : null;
+}
+
+function portableBasename(path: string): string {
+  return basename(path.replace(/\\/g, "/"));
+}
+
+export function inspectExecutableVersion(executablePath: string): ExecutableVersionEvidence {
+  const executable = portableBasename(executablePath);
+  const unavailable: ExecutableVersionEvidence = {
+    executable,
+    version: null,
+    fileVersion: null,
+    discovery: "unavailable",
+  };
+  if (process.platform !== "win32" || !existsSync(executablePath)) return unavailable;
+  const command = [
+    "$ErrorActionPreference = 'Stop'",
+    "$item = Get-Item -LiteralPath $env:RFO_OPERATIONAL_BASELINE_VERSION_PATH",
+    "$value = [ordered]@{ productVersion = $item.VersionInfo.ProductVersion; fileVersion = $item.VersionInfo.FileVersion }",
+    "[Console]::Out.Write((ConvertTo-Json -InputObject $value -Compress))",
+  ].join("; ");
+  const result = spawnSync(
+    "powershell.exe",
+    ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command],
+    {
+      encoding: "utf8",
+      windowsHide: true,
+      timeout: 15_000,
+      maxBuffer: 64 * 1024,
+      env: { ...process.env, RFO_OPERATIONAL_BASELINE_VERSION_PATH: executablePath },
+    }
+  );
+  if (result.error || result.status !== 0) return unavailable;
+  try {
+    const parsed = JSON.parse(result.stdout) as Record<string, unknown>;
+    const productVersion = boundedVersion(parsed.productVersion);
+    const fileVersion = boundedVersion(parsed.fileVersion);
+    return {
+      executable,
+      version: productVersion ?? fileVersion,
+      fileVersion,
+      discovery: productVersion || fileVersion ? "windows_file_metadata" : "unavailable",
+    };
+  } catch {
+    return unavailable;
+  }
+}
+
+export function operationalBaselineEnvironment(options: {
+  workbenchExecutable?: string;
+  gameExecutable?: string;
+  inspectVersion?: (path: string) => ExecutableVersionEvidence;
+} = {}): OperationalBaselineEnvironment {
+  const cpu = cpus();
+  const inspectVersion = options.inspectVersion ?? inspectExecutableVersion;
+  return {
+    node: { version: process.version, architecture: process.arch },
+    operatingSystem: { platform: platform(), release: release(), architecture: arch() },
+    machineClass: {
+      cpuModel: (cpu[0]?.model ?? "unknown").replace(/\s+/g, " ").trim().slice(0, 160),
+      logicalCpuCount: cpu.length,
+      totalMemoryGiB: Number((totalmem() / (1024 ** 3)).toFixed(1)),
+    },
+    workbench: options.workbenchExecutable ? inspectVersion(options.workbenchExecutable) : null,
+    game: options.gameExecutable ? inspectVersion(options.gameExecutable) : null,
+  };
+}
+
+export function operationalBaselineSource(
+  harnessPath: string,
+  repositoryRelativeHarness: string,
+  repositoryRoot: string,
+  measuredRepositoryRelativePaths: readonly string[],
+  measuredClosures: readonly OperationalBaselineSourceClosure[] = [],
+  recorderPath = fileURLToPath(import.meta.url),
+  repositoryRelativeRecorder = "scripts/observer-live-acceptance-support.ts"
+): OperationalBaselineArtifact["source"] {
+  const identity = (absolutePath: string, repositoryRelativePath: string): OperationalBaselineSourceIdentity => {
+    const normalizedPath = repositoryRelativePath.replace(/\\/g, "/");
+    if (!validRepositoryRelativeSourcePath(normalizedPath)) {
+      throw new Error("Operational baseline source identity is invalid");
+    }
+    const entry = lstatSync(absolutePath);
+    if (!entry.isFile() || entry.isSymbolicLink()) {
+      throw new Error("Operational baseline source identity must name a regular non-symlink file");
+    }
+    const source = {
+      path: normalizedPath,
+      sha256: createHash("sha256").update(readFileSync(absolutePath)).digest("hex"),
+    };
+    validateSourceIdentity(source);
+    return source;
+  };
+  const closureIdentity = (closure: OperationalBaselineSourceClosure): OperationalBaselineSourceIdentity => {
+    const path = closure.path.replace(/\\/g, "/");
+    const directory = closure.directory.replace(/\\/g, "/");
+    if (!validRepositoryRelativeSourcePath(path) ||
+        !validRepositoryRelativeSourcePath(directory) || /[*?\[\]]/.test(directory) ||
+        !/^\.[a-z0-9]+$/i.test(closure.extension)) {
+      throw new Error("Operational baseline source closure is invalid");
+    }
+    const members: Array<{ path: string; sha256: string }> = [];
+    const absoluteClosureDirectory = join(repositoryRoot, ...directory.split("/"));
+    const directoryEntry = lstatSync(absoluteClosureDirectory);
+    if (!directoryEntry.isDirectory() || directoryEntry.isSymbolicLink()) {
+      throw new Error("Operational baseline source closure must name a non-symlink directory");
+    }
+    const visit = (absoluteDirectory: string, repositoryRelativeDirectory: string): void => {
+      for (const entry of readdirSync(absoluteDirectory, { withFileTypes: true })) {
+        const memberPath = `${repositoryRelativeDirectory}/${entry.name}`;
+        const absoluteMemberPath = join(absoluteDirectory, entry.name);
+        if (entry.isSymbolicLink()) {
+          throw new Error("Operational baseline source closure must not contain symbolic links");
+        }
+        if (entry.isDirectory()) {
+          visit(absoluteMemberPath, memberPath);
+        } else if (entry.isFile() && entry.name.endsWith(closure.extension)) {
+          if (!validRepositoryRelativeSourcePath(memberPath)) {
+            throw new Error("Operational baseline source closure member is invalid");
+          }
+          members.push({
+            path: memberPath,
+            sha256: createHash("sha256").update(readFileSync(absoluteMemberPath)).digest("hex"),
+          });
+        }
+      }
+    };
+    visit(absoluteClosureDirectory, directory);
+    members.sort(compareSourcePath);
+    if (members.length < 1 || members.length > 256) {
+      throw new Error("Operational baseline source closure has an invalid member count");
+    }
+    const hash = createHash("sha256");
+    hash.update("rfo-operational-baseline-source-closure-v1\0");
+    for (const member of members) {
+      hash.update(member.path);
+      hash.update("\0");
+      hash.update(member.sha256);
+      hash.update("\0");
+    }
+    return { path, sha256: hash.digest("hex") };
+  };
+  const measured = measuredRepositoryRelativePaths.map((repositoryRelativePath) =>
+    identity(join(repositoryRoot, ...repositoryRelativePath.replace(/\\/g, "/").split("/")), repositoryRelativePath)
+  ).concat(measuredClosures.map(closureIdentity)).sort(compareSourcePath);
+  const measuredKeys = new Set(measured.map((source) => source.path.toLocaleLowerCase("en-US")));
+  if (measured.length < 1 || measured.length > 32 || measuredKeys.size !== measured.length) {
+    throw new Error("Operational baseline measured-source identity list is invalid");
+  }
+  return {
+    harness: identity(harnessPath, repositoryRelativeHarness),
+    recorder: identity(recorderPath, repositoryRelativeRecorder),
+    measured,
+  };
+}
+
+/** Write manifest-last through a unique sibling, then atomically rename it. */
+export function writeOperationalBaselineArtifact(
+  outputDirectory: string,
+  artifact: OperationalBaselineArtifact
+): string {
+  const directory = resolve(outputDirectory);
+  mkdirSync(directory, { recursive: true });
+  const stat = lstatSync(directory);
+  if (!stat.isDirectory() || stat.isSymbolicLink()) {
+    throw new Error("Operational baseline output must be a non-symlink directory");
+  }
+  const timestamp = artifact.startedAt.replace(/[:.]/g, "-");
+  const nonce = randomUUID();
+  const filename = `${timestamp}-${artifact.backend}-operational-baseline-${nonce}.json`;
+  const finalPath = join(directory, filename);
+  const temporaryPath = join(directory, `.${filename}.${process.pid}.tmp`);
+  if (existsSync(finalPath) || existsSync(temporaryPath)) {
+    throw new Error("Operational baseline artifact name unexpectedly collided");
+  }
+  writeFileSync(temporaryPath, `${JSON.stringify(artifact, null, 2)}\n`, {
+    encoding: "utf8",
+    flag: "wx",
+    mode: 0o600,
+  });
+  try {
+    renameSync(temporaryPath, finalPath);
+  } catch (error) {
+    try { unlinkSync(temporaryPath); } catch { /* preserve the publication error */ }
+    throw error;
+  }
+  return finalPath;
+}
 
 export interface PngMaterialEvidence {
   width: number;

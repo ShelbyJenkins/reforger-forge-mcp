@@ -29,6 +29,7 @@ import {
 } from "../workbench/process-guard.js";
 import {
   ChildSupervisor,
+  type SupervisedChildCounts,
   type SupervisedChildExit,
 } from "../workbench/child-supervisor.js";
 import type {
@@ -48,16 +49,34 @@ const DEFAULT_LIFECYCLE_RECORD_MAX_BYTES = 4 * 1024 * 1024;
 const DEFAULT_RECEIPT_RETENTION_MS = 24 * 60 * 60_000;
 const DEFAULT_MAX_STORE_RECORDS = 16_384;
 const DEFAULT_MAX_STORE_BYTES = 512 * 1024 * 1024;
-// 519 strings × 32,768 UTF-16 code units, including worst-case JSON escaping.
-const PREPARED_DESCRIPTOR_MAX_BYTES = 128 * 1024 * 1024;
-const DEFAULT_MAX_RECORD_BYTES = PREPARED_DESCRIPTOR_MAX_BYTES;
+// Keep the historical shared ceiling for unrelated lifecycle record kinds.
+// Prepared descriptors have the tighter, launch-derived bound below.
+const MAX_CONFIGURABLE_RECORD_BYTES = 128 * 1024 * 1024;
+const DEFAULT_MAX_RECORD_BYTES = MAX_CONFIGURABLE_RECORD_BYTES;
 const START_LIFECYCLE_RESERVE_RECORDS = 9;
 const START_LIFECYCLE_RESERVE_BYTES = 2 * 1024 * 1024;
 const CHILD_EXIT_RESERVE_BYTES = 256 * 1024;
 const SMALL_LIFECYCLE_RESERVE_BYTES = 8 * 1024;
+const WINDOWS_COMMAND_LINE_MAX_UTF16_UNITS = 32_767;
 const WINDOWS_PATH_MAX_CHARS = 32_768;
 const WINDOWS_SID_MAX_CHARS = 256;
 const DECIMAL_IDENTITY_MAX_CHARS = 32;
+const PREPARED_SESSION_ID_MAX_UTF16_UNITS = 96;
+const PREPARED_ARGUMENT_MAX_COUNT = 519;
+const JSON_STRING_MAX_UTF8_BYTES_PER_UTF16_UNIT = 6;
+const PREPARED_ARGUMENT_JSON_OVERHEAD_MAX_BYTES = PREPARED_ARGUMENT_MAX_COUNT * 8;
+const PREPARED_FIXED_JSON_ENVELOPE_MAX_BYTES = 4 * 1024;
+// A launchable argument vector contributes at most 32,767 UTF-16 units. JSON
+// can encode one UTF-16 unit as six UTF-8 bytes (for example, "\u0000"), and
+// the separately persisted profile path and session id have bounded lengths.
+// Each of the 519 pretty-printed array entries needs at most eight structural
+// bytes; 4 KiB covers the remaining production-generated keys, fixed metadata,
+// braces, indentation, and trailing newline:
+//   (32,767 + 32,768 + 96) * 6 + 519 * 8 + 4,096 = 402,034 bytes.
+const MAX_REALISTIC_PREPARED_DESCRIPTOR_BYTES =
+  (WINDOWS_COMMAND_LINE_MAX_UTF16_UNITS + WINDOWS_PATH_MAX_CHARS +
+    PREPARED_SESSION_ID_MAX_UTF16_UNITS) * JSON_STRING_MAX_UTF8_BYTES_PER_UTF16_UNIT +
+  PREPARED_ARGUMENT_JSON_OVERHEAD_MAX_BYTES + PREPARED_FIXED_JSON_ENVELOPE_MAX_BYTES;
 const OWNED_RUNTIME_RECORD_DIRECTORIES = [
   "prepared",
   "prepared-index",
@@ -186,17 +205,56 @@ export interface RuntimeStopPreflight {
   reason?: string;
 }
 
+/**
+ * Exact immutable fields from the durable runtime receipt. The observer child
+ * recomputes `generation` from this payload before it restores or mutates any
+ * session state; a PID, profile path, or executable name alone is never
+ * recovery authority.
+ */
+export interface OwnedRuntimeLifecycleAuthority {
+  preparedLaunchId: string;
+  profilePath: string;
+  runtimeKind: ObserverLaunchInput["runtimeKind"];
+  pid: number;
+  executablePath: string;
+  creationTimeFileTime: string;
+  ownerTokenArgument: string;
+  launchedAtMs: number;
+}
+
+export interface OwnedRuntimeLifecycleIdentity {
+  runtimeId: string;
+  generation: string;
+}
+
 export interface OwnedRuntimeObserverGate {
+  retainRuntimeLifecycle(
+    sessionId: string,
+    runtimeId: string,
+    generation: string,
+    authority: OwnedRuntimeLifecycleAuthority
+  ): Promise<unknown>;
+  releaseRuntimeLifecycle(
+    sessionId: string,
+    runtimeId: string,
+    generation: string
+  ): Promise<unknown>;
   reserveRuntimeStop(
     sessionId: string,
     proposedReservationId: string,
-    exactRuntimeVacant?: boolean
+    exactRuntimeVacant?: boolean,
+    lifecycle?: OwnedRuntimeLifecycleIdentity
   ): Promise<RuntimeStopPreflight>;
-  releaseRuntimeStop(sessionId: string, reservationId: string): Promise<unknown>;
+  releaseRuntimeStop(
+    sessionId: string,
+    reservationId: string,
+    lifecycle?: OwnedRuntimeLifecycleIdentity
+  ): Promise<unknown>;
   completeRuntimeStop(
     sessionId: string,
     reservationId?: string,
-    exactRuntimeVacant?: boolean
+    exactRuntimeVacant?: boolean,
+    lifecycle?: { runtimeId: string; generation: string }
   ): Promise<unknown>;
 }
 
@@ -288,11 +346,11 @@ export class OwnedRuntimeError extends Error {
 const preparedDescriptorSchema = z.object({
   version: z.literal(STORAGE_VERSION),
   preparedLaunchId: preparedLaunchIdSchema,
-  sessionId: z.string().min(1).max(96),
+  sessionId: z.string().min(1).max(PREPARED_SESSION_ID_MAX_UTF16_UNITS),
   // observer_prepare_launch accepts 512 input tokens. Normalization can append
   // six required observer tokens plus -forceUpdate, so preserve that existing
   // boundary in the persisted descriptor.
-  arguments: z.array(z.string().max(32_768)).max(519),
+  arguments: z.array(z.string().max(32_768)).max(PREPARED_ARGUMENT_MAX_COUNT),
   profilePath: z.string().min(1).max(WINDOWS_PATH_MAX_CHARS),
   runtimeKind: z.enum(["client", "listenServer", "dedicated", "testRunner"]),
   expiresAt: z.string().datetime(),
@@ -438,6 +496,13 @@ interface OwnedRuntimeLeaseFence {
   assertActive(): void;
 }
 
+interface OwnedRuntimeWallDeadline {
+  expiresAtMs: number;
+  code: "RECOVERY_REQUIRED" | "SHUTDOWN_SEAL_FAILED";
+  message: string;
+  details?: Record<string, unknown>;
+}
+
 type StopLockedResult =
   | { kind: "complete"; status: OwnedRuntimePublicStatus }
   | { kind: "observer_completion_required"; authority: StopCompletionAuthority };
@@ -466,13 +531,27 @@ const pendingStartSchema = z.object({
   runtimeId: runtimeIdSchema,
   sessionId: z.string().min(1).max(96),
   preparedLaunchId: preparedLaunchIdSchema,
-  state: z.enum(["pre_spawn", "spawned_unverified", "identity_verified", "cleanup_required", "cleanup_verified", "succeeded"]),
+  state: z.enum([
+    "pre_spawn",
+    "spawned_unverified",
+    "identity_verified",
+    "cleanup_required",
+    // Legacy v1 value written before release acknowledgement was separated.
+    "cleanup_verified",
+    "release_required",
+    "release_acknowledged",
+    "succeeded",
+  ]),
   pid: z.number().int().positive().nullable(),
   creationTimeFileTime: fileTimeSchema.nullable(),
   executablePath: z.string().min(1).max(WINDOWS_PATH_MAX_CHARS),
   executableFile: executableFileIdentitySchema,
   ownerTokenArgument: z.string().max(192).startsWith(OWNED_RUNTIME_OWNER_ARGUMENT_PREFIX),
   argvSha256: sha256Schema,
+  // Optional only for v1 pending receipts written before lifecycle leasing was
+  // introduced. New identity-verified receipts always persist both fields.
+  launchedAtMs: z.number().int().positive().optional(),
+  lifecycleGeneration: sha256Schema.nullable().optional(),
   mcpOwner: mcpOwnerSchema,
   createdAt: z.string().datetime(),
   updatedAt: z.string().datetime(),
@@ -490,6 +569,30 @@ function runtimeIdentity(identity: ExactProcessIdentity): OwnedRuntimeExactIdent
 
 function sha256(value: string | Buffer): string {
   return createHash("sha256").update(value).digest("hex");
+}
+
+type RuntimeLifecycleGenerationInput = Pick<OwnedRuntimeReceipt,
+  | "runtimeId"
+  | "sessionId"
+  | "preparedLaunchId"
+  | "pid"
+  | "executablePath"
+  | "creationTimeFileTime"
+  | "ownerTokenArgument"
+  | "launchedAtMs"
+>;
+
+function runtimeLifecycleGeneration(receipt: RuntimeLifecycleGenerationInput): string {
+  return sha256(JSON.stringify({
+    runtimeId: receipt.runtimeId,
+    sessionId: receipt.sessionId,
+    preparedLaunchId: receipt.preparedLaunchId,
+    pid: receipt.pid,
+    executablePath: receipt.executablePath,
+    creationTimeFileTime: receipt.creationTimeFileTime,
+    ownerTokenArgument: receipt.ownerTokenArgument,
+    launchedAtMs: receipt.launchedAtMs,
+  }));
 }
 
 function deterministicReservationId(...parts: string[]): string {
@@ -562,7 +665,7 @@ function assertWindowsCommandLineFits(executablePath: string, argumentsArray: re
   const lengthWithNull = [executablePath, ...argumentsArray]
     .map(quoteWindowsArgument)
     .join(" ").length + 1;
-  if (lengthWithNull > 32_767) {
+  if (lengthWithNull > WINDOWS_COMMAND_LINE_MAX_UTF16_UNITS) {
     throw new OwnedRuntimeError(
       "ARGUMENT_CONFLICT",
       "Prepared arguments exceed the Windows CreateProcess command-line limit"
@@ -759,7 +862,7 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
       ["receipt retention", this.receiptRetentionMs, 0, 365 * 24 * 60 * 60_000],
       ["store record count", this.maxStoreRecords, 8, 1_000_000],
       ["store byte budget", this.maxStoreBytes, 4_096, 4 * 1024 * 1024 * 1024],
-      ["record byte budget", this.maxRecordBytes, 1_024, PREPARED_DESCRIPTOR_MAX_BYTES],
+      ["record byte budget", this.maxRecordBytes, 1_024, MAX_CONFIGURABLE_RECORD_BYTES],
     ] as const) {
       if (!Number.isSafeInteger(value) || value < minimum || value > maximum) {
         throw new OwnedRuntimeError("INVALID_REQUEST", `Owned runtime ${label} is invalid`);
@@ -788,30 +891,442 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
   }
 
   private withFencedMachineMutex<T>(
-    action: (fence: OwnedRuntimeLeaseFence) => Promise<T>
+    action: (fence: OwnedRuntimeLeaseFence) => Promise<T>,
+    deadline?: OwnedRuntimeWallDeadline
   ): Promise<T> {
     let leaseLoss: LifecycleGuardError | null = null;
     const fence: OwnedRuntimeLeaseFence = {
       assertActive: () => {
-        if (!leaseLoss) return;
-        throw new OwnedRuntimeError(
-          "RECOVERY_REQUIRED",
-          "Owned-runtime lifecycle mutex lease was lost; durable state was preserved for recovery",
-          { reason: leaseLoss.code }
-        );
+        if (leaseLoss) {
+          throw new OwnedRuntimeError(
+            "RECOVERY_REQUIRED",
+            "Owned-runtime lifecycle mutex lease was lost; durable state was preserved for recovery",
+            { reason: leaseLoss.code }
+          );
+        }
+        if (deadline) this.remainingWallBudget(deadline);
       },
     };
-    return this.backend.withMachineMutex({
-      name: OWNED_RUNTIME_LIFECYCLE_MUTEX,
-      timeoutMs: this.lockTimeoutMs,
-      onLeaseLost: (error) => { leaseLoss = error; },
-      action: async () => {
-        fence.assertActive();
-        const result = await action(fence);
-        fence.assertActive();
-        return result;
-      },
+    const acquire = async (remainingMs = this.lockTimeoutMs): Promise<T> =>
+      this.backend.withMachineMutex({
+        name: OWNED_RUNTIME_LIFECYCLE_MUTEX,
+        timeoutMs: Math.min(this.lockTimeoutMs, remainingMs),
+        onLeaseLost: (error) => { leaseLoss = error; },
+        action: async () => {
+          fence.assertActive();
+          const result = await action(fence);
+          fence.assertActive();
+          return result;
+        },
+      });
+    return deadline
+      ? this.beforeWallDeadline(deadline, (remainingMs) => acquire(remainingMs))
+      : acquire();
+  }
+
+  private remainingWallBudget(deadline: OwnedRuntimeWallDeadline): number {
+    const remaining = Math.floor(deadline.expiresAtMs - Date.now());
+    if (remaining <= 0) {
+      throw new OwnedRuntimeError(deadline.code, deadline.message, {
+        ...deadline.details,
+        wallDeadlineExpired: true,
+      });
+    }
+    return remaining;
+  }
+
+  /**
+   * Start an uncancellable dependency only after proving budget remains and
+   * bound the caller's wait. Callers must still fence local mutation after an
+   * awaited dependency because the dependency may settle after this race.
+   */
+  private async beforeWallDeadline<T>(
+    deadline: OwnedRuntimeWallDeadline,
+    operation: (remainingMs: number) => Promise<T>
+  ): Promise<T> {
+    const remaining = this.remainingWallBudget(deadline);
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      return await Promise.race([
+        operation(remaining),
+        new Promise<T>((_resolve, reject) => {
+          timer = setTimeout(() => reject(new OwnedRuntimeError(
+            deadline.code,
+            deadline.message,
+            { ...deadline.details, wallDeadlineExpired: true }
+          )), remaining);
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  private isWallDeadlineError(error: unknown): boolean {
+    return error instanceof OwnedRuntimeError && error.details?.wallDeadlineExpired === true;
+  }
+
+  private async retainRuntimeLifecycle(
+    receipt: OwnedRuntimeReceipt,
+    deadline?: OwnedRuntimeWallDeadline
+  ): Promise<void> {
+    const generation = runtimeLifecycleGeneration(receipt);
+    const request = () => this.options.observerGate.retainRuntimeLifecycle(
+      receipt.sessionId,
+      receipt.runtimeId,
+      generation,
+      this.runtimeLifecycleAuthority(receipt)
+    );
+    const response = deadline
+      ? await this.beforeWallDeadline(deadline, () => request())
+      : await request();
+    const acknowledgement = response && typeof response === "object"
+      ? response as Record<string, unknown>
+      : null;
+    if (acknowledgement?.retained !== true || acknowledgement.generation !== generation) {
+      throw new OwnedRuntimeError(
+        "SESSION_UNVERIFIABLE",
+        "Observer session did not acknowledge the exact owned runtime lifecycle generation"
+      );
+    }
+  }
+
+  private async releaseRuntimeLifecycle(
+    receipt: OwnedRuntimeReceipt,
+    deadline?: OwnedRuntimeWallDeadline
+  ): Promise<void> {
+    await this.releaseRuntimeLifecycleIdentity(
+      receipt.sessionId,
+      receipt.runtimeId,
+      runtimeLifecycleGeneration(receipt),
+      deadline
+    );
+  }
+
+  private async releaseRuntimeLifecycleIdentity(
+    sessionId: string,
+    runtimeId: string,
+    generation: string,
+    deadline?: OwnedRuntimeWallDeadline
+  ): Promise<void> {
+    const request = () => this.options.observerGate.releaseRuntimeLifecycle(
+      sessionId,
+      runtimeId,
+      generation
+    );
+    const response = deadline
+      ? await this.beforeWallDeadline(deadline, () => request())
+      : await request();
+    const acknowledgement = response && typeof response === "object"
+      ? response as Record<string, unknown>
+      : null;
+    if (acknowledgement?.generation !== generation ||
+        (acknowledgement.released !== true && acknowledgement.alreadyReleased !== true)) {
+      throw new OwnedRuntimeError(
+        "SESSION_UNVERIFIABLE",
+        "Observer session did not acknowledge release of the exact runtime lifecycle generation"
+      );
+    }
+  }
+
+  private runtimeLifecycleAuthority(
+    receipt: OwnedRuntimeReceipt
+  ): OwnedRuntimeLifecycleAuthority {
+    return {
+      preparedLaunchId: receipt.preparedLaunchId,
+      profilePath: receipt.profilePath,
+      runtimeKind: receipt.runtimeKind,
+      pid: receipt.pid,
+      executablePath: receipt.executablePath,
+      creationTimeFileTime: receipt.creationTimeFileTime,
+      ownerTokenArgument: receipt.ownerTokenArgument,
+      launchedAtMs: receipt.launchedAtMs,
+    };
+  }
+
+  private pendingLifecycleAuthority(pending: PendingStart): {
+    generation: string;
+    identity: OwnedRuntimeExactIdentity & { ownerTokenArgument: string; launchedAtMs: number };
+  } | null {
+    if (!pending.lifecycleGeneration) return null;
+    if (pending.pid === null || pending.creationTimeFileTime === null ||
+        pending.launchedAtMs === undefined) {
+      throw new OwnedRuntimeError(
+        "STORAGE_UNVERIFIABLE",
+        "Pending lifecycle generation has no exact child identity"
+      );
+    }
+    const generation = runtimeLifecycleGeneration({
+      runtimeId: pending.runtimeId,
+      sessionId: pending.sessionId,
+      preparedLaunchId: pending.preparedLaunchId,
+      pid: pending.pid,
+      executablePath: pending.executablePath,
+      creationTimeFileTime: pending.creationTimeFileTime,
+      ownerTokenArgument: pending.ownerTokenArgument,
+      launchedAtMs: pending.launchedAtMs,
     });
+    if (generation !== pending.lifecycleGeneration) {
+      throw new OwnedRuntimeError(
+        "STORAGE_UNVERIFIABLE",
+        "Pending lifecycle generation does not match its exact child identity"
+      );
+    }
+    return {
+      generation,
+      identity: {
+        pid: pending.pid,
+        executablePath: pending.executablePath,
+        creationTimeFileTime: pending.creationTimeFileTime,
+        ownerTokenArgument: pending.ownerTokenArgument,
+        launchedAtMs: pending.launchedAtMs,
+      },
+    };
+  }
+
+  private pendingIdentityDisposition(
+    authority: NonNullable<ReturnType<OwnedRuntimeManager["pendingLifecycleAuthority"]>>,
+    inspection: OwnedRuntimeInspection | null
+  ): "same" | "absent" | "unverifiable" {
+    if (!inspection) return "absent";
+    if (inspection.identity.pid !== authority.identity.pid ||
+        pathKey(inspection.identity.executablePath) !== pathKey(authority.identity.executablePath) ||
+        inspection.identity.creationTimeFileTime !== authority.identity.creationTimeFileTime ||
+        inspection.ownerArgumentMatched === false) {
+      return "absent";
+    }
+    return inspection.ownerArgumentMatched === true ? "same" : "unverifiable";
+  }
+
+  private markPendingStartReleaseRequired(
+    root: string,
+    pending: PendingStart,
+    generation: string
+  ): PendingStart {
+    const authority = this.pendingLifecycleAuthority(pending);
+    if (!authority || authority.generation !== generation) {
+      throw new OwnedRuntimeError(
+        "STORAGE_UNVERIFIABLE",
+        "Pending cleanup release is not bound to its exact lifecycle generation"
+      );
+    }
+    if (pending.state === "release_acknowledged" || pending.state === "release_required") {
+      return pending;
+    }
+    const releaseRequired = this.updatePendingStart(root, pending, {
+      state: "release_required",
+    });
+    this.children.forget(pending.runtimeId);
+    return releaseRequired;
+  }
+
+  private async recoverPendingStartCleanup(
+    root: string,
+    pending: PendingStart,
+    leaseFence: OwnedRuntimeLeaseFence
+  ): Promise<PendingStart> {
+    if (!["identity_verified", "cleanup_required", "cleanup_verified", "release_required", "release_acknowledged"]
+      .includes(pending.state)) {
+      return pending;
+    }
+    const authority = this.pendingLifecycleAuthority(pending);
+    if (!authority) return pending;
+    if (pending.state === "release_acknowledged" || pending.state === "release_required") {
+      return pending;
+    }
+    if (pending.state === "cleanup_verified") {
+      // Migrate an exact-generation v1 record. `cleanup_verified` was written
+      // before release acknowledgement had its own durable commit.
+      return this.markPendingStartReleaseRequired(root, pending, authority.generation);
+    }
+
+    let inspection: OwnedRuntimeInspection | null;
+    try {
+      inspection = await this.backend.inspectProcess(
+        authority.identity.pid,
+        authority.identity.ownerTokenArgument
+      );
+    } catch (error) {
+      throw new OwnedRuntimeError(
+        "START_UNVERIFIABLE",
+        `Pending owned child cleanup cannot inspect the exact identity: ${this.message(error)}`,
+        { state: pending.state, pid: pending.pid }
+      );
+    }
+    leaseFence.assertActive();
+    let disposition = this.pendingIdentityDisposition(authority, inspection);
+    if (disposition === "absent") {
+      return this.markPendingStartReleaseRequired(root, pending, authority.generation);
+    }
+    if (disposition === "unverifiable") {
+      throw new OwnedRuntimeError(
+        "START_UNVERIFIABLE",
+        "Pending owned child command-line identity is unverifiable; its lifecycle lease was retained",
+        { state: pending.state, pid: pending.pid }
+      );
+    }
+
+    let terminationFailure: unknown = null;
+    try {
+      const result = await this.backend.verifyAndTerminate(
+        authority.identity,
+        this.terminationTimeoutMs
+      );
+      if (result.kind === "refused") terminationFailure = new Error(result.message);
+    } catch (error) {
+      // The helper may have failed after signalling. Only a fresh exact
+      // inspection decides whether the lifecycle lease can be released.
+      terminationFailure = error;
+    }
+    leaseFence.assertActive();
+    try {
+      inspection = await this.backend.inspectProcess(
+        authority.identity.pid,
+        authority.identity.ownerTokenArgument
+      );
+    } catch (error) {
+      throw new OwnedRuntimeError(
+        "START_UNVERIFIABLE",
+        `Pending owned child cleanup outcome is unverifiable: ${this.message(error)}`,
+        { state: pending.state, pid: pending.pid }
+      );
+    }
+    leaseFence.assertActive();
+    disposition = this.pendingIdentityDisposition(authority, inspection);
+    if (disposition === "absent") {
+      return this.markPendingStartReleaseRequired(root, pending, authority.generation);
+    }
+    throw new OwnedRuntimeError(
+      "START_UNVERIFIABLE",
+      disposition === "unverifiable"
+        ? "Pending owned child cleanup left command-line identity unverifiable; its lifecycle lease was retained"
+        : `Pending owned child is still live; its lifecycle lease was retained${terminationFailure ? `: ${this.message(terminationFailure)}` : ""}`,
+      { state: pending.state, pid: pending.pid }
+    );
+  }
+
+  private async reconcilePendingStartExit(
+    expected: OwnedRuntimeReceipt
+  ): Promise<void> {
+    const reconciled = await this.withFencedMachineMutex(async (fence) => {
+      const root = this.ensureStorage();
+      const pending = this.readOptionalPendingStart(expected.runtimeId);
+      if (!pending) {
+        throw new OwnedRuntimeError(
+          "STORAGE_UNVERIFIABLE",
+          "Exited unpublished child has no pending lifecycle receipt"
+        );
+      }
+      const authority = this.pendingLifecycleAuthority(pending);
+      if (!authority || authority.generation !== runtimeLifecycleGeneration(expected) ||
+          pending.sessionId !== expected.sessionId || pending.pid !== expected.pid ||
+          pathKey(pending.executablePath) !== pathKey(expected.executablePath) ||
+          pending.creationTimeFileTime !== expected.creationTimeFileTime ||
+          pending.ownerTokenArgument !== expected.ownerTokenArgument) {
+        throw new OwnedRuntimeError(
+          "STORAGE_UNVERIFIABLE",
+          "Exited unpublished child does not match its pending lifecycle generation"
+        );
+      }
+      fence.assertActive();
+      return this.markPendingStartReleaseRequired(root, pending, authority.generation);
+    });
+    await this.retryPendingStartLifecycleRelease(reconciled.runtimeId);
+  }
+
+  /**
+   * Release IPC deliberately runs between two short machine-mutex
+   * transactions. The first snapshots exact durable authority; the second
+   * CASes `release_acknowledged`. A lost request or response leaves
+   * `release_required` as the unsweepable retry head.
+   */
+  private async retryPendingStartLifecycleRelease(runtimeId: string): Promise<void> {
+    const pending = await this.withFencedMachineMutex(async (fence) => {
+      const root = this.ensureStorage();
+      let current = this.readOptionalPendingStart(runtimeId);
+      if (!current) return null;
+      const authority = this.pendingLifecycleAuthority(current);
+      if (!authority) return null;
+      if (current.state === "cleanup_verified") {
+        current = this.markPendingStartReleaseRequired(root, current, authority.generation);
+      }
+      fence.assertActive();
+      return current.state === "release_required" ? current : null;
+    });
+    if (!pending) return;
+    const authority = this.pendingLifecycleAuthority(pending);
+    if (!authority) return;
+
+    await this.releaseRuntimeLifecycleIdentity(
+      pending.sessionId,
+      pending.runtimeId,
+      authority.generation
+    );
+
+    await this.withFencedMachineMutex(async (fence) => {
+      const root = this.ensureStorage();
+      const current = this.readOptionalPendingStart(runtimeId);
+      if (!current) {
+        throw new OwnedRuntimeError(
+          "STORAGE_UNVERIFIABLE",
+          "Pending lifecycle release authority disappeared before acknowledgement"
+        );
+      }
+      const currentAuthority = this.pendingLifecycleAuthority(current);
+      if (!currentAuthority || currentAuthority.generation !== authority.generation ||
+          current.sessionId !== pending.sessionId ||
+          current.preparedLaunchId !== pending.preparedLaunchId) {
+        throw new OwnedRuntimeError(
+          "STORAGE_UNVERIFIABLE",
+          "Pending lifecycle generation changed before release acknowledgement"
+        );
+      }
+      if (current.state === "release_acknowledged") return;
+      if (current.state !== "release_required") {
+        throw new OwnedRuntimeError(
+          "STORAGE_UNVERIFIABLE",
+          "Pending lifecycle release state changed before acknowledgement"
+        );
+      }
+      fence.assertActive();
+      this.updatePendingStart(root, current, { state: "release_acknowledged" });
+    });
+  }
+
+  private async retryPendingStartLifecycleReleaseForKey(keyHash: string): Promise<void> {
+    const runtimeId = await this.withFencedMachineMutex(async (fence) => {
+      this.ensureStorage();
+      const attempt = this.readOptionalParsed(
+        this.idempotencyPath("start", keyHash),
+        idempotencySchema,
+        "start idempotency receipt"
+      );
+      fence.assertActive();
+      return attempt?.action === "start" && attempt.keyHash === keyHash
+        ? attempt.runtimeId
+        : null;
+    });
+    if (runtimeId) await this.retryPendingStartLifecycleRelease(runtimeId);
+  }
+
+  private runtimeLifecycleIsTerminal(runtimeId: string): boolean {
+    return this.readOptionalChildExitReceipt(runtimeId) !== null ||
+      this.readOptionalStopCompletion(runtimeId) !== null;
+  }
+
+  private async reconcileRuntimeLifecycleLease(
+    receipt: OwnedRuntimeReceipt,
+    deadline?: OwnedRuntimeWallDeadline
+  ): Promise<void> {
+    if (this.runtimeLifecycleIsTerminal(receipt.runtimeId)) {
+      await this.releaseRuntimeLifecycle(receipt, deadline);
+      return;
+    }
+    // A durable restoration proof has already sealed capture for this exact
+    // runtime generation. It is the restart authority when a replacement
+    // private child cannot reconstruct the old in-memory session.
+    if (this.readOptionalRestorationProof(receipt.runtimeId)) return;
+    await this.retainRuntimeLifecycle(receipt, deadline);
   }
 
   async recordPreparedLaunch(
@@ -871,6 +1386,7 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
               ? { prepareIdempotencyHash: sha256(boundedIdempotencyKey(input.idempotencyKey)) }
               : {}),
           });
+          this.assertPreparedDescriptorCapacity(descriptor);
           const index = preparedSessionIndexSchema.parse({
             version: STORAGE_VERSION,
             sessionId: prepared.sessionId,
@@ -907,6 +1423,12 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
       return await this.withFencedMachineMutex((fence) =>
         this.startLocked(input.preparedLaunchId, keyHash, requestFingerprint, fence));
     } catch (error) {
+      // A failed start may have durably proved exact child vacancy while
+      // leaving observer lifecycle release outstanding. Retry that IPC after
+      // the start transaction has relinquished the machine mutex. Preserve
+      // the primary start outcome; `release_required` remains the durable
+      // authority if this best-effort attempt also fails.
+      await this.retryPendingStartLifecycleReleaseForKey(keyHash).catch(() => undefined);
       throw this.normalizeError(error, "START_FAILED", "Owned runtime start failed");
     }
   }
@@ -915,7 +1437,17 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
     runtimeIdSchema.parse(runtimeId);
     try {
       const receipt = this.readRuntimeReceipt(runtimeId);
-      return await this.inspectReceipt(receipt);
+      if (this.runtimeLifecycleIsTerminal(runtimeId)) {
+        await this.releaseRuntimeLifecycle(receipt);
+        return await this.inspectReceipt(receipt);
+      }
+      await this.reconcileRuntimeLifecycleLease(receipt);
+      const status = await this.inspectReceipt(receipt);
+      if (status.state === "exited" && !this.readOptionalStopReceipt(runtimeId)) {
+        const reconciled = await this.persistObservedNaturalExit(receipt);
+        if (reconciled) await this.releaseRuntimeLifecycle(receipt);
+      }
+      return status;
     } catch (error) {
       if (error instanceof OwnedRuntimeError && error.code === "RUNTIME_NOT_FOUND") throw error;
       return {
@@ -934,7 +1466,12 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
 
   /** Bounded diagnostic used by lifecycle reconciliation tests and health output. */
   diagnosticSupervisedChildCount(): number {
-    return this.children.size;
+    return this.children.counts().active;
+  }
+
+  /** Count-only lifecycle evidence; no PID, owner token, or process handle is exposed. */
+  diagnosticSupervisedChildCounts(): SupervisedChildCounts {
+    return this.children.counts();
   }
 
   /** Explicit bounded retention hook for controlled shutdown and diagnostics. */
@@ -967,6 +1504,16 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
         input.waitForRestorationMs > 5 * 60_000) {
       throw new OwnedRuntimeError("INVALID_REQUEST", "waitForRestorationMs must be from 0 through 300000");
     }
+    // One budget covers preparation, the requested restoration wait, exact
+    // inspection/termination, observer completion, and the final CAS. Each
+    // configured component contributes once; no sub-operation resets it.
+    const wallDeadline: OwnedRuntimeWallDeadline = {
+      expiresAtMs: Date.now() + input.waitForRestorationMs +
+        this.lockTimeoutMs + this.inspectionTimeoutMs + this.terminationTimeoutMs,
+      code: "RECOVERY_REQUIRED",
+      message: "Owned runtime stop exceeded its total wall-clock deadline; exact durable state was preserved for retry",
+      details: { runtimeId: input.runtimeId, state: "stopping" },
+    };
     const keyHash = sha256(input.idempotencyKey);
     const requestFingerprint = sha256(JSON.stringify({
       runtimeId: input.runtimeId,
@@ -974,36 +1521,56 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
     }));
     let preparedReservation: StopReservation | null = null;
     try {
-      const preparation = await this.backend.withMachineMutex({
-        name: OWNED_RUNTIME_LIFECYCLE_MUTEX,
-        timeoutMs: this.lockTimeoutMs,
-        action: () => this.prepareStopLocked(input, keyHash, requestFingerprint),
-      });
+      const preparation = await this.withFencedMachineMutex(
+        (fence) => this.prepareStopLocked(
+          input,
+          keyHash,
+          requestFingerprint,
+          fence,
+          wallDeadline
+        ),
+        wallDeadline
+      );
       // Camera/restoration readiness can legitimately take minutes. It is an
       // observer-side wait, not a machine-wide lifecycle mutation, so never
       // retain the global mutex while polling it.
       if (preparation.needsRestorationReservation) {
+        // A valid durable restoration proof already seals the session, while
+        // exact vacancy can safely use the existing unknown-session path.
+        // Re-retention is mandatory only before a live, unsealed stop.
+        if (!preparation.allowUnknownVacantSession &&
+            !this.readOptionalRestorationProof(preparation.receipt.runtimeId)) {
+          await this.reconcileRuntimeLifecycleLease(preparation.receipt, wallDeadline);
+        }
         preparedReservation = await this.reserveStopWhenRestored(
           preparation.receipt,
           keyHash,
           preparation.proposedReservationId,
           input.waitForRestorationMs,
           input.signal,
-          preparation.allowUnknownVacantSession
+          preparation.allowUnknownVacantSession,
+          wallDeadline
         );
       }
       const transition = await this.withFencedMachineMutex((fence) =>
-        this.stopLocked(input, keyHash, requestFingerprint, preparedReservation, fence));
+        this.stopLocked(
+          input,
+          keyHash,
+          requestFingerprint,
+          preparedReservation,
+          fence,
+          wallDeadline
+        ), wallDeadline);
       if (transition.kind === "complete") return transition.status;
 
       // Observer session revocation is bounded IPC, not a machine lifecycle
       // mutation. Keep the global mutex free while it is pending, then CAS the
       // durable completion against the exact immutable authority.
-      const ack = await this.requestStopCompletionUnlocked(transition.authority);
+      const ack = await this.requestStopCompletionUnlocked(transition.authority, wallDeadline);
       return await this.withFencedMachineMutex(async (fence) => {
         fence.assertActive();
         return this.commitStopCompletionLocked(transition.authority, ack);
-      });
+      }, wallDeadline);
     } catch (error) {
       // A persisted restoration proof is intentionally retained when the
       // final mutex cannot be acquired. Deleting it here can race a second
@@ -1011,7 +1578,8 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
       await this.discardUncommittedStopAttempt(
         input.runtimeId,
         keyHash,
-        requestFingerprint
+        requestFingerprint,
+        wallDeadline
       ).catch(() => undefined);
       throw this.normalizeError(error, "STOP_FAILED", "Owned runtime stop failed");
     }
@@ -1042,6 +1610,15 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
   }
 
   private async closeOwnedRuntimes(): Promise<Record<string, unknown>> {
+    // Shutdown uses the configured lifecycle lock timeout as one aggregate
+    // budget, including inventory, observer release/reservation IPC, sealing,
+    // and the final inventory CAS. It is deliberately not reset per runtime.
+    const wallDeadline: OwnedRuntimeWallDeadline = {
+      expiresAtMs: Date.now() + this.lockTimeoutMs,
+      code: "SHUTDOWN_SEAL_FAILED",
+      message: "Owned runtime shutdown sealing exceeded its aggregate wall-clock deadline",
+      details: { state: "shutdown_sealing" },
+    };
     const runtimeDirectory = this.directory("runtimes");
     if (!existsSync(runtimeDirectory) && !existsSync(this.storageRoot) && this.children.size === 0) {
       return {
@@ -1063,11 +1640,7 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
       };
     }
     try {
-      const wallDeadline = Date.now() + this.lockTimeoutMs;
-      const inventory = await this.backend.withMachineMutex({
-        name: OWNED_RUNTIME_LIFECYCLE_MUTEX,
-        timeoutMs: this.lockTimeoutMs,
-        action: async () => {
+      const inventory = await this.withFencedMachineMutex(async (fence) => {
           this.ensureStorage();
           const ids: string[] = [];
           const errors: Array<{ runtimeId: string; reason: string }> = [];
@@ -1075,6 +1648,7 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
           const directory = opendirSync(runtimeDirectory);
           try {
             for (;;) {
+              fence.assertActive();
               const entry = directory.readSync();
               if (!entry) break;
               scannedEntries += 1;
@@ -1099,22 +1673,23 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
             directory.closeSync();
           }
           return { runtimeIds: ids.sort(), errors };
-        },
-      });
+        }, wallDeadline);
       const sealedRuntimeIds: string[] = [];
       const busyRuntimeIds: string[] = [];
       const errorRuntimes: Array<{ runtimeId: string; reason: string }> = [...inventory.errors];
-      for (const runtimeId of inventory.runtimeIds) {
-        if (Date.now() >= wallDeadline) {
-          errorRuntimes.push({ runtimeId, reason: "Shutdown sealing aggregate deadline expired" });
-          continue;
+      for (let runtimeIndex = 0; runtimeIndex < inventory.runtimeIds.length; runtimeIndex += 1) {
+        const runtimeId = inventory.runtimeIds[runtimeIndex];
+        if (Date.now() >= wallDeadline.expiresAtMs) {
+          errorRuntimes.push({
+            runtimeId: "inventory",
+            reason: `Shutdown sealing aggregate deadline expired; ${inventory.runtimeIds.length - runtimeIndex} runtime(s) were not inspected`,
+          });
+          break;
         }
         try {
-          const snapshot = await this.backend.withMachineMutex({
-            name: OWNED_RUNTIME_LIFECYCLE_MUTEX,
-            timeoutMs: Math.max(100, wallDeadline - Date.now()),
-            action: async () => {
+          const snapshot = await this.withFencedMachineMutex(async (fence) => {
               const receipt = this.readRuntimeReceipt(runtimeId);
+              fence.assertActive();
               if (receipt.mcpOwner.managerInstanceId !== this.managerInstanceId) return null;
               const stopped = this.readOptionalStopReceipt(runtimeId);
               if (stopped) {
@@ -1141,11 +1716,13 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
               }
               const existing = this.readOptionalRestorationProof(runtimeId);
               return { receipt, existing, alreadyVacant: false };
-            },
-          });
+            }, wallDeadline);
           if (!snapshot) continue;
           const { receipt, existing, alreadyVacant } = snapshot;
-          if (alreadyVacant) continue;
+          if (alreadyVacant) {
+            await this.releaseRuntimeLifecycle(receipt, wallDeadline);
+            continue;
+          }
           if (existing) {
             if (existing.sessionId !== receipt.sessionId ||
                 existing.managerInstanceId !== this.managerInstanceId) {
@@ -1158,11 +1735,7 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
             continue;
           }
 
-          const status = await this.beforeWallDeadline(
-            this.inspectReceipt(receipt),
-            wallDeadline,
-            "Owned runtime shutdown inspection timed out"
-          );
+          const status = await this.inspectReceipt(receipt, wallDeadline);
           const exactRuntimeVacant = status.state === "exited";
           if (!exactRuntimeVacant && status.state !== "running" && status.state !== "stale") {
             throw new OwnedRuntimeError(
@@ -1178,7 +1751,7 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
             receipt.mcpOwner.managerInstanceId
           );
           const preflight = await this.reserveShutdownLease(
-            receipt.sessionId,
+            receipt,
             proposedReservationId,
             wallDeadline,
             exactRuntimeVacant
@@ -1194,13 +1767,11 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
               "Observer shutdown lease did not echo the caller-proposed generation"
             );
           }
-          await this.backend.withMachineMutex({
-            name: OWNED_RUNTIME_LIFECYCLE_MUTEX,
-            timeoutMs: Math.max(100, wallDeadline - Date.now()),
-            action: async () => {
+          await this.withFencedMachineMutex(async (fence) => {
               const root = this.ensureStorage();
               const current = this.readRuntimeReceipt(runtimeId);
               this.assertSameRuntimeLifecycle(receipt, current);
+              fence.assertActive();
               const stopped = this.readOptionalStopReceipt(runtimeId);
               if (stopped) {
                 if (stopped.sessionId !== receipt.sessionId) {
@@ -1237,8 +1808,7 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
                 restorationPendingJobIds: [],
               });
               this.atomicWrite(root, this.restorationProofPath(runtimeId), proof, true);
-            },
-          });
+            }, wallDeadline);
           sealedRuntimeIds.push(runtimeId);
           // Deliberately retain the reservation until the coordinator closes
           // its private child, preventing a capture from racing the proof.
@@ -1246,12 +1816,10 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
           errorRuntimes.push({ runtimeId, reason: this.message(error).slice(0, 512) });
         }
       }
-      const finalUnsafe = await this.backend.withMachineMutex({
-        name: OWNED_RUNTIME_LIFECYCLE_MUTEX,
-        timeoutMs: Math.max(100, wallDeadline - Date.now()),
-        action: async () => {
+      const finalUnsafe = await this.withFencedMachineMutex(async (fence) => {
           const unsafe: Array<{ runtimeId: string; reason: string }> = [];
           for (const runtimeId of inventory.runtimeIds) {
+            fence.assertActive();
             try {
               const receipt = this.readRuntimeReceipt(runtimeId);
               if (receipt.mcpOwner.managerInstanceId !== this.managerInstanceId) continue;
@@ -1280,8 +1848,7 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
             }
           }
           return unsafe;
-        },
-      }).catch((error) => [{
+        }, wallDeadline).catch((error) => [{
         runtimeId: "inventory",
         reason: this.message(error).slice(0, 512),
       }]);
@@ -1300,32 +1867,10 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
     }
   }
 
-  private async beforeWallDeadline<T>(
-    operation: Promise<T>,
-    deadline: number,
-    message: string
-  ): Promise<T> {
-    const remaining = deadline - Date.now();
-    if (remaining <= 0) throw new OwnedRuntimeError("SHUTDOWN_SEAL_FAILED", message);
-    let timer: NodeJS.Timeout | undefined;
-    try {
-      return await Promise.race([
-        operation,
-        new Promise<T>((_resolve, reject) => {
-          timer = setTimeout(() => reject(
-            new OwnedRuntimeError("SHUTDOWN_SEAL_FAILED", message)
-          ), remaining);
-        }),
-      ]);
-    } finally {
-      if (timer) clearTimeout(timer);
-    }
-  }
-
   private async reserveShutdownLease(
-    sessionId: string,
+    receipt: OwnedRuntimeReceipt,
     proposedReservationId: string,
-    wallDeadline: number,
+    wallDeadline: OwnedRuntimeWallDeadline,
     exactRuntimeVacant: boolean
   ): Promise<RuntimeStopPreflight> {
     let lastError: unknown = new OwnedRuntimeError(
@@ -1333,20 +1878,33 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
       "Observer shutdown lease preflight failed"
     );
     for (let attempt = 0; attempt < 2; attempt += 1) {
-      const remaining = wallDeadline - Date.now();
-      if (remaining <= 0) break;
-      const attemptsLeft = 2 - attempt;
-      const attemptDeadline = Date.now() + Math.max(1, Math.floor(remaining / attemptsLeft));
+      let remaining: number;
       try {
-        return await this.beforeWallDeadline(
+        remaining = this.remainingWallBudget(wallDeadline);
+      } catch (error) {
+        lastError = error;
+        break;
+      }
+      const attemptsLeft = 2 - attempt;
+      const attemptDeadline: OwnedRuntimeWallDeadline = {
+        ...wallDeadline,
+        expiresAtMs: Math.min(
+          wallDeadline.expiresAtMs,
+          Date.now() + Math.max(1, Math.floor(remaining / attemptsLeft))
+        ),
+        message: "Observer shutdown lease preflight exceeded the remaining shutdown deadline",
+      };
+      try {
+        return await this.beforeWallDeadline(attemptDeadline, () =>
           this.options.observerGate.reserveRuntimeStop(
-            sessionId,
+            receipt.sessionId,
             proposedReservationId,
-            exactRuntimeVacant
-          ),
-          attemptDeadline,
-          "Observer shutdown lease preflight timed out"
-        );
+            exactRuntimeVacant,
+            {
+              runtimeId: receipt.runtimeId,
+              generation: runtimeLifecycleGeneration(receipt),
+            }
+          ));
       } catch (error) {
         lastError = error;
       }
@@ -1378,11 +1936,17 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
         if (runtime.preparedLaunchId !== preparedLaunchId) {
           throw new OwnedRuntimeError("STORAGE_UNVERIFIABLE", "Start idempotency receipt points at another prepared launch");
         }
+        await this.reconcileRuntimeLifecycleLease(runtime);
+        leaseFence.assertActive();
         return this.inspectReceipt(runtime);
       }
-      const pending = this.readOptionalPendingStart(existingAttempt.runtimeId);
+      let pending = this.readOptionalPendingStart(existingAttempt.runtimeId);
       if (pending && pending.preparedLaunchId !== preparedLaunchId) {
         throw new OwnedRuntimeError("STORAGE_UNVERIFIABLE", "Pending start receipt points at another prepared launch");
+      }
+      if (pending) {
+        pending = await this.recoverPendingStartCleanup(root, pending, leaseFence);
+        leaseFence.assertActive();
       }
       throw new OwnedRuntimeError(
         "START_UNVERIFIABLE",
@@ -1432,6 +1996,8 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
           if (runtime.preparedLaunchId !== preparedLaunchId) {
             throw new OwnedRuntimeError("STORAGE_UNVERIFIABLE", "Prepared-launch consumption points at another runtime receipt");
           }
+          await this.reconcileRuntimeLifecycleLease(runtime);
+          leaseFence.assertActive();
           return this.inspectReceipt(runtime);
         }
         throw new OwnedRuntimeError("START_UNVERIFIABLE", "Prepared launch was consumed without a successful receipt");
@@ -1461,7 +2027,8 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
       state: "starting",
       updatedAt: consumedAt,
     }), true);
-    const pendingCreatedAt = nowIso(this.clock);
+    const launchedAtMs = this.clock();
+    const pendingCreatedAt = new Date(launchedAtMs).toISOString();
     let pending = pendingStartSchema.parse({
       version: STORAGE_VERSION,
       runtimeId,
@@ -1474,15 +2041,17 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
       executableFile,
       ownerTokenArgument,
       argvSha256,
+      launchedAtMs,
+      lifecycleGeneration: null,
       mcpOwner,
       createdAt: pendingCreatedAt,
       updatedAt: pendingCreatedAt,
     });
     this.atomicWrite(root, this.pendingStartPath(runtimeId), pending, true);
 
-    const launchedAtMs = this.clock();
     let child: ChildProcess | null = null;
     let receiptPublished = false;
+    let pinnedReceipt: OwnedRuntimeReceipt | null = null;
     try {
       leaseFence.assertActive();
       child = this.spawnProcess(executablePath, argumentsArray, {
@@ -1504,11 +2073,6 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
       if (!executableFilesMatch(executableFile, executableFileAfterSpawn)) {
         throw new OwnedRuntimeError("IDENTITY_MISMATCH", "Graphical runtime executable was replaced during start");
       }
-      pending = this.updatePendingStart(root, pending, {
-        state: "identity_verified",
-        pid: identity.pid,
-        creationTimeFileTime: identity.creationTimeFileTime,
-      });
       const receipt = runtimeReceiptSchema.parse({
         version: STORAGE_VERSION,
         runtimeId,
@@ -1527,6 +2091,22 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
         preparedExpiresAt: descriptor.expiresAt,
         mcpOwner,
       });
+      const lifecycleGeneration = runtimeLifecycleGeneration(receipt);
+      // Persist the exact process identity and generation before asking the
+      // agent to retain it. A lost retain response or publication failure can
+      // then be reconciled without guessing which child owns the lease.
+      pending = this.updatePendingStart(root, pending, {
+        state: "identity_verified",
+        pid: identity.pid,
+        creationTimeFileTime: identity.creationTimeFileTime,
+        lifecycleGeneration,
+      });
+      // Acquire the agent-side lifecycle lease before publishing ownership.
+      // If publication fails, only exact child vacancy may release it; once
+      // the immutable receipt exists, retries can reassert this generation.
+      pinnedReceipt = receipt;
+      await this.retainRuntimeLifecycle(receipt);
+      leaseFence.assertActive();
       // This is the first successful ownership publication. Everything above
       // may fail without leaving a successful runtime receipt.
       leaseFence.assertActive();
@@ -1557,13 +2137,28 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
         const cleanupVerified = child ? await this.terminateRetainedChild(child).catch(() => false) : true;
         try {
           pending = this.updatePendingStart(root, pending, {
-            state: cleanupVerified ? "cleanup_verified" : "cleanup_required",
+            state: cleanupVerified
+              ? (pinnedReceipt ? "release_required" : "release_acknowledged")
+              : "cleanup_required",
             lastError: this.message(error).slice(0, 512),
           });
         } catch {
           // Retain the last durable pending state; never manufacture success.
         }
-        if (cleanupVerified) this.children.forget(runtimeId, child ?? undefined);
+        if (cleanupVerified) {
+          this.children.forget(runtimeId, child ?? undefined);
+        } else if (pinnedReceipt && child) {
+          // Keep the exact ChildProcess observed even though ownership was not
+          // published. Its eventual exit durably completes pending cleanup
+          // and releases the same generation; a process restart can perform
+          // the equivalent exact reconciliation from the pending receipt.
+          this.children.supervise(runtimeId, child, {
+            onExit: () => this.reconcilePendingStartExit(pinnedReceipt!),
+          });
+          try { child.unref(); } catch { /* durable pending cleanup remains authoritative */ }
+        }
+        // Lifecycle release and its durable acknowledgement are completed by
+        // `start()` after this mutex transaction exits.
       }
       throw this.normalizeError(error, "SPAWN_FAILED", "Owned runtime could not be spawned and verified");
     }
@@ -1572,16 +2167,20 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
   private async prepareStopLocked(
     input: OwnedRuntimeStopInput,
     keyHash: string,
-    requestFingerprint: string
+    requestFingerprint: string,
+    leaseFence: OwnedRuntimeLeaseFence,
+    wallDeadline: OwnedRuntimeWallDeadline
   ): Promise<{
     receipt: OwnedRuntimeReceipt;
     needsRestorationReservation: boolean;
     allowUnknownVacantSession: boolean;
     proposedReservationId: string;
   }> {
+    leaseFence.assertActive();
     this.assertOpenForMutation();
     const root = this.ensureStorage();
     this.sweepLocked(root, this.clock());
+    leaseFence.assertActive();
     const receipt = this.readRuntimeReceipt(input.runtimeId);
     const idempotencyPath = this.idempotencyPath("stop", keyHash);
     const existingAttempt = this.readOptionalParsed(
@@ -1625,7 +2224,8 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
         updatedAt: nowIso(this.clock),
       }), true);
     }
-    const current = await this.inspectReceipt(receipt);
+    const current = await this.inspectReceipt(receipt, wallDeadline);
+    leaseFence.assertActive();
     if (current.state === "identity_mismatch" || current.state === "unverifiable") {
       throw new OwnedRuntimeError(
         "IDENTITY_UNVERIFIABLE",
@@ -1656,7 +2256,8 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
     keyHash: string,
     requestFingerprint: string,
     preparedReservation: StopReservation | null,
-    leaseFence: OwnedRuntimeLeaseFence
+    leaseFence: OwnedRuntimeLeaseFence,
+    wallDeadline: OwnedRuntimeWallDeadline
   ): Promise<StopLockedResult> {
     leaseFence.assertActive();
     this.assertOpenForMutation();
@@ -1707,7 +2308,7 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
     // retry can still hold and act on that proof. Recovery with the same
     // idempotency key completes or explicitly revokes the sealed session.
     try {
-      const current = await this.inspectReceipt(receipt);
+      const current = await this.inspectReceipt(receipt, wallDeadline);
       leaseFence.assertActive();
       if (current.state === "identity_mismatch" || current.state === "unverifiable") {
         throw new OwnedRuntimeError(
@@ -1716,7 +2317,7 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
           { reason: current.reason }
         );
       }
-      const mcpActor = await this.currentMcpOwner();
+      const mcpActor = await this.currentMcpOwner(wallDeadline);
       leaseFence.assertActive();
       if (current.state === "exited") {
         const priorProof = this.readOptionalRestorationProof(receipt.runtimeId);
@@ -1754,7 +2355,8 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
       this.assertCurrentStopReservation(receipt, reservation.proof);
       if (input.signal?.aborted) throw new OwnedRuntimeError("CANCELLED", "Owned runtime stop was cancelled");
       this.assertExecutableFileMatches(receipt);
-      const inspection = await this.backend.inspectProcess(receipt.pid, receipt.ownerTokenArgument);
+      const inspection = await this.beforeWallDeadline(wallDeadline, () =>
+        this.backend.inspectProcess(receipt.pid, receipt.ownerTokenArgument));
       leaseFence.assertActive();
       if (!inspection) {
         const stopped = this.publishStop(
@@ -1793,13 +2395,14 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
       // the helper returns a refusal that is contractually pre-signal.
       leaseFence.assertActive();
       terminationMayHaveOccurred = true;
-      const result = await this.backend.verifyAndTerminate({
-        pid: receipt.pid,
-        executablePath: receipt.executablePath,
-        creationTimeFileTime: receipt.creationTimeFileTime,
-        ownerTokenArgument: receipt.ownerTokenArgument,
-        launchedAtMs: receipt.launchedAtMs,
-      }, this.terminationTimeoutMs);
+      const result = await this.beforeWallDeadline(wallDeadline, (remainingMs) =>
+        this.backend.verifyAndTerminate({
+          pid: receipt.pid,
+          executablePath: receipt.executablePath,
+          creationTimeFileTime: receipt.creationTimeFileTime,
+          ownerTokenArgument: receipt.ownerTokenArgument,
+          launchedAtMs: receipt.launchedAtMs,
+        }, Math.min(this.terminationTimeoutMs, remainingMs)));
       leaseFence.assertActive();
       if (result.kind === "refused") {
         if ([
@@ -1814,7 +2417,8 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
         }
         throw new OwnedRuntimeError("TERMINATION_REFUSED", result.message, { reason: result.reason });
       }
-      const after = await this.backend.inspectProcess(receipt.pid, receipt.ownerTokenArgument);
+      const after = await this.beforeWallDeadline(wallDeadline, () =>
+        this.backend.inspectProcess(receipt.pid, receipt.ownerTokenArgument));
       leaseFence.assertActive();
       let vacancyProof: StopReceipt["vacancyProof"] = "retained_handle_exit";
       if (after) {
@@ -1859,7 +2463,10 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
     }
   }
 
-  private async inspectReceipt(receipt: OwnedRuntimeReceipt): Promise<OwnedRuntimePublicStatus> {
+  private async inspectReceipt(
+    receipt: OwnedRuntimeReceipt,
+    wallDeadline?: OwnedRuntimeWallDeadline
+  ): Promise<OwnedRuntimePublicStatus> {
     const stopped = this.readOptionalStopReceipt(receipt.runtimeId);
     if (stopped) {
       if (stopped.sessionId !== receipt.sessionId) {
@@ -1920,8 +2527,9 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
     }
     let currentOwner: z.infer<typeof mcpOwnerSchema>;
     try {
-      currentOwner = await this.currentMcpOwner();
+      currentOwner = await this.currentMcpOwner(wallDeadline);
     } catch (error) {
+      if (this.isWallDeadlineError(error)) throw error;
       return this.publicStatus(receipt, "unverifiable", false, `MCP owner identity is unavailable: ${this.message(error)}`);
     }
     if (currentOwner.installationId !== receipt.mcpOwner.installationId ||
@@ -1931,8 +2539,12 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
     if (currentOwner.managerInstanceId !== receipt.mcpOwner.managerInstanceId) {
       let priorOwner: OwnedRuntimeInspection | null;
       try {
-        priorOwner = await this.backend.inspectProcess(receipt.mcpOwner.pid);
+        priorOwner = wallDeadline
+          ? await this.beforeWallDeadline(wallDeadline, () =>
+            this.backend.inspectProcess(receipt.mcpOwner.pid))
+          : await this.backend.inspectProcess(receipt.mcpOwner.pid);
       } catch (error) {
+        if (this.isWallDeadlineError(error)) throw error;
         return this.publicStatus(receipt, "unverifiable", false, `Prior MCP owner identity is unavailable: ${this.message(error)}`);
       }
       if (priorOwner && priorOwner.identity.pid === receipt.mcpOwner.pid &&
@@ -1966,8 +2578,12 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
     }
     let inspection: OwnedRuntimeInspection | null;
     try {
-      inspection = await this.backend.inspectProcess(receipt.pid, receipt.ownerTokenArgument);
+      inspection = wallDeadline
+        ? await this.beforeWallDeadline(wallDeadline, () =>
+          this.backend.inspectProcess(receipt.pid, receipt.ownerTokenArgument))
+        : await this.backend.inspectProcess(receipt.pid, receipt.ownerTokenArgument);
     } catch (error) {
+      if (this.isWallDeadlineError(error)) throw error;
       return this.publicStatus(receipt, "unverifiable", false, this.message(error));
     }
     if (!inspection) return this.publicStatus(receipt, "exited", true);
@@ -2013,6 +2629,43 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
         }), true);
       },
     });
+    await this.releaseRuntimeLifecycle(receipt);
+  }
+
+  private async persistObservedNaturalExit(receipt: OwnedRuntimeReceipt): Promise<boolean> {
+    return this.withFencedMachineMutex(async (fence) => {
+      const root = this.ensureStorage();
+      const current = this.readRuntimeReceipt(receipt.runtimeId);
+      this.assertSameRuntimeLifecycle(receipt, current);
+      if (this.readOptionalStopReceipt(receipt.runtimeId)) return false;
+      const existing = this.readOptionalChildExitReceipt(receipt.runtimeId);
+      if (existing) {
+        if (existing.sessionId !== receipt.sessionId || existing.pid !== receipt.pid ||
+            pathKey(existing.executablePath) !== pathKey(receipt.executablePath) ||
+            existing.creationTimeFileTime !== receipt.creationTimeFileTime) {
+          throw new OwnedRuntimeError(
+            "STORAGE_UNVERIFIABLE",
+            "Observed child exit belongs to another exact runtime lifecycle"
+          );
+        }
+        return true;
+      }
+      const inspection = await this.backend.inspectProcess(receipt.pid, receipt.ownerTokenArgument);
+      fence.assertActive();
+      if (inspection && this.inspectionMatches(receipt, inspection)) return false;
+      this.atomicWrite(root, this.childExitPath(receipt.runtimeId), childExitReceiptSchema.parse({
+        version: STORAGE_VERSION,
+        runtimeId: receipt.runtimeId,
+        sessionId: receipt.sessionId,
+        pid: receipt.pid,
+        executablePath: receipt.executablePath,
+        creationTimeFileTime: receipt.creationTimeFileTime,
+        observedAt: nowIso(this.clock),
+        exitCode: null,
+        signal: null,
+      }), true);
+      return true;
+    });
   }
 
   private async reserveStopWhenRestored(
@@ -2021,18 +2674,22 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
     proposedReservationId: string,
     waitForRestorationMs: number,
     signal?: AbortSignal,
-    allowUnknownVacantSession = false
+    allowUnknownVacantSession = false,
+    wallDeadline?: OwnedRuntimeWallDeadline
   ): Promise<StopReservation | null> {
-    const deadline = this.clock() + waitForRestorationMs;
+    const restorationDeadline = Date.now() + waitForRestorationMs;
     let exactRuntimeVacant = allowUnknownVacantSession;
     z.string().uuid().parse(proposedReservationId);
     for (;;) {
       if (signal?.aborted) throw new OwnedRuntimeError("CANCELLED", "Owned runtime stop was cancelled");
-      const durableProof = await this.backend.withMachineMutex({
-        name: OWNED_RUNTIME_LIFECYCLE_MUTEX,
-        timeoutMs: this.lockTimeoutMs,
-        action: async () => this.readValidatedRestorationProofLocked(receipt),
-      });
+      const durableProof = wallDeadline
+        ? await this.withFencedMachineMutex(
+          async () => this.readValidatedRestorationProofLocked(receipt),
+          wallDeadline
+        )
+        : await this.withFencedMachineMutex(
+          async () => this.readValidatedRestorationProofLocked(receipt)
+        );
       if (durableProof) {
         if (durableProof.kind === "live_stop_reservation" &&
             durableProof.stopIdempotencyHash !== keyHash) {
@@ -2047,11 +2704,18 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
 
       let preflight: RuntimeStopPreflight;
       try {
-        preflight = await this.options.observerGate.reserveRuntimeStop(
+        const request = () => this.options.observerGate.reserveRuntimeStop(
           receipt.sessionId,
           proposedReservationId,
-          exactRuntimeVacant
+          exactRuntimeVacant,
+          {
+            runtimeId: receipt.runtimeId,
+            generation: runtimeLifecycleGeneration(receipt),
+          }
         );
+        preflight = wallDeadline
+          ? await this.beforeWallDeadline(wallDeadline, () => request())
+          : await request();
       } catch (error) {
         // The request may have reached the serialized child before IPC failed.
         // Do not guess at release: a concurrent same-key recovery may already
@@ -2078,16 +2742,15 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
           );
         }
         try {
-          return await this.backend.withMachineMutex({
-            name: OWNED_RUNTIME_LIFECYCLE_MUTEX,
-            timeoutMs: this.lockTimeoutMs,
-            action: async () => this.persistStopReservationLocked(
-              receipt,
-              keyHash,
-              reservationId,
-              exactRuntimeVacant
-            ),
-          });
+          const persist = async () => this.persistStopReservationLocked(
+            receipt,
+            keyHash,
+            reservationId,
+            exactRuntimeVacant
+          );
+          return wallDeadline
+            ? await this.withFencedMachineMutex(persist, wallDeadline)
+            : await this.withFencedMachineMutex(persist);
         } catch (error) {
           // Whether proof publication ran is deliberately irrelevant to
           // adoption: the next same-key retry proposes this exact token and
@@ -2096,7 +2759,7 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
         }
       }
       if (!exactRuntimeVacant) {
-        const current = await this.inspectReceipt(receipt);
+        const current = await this.inspectReceipt(receipt, wallDeadline);
         if (current.state === "identity_mismatch" || current.state === "unverifiable") {
           throw new OwnedRuntimeError(
             "IDENTITY_UNVERIFIABLE",
@@ -2109,7 +2772,7 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
           continue;
         }
       }
-      if (waitForRestorationMs === 0 || this.clock() >= deadline) {
+      if (waitForRestorationMs === 0 || Date.now() >= restorationDeadline) {
         throw new OwnedRuntimeError(
           "CAMERA_BUSY",
           "Observer runtime still has active capture or camera-restoration work",
@@ -2120,7 +2783,14 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
           }
         );
       }
-      await wait(Math.min(PROCESS_POLL_MS, Math.max(1, deadline - this.clock())), signal);
+      const wallRemaining = wallDeadline
+        ? this.remainingWallBudget(wallDeadline)
+        : Number.MAX_SAFE_INTEGER;
+      await wait(Math.min(
+        PROCESS_POLL_MS,
+        Math.max(1, restorationDeadline - Date.now()),
+        wallRemaining
+      ), signal);
     }
   }
 
@@ -2312,8 +2982,13 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
     }
   }
 
-  private async currentMcpOwner(): Promise<z.infer<typeof mcpOwnerSchema>> {
-    const identity = await this.backend.inspectCurrentProcess(process.pid);
+  private async currentMcpOwner(
+    wallDeadline?: OwnedRuntimeWallDeadline
+  ): Promise<z.infer<typeof mcpOwnerSchema>> {
+    const identity = wallDeadline
+      ? await this.beforeWallDeadline(wallDeadline, () =>
+        this.backend.inspectCurrentProcess(process.pid))
+      : await this.backend.inspectCurrentProcess(process.pid);
     return mcpOwnerSchema.parse({
       installationId: this.installationId,
       managerInstanceId: this.managerInstanceId,
@@ -2520,16 +3195,23 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
   }
 
   private async requestStopCompletionUnlocked(
-    authority: StopCompletionAuthority
+    authority: StopCompletionAuthority,
+    wallDeadline: OwnedRuntimeWallDeadline
   ): Promise<StopCompletionAck> {
     let response: unknown;
     try {
-      response = await this.options.observerGate.completeRuntimeStop(
-        authority.receipt.sessionId,
-        authority.reservationId,
-        authority.stopped.restorationProofKind === "exact_runtime_vacancy"
-      );
+      response = await this.beforeWallDeadline(wallDeadline, () =>
+        this.options.observerGate.completeRuntimeStop(
+          authority.receipt.sessionId,
+          authority.reservationId,
+          authority.stopped.restorationProofKind === "exact_runtime_vacancy",
+          {
+            runtimeId: authority.receipt.runtimeId,
+            generation: runtimeLifecycleGeneration(authority.receipt),
+          }
+        ));
     } catch (error) {
+      if (this.isWallDeadlineError(error)) throw error;
       throw new OwnedRuntimeError(
         "SESSION_COMPLETION_FAILED",
         `Exact runtime is vacant, but observer session completion failed: ${this.message(error)}`
@@ -2640,12 +3322,10 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
   private async discardUncommittedStopAttempt(
     runtimeId: string,
     keyHash: string,
-    requestFingerprint: string
+    requestFingerprint: string,
+    wallDeadline: OwnedRuntimeWallDeadline
   ): Promise<void> {
-    await this.backend.withMachineMutex({
-      name: OWNED_RUNTIME_LIFECYCLE_MUTEX,
-      timeoutMs: this.lockTimeoutMs,
-      action: async () => {
+    await this.withFencedMachineMutex(async (fence) => {
         const attemptPath = this.idempotencyPath("stop", keyHash);
         const attempt = this.readOptionalParsed(
           attemptPath,
@@ -2659,9 +3339,9 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
         if (stopped?.stopIdempotencyHash === keyHash) return;
         const proof = this.readOptionalRestorationProof(runtimeId);
         if (proof?.stopIdempotencyHash === keyHash) return;
+        fence.assertActive();
         this.unlinkOwnedFile(attemptPath);
-      },
-    });
+      }, wallDeadline);
   }
 
   private sweepLocked(root: string, now: number): OwnedRuntimeSweepResult {
@@ -2719,14 +3399,18 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
       }
     }
 
-    // A failed start whose exact child cleanup was durably verified has no
-    // ownership obligation. Retain it for retries, then remove its cluster.
+    // A failed start becomes retention-eligible only after exact child vacancy
+    // and observer lifecycle release are separate durable commits. Legacy
+    // cleanup_verified records without a generation never acquired a lease;
+    // an exact-generation legacy record is migrated/retried, never swept.
     for (const name of readdirSync(this.directory("pending-starts")).sort()) {
       const runtimeId = name.endsWith(".json") ? name.slice(0, -5) : "";
       if (!runtimeIdSchema.safeParse(runtimeId).success || existsSync(this.runtimePath(runtimeId))) continue;
       try {
         const pending = this.readOptionalPendingStart(runtimeId);
-        if (!pending || pending.state !== "cleanup_verified" ||
+        const releaseComplete = pending?.state === "release_acknowledged" ||
+          (pending?.state === "cleanup_verified" && !pending.lifecycleGeneration);
+        if (!pending || !releaseComplete ||
             now - Date.parse(pending.updatedAt) < this.receiptRetentionMs) continue;
         const consumption = this.readOptionalConsumption(pending.preparedLaunchId);
         if (consumption && consumption.runtimeId !== runtimeId) continue;
@@ -2821,7 +3505,7 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
       this.unlinkOwnedFile(this.preparedSessionIndexPath(pending.sessionId));
     }
     this.unlinkOwnedFile(this.preparedPath(pending.preparedLaunchId));
-    // Keep the cleanup-verified pending receipt until every dependent record
+    // Keep the release-acknowledged pending receipt until every dependent record
     // has been removed so an interrupted sweep remains resumable.
     this.unlinkOwnedFile(this.pendingStartPath(runtimeId));
   }
@@ -3182,12 +3866,25 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
       this.preparedPath(preparedLaunchId),
       preparedDescriptorSchema,
       "prepared-launch descriptor",
-      Math.min(PREPARED_DESCRIPTOR_MAX_BYTES, this.maxRecordBytes)
+      this.preparedDescriptorMaxBytes()
     );
     if (descriptor.preparedLaunchId !== preparedLaunchId) {
       throw new OwnedRuntimeError("STORAGE_UNVERIFIABLE", "Prepared-launch descriptor does not match its filename");
     }
     return descriptor;
+  }
+
+  private preparedDescriptorMaxBytes(): number {
+    return Math.min(MAX_REALISTIC_PREPARED_DESCRIPTOR_BYTES, this.maxRecordBytes);
+  }
+
+  private assertPreparedDescriptorCapacity(descriptor: PreparedDescriptor): void {
+    if (Buffer.byteLength(this.serializeRecord(descriptor), "utf8") > this.preparedDescriptorMaxBytes()) {
+      throw new OwnedRuntimeError(
+        "STORE_CAPACITY_EXCEEDED",
+        "Prepared-launch descriptor exceeds its command-line-aligned byte budget"
+      );
+    }
   }
 
   private readOptionalPreparedSessionIndex(sessionId: string): PreparedSessionIndex | null {
@@ -3310,7 +4007,9 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
   private updatePendingStart(
     root: string,
     pending: PendingStart,
-    patch: Partial<Pick<PendingStart, "state" | "pid" | "creationTimeFileTime" | "lastError">>
+    patch: Partial<Pick<PendingStart,
+      "state" | "pid" | "creationTimeFileTime" | "lifecycleGeneration" | "lastError"
+    >>
   ): PendingStart {
     const next = pendingStartSchema.parse({
       ...pending,

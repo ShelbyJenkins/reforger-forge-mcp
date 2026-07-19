@@ -1,6 +1,7 @@
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { existsSync, lstatSync, readFileSync, renameSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
+import { z } from "zod";
 import {
   ADDON_VERSION,
   DEFAULT_LIMITS,
@@ -8,6 +9,7 @@ import {
   SESSION_CONTRACT_NAME,
   SESSION_DIRECTORY_NAME,
   sessionContractSchema,
+  limitsSchema,
   type ObserverLimits,
   type ObserverTransport,
   type InstanceRegistration,
@@ -42,6 +44,7 @@ export interface SessionStoreStats {
   active: number;
   terminal: number;
   pinned: number;
+  lifecycleLeased: number;
   estimatedBytes: number;
   actualBytes: number;
   maxRecords: number;
@@ -90,6 +93,25 @@ export interface CreatedSession {
   contractPath: string;
 }
 
+const durableSessionRecordSchema = z.object({
+  sessionId: z.string().min(1).max(96).regex(/^[A-Za-z0-9_-]+$/),
+  launchNonce: z.string().min(32).max(256).regex(/^[A-Za-z0-9_-]+$/),
+  tokenDigest: z.string().regex(/^[a-f0-9]{64}$/),
+  createdAt: z.number().int().nonnegative(),
+  expiresAt: z.number().int().positive(),
+  bundleDigest: z.string().regex(/^[a-f0-9]{64}$/),
+  buildIdentity: z.string().regex(/^[a-f0-9]{64}$/),
+  expectedRuntimeKind: z.enum(["client", "listenServer", "dedicated", "workbench", "testRunner"]),
+  agentInstanceId: z.string().min(1).max(96).regex(/^[A-Za-z0-9_-]+$/),
+  stagedAddonPath: z.string().min(1).max(32_768),
+  profilePath: z.string().min(1).max(32_768),
+  transportPreference: z.array(z.enum(["rest", "mailbox"])).min(1).max(2),
+  limits: limitsSchema,
+  registeredInstanceNonce: z.string().min(32).max(256).regex(/^[A-Za-z0-9_-]+$/).nullable(),
+  allowMultipleInstances: z.boolean(),
+  revokedAt: z.number().int().nonnegative().nullable(),
+});
+
 export type AgentLeaseProbeResult = "same" | "different" | "absent" | "unverifiable";
 
 export interface ContractRecoveryResult {
@@ -126,6 +148,7 @@ function parseExistingContract(contractPath: string): SessionContract {
 export class SessionStore {
   private readonly sessions = new Map<string, SessionRecord>();
   private readonly retentionPins = new Map<string, Set<string>>();
+  private readonly lifecycleLeases = new Map<string, Set<string>>();
   readonly terminalRetentionMs: number;
   readonly maxRecords: number;
   readonly maxEstimatedBytes: number;
@@ -269,9 +292,80 @@ export class SessionStore {
     return this.sessions.get(sessionId);
   }
 
+  /** Owner-private snapshot used only by exact owned-runtime recovery. */
+  durableSnapshot(sessionId: string): SessionRecord {
+    const record = this.sessions.get(sessionId);
+    if (!record) throw new ObserverError("SESSION_NOT_FOUND", "Observer session was not found", 404);
+    return structuredClone(durableSessionRecordSchema.parse(record));
+  }
+
+  /**
+   * Reconstruct an exact lifecycle lease from an owner-private durable
+   * snapshot and the runtime's still-present activation contract. Expiry is
+   * intentionally ignored here: the durable lease predates expiry. Explicit
+   * revocation is never undone.
+   */
+  restoreLifecycle(recordInput: unknown, owner: string): boolean {
+    if (!/^[A-Za-z0-9_.:-]{1,128}$/.test(owner)) {
+      throw new ObserverError("INVALID_REQUEST", "Session retention pin owner is invalid");
+    }
+    const parsed = durableSessionRecordSchema.parse(recordInput);
+    if (parsed.revokedAt !== null) return false;
+    const profilePath = ensureCanonicalDirectory(parsed.profilePath);
+    const stagedAddonPath = ensureCanonicalDirectory(parsed.stagedAddonPath);
+    const engineProfileDirectory = resolveEngineProfileDirectory(profilePath, { requireExisting: true });
+    const contractPath = join(engineProfileDirectory, SESSION_DIRECTORY_NAME, SESSION_CONTRACT_NAME);
+    assertManagedPath(profilePath, contractPath);
+    if (!existsSync(contractPath)) {
+      throw new ObserverError(
+        "SESSION_NOT_FOUND",
+        "Durable observer lifecycle has no activation contract",
+        404
+      );
+    }
+    const contract = parseExistingContract(contractPath);
+    if (contract.sessionId !== parsed.sessionId || contract.launchNonce !== parsed.launchNonce ||
+        digestToken(contract.sessionToken) !== parsed.tokenDigest ||
+        Date.parse(contract.createdAt) !== parsed.createdAt ||
+        Date.parse(contract.expiresAt) !== parsed.expiresAt ||
+        contract.bundleDigest !== parsed.bundleDigest ||
+        contract.buildIdentity !== parsed.buildIdentity ||
+        contract.expectedRuntimeKind !== parsed.expectedRuntimeKind ||
+        contract.agent.instanceId !== parsed.agentInstanceId ||
+        JSON.stringify(contract.transportPreference) !== JSON.stringify(parsed.transportPreference) ||
+        JSON.stringify(contract.limits) !== JSON.stringify(parsed.limits)) {
+      throw new ObserverError(
+        "SESSION_MISMATCH",
+        "Durable observer lifecycle does not match its activation contract",
+        409
+      );
+    }
+    const record: SessionRecord = { ...parsed, profilePath, stagedAddonPath };
+    const existing = this.sessions.get(record.sessionId);
+    if (existing && JSON.stringify(existing) !== JSON.stringify(record)) {
+      throw new ObserverError(
+        "SESSION_MISMATCH",
+        "Recovered observer session conflicts with current in-memory state",
+        409
+      );
+    }
+    const owners = this.lifecycleLeases.get(record.sessionId);
+    if (owners && owners.size > 0 && !owners.has(owner)) return false;
+    if (!existing) {
+      this.assertCapacity(record, false);
+      this.sessions.set(record.sessionId, record);
+    }
+    if (!this.pin(record.sessionId, owner)) return false;
+    const nextOwners = owners ?? new Set<string>();
+    nextOwners.add(owner);
+    this.lifecycleLeases.set(record.sessionId, nextOwners);
+    return true;
+  }
+
   isTerminal(sessionId: string, now = this.clock.now()): boolean {
     const record = this.sessions.get(sessionId);
-    return !record || record.revokedAt !== null || record.expiresAt <= now;
+    return !record || record.revokedAt !== null ||
+      (record.expiresAt <= now && !this.isLifecycleLeased(sessionId));
   }
 
   pin(sessionId: string, owner: string): boolean {
@@ -292,6 +386,38 @@ export class SessionStore {
     return true;
   }
 
+  retainLifecycle(sessionId: string, owner: string): boolean {
+    const record = this.sessions.get(sessionId);
+    const alreadyRetained = this.lifecycleLeases.get(sessionId)?.has(owner) === true;
+    if (alreadyRetained) {
+      // Exact-owner retries repair the ordinary retention pin even after an
+      // explicit revoke. They do not make the revoked session active again.
+      return this.pin(sessionId, owner);
+    }
+    if ((this.lifecycleLeases.get(sessionId)?.size ?? 0) > 0) return false;
+    if (!record || record.revokedAt !== null ||
+        (record.expiresAt <= this.clock.now() && !this.isLifecycleLeased(sessionId))) {
+      return false;
+    }
+    if (!this.pin(sessionId, owner)) return false;
+    const owners = this.lifecycleLeases.get(sessionId) ?? new Set<string>();
+    owners.add(owner);
+    this.lifecycleLeases.set(sessionId, owners);
+    return true;
+  }
+
+  releaseLifecycle(sessionId: string, owner: string): boolean {
+    const owners = this.lifecycleLeases.get(sessionId);
+    if (!owners || !owners.delete(owner)) return false;
+    if (owners.size === 0) this.lifecycleLeases.delete(sessionId);
+    this.unpin(sessionId, owner);
+    return true;
+  }
+
+  isLifecycleLeased(sessionId: string): boolean {
+    return (this.lifecycleLeases.get(sessionId)?.size ?? 0) > 0;
+  }
+
   isPinned(sessionId: string, externallyPinned: ReadonlySet<string> = new Set()): boolean {
     return externallyPinned.has(sessionId) || (this.retentionPins.get(sessionId)?.size ?? 0) > 0;
   }
@@ -300,7 +426,9 @@ export class SessionStore {
     const record = this.sessions.get(sessionId);
     if (!record) throw new ObserverError("SESSION_NOT_FOUND", "Observer session was not found", 404);
     if (record.revokedAt !== null) throw new ObserverError("SESSION_EXPIRED", "Observer session is revoked", 410);
-    if (record.expiresAt <= this.clock.now()) throw new ObserverError("SESSION_EXPIRED", "Observer session has expired", 410);
+    if (record.expiresAt <= this.clock.now() && !this.isLifecycleLeased(sessionId)) {
+      throw new ObserverError("SESSION_EXPIRED", "Observer session has expired", 410);
+    }
     return record;
   }
 
@@ -359,7 +487,7 @@ export class SessionStore {
   sweep(now = this.clock.now(), externallyPinned: ReadonlySet<string> = new Set()): SessionSweepResult {
     const expiredSessionIds: string[] = [];
     for (const record of this.sessions.values()) {
-      if (record.revokedAt === null && record.expiresAt <= now) {
+      if (record.revokedAt === null && record.expiresAt <= now && !this.isLifecycleLeased(record.sessionId)) {
         try {
           this.revoke(record.sessionId);
         } catch {
@@ -378,6 +506,7 @@ export class SessionStore {
       }
       this.sessions.delete(record.sessionId);
       this.retentionPins.delete(record.sessionId);
+      this.lifecycleLeases.delete(record.sessionId);
       removedSessionIds.push(record.sessionId);
     }
     return { expiredSessionIds, removedSessionIds };
@@ -390,7 +519,10 @@ export class SessionStore {
   activeBundleDigests(): Set<string> {
     const result = new Set<string>();
     for (const record of this.sessions.values()) {
-      if (record.revokedAt === null && record.expiresAt > this.clock.now()) result.add(record.bundleDigest);
+      if (this.isLifecycleLeased(record.sessionId) ||
+          (record.revokedAt === null && record.expiresAt > this.clock.now())) {
+        result.add(record.bundleDigest);
+      }
     }
     return result;
   }
@@ -400,17 +532,20 @@ export class SessionStore {
   }
 
   activeRecords(): SessionRecord[] {
-    return [...this.sessions.values()].filter((record) => record.revokedAt === null && record.expiresAt > this.clock.now());
+    return [...this.sessions.values()].filter((record) => record.revokedAt === null &&
+      (record.expiresAt > this.clock.now() || this.isLifecycleLeased(record.sessionId)));
   }
 
   stats(now = this.clock.now()): SessionStoreStats {
     const records = [...this.sessions.values()];
-    const active = records.filter((record) => record.revokedAt === null && record.expiresAt > now).length;
+    const active = records.filter((record) => record.revokedAt === null &&
+      (record.expiresAt > now || this.isLifecycleLeased(record.sessionId))).length;
     return {
       records: records.length,
       active,
       terminal: records.length - active,
       pinned: [...this.retentionPins.values()].filter((owners) => owners.size > 0).length,
+      lifecycleLeased: [...this.lifecycleLeases.values()].filter((owners) => owners.size > 0).length,
       estimatedBytes: records.reduce((total, record) => total + this.budgetedRecordBytes(record), 0),
       actualBytes: records.reduce((total, record) => total + this.recordBytes(record), 0),
       maxRecords: this.maxRecords,

@@ -30,9 +30,16 @@ import {
 } from "../src/workbench/observer-adapter.js";
 import { WorkbenchProcessGuard } from "../src/workbench/process-guard.js";
 import {
+  OperationalBaselineRecorder,
   analyzePngMaterial,
   comparePngImages,
   inspectBlockingProcesses,
+  operationalBaselineEnvironment,
+  operationalBaselineLaunchArgumentIdentity,
+  operationalBaselineProcedureSha256,
+  operationalBaselineSource,
+  waitForOperationalBaselineProcessVacancy,
+  writeOperationalBaselineArtifact,
   type PngComparisonEvidence,
   type PngMaterialEvidence,
 } from "./observer-live-acceptance-support.js";
@@ -45,13 +52,48 @@ export const LIVE_WORKBENCH_OBSERVER_TEST_CONFIRMATION =
 const SCRIPT_PATH = fileURLToPath(import.meta.url);
 const REPOSITORY_ROOT = resolve(dirname(SCRIPT_PATH), "..");
 const LOCAL_CONFIG_PATH = join(REPOSITORY_ROOT, "reforger-forge.config.json");
+const WORKBENCH_OPERATIONAL_BASELINE_SOURCES = [
+  "dist/observer/agent/private-child.js",
+  "observer/addon/.reforger-forge-observer-source.json",
+  "observer/addon/addon.gproj",
+  "observer/agent/private-child.ts",
+  "observer/workbench-addon/.reforger-forge-workbench-helper-source.json",
+  "observer/workbench-addon/addon.gproj",
+  "package-lock.json",
+  "package.json",
+  "scripts/windows/workbench-lifecycle.ps1",
+  "src/observer/coordinator.ts",
+  "src/workbench/child-supervisor.ts",
+  "src/workbench/client.ts",
+  "src/workbench/helper-addon.ts",
+  "src/workbench/observer-adapter.ts",
+  "src/workbench/process-guard.ts",
+] as const;
+const OBSERVER_OPERATIONAL_BASELINE_SOURCE_CLOSURES = [
+  { path: "dist/observer/agent/**/*.js", directory: "dist/observer/agent", extension: ".js" },
+  { path: "dist/observer/protocol/**/*.js", directory: "dist/observer/protocol", extension: ".js" },
+  { path: "observer/addon/**/*.c", directory: "observer/addon", extension: ".c" },
+  { path: "observer/agent/**/*.ts", directory: "observer/agent", extension: ".ts" },
+  { path: "observer/protocol/**/*.ts", directory: "observer/protocol", extension: ".ts" },
+  { path: "observer/workbench-addon/**/*.c", directory: "observer/workbench-addon", extension: ".c" },
+  { path: "src/**/*.ts", directory: "src", extension: ".ts" },
+] as const;
 const BASE_EVERON_WORLD = "{853E92315D1D9EFE}worlds/Eden/Eden.ent";
+const WORKBENCH_CAPTURE_LABELS = [
+  "initial-current",
+  "explicit-pose",
+  "post-pose-restoration-current",
+  "explicit-look-at",
+  "post-look-at-restoration-current",
+] as const;
 const TERMINAL_STATES = new Set(["completed", "failed", "cancelled"]);
 
 export interface WorkbenchObserverAcceptanceOptions {
   confirmed: boolean;
   environment?: NodeJS.ProcessEnv;
   artifactRoot?: string;
+  /** Defaults to the repository's docs/validation directory. */
+  validationRoot?: string;
   timeoutMs?: number;
 }
 
@@ -60,6 +102,7 @@ export interface WorkbenchObserverAcceptanceResult {
   summaryPath: string;
   evidenceDirectory: string;
   manifestPath: string;
+  baselinePath: string;
   summary: Record<string, unknown>;
 }
 
@@ -291,6 +334,32 @@ function acceptanceConfig(projectRoot: string, managedRoot: string): Config {
   };
 }
 
+function firstRegularExecutable(candidates: string[]): string | undefined {
+  return candidates.find((candidate) => {
+    if (!existsSync(candidate)) return false;
+    const entry = lstatSync(candidate);
+    return entry.isFile() && !entry.isSymbolicLink();
+  });
+}
+
+function workbenchEnvironmentExecutables(config: Config): {
+  workbenchExecutable?: string;
+  gameExecutable?: string;
+} {
+  return {
+    workbenchExecutable: firstRegularExecutable([
+      join(config.workbenchPath, "Workbench", "ArmaReforgerWorkbenchSteamDiag.exe"),
+      join(config.workbenchPath, "ArmaReforgerWorkbenchSteamDiag.exe"),
+    ]),
+    gameExecutable: firstRegularExecutable([
+      join(config.gamePath, "ArmaReforgerSteamDiag.exe"),
+      join(config.gamePath, "ArmaReforgerDiag.exe"),
+      join(config.gamePath, "ArmaReforgerSteam.exe"),
+      join(config.gamePath, "ArmaReforger.exe"),
+    ]),
+  };
+}
+
 function assertNoArmaOrWorkbench(): void {
   const blockers = inspectBlockingProcesses();
   if (blockers.length > 0) {
@@ -356,7 +425,7 @@ async function pollTerminal(
   return status;
 }
 
-async function captureAndRetain(
+async function captureAndRetainUnmeasured(
   coordinator: ObserverCoordinator,
   view: ObserverCaptureView,
   label: string,
@@ -410,6 +479,32 @@ async function captureAndRetain(
     throw new Error(`${label} managed job artifact metadata disagrees with the independently validated PNG`);
   }
   return { label, submitted, completed, image: retained.image, png };
+}
+
+async function captureAndRetain(
+  coordinator: ObserverCoordinator,
+  view: ObserverCaptureView,
+  label: string,
+  runId: string,
+  instanceId: string,
+  expectedWorldId: string,
+  deadline: number,
+  baseline: OperationalBaselineRecorder
+): Promise<RetainedCapture> {
+  return baseline.measure(
+    "capture",
+    `ObserverCoordinator.capture/jobStatus/readJob(${label})`,
+    () => captureAndRetainUnmeasured(
+      coordinator,
+      view,
+      label,
+      runId,
+      instanceId,
+      expectedWorldId,
+      deadline
+    ),
+    label
+  );
 }
 
 function writeSummary(path: string, summary: Record<string, unknown>): void {
@@ -571,6 +666,9 @@ export async function runWorkbenchObserverAcceptance(
   mkdirSync(managedRoot);
   mkdirSync(evidenceRoot);
   const summaryPath = join(runDirectory, "summary.json");
+  const validationRoot = resolve(
+    options.validationRoot ?? join(REPOSITORY_ROOT, "docs", "validation")
+  );
   const project = createDisposableProject(projectRoot);
   const config = acceptanceConfig(projectRoot, managedRoot);
   const guard = new WorkbenchProcessGuard({
@@ -578,6 +676,7 @@ export async function runWorkbenchObserverAcceptance(
     helperPath: join(REPOSITORY_ROOT, "scripts", "windows", "workbench-lifecycle.ps1"),
     lockTimeoutMs: 20_000,
   });
+  let baselineLaunchArguments = operationalBaselineLaunchArgumentIdentity([], false);
   const client = new WorkbenchClient(
     config.workbenchHost,
     config.workbenchPort,
@@ -589,8 +688,11 @@ export async function runWorkbenchObserverAcceptance(
       launchPollIntervalMs: 1_000,
       // Acceptance projects are created immediately before launch. A fixed,
       // argument-array-only force update indexes the world without a shell.
-      spawnProcess: (command, argumentsArray, spawnOptions) =>
-        spawn(command, [...argumentsArray, "-forceUpdate"], spawnOptions),
+      spawnProcess: (command, argumentsArray, spawnOptions) => {
+        const actualArguments = [...argumentsArray, "-forceUpdate"];
+        baselineLaunchArguments = operationalBaselineLaunchArgumentIdentity(actualArguments);
+        return spawn(command, actualArguments, spawnOptions);
+      },
     }
   );
   const adapter = new WorkbenchObserverAdapter(client, { handlerTimeoutMs: 10_000 });
@@ -613,11 +715,38 @@ export async function runWorkbenchObserverAcceptance(
     workbenchAdapter: adapter,
   });
   let cleanupClient = client;
+  const readBaselineProcessCounts = () => {
+    const primary = client.diagnosticSupervisedChildCounts();
+    const recovery = cleanupClient === client
+      ? { active: 0, reconciling: 0, total: 0 }
+      : cleanupClient.diagnosticSupervisedChildCounts();
+    const observerPrivateChildren = coordinator.diagnosticPrivateChildCount();
+    return {
+      active: primary.active + recovery.active + observerPrivateChildren,
+      reconciling: primary.reconciling + recovery.reconciling,
+      total: primary.total + recovery.total + observerPrivateChildren,
+    };
+  };
+  const baseline = new OperationalBaselineRecorder({
+    backend: "workbench",
+    readSupervisedProcessCounts: readBaselineProcessCounts,
+  });
+  const baselineEnvironment = operationalBaselineEnvironment(
+    workbenchEnvironmentExecutables(config)
+  );
+  const baselineSource = operationalBaselineSource(
+    SCRIPT_PATH,
+    "scripts/run-workbench-observer-acceptance.ts",
+    REPOSITORY_ROOT,
+    WORKBENCH_OPERATIONAL_BASELINE_SOURCES,
+    OBSERVER_OPERATIONAL_BASELINE_SOURCE_CLOSURES
+  );
+  baseline.sampleProcessCounts("rest.beforeLaunch");
   const deadline = Date.now() + timeoutMs;
   const summary: Record<string, unknown> = {
     version: 1,
     status: "running",
-    startedAt: new Date().toISOString(),
+    startedAt: baseline.startedAt,
     runDirectory,
     project: project.projectPath,
     worldResource: project.worldResource,
@@ -628,6 +757,7 @@ export async function runWorkbenchObserverAcceptance(
   let failure: unknown = null;
   let observerRunId: string | null = null;
   let bundle: FinalizedBundleEvidence | null = null;
+  let baselinePath = "";
   try {
     assertNoArmaOrWorkbench();
     const begun = await coordinator.beginRun({
@@ -638,12 +768,22 @@ export async function runWorkbenchObserverAcceptance(
     });
     observerRunId = requiredString(begun.runId, "Managed observer run ID");
     summary.observerRun = begun;
-    const launched = await client.ensureRunning(project.projectPath);
+    const launched = await baseline.measure(
+      "launch",
+      "WorkbenchClient.ensureRunning",
+      () => client.ensureRunning(project.projectPath),
+      "running_confirmation"
+    );
     summary.launch = launched;
-    const open = await client.call<Record<string, unknown>>("EMCP_WB_EditorControl", {
-      action: "openResource",
-      path: project.worldResource,
-    }, { skipAutoLaunch: true, timeout: 30_000 });
+    const open = await baseline.measure(
+      "managed_call",
+      "WorkbenchClient.call(EMCP_WB_EditorControl.openResource)",
+      () => client.call<Record<string, unknown>>("EMCP_WB_EditorControl", {
+        action: "openResource",
+        path: project.worldResource,
+      }, { skipAutoLaunch: true, timeout: 30_000 }),
+      "representative_net_api"
+    );
     if (open.status !== "ok" || !String(open.message ?? "").startsWith("Opened resource:")) {
       throw new Error(`Disposable acceptance world did not open: ${String(open.message ?? "no response")}`);
     }
@@ -658,27 +798,33 @@ export async function runWorkbenchObserverAcceptance(
       observerRunId,
       instanceId,
       expectedWorldId,
-      deadline
+      deadline,
+      baseline
     );
     const inventory = await coordinator.instances({ renderersOnly: true });
     const workbenchInventory = inventory.instances.filter((instance) => instance.backend === "workbench");
-    const ping = await adapter.ping();
+    const ping = await baseline.measure(
+      "managed_call",
+      "WorkbenchObserverAdapter.ping(EMCP_WB_Ping)",
+      () => adapter.ping(),
+      "representative_net_api"
+    );
     if (workbenchInventory.length !== 1 || workbenchInventory[0].instanceId !== instanceId ||
         workbenchInventory[0].worldId !== expectedWorldId ||
         !ping.capabilities.includes("render.capture") ||
         !ping.capabilities.includes("camera.editor") || !ping.restorationApiAvailable) {
       throw new Error("Workbench failed to advertise proven render.capture and camera.editor after current-view restoration");
     }
-    const baseline = initial.completed.actualCamera;
-    const baselineFov = baseline.verticalFov;
+    const baselineCamera = initial.completed.actualCamera;
+    const baselineFov = baselineCamera.verticalFov;
     if (!Number.isFinite(baselineFov) || baselineFov < 1 || baselineFov > 179) {
       throw new Error(`Baseline editor FOV is outside pose request bounds: ${baselineFov}`);
     }
-    const orientation = quaternionFromWorkbenchMatrix(baseline.matrix);
+    const orientation = quaternionFromWorkbenchMatrix(baselineCamera.matrix);
     const posePosition: [number, number, number] = [
-      baseline.position[0] + 75,
-      baseline.position[1] + 25,
-      baseline.position[2] + 50,
+      baselineCamera.position[0] + 75,
+      baselineCamera.position[1] + 25,
+      baselineCamera.position[2] + 50,
     ];
     const poseFov = baselineFov <= 169 ? baselineFov + 10 : baselineFov - 10;
     const poseView = {
@@ -694,7 +840,8 @@ export async function runWorkbenchObserverAcceptance(
       observerRunId,
       instanceId,
       expectedWorldId,
-      deadline
+      deadline,
+      baseline
     );
     const poseDifference: PngComparisonEvidence = comparePngImages(initial.image, pose.image);
     if (!poseDifference.materiallyDifferent) {
@@ -722,22 +869,23 @@ export async function runWorkbenchObserverAcceptance(
       observerRunId,
       instanceId,
       expectedWorldId,
-      deadline
+      deadline,
+      baseline
     );
     assertRestoredWorkbenchCurrent(initial, postPose, "Post-pose current capture");
 
-    const right = baseline.matrix[0];
-    const up = baseline.matrix[1];
-    const forward = baseline.matrix[2];
+    const right = baselineCamera.matrix[0];
+    const up = baselineCamera.matrix[1];
+    const forward = baselineCamera.matrix[2];
     const lookAtPosition: [number, number, number] = [
-      baseline.position[0] - right[0] * 90 + up[0] * 35 - forward[0] * 60,
-      baseline.position[1] - right[1] * 90 + up[1] * 35 - forward[1] * 60,
-      baseline.position[2] - right[2] * 90 + up[2] * 35 - forward[2] * 60,
+      baselineCamera.position[0] - right[0] * 90 + up[0] * 35 - forward[0] * 60,
+      baselineCamera.position[1] - right[1] * 90 + up[1] * 35 - forward[1] * 60,
+      baselineCamera.position[2] - right[2] * 90 + up[2] * 35 - forward[2] * 60,
     ];
     const lookAtTarget: [number, number, number] = [
-      baseline.position[0] + forward[0] * 150,
-      baseline.position[1] + forward[1] * 150,
-      baseline.position[2] + forward[2] * 150,
+      baselineCamera.position[0] + forward[0] * 150,
+      baselineCamera.position[1] + forward[1] * 150,
+      baselineCamera.position[2] + forward[2] * 150,
     ];
     const lookAtFov = baselineFov <= 164 ? baselineFov + 15 : baselineFov - 15;
     const lookAtView = {
@@ -753,7 +901,8 @@ export async function runWorkbenchObserverAcceptance(
       observerRunId,
       instanceId,
       expectedWorldId,
-      deadline
+      deadline,
+      baseline
     );
     const lookAtDifference: PngComparisonEvidence = comparePngImages(initial.image, lookAt.image);
     if (!lookAtDifference.materiallyDifferent) {
@@ -776,7 +925,8 @@ export async function runWorkbenchObserverAcceptance(
       observerRunId,
       instanceId,
       expectedWorldId,
-      deadline
+      deadline,
+      baseline
     );
     assertRestoredWorkbenchCurrent(initial, postLookAt, "Post-look-at current capture");
     summary.inventory = inventory;
@@ -835,7 +985,12 @@ export async function runWorkbenchObserverAcceptance(
       }
     }
     try {
-      await adapter.restoreAll();
+      await baseline.measure(
+        "shutdown",
+        "WorkbenchObserverAdapter.restoreAll",
+        () => adapter.restoreAll(),
+        "observer_restoration"
+      );
       summary.adapterRestoration = "complete";
     } catch (error) {
       failure ??= error;
@@ -843,7 +998,12 @@ export async function runWorkbenchObserverAcceptance(
       summary.status = "failed";
     }
     try {
-      await coordinator.close();
+      await baseline.measure(
+        "shutdown",
+        "ObserverCoordinator.close",
+        () => coordinator.close(),
+        "observer_cleanup"
+      );
       summary.coordinatorShutdown = "complete";
     } catch (error) {
       failure ??= error;
@@ -851,7 +1011,19 @@ export async function runWorkbenchObserverAcceptance(
       summary.status = "failed";
     }
     try {
-      summary.shutdown = await client.shutdownOwnedWorkbench();
+      summary.shutdown = await baseline.measure(
+        "shutdown",
+        "WorkbenchClient.shutdownOwnedWorkbench",
+        async () => {
+          const result = await client.shutdownOwnedWorkbench();
+          if (!result.stopped) {
+            throw new Error("Owned Workbench shutdown did not terminate the launched lifecycle child");
+          }
+          return result;
+        },
+        "termination",
+        (result) => ({ stopped: result.stopped })
+      );
     } catch (error) {
       failure ??= error;
       summary.shutdown = error instanceof Error ? error.message : String(error);
@@ -869,7 +1041,12 @@ export async function runWorkbenchObserverAcceptance(
           `live-workbench-observer-recovery-${randomUUID()}`,
           guard
         );
-        summary.shutdownRecovery = await cleanupClient.shutdownOwnedWorkbench();
+        summary.shutdownRecovery = await baseline.measure(
+          "shutdown",
+          "WorkbenchClient.shutdownOwnedWorkbench(recovery)",
+          () => cleanupClient.shutdownOwnedWorkbench(),
+          "termination_recovery"
+        );
       } catch (recoveryError) {
         summary.shutdownRecovery = recoveryError instanceof Error ? recoveryError.message : String(recoveryError);
       }
@@ -885,6 +1062,113 @@ export async function runWorkbenchObserverAcceptance(
     } else {
       summary.projectCleanupRequired = false;
     }
+    let supervisedProcessVacancy: Awaited<ReturnType<
+      typeof waitForOperationalBaselineProcessVacancy
+    >> | null = null;
+    try {
+      supervisedProcessVacancy = await baseline.measure(
+        "shutdown",
+        "waitForOperationalBaselineProcessVacancy",
+        async () => {
+          const evidence = await waitForOperationalBaselineProcessVacancy(
+            readBaselineProcessCounts
+          );
+          supervisedProcessVacancy = evidence;
+          if (!evidence.vacant) {
+            const error = new Error(
+              `Supervised process vacancy was not observed within ${evidence.timeoutMs} ms ` +
+              `(active=${evidence.counts.active}, reconciling=${evidence.counts.reconciling}, ` +
+              `total=${evidence.counts.total})`
+            );
+            error.name = "SupervisedProcessVacancyTimeoutError";
+            throw error;
+          }
+          return evidence;
+        },
+        "supervised_exit_settle",
+        (evidence) => ({
+          vacant: evidence.vacant,
+          polls: evidence.polls,
+          waitedMs: evidence.waitedMs,
+          finalActive: evidence.counts.active,
+          finalReconciling: evidence.counts.reconciling,
+          finalTotal: evidence.counts.total,
+        })
+      );
+      summary.supervisedProcessVacancy = supervisedProcessVacancy;
+    } catch (error) {
+      failure ??= error;
+      summary.status = "failed";
+      summary.supervisedProcessVacancy = {
+        ...(supervisedProcessVacancy ?? {}),
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
+    baseline.sampleProcessCounts("rest.afterShutdown");
+    try {
+      const baselineFailed = Boolean(failure) || summary.status !== "passed";
+      const artifact = baseline.artifact({
+        result: baselineFailed ? "failed" : "passed",
+        environment: baselineEnvironment,
+        workload: {
+          procedureRevision: "workbench-observer-live-acceptance-v3",
+          runtimeKind: "workbench",
+          overallTimeoutMs: timeoutMs,
+          worldResource: BASE_EVERON_WORLD,
+          fixture: {
+            kind: "disposable_workbench_world",
+            id: "ObserverAcceptance",
+            guid: null,
+            sourceFileCount: 3,
+            sourceSha256: operationalBaselineProcedureSha256({
+              projectName: "ObserverAcceptance",
+              parentWorld: BASE_EVERON_WORLD,
+              worldResourcePattern: "{random-16-hex}Worlds/ObserverAcceptance.ent",
+            }),
+          },
+          capture: {
+            labels: [...WORKBENCH_CAPTURE_LABELS],
+            settleFrames: 3,
+            performancePolicy: "evidence",
+            asynchronous: true,
+            configurationSha256: operationalBaselineProcedureSha256({
+              initial: "current",
+              pose: {
+                positionOffset: [75, 25, 50],
+                orientation: "initial-camera",
+                fovDeltaWithinBounds: 10,
+              },
+              restorations: ["post-pose-current", "post-look-at-current"],
+              lookAt: {
+                positionInInitialBasis: { right: -90, up: 35, forward: -60 },
+                targetInInitialBasis: { forward: 150 },
+                fovDeltaWithinBounds: 15,
+              },
+            }),
+          },
+          launchArguments: baselineLaunchArguments,
+        },
+        source: baselineSource,
+        limitations: [
+          "Descriptive controlled-run baseline only; no timing or process-count thresholds are applied.",
+          "Supervised counts combine ChildSupervisor-managed Workbench lifecycle children with count-only ObserverCoordinator private-child tracking through actual child exit.",
+          "Configured Workbench add-on roots outside the disposable project and managed helper are represented by path-list cardinality, not external add-on content; compare runs only when those roots are unchanged.",
+        ],
+        ...(baselineFailed ? {
+          failureName: failure instanceof Error ? failure.name : "AcceptanceFailed",
+        } : {}),
+      });
+      baselinePath = writeOperationalBaselineArtifact(validationRoot, artifact);
+      summary.operationalBaseline = {
+        artifact: relative(REPOSITORY_ROOT, baselinePath).replace(/\\/g, "/"),
+        result: artifact.result,
+        kind: artifact.kind,
+      };
+    } catch (error) {
+      failure ??= error;
+      summary.operationalBaseline = error instanceof Error ? error.message : String(error);
+      summary.status = "failed";
+    }
     summary.finishedAt = new Date().toISOString();
     writeSummary(summaryPath, summary);
   }
@@ -899,12 +1183,13 @@ export async function runWorkbenchObserverAcceptance(
     summaryPath,
     evidenceDirectory: bundle.evidenceDirectory,
     manifestPath: bundle.manifestPath,
+    baselinePath,
     summary,
   };
 }
 
 function usage(): string {
-  return `Usage: npm run observer:acceptance:workbench -- --confirm-live-run [--artifact-root <directory>] [--timeout-ms <60000..600000>]\n\n` +
+  return `Usage: npm run dev:observer:acceptance:workbench -- --confirm-live-run [--artifact-root <directory>] [--validation-root <directory>] [--timeout-ms <60000..600000>]\n\n` +
     `Required environment: ${LIVE_WORKBENCH_OBSERVER_ENVIRONMENT}=1\n`;
 }
 
@@ -924,12 +1209,14 @@ if (process.argv[1] && resolve(process.argv[1]) === resolve(SCRIPT_PATH)) {
       const result = await runWorkbenchObserverAcceptance({
         confirmed: process.argv.includes("--confirm-live-run"),
         artifactRoot: readOption("--artifact-root"),
+        validationRoot: readOption("--validation-root"),
         timeoutMs: readOption("--timeout-ms") ? Number(readOption("--timeout-ms")) : undefined,
       });
       process.stdout.write(
         `Workbench observer acceptance passed.\n` +
         `RFO_WORKBENCH_OBSERVER_ACCEPTANCE_RESULT=${result.summaryPath}\n` +
-        `RFO_WORKBENCH_OBSERVER_ACCEPTANCE_MANIFEST=${result.manifestPath}\n`
+        `RFO_WORKBENCH_OBSERVER_ACCEPTANCE_MANIFEST=${result.manifestPath}\n` +
+        `RFO_WORKBENCH_OPERATIONAL_BASELINE=${result.baselinePath}\n`
       );
     } catch (error) {
       process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);

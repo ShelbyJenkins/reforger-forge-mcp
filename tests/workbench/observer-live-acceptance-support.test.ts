@@ -1,14 +1,27 @@
 import { createHash } from "node:crypto";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { deflateSync } from "node:zlib";
 import { describe, expect, it } from "vitest";
 import {
+  OperationalBaselineRecorder,
   analyzePngMaterial,
+  buildOperationalBaselineArtifact,
   compareDecodedPng,
   comparePngImages,
   decodePng,
   detectColorMarker,
   detectPngColorMarker,
   findBlockingProcesses,
+  operationalBaselineDirectoryIdentity,
+  operationalBaselineEnvironment,
+  operationalBaselineLaunchArgumentIdentity,
+  operationalBaselineProcedureSha256,
+  operationalBaselineSource,
+  waitForOperationalBaselineProcessVacancy,
+  type AcceptanceSupervisedProcessCounts,
+  type OperationalBaselineEnvironment,
+  type OperationalBaselineWorkload,
 } from "../../scripts/observer-live-acceptance-support.js";
 
 function crcTable(): Uint32Array {
@@ -82,7 +95,564 @@ function gradientPixel(x: number, y: number): readonly [number, number, number] 
   return [(x * 3) & 0xff, (y * 3) & 0xff, ((x + y) * 2) & 0xff];
 }
 
+function testWorkload(backend: "workbench" | "runtime"): OperationalBaselineWorkload {
+  return {
+    procedureRevision: backend === "workbench"
+      ? "workbench-observer-live-acceptance-v3"
+      : "runtime-observer-acceptance-v2",
+    runtimeKind: backend === "workbench" ? "workbench" : "listenServer",
+    overallTimeoutMs: 300_000,
+    worldResource: "{96A8AF57260A7392}worlds/MP/MpTest/MpTest.ent",
+    fixture: backend === "workbench" ? {
+      kind: "disposable_workbench_world",
+      id: "ObserverAcceptance",
+      guid: null,
+      sourceFileCount: 3,
+      sourceSha256: "f".repeat(64),
+    } : null,
+    capture: {
+      labels: ["initial-current"],
+      settleFrames: 3,
+      performancePolicy: "evidence",
+      asynchronous: backend === "workbench",
+      configurationSha256: "e".repeat(64),
+    },
+    launchArguments: operationalBaselineLaunchArgumentIdentity(["-noThrow"]),
+  };
+}
+
+function testEnvironment(backend: "workbench" | "runtime"): OperationalBaselineEnvironment {
+  const executable = backend === "workbench"
+    ? "ArmaReforgerWorkbenchSteamDiag.exe"
+    : "ArmaReforgerSteamDiag.exe";
+  return operationalBaselineEnvironment({
+    ...(backend === "workbench"
+      ? { workbenchExecutable: executable }
+      : { gameExecutable: executable }),
+    inspectVersion: () => ({
+      executable,
+      version: "1.7.0.54",
+      fileVersion: "1.7.0.54",
+      discovery: "windows_file_metadata",
+    }),
+  });
+}
+
 describe("live observer acceptance support", () => {
+  it("records boundary timing and count-only process snapshots without thresholds", async () => {
+    let wallMs = Date.parse("2026-07-19T06:00:00.000Z");
+    let monotonicMs = 500;
+    let counts: AcceptanceSupervisedProcessCounts = { active: 0, reconciling: 0, total: 0 };
+    const recorder = new OperationalBaselineRecorder({
+      backend: "workbench",
+      readSupervisedProcessCounts: () => counts,
+      clock: {
+        wallNow: () => new Date(wallMs),
+        monotonicNow: () => monotonicMs,
+      },
+    });
+
+    recorder.sampleProcessCounts("rest.beforeLaunch");
+    const result = await recorder.measure(
+      "launch",
+      "WorkbenchClient.ensureRunning",
+      async () => {
+        wallMs += 1_250;
+        monotonicMs += 1_250.375;
+        counts = { active: 1, reconciling: 0, total: 1 };
+        return "running";
+      },
+      "running_confirmation"
+    );
+    expect(result).toBe("running");
+    await recorder.measure(
+      "managed_call",
+      "WorkbenchObserverAdapter.ping(EMCP_WB_Ping)",
+      async () => {
+        wallMs += 10;
+        monotonicMs += 10;
+        return { status: "ok" };
+      },
+      "representative_net_api"
+    );
+    await recorder.measure(
+      "capture",
+      "ObserverCoordinator.capture/jobStatus/readJob(initial-current)",
+      async () => {
+        wallMs += 100;
+        monotonicMs += 100;
+        return { artifactAvailable: true };
+      },
+      "initial-current"
+    );
+    await recorder.measure(
+      "shutdown",
+      "ObserverCoordinator.close",
+      async () => {
+        wallMs += 5;
+        monotonicMs += 5;
+      },
+      "observer_cleanup"
+    );
+    await recorder.measure(
+      "shutdown",
+      "WorkbenchClient.shutdownOwnedWorkbench",
+      async () => {
+        wallMs += 50;
+        monotonicMs += 50;
+        counts = { active: 0, reconciling: 0, total: 0 };
+        return { stopped: true };
+      },
+      "termination",
+      (shutdown) => ({ stopped: shutdown.stopped })
+    );
+    await recorder.measure(
+      "shutdown",
+      "waitForOperationalBaselineProcessVacancy",
+      async () => ({
+        vacant: true,
+        timeoutMs: 5_000,
+        pollIntervalMs: 25,
+        polls: 1,
+        waitedMs: 0,
+        counts,
+      }),
+      "supervised_exit_settle",
+      (evidence) => ({
+        vacant: evidence.vacant,
+        polls: evidence.polls,
+        waitedMs: evidence.waitedMs,
+        finalActive: evidence.counts.active,
+        finalReconciling: evidence.counts.reconciling,
+        finalTotal: evidence.counts.total,
+      })
+    );
+    recorder.sampleProcessCounts("rest.afterShutdown");
+    wallMs += 250;
+    monotonicMs += 250;
+    const artifact = recorder.artifact({
+      result: "passed",
+      environment: testEnvironment("workbench"),
+      workload: testWorkload("workbench"),
+      source: {
+        harness: { path: "scripts/run-workbench-observer-acceptance.ts", sha256: "a".repeat(64) },
+        recorder: { path: "scripts/observer-live-acceptance-support.ts", sha256: "d".repeat(64) },
+        measured: [{ path: "src/workbench/client.ts", sha256: "e".repeat(64) }],
+      },
+      limitations: ["Descriptive baseline only; no thresholds are applied."],
+    });
+
+    expect(artifact).toMatchObject({
+      schemaVersion: 1,
+      kind: "reforger_forge_workbench_operational_baseline",
+      backend: "workbench",
+      result: "passed",
+      thresholds: null,
+    });
+    expect(artifact.measurements[0]).toMatchObject({
+      boundary: "launch",
+      operation: "WorkbenchClient.ensureRunning",
+      phase: "running_confirmation",
+      durationMs: 1250.375,
+      outcome: "passed",
+      processCountBefore: { active: 0, reconciling: 0, total: 0 },
+      processCountAfter: { active: 1, reconciling: 0, total: 1 },
+    });
+    expect(artifact.processCounts.map((sample) => sample.label)).toEqual([
+      "rest.beforeLaunch",
+      "launch.running_confirmation.WorkbenchClient.ensureRunning.before",
+      "launch.running_confirmation.WorkbenchClient.ensureRunning.after",
+      "managed_call.representative_net_api.WorkbenchObserverAdapter.ping(EMCP_WB_Ping).before",
+      "managed_call.representative_net_api.WorkbenchObserverAdapter.ping(EMCP_WB_Ping).after",
+      "capture.initial-current.ObserverCoordinator.capture/jobStatus/readJob(initial-current).before",
+      "capture.initial-current.ObserverCoordinator.capture/jobStatus/readJob(initial-current).after",
+      "shutdown.observer_cleanup.ObserverCoordinator.close.before",
+      "shutdown.observer_cleanup.ObserverCoordinator.close.after",
+      "shutdown.termination.WorkbenchClient.shutdownOwnedWorkbench.before",
+      "shutdown.termination.WorkbenchClient.shutdownOwnedWorkbench.after",
+      "shutdown.supervised_exit_settle.waitForOperationalBaselineProcessVacancy.before",
+      "shutdown.supervised_exit_settle.waitForOperationalBaselineProcessVacancy.after",
+      "rest.afterShutdown",
+    ]);
+    const { schemaVersion: _schema, kind: _kind, thresholds: _thresholds, ...rebuilt } = artifact;
+    expect(() => buildOperationalBaselineArtifact({
+      ...rebuilt,
+      environment: { ...rebuilt.environment, workbench: null },
+    })).toThrow(/Workbench Windows file metadata/);
+    expect(() => buildOperationalBaselineArtifact({
+      ...rebuilt,
+      measurements: rebuilt.measurements.filter((item) => item.boundary !== "capture"),
+    })).toThrow(/capture availability/);
+    expect(() => buildOperationalBaselineArtifact({
+      ...rebuilt,
+      measurements: rebuilt.measurements.filter((item) =>
+        item.operation !== "waitForOperationalBaselineProcessVacancy"),
+    })).toThrow(/supervised exit-settle vacancy evidence/);
+  });
+
+  it("waits deterministically for delayed supervised-process vacancy", async () => {
+    let monotonicMs = 0;
+    const observations: AcceptanceSupervisedProcessCounts[] = [
+      { active: 1, reconciling: 1, total: 2 },
+      { active: 0, reconciling: 1, total: 1 },
+      { active: 0, reconciling: 0, total: 0 },
+    ];
+    let readIndex = 0;
+
+    await expect(waitForOperationalBaselineProcessVacancy(
+      () => observations[Math.min(readIndex++, observations.length - 1)],
+      {
+        timeoutMs: 50,
+        pollIntervalMs: 10,
+        monotonicNow: () => monotonicMs,
+        wait: async (milliseconds) => {
+          monotonicMs += milliseconds;
+        },
+      }
+    )).resolves.toEqual({
+      vacant: true,
+      timeoutMs: 50,
+      pollIntervalMs: 10,
+      polls: 3,
+      waitedMs: 20,
+      counts: { active: 0, reconciling: 0, total: 0 },
+    });
+  });
+
+  it("returns bounded nonzero count diagnostics when vacancy times out", async () => {
+    let monotonicMs = 0;
+    const counts = { active: 1, reconciling: 1, total: 2 };
+
+    await expect(waitForOperationalBaselineProcessVacancy(
+      () => counts,
+      {
+        timeoutMs: 25,
+        pollIntervalMs: 10,
+        monotonicNow: () => monotonicMs,
+        wait: async (milliseconds) => {
+          monotonicMs += milliseconds;
+        },
+      }
+    )).resolves.toEqual({
+      vacant: false,
+      timeoutMs: 25,
+      pollIntervalMs: 10,
+      polls: 4,
+      waitedMs: 25,
+      counts,
+    });
+  });
+
+  it("classifies failed measurements and rejects a passed artifact that contains one", async () => {
+    let wallMs = Date.parse("2026-07-19T06:10:00.000Z");
+    let monotonicMs = 10;
+    const recorder = new OperationalBaselineRecorder({
+      backend: "runtime",
+      readSupervisedProcessCounts: () => ({ active: 0, reconciling: 0, total: 0 }),
+      clock: {
+        wallNow: () => new Date(wallMs),
+        monotonicNow: () => monotonicMs,
+      },
+    });
+    await expect(recorder.measure("managed_call", "OwnedRuntimeManager.status", async () => {
+      wallMs += 5;
+      monotonicMs += 5;
+      throw new TypeError("fixture failure");
+    })).rejects.toThrow("fixture failure");
+    expect(recorder.artifact({
+      result: "failed",
+      environment: operationalBaselineEnvironment(),
+      workload: testWorkload("runtime"),
+      source: {
+        harness: { path: "scripts/run-runtime-observer-acceptance.ts", sha256: "b".repeat(64) },
+        recorder: { path: "scripts/observer-live-acceptance-support.ts", sha256: "d".repeat(64) },
+        measured: [{ path: "src/observer/owned-runtime-manager.ts", sha256: "e".repeat(64) }],
+      },
+      limitations: [],
+      failureName: "TypeError",
+    })).toMatchObject({
+      result: "failed",
+      failure: { name: "TypeError" },
+      measurements: [{ outcome: "failed", errorName: "TypeError" }],
+    });
+    expect(() => recorder.artifact({
+      result: "passed",
+      environment: operationalBaselineEnvironment(),
+      workload: testWorkload("runtime"),
+      source: {
+        harness: { path: "scripts/run-runtime-observer-acceptance.ts", sha256: "b".repeat(64) },
+        recorder: { path: "scripts/observer-live-acceptance-support.ts", sha256: "d".repeat(64) },
+        measured: [{ path: "src/observer/owned-runtime-manager.ts", sha256: "e".repeat(64) }],
+      },
+      limitations: [],
+    })).toThrow(/passed operational baseline/);
+  });
+
+  it("requires distinct durable termination and observer-cleanup evidence for a passed runtime baseline", () => {
+    const zero = { active: 0, reconciling: 0, total: 0 };
+    const measurement = (
+      boundary: "launch" | "managed_call" | "capture" | "shutdown",
+      operation: string,
+      phase: string,
+      observations?: Record<string, string | number | boolean | null>
+    ) => ({
+      boundary,
+      operation,
+      phase,
+      startedAt: "2026-07-19T06:20:00.000Z",
+      finishedAt: "2026-07-19T06:20:00.001Z",
+      durationMs: 1,
+      outcome: "passed" as const,
+      processCountBefore: zero,
+      processCountAfter: zero,
+      ...(observations ? { observations } : {}),
+    });
+    const input = {
+      backend: "runtime" as const,
+      result: "passed" as const,
+      startedAt: "2026-07-19T06:20:00.000Z",
+      finishedAt: "2026-07-19T06:20:01.000Z",
+      durationMs: 1_000,
+      environment: testEnvironment("runtime"),
+      workload: testWorkload("runtime"),
+      source: {
+        harness: { path: "scripts/run-runtime-observer-acceptance.ts", sha256: "a".repeat(64) },
+        recorder: { path: "scripts/observer-live-acceptance-support.ts", sha256: "b".repeat(64) },
+        measured: [
+          { path: "src/observer/coordinator.ts", sha256: "c".repeat(64) },
+          { path: "src/observer/owned-runtime-manager.ts", sha256: "d".repeat(64) },
+        ],
+      },
+      measurements: [
+        measurement("launch", "OwnedRuntimeManager.start/status(running)", "running_confirmation"),
+        measurement("managed_call", "OwnedRuntimeManager.status", "representative_status_api"),
+        measurement("capture", "ObserverCoordinator.capture(initial-current)", "initial-current"),
+        measurement("shutdown", "OwnedRuntimeManager.stop", "termination", {
+          terminationComplete: true,
+          identityVacant: true,
+        }),
+        measurement("shutdown", "OwnedRuntimeManager.stop", "observer_cleanup", {
+          observerCleanupPending: false,
+        }),
+        measurement("shutdown", "ObserverCoordinator.close", "observer_cleanup"),
+        measurement(
+          "shutdown",
+          "waitForOperationalBaselineProcessVacancy",
+          "supervised_exit_settle",
+          { vacant: true, finalTotal: 0 }
+        ),
+      ],
+      processCounts: [
+        { label: "rest.beforeLaunch", at: "2026-07-19T06:20:00.000Z", ...zero },
+        { label: "rest.afterShutdown", at: "2026-07-19T06:20:01.000Z", ...zero },
+      ],
+      limitations: [],
+      failure: null,
+    };
+
+    const artifact = buildOperationalBaselineArtifact(input);
+    expect(artifact.measurements.filter((item) =>
+      item.operation === "OwnedRuntimeManager.stop").map((item) => item.phase)).toEqual([
+      "termination",
+      "observer_cleanup",
+    ]);
+    expect(() => buildOperationalBaselineArtifact({
+      ...input,
+      measurements: input.measurements.filter((item) =>
+        item.operation !== "OwnedRuntimeManager.stop" || item.phase !== "observer_cleanup"),
+    })).toThrow(/lifecycle\/cleanup evidence/);
+    expect(() => buildOperationalBaselineArtifact({
+      ...input,
+      measurements: input.measurements.map((item) => item.phase === "supervised_exit_settle"
+        ? { ...item, observations: { vacant: true, finalTotal: 1 } }
+        : item),
+    })).toThrow(/supervised exit-settle vacancy evidence/);
+    expect(() => buildOperationalBaselineArtifact({
+      ...input,
+      processCounts: [
+        input.processCounts[0],
+        { ...input.processCounts[1], active: 1, total: 1 },
+      ],
+    })).toThrow(/zero supervised processes/);
+    expect(() => buildOperationalBaselineArtifact({
+      ...input,
+      environment: {
+        ...input.environment,
+        game: {
+          executable: "ArmaReforgerSteamDiag.exe",
+          version: null,
+          fileVersion: null,
+          discovery: "unavailable" as const,
+        },
+      },
+    })).toThrow(/game Windows file metadata/);
+  });
+
+  it("keeps executable metadata path-free and rejects absolute harness identities", () => {
+    const secretRoot = "C:\\Users\\private-user\\Steam\\Arma Reforger";
+    const environment = operationalBaselineEnvironment({
+      gameExecutable: `${secretRoot}\\ArmaReforgerSteamDiag.exe`,
+      inspectVersion: () => ({
+        executable: "ArmaReforgerSteamDiag.exe",
+        version: "1.7.0.54",
+        fileVersion: "1.7.0.54",
+        discovery: "windows_file_metadata",
+      }),
+    });
+    expect(environment.game).toMatchObject({
+      executable: "ArmaReforgerSteamDiag.exe",
+      version: "1.7.0.54",
+    });
+    expect(JSON.stringify(environment)).not.toContain("private-user");
+    expect(environment).not.toHaveProperty("hostname");
+
+    expect(() => buildOperationalBaselineArtifact({
+      backend: "runtime",
+      result: "passed",
+      startedAt: "2026-07-19T06:00:00.000Z",
+      finishedAt: "2026-07-19T06:00:01.000Z",
+      durationMs: 1_000,
+      environment,
+      workload: testWorkload("runtime"),
+      source: {
+        harness: { path: `${secretRoot}\\harness.ts`, sha256: "c".repeat(64) },
+        recorder: { path: "scripts/observer-live-acceptance-support.ts", sha256: "d".repeat(64) },
+        measured: [{ path: "src/observer/owned-runtime-manager.ts", sha256: "e".repeat(64) }],
+      },
+      measurements: [],
+      processCounts: [],
+      limitations: [],
+      failure: null,
+    })).toThrow(/source identity/);
+  });
+
+  it("canonicalizes measured source hashes and rejects absolute, duplicate, or unsorted identities", () => {
+    const testPath = fileURLToPath(import.meta.url);
+    const repositoryRoot = resolve(dirname(testPath), "..", "..");
+    const source = operationalBaselineSource(
+      testPath,
+      "tests/workbench/observer-live-acceptance-support.test.ts",
+      repositoryRoot,
+      ["src/workbench/client.ts", "src/observer/coordinator.ts"],
+      [{ path: "scripts/windows/**/*.ps1", directory: "scripts/windows", extension: ".ps1" }]
+    );
+    expect(source.measured.map((item) => item.path)).toEqual([
+      "scripts/windows/**/*.ps1",
+      "src/observer/coordinator.ts",
+      "src/workbench/client.ts",
+    ]);
+    expect(source.measured[0]?.sha256).toMatch(/^[a-f0-9]{64}$/);
+
+    const base = {
+      backend: "runtime" as const,
+      result: "failed" as const,
+      startedAt: "2026-07-19T06:30:00.000Z",
+      finishedAt: "2026-07-19T06:30:01.000Z",
+      durationMs: 1_000,
+      environment: operationalBaselineEnvironment(),
+      workload: testWorkload("runtime"),
+      source,
+      measurements: [],
+      processCounts: [],
+      limitations: [],
+      failure: { name: "FixtureFailure" },
+    };
+    expect(() => buildOperationalBaselineArtifact({
+      ...base,
+      source: {
+        ...source,
+        measured: [{ path: "C:\\private\\coordinator.ts", sha256: "a".repeat(64) }],
+      },
+    })).toThrow(/source identity/);
+    expect(() => buildOperationalBaselineArtifact({
+      ...base,
+      source: {
+        ...source,
+        measured: [
+          { path: "src/observer/coordinator.ts", sha256: "a".repeat(64) },
+          { path: "src/observer/coordinator.ts", sha256: "b".repeat(64) },
+        ],
+      },
+    })).toThrow(/duplicate path/);
+    expect(() => buildOperationalBaselineArtifact({
+      ...base,
+      source: {
+        ...source,
+        measured: [...source.measured].reverse(),
+      },
+    })).toThrow(/canonical path order/);
+  });
+
+  it("keeps workload identity path-free, canonical, and schema-closed", () => {
+    const world = "{96A8AF57260A7392}worlds/MP/MpTest/MpTest.ent";
+    const first = operationalBaselineLaunchArgumentIdentity([
+      "-addonsDir",
+      "C:\\Users\\private-user\\fixture",
+      "-reforgerForgeOwnerToken=first-secret",
+      "-server",
+      world,
+    ]);
+    const second = operationalBaselineLaunchArgumentIdentity([
+      "-addonsDir",
+      "D:\\different-machine\\fixture",
+      "-reforgerForgeOwnerToken=second-secret",
+      "-server",
+      world,
+    ]);
+    expect(second).toEqual(first);
+    expect(JSON.stringify(first)).not.toMatch(/private-user|first-secret|different-machine|second-secret/);
+    expect(operationalBaselineLaunchArgumentIdentity([
+      "-addonsDir", "D:\\different-machine\\fixture", "-server", "different-world",
+    ]).sha256).not.toBe(first.sha256);
+    const oneAddonRoot = operationalBaselineLaunchArgumentIdentity([
+      "-addonsDir", "C:\\Users\\private-user\\addons",
+    ]);
+    const twoAddonRoots = operationalBaselineLaunchArgumentIdentity([
+      "-addonsDir", "C:\\Users\\private-user\\addons,D:\\private\\more-addons",
+    ]);
+    expect(twoAddonRoots.count).toBe(oneAddonRoot.count);
+    expect(twoAddonRoots.sha256).not.toBe(oneAddonRoot.sha256);
+    expect(JSON.stringify(twoAddonRoots)).not.toMatch(/private-user|more-addons/);
+    expect(operationalBaselineProcedureSha256({ pose: [1, 2, 3], policy: "evidence" }))
+      .toBe(operationalBaselineProcedureSha256({ policy: "evidence", pose: [1, 2, 3] }));
+
+    const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
+    const fixtureIdentity = operationalBaselineDirectoryIdentity(
+      resolve(repositoryRoot, "scripts", "windows"),
+      [".ps1"]
+    );
+    expect(fixtureIdentity).toMatchObject({ fileCount: 1 });
+    expect(fixtureIdentity.sha256).toMatch(/^[a-f0-9]{64}$/);
+    expect(fixtureIdentity).not.toHaveProperty("path");
+
+    const base = {
+      backend: "runtime" as const,
+      result: "failed" as const,
+      startedAt: "2026-07-19T06:40:00.000Z",
+      finishedAt: "2026-07-19T06:40:01.000Z",
+      durationMs: 1_000,
+      environment: operationalBaselineEnvironment(),
+      workload: testWorkload("runtime"),
+      source: {
+        harness: { path: "scripts/run-runtime-observer-acceptance.ts", sha256: "a".repeat(64) },
+        recorder: { path: "scripts/observer-live-acceptance-support.ts", sha256: "b".repeat(64) },
+        measured: [{ path: "src/**/*.ts", sha256: "c".repeat(64) }],
+      },
+      measurements: [],
+      processCounts: [],
+      limitations: [],
+      failure: { name: "FixtureFailure" },
+    };
+    expect(() => buildOperationalBaselineArtifact({
+      ...base,
+      workload: { ...base.workload, privatePath: "C:\\Users\\private-user" },
+    })).toThrow(/unexpected or missing fields/);
+    expect(() => buildOperationalBaselineArtifact({
+      ...base,
+      workload: { ...base.workload, worldResource: "C:\\private\\world.ent" },
+    })).toThrow(/workload identity/);
+  });
+
   it("filters and sorts only relevant engine/editor processes", () => {
     expect(findBlockingProcesses([
       { Id: "52", ProcessName: "ArmaReforgerWorkbench" },

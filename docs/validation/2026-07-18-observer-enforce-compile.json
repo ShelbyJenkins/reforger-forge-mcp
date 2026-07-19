@@ -1,0 +1,72 @@
+{
+  "schemaVersion": 1,
+  "kind": "reforger_forge_observer_enforce_compile",
+  "result": "passed",
+  "startedAt": "2026-07-19T05:06:30.664Z",
+  "finishedAt": "2026-07-19T05:06:38.989Z",
+  "durationMs": 8325,
+  "workbench": {
+    "executable": "ArmaReforgerWorkbenchSteamDiag.exe",
+    "version": "1.7.0.54",
+    "configuration": "PC"
+  },
+  "invocation": [
+    "-gproj",
+    "observer/addon/addon.gproj",
+    "-addonsDir",
+    "<2 configured addon directories>",
+    "-profile",
+    "<temporary isolated profile>",
+    "-noThrow",
+    "-wbsilent",
+    "-wbModule=ScriptEditor",
+    "-validate",
+    "PC"
+  ],
+  "source": {
+    "project": "observer/addon/addon.gproj",
+    "projectSha256": "5606e5810d5a82c09ef7e148454f23d80b9e69d728bd5994132aad3cc82af086",
+    "manifestSha256": "05a0db8a8be7b5853021b525b776a45a6a437eaf4bc6e1dfe581602b5a0fbc47",
+    "declaredBundleDigest": "c7edb7caf5e979bbe78a3c2e5f803ac758060558ba237e389a93efff725655c6",
+    "mailboxSourceSha256": "bb750fb609573579cc52e4f20878bbc6a0b097d66f96b59c9011d5974161d8f4"
+  },
+  "enforceCompilation": {
+    "stage": "completed_without_script_errors",
+    "authoritativeExitPass": true,
+    "validationSuccessMarker": true,
+    "gameModuleLoaded": true,
+    "compilationFinished": true,
+    "scriptErrorLines": []
+  },
+  "environmentBlocker": null,
+  "process": {
+    "exitCode": 0,
+    "signal": null,
+    "errorCode": null,
+    "stdoutSha256": "6e12799bd50675dd0afae79d13a23a3fe01a965fd99f9ca38e7e2002d5084cbc",
+    "stderrSha256": "521efbfa08d92fb54aaa214f5645ab9f0916bea95236a380b8be5bea8cdf6e04",
+    "stdoutTail": "CR_PlayerProfileManagerComponent.c(135): warning: 'PlayerData' is obsolete\r\nScripts/Game/Map/Modules/SCR_MapCursorModule.c(259): warning: 'SetCursorPosition' is obsolete: Use MouseDeviceHandler.SetCursorPosition() instead\r\nScripts/Game/Map/Modules/SCR_MapCursorModule.c(280): warning: 'SetCursorPosition' is obsolete: Use MouseDeviceHandler.SetCursorPosition() instead\r\nScripts/Game/UI/Menu/SettingsMenu/SCR_ControllerPresetsSettingsSubMenu.c(63): warning: 'IsTrackIRConnected' is obsolete: Use TrackIRDeviceHandler.IsTrackIRConnected() instead\r\nScripts/Game/UI/Menu/SettingsMenu/SCR_ControllerPresetsSettingsSubMenu.c(159): warning: 'GetJoystickProductName' is obsolete: Use JoystickDeviceHandler.GetJoystickProductName() instead\r\nScripts/Game/Global/Functions.c(61): warning: 'IsLocalPlatformAssigned' is obsolete\r\nscripts/Autotest/Game/TestFramework/SCR_AutotestCaseBase.c(66): warning: 'GetNSuites' is obsolete: Switch to instantiating tests and suites manually.\r\nscripts/Autotest/Game/TestFramework/SCR_AutotestCaseBase.c(68): warning: 'GetSuite' is obsolete: Switch to instantiating tests and suites manually.\r\nScripts/Game/Utilities/SCR_PlayerIdentityUtils.c(20): warning: 'GetPlayerIdentityId' is obsolete\r\nScripts/Game/Editor/UI/Components/Common/SCR_CursorEditorUIComponent.c(69): warning: 'SetCursorPosition' is obsolete: Use MouseDeviceHandler.SetCursorPosition() instead\r\nscripts/Autotest/Game/TestFramework/SCR_AutotestReport.c(61): warning: 'GetNSuites' is obsolete: Switch to instantiating tests and suites manually.\r\nscripts/Autotest/Game/TestFramework/SCR_AutotestReport.c(64): warning: 'GetSuite' is obsolete: Switch to instantiating tests and suites manually.\r\nScripts/Game/UI/Menu/MainMenuUI.c(643): warning: 'GetNotifyCount' is obsolete: Will be substitued by Notification Api.\r\nScripts/Game/UI/Menu/MainMenuUI.c(645): warning: 'GetNotifyItem' is obsolete: Will be substitued by Notification Api.\r\nScripts/Game/DataCollection/PlayerData/SCR_PlayerData.c(210): warning: 'PlayerData' is obsolete\r\nScript validation successful.\r\n",
+    "stderrTail": "Setting breakpad minidump AppID = 1874910\r\nSteamInternal_SetMinidumpSteamID:  Caching Steam ID:  <steam-id> [API loaded no]\r\n"
+  },
+  "isolatedProfileDiagnostics": [
+    {
+      "path": "logs/logs_2026-07-18_22-06-30/console.log",
+      "bytes": 52884,
+      "sha256": "6cf9042ccd2cb9849866a58b5d35aa3ca45ba02bdd565d52494a08ac30cc3544"
+    },
+    {
+      "path": "logs/logs_2026-07-18_22-06-30/error.log",
+      "bytes": 35571,
+      "sha256": "a2fd1f879e6250844ed374c818f6e6f23c5aaef43746498992aea365d45cefaa"
+    },
+    {
+      "path": "logs/logs_2026-07-18_22-06-30/script.log",
+      "bytes": 34759,
+      "sha256": "ca5b67f120f8c7d43e2fda28cf1bf9b8d06620989a026583bbcf449ddc62b8fe"
+    }
+  ],
+  "behavioralMailboxAcceptance": {
+    "result": "not_run",
+    "note": "ScriptEditor validation compiles Enforce source but does not execute V3/V4 mailbox runtime behavior."
+  }
+}

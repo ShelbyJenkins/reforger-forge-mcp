@@ -1,0 +1,14 @@
+GameProject {
+ ID RFOEnforceMailboxAcceptance
+ GUID "A6E41B89D2C7503F"
+ TITLE "RFO Enforce Mailbox Acceptance"
+ Dependencies {
+  "7F3A91C2E40B6D58"
+ }
+ Configurations {
+  GameProjectConfig PC {
+  }
+  GameProjectConfig HEADLESS {
+  }
+ }
+}

@@ -1,19 +1,23 @@
 import { createHash, timingSafeEqual } from "node:crypto";
 import { existsSync, lstatSync, readdirSync, rmSync, statSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import { join, sep } from "node:path";
+import { join, resolve, sep } from "node:path";
 import { isIP } from "node:net";
 import { ZodError } from "zod";
 import { AGENT_VERSION, DEFAULT_LIMITS, MAX_PROTOCOL_MESSAGE_BYTES, PROTOCOL_VERSION } from "../protocol/index.js";
 import { ArtifactStore } from "./artifacts.js";
 import { ObserverControlApi } from "./control-api.js";
 import { asObserverError, errorBody, ObserverError } from "./errors.js";
-import { JobStore } from "./jobs.js";
+import { JobStore, type JobStoreDurableMutation } from "./jobs.js";
 import { observerLogger } from "./logger.js";
 import { MailboxCoordinator, type MailboxCoordinatorOptions, type MailboxSweepResult } from "./mailbox-coordinator.js";
-import { InstanceRegistry } from "./registry.js";
+import { InstanceRegistry, type RegistryDurableMutation } from "./registry.js";
 import { ObserverRuntimeApi } from "./runtime-api.js";
 import { ObserverRunStore } from "./runs.js";
+import {
+  OwnedRuntimeAuthorityStore,
+  type OwnedRuntimeRecoveryAuthority,
+} from "./owned-runtime-authority.js";
 
 export interface ObserverAgentServerOptions {
   host?: "127.0.0.1" | "::1";
@@ -25,6 +29,7 @@ export interface ObserverAgentServerOptions {
   retentionMaxBytes?: number;
   sweepIntervalMs?: number;
   mailbox?: MailboxCoordinatorOptions;
+  clock?: { now(): number };
 }
 
 export interface ObserverApplicationSweepResult {
@@ -46,6 +51,12 @@ export interface StartupDescriptor {
   port: number;
   controlHttpEnabled: boolean;
   controlToken?: string;
+}
+
+interface OwnedRuntimeLifecyclePin {
+  runtimeId: string;
+  sessionId: string;
+  generation: string;
 }
 
 function tokenDigest(token: string): Buffer {
@@ -119,6 +130,8 @@ export class ObserverAgentServer {
   private closePromise: Promise<void> | null = null;
   private lastRetentionAt = 0;
   private lastSweep: ObserverApplicationSweepResult | null = null;
+  private readonly ownedRuntimeLifecyclePins = new Map<string, OwnedRuntimeLifecyclePin>();
+  private readonly ownedRuntimeAuthorities: OwnedRuntimeAuthorityStore;
 
   constructor(
     readonly agentInstanceId: string,
@@ -131,6 +144,20 @@ export class ObserverAgentServer {
   ) {
     this.runtime = new ObserverRuntimeApi(control.sessions, registry, jobs, artifacts);
     this.mailbox = new MailboxCoordinator(control.sessions, registry, jobs, artifacts, options.mailbox);
+    this.ownedRuntimeAuthorities = new OwnedRuntimeAuthorityStore(
+      control.paths.state,
+      () => options.clock?.now() ?? Date.now(),
+      {
+        maxRecords: control.sessions.maxRecords,
+        releaseRetentionMs: control.sessions.terminalRetentionMs,
+      }
+    );
+    this.jobs.setDurableMutationHook((mutation) => {
+      this.persistOwnedRuntimeLifecycleSnapshot(mutation.sessionId, mutation, undefined);
+    });
+    this.registry.setDurableMutationHook((mutation) => {
+      this.persistOwnedRuntimeLifecycleSnapshot(mutation.sessionId, undefined, mutation);
+    });
   }
 
   async start(): Promise<StartupDescriptor> {
@@ -219,6 +246,7 @@ export class ObserverAgentServer {
     ]);
     const finalSessions = this.control.sessions.sweep(now, finalPins);
     const removedPreparedReceiptKeys = this.control.sweepPrepared(now, finalPins);
+    this.ownedRuntimeAuthorities.sweep(now);
 
     const retentionIntervalMs = this.boundedOption(
       this.options.retentionIntervalMs,
@@ -249,6 +277,223 @@ export class ObserverAgentServer {
     return result;
   }
 
+  /**
+   * Retain the complete observer-side lifecycle for one exact owned runtime.
+   * The durable runtime receipt is the source of truth; this bounded map is
+   * the live agent lease that prevents TTL retention from deleting the state
+   * required by a later exact stop.
+   */
+  retainOwnedRuntimeLifecycle(
+    sessionId: string,
+    runtimeId: string,
+    generation: string,
+    authorityInput: Omit<OwnedRuntimeRecoveryAuthority, "sessionId" | "runtimeId" | "generation">
+  ): { retained: boolean; alreadyRetained: boolean; reconstructed: boolean; generation: string } {
+    this.assertOwnedRuntimeLifecycleIdentity(sessionId, runtimeId, generation);
+    const authority = this.ownedRuntimeAuthorities.validateAuthority({
+      sessionId,
+      runtimeId,
+      generation,
+      ...authorityInput,
+    });
+    const existing = this.ownedRuntimeLifecyclePins.get(runtimeId);
+    if (existing) {
+      if (existing.sessionId !== sessionId || existing.generation !== generation) {
+        throw new ObserverError(
+          "SESSION_MISMATCH",
+          "Owned runtime lifecycle pin belongs to another exact runtime generation",
+          409
+        );
+      }
+      if (!this.control.sessions.retainLifecycle(sessionId, this.ownedRuntimePinOwner(runtimeId))) {
+        return { retained: false, alreadyRetained: true, reconstructed: false, generation };
+      }
+      return { retained: true, alreadyRetained: true, reconstructed: false, generation };
+    }
+    for (const pin of this.ownedRuntimeLifecyclePins.values()) {
+      if (pin.sessionId === sessionId) {
+        throw new ObserverError(
+          "SESSION_MISMATCH",
+          "Observer session is already retained by another owned runtime",
+          409
+        );
+      }
+    }
+    if (this.ownedRuntimeLifecyclePins.size >= this.control.sessions.maxRecords) {
+      throw new ObserverError(
+        "TRANSPORT_UNAVAILABLE",
+        "Owned runtime lifecycle pin capacity is exhausted",
+        503
+      );
+    }
+    const currentSession = this.control.sessions.peek(sessionId);
+    let retained: ReturnType<OwnedRuntimeAuthorityStore["retain"]>;
+    if (currentSession) {
+      this.assertOwnedRuntimeSessionBinding(currentSession, authority);
+      if (!this.control.sessions.retainLifecycle(sessionId, this.ownedRuntimePinOwner(runtimeId))) {
+        return { retained: false, alreadyRetained: false, reconstructed: false, generation };
+      }
+      try {
+        retained = this.ownedRuntimeAuthorities.retain(authority, {
+          session: this.control.sessions.durableSnapshot(sessionId),
+          jobs: this.jobs.durableSnapshot(sessionId),
+          instances: this.registry.durableSnapshot(sessionId),
+        });
+      } catch (error) {
+        this.control.sessions.releaseLifecycle(sessionId, this.ownedRuntimePinOwner(runtimeId));
+        throw error;
+      }
+    } else {
+      // The exact-generation durable record is read before any in-memory state
+      // is created. A missing/corrupt/cross-bound record fails closed.
+      retained = this.ownedRuntimeAuthorities.retain(authority, {
+        session: null,
+        jobs: [],
+        instances: [],
+      });
+      if (!retained.record.session || retained.record.state !== "retained") {
+        throw new ObserverError(
+          "SESSION_UNVERIFIABLE",
+          "Owned runtime recovery authority has no retained observer session",
+          409
+        );
+      }
+      if (!this.control.sessions.restoreLifecycle(
+        retained.record.session,
+        this.ownedRuntimePinOwner(runtimeId)
+      )) {
+        throw new ObserverError(
+          "SESSION_UNVERIFIABLE",
+          "Owned runtime recovery could not reconstruct its exact session lease",
+          409
+        );
+      }
+      this.assertOwnedRuntimeSessionBinding(
+        this.control.sessions.durableSnapshot(sessionId),
+        authority
+      );
+      this.registry.restoreDurable(sessionId, retained.record.instances);
+      this.jobs.restoreDurable(sessionId, retained.record.jobs);
+    }
+    this.ownedRuntimeLifecyclePins.set(runtimeId, { runtimeId, sessionId, generation });
+    return {
+      retained: true,
+      alreadyRetained: retained.alreadyRetained,
+      reconstructed: currentSession === undefined,
+      generation,
+    };
+  }
+
+  assertOwnedRuntimeLifecycle(
+    sessionId: string,
+    runtimeId: string,
+    generation: string
+  ): boolean {
+    this.assertOwnedRuntimeLifecycleIdentity(sessionId, runtimeId, generation);
+    const existing = this.ownedRuntimeLifecyclePins.get(runtimeId);
+    if (!existing) {
+      const durable = this.ownedRuntimeAuthorities.read(runtimeId);
+      if (durable) {
+        if (durable.authority.sessionId !== sessionId || durable.authority.generation !== generation) {
+          throw new ObserverError(
+            "SESSION_MISMATCH",
+            "Owned runtime lifecycle belongs to another exact generation",
+            409
+          );
+        }
+        if (durable.state === "release_acknowledged") return false;
+        throw new ObserverError(
+          "SESSION_UNVERIFIABLE",
+          "Owned runtime lifecycle must be reconstructed before mutation",
+          409
+        );
+      }
+      if ([...this.ownedRuntimeLifecyclePins.values()].some((pin) => pin.sessionId === sessionId)) {
+        throw new ObserverError(
+          "SESSION_MISMATCH",
+          "Observer session is retained by another owned runtime lifecycle",
+          409
+        );
+      }
+      return false;
+    }
+    if (existing.sessionId !== sessionId || existing.generation !== generation) {
+      throw new ObserverError(
+        "SESSION_MISMATCH",
+        "Owned runtime lifecycle release belongs to another exact runtime generation",
+        409
+      );
+    }
+    return true;
+  }
+
+  releaseOwnedRuntimeLifecycle(
+    sessionId: string,
+    runtimeId: string,
+    generation: string
+  ): { released: boolean; alreadyReleased: boolean; generation: string } {
+    this.assertOwnedRuntimeLifecycleIdentity(sessionId, runtimeId, generation);
+    const existing = this.ownedRuntimeLifecyclePins.get(runtimeId);
+    if (existing && (existing.sessionId !== sessionId || existing.generation !== generation)) {
+      throw new ObserverError(
+        "SESSION_MISMATCH",
+        "Owned runtime lifecycle release belongs to another exact generation",
+        409
+      );
+    }
+    const acknowledgement = this.ownedRuntimeAuthorities.acknowledgeRelease(
+      sessionId,
+      runtimeId,
+      generation
+    );
+    this.ownedRuntimeLifecyclePins.delete(runtimeId);
+    this.control.sessions.releaseLifecycle(sessionId, this.ownedRuntimePinOwner(runtimeId));
+    return acknowledgement;
+  }
+
+  claimOwnedRuntimeStopReservation(
+    sessionId: string,
+    runtimeId: string,
+    generation: string,
+    reservationId: string
+  ): { reserved: boolean; reservationId?: string; created: boolean } {
+    this.assertOwnedRuntimeLifecycle(sessionId, runtimeId, generation);
+    return this.ownedRuntimeAuthorities.claimStopReservation(
+      sessionId,
+      runtimeId,
+      generation,
+      reservationId
+    );
+  }
+
+  ownedRuntimeStopReservation(
+    sessionId: string,
+    runtimeId: string,
+    generation: string
+  ): string | null {
+    this.assertOwnedRuntimeLifecycle(sessionId, runtimeId, generation);
+    return this.ownedRuntimeAuthorities.stopReservation(sessionId, runtimeId, generation);
+  }
+
+  releaseOwnedRuntimeStopReservation(
+    sessionId: string,
+    runtimeId: string,
+    generation: string,
+    reservationId: string
+  ): boolean {
+    this.assertOwnedRuntimeLifecycle(sessionId, runtimeId, generation);
+    return this.ownedRuntimeAuthorities.releaseStopReservation(
+      sessionId,
+      runtimeId,
+      generation,
+      reservationId
+    );
+  }
+
+  hasOwnedRuntimeStopReservation(sessionId: string): boolean {
+    return this.ownedRuntimeAuthorities.hasStopReservation(sessionId);
+  }
+
   storeDiagnostics(): Record<string, unknown> {
     return {
       sessions: this.control.sessions.stats(),
@@ -256,6 +501,11 @@ export class ObserverAgentServer {
       jobs: this.jobs.stats(),
       mailbox: this.mailbox.stats(),
       preparedLaunches: this.control.preparedStats(),
+      ownedRuntimeLifecyclePins: {
+        records: this.ownedRuntimeLifecyclePins.size,
+        maxRecords: this.control.sessions.maxRecords,
+      },
+      ownedRuntimeAuthorities: this.ownedRuntimeAuthorities.stats(),
       lastSweep: this.lastSweep,
     };
   }
@@ -306,6 +556,24 @@ export class ObserverAgentServer {
       }
     }
     return result;
+  }
+
+  private persistOwnedRuntimeLifecycleSnapshot(
+    sessionId: string,
+    jobMutation?: JobStoreDurableMutation,
+    registryMutation?: RegistryDurableMutation
+  ): void {
+    const authority = this.ownedRuntimeAuthorities.findRetainedBySession(sessionId);
+    if (!authority || !this.ownedRuntimeLifecyclePins.has(authority.authority.runtimeId)) return;
+    this.ownedRuntimeAuthorities.updateSnapshot(
+      authority.authority.runtimeId,
+      sessionId,
+      {
+        session: this.control.sessions.durableSnapshot(sessionId),
+        jobs: this.jobs.durableSnapshot(sessionId, jobMutation),
+        instances: this.registry.durableSnapshot(sessionId, registryMutation),
+      }
+    );
   }
 
   private applyDiskRetention(now: number, protectedSessionIds: ReadonlySet<string>): void {
@@ -423,6 +691,41 @@ export class ObserverAgentServer {
       throw new ObserverError("INVALID_REQUEST", `${label} must be an integer from ${minimum} through ${maximum}`);
     }
     return selected;
+  }
+
+  private assertOwnedRuntimeLifecycleIdentity(
+    sessionId: string,
+    runtimeId: string,
+    generation: string
+  ): void {
+    if (typeof sessionId !== "string" || sessionId.length < 1 || sessionId.length > 96 ||
+        !/^rt-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(runtimeId) ||
+        !/^[a-f0-9]{64}$/.test(generation)) {
+      throw new ObserverError("INVALID_REQUEST", "Owned runtime lifecycle pin identity is invalid");
+    }
+  }
+
+  private assertOwnedRuntimeSessionBinding(
+    session: { profilePath: string; expectedRuntimeKind: string },
+    authority: OwnedRuntimeRecoveryAuthority
+  ): void {
+    const left = process.platform === "win32"
+      ? resolve(session.profilePath).toLowerCase()
+      : resolve(session.profilePath);
+    const right = process.platform === "win32"
+      ? resolve(authority.profilePath).toLowerCase()
+      : resolve(authority.profilePath);
+    if (left !== right || session.expectedRuntimeKind !== authority.runtimeKind) {
+      throw new ObserverError(
+        "SESSION_MISMATCH",
+        "Owned runtime receipt does not match the recovered observer session profile and kind",
+        409
+      );
+    }
+  }
+
+  private ownedRuntimePinOwner(runtimeId: string): string {
+    return `owned-runtime:${runtimeId}`;
   }
 
   private async handle(request: IncomingMessage, response: ServerResponse, maxBodyBytes: number): Promise<void> {

@@ -71,7 +71,9 @@ function toolError(error: unknown) {
     error instanceof Error ? error.message : undefined
   );
   const { code, message } = publicError;
-  const details = error instanceof ObserverCoordinatorError ? error.details : undefined;
+  const details = publicError.diagnosticDetailsAllowed && error instanceof ObserverCoordinatorError
+    ? error.details
+    : undefined;
   return {
     content: [{
       type: "text" as const,

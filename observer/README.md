@@ -84,6 +84,8 @@ until the host has validated the regular PNG file, dimensions, stable size,
 digest, and session/job binding. Status and doctor remain non-mutating while the
 private child is idle.
 
+### Bounded mailbox and retention behavior
+
 The agent sweeps in-memory ownership stores every second and once more during
 controlled shutdown. By default, revoked session tombstones remain replayable
 for five minutes, terminal jobs and idempotency receipts for ten minutes, and
@@ -92,13 +94,50 @@ restoration-pending jobs, runtime-stop reservations, and captures referenced by
 an open evidence run pin their owning records. Store diagnostics report current
 counts, estimated bytes, and configured ceilings.
 
-Mailbox remains a supported fallback. Accepted files are deleted, permanent
-rejections move immediately to quarantine, and transient failures have an
-eight-attempt/30-second budget. Polling rotates beyond the 256-file work batch,
-so an earlier poison set cannot starve later commands. Each quarantine keeps at
-most 128 records, 4 MiB, and 24 hours of evidence; the agent also enforces a
-64-MiB aggregate mailbox-state ceiling and substitutes a bounded disposition
-summary when retaining an original would exceed it.
+Mailbox remains a supported fallback. Each command has an explicit `disposed`,
+`retained_for_retry`, or `storage_unavailable` disposition. Accepted cleanup is
+replay-safe, permanent rejection uses one exact idempotent quarantine target per
+source file, and transient failures have an eight-attempt/30-second budget.
+Polling rotates beyond the 256-file work batch, so one locked poison file cannot
+starve later commands or disable status, heartbeat, or artifact egress. Each
+quarantine keeps at most 128 records, 4 MiB, and 24 hours of evidence; the agent
+also enforces a 64-MiB aggregate mailbox-state ceiling and substitutes a bounded
+disposition summary when retaining an original would exceed it.
+
+Runtime status publication serializes orphan reclamation with the next write,
+before applying the 512-data-file cap. The host never deletes markerless data
+for an active session: host reclamation begins only after durable session state
+proves the writer terminal and unpinned. Thus a writer paused after data copy but
+before marker publication can resume without finding its payload removed.
+
+After changing the runtime add-on, regenerate its source manifest, build the
+host, compile Enforce, and run the real mailbox behavior gate:
+
+```powershell
+npm run observer:manifest
+npm run build
+npm run observer:validate:enforce
+npm run observer:acceptance:enforce-mailbox
+```
+
+Both commands read only Workbench/add-on paths from the gitignored local config,
+refuse an already-running Workbench, use isolated temporary profiles, and write
+sanitized JSON evidence. `observer:validate:enforce` is compile-only and
+deliberately records `behavioralMailboxAcceptance.result: "not_run"`.
+`observer:acceptance:enforce-mailbox` is the V10 behavioral gate: it verifies the
+source manifest and just-built host modules, compiles Game and WorkbenchGame,
+executes all five cases, and proves final Workbench vacancy.
+
+The recorded 2026-07-18 local run (2026-07-19 UTC) is
+[`docs/validation/2026-07-18-observer-enforce-compile.json`](../docs/validation/2026-07-18-observer-enforce-compile.json).
+Workbench 1.7.0.54 loaded the Game module and completed compilation with no
+script error lines, emitted `Script validation successful.`, and exited `0`.
+That record is authoritative compile-stage evidence only. The separate V10 run
+is [`docs/validation/2026-07-18-observer-enforce-mailbox-acceptance.json`](../docs/validation/2026-07-18-observer-enforce-mailbox-acceptance.json).
+It passed fairness beyond one 256-file batch, real `FileShare.None` deletion
+failures, 513-file reclamation and exact 512-file cap recovery, active-writer
+preservation followed by exactly-once host delivery, and both quarantine bounds.
+Both modules had zero script errors, Workbench exited `0`, and vacancy was `0/0`.
 
 Explicit runtime views restore in two phases. The normal update stages the
 original camera owner and state; the still-live observer entity then reapplies
@@ -246,6 +285,10 @@ artifacts outside the project:
 }
 ```
 
+Every capture requires its `runId` and a human-meaningful `captureLabel`.
+Labels are normalized and must be unique within the run, so name them for the
+claim they show rather than for an internal job ID.
+
 Choose the view by what the image must prove:
 
 | View | Use it for |
@@ -301,7 +344,11 @@ For Workbench, select its inventory `instanceId` and omit `sessionId`:
 }
 ```
 
-Synchronous capture remains best for interactive image review. For an async
+Synchronous capture remains best for interactive image review. A completed
+capture proves a valid, world-bound image and terminal camera restoration; it
+does not by itself prove the gameplay claim. `Passed` and `Failed` require
+`imagesReviewed=true` and a stable reviewer identity. With unreviewed images,
+use `Unreviewed` or `Inconclusive` instead. For an async
 capture, poll `observer_job action="status"`, then use `action="read"` after it
 completes. If the PNG exceeds the inline limit, leave it managed and finalize
 the run; do not copy a private artifact path.
@@ -331,9 +378,15 @@ the run into an allowlisted root:
 Finalization creates `<evidenceRoot>/<runId>/` with `RESULT.md`,
 `manifest.json`, capture PNG/JSON pairs, and only supplied allowlisted logs or
 sanitized runtime configuration. It never overwrites an existing directory.
-Use `discard` for a run that should produce no evidence bundle. On timeout or
-failure, cancel the job and wait for terminal restoration before stopping an
-owned process.
+The finalizer confines the destination to a configured root, rejects path and
+link escapes, pins source artifacts during export, re-hashes the output, and
+writes `manifest.json` last as the completion marker. A matching retry returns
+the existing receipt, and managed artifacts are released only after verified
+export. Optional `runtimeConfig` accepts only bounded structured scalar values
+without secret-like keys. Optional `supportingFiles` accepts only bounded,
+regular text `relevantLog` files beneath `supportingLogRoots`. Use `discard` for
+a run that should produce no evidence bundle. On timeout or failure, cancel the
+job and wait for terminal restoration before stopping an owned process.
 
 ## Opt-in graphical runtime screenshot acceptance
 
@@ -348,7 +401,7 @@ environment gate and an independent command-line confirmation:
 
 ```powershell
 $env:RFO_RUN_LIVE_RUNTIME_OBSERVER_ACCEPTANCE = '1'
-npm run observer:acceptance:runtime -- --confirm-live-run
+npm run dev:observer:acceptance:runtime -- --confirm-live-run
 ```
 
 By default the harness uses the installed stock world
@@ -440,6 +493,14 @@ transaction implementation. Their canonical sources live in
 external observer managed root; its dedicated Workbench profile is external as
 well. Target projects receive no MCP helper sources.
 
+After changing any helper source or project file under
+`observer/workbench-addon`, run `npm run observer:manifest` to regenerate the
+compiled identity and source manifest, then run package verification. Before a
+Workbench spawn, staging validates the helper role, identity, complete file set,
+file hashes, and bundle digest; rejects target overlap with the managed root,
+staged add-on, search root, or profile; and re-hashes the payload after copying
+it into digest-addressed immutable external storage.
+
 Workbench launches record the helper add-on ID, GUID, staged directory, search
 root, bundle digest, build identity, and profile in the version-3 lifecycle.
 Readiness and reuse require `EMCP_WB_Ping` to return the exact helper add-on ID,
@@ -508,7 +569,7 @@ requires both confirmations:
 
 ```powershell
 $env:RFO_RUN_LIVE_WORKBENCH_OBSERVER_ACCEPTANCE = '1'
-npm run observer:acceptance:workbench -- --confirm-live-run
+npm run dev:observer:acceptance:workbench -- --confirm-live-run
 ```
 
 The harness reads machine paths only from the gitignored
@@ -536,9 +597,12 @@ Both explicit captures were materially different and matched their exact
 requested matrices/FOVs; both following current captures proved exact
 restoration. Finalization had no warnings, the target stayed clean, exact-owner
 shutdown left zero Workbench processes, and all five images were visually
-inspected during implementation. The formal bundle remains `Unreviewed` with
-`imagesReviewed=false`, so automation passed but formal evidence review is
-still required before advertising the companion as live-qualified.
+inspected at original resolution. The finalized manifest remains unmodified
+with `Unreviewed`/`imagesReviewed=false`; the separate
+[hash-bound formal review](../docs/validation/2026-07-19-workbench-observer-evidence-review.json)
+records a `Passed` outcome, the Workbench 1.7.0.54 version, warning,
+limitations, and successful verification of every exported hash. The companion
+editor path is live-qualified for this reviewed procedure.
 
 ## Capability status
 
@@ -554,14 +618,15 @@ implemented paths; it is not a substitute for recording a successful live run.
 | Dedicated/headless server | Registration, health, authority facts, coordination, and diagnostics without camera/render claims | Never advertises `render.capture` or a camera capability | Pending non-render qualification |
 | Minimized/out-of-focus client | Same transaction path; `-forceUpdate` remains an explicit launch-preparation option | Same initialized graphical gates | Pending |
 | World unload or agent loss during a lease | World epochs invalidate stale work; cancellation/watchdog restoration must reach a terminal state | Renderer is withheld when restoration or world identity is uncertain | Pending failure-injection qualification |
-| Workbench editor | Externally staged helper, exact Ping identity, dedicated profile, version-3 lifecycle, confined native-PNG validation, activity gating, and exact `BaseWorld` slot/matrix/FOV restoration | `render.capture` when current capture is initialized; `camera.editor` only after a current-view restoration proof in that exact process | Five-capture v3 automation passed in a disposable stock-Everon-derived world with clean-target and exact-owner-shutdown proof; formal bundle review remains pending |
+| Workbench editor | Externally staged helper, exact Ping identity, dedicated profile, version-3 lifecycle, confined native-PNG validation, activity gating, and exact `BaseWorld` slot/matrix/FOV restoration | `render.capture` when current capture is initialized; `camera.editor` only after a current-view restoration proof in that exact process | Five-capture v3 automation and hash-bound formal image review passed in a disposable stock-Everon-derived world on Workbench 1.7.0.54, with clean-target and exact-owner-shutdown proof |
 
 **Live validation status:** fresh five-capture automation passed for both the
 graphical stock-`MpTest` listen host and the companion-based Workbench editor as
-recorded above. Both sets of images were visually inspected during
-implementation, but both finalized bundles retain their immutable `Unreviewed`
-metadata pending formal evidence review. Dedicated and headless non-render
-behavior, minimized/out-of-focus rendering, world-unload or agent-loss failure
-injection, and remote/delegated rendering remain outside current live proof.
+recorded above. The Workbench export now has a hash-bound formal `Passed` image
+review; the graphical runtime export remains pending formal review. Both source
+manifests retain their finalized `Unreviewed` metadata. Dedicated and headless
+non-render behavior, minimized/out-of-focus rendering, world-unload or
+agent-loss failure injection, and remote/delegated rendering remain outside
+current live proof.
 
 Real-engine tests belong under `tests/observer/integration` and run only through `npm run test:observer:integration` with disposable profiles and target projects.

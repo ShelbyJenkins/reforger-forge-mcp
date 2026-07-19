@@ -36,7 +36,15 @@ describe("observer package and source contracts", () => {
     expect(packageJson.scripts["observer:manifest"]).toContain("addons:manifest");
     expect(Object.keys(packageJson.scripts).filter((name) =>
       name.startsWith("observer:acceptance:")
-    )).toEqual(["observer:acceptance:workbench", "observer:acceptance:runtime"]);
+    )).toEqual([
+      "observer:acceptance:enforce-mailbox",
+    ]);
+    expect(Object.keys(packageJson.scripts).filter((name) =>
+      name.startsWith("dev:observer:acceptance:")
+    )).toEqual([
+      "dev:observer:acceptance:workbench",
+      "dev:observer:acceptance:runtime",
+    ]);
     expect(packageJson.files).toEqual(expect.arrayContaining([
       "dist",
       "observer/addon",
@@ -45,13 +53,19 @@ describe("observer package and source contracts", () => {
       "observer/README.md",
     ]));
     expect(packageJson.files).not.toContain("mod");
-    const observerReleaseScripts = [
+    const observerReleaseAssets = [
+      "scripts/run-observer-enforce-mailbox-acceptance.mjs",
+      "scripts/update-observer-source-manifest.mjs",
+      "tests/fixtures/enforce-mailbox-acceptance-addon/addon.gproj",
+      "tests/fixtures/enforce-mailbox-acceptance-addon/Scripts/WorkbenchGame/RFO_MailboxAcceptancePlugin.c",
+    ];
+    const repositoryOnlyAcceptanceSources = [
       "scripts/observer-live-acceptance-support.ts",
       "scripts/run-runtime-observer-acceptance.ts",
       "scripts/run-workbench-observer-acceptance.ts",
-      "scripts/update-observer-source-manifest.mjs",
     ];
-    expect(packageJson.files).toEqual(expect.arrayContaining(observerReleaseScripts));
+    expect(packageJson.files).toEqual(expect.arrayContaining(observerReleaseAssets));
+    expect(packageJson.files).toEqual(expect.not.arrayContaining(repositoryOnlyAcceptanceSources));
     const observerConfig = JSON.parse(readFileSync(join(repositoryRoot, "observer", "tsconfig.build.json"), "utf8"));
     expect(observerConfig.compilerOptions.outDir).toBe("../dist/observer");
     expect(JSON.parse(readFileSync(join(repositoryRoot, "tsconfig.build.json"), "utf8")).include).toEqual(["src/**/*"]);
@@ -63,7 +77,17 @@ describe("observer package and source contracts", () => {
     expect(packageCheck).toContain("dist/workbench/observer-adapter.js");
     expect(packageCheck).toContain("dist/workbench/helper-addon.js");
     expect(packageCheck).toContain("legacy project-injection handler must not be packaged");
-    for (const path of observerReleaseScripts) expect(packageCheck).toContain(path);
+    expect(packageCheck).toContain("resourceDatabase\\.rdb");
+    expect(packageCheck).toContain("--omit=dev");
+    expect(packageCheck).toContain("--offline");
+    expect(packageCheck).toContain("npm-cli.js");
+    expect(packageCheck).not.toContain("shell:");
+    for (const module of ["artifacts", "jobs", "mailbox-coordinator", "registry", "sessions"]) {
+      expect(packageCheck).toContain(`dist/observer/agent/${module}.js`);
+    }
+    for (const path of [...observerReleaseAssets, ...repositoryOnlyAcceptanceSources]) {
+      expect(packageCheck).toContain(path);
+    }
     const manifestGenerator = readFileSync(
       join(repositoryRoot, "scripts", "update-observer-source-manifest.mjs"),
       "utf8"

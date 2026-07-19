@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import { readFileSync } from "node:fs";
 import { loadConfig } from "../config.js";
 import {
   parseWorkbenchRunnerArguments,
@@ -24,30 +25,45 @@ function receiptExitCode(receipt: WorkbenchRunnerReceipt): number {
     : 1;
 }
 
-const abortController = new AbortController();
-const requestAbort = (): void => abortController.abort();
-process.on("SIGINT", requestAbort);
-process.on("SIGTERM", requestAbort);
+function installedPackageVersion(): string {
+  const manifest = JSON.parse(
+    readFileSync(new URL("../../package.json", import.meta.url), "utf8")
+  ) as { version?: unknown };
+  if (typeof manifest.version !== "string" || !/^\d+\.\d+\.\d+(?:[-+].+)?$/.test(manifest.version)) {
+    throw new Error("Installed package manifest does not contain a valid version");
+  }
+  return manifest.version;
+}
 
-try {
-  const intent = parseWorkbenchRunnerArguments(process.argv.slice(2));
-  const receipt = await runWorkbenchIntent(loadConfig(), intent, {
-    signal: abortController.signal,
-  });
-  process.stdout.write(`${JSON.stringify(receipt)}\n`);
-  process.exitCode = receiptExitCode(receipt);
-} catch (error) {
-  const record = error && typeof error === "object" ? error as { code?: unknown } : null;
-  const message = redactPrivateOwnerTokens(
-    error instanceof Error ? error.message : String(error)
-  );
-  process.stderr.write(`${JSON.stringify({
-    ok: false,
-    code: typeof record?.code === "string" ? record.code : "RUNNER_FAILED",
-    message,
-  })}\n`);
-  process.exitCode = abortController.signal.aborted ? 130 : 1;
-} finally {
-  process.off("SIGINT", requestAbort);
-  process.off("SIGTERM", requestAbort);
+const cliArguments = process.argv.slice(2);
+if (cliArguments.length === 1 && cliArguments[0] === "--version") {
+  process.stdout.write(`${installedPackageVersion()}\n`);
+} else {
+  const abortController = new AbortController();
+  const requestAbort = (): void => abortController.abort();
+  process.on("SIGINT", requestAbort);
+  process.on("SIGTERM", requestAbort);
+
+  try {
+    const intent = parseWorkbenchRunnerArguments(cliArguments);
+    const receipt = await runWorkbenchIntent(loadConfig(), intent, {
+      signal: abortController.signal,
+    });
+    process.stdout.write(`${JSON.stringify(receipt)}\n`);
+    process.exitCode = receiptExitCode(receipt);
+  } catch (error) {
+    const record = error && typeof error === "object" ? error as { code?: unknown } : null;
+    const message = redactPrivateOwnerTokens(
+      error instanceof Error ? error.message : String(error)
+    );
+    process.stderr.write(`${JSON.stringify({
+      ok: false,
+      code: typeof record?.code === "string" ? record.code : "RUNNER_FAILED",
+      message,
+    })}\n`);
+    process.exitCode = abortController.signal.aborted ? 130 : 1;
+  } finally {
+    process.off("SIGINT", requestAbort);
+    process.off("SIGTERM", requestAbort);
+  }
 }

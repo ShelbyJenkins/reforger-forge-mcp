@@ -420,17 +420,25 @@ function defaultStateDir(): string {
 
 export interface WindowsLifecycleBackendOptions {
   helperTimeoutMs?: number;
+  /**
+   * Process-level fail-stop invoked if an acquired OS mutex disappears before
+   * the protected action finishes. It must not return. Injection exists only
+   * so a subprocess test can use a deterministic exit code.
+   */
+  leaseLossFailStop?: (error: LifecycleGuardError) => never;
 }
 
 export class WindowsLifecycleBackend implements WorkbenchLifecycleBackend {
   readonly platform = "win32" as const;
   private readonly helperTimeoutMs: number;
+  private readonly leaseLossFailStop: (error: LifecycleGuardError) => never;
 
   constructor(
     private readonly helperPath: string,
     options: WindowsLifecycleBackendOptions = {}
   ) {
     this.helperTimeoutMs = options.helperTimeoutMs ?? HELPER_TIMEOUT_MS;
+    this.leaseLossFailStop = options.leaseLossFailStop ?? (() => process.abort());
     if (!Number.isInteger(this.helperTimeoutMs) || this.helperTimeoutMs <= 0) {
       throw new LifecycleGuardError("Windows lifecycle helper timeout must be positive.", "STATE_INVALID");
     }
@@ -689,11 +697,19 @@ export class WindowsLifecycleBackend implements WorkbenchLifecycleBackend {
       if (!released) {
         const error = new LifecycleGuardError(
           `Lifecycle mutex holder exited unexpectedly with code ${code}; ` +
-            "durable lifecycle state was preserved for recovery.",
+            "the MCP must fail-stop before any unprotected lifecycle work can continue.",
           "RECOVERY_REQUIRED"
         );
-        try { args.onLeaseLost?.(error); } catch { /* retain the canonical recovery result */ }
-        throw error;
+        // Promises cannot cancel the losing action in Promise.race. A
+        // cooperative fence is therefore insufficient: another process can
+        // acquire the released OS mutex while that callback keeps running.
+        // Terminate this process synchronously. The finally fallback protects
+        // production even if an invalid injected handler throws or returns.
+        try {
+          this.leaseLossFailStop(error);
+        } finally {
+          process.abort();
+        }
       }
       return new Promise<never>(() => undefined);
     });
@@ -835,7 +851,21 @@ export class WindowsLifecycleBackend implements WorkbenchLifecycleBackend {
         message: "Endpoint vacancy requires a numeric loopback endpoint.",
       };
     }
-    const response = await this.invoke("VerifyEndpointVacant", { endpoint: normalized });
+    let response: HelperResponse;
+    try {
+      response = await this.invoke("VerifyEndpointVacant", { endpoint: normalized });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return {
+        kind: "unverifiable",
+        reason: message.startsWith(
+          "Windows lifecycle helper mode VerifyEndpointVacant exceeded"
+        )
+          ? "timeout"
+          : "helper_failure",
+        message: `The native endpoint-vacancy probe failed: ${message}`,
+      };
+    }
     if (response.ok === true && response.status === "vacant") return { kind: "vacant" };
     const listenerPid = Number(response.listenerPid);
     if (response.reason === "listener_present" && Number.isInteger(listenerPid) && listenerPid > 0) {
@@ -870,9 +900,24 @@ export class WindowsLifecycleBackend implements WorkbenchLifecycleBackend {
     if (response.ok === true && (response.status === "terminated" || response.status === "already_exited")) {
       return { kind: response.status };
     }
+    const allowedReasons = new Set<Extract<VerifyTerminateResult, { kind: "refused" }>["reason"]>([
+      "access_denied",
+      "pid_reused",
+      "executable_mismatch",
+      "creation_time_mismatch",
+      "command_line_unverifiable",
+      "token_mismatch",
+      "timeout",
+      "helper_failure",
+    ]);
+    const reason = allowedReasons.has(
+      response.reason as Extract<VerifyTerminateResult, { kind: "refused" }>["reason"]
+    )
+      ? response.reason as Extract<VerifyTerminateResult, { kind: "refused" }>["reason"]
+      : "helper_failure";
     return {
       kind: "refused",
-      reason: (response.reason ?? "helper_failure") as Extract<VerifyTerminateResult, { kind: "refused" }>["reason"],
+      reason,
       message: response.message ?? "The exact process helper refused termination.",
     };
   }
@@ -1192,7 +1237,18 @@ export class WorkbenchProcessGuard {
         message: "Endpoint vacancy requires a numeric loopback endpoint.",
       };
     }
-    return this.backend.verifyEndpointVacant(normalized);
+    try {
+      return await this.backend.verifyEndpointVacant(normalized);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return {
+        kind: "unverifiable",
+        reason: /(?:exceeded (?:its )?\d+ms deadline|timed?\s*out|deadline expired)/i.test(message)
+          ? "timeout"
+          : "helper_failure",
+        message: `Endpoint vacancy could not be proven: ${message}`,
+      };
+    }
   }
 
   async verifyAndTerminate(

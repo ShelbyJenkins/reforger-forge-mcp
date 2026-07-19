@@ -10,7 +10,9 @@ dist/
 reforger-forge.config.json
 enfusion-mcp.config.json
 .scraper-cache/
+.artifacts/
 *.tsbuildinfo
+**/resourceDatabase.rdb
 *.pdf
 .claude/
 nul

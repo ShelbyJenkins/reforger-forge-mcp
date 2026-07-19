@@ -41,7 +41,12 @@ function setup(jobOptions: JobStoreOptions = {}) {
   const registration = graphicalRegistration(fixture.created);
   registry.register(registration, fixture.created.contract.sessionToken);
   const jobs = new JobStore(fixture.store, registry, clock, jobOptions);
-  const artifacts = new ArtifactStore(join(root, "artifacts"), fixture.store, jobs, { stableIntervalMs: 2, stableTimeoutMs: 100 });
+  const artifacts = new ArtifactStore(join(root, "artifacts"), fixture.store, jobs, {
+    stableIntervalMs: 2,
+    // Success-path stability checks need scheduler headroom under a parallel
+    // full-suite run; the production default is 2 seconds.
+    stableTimeoutMs: 2_000,
+  });
   return { root, ...fixture, registry, registration, jobs, artifacts };
 }
 

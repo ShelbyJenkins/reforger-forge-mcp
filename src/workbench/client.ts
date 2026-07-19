@@ -1,9 +1,10 @@
 /**
  * TCP client and target-aware Workbench lifecycle coordinator.
  *
- * Every NET API call uses a fresh socket. Every process/filesystem mutation is
- * serialized in-process and then performed while the machine-wide lifecycle
- * mutex is held by WorkbenchProcessGuard.
+ * Every NET API call uses a fresh socket. Lifecycle mutations use short
+ * reserve/CAS/commit transactions under the machine-wide mutex; readiness,
+ * exact termination, and endpoint-release waits run against durable exact
+ * owner evidence after that mutex is released.
  */
 
 import { randomUUID } from "node:crypto";
@@ -26,7 +27,10 @@ import {
   type WorkbenchActivityGateTiming,
 } from "./activity-gate.js";
 import { decodeResponse, encodeRequest } from "./protocol.js";
-import { ChildSupervisor } from "./child-supervisor.js";
+import {
+  ChildSupervisor,
+  type SupervisedChildCounts,
+} from "./child-supervisor.js";
 import {
   WORKBENCH_HELPER_ADDON_GUID,
   WORKBENCH_HELPER_ADDON_ID,
@@ -55,6 +59,7 @@ import {
   LifecycleGuardError,
   type ExpectedStateVersion,
   type LifecycleClaimResult,
+  type LifecycleStateRead,
   type LifecycleOperationKind,
   type LifecycleStateDraft,
   type WorkbenchCompanionLifecycleState,
@@ -203,6 +208,8 @@ export class WorkbenchError extends Error {
   }
 }
 
+class ProvenPreSignalTerminationRefusal extends WorkbenchError {}
+
 export function buildWorkbenchLaunchArgs(
   gprojPath?: string | null,
   configuredAddonDirs?: readonly string[],
@@ -299,6 +306,11 @@ interface OwnedChildObservation {
   targetKey: string;
 }
 
+interface ManagedRunningAuthority {
+  readonly state: WorkbenchLifecycleStateV3;
+  readonly snapshot: WorkbenchObserverSnapshot;
+}
+
 interface ActiveLifecycleOperation {
   kind: LifecycleOperationKind;
   operationId: string;
@@ -354,6 +366,31 @@ function stateDraft(
   };
 }
 
+function sameLifecycleOwner(
+  left: WorkbenchLifecycleStateV3["mcpOwner"],
+  right: WorkbenchLifecycleStateV3["mcpOwner"]
+): boolean {
+  if (!left || !right) return left === right;
+  return left.pid === right.pid &&
+    pathKey(left.executablePath) === pathKey(right.executablePath) &&
+    left.creationTime === right.creationTime &&
+    left.userSid === right.userSid &&
+    left.instanceId === right.instanceId &&
+    left.leaseId === right.leaseId;
+}
+
+function sameWorkbenchIdentity(
+  left: WorkbenchIdentity | null,
+  right: WorkbenchIdentity | null
+): boolean {
+  if (!left || !right) return left === right;
+  return left.pid === right.pid &&
+    pathKey(left.executablePath) === pathKey(right.executablePath) &&
+    left.creationTime === right.creationTime &&
+    left.ownerTokenArgument === right.ownerTokenArgument &&
+    left.launchedAtMs === right.launchedAtMs;
+}
+
 function companionLifecycleState(
   companion: WorkbenchCompanionLaunch
 ): WorkbenchCompanionLifecycleState {
@@ -378,6 +415,7 @@ export class WorkbenchClient {
   private readonly launchTimeoutMs: number;
   private readonly launchPollIntervalMs: number;
   private readonly activityGate: WorkbenchActivityGate;
+  private companionAttestationKey: string | null = null;
 
   get state(): Readonly<WorkbenchState> {
     return this._state;
@@ -471,8 +509,19 @@ export class WorkbenchClient {
    */
   async getRunningObserverSnapshot(): Promise<WorkbenchObserverSnapshot> {
     try {
-      return await this.processGuard.withLifecycleLock((session) =>
-        this.validateManagedRunningState(session, "observer capture", false));
+      const authority = await this.processGuard.withLifecycleLock((session) =>
+        this.readManagedRunningAuthority(session, "observer capture", false));
+      const snapshot = await this.validateManagedAuthority(authority, "observer capture");
+      await this.processGuard.withLifecycleLock(async (session) => {
+        const current = await this.readManagedRunningAuthority(session, "observer capture", false);
+        if (!this.sameManagedAuthority(authority, current)) {
+          throw new WorkbenchError(
+            "RECOVERY_REQUIRED: Workbench changed during observer snapshot qualification.",
+            "RECOVERY_REQUIRED"
+          );
+        }
+      });
+      return snapshot;
     } catch (error) {
       throw this.mapLifecycleError(error);
     }
@@ -517,15 +566,18 @@ export class WorkbenchClient {
     }
   }
 
+  /** Count-only lifecycle evidence; no PID, owner token, or process handle is exposed. */
+  diagnosticSupervisedChildCounts(): SupervisedChildCounts {
+    return this.childSupervisor.counts();
+  }
+
   async ensureRunning(gprojPath?: string): Promise<WorkbenchLaunchResult> {
     this.requireConfig("auto-launch");
     const project = await this.resolveLifecycleProject(gprojPath);
     try {
       return await this.activityGate.runLifecycle("launch", () =>
         this.coordinateLifecycle("launch", project.comparisonKey, async (operationId) =>
-          this.processGuard.withLifecycleLock(async (session) =>
-            this.ensureRunningLocked(session, revalidateProjectIdentity(project), operationId)
-          )
+          this.ensureRunningCoordinated(revalidateProjectIdentity(project), operationId)
         )
       );
     } catch (error) {
@@ -539,9 +591,7 @@ export class WorkbenchClient {
     try {
       return await this.activityGate.runLifecycle("restart", () =>
         this.coordinateLifecycle("restart", project.comparisonKey, async (operationId) =>
-          this.processGuard.withLifecycleLock(async (session) =>
-            this.restartLocked(session, revalidateProjectIdentity(project), operationId)
-          )
+          this.restartCoordinated(revalidateProjectIdentity(project), operationId)
         )
       );
     } catch (error) {
@@ -556,9 +606,7 @@ export class WorkbenchClient {
       const targetKey = read.kind === "valid" ? read.state.target?.comparisonKey ?? null : null;
       return await this.activityGate.runLifecycle("shutdown", () =>
         this.coordinateLifecycle("shutdown", targetKey, async (operationId) =>
-          this.processGuard.withLifecycleLock(async (session) =>
-            this.shutdownLocked(session, operationId)
-          )
+          this.shutdownCoordinated(operationId)
         )
       );
     } catch (error) {
@@ -676,14 +724,47 @@ export class WorkbenchClient {
       );
     }
     try {
-      return await this.processGuard.withLifecycleLock(async (session) => {
-        const read = await session.readState();
-        if (read.kind === "valid" && read.state.phase === "running") {
-          const snapshot = await this.validateManagedRunningState(
-            session,
-            "Workbench companion setup",
-            false
+      return await this.activityGate.runManaged("companion setup", async () => {
+        const initial = await this.processGuard.withLifecycleLock(async (session) => {
+          const read = await session.readState();
+          if (read.kind === "valid" && read.state.phase === "running") {
+            return {
+              kind: "running" as const,
+              authority: await this.readManagedRunningAuthority(
+                session,
+                "Workbench companion setup",
+                false
+              ),
+            };
+          }
+          if (read.kind === "valid" && read.state.phase !== "vacant") {
+            throw new WorkbenchError(
+              `Workbench companion setup requires a vacant or healthy running lifecycle; current phase is ${read.state.phase}.`,
+              "LIFECYCLE_BUSY"
+            );
+          }
+          await session.assertNoWorkbenchProcesses();
+          return { kind: "vacant" as const, read };
+        });
+
+        if (initial.kind === "running") {
+          const snapshot = await this.validateManagedAuthority(
+            initial.authority,
+            "Workbench companion setup"
           );
+          await this.processGuard.withLifecycleLock(async (session) => {
+            const current = await this.readManagedRunningAuthority(
+              session,
+              "Workbench companion setup",
+              false
+            );
+            if (!this.sameManagedAuthority(initial.authority, current)) {
+              throw new WorkbenchError(
+                "RECOVERY_REQUIRED: Workbench changed while companion setup was unlocked.",
+                "RECOVERY_REQUIRED"
+              );
+            }
+          });
           return {
             action: "verified_running",
             generation: snapshot.generation,
@@ -691,18 +772,22 @@ export class WorkbenchClient {
             status: this.companionProvider!.status!(),
           };
         }
-        if (read.kind === "valid" && read.state.phase !== "vacant") {
-          throw new WorkbenchError(
-            `Workbench companion setup requires a vacant or healthy running lifecycle; current phase is ${read.state.phase}.`,
-            "LIFECYCLE_BUSY"
-          );
-        }
-        await session.assertNoWorkbenchProcesses();
+
+        // Copying, hashing, retention, and status inventory can be expensive.
+        // Keep them outside the machine mutex, then prove the lifecycle stayed
+        // at the same vacant generation before publishing their result.
         const staged = this.companionProvider!.ensureStaged(targetProjectPath);
         const attested = this.companionProvider!.verifyStaged!(staged, targetProjectPath);
         const retention = this.companionProvider!.applyRetention?.({
           protectedDigests: [attested.bundleDigest],
         }) ?? null;
+        const status = this.companionProvider!.status!();
+        await this.processGuard.withLifecycleLock((session) =>
+          this.assertSameVacantCompanionAuthority(
+            session,
+            initial.read,
+            "Workbench companion setup"
+          ));
         return {
           action: staged.reused ? "verified" : "staged",
           companion: {
@@ -716,7 +801,7 @@ export class WorkbenchClient {
             profilePath: attested.workbenchProfilePath,
           },
           retention,
-          status: this.companionProvider!.status!(),
+          status,
         };
       });
     } catch (error) {
@@ -765,19 +850,29 @@ export class WorkbenchClient {
       );
     }
     try {
-      return await this.processGuard.withLifecycleLock(async (session) => {
-        await session.assertNoWorkbenchProcesses();
-        const read = await session.readState();
-        if (read.kind === "valid" && read.state.phase !== "vacant") {
-          throw new WorkbenchError(
-            `Workbench companion retention requires a vacant lifecycle; current phase is ${read.state.phase}.`,
-            "LIFECYCLE_BUSY"
-          );
-        }
+      return await this.activityGate.runManaged("companion retention", async () => {
+        const read = await this.processGuard.withLifecycleLock(async (session) => {
+          await session.assertNoWorkbenchProcesses();
+          const current = await session.readState();
+          if (current.kind === "valid" && current.state.phase !== "vacant") {
+            throw new WorkbenchError(
+              `Workbench companion retention requires a vacant lifecycle; current phase is ${current.state.phase}.`,
+              "LIFECYCLE_BUSY"
+            );
+          }
+          return current;
+        });
         const protectedDigests = read.kind === "valid" && read.state.companion
           ? [read.state.companion.bundleDigest]
           : [];
-        return this.companionProvider!.applyRetention!({ protectedDigests });
+        const result = this.companionProvider!.applyRetention!({ protectedDigests });
+        await this.processGuard.withLifecycleLock((session) =>
+          this.assertSameVacantCompanionAuthority(
+            session,
+            read,
+            "Workbench companion retention"
+          ));
+        return result;
       });
     } catch (error) {
       throw this.mapLifecycleError(error);
@@ -821,28 +916,49 @@ export class WorkbenchClient {
     options: WorkbenchCallOptions
   ): Promise<T> {
     try {
-      return await this.processGuard.withLifecycleLock(async (session) => {
-        const snapshot = await this.validateManagedRunningState(
-          session,
-          `Workbench call ${apiFunc}`,
-          true
-        );
-        const result = await this.callAndCache<T>(apiFunc, params, options);
-        // Detect staged payload replacement even when the NET API call itself
-        // succeeded. The machine-wide lifecycle mutex stays held throughout.
+      return await this.activityGate.runManaged(`call ${apiFunc}`, async () => {
+        const context = `Workbench call ${apiFunc}`;
+        const authority = await this.processGuard.withLifecycleLock((session) =>
+          this.readManagedRunningAuthority(session, context, true));
+
+        // Network I/O, exact-process probing, target resolution, and immutable
+        // companion hashing happen without monopolizing the machine mutex.
+        const snapshot = await this.validateManagedAuthority(authority, context);
+        // Treat the NET result as provisional until the exact lifecycle CAS
+        // below proves that its generation and owner are still authoritative.
+        const result = await this.rawCall<T>(apiFunc, params, options);
+
+        // Reacquire only for a bounded read/revalidation. A cross-process
+        // generation or owner change makes the local NET result stale.
+        await this.processGuard.withLifecycleLock(async (session) => {
+          const current = await this.readManagedRunningAuthority(session, context, true);
+          if (!this.sameManagedAuthority(authority, current)) {
+            throw new WorkbenchError(
+              "RECOVERY_REQUIRED: Workbench lifecycle generation or exact owner changed during " +
+                `managed call ${apiFunc}; stale state publication was refused.`,
+              "RECOVERY_REQUIRED"
+            );
+          }
+        });
+        this._state.connected = true;
+        this._state.lastUpdated = Date.now();
+        this.extractMode(result);
         this.attestRecordedCompanion(snapshot);
         return result;
       });
     } catch (error) {
+      if (error instanceof WorkbenchError && error.code === "RECOVERY_REQUIRED") {
+        this.resetConnectionState();
+      }
       throw this.mapLifecycleError(error);
     }
   }
 
-  private async validateManagedRunningState(
+  private async readManagedRunningAuthority(
     session: WorkbenchLifecycleSession,
     context: string,
     unavailableWhenVacant: boolean
-  ): Promise<WorkbenchObserverSnapshot> {
+  ): Promise<ManagedRunningAuthority> {
     const read = await session.readState();
     if (read.kind !== "valid") {
       if (unavailableWhenVacant && read.kind === "missing") {
@@ -913,19 +1029,12 @@ export class WorkbenchClient {
       );
     }
 
-    const canonicalTarget = canonicalizeGproj(state.target.path);
-    if (canonicalTarget.comparisonKey !== state.target.comparisonKey) {
-      throw new WorkbenchError(
-        `Recorded Workbench target ${state.target.path} changed canonical identity.`,
-        "TARGET_CHANGED"
-      );
-    }
     const snapshot = Object.freeze({
       generation: state.generation,
       companion: Object.freeze({ ...state.companion }),
       target: Object.freeze({
-        path: canonicalTarget.displayPath,
-        comparisonKey: canonicalTarget.comparisonKey,
+        path: state.target.path,
+        comparisonKey: state.target.comparisonKey,
       }),
       endpoint: Object.freeze({ ...state.endpoint }),
       process: Object.freeze({
@@ -935,14 +1044,39 @@ export class WorkbenchClient {
         launchedAtMs: state.workbench.launchedAtMs,
       }),
     }) satisfies WorkbenchObserverSnapshot;
+    return { state, snapshot };
+  }
+
+  private async validateManagedAuthority(
+    authority: ManagedRunningAuthority,
+    context: string
+  ): Promise<WorkbenchObserverSnapshot> {
+    const canonicalTarget = canonicalizeGproj(authority.snapshot.target.path);
+    if (canonicalTarget.comparisonKey !== authority.snapshot.target.comparisonKey) {
+      throw new WorkbenchError(
+        `Recorded Workbench target ${authority.snapshot.target.path} changed canonical identity.`,
+        "TARGET_CHANGED"
+      );
+    }
+    const snapshot = Object.freeze({
+      ...authority.snapshot,
+      target: Object.freeze({
+        path: canonicalTarget.displayPath,
+        comparisonKey: canonicalTarget.comparisonKey,
+      }),
+    }) satisfies WorkbenchObserverSnapshot;
     this.attestRecordedCompanion(snapshot);
-    if (await this.inspectRecordedWorkbench(state) !== "live") {
+    if (await this.inspectRecordedWorkbench(authority.state) !== "live") {
       throw new WorkbenchError(
         `Recorded exact owned Workbench exited before ${context}.`,
         "IDENTITY_UNVERIFIABLE"
       );
     }
-    await this.assertEndpointOwnedByRecordedWorkbench(session, state.workbench, context);
+    await this.assertEndpointOwnedByRecordedWorkbench(
+      this.processGuard,
+      authority.state.workbench!,
+      context
+    );
     if (!(await this.ping())) {
       throw new WorkbenchError(
         "The recorded Workbench endpoint did not prove the expected companion add-on identity.",
@@ -953,6 +1087,58 @@ export class WorkbenchClient {
     return snapshot;
   }
 
+  private sameManagedAuthority(
+    expected: ManagedRunningAuthority,
+    current: ManagedRunningAuthority
+  ): boolean {
+    return expected.state.generation === current.state.generation &&
+      sameLifecycleOwner(expected.state.mcpOwner, current.state.mcpOwner) &&
+      sameWorkbenchIdentity(expected.state.workbench, current.state.workbench) &&
+      expected.snapshot.target.path === current.snapshot.target.path &&
+      expected.snapshot.target.comparisonKey === current.snapshot.target.comparisonKey &&
+      expected.snapshot.endpoint.host === current.snapshot.endpoint.host &&
+      expected.snapshot.endpoint.port === current.snapshot.endpoint.port &&
+      expected.snapshot.companion.bundleDigest === current.snapshot.companion.bundleDigest &&
+      expected.snapshot.companion.buildIdentity === current.snapshot.companion.buildIdentity &&
+      pathKey(expected.snapshot.companion.addonDirectory) ===
+        pathKey(current.snapshot.companion.addonDirectory) &&
+      pathKey(expected.snapshot.companion.addonSearchRoot) ===
+        pathKey(current.snapshot.companion.addonSearchRoot) &&
+      pathKey(expected.snapshot.companion.profilePath) ===
+        pathKey(current.snapshot.companion.profilePath);
+  }
+
+  private sameLifecycleRead(
+    expected: LifecycleStateRead,
+    current: LifecycleStateRead
+  ): boolean {
+    if (expected.kind !== current.kind) return false;
+    if (expected.kind === "missing" && current.kind === "missing") return true;
+    if (expected.kind === "malformed" && current.kind === "malformed") {
+      return expected.path === current.path && expected.rawSha256 === current.rawSha256;
+    }
+    return expected.kind === "valid" && current.kind === "valid" &&
+      expected.state.phase === "vacant" && current.state.phase === "vacant" &&
+      expected.state.generation === current.state.generation;
+  }
+
+  private async assertSameVacantCompanionAuthority(
+    session: WorkbenchLifecycleSession,
+    expected: LifecycleStateRead,
+    context: string
+  ): Promise<void> {
+    // A process can appear before its lifecycle publication, so a generation
+    // comparison alone is insufficient for the final fail-closed check.
+    await session.assertNoWorkbenchProcesses();
+    const current = await session.readState();
+    if (!this.sameLifecycleRead(expected, current)) {
+      throw new WorkbenchError(
+        `RECOVERY_REQUIRED: Workbench lifecycle changed while ${context.toLowerCase()} was unlocked.`,
+        "RECOVERY_REQUIRED"
+      );
+    }
+  }
+
   private attestRecordedCompanion(snapshot: WorkbenchObserverSnapshot): void {
     const verify = this.companionProvider?.verifyStaged;
     if (!verify) {
@@ -961,6 +1147,16 @@ export class WorkbenchClient {
         "IDENTITY_UNVERIFIABLE"
       );
     }
+    const attestationKey = JSON.stringify([
+      snapshot.generation,
+      snapshot.companion.bundleDigest,
+      snapshot.companion.buildIdentity,
+      pathKey(snapshot.companion.addonDirectory),
+      pathKey(snapshot.companion.addonSearchRoot),
+      pathKey(snapshot.companion.profilePath),
+      snapshot.target.comparisonKey,
+    ]);
+    if (this.companionAttestationKey === attestationKey) return;
     const candidate: WorkbenchCompanionLaunch = {
       addonId: WORKBENCH_HELPER_ADDON_ID,
       addonGuid: WORKBENCH_HELPER_ADDON_GUID,
@@ -981,6 +1177,7 @@ export class WorkbenchClient {
           pathKey(attested.workbenchProfilePath) !== pathKey(candidate.workbenchProfilePath)) {
         throw new Error("attested descriptor changed recorded companion identity");
       }
+      this.companionAttestationKey = attestationKey;
     } catch (error) {
       throw new WorkbenchError(
         `Managed Workbench companion attestation failed: ${error instanceof Error ? error.message : String(error)}`,
@@ -1107,11 +1304,11 @@ export class WorkbenchClient {
   }
 
   private async assertNoWorkbenchProcesses(
-    session: WorkbenchLifecycleSession,
+    probe: Pick<WorkbenchLifecycleSession, "assertNoWorkbenchProcesses">,
     action: string
   ): Promise<void> {
     try {
-      await session.assertNoWorkbenchProcesses();
+      await probe.assertNoWorkbenchProcesses();
     } catch (error) {
       const mapped = this.mapLifecycleError(error);
       throw new WorkbenchError(
@@ -1122,13 +1319,13 @@ export class WorkbenchClient {
   }
 
   private async assertEndpointOwnedByRecordedWorkbench(
-    session: WorkbenchLifecycleSession,
+    probe: Pick<WorkbenchLifecycleSession, "verifyEndpointOwner">,
     expected: WorkbenchIdentity,
     context: string
   ): Promise<void> {
     let result;
     try {
-      result = await session.verifyEndpointOwner(
+      result = await probe.verifyEndpointOwner(
         { host: this.host, port: this.port },
         expected
       );
@@ -1161,25 +1358,63 @@ export class WorkbenchClient {
     });
   }
 
-  private async reconcileForEnsure(
+  private async requireReservedLifecycle(
     session: WorkbenchLifecycleSession,
+    expected: WorkbenchLifecycleStateV3
+  ): Promise<WorkbenchLifecycleStateV3> {
+    const read = await session.readState();
+    if (read.kind !== "valid" || read.state.generation !== expected.generation ||
+        !sameLifecycleOwner(read.state.mcpOwner, expected.mcpOwner) ||
+        !sameWorkbenchIdentity(read.state.workbench, expected.workbench)) {
+      throw new WorkbenchError(
+        "RECOVERY_REQUIRED: lifecycle generation or exact owner changed while the machine mutex " +
+          "was released. The stale mutation was refused and durable recovery evidence was preserved.",
+        "RECOVERY_REQUIRED"
+      );
+    }
+    return read.state;
+  }
+
+  private transitionReservedLifecycle(
+    expected: WorkbenchLifecycleStateV3,
+    overrides: Partial<LifecycleStateDraft>
+  ): Promise<WorkbenchLifecycleStateV3> {
+    return this.processGuard.withLifecycleLock(async (session) => {
+      const current = await this.requireReservedLifecycle(session, expected);
+      return session.transition(stateExpected(current), stateDraft(current, overrides));
+    });
+  }
+
+  private vacateReservedLifecycle(
+    expected: WorkbenchLifecycleStateV3,
+    target: StoredLifecycleTarget | null
+  ): Promise<WorkbenchLifecycleStateV3> {
+    return this.processGuard.withLifecycleLock(async (session) => {
+      const current = await this.requireReservedLifecycle(session, expected);
+      return session.transitionToVacant(stateExpected(current), {
+        target: target ?? current.target,
+        companion: current.companion,
+      });
+    });
+  }
+
+  private async reconcileForEnsure(
     state: WorkbenchLifecycleStateV3,
     project: CanonicalProjectIdentity
   ): Promise<{ state: WorkbenchLifecycleStateV3; live: boolean }> {
     const status = await this.inspectRecordedWorkbench(state);
     if (status === "absent") {
-      await this.assertNoWorkbenchProcesses(session, "Lifecycle recovery");
+      await this.assertNoWorkbenchProcesses(this.processGuard, "Lifecycle recovery");
       return {
-        state: await this.reconcileAbsentState(session, state, this.lifecycleTarget(project)),
+        state: await this.vacateReservedLifecycle(state, this.lifecycleTarget(project)),
         live: false,
       };
     }
     if (state.phase === "stopping") {
-      const stopped = await this.terminateExact(session, state.workbench!);
-      if (!stopped) throw new WorkbenchError("Exact Workbench shutdown could not be proven.", "RECOVERY_REQUIRED");
-      await this.waitForPortRelease(session);
+      await this.terminateExact(state.workbench!);
+      await this.waitForPortRelease();
       return {
-        state: await this.reconcileAbsentState(session, state, this.lifecycleTarget(project)),
+        state: await this.vacateReservedLifecycle(state, this.lifecycleTarget(project)),
         live: false,
       };
     }
@@ -1192,39 +1427,56 @@ export class WorkbenchClient {
           );
         }
         await this.assertEndpointOwnedByRecordedWorkbench(
-          session,
+          this.processGuard,
           state.workbench,
           `${state.phase} recovery`
         );
-        const running = await session.transition(stateExpected(state), stateDraft(state, {
+        const running = await this.transitionReservedLifecycle(state, {
           phase: "running",
           operation: null,
-        }));
+        });
         return { state: running, live: true };
       }
-      await this.terminateExact(session, state.workbench!);
-      await this.waitForPortRelease(session);
+      await this.terminateExact(state.workbench!);
+      await this.waitForPortRelease();
       return {
-        state: await this.reconcileAbsentState(session, state, this.lifecycleTarget(project)),
+        state: await this.vacateReservedLifecycle(state, this.lifecycleTarget(project)),
         live: false,
       };
     }
     return { state, live: true };
   }
 
-  private async ensureRunningLocked(
-    session: WorkbenchLifecycleSession,
+  private async ensureRunningCoordinated(
     project: CanonicalProjectIdentity,
     operationId: string
   ): Promise<WorkbenchLaunchResult> {
-    let state = await this.claimState(session, project);
-    const reconciled = await this.reconcileForEnsure(session, state, project);
+    let state = await this.processGuard.withLifecycleLock((session) =>
+      this.claimState(session, project));
+    const reconciled = await this.reconcileForEnsure(state, project);
     state = reconciled.state;
     if (reconciled.live) {
       if (!state.workbench || !state.target || state.target.comparisonKey !== project.comparisonKey) {
         throw new WorkbenchError("Recorded Workbench target does not match the requested project.", "TARGET_CONFLICT");
       }
-      await this.validateManagedRunningState(session, "running-session reuse", false);
+      const authority = await this.processGuard.withLifecycleLock(async (session) => {
+        await this.requireReservedLifecycle(session, state);
+        return this.readManagedRunningAuthority(session, "running-session reuse", false);
+      });
+      await this.validateManagedAuthority(authority, "running-session reuse");
+      await this.processGuard.withLifecycleLock(async (session) => {
+        const current = await this.readManagedRunningAuthority(
+          session,
+          "running-session reuse",
+          false
+        );
+        if (!this.sameManagedAuthority(authority, current)) {
+          throw new WorkbenchError(
+            "RECOVERY_REQUIRED: running Workbench changed while reuse qualification was unlocked.",
+            "RECOVERY_REQUIRED"
+          );
+        }
+      });
       return {
         action: "reused",
         pid: state.workbench.pid,
@@ -1233,27 +1485,37 @@ export class WorkbenchClient {
       };
     }
 
-    await this.assertNoWorkbenchProcesses(session, "Launch");
-    const vacancy = await session.verifyEndpointVacant({ host: this.host, port: this.port });
-    if (vacancy.kind === "occupied") {
-      throw new WorkbenchError(
-        `UNOWNED_WORKBENCH: NET API endpoint ${this.host}:${this.port} is occupied without the exact ` +
-          `recorded Workbench identity (listener PID ${vacancy.listenerPid}).`,
-        "UNOWNED_WORKBENCH"
-      );
-    }
-    if (vacancy.kind === "unverifiable") {
-      throw new WorkbenchError(
-        `IDENTITY_UNVERIFIABLE: NET API endpoint ${this.host}:${this.port} vacancy could not be ` +
-          `proved (${vacancy.reason}): ${vacancy.message}`,
-        "IDENTITY_UNVERIFIABLE"
-      );
-    }
     const preflight = this.preflightLaunch(project);
     this.companionProvider?.applyRetention?.({
       protectedDigests: [preflight.companion.bundleDigest],
     });
-    const started = await this.startLocked(session, state, preflight, "starting", "launch", operationId);
+    state = await this.processGuard.withLifecycleLock(async (session) => {
+      const current = await this.requireReservedLifecycle(session, state);
+      await this.assertNoWorkbenchProcesses(session, "Launch");
+      const vacancy = await session.verifyEndpointVacant({ host: this.host, port: this.port });
+      if (vacancy.kind === "occupied") {
+        throw new WorkbenchError(
+          `UNOWNED_WORKBENCH: NET API endpoint ${this.host}:${this.port} is occupied without the exact ` +
+            `recorded Workbench identity (listener PID ${vacancy.listenerPid}).`,
+          "UNOWNED_WORKBENCH"
+        );
+      }
+      if (vacancy.kind === "unverifiable") {
+        throw new WorkbenchError(
+          `IDENTITY_UNVERIFIABLE: NET API endpoint ${this.host}:${this.port} vacancy could not be ` +
+            `proved (${vacancy.reason}): ${vacancy.message}`,
+          "IDENTITY_UNVERIFIABLE"
+        );
+      }
+      return session.transition(stateExpected(current), stateDraft(current, {
+        phase: "starting",
+        target: this.lifecycleTarget(preflight.project),
+        workbench: null,
+        companion: companionLifecycleState(preflight.companion),
+        operation: { kind: "launch", operationId },
+      }));
+    });
+    const started = await this.startReserved(state, preflight, "launch");
     return {
       action: "launched",
       pid: started.workbench!.pid,
@@ -1262,13 +1524,13 @@ export class WorkbenchClient {
     };
   }
 
-  private async restartLocked(
-    session: WorkbenchLifecycleSession,
+  private async restartCoordinated(
     project: CanonicalProjectIdentity,
     operationId: string
   ): Promise<WorkbenchRestartResult> {
-    let state = await this.claimState(session, project);
-    const reconciled = await this.reconcileForEnsure(session, state, project);
+    let state = await this.processGuard.withLifecycleLock((session) =>
+      this.claimState(session, project));
+    const reconciled = await this.reconcileForEnsure(state, project);
     state = reconciled.state;
     if (!reconciled.live || !state.workbench) {
       throw new WorkbenchError("Restart refused: no exact owned Workbench is running.", "LAUNCH_FAILED");
@@ -1278,32 +1540,45 @@ export class WorkbenchClient {
     const preflight = this.preflightLaunch(revalidateProjectIdentity(project));
     const previous = state.workbench;
     const priorPhase = state.phase;
-    state = await session.transition(stateExpected(state), stateDraft(state, {
+    state = await this.transitionReservedLifecycle(state, {
       phase: "restarting",
       operation: { kind: "restart", operationId },
-    }));
+    });
     try {
-      await this.terminateExact(session, previous);
+      await this.terminateExact(previous);
     } catch (error) {
-      await session.transition(stateExpected(state), stateDraft(state, {
-        phase: priorPhase,
-        operation: null,
-      })).catch(() => undefined);
+      if (error instanceof ProvenPreSignalTerminationRefusal) {
+        try {
+          const rolledBack = await this.transitionReservedLifecycle(state, {
+            phase: priorPhase,
+            operation: null,
+          });
+          if (this.ownedChild && sameWorkbenchIdentity(this.ownedChild.identity, previous)) {
+            this.ownedChild.generation = rolledBack.generation;
+          }
+        } catch (rollbackError) {
+          throw new WorkbenchError(
+            `RECOVERY_REQUIRED: exact termination was refused before signalling, but the restart ` +
+              `reservation changed before rollback (${rollbackError instanceof Error
+                ? rollbackError.message
+                : String(rollbackError)}).`,
+            "RECOVERY_REQUIRED"
+          );
+        }
+      }
       throw error;
     }
     this.resetConnectionState();
-    await this.waitForPortRelease(session);
-    state = await session.transition(stateExpected(state), stateDraft(state, {
+    await this.waitForPortRelease();
+    state = await this.transitionReservedLifecycle(state, {
       phase: "restarting",
       workbench: null,
-    }));
-    const restarted = await this.startLocked(
-      session,
+      companion: companionLifecycleState(preflight.companion),
+    });
+    const restarted = await this.startReserved(
       state,
       preflight,
-      "restarting",
-      "restart",
-      operationId
+      "restart"
     );
     return {
       previousPid: previous.pid,
@@ -1313,19 +1588,19 @@ export class WorkbenchClient {
     };
   }
 
-  private async shutdownLocked(
-    session: WorkbenchLifecycleSession,
+  private async shutdownCoordinated(
     operationId: string
   ): Promise<WorkbenchShutdownResult> {
     // Shutdown is identity-driven. Preserve the durable target spelling/key but
     // do not touch the .gproj: it may have been deleted or disconnected while
     // the exact recorded Workbench is still safely terminable.
-    let state = await this.claimState(session, null);
+    let state = await this.processGuard.withLifecycleLock((session) =>
+      this.claimState(session, null));
     const target = state.target;
     const status = await this.inspectRecordedWorkbench(state);
     if (status === "absent") {
-      await this.assertNoWorkbenchProcesses(session, "Shutdown");
-      state = await this.reconcileAbsentState(session, state, target);
+      await this.assertNoWorkbenchProcesses(this.processGuard, "Shutdown");
+      state = await this.vacateReservedLifecycle(state, target);
       return {
         stopped: false,
         previousPid: null,
@@ -1334,20 +1609,35 @@ export class WorkbenchClient {
       };
     }
     const expected = state.workbench!;
-    state = await session.transition(stateExpected(state), stateDraft(state, {
+    state = await this.transitionReservedLifecycle(state, {
       phase: "stopping",
       operation: { kind: "shutdown", operationId },
-    }));
+    });
     try {
-      await this.terminateExact(session, expected);
+      await this.terminateExact(expected);
     } catch (error) {
-      await session.transition(stateExpected(state), stateDraft(state, {
-        phase: "running",
-        operation: null,
-      })).catch(() => undefined);
+      if (error instanceof ProvenPreSignalTerminationRefusal) {
+        try {
+          const rolledBack = await this.transitionReservedLifecycle(state, {
+            phase: "running",
+            operation: null,
+          });
+          if (this.ownedChild && sameWorkbenchIdentity(this.ownedChild.identity, expected)) {
+            this.ownedChild.generation = rolledBack.generation;
+          }
+        } catch (rollbackError) {
+          throw new WorkbenchError(
+            `RECOVERY_REQUIRED: exact termination was refused before signalling, but the shutdown ` +
+              `reservation changed before rollback (${rollbackError instanceof Error
+                ? rollbackError.message
+                : String(rollbackError)}).`,
+            "RECOVERY_REQUIRED"
+          );
+        }
+      }
       throw error;
     }
-    await this.waitForPortRelease(session);
+    await this.waitForPortRelease();
     this.resetConnectionState();
     const observedChild = this.ownedChild;
     if (observedChild && observedChild.identity.pid === expected.pid &&
@@ -1355,7 +1645,7 @@ export class WorkbenchClient {
       this.childSupervisor.forget("owned-workbench", observedChild.child);
       this.ownedChild = null;
     }
-    const vacant = await this.reconcileAbsentState(session, state, target);
+    const vacant = await this.vacateReservedLifecycle(state, target);
     this.companionProvider?.applyRetention?.({
       protectedDigests: state.companion ? [state.companion.bundleDigest] : [],
     });
@@ -1446,22 +1736,12 @@ export class WorkbenchClient {
     };
   }
 
-  private async startLocked(
-    session: WorkbenchLifecycleSession,
+  private async startReserved(
     initialState: WorkbenchLifecycleStateV3,
     preflight: LaunchPreflight,
-    transientPhase: "starting" | "restarting",
-    operationKind: "launch" | "restart",
-    operationId: string
+    operationKind: "launch" | "restart"
   ): Promise<WorkbenchLifecycleStateV3> {
-    const launchTarget = this.lifecycleTarget(preflight.project);
-    let state = await session.transition(stateExpected(initialState), stateDraft(initialState, {
-      phase: transientPhase,
-      target: launchTarget,
-      workbench: null,
-      companion: companionLifecycleState(preflight.companion),
-      operation: { kind: operationKind, operationId },
-    }));
+    let state = initialState;
 
     const ownerToken = this.processGuard.createOwnerToken();
     const ownerArgument = this.processGuard.ownerArgument(ownerToken);
@@ -1477,7 +1757,19 @@ export class WorkbenchClient {
     let childObservation: OwnedChildObservation | null = null;
     let spawnError: Error | null = null;
     try {
-      session.assertActive();
+      // The reservation is durable before spawn. Reacquire the mutex only to
+      // prove the exact generation/owner is still authoritative, then release
+      // it before process inspection and readiness polling.
+      await this.processGuard.withLifecycleLock((session) =>
+        this.requireReservedLifecycle(session, state));
+      revalidateProjectIdentity(preflight.project);
+      if (!this.companionProvider?.verifyStaged) {
+        throw new WorkbenchError(
+          "Workbench companion provider cannot re-attest the launched payload.",
+          "IDENTITY_UNVERIFIABLE"
+        );
+      }
+      this.companionProvider.verifyStaged(preflight.companion, preflight.project.displayPath);
       const launchedAtMs = Date.now();
       child = this.spawnProcess!(preflight.executablePath, args, {
         detached: true,
@@ -1496,15 +1788,15 @@ export class WorkbenchClient {
           "IDENTITY_UNVERIFIABLE"
         );
       }
-      identity = await session.inspectSpawnedWorkbench({
+      identity = await this.processGuard.inspectSpawnedWorkbench({
         pid: child.pid,
         executablePath: preflight.executablePath,
         ownerTokenArgument: ownerArgument,
         launchedAtMs,
       });
-      state = await session.transition(stateExpected(state), stateDraft(state, {
+      state = await this.transitionReservedLifecycle(state, {
         workbench: identity,
-      }));
+      });
       childObservation = this.attachOwnedChild(
         child,
         identity,
@@ -1527,17 +1819,17 @@ export class WorkbenchClient {
         );
       }
       await this.assertEndpointOwnedByRecordedWorkbench(
-        session,
+        this.processGuard,
         identity,
         `${operationKind} readiness`
       );
-      state = await session.transition(stateExpected(state), stateDraft(state, {
+      state = await this.transitionReservedLifecycle(state, {
         phase: "running",
         operation: null,
-      }));
+      });
       if (childObservation) childObservation.generation = state.generation;
     } catch (error) {
-      await this.rollbackFailedLaunch(session, state, identity);
+      await this.rollbackFailedLaunch(state, identity);
       throw this.mapLifecycleError(error);
     }
 
@@ -1554,20 +1846,21 @@ export class WorkbenchClient {
   }
 
   private async rollbackFailedLaunch(
-    session: WorkbenchLifecycleSession,
     state: WorkbenchLifecycleStateV3,
     identity: WorkbenchIdentity | null
   ): Promise<void> {
     if (identity) {
-      const result = await session.verifyAndTerminate(identity, OWNED_PROCESS_EXIT_TIMEOUT_MS);
-      if (result.kind === "refused") {
+      try {
+        await this.terminateExact(identity);
+      } catch (error) {
         throw new WorkbenchError(
-          `RECOVERY_REQUIRED: launch failed and exact Workbench shutdown was refused (${result.reason}): ` +
-            `${result.message}. The lifecycle record was preserved for exact-owner recovery.`,
+          `RECOVERY_REQUIRED: launch failed and exact Workbench shutdown could not be proven: ` +
+            `${error instanceof Error ? error.message : String(error)}. ` +
+            "The lifecycle record was preserved for exact-owner recovery.",
           "RECOVERY_REQUIRED"
         );
       }
-      await this.waitForPortRelease(session);
+      await this.waitForPortRelease();
     } else {
       const processes = await this.processGuard.listWorkbenchProcesses();
       if (processes.length > 0) {
@@ -1579,10 +1872,7 @@ export class WorkbenchClient {
         );
       }
     }
-    await session.transitionToVacant(stateExpected(state), {
-      target: state.target,
-      companion: state.companion,
-    });
+    await this.vacateReservedLifecycle(state, state.target);
     this.resetConnectionState();
   }
 
@@ -1648,18 +1938,37 @@ export class WorkbenchClient {
   }
 
   private async terminateExact(
-    session: WorkbenchLifecycleSession,
     expected: WorkbenchIdentity
-  ): Promise<boolean> {
-    const result = await session.verifyAndTerminate(expected, OWNED_PROCESS_EXIT_TIMEOUT_MS);
-    if (result.kind === "refused") {
+  ): Promise<void> {
+    let result;
+    try {
+      result = await this.processGuard.verifyAndTerminate(
+        expected,
+        OWNED_PROCESS_EXIT_TIMEOUT_MS
+      );
+    } catch (error) {
+      const mapped = this.mapLifecycleError(error);
       throw new WorkbenchError(
-        `IDENTITY_UNVERIFIABLE: exact Workbench termination was refused (${result.reason}): ` +
-          `${result.message}. No PID-only signal was attempted.`,
+        `RECOVERY_REQUIRED: exact Workbench termination outcome is uncertain: ${mapped.message}. ` +
+          "The durable lifecycle remains reserved with its exact process identity.",
+        "RECOVERY_REQUIRED"
+      );
+    }
+    if (result.kind === "refused") {
+      if (result.reason === "timeout" || result.reason === "helper_failure") {
+        throw new WorkbenchError(
+          `RECOVERY_REQUIRED: exact Workbench termination helper returned ${result.reason}: ` +
+            `${result.message}. A native signal may already have been issued; durable exact-owner ` +
+            "recovery evidence was preserved.",
+          "RECOVERY_REQUIRED"
+        );
+      }
+      throw new ProvenPreSignalTerminationRefusal(
+        `IDENTITY_UNVERIFIABLE: exact Workbench termination was refused before signalling ` +
+          `(${result.reason}): ${result.message}. No PID-only signal was attempted.`,
         "IDENTITY_UNVERIFIABLE"
       );
     }
-    return true;
   }
 
   private attachOwnedChild(
@@ -1670,34 +1979,44 @@ export class WorkbenchClient {
   ): OwnedChildObservation {
     const observation: OwnedChildObservation = { child, identity, generation, targetKey };
     this.ownedChild = observation;
-    this.childSupervisor.supervise("owned-workbench", child, { onExit: async () => {
-      if (this.ownedChild !== observation) return;
-      this.activityGate.invalidateForUnexpectedExit({
-        generation: observation.generation,
-        targetKey: observation.targetKey,
-        process: {
-          pid: identity.pid,
-          executablePath: identity.executablePath,
-          creationTime: identity.creationTime,
-        },
-      });
-      this.resetConnectionState();
-      this.ownedChild = null;
-      await this.activityGate.runLifecycle("recovery", () =>
-        this.coordinateLifecycle("recovery", targetKey, async () =>
-          this.processGuard.withLifecycleLock(async (session) => {
-            const read = await session.readState();
-            if (read.kind !== "valid" || read.state.generation !== observation.generation ||
-                !read.state.workbench || read.state.workbench.pid !== identity.pid ||
-                read.state.workbench.creationTime !== identity.creationTime) return;
-            await this.assertNoWorkbenchProcesses(session, "Unexpected-exit recovery");
-            await this.reconcileAbsentState(session, read.state, read.state.target);
-          })
-        )
-      ).catch((error) => logger.warn(
-        `Workbench exit reconciliation failed: ${error instanceof Error ? error.message : String(error)}`
-      ));
-    } });
+    this.childSupervisor.supervise("owned-workbench", child, {
+      onExit: async () => {
+        // A retry is allowed after the first attempt has cleared the local
+        // observation. A newer child under the same key cancels this retry,
+        // and the durable generation checks below independently reject it.
+        if (this.ownedChild && this.ownedChild !== observation) return;
+        if (this.ownedChild === observation) {
+          this.activityGate.invalidateForUnexpectedExit({
+            generation: observation.generation,
+            targetKey: observation.targetKey,
+            process: {
+              pid: identity.pid,
+              executablePath: identity.executablePath,
+              creationTime: identity.creationTime,
+            },
+          });
+          this.resetConnectionState();
+          this.ownedChild = null;
+        }
+        await this.activityGate.runLifecycle("recovery", () =>
+          this.coordinateLifecycle("recovery", targetKey, async () =>
+            this.processGuard.withLifecycleLock(async (session) => {
+              const read = await session.readState();
+              if (read.kind !== "valid" || read.state.generation !== observation.generation ||
+                  !read.state.workbench || read.state.workbench.pid !== identity.pid ||
+                  read.state.workbench.creationTime !== identity.creationTime) return;
+              await this.assertNoWorkbenchProcesses(session, "Unexpected-exit recovery");
+              await this.reconcileAbsentState(session, read.state, read.state.target);
+            })
+          )
+        );
+      },
+      onCallbackError: (error) => logger.warn(
+        `Workbench exit reconciliation failed and will retry: ${error instanceof Error
+          ? error.message
+          : String(error)}`
+      ),
+    });
     return observation;
   }
 
@@ -1725,10 +2044,12 @@ export class WorkbenchClient {
     return candidates.find((candidate) => existsSync(join(candidate, "addons"))) ?? null;
   }
 
-  private async waitForPortRelease(session: WorkbenchLifecycleSession): Promise<void> {
+  private async waitForPortRelease(
+    probe: Pick<WorkbenchLifecycleSession, "verifyEndpointVacant"> = this.processGuard
+  ): Promise<void> {
     const deadline = Date.now() + PORT_RELEASE_TIMEOUT_MS;
     while (Date.now() < deadline) {
-      const vacancy = await session.verifyEndpointVacant({ host: this.host, port: this.port });
+      const vacancy = await probe.verifyEndpointVacant({ host: this.host, port: this.port });
       if (vacancy.kind === "vacant") return;
       if (vacancy.kind === "unverifiable") {
         throw new WorkbenchError(

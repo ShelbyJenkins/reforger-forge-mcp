@@ -9,6 +9,7 @@ import {
   readdirSync,
   renameSync,
   statSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
@@ -142,13 +143,28 @@ export function atomicWriteFile(root: string, targetPath: string, data: string |
   const parent = ensureCanonicalDirectory(dirname(target));
   assertManagedPath(root, parent);
   const temporary = join(parent, `.${randomUUID()}.tmp`);
-  const descriptor = openSync(temporary, "wx", mode);
   try {
-    writeFileSync(descriptor, data);
-  } finally {
-    closeSync(descriptor);
+    const descriptor = openSync(temporary, "wx", mode);
+    try {
+      writeFileSync(descriptor, data);
+    } finally {
+      closeSync(descriptor);
+    }
+    renameSync(temporary, target);
+  } catch (error) {
+    // A failed write/close/rename must not leave a fresh UUID temporary behind.
+    // Callers that own durable bounded stores also inventory old temporaries so
+    // a raced/busy cleanup failure is visible and prevents further allocation.
+    try {
+      unlinkSync(temporary);
+    } catch (cleanupError) {
+      if ((cleanupError as NodeJS.ErrnoException)?.code !== "ENOENT") {
+        // Preserve the operation's primary failure. The exact temporary remains
+        // discoverable by the bounded store's next inventory pass.
+      }
+    }
+    throw error;
   }
-  renameSync(temporary, target);
 }
 
 export function atomicWriteJson(root: string, targetPath: string, value: unknown, mode = 0o600): void {

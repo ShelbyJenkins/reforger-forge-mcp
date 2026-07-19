@@ -9,6 +9,7 @@ on:
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     strategy:
       matrix:
         node-version: [20, 22]
@@ -21,6 +22,47 @@ jobs:
           cache: npm
 
       - run: npm ci
+
+      # Check before writing so a deleted generated artifact cannot hide as an
+      # untracked file from the subsequent Git dirty-diff assertion.
+      - run: npm run protocol:check
+
+      - run: npm run protocol:generate
+
+      - run: git diff --exit-code -- observer/protocol
+
+      - run: npm run build
+
+      - run: npm test
+
+      # The installed-tarball smoke is platform-independent. Run it once rather
+      # than packing and installing the same artifact for every matrix entry.
+      - if: matrix.node-version == 20
+        run: npm run test:package
+
+  build-and-test-windows:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    strategy:
+      matrix:
+        node-version: [20, 22]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+
+      - run: npm ci
+
+      # Keep generated-output evidence symmetric so platform-specific output
+      # differences cannot pass behind the Ubuntu-only check.
+      - run: npm run protocol:check
+
+      - run: npm run protocol:generate
+
+      - run: git diff --exit-code -- observer/protocol
 
       - run: npm run build
 

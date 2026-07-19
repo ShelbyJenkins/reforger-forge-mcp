@@ -15,10 +15,14 @@ import {
 } from "../../src/observer/coordinator.js";
 import { registerObserverTools } from "../../src/observer/tools.js";
 import { prepareObserverLaunch } from "../../src/observer/launch.js";
-import type { OwnedRuntimeManager } from "../../src/observer/owned-runtime-manager.js";
+import {
+  OwnedRuntimeError,
+  type OwnedRuntimeManager,
+} from "../../src/observer/owned-runtime-manager.js";
 import {
   claimRuntimeStopReservation,
   releaseRuntimeStopReservation,
+  runtimeStopObligations,
   uninstallManagedObserver,
 } from "../../observer/agent/private-child.js";
 import { ObserverError } from "../../observer/agent/errors.js";
@@ -74,6 +78,30 @@ describe("observer runtime-stop lease generations", () => {
     });
     expect(releaseRuntimeStopReservation(reservations, sessionId, first)).toBe(false);
     expect(reservations.get(sessionId)).toBe(second);
+  });
+
+  it("ignores stale terminal heartbeat IDs while retaining authoritative restoration work", () => {
+    const obligations = runtimeStopObligations([
+      {
+        jobId: "job-terminal",
+        state: "completed",
+        cameraLease: { everHeld: true, held: false, restorationConfirmed: true },
+      },
+      {
+        jobId: "job-restoring",
+        state: "restoring",
+        cameraLease: { everHeld: true, held: false, restorationConfirmed: false },
+      },
+    ], [
+      { activeJobId: "job-terminal", cameraLeaseJobId: "job-terminal" },
+      { activeJobId: "job-restoring", cameraLeaseJobId: "job-restoring" },
+    ], new Set(["job-restoring"]));
+
+    expect(obligations).toEqual({
+      activeJobIds: ["job-restoring"],
+      cameraLeaseJobIds: ["job-restoring"],
+      restorationPendingJobIds: ["job-restoring"],
+    });
   });
 });
 
@@ -364,14 +392,47 @@ describe("Phase H observer coordinator", () => {
       requestTimeoutMs: 1_000,
     });
 
+    expect(coordinator.diagnosticPrivateChildCount()).toBe(0);
     await Promise.all([coordinator.ensureSetup(), coordinator.ensureSetup()]);
     await Promise.all([coordinator.status(), coordinator.doctor()]);
 
     expect(count.value).toBe(1);
+    expect(coordinator.diagnosticPrivateChildCount()).toBe(1);
     expect(child.operations.sort()).toEqual(["doctor", "stage", "stage", "status"]);
     await coordinator.close();
     expect(child.operations).toContain("shutdown");
     expect(child.killed).toBe(false);
+    expect(coordinator.diagnosticPrivateChildCount()).toBe(0);
+  });
+
+  it("keeps a timed-out private child counted until its actual exit", async () => {
+    const child = new FakeChild();
+    const coordinator = new ObserverCoordinator({
+      agentPath: "private-child.js",
+      forkChild: fakeFork(child, { value: 0 }),
+      startupTimeoutMs: 1_000,
+      requestTimeoutMs: 1_000,
+    });
+    await coordinator.ensureSetup();
+    child.holdOperation = "shutdown";
+    child.kill = () => {
+      child.killed = true;
+      return true;
+    };
+
+    vi.useFakeTimers();
+    try {
+      const closePromise = coordinator.close();
+      await vi.advanceTimersByTimeAsync(4_000);
+      await closePromise;
+
+      expect(child.killed).toBe(true);
+      expect(coordinator.diagnosticPrivateChildCount()).toBe(1);
+      child.exit(0);
+      expect(coordinator.diagnosticPrivateChildCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("rejects active operations when its exact child exits", async () => {
@@ -765,6 +826,46 @@ describe("Phase H observer MCP tools", () => {
     const invalid = await handler({ action: "start" }, { signal });
     expect(invalid.isError).toBe(true);
     expect(invalid.content[0].text).toContain("INVALID_REQUEST");
+  });
+
+  it("does not re-expose fixed-policy diagnostics through structured tool details", async () => {
+    const secret = "must-not-cross-the-public-boundary";
+    const manager = {
+      start: vi.fn(async () => {
+        throw new OwnedRuntimeError(
+          "STORAGE_UNVERIFIABLE",
+          `private storage diagnostic: ${secret}`,
+          { originalDiagnostic: secret }
+        );
+      }),
+    } as unknown as OwnedRuntimeManager;
+    const coordinator = {
+      defaultCaptureTimeoutMs: 30_000,
+      maxInlineImageBytes: 1_024,
+      instances: vi.fn(async () => {
+        throw new ObserverCoordinatorError(
+          "UNAUTHORIZED",
+          `private authorization diagnostic: ${secret}`,
+          { originalDiagnostic: secret }
+        );
+      }),
+    } as unknown as ObserverCoordinator;
+    const tools = toolRegistry(coordinator, manager);
+    const signal = new AbortController().signal;
+
+    const runtimeResult = await tools.get("observer_runtime")!.handler({
+      action: "start",
+      preparedLaunchId: "pl-00000000-0000-4000-8000-000000000001",
+      idempotencyKey: "redacted-start",
+    }, { signal });
+    const instancesResult = await tools.get("observer_instances")!.handler({}, { signal });
+
+    expect(runtimeResult.content[0].text).toContain("Observer lifecycle storage could not be verified.");
+    expect(instancesResult.content[0].text).toContain("Observer request was not authorized.");
+    expect(runtimeResult.content[0].text).not.toContain(secret);
+    expect(instancesResult.content[0].text).not.toContain(secret);
+    expect(runtimeResult.content[0].text).not.toContain("originalDiagnostic");
+    expect(instancesResult.content[0].text).not.toContain("originalDiagnostic");
   });
 
   it("rejects stale Workbench expected-world binding before adapter submission", async () => {
