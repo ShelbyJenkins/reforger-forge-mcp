@@ -1,7 +1,7 @@
 import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { logger } from "../utils/logger.js";
-import type { PrefabRecipe, RecipeVariant, RecipeOverrideComponent } from "./recipe.js";
+import type { PrefabRecipe, RecipeVariant } from "./recipe.js";
 import { loadConfig } from "../config.js";
 
 /**

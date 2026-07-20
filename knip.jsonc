@@ -1,0 +1,33 @@
+{
+  "$schema": "https://unpkg.com/knip@6/schema-jsonc.json",
+
+  // Package executables, supported direct imports, manually-run scripts, and
+  // child-process fixtures are runtime entry points that static imports alone
+  // cannot discover.
+  "entry": [
+    "src/workbench/runner-cli.ts",
+    "src/workbench/child-supervisor.ts",
+    "observer/agent/index.ts",
+    "src/scraper/index.ts",
+    "src/scraper/source-remote.ts",
+    "scripts/**/*.ts",
+    "scripts/**/*.mjs",
+    "test-mcp-connection.js",
+    "tests/**/*.ts",
+    "tests/**/*.mjs"
+  ],
+  "project": [
+    "src/**/*.ts",
+    "observer/agent/**/*.ts",
+    "observer/protocol/**/*.ts",
+    "scripts/**/*.{ts,mjs}",
+    "tests/**/*.{ts,mjs}"
+  ],
+
+  // TypeScript owns unused locals and parameters. This check complements it
+  // with unreachable files and package-manifest drift; export analysis is not
+  // reliable while consumers may deep-import library modules.
+  "include": ["files", "dependencies", "devDependencies", "unlisted", "binaries"],
+  "treatConfigHintsAsErrors": true,
+  "ignoreBinaries": ["where.exe", "tasklist.exe", "taskkill.exe"]
+}

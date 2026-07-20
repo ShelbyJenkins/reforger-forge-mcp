@@ -336,8 +336,6 @@ export class ArtifactStore {
     const backendRoot = ensureCanonicalDirectory(join(this.artifactsRoot, input.backend));
     const root = join(backendRoot, input.jobId);
     assertManagedPath(backendRoot, root);
-    const imagePath = join(root, "image.png");
-    const metadataPath = join(root, "metadata.json");
     const retainedMetadata: Record<string, unknown> = {
       ...input.metadata,
       version: 1,

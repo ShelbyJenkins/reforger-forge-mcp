@@ -12,7 +12,6 @@ import {
   type EvidenceExportReceipt,
   type EvidenceRunExportSnapshot,
   normalizeEvidenceLabel,
-  type ObserverRunReview,
 } from "./evidence-bundle-service.js";
 import { ObserverError } from "./errors.js";
 import { assertIdentifier, assertManagedPath, assertRegularManagedFile, ensureCanonicalDirectory } from "./paths.js";

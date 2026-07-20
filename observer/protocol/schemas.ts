@@ -1,6 +1,5 @@
 import { z } from "zod";
 import {
-  ADDON_VERSION,
   CAPABILITIES,
   DEFAULT_LIMITS,
   ERROR_CODES,

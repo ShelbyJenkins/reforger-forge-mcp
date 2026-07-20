@@ -1,6 +1,6 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { existsSync, mkdirSync, writeFileSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync, readdirSync, readFileSync } from "node:fs";
 import { resolve, join, extname, relative } from "node:path";
 import type { Config } from "../config.js";
 import { generateGproj } from "../templates/gproj.js";
@@ -369,7 +369,7 @@ export function registerMod(
           .describe("(validate) Specific checks to run. Runs all checks if omitted."),
       },
     },
-    async ({ action, name, description, prefix, pattern: patternName, projectPath, checks }) => {
+    async ({ action, name, description: _description, prefix, pattern: patternName, projectPath, checks }) => {
 
       // ── create ─────────────────────────────────────────────────────────────
       if (action === "create") {

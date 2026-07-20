@@ -365,7 +365,7 @@ export class WorkbenchObserverAdapter {
 
   async instances(): Promise<WorkbenchObserverInstance[]> {
     const snapshot = await this.client.getRunningObserverSnapshot();
-    const ping = await this.pingSnapshot(snapshot);
+    const ping = await this.pingSnapshot();
     const capabilities: string[] = [];
     if (ping.captureCurrent) capabilities.push("render.capture");
     if (ping.cameraEditor) capabilities.push("camera.editor");
@@ -398,7 +398,7 @@ export class WorkbenchObserverAdapter {
       throw new WorkbenchObserverAdapterError("INVALID_REQUEST", parsed.error.issues.map((issue) => issue.message).join("; "));
     }
     const snapshot = await this.client.getRunningObserverSnapshot();
-    const ping = await this.pingSnapshot(snapshot);
+    const ping = await this.pingSnapshot();
     if (!ping.captureCurrent) {
       throw new WorkbenchObserverAdapterError("CAPABILITY_UNAVAILABLE", ping.message || "Workbench current-view capture is unavailable");
     }
@@ -562,7 +562,7 @@ export class WorkbenchObserverAdapter {
     if (input.expectedInstanceId && recoveredInstanceId !== input.expectedInstanceId) {
       throw new WorkbenchObserverAdapterError("STALE_LIFECYCLE", "Workbench observer job belongs to an old lifecycle generation or canonical target");
     }
-    const ping = await this.pingSnapshot(snapshot);
+    const ping = await this.pingSnapshot();
     if (ping.activeJobId !== input.jobId) {
       throw new WorkbenchObserverAdapterError("JOB_NOT_FOUND", `Workbench observer job ${input.jobId} is not retained by the current handler`);
     }
@@ -719,7 +719,7 @@ export class WorkbenchObserverAdapter {
     }
   }
 
-  private async pingSnapshot(snapshot: WorkbenchObserverSnapshot): Promise<z.infer<typeof pingResponseSchema>> {
+  private async pingSnapshot(): Promise<z.infer<typeof pingResponseSchema>> {
     const raw = await this.client.call<unknown>("EMCP_WB_ObserverPing", {}, this.callOptions());
     const parsed = pingResponseSchema.safeParse(raw);
     if (!parsed.success) {
@@ -746,7 +746,7 @@ export class WorkbenchObserverAdapter {
       this.convergeAbort(record);
       if (record.gateReleased) return true;
       try {
-        const ping = await this.pingSnapshot(record.snapshot);
+        const ping = await this.pingSnapshot();
         // A different or empty active job proves this random lease did not
         // retain handler state. The matching job remains fail-closed so a
         // lifecycle operation cannot overtake unproven camera restoration.

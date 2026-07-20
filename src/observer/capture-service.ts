@@ -14,7 +14,6 @@ import {
   type CaptureInstance,
   type CaptureResult,
   type CaptureRunPort,
-  type CaptureState,
   type ListInstancesInput,
   type PublicCaptureJob,
 } from "./capture-contract.js";
@@ -30,8 +29,6 @@ import {
   workbenchWorldRevision,
   type WorldRevision,
 } from "./world-revision.js";
-
-const TERMINAL = new Set(["completed", "failed", "cancelled", "released"]);
 
 export interface CaptureServiceOptions {
   backends: readonly CaptureBackend[];

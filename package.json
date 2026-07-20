@@ -33,6 +33,7 @@
     "protocol:generate": "tsx scripts/generate-protocol-artifacts.ts",
     "protocol:check": "tsx scripts/generate-protocol-artifacts.ts --check",
     "test": "vitest run",
+    "lint:unused": "knip",
     "test:stage3": "vitest run tests/workbench/stage3-acceptance.test.ts tests/workbench/stage3-architecture.test.ts tests/workbench/build-acceptance-contract.test.ts tests/workbench/server-composition.test.ts tests/workbench/net-api-client.test.ts tests/workbench/workbench-launch-plan.test.ts tests/workbench/workbench-session-controller.test.ts tests/workbench/session-state.test.ts tests/workbench/readiness.test.ts tests/workbench/diagnostics.test.ts tests/workbench/client.test.ts tests/workbench/activity-gate.test.ts tests/workbench/restart-ownership.test.ts tests/workbench/runner.test.ts tests/workbench/runner-cli.test.ts tests/workbench/spawn-crash-characterization.test.ts tests/workbench/process-guard.test.ts tests/workbench/child-supervisor.test.ts tests/foundation/recoverable-spawn.test.ts",
     "test:stage4": "vitest run tests/observer/agent-client.test.ts tests/observer/capture-request.test.ts tests/observer/world-revision.test.ts tests/observer/runtime-capture-backend.test.ts tests/observer/workbench-capture-backend.test.ts tests/observer/capture-service.test.ts tests/observer/evidence-run-service.test.ts tests/observer/evidence-bundle-service.test.ts tests/observer/application.test.ts tests/observer/application-operations.test.ts tests/observer/cli.test.ts tests/observer/paths.test.ts tests/observer/stage4-architecture.test.ts tests/observer/private-child-owned-runtime-recovery.test.ts tests/workbench/observer-adapter.test.ts",
     "test:integration": "vitest run tests/workbench/project-launcher-safety.test.ts tests/animation/integration-m151a2.test.ts",
@@ -52,11 +53,13 @@
     "@modelcontextprotocol/sdk": "^1.26.0",
     "adm-zip": "^0.5.16",
     "cheerio": "^1.0.0",
+    "domhandler": "5.0.3",
     "zod": "^3.25.0"
   },
   "devDependencies": {
     "@types/adm-zip": "^0.5.7",
     "@types/node": "^22.0.0",
+    "knip": "6.27.0",
     "tsx": "^4.19.0",
     "typescript": "^5.7.0",
     "vitest": "^3.0.0"

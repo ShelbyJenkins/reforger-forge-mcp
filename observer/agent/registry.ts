@@ -5,7 +5,6 @@ import {
   instanceRegistrationSchema,
   parseProtocolMessage,
   protocolMajor,
-  type Heartbeat,
   type InstanceRegistration,
   type ObserverCapability,
 } from "../protocol/index.js";

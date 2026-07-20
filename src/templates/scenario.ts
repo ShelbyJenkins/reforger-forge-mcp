@@ -22,16 +22,13 @@ const PREFAB_SPAWN_PROTECT  = "{35C70C8528D145B1}Prefabs/MOBSpawnProtection/MOBS
 // Faction-specific ambient patrol spawnpoints
 const PREFAB_PATROL_FIA     = "{9273AB931008C271}Prefabs/Systems/AmbientPatrol/AmbientPatrolSpawnpoint_FIA.et";
 const PREFAB_PATROL_US      = "{1E4C8AD00BBB16AA}Prefabs/Systems/AmbientPatrol/AmbientPatrolSpawnpoint_Base.et"; // Base used for US
-const PREFAB_PATROL_USSR    = "{1E4C8AD00BBB16AA}Prefabs/Systems/AmbientPatrol/AmbientPatrolSpawnpoint_Base.et"; // Base used for USSR
 // Ambient vehicle spawnpoints (civilian and faction)
 const PREFAB_VEHICLE_CIV    = "{0DDAFCA92FF4451C}Prefabs/Systems/AmbientVehicles/AmbientVehicleSpawnpoint_CIV.et";
-const PREFAB_VEHICLE_FIA    = "{D4A604DD154470CD}Prefabs/Systems/AmbientVehicles/AmbientVehicleSpawnpoint_FIA.et";
 // CAH area (major base capture zones)
 const PREFAB_CAH_MAJOR      = "{F4649500E51DF810}Prefabs/MP/Modes/CaptureAndHold/Areas/CaptureAndHoldArea_Major.et";
 // Defend waypoint for patrol defenders
 const PREFAB_DEFEND_WP      = "{AAE8882E0DE0761A}Prefabs/AI/Waypoints/AIWaypoint_Defend_Hierarchy.et";
 // Harbor source base (T3 = large, most common in production mods)
-const PREFAB_HARBOR_T3      = "{0226331FB6A8249A}Prefabs/Systems/MilitaryBase/ConflictSourceBase_T3Harbor.et";
 
 // Component GUIDs inside ConflictMilitaryBase (from mod analysis)
 const CID_SEIZING   = "{5C66967235FBEEA3}";
@@ -40,8 +37,6 @@ const CID_RELAY_TX  = "{5C669673E8C94083}";
 const CID_BASE_COMP = "{5AFC974A70234D1C}";
 const CID_SUPPLIES  = "{5C6696724F524DA2}";
 // Harbor source base component GUIDs
-const CID_HARBOR_SEIZING    = "{621EB97024DABABE}";
-const CID_HARBOR_SOURCE     = "{621EB97024DABD3C}";
 // Ambient patrol component GUID
 const CID_PATROL_COMP       = "{5CCEC6036BBF3EDD}";
 // Ambient vehicle component GUID

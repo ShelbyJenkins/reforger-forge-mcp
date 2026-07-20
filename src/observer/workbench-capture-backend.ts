@@ -73,7 +73,7 @@ export class WorkbenchCaptureBackend implements CaptureBackend {
 
   constructor(private readonly adapter: Pick<WorkbenchObserverAdapter, "instances" | "submit" | "recover" | "status" | "cancel" | "release" | "readCompletedArtifact">) {}
 
-  async listInstances(input: ListInstancesInput, context: BackendCallContext): Promise<CaptureInstance[]> {
+  async listInstances(_input: ListInstancesInput, context: BackendCallContext): Promise<CaptureInstance[]> {
     try {
       const instances = await within(() => this.adapter.instances(), context);
       return instances.map((value) => this.instance(value));

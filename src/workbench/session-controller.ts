@@ -10,7 +10,6 @@
 import { randomUUID } from "node:crypto";
 import { spawn, type ChildProcess, type SpawnOptions } from "node:child_process";
 import { join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
 import type { Config } from "../config.js";
 import { logger } from "../utils/logger.js";
 import {
@@ -2437,7 +2436,7 @@ export class WorkbenchSessionController {
         operation: { kind: "launch", operationId },
       }));
     });
-    const started = await this.startReserved(state, preflight, "launch");
+    const started = await this.startReserved(state, preflight);
     return {
       action: "launched",
       pid: started.workbench!.pid,
@@ -2497,11 +2496,7 @@ export class WorkbenchSessionController {
       workbench: null,
       companion: companionLifecycleState(preflight.helper),
     });
-    const restarted = await this.startReserved(
-      state,
-      preflight,
-      "restart"
-    );
+    const restarted = await this.startReserved(state, preflight);
     return {
       previousPid: previous.pid,
       pid: restarted.workbench!.pid,
@@ -2615,8 +2610,7 @@ export class WorkbenchSessionController {
 
   private async startReserved(
     initialState: WorkbenchLifecycleStateV3,
-    preflight: LaunchPreflight,
-    operationKind: "launch" | "restart"
+    preflight: LaunchPreflight
   ): Promise<WorkbenchLifecycleStateV3> {
     let state = initialState;
 

@@ -4,7 +4,6 @@ import {
   type ObserverApplication,
   type ObserverCaptureInput,
   type ObserverCaptureResult,
-  type ObserverCaptureView,
   type ObserverInstanceList,
   type ObserverInstanceQuery,
 } from "./application.js";

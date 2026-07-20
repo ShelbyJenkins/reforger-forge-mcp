@@ -8,7 +8,6 @@ import {
   mkdirSync,
   opendirSync,
   openSync,
-  readFileSync,
   readSync,
   readdirSync,
   unlinkSync,
@@ -1438,8 +1437,8 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
         name: OWNED_RUNTIME_LIFECYCLE_MUTEX,
         timeoutMs: this.lockTimeoutMs,
         action: async () => {
-          const root = this.ensureStorage();
-          return this.sweepLocked(root, now);
+          this.ensureStorage();
+          return this.sweepLocked(now);
         },
       });
     } catch (error) {
@@ -1878,7 +1877,7 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
     leaseFence.assertActive();
     this.assertOpenForMutation();
     const root = this.ensureStorage();
-    this.sweepLocked(root, this.clock());
+    this.sweepLocked(this.clock());
     const idempotencyPath = this.idempotencyPath("start", keyHash);
     const existingAttempt = this.readOptionalParsed(idempotencyPath, idempotencySchema, "start idempotency receipt");
     if (existingAttempt) {
@@ -2192,7 +2191,7 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
     leaseFence.assertActive();
     this.assertOpenForMutation();
     const root = this.ensureStorage();
-    this.sweepLocked(root, this.clock());
+    this.sweepLocked(this.clock());
     leaseFence.assertActive();
     const receipt = this.readRuntimeReceipt(input.runtimeId);
     const idempotencyPath = this.idempotencyPath("stop", keyHash);
@@ -2338,7 +2337,7 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
             priorProof.managerInstanceId !== receipt.mcpOwner.managerInstanceId)) {
           throw new OwnedRuntimeError("STORAGE_UNVERIFIABLE", "Runtime restoration proof belongs to another lifecycle");
         }
-        const stopped = this.publishStop(
+        this.publishStop(
           root,
           receipt,
           keyHash,
@@ -2372,7 +2371,7 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
         this.backend.inspectProcess(receipt.pid, receipt.ownerTokenArgument));
       leaseFence.assertActive();
       if (!inspection) {
-        const stopped = this.publishStop(
+        this.publishStop(
           root,
           receipt,
           keyHash,
@@ -2443,7 +2442,7 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
       } else {
         vacancyProof = "pid_absent";
       }
-      const stopped = this.publishStop(
+      this.publishStop(
         root,
         receipt,
         keyHash,
@@ -3370,7 +3369,7 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
       }, wallDeadline);
   }
 
-  private sweepLocked(root: string, now: number): OwnedRuntimeSweepResult {
+  private sweepLocked(now: number): OwnedRuntimeSweepResult {
     if (!Number.isFinite(now)) {
       throw new OwnedRuntimeError("INVALID_REQUEST", "Owned runtime retention time is invalid");
     }

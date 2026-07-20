@@ -2,7 +2,6 @@ import { createHash, timingSafeEqual } from "node:crypto";
 import { existsSync, lstatSync, readdirSync, rmSync, statSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { join, resolve, sep } from "node:path";
-import { isIP } from "node:net";
 import { ZodError } from "zod";
 import { boundedOption } from "#foundation/bounded-option";
 import { AGENT_VERSION, DEFAULT_LIMITS, MAX_PROTOCOL_MESSAGE_BYTES, PROTOCOL_VERSION } from "../protocol/index.js";

@@ -8,7 +8,7 @@ export interface CancellationReason<Code extends string = string> {
  * Process-local lease whose cancellation requests cleanup but does not imply
  * that cleanup or restoration has completed.
  */
-export interface AbortableLease<Binding, Reason extends CancellationReason> {
+export interface AbortableLease<Binding, _Reason extends CancellationReason> {
   readonly id: string;
   readonly binding: Binding;
   readonly signal: AbortSignal;

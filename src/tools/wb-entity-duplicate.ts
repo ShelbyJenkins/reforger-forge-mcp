@@ -6,7 +6,7 @@ import {
   mkdirSync,
   existsSync,
 } from "node:fs";
-import { join, dirname } from "node:path";
+import { dirname } from "node:path";
 import type { Config } from "../config.js";
 import type { WorkbenchClient } from "../workbench/client.js";
 import { resolveGameDataPath, findLooseFile, resolveAddonDir } from "../utils/game-paths.js";

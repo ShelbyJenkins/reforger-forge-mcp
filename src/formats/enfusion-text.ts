@@ -284,7 +284,6 @@ class Parser {
         } else if (after.type === TokenType.String) {
           // Could be: Key "value" (property)
           // Or: TypeName "guid" { ... } (child node with ID)
-          const saved2 = this.pos;
           const strTok = this.advance();
           const afterStr = this.peek();
 
@@ -327,8 +326,7 @@ class Parser {
             node.children.push(child);
           } else if (afterIdent2 && afterIdent2.type === TokenType.String) {
             // Three tokens: Ident1 Ident2 "string" — could be node: Type SubId "guid" { }
-            const saved3 = this.pos;
-            const strTok = this.advance();
+            this.advance();
             const afterStr = this.peek();
             if (afterStr && afterStr.type === TokenType.OpenBrace) {
               // TypeName SubType "guid" { ... }

@@ -277,7 +277,6 @@ export function registerAssetSearch(server: McpServer, config: Config): void {
           };
         }
 
-        const guidTotal = index.filter((e) => e.guid).length;
         const lines: string[] = [];
         const diagInfo = `GUIDs:${cachedGuidDiag || `0(empty)`}|basePath:${basePath}|gamePath:${config.gamePath}|indexSize:${index.length}`;
         lines.push(`Found ${results.length} match${results.length !== 1 ? "es" : ""} (showing ${shown.length}) [${diagInfo}]:\n`);

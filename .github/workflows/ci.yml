@@ -27,6 +27,8 @@ jobs:
       # untracked file from the subsequent Git dirty-diff assertion.
       - run: npm run protocol:check
 
+      - run: npm run lint:unused
+
       - run: npm run protocol:generate
 
       - run: git diff --exit-code -- observer/protocol
@@ -59,6 +61,8 @@ jobs:
       # Keep generated-output evidence symmetric so platform-specific output
       # differences cannot pass behind the Ubuntu-only check.
       - run: npm run protocol:check
+
+      - run: npm run lint:unused
 
       - run: npm run protocol:generate
 

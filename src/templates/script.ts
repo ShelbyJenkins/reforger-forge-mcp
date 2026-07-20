@@ -114,7 +114,7 @@ export function generateScript(opts: ScriptOptions): string {
 
   switch (opts.scriptType) {
     case "modded":
-      lines.push(...generateModded(opts.className, parent, effectiveMethods));
+      lines.push(...generateModded(parent, effectiveMethods));
       break;
     case "component":
       lines.push(...generateComponent(opts.className, parent, effectiveMethods));
@@ -140,7 +140,7 @@ export function generateScript(opts: ScriptOptions): string {
   return lines.join("\n");
 }
 
-function generateModded(className: string, parent: string, methods?: string[]): string[] {
+function generateModded(parent: string, methods?: string[]): string[] {
   if (!parent) {
     throw new Error("Modded scripts require a parentClass to mod");
   }
@@ -370,7 +370,7 @@ function extractParamNames(sig: string): string {
  * Get the correct module subfolder for a script type.
  * Scripts must be in the right folder or they're silently ignored.
  */
-export function getScriptModuleFolder(scriptType: ScriptType): string {
+export function getScriptModuleFolder(_scriptType: ScriptType): string {
   // All standard mod scripts go in Scripts/Game/
   // WorkbenchGame/ is only for editor plugins
   // GameLib/ is for engine extensions (rare)

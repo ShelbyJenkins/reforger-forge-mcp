@@ -717,7 +717,7 @@ export function parseGroupPage(html: string): GroupInfo {
   const description = $("div.contents div.textblock").first().text().trim();
 
   const classes: string[] = [];
-  $("table.memberdecls tr.memitem\\:").each((_i, row) => {
+  $("table.memberdecls tr.memitem\\:").each((_i, _row) => {
     // These are actually compound rows for classes in the group
   });
 

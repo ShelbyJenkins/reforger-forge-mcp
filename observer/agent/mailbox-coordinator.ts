@@ -1,4 +1,4 @@
-import { existsSync, lstatSync, readdirSync, renameSync, unlinkSync } from "node:fs";
+import { lstatSync, readdirSync, renameSync, unlinkSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { boundedOption } from "#foundation/bounded-option";
 import { BoundedJsonMap, BoundedJsonStore } from "#foundation/json-store";
