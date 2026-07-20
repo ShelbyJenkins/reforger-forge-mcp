@@ -95,6 +95,15 @@ describe("observer runtime HTTP API", () => {
     });
   });
 
+  it("is single-use and refuses to restart after closing", async () => {
+    await withTemporaryDirectory(async (root) => {
+      const agent = createObserverApplication({ root: join(root, "managed"), sourceDirectory: observerAddonSource });
+      await agent.server.start();
+      await agent.server.close();
+      await expect(agent.server.start()).rejects.toThrow("cannot restart after closing");
+    }, { prefix: "rfo-agent-single-use-" });
+  });
+
   it("enforces the body limit before JSON parsing", async () => {
     await withTemporaryDirectory(async (root) => {
     const agent = createObserverApplication({ root: join(root, "managed"), sourceDirectory: observerAddonSource, maxBodyBytes: 64 });

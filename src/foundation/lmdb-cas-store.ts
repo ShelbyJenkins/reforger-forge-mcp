@@ -3,7 +3,7 @@ import { join } from "node:path";
 import type { DurableRecordCodec } from "./durable-kv.js";
 import { sha256Hex } from "./digest.js";
 import { atomicWriteFile } from "./json-store.js";
-import { LmdbDurableKvStore } from "./lmdb-store.js";
+import { LmdbDurableKvStore, type LmdbEnvironment } from "./lmdb-store.js";
 
 export type LmdbCasInspection<T> =
   | { kind: "missing" }
@@ -30,6 +30,12 @@ export class LmdbCasStoreError extends Error {
 export interface LmdbCasStoreOptions<T> {
   readonly storageRoot: string;
   readonly databaseDirectory?: string;
+  /**
+   * A shared {@link LmdbEnvironment} to open against. Several CAS stores over
+   * distinct keys can pass the same environment so their single owner opens and
+   * closes it exactly once. When omitted, the store owns its own environment.
+   */
+  readonly environment?: LmdbEnvironment;
   readonly key: string;
   /** Used only to build the synthetic display path and archive filename. */
   readonly recordLabel: string;
@@ -57,10 +63,10 @@ export interface LmdbCasStoreOptions<T> {
 }
 
 /**
- * Process-guard-facing adapter over `LmdbDurableKvStore` that mirrors the
- * shape `JsonCasStore` previously exposed (missing/versioned/corrupt
- * inspection, generation-checked CAS, file-based corrupt archival) so
- * lifecycle/spawn-journal call sites change only at construction time.
+ * Process-guard-facing adapter over `LmdbDurableKvStore`. It presents the
+ * process guard's expected CAS shape (missing/versioned/corrupt inspection,
+ * generation-checked compare-and-swap, and file-based corrupt archival) so
+ * lifecycle/spawn-journal call sites depend only on this narrow surface.
  */
 export class LmdbCasStore<T> {
   private readonly store: LmdbDurableKvStore<T>;
@@ -75,6 +81,7 @@ export class LmdbCasStore<T> {
     this.store = new LmdbDurableKvStore({
       storageRoot: options.storageRoot,
       databaseDirectory: options.databaseDirectory,
+      environment: options.environment,
       schema: options.schema,
       codec: options.codec,
       generationOf: options.generationOf,

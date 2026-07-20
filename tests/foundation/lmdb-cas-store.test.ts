@@ -4,6 +4,7 @@ import { asBinary, open } from "lmdb";
 import { describe, expect, it } from "vitest";
 import { encodeDurableKey, jsonDurableRecordCodec } from "../../src/foundation/durable-kv.js";
 import { LmdbCasStore } from "../../src/foundation/lmdb-cas-store.js";
+import { LmdbEnvironment } from "../../src/foundation/lmdb-store.js";
 import { withTemporaryDirectory } from "../support/temporary-directory.js";
 
 interface TestRecord {
@@ -223,5 +224,41 @@ describe("LmdbCasStore", () => {
         await store.close();
       }
     }, { prefix: "rfo-lmdb-cas-after-hook-" });
+  });
+
+  it("shares one owned environment across CAS stores over distinct keys", async () => {
+    await withTemporaryDirectory(async (root) => {
+      // One environment owner, two typed CAS views over distinct namespaced keys
+      // (the workbench lifecycle + spawn-journal shape). The environment is
+      // opened once and closed once by its sole owner, never per record type.
+      const environment = new LmdbEnvironment(root);
+      const makeShared = (recordKey: string, recordLabel: string): LmdbCasStore<TestRecord> =>
+        new LmdbCasStore({
+          storageRoot: root,
+          environment,
+          key: recordKey,
+          recordLabel,
+          schema: "test-cas-record-v1",
+          codec,
+          generationOf: (value) => value.generation,
+          corruptArchiveDir: join(root, "corrupt"),
+        });
+      const lifecycle = makeShared(encodeDurableKey("workbench", "lifecycle"), "lifecycle");
+      const journal = makeShared(encodeDurableKey("workbench", "spawn-journal"), "spawn-journal");
+      try {
+        await lifecycle.compareAndSwap(null, { generation: "g1", state: "life" });
+        await journal.compareAndSwap(null, { generation: "g2", state: "spawn" });
+        // Both records coexist in the one shared environment, independently keyed.
+        expect(await lifecycle.inspect()).toMatchObject({ kind: "versioned", value: { state: "life" } });
+        expect(await journal.inspect()).toMatchObject({ kind: "versioned", value: { state: "spawn" } });
+        // Closing one typed view must not close the shared environment.
+        await lifecycle.close();
+        expect(await journal.inspect()).toMatchObject({ kind: "versioned", value: { state: "spawn" } });
+      } finally {
+        // The single owner releases the environment exactly once for every view.
+        await environment.close();
+      }
+      await expect(journal.inspect()).rejects.toThrow(/closed/i);
+    }, { prefix: "rfo-lmdb-cas-shared-env-" });
   });
 });

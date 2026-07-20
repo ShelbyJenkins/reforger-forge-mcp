@@ -121,9 +121,19 @@ function runtimeCredential(request: IncomingMessage, body: Record<string, unknow
   return token;
 }
 
+/**
+ * ObserverAgentServer instances are single-use:
+ * construct → start → close → discard.
+ *
+ * Once {@link close} runs, {@link start} fails closed; a new agent lifecycle
+ * needs a fresh instance. Close releases every agent-private LMDB environment
+ * and does not reopen them, so restarting the same instance could never
+ * re-admit durable writes.
+ */
 export class ObserverAgentServer {
   private server: Server | null = null;
   private descriptor: StartupDescriptor | null = null;
+  private closed = false;
   private readonly runtime: ObserverRuntimeApi;
   private readonly mailbox: MailboxCoordinator;
   private sweepTimer: NodeJS.Timeout | null = null;
@@ -168,9 +178,14 @@ export class ObserverAgentServer {
   }
 
   async start(): Promise<StartupDescriptor> {
+    if (this.closed) {
+      throw new ObserverError(
+        "INVALID_REQUEST",
+        "Observer agent server cannot restart after closing",
+        409
+      );
+    }
     if (this.server) return this.descriptor!;
-    if (this.closePromise) await this.closePromise;
-    this.closePromise = null;
     const host = this.options.host ?? "127.0.0.1";
     if (host !== "127.0.0.1" && host !== "::1") throw new ObserverError("INVALID_REQUEST", "Observer agent may bind only to a loopback address");
     const port = this.options.port ?? 0;
@@ -519,9 +534,13 @@ export class ObserverAgentServer {
   }
 
   managedStorageDiagnostics(): Record<string, unknown> {
+    const runRecords = this.runs.recordUsage();
     return {
       artifacts: this.directoryUsage(this.control.paths.artifacts),
-      runs: this.directoryUsage(this.control.paths.runs),
+      // `paths.runs` holds only run-owned filesystem artifacts. The record
+      // bytes live in the private LMDB environment beneath state and are
+      // surfaced separately so diagnostics and the retention budget agree.
+      runs: { ...this.directoryUsage(this.control.paths.runs), recordBytes: runRecords.bytes, recordCount: runRecords.records },
       profiles: this.directoryUsage(this.control.profileRoot),
       exportWork: this.directoryUsage(this.control.paths.exportWork),
       logs: this.directoryUsage(this.control.paths.logs),
@@ -589,8 +608,13 @@ export class ObserverAgentServer {
       const maxAgeMs = this.options.retentionMaxAgeMs ?? 7 * 24 * 60 * 60 * 1_000;
       const maxBytes = this.options.retentionMaxBytes ?? 512 * 1024 * 1024;
       this.runs.applyRetention(maxAgeMs);
+      // LMDB stores the exact old run.json payload bytes outside paths.runs.
+      // Charge them here so artifact retention receives only the capacity left
+      // after every run-owned byte, whether file-backed or record-backed.
+      const runRecordBytes = this.runs.recordUsage().bytes;
       const auxiliaryBytes = this.sweepAuxiliaryStorage(maxAgeMs, maxBytes, now, protectedSessionIds) +
-        this.directoryUsage(this.control.paths.runs).bytes;
+        this.directoryUsage(this.control.paths.runs).bytes +
+        runRecordBytes;
       this.artifacts.applyRetention(
         maxAgeMs,
         Math.max(0, maxBytes - auxiliaryBytes),
@@ -668,6 +692,7 @@ export class ObserverAgentServer {
   }
 
   async close(): Promise<void> {
+    this.closed = true;
     if (this.closePromise) return this.closePromise;
     this.closePromise = this.closeInternal();
     return this.closePromise;
@@ -689,8 +714,18 @@ export class ObserverAgentServer {
     this.server = null;
     this.descriptor = null;
     this.control.clearEndpoint();
-    if (!server) return;
-    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    try {
+      if (server) {
+        await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+      }
+    } finally {
+      // Release every agent-private LMDB environment on shutdown so the state
+      // root can be removed (an open memory map blocks it on Windows).
+      await Promise.all([
+        this.ownedRuntimeAuthorities.close(),
+        this.runs.close(),
+      ]);
+    }
   }
 
   private assertOwnedRuntimeLifecycleIdentity(

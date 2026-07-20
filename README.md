@@ -567,7 +567,7 @@ Environment variables override config files:
 | `REFORGER_FORGE_OBSERVER_MAX_INLINE_IMAGE_BYTES` | Maximum PNG bytes embedded in an MCP result | `8388608` |
 | `REFORGER_FORGE_OBSERVER_RETENTION_INTERVAL_MS` | Agent retention sweep cadence | `60000` |
 | `REFORGER_FORGE_OBSERVER_RETENTION_MAX_AGE_MS` | Retained artifact age limit | `604800000` |
-| `REFORGER_FORGE_OBSERVER_RETENTION_MAX_BYTES` | Coordinated managed-storage limit for artifacts, runs, profiles, logs, and export scratch | `536870912` |
+| `REFORGER_FORGE_OBSERVER_RETENTION_MAX_BYTES` | Coordinated managed-storage limit for artifacts, run-owned files, run-record payload bytes, profiles, logs, and export scratch | `536870912` |
 | `REFORGER_FORGE_OBSERVER_SESSION_TTL_MS` | Default prepared-session lifetime | `1200000` |
 | `ENFUSION_WORKBENCH_PATH` | Arma Reforger Tools path | Steam default |
 | `ENFUSION_GAME_PATH` | Arma Reforger game path | Sibling of Tools |

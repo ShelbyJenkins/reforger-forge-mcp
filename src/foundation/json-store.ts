@@ -2,7 +2,6 @@ import { randomUUID } from "node:crypto";
 import {
   closeSync,
   constants,
-  existsSync,
   fstatSync,
   fsyncSync,
   linkSync,
@@ -16,7 +15,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import type { BigIntStats } from "node:fs";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, join } from "node:path";
 import {
   assertRegularManagedFile,
   canonicalizeExistingDirectory,
@@ -52,14 +51,6 @@ export interface Missing {
   kind: "missing";
 }
 
-export interface Versioned<T> {
-  kind: "versioned";
-  value: T;
-  generation: string;
-  byteLength: number;
-  sha256: string;
-}
-
 export interface CorruptJsonRecord {
   kind: "corrupt";
   path: string;
@@ -72,17 +63,6 @@ export type BoundedJsonInspection<T> =
   | Missing
   | { kind: "valid"; value: T; byteLength: number; sha256: string }
   | CorruptJsonRecord;
-
-export type JsonCasInspection<T> = Missing | Versioned<T> | CorruptJsonRecord;
-
-export type CasResult<T> =
-  | { kind: "replaced"; current: Versioned<T> }
-  | { kind: "conflict"; actualGeneration: string | null };
-
-export interface JsonCasPort<T> {
-  read(): Promise<Versioned<T> | Missing>;
-  compareAndSwap(expected: string | null, next: T): Promise<CasResult<T>>;
-}
 
 const MISSING: Missing = Object.freeze({ kind: "missing" });
 
@@ -552,282 +532,5 @@ export class BoundedJsonStore<T> {
       durable: this.durable,
       exclusive: options.exclusive,
     });
-  }
-}
-
-export interface JsonCasBackendRequest<T> {
-  path: string;
-  expectedGeneration: string | null;
-  next: T;
-  nextJson: string;
-  inspectCurrent: () => JsonCasInspection<T>;
-  assertCapacity: () => void;
-  publishPlainNode: () => void;
-}
-
-export interface JsonArchiveBackendRequest {
-  path: string;
-  archivePath: string;
-  expectedSha256: string;
-  archivePlainNode: () => void;
-}
-
-export interface JsonCasMutationBackend {
-  readonly atomicity: "process-local" | "helper-mediated-cross-process";
-  compareAndSwap<T>(request: JsonCasBackendRequest<T>): Promise<{
-    kind: "replaced";
-  } | {
-    kind: "conflict";
-    actualGeneration: string | null;
-  }>;
-  archive(request: JsonArchiveBackendRequest): Promise<void>;
-}
-
-const pathLockTails = new Map<string, Promise<void>>();
-
-async function withProcessPathLock<T>(path: string, action: () => Promise<T> | T): Promise<T> {
-  const key = resolve(path).toLowerCase();
-  const previous = pathLockTails.get(key) ?? Promise.resolve();
-  let release!: () => void;
-  const turn = new Promise<void>((resolveTurn) => { release = resolveTurn; });
-  const tail = previous.then(() => turn);
-  pathLockTails.set(key, tail);
-  await previous;
-  try {
-    return await action();
-  } finally {
-    release();
-    if (pathLockTails.get(key) === tail) pathLockTails.delete(key);
-  }
-}
-
-/**
- * Plain Node CAS is serialized across store instances in this process only.
- * It intentionally makes no cross-process claim; use the helper-mediated
- * backend when a machine mutex or native helper owns that guarantee.
- */
-export class PlainNodeJsonCasBackend implements JsonCasMutationBackend {
-  readonly atomicity = "process-local" as const;
-
-  compareAndSwap<T>(request: JsonCasBackendRequest<T>): Promise<{
-    kind: "replaced";
-  } | {
-    kind: "conflict";
-    actualGeneration: string | null;
-  }> {
-    return withProcessPathLock(request.path, () => {
-      const inspected = request.inspectCurrent();
-      if (inspected.kind === "corrupt") {
-        throw new JsonStoreError("CORRUPT_JSON", inspected.message);
-      }
-      const actualGeneration = inspected.kind === "missing" ? null : inspected.generation;
-      if (actualGeneration !== request.expectedGeneration) {
-        return { kind: "conflict" as const, actualGeneration };
-      }
-      request.assertCapacity();
-      request.publishPlainNode();
-      return { kind: "replaced" as const };
-    });
-  }
-
-  archive(request: JsonArchiveBackendRequest): Promise<void> {
-    return withProcessPathLock(request.path, () => request.archivePlainNode());
-  }
-}
-
-export interface HelperMediatedJsonCasBackendOptions {
-  compareAndSwap: (request: {
-    path: string;
-    expectedGeneration: string | null;
-    nextJson: string;
-  }) => Promise<void | { kind: "replaced" } | { kind: "conflict"; actualGeneration?: string | null }>;
-  archive: (request: {
-    path: string;
-    archivePath: string;
-    expectedSha256: string;
-  }) => Promise<void>;
-  isConflict?: (error: unknown) => boolean;
-}
-
-/** Mutation adapter for state whose CAS must remain inside a native helper. */
-export class HelperMediatedJsonCasBackend implements JsonCasMutationBackend {
-  readonly atomicity = "helper-mediated-cross-process" as const;
-
-  constructor(private readonly options: HelperMediatedJsonCasBackendOptions) {}
-
-  async compareAndSwap<T>(request: JsonCasBackendRequest<T>): Promise<{
-    kind: "replaced";
-  } | {
-    kind: "conflict";
-    actualGeneration: string | null;
-  }> {
-    const current = request.inspectCurrent();
-    if (current.kind === "corrupt") {
-      throw new JsonStoreError("CORRUPT_JSON", current.message);
-    }
-    const actualGeneration = current.kind === "missing" ? null : current.generation;
-    if (actualGeneration !== request.expectedGeneration) {
-      return { kind: "conflict", actualGeneration };
-    }
-    request.assertCapacity();
-    try {
-      const result = await this.options.compareAndSwap({
-        path: request.path,
-        expectedGeneration: request.expectedGeneration,
-        nextJson: request.nextJson,
-      });
-      if (result?.kind === "conflict") {
-        if (!Object.prototype.hasOwnProperty.call(result, "actualGeneration")) {
-          return this.currentConflict(request);
-        }
-        return {
-          kind: "conflict",
-          actualGeneration: result.actualGeneration ?? null,
-        };
-      }
-      return { kind: "replaced" };
-    } catch (error) {
-      if (this.options.isConflict?.(error)) {
-        return this.currentConflict(request);
-      }
-      throw error;
-    }
-  }
-
-  private currentConflict<T>(request: JsonCasBackendRequest<T>): {
-    kind: "conflict";
-    actualGeneration: string | null;
-  } {
-    const current = request.inspectCurrent();
-    if (current.kind === "corrupt") {
-      throw new JsonStoreError("CORRUPT_JSON", current.message);
-    }
-    return {
-      kind: "conflict",
-      actualGeneration: current.kind === "missing" ? null : current.generation,
-    };
-  }
-
-  archive(request: JsonArchiveBackendRequest): Promise<void> {
-    return this.options.archive({
-      path: request.path,
-      archivePath: request.archivePath,
-      expectedSha256: request.expectedSha256,
-    });
-  }
-}
-
-export interface JsonCasStoreOptions<T> extends Omit<BoundedJsonStoreOptions<T>, "root"> {
-  root: string;
-  path: string;
-  generationOf: (value: T) => string;
-  backend: JsonCasMutationBackend;
-}
-
-export class JsonCasStore<T> implements JsonCasPort<T> {
-  readonly path: string;
-  private readonly records: BoundedJsonStore<T>;
-  private readonly generationOf: (value: T) => string;
-  private readonly backend: JsonCasMutationBackend;
-
-  constructor(options: JsonCasStoreOptions<T>) {
-    this.records = new BoundedJsonStore(options);
-    this.path = resolveManagedPath(this.records.root, options.path, "link-safe");
-    this.generationOf = options.generationOf;
-    this.backend = options.backend;
-  }
-
-  async inspect(): Promise<JsonCasInspection<T>> {
-    const inspected = this.records.inspect(this.path);
-    if (inspected.kind === "missing" || inspected.kind === "corrupt") return inspected;
-    return this.versioned(inspected.value, inspected.byteLength, inspected.sha256);
-  }
-
-  async read(): Promise<Versioned<T> | Missing> {
-    const inspected = await this.inspect();
-    if (inspected.kind === "corrupt") {
-      throw new JsonStoreError("CORRUPT_JSON", inspected.message);
-    }
-    return inspected;
-  }
-
-  async compareAndSwap(expected: string | null, nextInput: T): Promise<CasResult<T>> {
-    const encoded = this.records.encode(nextInput);
-    const nextGeneration = this.checkedGeneration(encoded.value);
-    const result = await this.backend.compareAndSwap({
-      path: this.path,
-      expectedGeneration: expected,
-      next: encoded.value,
-      nextJson: encoded.text,
-      inspectCurrent: () => {
-        const inspected = this.records.inspect(this.path);
-        if (inspected.kind === "missing" || inspected.kind === "corrupt") return inspected;
-        return this.versioned(inspected.value, inspected.byteLength, inspected.sha256);
-      },
-      assertCapacity: () => {
-        this.records.assertWriteCapacity(this.path, encoded.bytes.length);
-      },
-      publishPlainNode: () => {
-        this.records.write(this.path, encoded.value, {
-          exclusive: expected === null,
-          capacityPreflighted: true,
-        });
-      },
-    });
-    if (result.kind === "conflict") return result;
-    return {
-      kind: "replaced",
-      current: {
-        kind: "versioned",
-        value: encoded.value,
-        generation: nextGeneration,
-        byteLength: encoded.bytes.length,
-        sha256: encoded.sha256,
-      },
-    };
-  }
-
-  async archiveCorrupt(record: CorruptJsonRecord, archivePath: string): Promise<void> {
-    if (resolve(record.path) !== resolve(this.path)) {
-      throw new JsonStoreError("UNSAFE_PATH", "Corrupt JSON record does not belong to this CAS store");
-    }
-    const archive = resolveManagedPath(this.records.root, archivePath, "link-safe");
-    await this.backend.archive({
-      path: this.path,
-      archivePath: archive,
-      expectedSha256: record.rawSha256,
-      archivePlainNode: () => {
-        const current = this.records.inspect(this.path);
-        const actualSha = current.kind === "valid" ? current.sha256
-          : current.kind === "corrupt" ? current.rawSha256
-            : null;
-        if (actualSha !== record.rawSha256) {
-          throw new JsonStoreError("CAS_CONFLICT", "JSON record changed before archival");
-        }
-        if (existsSync(archive)) {
-          throw new JsonStoreError("CAS_CONFLICT", `JSON archive target already exists: ${archive}`);
-        }
-        ensureManagedDirectory(this.records.root, dirname(archive));
-        renameSync(this.path, archive);
-      },
-    });
-  }
-
-  private versioned(value: T, byteLength: number, digest: string): Versioned<T> {
-    return {
-      kind: "versioned",
-      value,
-      generation: this.checkedGeneration(value),
-      byteLength,
-      sha256: digest,
-    };
-  }
-
-  private checkedGeneration(value: T): string {
-    const generation = this.generationOf(value);
-    if (typeof generation !== "string" || generation.length === 0 || generation.length > 512) {
-      throw new JsonStoreError("SCHEMA_INVALID", "JSON record generation is invalid");
-    }
-    return generation;
   }
 }

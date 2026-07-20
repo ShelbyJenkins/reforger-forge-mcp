@@ -152,7 +152,8 @@ export function registerTools(server: McpServer, config: Config): RegisteredTool
 
   // Workbench Live Control tools (Phase 4)
   const observerConfig = config.observer;
-  const { client: wbClient } = createWorkbenchServerComposition(config);
+  const workbenchComposition = createWorkbenchServerComposition(config);
+  const wbClient = workbenchComposition.client;
   // The observer adapter deliberately shares the one Workbench client and its
   // lifecycle/activity gate with every other Workbench tool. It never owns an
   // independent connection or auto-launch path.
@@ -186,7 +187,17 @@ export function registerTools(server: McpServer, config: Config): RegisteredTool
   });
   let observerShutdown: Promise<Record<string, unknown>> | null = null;
   const disposeObserverLifecycle = (): Promise<Record<string, unknown>> => {
-    observerShutdown ??= observerApplication.closeRuntimeLifecycle();
+    // Seal owned-runtime lifecycle state, then always release the Workbench
+    // process guard's LMDB environment. The composition's guard is otherwise
+    // never closed on the embedded-server disposal path, leaking its handle
+    // (and, on Windows, the memory map) until process exit.
+    observerShutdown ??= (async () => {
+      try {
+        return await observerApplication.closeRuntimeLifecycle();
+      } finally {
+        await workbenchComposition.processGuard.close();
+      }
+    })();
     return observerShutdown;
   };
   registerWbLaunch(server, config, wbClient);

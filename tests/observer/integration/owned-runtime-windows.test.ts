@@ -11,10 +11,15 @@ import type { ObserverLaunchInput, ObserverPreparedLaunch } from "../../../src/o
 
 const roots: string[] = [];
 const retainedChildren: ChildProcess[] = [];
+const managers: OwnedRuntimeManager[] = [];
 
-afterEach(() => {
+afterEach(async () => {
   for (const child of retainedChildren.splice(0)) {
     if (child.exitCode === null && child.signalCode === null) child.kill();
+  }
+  // Release the LMDB environment before rmSync (an open memory map blocks it on Windows).
+  for (const manager of managers.splice(0)) {
+    await manager.closeStorageForTest().catch(() => undefined);
   }
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
@@ -53,6 +58,7 @@ describe("owned runtime native Windows integration", () => {
       inspectionTimeoutMs: 10_000,
       terminationTimeoutMs: 10_000,
     });
+    managers.push(manager);
     const input: ObserverLaunchInput = {
       runtimeKind: "testRunner",
       // `--` makes the subsequently appended owner token a fixture argv value,

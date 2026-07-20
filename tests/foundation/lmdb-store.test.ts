@@ -1,8 +1,11 @@
+import { mkdirSync } from "node:fs";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
 import { asBinary, open } from "lmdb";
 import { describe, expect, it } from "vitest";
 import { encodeDurableKey, jsonDurableRecordCodec } from "../../src/foundation/durable-kv.js";
+import { BoundedJsonStore } from "../../src/foundation/json-store.js";
 import { LmdbDurableKvStore } from "../../src/foundation/lmdb-store.js";
 import { withTemporaryDirectory } from "../support/temporary-directory.js";
 import { durableKvStoreContract } from "./durable-kv-contract.js";
@@ -12,15 +15,17 @@ interface TestRecord {
     state: string;
 }
 
-const key = encodeDurableKey("observer", "runtime", "rt-123");
-const codec = jsonDurableRecordCodec((value: unknown): TestRecord => {
+function parseTestRecord(value: unknown): TestRecord {
     if (!value || typeof value !== "object") throw new Error("object required");
     const record = value as Partial<TestRecord>;
     if (typeof record.generation !== "string" || typeof record.state !== "string") {
         throw new Error("record fields are invalid");
     }
     return { generation: record.generation, state: record.state };
-});
+}
+
+const key = encodeDurableKey("observer", "runtime", "rt-123");
+const codec = jsonDurableRecordCodec(parseTestRecord);
 
 function createStore(root: string, nowMs = 1_000): LmdbDurableKvStore<TestRecord> {
     return new LmdbDurableKvStore({
@@ -69,6 +74,18 @@ function replaceRawValue(root: string, value: Uint8Array, version: number): Prom
         overlappingSync: false,
     });
     database.putSync(Buffer.from(key, "utf8"), asBinary(value), version);
+    return database.close();
+}
+
+function writeRawAt(root: string, encodedKey: string, value: Uint8Array, version = 1): Promise<void> {
+    const database = open<unknown, Uint8Array>(`${root}/durable-kv-v1`, {
+        encoding: "binary",
+        keyEncoding: "binary",
+        useVersions: true,
+        maxDbs: 1,
+        overlappingSync: false,
+    });
+    database.putSync(Buffer.from(encodedKey, "utf8"), asBinary(value), version);
     return database.close();
 }
 
@@ -191,5 +208,194 @@ describe("LMDB durable KV store", () => {
             await expect(mismatched.read(key)).rejects.toMatchObject({ code: "CORRUPT_RECORD" });
             await mismatched.close();
         }, { prefix: "rfo-lmdb-corrupt-" });
+    });
+});
+
+describe("LMDB namespace list and stats", () => {
+    const family = ["observer", "owned-runtime", "runtimes"] as const;
+    const memberKey = (id: string): string => encodeDurableKey(...family, id);
+
+    it("reports an empty namespace as empty", async () => {
+        await withTemporaryDirectory(async (root) => {
+            const store = createStore(root);
+            try {
+                await expect(store.list([...family], 10)).resolves.toEqual({ entries: [], truncated: false });
+                await expect(store.stats([...family])).resolves.toEqual({ count: 0, totalValueBytes: 0 });
+            } finally {
+                await store.close();
+            }
+        }, { prefix: "rfo-lmdb-ns-empty-" });
+    });
+
+    it("lists every valid record with its value and storage version", async () => {
+        await withTemporaryDirectory(async (root) => {
+            const store = createStore(root);
+            try {
+                await store.put(memberKey("rt-1"), { generation: "g1", state: "one" }, null);
+                await store.put(memberKey("rt-2"), { generation: "g2", state: "two" }, null);
+                await store.put(memberKey("rt-2"), { generation: "g3", state: "two-b" }, 1);
+
+                const page = await store.list([...family], 10);
+                expect(page.truncated).toBe(false);
+                const byKey = new Map(page.entries.map((entry) => [entry.key, entry]));
+                expect(byKey.get(memberKey("rt-1"))).toMatchObject({
+                    kind: "valid",
+                    value: { generation: "g1", state: "one" },
+                    version: 1,
+                });
+                expect(byKey.get(memberKey("rt-2"))).toMatchObject({
+                    kind: "valid",
+                    value: { generation: "g3", state: "two-b" },
+                    version: 2,
+                });
+            } finally {
+                await store.close();
+            }
+        }, { prefix: "rfo-lmdb-ns-list-" });
+    });
+
+    it("matches decoded components so a sibling prefix cannot leak in", async () => {
+        await withTemporaryDirectory(async (root) => {
+            const store = createStore(root);
+            try {
+                await store.put(encodeDurableKey("observer", "runtime", "rt-1"), { generation: "g1", state: "a" }, null);
+                await store.put(
+                    encodeDurableKey("observer", "runtime-index", "idx-1"),
+                    { generation: "g2", state: "b" },
+                    null,
+                );
+
+                const runtime = await store.list(["observer", "runtime"], 10);
+                expect(runtime.entries.map((entry) => entry.key)).toEqual([
+                    encodeDurableKey("observer", "runtime", "rt-1"),
+                ]);
+
+                const index = await store.list(["observer", "runtime-index"], 10);
+                expect(index.entries.map((entry) => entry.key)).toEqual([
+                    encodeDurableKey("observer", "runtime-index", "idx-1"),
+                ]);
+
+                await expect(store.stats(["observer", "runtime"])).resolves.toMatchObject({ count: 1 });
+            } finally {
+                await store.close();
+            }
+        }, { prefix: "rfo-lmdb-ns-collision-" });
+    });
+
+    it("bounds a listing by its limit and flags truncation", async () => {
+        await withTemporaryDirectory(async (root) => {
+            const store = createStore(root);
+            try {
+                for (let index = 0; index < 5; index += 1) {
+                    await store.put(memberKey(`rt-${index}`), { generation: `g${index}`, state: "x" }, null);
+                }
+
+                const bounded = await store.list([...family], 2);
+                expect(bounded.entries).toHaveLength(2);
+                expect(bounded.truncated).toBe(true);
+
+                const exact = await store.list([...family], 5);
+                expect(exact.entries).toHaveLength(5);
+                expect(exact.truncated).toBe(false);
+
+                const roomy = await store.list([...family], 50);
+                expect(roomy.entries).toHaveLength(5);
+                expect(roomy.truncated).toBe(false);
+                await expect(store.stats([...family])).resolves.toMatchObject({ count: 5 });
+            } finally {
+                await store.close();
+            }
+        }, { prefix: "rfo-lmdb-ns-limit-" });
+    });
+
+    it("surfaces a corrupt sibling without hiding the valid records or the count", async () => {
+        await withTemporaryDirectory(async (root) => {
+            const seed = createStore(root);
+            await seed.put(memberKey("rt-1"), { generation: "g1", state: "one" }, null);
+            await seed.put(memberKey("rt-2"), { generation: "g2", state: "two" }, null);
+            await seed.close();
+
+            await writeRawAt(root, memberKey("rt-bad"), new TextEncoder().encode("not an envelope"));
+
+            const store = createStore(root);
+            try {
+                const page = await store.list([...family], 10);
+                expect(page.truncated).toBe(false);
+                expect(page.entries).toHaveLength(3);
+                const valid = page.entries.filter((entry) => entry.kind === "valid");
+                const corrupt = page.entries.filter((entry) => entry.kind === "corrupt");
+                expect(valid).toHaveLength(2);
+                expect(corrupt).toHaveLength(1);
+                const bad = corrupt[0];
+                expect(bad.key).toBe(memberKey("rt-bad"));
+                if (bad.kind === "corrupt") {
+                    expect(bad.rawSha256).toMatch(/^[a-f0-9]{64}$/);
+                    expect(bad.valueBytes).toBeGreaterThan(0);
+                }
+
+                // The corrupt record must still count toward the namespace budget.
+                await expect(store.stats([...family])).resolves.toMatchObject({ count: 3 });
+            } finally {
+                await store.close();
+            }
+        }, { prefix: "rfo-lmdb-ns-corrupt-" });
+    });
+
+    it("accounts stored bytes consistently and parities a BoundedJsonStore's record count", async () => {
+        await withTemporaryDirectory(async (root) => {
+            const records = [
+                { id: "rt-1", value: { generation: "g1", state: "one" } },
+                { id: "rt-2", value: { generation: "g2", state: "two" } },
+                { id: "rt-3", value: { generation: "g3", state: "three" } },
+            ];
+            const store = createStore(root);
+            try {
+                for (const record of records) {
+                    await store.put(memberKey(record.id), record.value, null);
+                }
+
+                const page = await store.list([...family], 100);
+                const stats = await store.stats([...family]);
+
+                // stats must agree with an untruncated listing over the same view.
+                expect(page.truncated).toBe(false);
+                expect(stats.count).toBe(page.entries.length);
+                const listedBytes = page.entries.reduce((total, entry) => total + entry.valueBytes, 0);
+                expect(stats.totalValueBytes).toBe(listedBytes);
+                expect(stats.totalValueBytes).toBeGreaterThan(0);
+
+                // Count parity against the filesystem store this retention policy
+                // is ported from. Stored byte totals differ by encoding (LMDB
+                // stores a versioned envelope; the JSON store stores a
+                // pretty-printed file), so only the record count is a like-for-like
+                // admission signal.
+                const jsonRoot = join(root, "json-fixture");
+                mkdirSync(jsonRoot);
+                const jsonStore = new BoundedJsonStore<TestRecord>({
+                    root: jsonRoot,
+                    maxRecordBytes: 4_096,
+                    parse: parseTestRecord,
+                });
+                for (const record of records) {
+                    jsonStore.write(join(jsonRoot, `${record.id}.json`), record.value);
+                }
+                expect(jsonStore.usage().records).toBe(stats.count);
+            } finally {
+                await store.close();
+            }
+        }, { prefix: "rfo-lmdb-ns-parity-" });
+    });
+
+    it("rejects an empty prefix and a non-positive limit", async () => {
+        await withTemporaryDirectory(async (root) => {
+            const store = createStore(root);
+            try {
+                await expect(store.list([], 10)).rejects.toMatchObject({ code: "INVALID_KEY" });
+                await expect(store.stats([])).rejects.toMatchObject({ code: "INVALID_KEY" });
+                await expect(store.list([...family], 0)).rejects.toMatchObject({ code: "INVALID_OPTIONS" });
+            } finally {
+                await store.close();
+            }
+        }, { prefix: "rfo-lmdb-ns-invalid-" });
     });
 });

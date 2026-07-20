@@ -21,6 +21,7 @@ vi.mock("../../src/observer/tools.js", () => ({
 }));
 
 import { registerTools } from "../../src/server.js";
+import { WorkbenchProcessGuard } from "../../src/workbench/process-guard.js";
 
 function config(): Config {
   return {
@@ -49,5 +50,21 @@ describe("registerTools explicit shutdown ownership", () => {
       busyRuntimeIds: ["runtime-busy"],
     });
     expect(lifecycle.close).toHaveBeenCalledOnce();
+  });
+
+  it("releases the Workbench process guard's LMDB environment on disposal", async () => {
+    const closeSpy = vi.spyOn(WorkbenchProcessGuard.prototype, "close");
+    try {
+      const server = new McpServer({ name: "embedded-test", version: "1.0.0" });
+      const disposeTools = registerTools(server, config());
+      expect(closeSpy).not.toHaveBeenCalled();
+      await disposeTools();
+      expect(closeSpy).toHaveBeenCalledOnce();
+      // Idempotent: a second disposal does not re-close the guard.
+      await disposeTools();
+      expect(closeSpy).toHaveBeenCalledOnce();
+    } finally {
+      closeSpy.mockRestore();
+    }
   });
 });

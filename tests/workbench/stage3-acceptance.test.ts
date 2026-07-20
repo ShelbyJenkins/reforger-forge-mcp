@@ -262,6 +262,18 @@ describe("Stage 3 shared session-controller adapter trace", () => {
         return verifyEndpointOwner(...args);
       };
 
+      // A non-MCP child exits on its own, but only *after* the lifecycle has
+      // been durably published for its policy. Keying the exit on the durable
+      // write instead of a wall-clock timer keeps the expected trace ordering
+      // deterministic regardless of how long durable publication takes.
+      let releaseChild: (() => void) | null = null;
+      let childReleased = false;
+      const releaseChildOnce = (): void => {
+        if (childReleased || !releaseChild) return;
+        childReleased = true;
+        setTimeout(releaseChild, 0);
+      };
+
       const guard = new WorkbenchProcessGuard({
         backend,
         stateDir: join(fixture.root, `trace-${kind}`),
@@ -269,8 +281,14 @@ describe("Stage 3 shared session-controller adapter trace", () => {
         beforeLifecycleReplace: ({ next }) => {
           trace.push(`state:${next.phase}:${next.workbench === null ? "unbound" : "bound"}`);
         },
+        afterLifecycleReplace: ({ next }) => {
+          if (kind === "cli_editor" && next.phase === "running") releaseChildOnce();
+        },
         beforeSpawnJournalReplace: ({ next }) => {
           trace.push(`journal:${next.record.phase}`);
+        },
+        afterSpawnJournalReplace: ({ next }) => {
+          if (kind === "target_build" && next.record.phase === "published") releaseChildOnce();
         },
       });
       const supervisor = new ChildSupervisor();
@@ -287,12 +305,14 @@ describe("Stage 3 shared session-controller adapter trace", () => {
         spawnObserved = true;
         spawns.push({ argv: Object.freeze([...argv]), options: Object.freeze({ ...options }) });
         trace.push(`spawn:${kind}`);
-        if (kind !== "mcp_editor") setTimeout(() => {
-          backend.processes.delete(child.pid);
-          backend.workbenchPids.delete(child.pid);
-          trace.push("child:exit");
-          child.finish(0);
-        }, 5);
+        if (kind !== "mcp_editor") {
+          releaseChild = () => {
+            backend.processes.delete(child.pid);
+            backend.workbenchPids.delete(child.pid);
+            trace.push("child:exit");
+            child.finish(0);
+          };
+        }
         return child.asChildProcess();
       };
       const readiness = async (options: CompanionReadinessOptions) => {

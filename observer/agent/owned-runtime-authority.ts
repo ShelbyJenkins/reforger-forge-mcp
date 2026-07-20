@@ -1,12 +1,8 @@
 import { createHash } from "node:crypto";
-import {
-  readdirSync,
-  unlinkSync,
-} from "node:fs";
 import { join } from "node:path";
 import { z } from "zod";
 import { boundedOption } from "#foundation/bounded-option";
-import { BoundedJsonStore, JsonStoreError } from "#foundation/json-store";
+import { LmdbRecordStore, LmdbRecordStoreError } from "#foundation/lmdb-record-store";
 import { ObserverError, observerOptionError } from "./errors.js";
 import {
   assertManagedPath,
@@ -14,6 +10,14 @@ import {
 } from "./paths.js";
 
 const STORAGE_VERSION = 1;
+// Single LMDB namespace for the agent's private authority records. The store
+// opens its own environment under `root`, distinct from the MCP process's
+// owned-runtimes environment (the process boundary is preserved by IPC, never
+// by sharing a database).
+const AUTHORITY_FAMILY = "authority";
+// A serialized authority record is at minimum `{}\n`; anything shorter is a
+// truncated/corrupt value. Preserves the prior BoundedJsonStore lower bound.
+const AUTHORITY_RECORD_MIN_BYTES = 2;
 const DEFAULT_MAX_RECORDS = 1_024;
 const DEFAULT_MAX_BYTES = 64 * 1024 * 1024;
 const DEFAULT_MAX_RECORD_BYTES = 32 * 1024 * 1024;
@@ -121,7 +125,8 @@ export class OwnedRuntimeAuthorityStore {
   readonly maxBytes: number;
   readonly maxRecordBytes: number;
   readonly releaseRetentionMs: number;
-  private readonly recordsStore: BoundedJsonStore<OwnedRuntimeAuthorityRecord>;
+  private readonly recordStore: LmdbRecordStore;
+  private closed = false;
 
   constructor(
     stateRoot: string,
@@ -153,14 +158,19 @@ export class OwnedRuntimeAuthorityStore {
       "Owned runtime authority release retention",
       observerOptionError
     );
-    this.recordsStore = new BoundedJsonStore({
-      root: this.root,
-      minRecordBytes: 2,
+    this.recordStore = new LmdbRecordStore({
+      storageRoot: this.root,
       maxRecordBytes: this.maxRecordBytes,
-      maxRecords: this.maxRecords,
-      maxTotalBytes: this.maxBytes,
-      parse: (value) => authorityRecordSchema.parse(value),
+      // Bound listIds/usage scans to the aggregate record cap so a corrupt or
+      // oversized authority namespace fails closed rather than materializing.
+      maxScanRecords: this.maxRecords,
     });
+  }
+
+  /** Release the agent-private LMDB environment; called on agent shutdown. */
+  async close(): Promise<void> {
+    this.closed = true;
+    await this.recordStore.close();
   }
 
   validateAuthority(input: unknown): OwnedRuntimeRecoveryAuthority {
@@ -177,9 +187,11 @@ export class OwnedRuntimeAuthorityStore {
 
   read(runtimeId: string): OwnedRuntimeAuthorityRecord | null {
     runtimeIdSchema.parse(runtimeId);
-    const path = this.path(runtimeId);
+    // After shutdown the environment is released; report nothing durable rather
+    // than reopening it (which would re-hold the memory map past teardown).
+    if (this.closed) return null;
     try {
-      const record = this.recordsStore.read(path);
+      const record = this.readRecord(runtimeId);
       if (!record) return null;
       if (record.authority.runtimeId !== runtimeId ||
           ("preparedLaunchId" in record.authority &&
@@ -377,23 +389,29 @@ export class OwnedRuntimeAuthorityStore {
     for (const record of this.records()) {
       if (record.state !== "release_acknowledged" || !record.releasedAt ||
           now - Date.parse(record.releasedAt) < this.releaseRetentionMs) continue;
-      unlinkSync(this.path(record.authority.runtimeId));
+      this.recordStore.remove(AUTHORITY_FAMILY, record.authority.runtimeId);
       removed.push(record.authority.runtimeId);
     }
     return removed.sort();
   }
 
   stats(): OwnedRuntimeAuthorityStats {
+    const base = {
+      maxRecords: this.maxRecords,
+      maxBytes: this.maxBytes,
+      maxRecordBytes: this.maxRecordBytes,
+    };
+    if (this.closed) {
+      return { records: 0, bytes: 0, retained: 0, releaseAcknowledged: 0, ...base };
+    }
     const records = this.records();
-    const usage = this.recordsStore.usage();
+    const usage = this.recordStore.usage([AUTHORITY_FAMILY]);
     return {
       records: records.length,
       bytes: usage.bytes,
       retained: records.filter((record) => record.state === "retained").length,
       releaseAcknowledged: records.filter((record) => record.state === "release_acknowledged").length,
-      maxRecords: this.maxRecords,
-      maxBytes: this.maxBytes,
-      maxRecordBytes: this.maxRecordBytes,
+      ...base,
     };
   }
 
@@ -428,51 +446,59 @@ export class OwnedRuntimeAuthorityStore {
     }
   }
 
+  private readRecord(runtimeId: string): OwnedRuntimeAuthorityRecord | null {
+    const raw = this.recordStore.getRaw(AUTHORITY_FAMILY, runtimeId);
+    if (raw === null) return null;
+    if (raw.byteLength < AUTHORITY_RECORD_MIN_BYTES || raw.byteLength > this.maxRecordBytes) {
+      throw new Error(`authority record byte length ${raw.byteLength} is outside its bounds`);
+    }
+    const decoded = JSON.parse(Buffer.from(raw).toString("utf8").replace(/^\uFEFF/, ""));
+    return authorityRecordSchema.parse(decoded);
+  }
+
   private write(record: OwnedRuntimeAuthorityRecord, exclusive: boolean): void {
-    const path = this.path(record.authority.runtimeId);
+    const runtimeId = record.authority.runtimeId;
+    const bytes = Buffer.from(`${JSON.stringify(record, null, 2)}\n`, "utf8");
+    if (bytes.byteLength > this.maxRecordBytes) {
+      throw new ObserverError("TRANSPORT_UNAVAILABLE", "Owned runtime recovery authority exceeds its record budget", 503);
+    }
+    // Aggregate record/byte admission, byte-for-byte parity with the prior
+    // BoundedJsonStore bounds (stored bytes equal the old serialized file size).
+    const existing = this.recordStore.getRaw(AUTHORITY_FAMILY, runtimeId);
+    const usage = this.recordStore.usage([AUTHORITY_FAMILY]);
+    const nextRecords = usage.records + (existing === null ? 1 : 0);
+    const nextBytes = usage.bytes - (existing?.byteLength ?? 0) + bytes.byteLength;
+    if (nextRecords > this.maxRecords || nextBytes > this.maxBytes) {
+      throw new ObserverError("TRANSPORT_UNAVAILABLE", "Owned runtime recovery authority store is full", 503);
+    }
     try {
-      this.recordsStore.write(path, record, { exclusive });
+      this.recordStore.putRaw(AUTHORITY_FAMILY, runtimeId, bytes, { exclusive });
     } catch (error) {
-      if (error instanceof JsonStoreError && error.code === "CAS_CONFLICT") {
+      if (error instanceof LmdbRecordStoreError && error.code === "RECORD_EXISTS") {
         throw new ObserverError("SESSION_MISMATCH", "Owned runtime recovery authority already exists", 409);
       }
-      if (error instanceof JsonStoreError && [
-        "RECORD_TOO_LARGE",
-        "CAPACITY_EXCEEDED",
-      ].includes(error.code)) {
-        throw new ObserverError(
-          "TRANSPORT_UNAVAILABLE",
-          error.code === "RECORD_TOO_LARGE"
-            ? "Owned runtime recovery authority exceeds its record budget"
-            : "Owned runtime recovery authority store is full",
-          503
-        );
+      if (error instanceof LmdbRecordStoreError && error.code === "RECORD_TOO_LARGE") {
+        throw new ObserverError("TRANSPORT_UNAVAILABLE", "Owned runtime recovery authority exceeds its record budget", 503);
       }
       throw error;
     }
   }
 
   private records(): OwnedRuntimeAuthorityRecord[] {
+    if (this.closed) return [];
     const records: OwnedRuntimeAuthorityRecord[] = [];
-    for (const name of readdirSync(this.root).sort()) {
-      const runtimeId = name.endsWith(".json") ? name.slice(0, -5) : "";
+    for (const runtimeId of this.recordStore.listIds(AUTHORITY_FAMILY)) {
       if (!runtimeIdSchema.safeParse(runtimeId).success) continue;
       try {
         const record = this.read(runtimeId);
         if (record) records.push(record);
       } catch {
-        // Isolate one corrupt lifecycle. Its regular file still consumes the
+        // Isolate one corrupt lifecycle. Its record still consumes the
         // aggregate capacity budget, but it cannot block unrelated exact
         // recovery, release, diagnostics, or tombstone sweeping.
       }
     }
     return records;
-  }
-
-  private path(runtimeId: string): string {
-    const path = join(this.root, `${runtimeIdSchema.parse(runtimeId)}.json`);
-    assertManagedPath(this.root, path);
-    return path;
   }
 
 }

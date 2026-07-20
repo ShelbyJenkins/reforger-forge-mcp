@@ -6,13 +6,10 @@ import {
   fstatSync,
   lstatSync,
   mkdirSync,
-  opendirSync,
   openSync,
   readSync,
-  readdirSync,
-  unlinkSync,
 } from "node:fs";
-import { dirname, join, parse, resolve, sep } from "node:path";
+import { basename, dirname, join, parse, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import { redactText } from "../foundation/redact.js";
@@ -39,10 +36,9 @@ import {
   type RecoverableSpawnRecord,
 } from "../foundation/recoverable-spawn.js";
 import {
-  atomicWriteFile as foundationAtomicWriteFile,
-  BoundedJsonStore,
-  JsonStoreError,
-} from "../foundation/json-store.js";
+  LmdbRecordStore,
+  LmdbRecordStoreError,
+} from "../foundation/lmdb-record-store.js";
 import {
   assertRegularManagedFile,
   canonicalizeExistingDirectory,
@@ -67,6 +63,9 @@ export const OWNED_RUNTIME_OWNER_ARGUMENT_PREFIX = "-reforgerForgeOwnerToken=";
 export const OWNED_RUNTIME_LIFECYCLE_MUTEX = "Global\\ReforgerForge.ObserverRuntimeLifecycle.v1";
 
 const STORAGE_VERSION = 1;
+// A serialized lifecycle record is at minimum `{}\n`; anything shorter is a
+// truncated/corrupt value. Preserves the prior BoundedJsonStore lower bound.
+const LIFECYCLE_RECORD_MIN_BYTES = 2;
 const DEFAULT_INSPECTION_TIMEOUT_MS = 5_000;
 const DEFAULT_TERMINATION_TIMEOUT_MS = 20_000;
 const PROCESS_POLL_MS = 100;
@@ -102,7 +101,7 @@ const MAX_REALISTIC_PREPARED_DESCRIPTOR_BYTES =
   (WINDOWS_COMMAND_LINE_MAX_UTF16_UNITS + WINDOWS_PATH_MAX_CHARS +
     PREPARED_SESSION_ID_MAX_UTF16_UNITS) * JSON_STRING_MAX_UTF8_BYTES_PER_UTF16_UNIT +
   PREPARED_ARGUMENT_JSON_OVERHEAD_MAX_BYTES + PREPARED_FIXED_JSON_ENVELOPE_MAX_BYTES;
-const OWNED_RUNTIME_RECORD_DIRECTORIES = [
+export const OWNED_RUNTIME_RECORD_DIRECTORIES = [
   "prepared",
   "prepared-index",
   "consumed",
@@ -769,6 +768,7 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
   private readonly maxRecordBytes: number;
   private readonly managedRoot: string;
   private readonly children = new ChildSupervisor();
+  private recordStoreInstance: LmdbRecordStore | null = null;
   private closing = false;
   private closePromise: Promise<Record<string, unknown>> | null = null;
 
@@ -1543,10 +1543,15 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
     if (this.closePromise) return this.closePromise;
     this.closing = true;
     const attempt = this.closeOwnedRuntimes();
-    this.closePromise = attempt.then((result) => {
+    this.closePromise = attempt.then(async (result) => {
       if (result.applicationCloseSafe !== true) {
         this.closing = false;
         this.closePromise = null;
+      } else {
+        // A clean shutdown seal completed; release the LMDB environment. An
+        // unsafe/retryable close deliberately keeps it open for the retry.
+        await this.recordStoreInstance?.close();
+        this.recordStoreInstance = null;
       }
       return result;
     }, (error) => {
@@ -1555,6 +1560,41 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
       throw error;
     });
     return this.closePromise;
+  }
+
+  /**
+   * Test-only seam: the live record store, opened against the current storage
+   * root. Recovery/injection tests use it to inspect, inject, or fault records
+   * that used to be manipulated as `<family>/<id>.json` files.
+   */
+  recordStoreForTest(): LmdbRecordStore {
+    this.assertTestSeam("recordStoreForTest");
+    this.ensureStorage();
+    return this.recordStore();
+  }
+
+  /**
+   * Fail closed unless a test runner is active. The `*ForTest` seams ship in the
+   * published build (tests are excluded from the type-check, not the artifact)
+   * yet hand out unmediated record-store access that bypasses the manager's
+   * mutex, schema, generation, and aggregate-capacity rules. This guard keeps
+   * them unreachable in production while remaining transparent under Vitest.
+   */
+  private assertTestSeam(method: string): void {
+    if (process.env.VITEST === undefined && process.env.NODE_ENV !== "test") {
+      throw new Error(`${method} is a test-only seam and must not be called outside the test runner.`);
+    }
+  }
+
+  /**
+   * Test-only seam: release the record-store environment regardless of seal
+   * state so `rmSync`/`withTemporaryDirectory` teardown succeeds on Windows,
+   * where an open LMDB memory map blocks directory removal.
+   */
+  async closeStorageForTest(): Promise<void> {
+    this.assertTestSeam("closeStorageForTest");
+    await this.recordStoreInstance?.close();
+    this.recordStoreInstance = null;
   }
 
   private async closeOwnedRuntimes(): Promise<Record<string, unknown>> {
@@ -1567,8 +1607,8 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
       message: "Owned runtime shutdown sealing exceeded its aggregate wall-clock deadline",
       details: { state: "shutdown_sealing" },
     };
-    const runtimeDirectory = this.directory("runtimes");
-    if (!existsSync(runtimeDirectory) && !existsSync(this.storageRoot) && this.children.size === 0) {
+    if (!existsSync(this.storageRoot) && this.children.size === 0) {
+      // No durable storage and no live children: nothing to seal.
       return {
         sealedRuntimeIds: [],
         busyRuntimeIds: [],
@@ -1576,52 +1616,47 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
         applicationCloseSafe: true,
       };
     }
-    if (!existsSync(runtimeDirectory)) {
-      return {
-        sealedRuntimeIds: [],
-        busyRuntimeIds: [],
-        errorRuntimes: [{
-          runtimeId: "inventory",
-          reason: "Owned runtime receipt directory is missing; shutdown safety is unverifiable",
-        }],
-        applicationCloseSafe: false,
-      };
-    }
     try {
       const inventory = await this.withFencedMachineMutex(async (fence) => {
           this.ensureStorage();
+          fence.assertActive();
+          let runtimeNames: string[];
+          try {
+            runtimeNames = this.recordFileNames("runtimes");
+          } catch (error) {
+            // The runtime receipt namespace could not be inventoried, so
+            // shutdown safety cannot be proven. Report it as an inventory error
+            // rather than declaring the coordinator safe to close.
+            return { kind: "unverifiable" as const, reason: this.message(error) };
+          }
           const ids: string[] = [];
           const errors: Array<{ runtimeId: string; reason: string }> = [];
           let scannedEntries = 0;
-          const directory = opendirSync(runtimeDirectory);
-          try {
-            for (;;) {
-              fence.assertActive();
-              const entry = directory.readSync();
-              if (!entry) break;
-              scannedEntries += 1;
-              if (scannedEntries > this.maxStoreRecords) {
-                throw new OwnedRuntimeError(
-                  "STORE_CAPACITY_EXCEEDED",
-                  "Owned runtime shutdown inventory exceeds its record bound"
-                );
-              }
-              const runtimeId = entry.name.endsWith(".json") ? entry.name.slice(0, -5) : "";
-              const validRuntimeId = runtimeIdSchema.safeParse(runtimeId).success;
-              if (entry.isSymbolicLink() || !entry.isFile()) {
-                errors.push({
-                  runtimeId: validRuntimeId ? runtimeId : "inventory",
-                  reason: `Owned runtime inventory entry is not a regular file: ${entry.name}`.slice(0, 512),
-                });
-                continue;
-              }
-              if (validRuntimeId) ids.push(runtimeId);
+          for (const name of runtimeNames) {
+            fence.assertActive();
+            scannedEntries += 1;
+            if (scannedEntries > this.maxStoreRecords) {
+              throw new OwnedRuntimeError(
+                "STORE_CAPACITY_EXCEEDED",
+                "Owned runtime shutdown inventory exceeds its record bound"
+              );
             }
-          } finally {
-            directory.closeSync();
+            const runtimeId = name.endsWith(".json") ? name.slice(0, -5) : "";
+            if (runtimeIdSchema.safeParse(runtimeId).success) ids.push(runtimeId);
           }
-          return { runtimeIds: ids.sort(), errors };
+          return { kind: "ok" as const, runtimeIds: ids.sort(), errors };
         }, wallDeadline);
+      if (inventory.kind === "unverifiable") {
+        return {
+          sealedRuntimeIds: [],
+          busyRuntimeIds: [],
+          errorRuntimes: [{
+            runtimeId: "inventory",
+            reason: `Owned runtime receipt directory is missing or unverifiable; shutdown safety cannot be proven: ${inventory.reason}`.slice(0, 512),
+          }],
+          applicationCloseSafe: false,
+        };
+      }
       const sealedRuntimeIds: string[] = [];
       const busyRuntimeIds: string[] = [];
       const errorRuntimes: Array<{ runtimeId: string; reason: string }> = [...inventory.errors];
@@ -3367,43 +3402,26 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
     }
     const removedPreparedLaunchIds = new Set<string>();
     const removedRuntimeIds: string[] = [];
-    let removedTemporaryFiles = 0;
-
-    // A crash may leave an unpublished temporary file. The lifecycle mutex
-    // proves no other process is actively publishing through this store, but
-    // retain fresh files for one full retry window in case an older binary did
-    // not use the mutex consistently.
-    for (const directoryName of OWNED_RUNTIME_RECORD_DIRECTORIES) {
-      for (const name of readdirSync(this.directory(directoryName))) {
-        if (!name.startsWith(".") || !name.endsWith(".tmp")) continue;
-        const candidate = join(this.directory(directoryName), name);
-        try {
-          const entry = lstatSync(candidate);
-          if (entry.isSymbolicLink() || !entry.isFile()) continue;
-          if (now - entry.mtimeMs < this.receiptRetentionMs) continue;
-          this.unlinkOwnedFile(candidate);
-          removedTemporaryFiles += 1;
-        } catch {
-          // A corrupt or concurrently removed forensic file is isolated.
-        }
-      }
-    }
+    // LMDB has no unpublished temporary files: each record write is its own
+    // synchronous commit, so there is nothing to sweep. The field is retained
+    // for result-shape stability and is always zero.
+    const removedTemporaryFiles = 0;
 
     // A completed stop is the sole terminal authority for a runtime cluster.
     // Natural exit, stale sessions, cleanup-pending stops, and failed starts
     // with unverified cleanup remain durable recovery obligations.
-    for (const name of readdirSync(this.directory("stop-completions")).sort()) {
+    for (const name of this.recordFileNames("stop-completions")) {
       const runtimeId = name.endsWith(".json") ? name.slice(0, -5) : "";
       if (!runtimeIdSchema.safeParse(runtimeId).success) continue;
       try {
         const completion = this.readOptionalStopCompletion(runtimeId);
         if (!completion || now - Date.parse(completion.completedAt) < this.receiptRetentionMs) continue;
-        if (existsSync(this.runtimePath(runtimeId))) {
+        if (this.hasRecord(this.runtimePath(runtimeId))) {
           const receipt = this.readRuntimeReceipt(runtimeId);
           if (completion.sessionId !== receipt.sessionId ||
               completion.preparedLaunchId !== receipt.preparedLaunchId) continue;
         }
-        if (existsSync(this.stopPath(runtimeId))) {
+        if (this.hasRecord(this.stopPath(runtimeId))) {
           const stopped = this.readOptionalStopReceipt(runtimeId);
           if (!stopped || stopped.sessionId !== completion.sessionId) continue;
         }
@@ -3420,9 +3438,9 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
     // and observer lifecycle release are separate durable commits. Legacy
     // cleanup_verified records without a generation never acquired a lease;
     // an exact-generation legacy record is migrated/retried, never swept.
-    for (const name of readdirSync(this.directory("pending-starts")).sort()) {
+    for (const name of this.recordFileNames("pending-starts")) {
       const runtimeId = name.endsWith(".json") ? name.slice(0, -5) : "";
-      if (!runtimeIdSchema.safeParse(runtimeId).success || existsSync(this.runtimePath(runtimeId))) continue;
+      if (!runtimeIdSchema.safeParse(runtimeId).success || this.hasRecord(this.runtimePath(runtimeId))) continue;
       try {
         const pending = this.readOptionalPendingStart(runtimeId);
         const releaseComplete = pending?.state === "release_acknowledged" ||
@@ -3443,7 +3461,7 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
     // restoration proof nor its stop receipt exists. Bound crash-left retry
     // keys independently so repeated CAMERA_BUSY/cancel attempts cannot
     // consume the recovery headroom of a live runtime.
-    for (const name of readdirSync(this.directory("idempotency")).sort()) {
+    for (const name of this.recordFileNames("idempotency")) {
       const match = /^stop-([a-f0-9]{64})\.json$/.exec(name);
       if (!match) continue;
       try {
@@ -3466,10 +3484,10 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
     // state. Each descriptor is isolated so corrupt unrelated evidence never
     // blocks later preparation or retention work.
     const preparedReferences = this.preparedRuntimeReferences();
-    for (const name of readdirSync(this.directory("prepared")).sort()) {
+    for (const name of this.recordFileNames("prepared")) {
       const preparedLaunchId = name.endsWith(".json") ? name.slice(0, -5) : "";
       if (!preparedLaunchIdSchema.safeParse(preparedLaunchId).success ||
-          existsSync(this.consumptionPath(preparedLaunchId)) ||
+          this.hasRecord(this.consumptionPath(preparedLaunchId)) ||
           preparedReferences.has(preparedLaunchId)) continue;
       try {
         const descriptor = this.readPreparedDescriptor(preparedLaunchId);
@@ -3529,7 +3547,7 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
 
   private preparedRuntimeReferences(): Set<string> {
     const ids = new Set<string>();
-    for (const name of readdirSync(this.directory("runtimes"))) {
+    for (const name of this.recordFileNames("runtimes")) {
       const runtimeId = name.endsWith(".json") ? name.slice(0, -5) : "";
       if (!runtimeIdSchema.safeParse(runtimeId).success) continue;
       try {
@@ -3545,7 +3563,7 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
         // forward receipt pin every unrelated preparation in the store.
       }
     }
-    for (const name of readdirSync(this.directory("pending-starts"))) {
+    for (const name of this.recordFileNames("pending-starts")) {
       const runtimeId = name.endsWith(".json") ? name.slice(0, -5) : "";
       if (!runtimeIdSchema.safeParse(runtimeId).success) continue;
       try {
@@ -3564,7 +3582,7 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
   }
 
   private removeIdempotencyForRuntime(runtimeId: string): void {
-    for (const name of readdirSync(this.directory("idempotency"))) {
+    for (const name of this.recordFileNames("idempotency")) {
       if (!name.endsWith(".json")) continue;
       const candidate = join(this.directory("idempotency"), name);
       let receipt: z.infer<typeof idempotencySchema>;
@@ -3583,20 +3601,20 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
   private storageStats(root: string): OwnedRuntimeStorageStats {
     const usage = this.storeUsage(root);
     const mutationReserve = this.mutationReserve(usage.byPath, []);
-    const prepared = readdirSync(this.directory("prepared"))
+    const prepared = this.recordFileNames("prepared")
       .filter((name) => preparedLaunchIdSchema.safeParse(name.endsWith(".json") ? name.slice(0, -5) : "").success)
       .length;
     let completedRuntimes = 0;
     let activeOrRecoverableRuntimes = 0;
-    for (const name of readdirSync(this.directory("runtimes"))) {
+    for (const name of this.recordFileNames("runtimes")) {
       const runtimeId = name.endsWith(".json") ? name.slice(0, -5) : "";
       if (!runtimeIdSchema.safeParse(runtimeId).success) continue;
-      if (existsSync(this.stopCompletionPath(runtimeId))) completedRuntimes += 1;
+      if (this.hasRecord(this.stopCompletionPath(runtimeId))) completedRuntimes += 1;
       else activeOrRecoverableRuntimes += 1;
     }
-    for (const name of readdirSync(this.directory("pending-starts"))) {
+    for (const name of this.recordFileNames("pending-starts")) {
       const runtimeId = name.endsWith(".json") ? name.slice(0, -5) : "";
-      if (runtimeIdSchema.safeParse(runtimeId).success && !existsSync(this.runtimePath(runtimeId))) {
+      if (runtimeIdSchema.safeParse(runtimeId).success && !this.hasRecord(this.runtimePath(runtimeId))) {
         activeOrRecoverableRuntimes += 1;
       }
     }
@@ -3616,29 +3634,22 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
   }
 
   private storeUsage(root: string): { records: number; bytes: number; byPath: Map<string, number> } {
-    let records = 0;
-    let bytes = 0;
     const byPath = new Map<string, number>();
-    for (const directoryName of OWNED_RUNTIME_RECORD_DIRECTORIES) {
-      const directory = this.directory(directoryName);
-      if (!isContained(root, directory)) {
-        throw new OwnedRuntimeError("STORAGE_UNVERIFIABLE", "Owned-runtime record directory escaped storage");
-      }
-      for (const name of readdirSync(directory)) {
-        const candidate = join(directory, name);
-        const entry = lstatSync(candidate);
-        if (entry.isSymbolicLink() || !entry.isFile()) {
-          throw new OwnedRuntimeError(
-            "STORAGE_UNVERIFIABLE",
-            "Owned-runtime record storage contains a link or non-file entry"
-          );
-        }
-        records += 1;
-        bytes += entry.size;
-        byPath.set(pathKey(candidate), entry.size);
-      }
+    // `root` is the canonical storage root returned by ensureStorage; it must
+    // still be identical to the manager's storage root before any accounting.
+    if (!isContained(this.storageRoot, root)) {
+      throw new OwnedRuntimeError("STORAGE_UNVERIFIABLE", "Owned-runtime storage root escaped its managed root");
     }
-    return { records, bytes, byPath };
+    if (!existsSync(this.storageRoot)) return { records: 0, bytes: 0, byPath };
+    const usage = this.recordStore().usage(OWNED_RUNTIME_RECORD_DIRECTORIES);
+    for (const entry of usage.byId.values()) {
+      // Re-key each record's stored byte count by its virtual path so
+      // mutationReserve/assertBatchCapacity stay byte-for-byte unchanged. The
+      // stored byte length equals the pre-migration serialized file size.
+      const virtualPath = join(this.directory(entry.family as OwnedRuntimeRecordDirectory), `${entry.id}.json`);
+      byPath.set(pathKey(virtualPath), entry.bytes);
+    }
+    return { records: usage.records, bytes: usage.bytes, byPath };
   }
 
   private mutationReserve(
@@ -3669,7 +3680,7 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
       }
     };
     const runtimeIds = new Set<string>();
-    for (const name of readdirSync(this.directory("runtimes"))) {
+    for (const name of this.recordFileNames("runtimes")) {
       const runtimeId = name.endsWith(".json") ? name.slice(0, -5) : "";
       if (runtimeIdSchema.safeParse(runtimeId).success &&
           projectedPaths.has(pathKey(this.runtimePath(runtimeId)))) runtimeIds.add(runtimeId);
@@ -3683,7 +3694,7 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
     }
 
     const stopAttemptRuntimeIds = new Set<string>();
-    for (const name of readdirSync(this.directory("idempotency"))) {
+    for (const name of this.recordFileNames("idempotency")) {
       const match = /^stop-([a-f0-9]{64})\.json$/.exec(name);
       if (!match) continue;
       try {
@@ -3827,12 +3838,12 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
   }
 
   private unlinkOwnedFile(target: string): void {
-    if (!isContained(this.storageRoot, target) || !existsSync(target)) return;
-    const entry = lstatSync(target);
-    if (entry.isSymbolicLink() || !entry.isFile()) {
-      throw new OwnedRuntimeError("STORAGE_UNVERIFIABLE", "Lifecycle cleanup target is not a regular file");
-    }
-    unlinkSync(target);
+    // Cleanup targets are always virtual record paths; an absent record is a
+    // no-op (parity with the prior existsSync guard). The coordinate mapping is
+    // the "must be a managed record" key-validity check.
+    if (!existsSync(this.storageRoot)) return;
+    const { family, id } = this.recordCoordinates(target);
+    this.recordStore().remove(family, id);
   }
 
   private ensureStorage(): string {
@@ -3848,17 +3859,69 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
     if (pathKey(root) !== pathKey(this.storageRoot)) {
       throw new OwnedRuntimeError("STORAGE_UNVERIFIABLE", "Owned-runtime storage root changed identity");
     }
-    for (const name of OWNED_RUNTIME_RECORD_DIRECTORIES) {
-      const directory = canonicalDirectory(join(root, name), true, true);
-      if (!isContained(root, directory)) {
-        throw new OwnedRuntimeError("STORAGE_UNVERIFIABLE", "Owned-runtime storage escaped its managed root");
-      }
-    }
+    // Open (lazily, once) the single LMDB record-store environment beneath the
+    // validated storage root. Records live inside that environment; the ten
+    // family directories are no longer created. The prior file-based store was
+    // never released publicly, so there is no legacy on-disk state to import.
+    this.recordStore();
     return root;
   }
 
   private directory(name: OwnedRuntimeRecordDirectory): string {
     return join(this.storageRoot, name);
+  }
+
+  /** Lazily bind the single synchronous LMDB record store for this manager. */
+  private recordStore(): LmdbRecordStore {
+    if (!this.recordStoreInstance) {
+      this.recordStoreInstance = new LmdbRecordStore({
+        storageRoot: this.storageRoot,
+        maxRecordBytes: this.maxRecordBytes,
+        // A namespace larger than the aggregate record cap cannot arise from
+        // admitted writes; bound scans to it so a corrupt/oversized store fails
+        // closed instead of materializing the whole namespace.
+        maxScanRecords: this.maxStoreRecords,
+      });
+    }
+    return this.recordStoreInstance;
+  }
+
+  /**
+   * Map a virtual record path `{storageRoot}/{family}/{basename}.json` back to
+   * its `(family, id)` LMDB coordinates. The virtual path remains the record's
+   * identity everywhere above the storage boundary; only this leaf translates.
+   */
+  private recordCoordinates(target: string): { family: OwnedRuntimeRecordDirectory; id: string } {
+    const resolved = resolve(target);
+    if (!isContained(this.storageRoot, resolved)) {
+      throw new OwnedRuntimeError("STORAGE_UNVERIFIABLE", "Lifecycle record escaped managed storage");
+    }
+    const family = basename(dirname(resolved));
+    if (pathKey(dirname(dirname(resolved))) !== pathKey(this.storageRoot) ||
+        !(OWNED_RUNTIME_RECORD_DIRECTORIES as readonly string[]).includes(family)) {
+      throw new OwnedRuntimeError("STORAGE_UNVERIFIABLE", "Lifecycle record is outside a known family namespace");
+    }
+    const name = basename(resolved);
+    if (!name.endsWith(".json")) {
+      throw new OwnedRuntimeError("STORAGE_UNVERIFIABLE", "Lifecycle record is not a canonical .json record");
+    }
+    return { family: family as OwnedRuntimeRecordDirectory, id: name.slice(0, -5) };
+  }
+
+  /** Existence of the record addressed by a virtual path (parity with existsSync). */
+  private hasRecord(target: string): boolean {
+    if (!existsSync(this.storageRoot)) return false;
+    const { family, id } = this.recordCoordinates(target);
+    return this.recordStore().has(family, id);
+  }
+
+  /**
+   * Sorted `<id>.json` names in a family namespace, so callers that parsed
+   * `readdirSync` filenames keep their existing `name.slice(0, -5)` logic.
+   */
+  private recordFileNames(family: OwnedRuntimeRecordDirectory): string[] {
+    if (!existsSync(this.storageRoot)) return [];
+    return this.recordStore().listIds(family).map((id) => `${id}.json`).sort();
   }
 
   private preparedPath(id: string): string { return join(this.directory("prepared"), `${id}.json`); }
@@ -3989,7 +4052,7 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
   }
 
   private readRuntimeReceipt(runtimeId: string): OwnedRuntimeReceipt {
-    if (!existsSync(this.runtimePath(runtimeId))) {
+    if (!this.hasRecord(this.runtimePath(runtimeId))) {
       throw new OwnedRuntimeError("RUNTIME_NOT_FOUND", "Owned runtime receipt was not found");
     }
     const receipt = this.readParsed(this.runtimePath(runtimeId), runtimeReceiptSchema, "runtime lifecycle receipt");
@@ -4010,7 +4073,7 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
   }
 
   private readOptionalRuntimeReceipt(runtimeId: string): OwnedRuntimeReceipt | null {
-    return existsSync(this.runtimePath(runtimeId)) ? this.readRuntimeReceipt(runtimeId) : null;
+    return this.hasRecord(this.runtimePath(runtimeId)) ? this.readRuntimeReceipt(runtimeId) : null;
   }
 
   private readOptionalPendingStart(runtimeId: string): PendingStart | null {
@@ -4043,30 +4106,40 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
     label: string,
     maxBytes = Math.min(DEFAULT_LIFECYCLE_RECORD_MAX_BYTES, this.maxRecordBytes)
   ): T {
-    const store = new BoundedJsonStore<T>({
-      root: this.storageRoot,
-      minRecordBytes: 2,
-      maxRecordBytes: maxBytes,
-      maxRecords: this.maxStoreRecords,
-      maxTotalBytes: this.maxStoreBytes,
-      parse: (value) => schema.parse(value),
-    });
-    const inspected = store.inspect(path);
-    if (inspected.kind === "missing") {
+    const { family, id } = this.recordCoordinates(path);
+    const raw = existsSync(this.storageRoot) ? this.recordStore().getRaw(family, id) : null;
+    if (raw === null) {
       throw new OwnedRuntimeError("RUNTIME_NOT_FOUND", `${label} was not found`);
     }
-    if (inspected.kind === "corrupt") {
+    // Preserve the prior min/max byte bounds. A record outside them is
+    // unverifiable, exactly like a corrupt file that violated the same bounds.
+    if (raw.byteLength < LIFECYCLE_RECORD_MIN_BYTES || raw.byteLength > maxBytes) {
       throw new OwnedRuntimeError(
         "STORAGE_UNVERIFIABLE",
-        `${label} is invalid: ${inspected.message}`
+        `${label} is invalid: record byte length ${raw.byteLength} is outside its bounds`
       );
     }
-    return inspected.value;
+    let decoded: unknown;
+    try {
+      decoded = JSON.parse(Buffer.from(raw).toString("utf8").replace(/^\uFEFF/, ""));
+    } catch (error) {
+      throw new OwnedRuntimeError(
+        "STORAGE_UNVERIFIABLE",
+        `${label} is invalid: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+    try {
+      return schema.parse(decoded);
+    } catch (error) {
+      throw new OwnedRuntimeError(
+        "STORAGE_UNVERIFIABLE",
+        `${label} is invalid: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
   }
 
   private readOptionalParsed<T>(path: string, schema: z.ZodType<T>, label: string): T | null {
-    if (!existsSync(path)) return null;
-    return this.readParsed(path, schema, label);
+    return this.hasRecord(path) ? this.readParsed(path, schema, label) : null;
   }
 
   private atomicWrite(
@@ -4077,27 +4150,18 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
     capacityPreflighted = false
   ): void {
     if (!isContained(root, target)) throw new OwnedRuntimeError("STORAGE_UNVERIFIABLE", "Lifecycle write escaped managed storage");
-    const targetDirectory = canonicalDirectory(dirname(target), false, true);
-    if (pathKey(targetDirectory) !== pathKey(dirname(target))) {
-      throw new OwnedRuntimeError("STORAGE_UNVERIFIABLE", "Lifecycle write directory changed identity");
-    }
-    if (exclusive && existsSync(target)) {
+    // `target` remains the virtual record path (crash-injection tests hook it by
+    // that path); only the leaf translation to (family, id) touches LMDB.
+    const { family, id } = this.recordCoordinates(target);
+    if (exclusive && this.recordStore().has(family, id)) {
       throw new OwnedRuntimeError("STORAGE_CONFLICT", "Lifecycle receipt already exists");
     }
     if (!capacityPreflighted) this.assertBatchCapacity(root, [{ target, value, exclusive }]);
     const serialized = this.serializeRecord(value);
     try {
-      foundationAtomicWriteFile({
-        root,
-        targetPath: target,
-        data: serialized,
-        maxBytes: this.maxRecordBytes,
-        mode: 0o600,
-        durable: true,
-        exclusive,
-      });
+      this.recordStore().putRaw(family, id, Buffer.from(serialized, "utf8"), { exclusive });
     } catch (error) {
-      if (error instanceof JsonStoreError && error.code === "CAS_CONFLICT") {
+      if (error instanceof LmdbRecordStoreError && error.code === "RECORD_EXISTS") {
         throw new OwnedRuntimeError(
           "STORAGE_CONFLICT",
           "Lifecycle receipt appeared concurrently"

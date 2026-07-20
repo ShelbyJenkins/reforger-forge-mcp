@@ -5,9 +5,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
-  readdirSync,
   rmSync,
-  statSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -448,10 +446,48 @@ interface Harness {
 }
 
 const roots: string[] = [];
+const openManagers: OwnedRuntimeManager[] = [];
+const openAgents: Array<{ server: { close(): Promise<void> } }> = [];
 
-afterEach(() => {
+afterEach(async () => {
+  // Release every manager's and in-process agent's LMDB environment before
+  // removing its root: an open memory map blocks rmSync on Windows. (An agent
+  // simulating "loss" is never closed by the test, so close it here.)
+  for (const manager of openManagers.splice(0)) {
+    await manager.closeStorageForTest().catch(() => undefined);
+  }
+  for (const agent of openAgents.splice(0)) {
+    await agent.server.close().catch(() => undefined);
+  }
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
+
+function listRecordIds(manager: OwnedRuntimeManager, family: string): string[] {
+  return manager.recordStoreForTest().listIds(family);
+}
+
+function recordExists(manager: OwnedRuntimeManager, family: string, id: string): boolean {
+  return manager.recordStoreForTest().has(family, id);
+}
+
+function removeRecord(manager: OwnedRuntimeManager, family: string, id: string): boolean {
+  return manager.recordStoreForTest().remove(family, id);
+}
+
+function writeRecord(manager: OwnedRuntimeManager, family: string, id: string, text: string): void {
+  manager.recordStoreForTest().putRaw(family, id, Buffer.from(text, "utf8"), { exclusive: false });
+}
+
+function readRecordText(manager: OwnedRuntimeManager, family: string, id: string): string {
+  const raw = manager.recordStoreForTest().getRaw(family, id);
+  if (raw === null) throw new Error(`Expected record ${family}/${id}`);
+  return Buffer.from(raw).toString("utf8");
+}
+
+function recordByteLength(manager: OwnedRuntimeManager, family: string, id: string): number {
+  const raw = manager.recordStoreForTest().getRaw(family, id);
+  return raw === null ? 0 : raw.byteLength;
+}
 
 function makeHarness(options: {
   spawnFailure?: boolean;
@@ -517,6 +553,7 @@ function makeHarness(options: {
     ...(options.maxStoreBytes === undefined ? {} : { maxStoreBytes: options.maxStoreBytes }),
     ...(options.maxRecordBytes === undefined ? {} : { maxRecordBytes: options.maxRecordBytes }),
   });
+  openManagers.push(manager);
   const prepare = async (argumentsArray = ["-window", "-noSplash"], idempotencyKey?: string) => {
     const input: ObserverLaunchInput = {
       runtimeKind: "listenServer",
@@ -570,8 +607,7 @@ describe("OwnedRuntimeManager", () => {
     const value = makeHarness();
     const windowsCommandLineMaxUtf16Units = 32_767;
     const prepared = await value.prepare(["x".repeat(windowsCommandLineMaxUtf16Units)]);
-    const descriptorPath = join(value.manager.storageRoot, "prepared", `${prepared.id}.json`);
-    expect(statSync(descriptorPath).size).toBeGreaterThan(windowsCommandLineMaxUtf16Units);
+    expect(recordByteLength(value.manager, "prepared", prepared.id)).toBeGreaterThan(windowsCommandLineMaxUtf16Units);
     await expect(value.manager.start({ preparedLaunchId: prepared.id, idempotencyKey: "boundary-payload" }))
       .rejects.toMatchObject({ code: "ARGUMENT_CONFLICT" });
     const later = await value.prepare(["-later"]);
@@ -596,8 +632,7 @@ describe("OwnedRuntimeManager", () => {
     });
 
     const prepared = await value.prepare(argumentsArray, "maximum-escape-descriptor");
-    const descriptorPath = join(value.manager.storageRoot, "prepared", `${prepared.id}.json`);
-    expect(statSync(descriptorPath).size).toBeGreaterThan(390_000);
+    expect(recordByteLength(value.manager, "prepared", prepared.id)).toBeGreaterThan(390_000);
 
     // Reusing the exact session takes the indexed replay path, which reopens,
     // parses, and fingerprints the bounded descriptor before returning its id.
@@ -612,22 +647,15 @@ describe("OwnedRuntimeManager", () => {
 
     await expect(value.prepare(Array.from({ length: 3 }, () => jsonWorstCaseBoundaryToken)))
       .rejects.toMatchObject({ code: "STORE_CAPACITY_EXCEEDED" });
-    expect(readdirSync(join(value.manager.storageRoot, "prepared"))).toEqual([]);
-    expect(readdirSync(join(value.manager.storageRoot, "prepared-index"))).toEqual([]);
+    expect(listRecordIds(value.manager, "prepared")).toEqual([]);
+    expect(listRecordIds(value.manager, "prepared-index")).toEqual([]);
     await expect(value.prepare(["-later"])).resolves.toBeDefined();
   });
 
   it("uses a direct session index and isolates an unrelated corrupt prepared descriptor", async () => {
     const value = makeHarness();
     const first = await value.prepare(["-indexed"]);
-    writeFileSync(
-      join(
-        value.manager.storageRoot,
-        "prepared",
-        "pl-ffffffff-ffff-4fff-8fff-ffffffffffff.json"
-      ),
-      "{\n"
-    );
+    writeRecord(value.manager, "prepared", "pl-ffffffff-ffff-4fff-8fff-ffffffffffff", "{\n");
 
     const replay = await value.manager.recordPreparedLaunch({
       runtimeKind: "listenServer",
@@ -648,7 +676,7 @@ describe("OwnedRuntimeManager", () => {
 
     expect(replay).toBe(first.id);
     expect(later.id).not.toBe(first.id);
-    expect(readdirSync(join(value.manager.storageRoot, "prepared-index"))).toHaveLength(2);
+    expect(listRecordIds(value.manager, "prepared-index")).toHaveLength(2);
   });
 
   it("enforces per-record, aggregate-byte, and record-count budgets with diagnostics", async () => {
@@ -664,9 +692,8 @@ describe("OwnedRuntimeManager", () => {
     expect(aggregate.manager.diagnosticStorageStats().bytes).toBeLessThanOrEqual(4_096);
 
     const countBound = makeHarness({ maxStoreRecords: 8 });
-    countBound.manager.diagnosticStorageStats();
     for (let index = 0; index < 8; index += 1) {
-      writeFileSync(join(countBound.manager.storageRoot, "prepared", `forensic-${index}.json`), "{}\n");
+      writeRecord(countBound.manager, "prepared", `forensic-${index}`, "{}\n");
     }
     await expect(countBound.prepare()).rejects.toMatchObject({ code: "STORE_CAPACITY_EXCEEDED" });
     expect(countBound.manager.diagnosticStorageStats()).toMatchObject({ records: 8, maxRecords: 8 });
@@ -680,9 +707,9 @@ describe("OwnedRuntimeManager", () => {
       idempotencyKey: "tight-start",
     })).rejects.toMatchObject({ code: "STORE_CAPACITY_EXCEEDED" });
     expect(insufficient.spawnCalls).toEqual([]);
-    expect(readdirSync(join(insufficient.manager.storageRoot, "consumed"))).toEqual([]);
-    expect(readdirSync(join(insufficient.manager.storageRoot, "pending-starts"))).toEqual([]);
-    expect(readdirSync(join(insufficient.manager.storageRoot, "idempotency"))).toEqual([]);
+    expect(listRecordIds(insufficient.manager, "consumed")).toEqual([]);
+    expect(listRecordIds(insufficient.manager, "pending-starts")).toEqual([]);
+    expect(listRecordIds(insufficient.manager, "idempotency")).toEqual([]);
 
     // This case exercises storage reservation, not deadline handling. Leave
     // enough wall-clock headroom for filesystem syncs when the full suite is
@@ -697,11 +724,11 @@ describe("OwnedRuntimeManager", () => {
     // replacements must not borrow the fsynced temporary-file slot. A crash
     // could otherwise consume mandatory recovery headroom for the retention
     // window.
-    const tightStartAttempt = JSON.parse(readFileSync(join(
-      sufficient.manager.storageRoot,
+    const tightStartAttempt = JSON.parse(readRecordText(
+      sufficient.manager,
       "idempotency",
-      `start-${createHash("sha256").update("reserved-start").digest("hex")}.json`
-    ), "utf8"));
+      `start-${createHash("sha256").update("reserved-start").digest("hex")}`
+    ));
     expect(tightStartAttempt.state).toBe("starting");
     expect(sufficient.manager.diagnosticStorageStats()).toMatchObject({
       records: 6,
@@ -757,7 +784,7 @@ describe("OwnedRuntimeManager", () => {
     });
     live.setClock(Date.parse(livePrepared.prepared.expiresAt) + 60_000);
     await live.manager.sweep();
-    expect(existsSync(join(live.manager.storageRoot, "runtimes", `${liveStarted.runtimeId}.json`))).toBe(true);
+    expect(recordExists(live.manager, "runtimes", liveStarted.runtimeId)).toBe(true);
     expect(live.manager.diagnosticStorageStats().activeOrRecoverableRuntimes).toBe(1);
   });
 
@@ -777,6 +804,7 @@ describe("OwnedRuntimeManager", () => {
       sessionStore: { terminalRetentionMs: 0 },
       registry: { staleAfterMs: 1_000, staleRetentionMs: 0 },
     });
+    openAgents.push(agent);
     const profilePath = join(profileRoot, "runtime-profile");
     mkdirSync(profilePath, { recursive: true });
     const created = agent.control.sessions.create({
@@ -935,6 +963,7 @@ describe("OwnedRuntimeManager", () => {
       registry: { staleAfterMs: 1_000, staleRetentionMs: 0 },
       jobs: { terminalJobRetentionMs: 1, idempotencyReceiptRetentionMs: 1 },
     });
+    openAgents.push(firstAgent);
     const created = firstAgent.control.sessions.create({
       bundleDigest: testBundleDigest,
       stagedAddonPath,
@@ -1026,6 +1055,7 @@ describe("OwnedRuntimeManager", () => {
       registry: { staleAfterMs: 1_000, staleRetentionMs: 0 },
       jobs: { terminalJobRetentionMs: 1, idempotencyReceiptRetentionMs: 1 },
     });
+    openAgents.push(replacementAgent);
     const recovered = makeHarness({
       root,
       backend,
@@ -1097,17 +1127,13 @@ describe("OwnedRuntimeManager", () => {
       waitForRestorationMs: 0,
       idempotencyKey: "partial-cleanup-stop",
     });
-    rmSync(join(completed.manager.storageRoot, "runtimes", `${started.runtimeId}.json`));
-    rmSync(join(completed.manager.storageRoot, "stops", `${started.runtimeId}.json`));
+    removeRecord(completed.manager, "runtimes", started.runtimeId);
+    removeRecord(completed.manager, "stops", started.runtimeId);
     await expect(completed.manager.sweep()).resolves.toMatchObject({
       removedRuntimeIds: [started.runtimeId],
       removedPreparedLaunchIds: [prepared.id],
     });
-    expect(existsSync(join(
-      completed.manager.storageRoot,
-      "stop-completions",
-      `${started.runtimeId}.json`
-    ))).toBe(false);
+    expect(recordExists(completed.manager, "stop-completions", started.runtimeId)).toBe(false);
 
     const live = makeHarness({ receiptRetentionMs: 0 });
     const livePrepared = await live.prepare();
@@ -1115,11 +1141,11 @@ describe("OwnedRuntimeManager", () => {
       preparedLaunchId: livePrepared.id,
       idempotencyKey: "broken-link-start",
     });
-    rmSync(join(live.manager.storageRoot, "consumed", `${livePrepared.id}.json`));
+    removeRecord(live.manager, "consumed", livePrepared.id);
     live.setClock(Date.parse(livePrepared.prepared.expiresAt) + 1);
     await live.manager.sweep();
-    expect(existsSync(join(live.manager.storageRoot, "prepared", `${livePrepared.id}.json`))).toBe(true);
-    expect(existsSync(join(live.manager.storageRoot, "runtimes", `${liveStarted.runtimeId}.json`))).toBe(true);
+    expect(recordExists(live.manager, "prepared", livePrepared.id)).toBe(true);
+    expect(recordExists(live.manager, "runtimes", liveStarted.runtimeId)).toBe(true);
   });
 
   it("scopes a corrupt live forward receipt to its consumed preparation", async () => {
@@ -1131,8 +1157,8 @@ describe("OwnedRuntimeManager", () => {
     });
     const unused = await value.prepare(["-unrelated-unused"]);
 
-    rmSync(join(value.manager.storageRoot, "pending-starts", `${live.runtimeId}.json`));
-    writeFileSync(join(value.manager.storageRoot, "runtimes", `${live.runtimeId}.json`), "{\n");
+    removeRecord(value.manager, "pending-starts", live.runtimeId);
+    writeRecord(value.manager, "runtimes", live.runtimeId, "{\n");
     value.setClock(Math.max(
       Date.parse(livePrepared.prepared.expiresAt),
       Date.parse(unused.prepared.expiresAt)
@@ -1141,10 +1167,10 @@ describe("OwnedRuntimeManager", () => {
     await expect(value.manager.sweep()).resolves.toMatchObject({
       removedPreparedLaunchIds: [unused.id],
     });
-    expect(existsSync(join(value.manager.storageRoot, "prepared", `${unused.id}.json`))).toBe(false);
-    expect(existsSync(join(value.manager.storageRoot, "prepared", `${livePrepared.id}.json`))).toBe(true);
-    expect(existsSync(join(value.manager.storageRoot, "consumed", `${livePrepared.id}.json`))).toBe(true);
-    expect(existsSync(join(value.manager.storageRoot, "runtimes", `${live.runtimeId}.json`))).toBe(true);
+    expect(recordExists(value.manager, "prepared", unused.id)).toBe(false);
+    expect(recordExists(value.manager, "prepared", livePrepared.id)).toBe(true);
+    expect(recordExists(value.manager, "consumed", livePrepared.id)).toBe(true);
+    expect(recordExists(value.manager, "runtimes", live.runtimeId)).toBe(true);
   });
 
   it("keeps the terminal cleanup trigger when an idempotency unlink fails", async () => {
@@ -1173,18 +1199,13 @@ describe("OwnedRuntimeManager", () => {
     };
 
     await expect(value.manager.sweep()).resolves.toMatchObject({ removedRuntimeIds: [] });
-    const completionPath = join(
-      value.manager.storageRoot,
-      "stop-completions",
-      `${started.runtimeId}.json`
-    );
-    expect(existsSync(completionPath)).toBe(true);
+    expect(recordExists(value.manager, "stop-completions", started.runtimeId)).toBe(true);
 
     failIdempotencyUnlink = false;
     await expect(value.manager.sweep()).resolves.toMatchObject({
       removedRuntimeIds: [started.runtimeId],
     });
-    expect(existsSync(completionPath)).toBe(false);
+    expect(recordExists(value.manager, "stop-completions", started.runtimeId)).toBe(false);
   });
 
   it("spawns exact structured arguments visibly without a shell and publishes a complete restrictive receipt", async () => {
@@ -1208,8 +1229,7 @@ describe("OwnedRuntimeManager", () => {
       stdio: "ignore",
       windowsHide: false,
     });
-    const receiptPath = join(value.manager.storageRoot, "runtimes", `${started.runtimeId}.json`);
-    const receipt = JSON.parse(readFileSync(receiptPath, "utf8"));
+    const receipt = JSON.parse(readRecordText(value.manager, "runtimes", started.runtimeId));
     expect(receipt).toMatchObject({
       version: 1,
       runtimeId: started.runtimeId,
@@ -1242,7 +1262,7 @@ describe("OwnedRuntimeManager", () => {
     })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
 
     expect(value.spawnCalls).toHaveLength(0);
-    expect(readdirSync(join(value.manager.storageRoot, "runtimes"))).toEqual([]);
+    expect(listRecordIds(value.manager, "runtimes")).toEqual([]);
   });
 
   it("removes naturally exited children and reconciles exact exit evidence durably", async () => {
@@ -1264,11 +1284,10 @@ describe("OwnedRuntimeManager", () => {
     child.emit("exit", 0, null);
     expect(value.manager.diagnosticSupervisedChildCount()).toBe(0);
 
-    const exitPath = join(value.manager.storageRoot, "child-exits", `${started.runtimeId}.json`);
-    for (let attempt = 0; attempt < 50 && !existsSync(exitPath); attempt += 1) {
+    for (let attempt = 0; attempt < 50 && !recordExists(value.manager, "child-exits", started.runtimeId); attempt += 1) {
       await new Promise((resolve) => setTimeout(resolve, 2));
     }
-    expect(JSON.parse(readFileSync(exitPath, "utf8"))).toMatchObject({
+    expect(JSON.parse(readRecordText(value.manager, "child-exits", started.runtimeId))).toMatchObject({
       runtimeId: started.runtimeId,
       sessionId: started.sessionId,
       pid: started.pid,
@@ -1312,13 +1331,13 @@ describe("OwnedRuntimeManager", () => {
     const prepared = await failed.prepare();
     await expect(failed.manager.start({ preparedLaunchId: prepared.id, idempotencyKey: "failed-start" }))
       .rejects.toMatchObject({ code: "SPAWN_FAILED" });
-    expect(readdirSync(join(failed.manager.storageRoot, "runtimes"))).toEqual([]);
+    expect(listRecordIds(failed.manager, "runtimes")).toEqual([]);
     expect(failed.spawnCalls[0].child.killed).toBe(true);
-    const pending = JSON.parse(readFileSync(join(
-      failed.manager.storageRoot,
+    const pending = JSON.parse(readRecordText(
+      failed.manager,
       "pending-starts",
-      readdirSync(join(failed.manager.storageRoot, "pending-starts"))[0]
-    ), "utf8"));
+      listRecordIds(failed.manager, "pending-starts")[0]
+    ));
     expect(pending).toMatchObject({ state: "release_acknowledged", preparedLaunchId: prepared.id });
   });
 
@@ -1342,7 +1361,7 @@ describe("OwnedRuntimeManager", () => {
     })).rejects.toMatchObject({ code: "SPAWN_FAILED" });
     expect(value.gate.retainedLifecycles).toHaveLength(1);
     expect(value.gate.releasedLifecycles).toEqual(value.gate.retainedLifecycles);
-    expect(readdirSync(join(value.manager.storageRoot, "runtimes"))).toEqual([]);
+    expect(listRecordIds(value.manager, "runtimes")).toEqual([]);
   });
 
   it("retains an unpublished exact lifecycle until a same-key retry proves child vacancy", async () => {
@@ -1363,9 +1382,8 @@ describe("OwnedRuntimeManager", () => {
       preparedLaunchId: prepared.id,
       idempotencyKey: "uncertain-post-pin-publication",
     })).rejects.toMatchObject({ code: "SPAWN_FAILED" });
-    const pendingName = readdirSync(join(value.manager.storageRoot, "pending-starts"))[0];
-    const pendingPath = join(value.manager.storageRoot, "pending-starts", pendingName);
-    expect(JSON.parse(readFileSync(pendingPath, "utf8"))).toMatchObject({
+    const pendingId = listRecordIds(value.manager, "pending-starts")[0];
+    expect(JSON.parse(readRecordText(value.manager, "pending-starts", pendingId))).toMatchObject({
       state: "cleanup_required",
       lifecycleGeneration: expect.stringMatching(/^[a-f0-9]{64}$/),
       launchedAtMs: expect.any(Number),
@@ -1384,7 +1402,7 @@ describe("OwnedRuntimeManager", () => {
     });
     expect(value.backend.processes.has(value.spawnCalls[0].child.pid)).toBe(false);
     expect(value.gate.releasedLifecycles).toEqual(value.gate.retainedLifecycles);
-    expect(JSON.parse(readFileSync(pendingPath, "utf8"))).toMatchObject({ state: "release_acknowledged" });
+    expect(JSON.parse(readRecordText(value.manager, "pending-starts", pendingId))).toMatchObject({ state: "release_acknowledged" });
   });
 
   it("keeps durable unpublished-exit cleanup retryable when lifecycle release IPC fails", async () => {
@@ -1408,21 +1426,20 @@ describe("OwnedRuntimeManager", () => {
     expect(value.gate.releasedLifecycles).toEqual([]);
 
     const child = value.spawnCalls[0].child;
-    const pendingName = readdirSync(join(value.manager.storageRoot, "pending-starts"))[0];
-    const pendingPath = join(value.manager.storageRoot, "pending-starts", pendingName);
+    const pendingId = listRecordIds(value.manager, "pending-starts")[0];
     value.gate.releaseLifecycleFailures = 1;
     value.backend.processes.delete(child.pid);
     child.exitCode = 0;
     child.emit("exit", 0, null);
     for (let attempt = 0; attempt < 50; attempt += 1) {
-      if (JSON.parse(readFileSync(pendingPath, "utf8")).state === "release_required" &&
+      if (JSON.parse(readRecordText(value.manager, "pending-starts", pendingId)).state === "release_required" &&
           value.gate.releaseLifecycleAttempts === 1) break;
       await new Promise((resolve) => setTimeout(resolve, 2));
     }
 
     expect(value.gate.releaseLifecycleAttempts).toBe(1);
     expect(value.gate.releasedLifecycles).toEqual([]);
-    expect(JSON.parse(readFileSync(pendingPath, "utf8"))).toMatchObject({
+    expect(JSON.parse(readRecordText(value.manager, "pending-starts", pendingId))).toMatchObject({
       state: "release_required",
       pid: child.pid,
     });
@@ -1434,7 +1451,7 @@ describe("OwnedRuntimeManager", () => {
       details: { state: "release_required", pid: child.pid },
     });
     expect(value.gate.releasedLifecycles).toEqual(value.gate.retainedLifecycles);
-    expect(JSON.parse(readFileSync(pendingPath, "utf8"))).toMatchObject({
+    expect(JSON.parse(readRecordText(value.manager, "pending-starts", pendingId))).toMatchObject({
       state: "release_acknowledged",
     });
   });
@@ -1462,11 +1479,7 @@ describe("OwnedRuntimeManager", () => {
     value.backend.inspectFailure = null;
     value.backend.processes.delete(started.pid);
     expect((await value.manager.status(started.runtimeId)).state).toBe("exited");
-    expect(existsSync(join(
-      value.manager.storageRoot,
-      "child-exits",
-      `${started.runtimeId}.json`
-    ))).toBe(true);
+    expect(recordExists(value.manager, "child-exits", started.runtimeId)).toBe(true);
     expect(value.gate.releasedLifecycles.at(-1)).toMatchObject({ runtimeId: started.runtimeId });
   });
 
@@ -1525,8 +1538,8 @@ describe("OwnedRuntimeManager", () => {
       waitForRestorationMs: 0,
       idempotencyKey: "camera-stop-other",
     })).rejects.toMatchObject({ code: "CAMERA_BUSY" });
-    expect(readdirSync(join(value.manager.storageRoot, "idempotency"))
-      .filter((name) => name.startsWith("stop-"))).toEqual([]);
+    expect(listRecordIds(value.manager, "idempotency")
+      .filter((id) => id.startsWith("stop-"))).toEqual([]);
 
     const stopped = await value.manager.stop({
       runtimeId: started.runtimeId,
@@ -1564,7 +1577,7 @@ describe("OwnedRuntimeManager", () => {
     })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
 
     expect(backend.terminateCalls).toHaveLength(1);
-    expect(existsSync(join(value.manager.storageRoot, "stops", `${started.runtimeId}.json`))).toBe(false);
+    expect(recordExists(value.manager, "stops", started.runtimeId)).toBe(false);
     await expect(value.manager.status(started.runtimeId)).resolves.toMatchObject({
       state: "stopping",
       terminationComplete: false,
@@ -1619,12 +1632,7 @@ describe("OwnedRuntimeManager", () => {
       idempotencyKey: "reservation-cas-stop",
     })).rejects.toMatchObject({ code: "TERMINATION_REFUSED" });
     expect(release).not.toHaveBeenCalled();
-    const proofPath = join(
-      value.manager.storageRoot,
-      "restoration-proofs",
-      `${started.runtimeId}.json`
-    );
-    const proof = JSON.parse(readFileSync(proofPath, "utf8"));
+    const proof = JSON.parse(readRecordText(value.manager, "restoration-proofs", started.runtimeId));
     expect(proof).toMatchObject({
       kind: "live_stop_reservation",
       stopIdempotencyHash: createHash("sha256").update("reservation-cas-stop").digest("hex"),
@@ -1792,8 +1800,8 @@ describe("OwnedRuntimeManager", () => {
       idempotencyKey: "unlocked-completion-stop",
     });
     await didCallCompletion;
-    expect(existsSync(join(value.manager.storageRoot, "stops", `${started.runtimeId}.json`))).toBe(true);
-    expect(existsSync(join(value.manager.storageRoot, "stop-completions", `${started.runtimeId}.json`))).toBe(false);
+    expect(recordExists(value.manager, "stops", started.runtimeId)).toBe(true);
+    expect(recordExists(value.manager, "stop-completions", started.runtimeId)).toBe(false);
     await expect(Promise.race([
       backend.withMachineMutex({ action: async () => "entered" as const }),
       new Promise<"timed_out">((resolve) => setTimeout(() => resolve("timed_out"), 100)),
@@ -1842,11 +1850,7 @@ describe("OwnedRuntimeManager", () => {
     const attemptHash = createHash("sha256")
       .update("deadline-restoration-stop")
       .digest("hex");
-    expect(JSON.parse(readFileSync(join(
-      value.manager.storageRoot,
-      "idempotency",
-      `stop-${attemptHash}.json`
-    ), "utf8"))).toMatchObject({
+    expect(JSON.parse(readRecordText(value.manager, "idempotency", `stop-${attemptHash}`))).toMatchObject({
       action: "stop",
       runtimeId: started.runtimeId,
       state: "starting",
@@ -1886,16 +1890,8 @@ describe("OwnedRuntimeManager", () => {
 
       expect(Date.now() - beganAt).toBe(300);
       expect(value.backend.processes.has(started.pid)).toBe(false);
-      expect(existsSync(join(
-        value.manager.storageRoot,
-        "stops",
-        `${started.runtimeId}.json`
-      ))).toBe(true);
-      expect(existsSync(join(
-        value.manager.storageRoot,
-        "stop-completions",
-        `${started.runtimeId}.json`
-      ))).toBe(false);
+      expect(recordExists(value.manager, "stops", started.runtimeId)).toBe(true);
+      expect(recordExists(value.manager, "stop-completions", started.runtimeId)).toBe(false);
       await expect(value.manager.status(started.runtimeId)).resolves.toMatchObject({
         state: "stopping",
         identityVacant: true,
@@ -1970,16 +1966,11 @@ describe("OwnedRuntimeManager", () => {
       idempotencyKey: "proof-race-start",
     });
     backend.beforeAction = () => {
-      const proofPath = join(
-        value.manager.storageRoot,
-        "restoration-proofs",
-        `${started.runtimeId}.json`
-      );
-      if (!existsSync(proofPath)) return;
+      if (!recordExists(value.manager, "restoration-proofs", started.runtimeId)) return;
       backend.beforeAction = null;
-      const proof = JSON.parse(readFileSync(proofPath, "utf8"));
+      const proof = JSON.parse(readRecordText(value.manager, "restoration-proofs", started.runtimeId));
       proof.reservationId = "00000000-0000-4000-8000-999999999999";
-      writeFileSync(proofPath, JSON.stringify(proof));
+      writeRecord(value.manager, "restoration-proofs", started.runtimeId, JSON.stringify(proof));
     };
 
     await expect(value.manager.stop({
@@ -2134,14 +2125,14 @@ describe("OwnedRuntimeManager", () => {
     expired.setClock(Date.parse(prepared.prepared.expiresAt));
     await expect(expired.manager.start({ preparedLaunchId: prepared.id, idempotencyKey: "expired-start" }))
       .rejects.toMatchObject({ code: "PREPARED_LAUNCH_EXPIRED" });
-    expect(readdirSync(join(expired.manager.storageRoot, "consumed"))).toEqual([]);
+    expect(listRecordIds(expired.manager, "consumed")).toEqual([]);
     expect(expired.spawnCalls).toEqual([]);
 
     const oversized = makeHarness();
     const tooLong = await oversized.prepare(["x".repeat(32_760)]);
     await expect(oversized.manager.start({ preparedLaunchId: tooLong.id, idempotencyKey: "oversized-start" }))
       .rejects.toMatchObject({ code: "ARGUMENT_CONFLICT" });
-    expect(readdirSync(join(oversized.manager.storageRoot, "consumed"))).toEqual([]);
+    expect(listRecordIds(oversized.manager, "consumed")).toEqual([]);
     expect(oversized.spawnCalls).toEqual([]);
 
     const oversizedProfile = makeHarness();
@@ -2169,9 +2160,9 @@ describe("OwnedRuntimeManager", () => {
     const prepared = await value.prepare();
     await expect(value.manager.start({ preparedLaunchId: prepared.id, idempotencyKey: "stubborn-start" }))
       .rejects.toMatchObject({ code: "SPAWN_FAILED" });
-    expect(readdirSync(join(value.manager.storageRoot, "runtimes"))).toEqual([]);
-    const pendingName = readdirSync(join(value.manager.storageRoot, "pending-starts"))[0];
-    const pending = JSON.parse(readFileSync(join(value.manager.storageRoot, "pending-starts", pendingName), "utf8"));
+    expect(listRecordIds(value.manager, "runtimes")).toEqual([]);
+    const pendingId = listRecordIds(value.manager, "pending-starts")[0];
+    const pending = JSON.parse(readRecordText(value.manager, "pending-starts", pendingId));
     expect(pending).toMatchObject({ state: "cleanup_required", preparedLaunchId: prepared.id });
     await expect(value.manager.start({ preparedLaunchId: prepared.id, idempotencyKey: "stubborn-start" }))
       .rejects.toMatchObject({ code: "START_UNVERIFIABLE", details: { state: "cleanup_required" } });
@@ -2202,11 +2193,7 @@ describe("OwnedRuntimeManager", () => {
     const prepared = await value.prepare();
     const started = await value.manager.start({ preparedLaunchId: prepared.id, idempotencyKey: "proof-start" });
     value.backend.beforeTerminate = () => {
-      const proof = JSON.parse(readFileSync(join(
-        value.manager.storageRoot,
-        "restoration-proofs",
-        `${started.runtimeId}.json`
-      ), "utf8"));
+      const proof = JSON.parse(readRecordText(value.manager, "restoration-proofs", started.runtimeId));
       expect(proof).toMatchObject({
         runtimeId: started.runtimeId,
         sessionId: started.sessionId,
@@ -2221,8 +2208,8 @@ describe("OwnedRuntimeManager", () => {
     })).rejects.toMatchObject({ code: "SESSION_COMPLETION_FAILED" });
     expect(value.backend.processes.has(started.pid)).toBe(false);
     expect(value.backend.terminateCalls).toHaveLength(1);
-    expect(existsSync(join(value.manager.storageRoot, "stops", `${started.runtimeId}.json`))).toBe(true);
-    expect(existsSync(join(value.manager.storageRoot, "stop-completions", `${started.runtimeId}.json`))).toBe(false);
+    expect(recordExists(value.manager, "stops", started.runtimeId)).toBe(true);
+    expect(recordExists(value.manager, "stop-completions", started.runtimeId)).toBe(false);
     expect(await value.manager.status(started.runtimeId)).toMatchObject({
       state: "stopping",
       exactOwned: true,
@@ -2233,15 +2220,10 @@ describe("OwnedRuntimeManager", () => {
 
     // Simulate a legacy/racing tokenless vacancy receipt. The durable proof
     // remains the completion authority and must converge the observer lease.
-    const proof = JSON.parse(readFileSync(join(
-      value.manager.storageRoot,
-      "restoration-proofs",
-      `${started.runtimeId}.json`
-    ), "utf8"));
-    const stopPath = join(value.manager.storageRoot, "stops", `${started.runtimeId}.json`);
-    const tokenlessStop = JSON.parse(readFileSync(stopPath, "utf8"));
+    const proof = JSON.parse(readRecordText(value.manager, "restoration-proofs", started.runtimeId));
+    const tokenlessStop = JSON.parse(readRecordText(value.manager, "stops", started.runtimeId));
     delete tokenlessStop.restorationReservationId;
-    writeFileSync(stopPath, JSON.stringify(tokenlessStop));
+    writeRecord(value.manager, "stops", started.runtimeId, JSON.stringify(tokenlessStop));
 
     const replay = await value.manager.stop({
       runtimeId: started.runtimeId,
@@ -2256,7 +2238,7 @@ describe("OwnedRuntimeManager", () => {
     });
     expect(value.backend.terminateCalls).toHaveLength(1);
     expect(value.gate.completedReservations).toEqual([proof.reservationId]);
-    const stopped = JSON.parse(readFileSync(join(value.manager.storageRoot, "stops", `${started.runtimeId}.json`), "utf8"));
+    const stopped = JSON.parse(readRecordText(value.manager, "stops", started.runtimeId));
     expect(stopped).toMatchObject({
       sessionId: started.sessionId,
       restorationProofKind: "live_stop_reservation",
@@ -2278,13 +2260,9 @@ describe("OwnedRuntimeManager", () => {
       waitForRestorationMs: 0,
       idempotencyKey: "late-error-stop",
     })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
-    expect(existsSync(join(
-      value.manager.storageRoot,
-      "restoration-proofs",
-      `${started.runtimeId}.json`
-    ))).toBe(true);
+    expect(recordExists(value.manager, "restoration-proofs", started.runtimeId)).toBe(true);
     expect(value.gate.released).toEqual([]);
-    expect(existsSync(join(value.manager.storageRoot, "stops", `${started.runtimeId}.json`))).toBe(false);
+    expect(recordExists(value.manager, "stops", started.runtimeId)).toBe(false);
     expect(await value.manager.status(started.runtimeId)).toMatchObject({
       state: "stopping",
       terminationComplete: false,
@@ -2306,6 +2284,7 @@ describe("OwnedRuntimeManager", () => {
       executableResolver: () => value.executable,
       installationRoot: otherInstall,
     });
+    openManagers.push(differentInstall);
     expect(await differentInstall.status(started.runtimeId)).toMatchObject({ state: "unverifiable", exactOwned: false });
 
     value.backend.currentUserSid = "S-1-5-21-different-owner";
@@ -2317,6 +2296,7 @@ describe("OwnedRuntimeManager", () => {
       executableResolver: () => value.executable,
       installationRoot: process.cwd(),
     });
+    openManagers.push(differentOwner);
     expect(await differentOwner.status(started.runtimeId)).toMatchObject({ state: "unverifiable", exactOwned: false });
   });
 
@@ -2399,11 +2379,7 @@ describe("OwnedRuntimeManager", () => {
       expect(result.applicationCloseSafe).toBe(false);
       expect(runtimeError?.reason).toContain("aggregate wall-clock deadline");
       expect(value.gate.releaseRuntimeLifecycle).toHaveBeenCalledTimes(1);
-      expect(existsSync(join(
-        value.manager.storageRoot,
-        "stop-completions",
-        `${started.runtimeId}.json`
-      ))).toBe(true);
+      expect(recordExists(value.manager, "stop-completions", started.runtimeId)).toBe(true);
     } finally {
       vi.useRealTimers();
     }
@@ -2464,6 +2440,22 @@ describe("OwnedRuntimeManager", () => {
     }
   }, 15_000);
 
+  it("guards the test-only record-store seam against non-test callers", () => {
+    const value = makeHarness();
+    const savedVitest = process.env.VITEST;
+    const savedNodeEnv = process.env.NODE_ENV;
+    try {
+      // Simulate a production process (no test runner markers): the seam must
+      // fail closed rather than hand out unmediated record-store mutation.
+      delete process.env.VITEST;
+      delete process.env.NODE_ENV;
+      expect(() => value.manager.recordStoreForTest()).toThrowError(/test-only seam/);
+    } finally {
+      if (savedVitest === undefined) delete process.env.VITEST; else process.env.VITEST = savedVitest;
+      if (savedNodeEnv === undefined) delete process.env.NODE_ENV; else process.env.NODE_ENV = savedNodeEnv;
+    }
+  });
+
   it("keeps coordinator shutdown unsafe when the runtime receipt directory disappears", async () => {
     const value = makeHarness();
     const prepared = await value.prepare();
@@ -2471,7 +2463,13 @@ describe("OwnedRuntimeManager", () => {
       preparedLaunchId: prepared.id,
       idempotencyKey: "missing-inventory-start",
     });
-    rmSync(join(value.manager.storageRoot, "runtimes"), { recursive: true, force: true });
+    // Under LMDB there is no separate on-disk receipt directory to delete; the
+    // equivalent tamper is a receipt store that cannot be inventoried. Faulting
+    // the inventory read through the record-store seam must keep shutdown unsafe.
+    vi.spyOn(value.manager.recordStoreForTest(), "listIds").mockImplementation((family: string) => {
+      if (family === "runtimes") throw new Error("fixture receipt store unavailable");
+      return [];
+    });
 
     await expect(value.manager.close()).resolves.toMatchObject({
       sealedRuntimeIds: [],
@@ -2485,43 +2483,31 @@ describe("OwnedRuntimeManager", () => {
     expect(value.backend.processes.has(started.pid)).toBe(true);
   });
 
-  it.each(["symbolic link", "directory"] as const)(
-    "keeps coordinator shutdown unsafe for a %s runtime inventory entry",
-    async (entryKind) => {
-      const value = makeHarness();
-      const prepared = await value.prepare();
-      const started = await value.manager.start({
-        preparedLaunchId: prepared.id,
-        idempotencyKey: `non-file-inventory-${entryKind}`,
-      });
-      const receiptPath = join(
-        value.manager.storageRoot,
-        "runtimes",
-        `${started.runtimeId}.json`
-      );
-      rmSync(receiptPath);
-      if (entryKind === "symbolic link") {
-        const target = join(value.root, "replacement-runtime-receipt.json");
-        writeFileSync(target, "{}\n");
-        symlinkSync(target, receiptPath, "file");
-      } else {
-        mkdirSync(receiptPath);
-      }
-      const reserve = vi.spyOn(value.gate, "reserveRuntimeStop");
+  it("keeps coordinator shutdown unsafe for a corrupt runtime inventory entry", async () => {
+    const value = makeHarness();
+    const prepared = await value.prepare();
+    const started = await value.manager.start({
+      preparedLaunchId: prepared.id,
+      idempotencyKey: "non-file-inventory",
+    });
+    // The file-layout analog (a symlink/directory where a receipt file belonged)
+    // cannot exist under LMDB; the faithful port is a corrupt receipt record.
+    // Sealing must isolate it as an unverifiable runtime and never reserve it.
+    writeRecord(value.manager, "runtimes", started.runtimeId, "{\n");
+    const reserve = vi.spyOn(value.gate, "reserveRuntimeStop");
 
-      await expect(value.manager.close()).resolves.toMatchObject({
-        sealedRuntimeIds: [],
-        busyRuntimeIds: [],
-        errorRuntimes: [expect.objectContaining({
-          runtimeId: started.runtimeId,
-          reason: expect.stringContaining("not a regular file"),
-        })],
+    await expect(value.manager.close()).resolves.toMatchObject({
+      sealedRuntimeIds: [],
+      busyRuntimeIds: [],
+      errorRuntimes: [expect.objectContaining({
+        runtimeId: started.runtimeId,
+        reason: expect.stringContaining("is invalid"),
+      })],
       applicationCloseSafe: false,
-      });
-      expect(reserve).not.toHaveBeenCalled();
-      expect(value.backend.processes.has(started.pid)).toBe(true);
-    }
-  );
+    });
+    expect(reserve).not.toHaveBeenCalled();
+    expect(value.backend.processes.has(started.pid)).toBe(true);
+  });
 
   it("cross-binds runtime filenames and isolates shutdown sealing across corrupt receipts", async () => {
     const value = makeHarness();
@@ -2529,7 +2515,7 @@ describe("OwnedRuntimeManager", () => {
     const secondPrepared = await value.prepare(["-second"]);
     const first = await value.manager.start({ preparedLaunchId: firstPrepared.id, idempotencyKey: "binding-first" });
     const second = await value.manager.start({ preparedLaunchId: secondPrepared.id, idempotencyKey: "binding-second" });
-    writeFileSync(join(value.manager.storageRoot, "runtimes", `${first.runtimeId}.json`), "{\n");
+    writeRecord(value.manager, "runtimes", first.runtimeId, "{\n");
 
     expect(await value.manager.status(first.runtimeId)).toMatchObject({ state: "unverifiable", exactOwned: false });
     const result = await value.manager.close();
@@ -2547,11 +2533,7 @@ describe("OwnedRuntimeManager", () => {
       idempotencyKey: "completion-binding-start",
     });
     expect(value.manager.diagnosticStorageStats().reservedMutationRecords).toBe(5);
-    writeFileSync(join(
-      value.manager.storageRoot,
-      "stop-completions",
-      `${started.runtimeId}.json`
-    ), JSON.stringify({
+    writeRecord(value.manager, "stop-completions", started.runtimeId, JSON.stringify({
       version: 1,
       runtimeId: "rt-ffffffff-ffff-4fff-8fff-ffffffffffff",
       sessionId: started.sessionId,

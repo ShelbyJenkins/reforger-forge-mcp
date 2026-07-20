@@ -1,8 +1,8 @@
 import { randomBytes } from "node:crypto";
-import { existsSync, lstatSync, mkdirSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, lstatSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { sha256Hex } from "#foundation/digest";
-import { BoundedJsonStore } from "#foundation/json-store";
+import { LmdbRecordStore } from "#foundation/lmdb-record-store";
 import type { ArtifactStore, ManagedArtifactRef } from "./artifacts.js";
 import {
   DisabledEvidenceBundleService,
@@ -14,13 +14,15 @@ import {
   normalizeEvidenceLabel,
 } from "./evidence-bundle-service.js";
 import { ObserverError } from "./errors.js";
-import { assertIdentifier, assertManagedPath, assertRegularManagedFile, ensureCanonicalDirectory } from "./paths.js";
+import { assertIdentifier, assertManagedPath, ensureCanonicalDirectory } from "./paths.js";
 
 export type { EvidenceBundleFinalizeInput as ObserverRunFinalizeInput, ObserverRunReview } from "./evidence-bundle-service.js";
 
 const RUN_RECORD_VERSION = 1;
 const MAX_RUN_RECORD_BYTES = 2 * 1024 * 1024;
 const RUN_ID_PATTERN = /^\d{8}T\d{6}Z-[a-f0-9]{8}$/;
+const RUN_RECORD_FAMILY = "run";
+const RUN_RECORD_KEY_PREFIX = ["observer", "runs"] as const;
 
 export interface ObserverRunBeginInput {
   title: string;
@@ -149,9 +151,19 @@ export class ObserverRunStore {
   readonly runsRoot: string;
   private readonly exporter: EvidenceBundleService;
   private readonly exportEnabled: boolean;
+  private readonly recordStorageRoot: string;
+  private recordStoreInstance: LmdbRecordStore | null = null;
+  private closed = false;
+  private closePromise: Promise<void> | null = null;
 
-  constructor(runsRoot: string, private readonly artifacts: ArtifactStore, exporter?: EvidenceBundleService) {
+  constructor(
+    runsRoot: string,
+    private readonly artifacts: ArtifactStore,
+    exporter?: EvidenceBundleService,
+    recordStorageRoot = runsRoot,
+  ) {
     this.runsRoot = ensureCanonicalDirectory(runsRoot);
+    this.recordStorageRoot = ensureCanonicalDirectory(recordStorageRoot);
     this.exporter = exporter ?? new DisabledEvidenceBundleService();
     this.exportEnabled = exporter !== undefined;
   }
@@ -175,7 +187,6 @@ export class ObserverRunStore {
     }
     const timestamp = new Date();
     const runId = `${timestamp.toISOString().replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z")}-${randomBytes(4).toString("hex")}`;
-    mkdirSync(join(this.runsRoot, runId), { mode: 0o700 });
     const record: ObserverRunRecord = {
       version: RUN_RECORD_VERSION,
       runId,
@@ -187,7 +198,7 @@ export class ObserverRunStore {
       updatedAt: timestamp.toISOString(),
       captures: [],
     };
-    this.write(record);
+    this.write(record, true);
     return this.publicRun(record);
   }
 
@@ -372,7 +383,11 @@ export class ObserverRunStore {
       if (!capture.artifact) continue;
       if (this.artifacts.releaseRef(capture.artifact).released) released.push(capture.label);
     }
-    rmSync(this.rootFor(runId), { recursive: true, force: false });
+    // The artifact directory is deliberately removed before the record. If a
+    // process stops between these operations, the retained LMDB record makes a
+    // later discard/retention pass resumable instead of losing the owner index.
+    this.removeArtifactDirectory(runId);
+    this.recordStore().remove(RUN_RECORD_FAMILY, this.recordId(runId));
     return { runId, discarded: true, releasedCaptureLabels: released };
   }
 
@@ -420,7 +435,10 @@ export class ObserverRunStore {
         this.write(record);
         expiredRuns.push(record.runId);
       } else {
-        rmSync(this.rootFor(record.runId), { recursive: true, force: false });
+        // Keep the durable index until all co-located file cleanup is complete;
+        // see discard() for why this ordering is intentional.
+        this.removeArtifactDirectory(record.runId);
+        this.recordStore().remove(RUN_RECORD_FAMILY, this.recordId(record.runId));
         removedRunRecords.push(record.runId);
       }
     }
@@ -429,6 +447,7 @@ export class ObserverRunStore {
 
   diagnostics(): Record<string, unknown> {
     const records = this.records();
+    const usage = this.recordUsage();
     return {
       evidence: this.exporter.diagnostics(),
       runs: {
@@ -436,10 +455,38 @@ export class ObserverRunStore {
         open: records.filter((record) => record.state === "open").length,
         finalized: records.filter((record) => record.state === "finalized").length,
         expired: records.filter((record) => record.state === "expired").length,
+        recordBytes: usage.bytes,
       },
     };
   }
+
+  /** Exact serialized bytes owned by the private run-record namespace. */
+  recordUsage(): { records: number; bytes: number } {
+    const usage = this.recordStore().usage([RUN_RECORD_FAMILY]);
+    return { records: usage.records, bytes: usage.bytes };
+  }
+
   evidenceDiagnostics(): Record<string, unknown> { return this.exporter.diagnostics(); }
+
+  /** Release the lazily opened run-record environment during agent shutdown. */
+  async close(): Promise<void> {
+    if (this.closePromise) return this.closePromise;
+    this.closed = true;
+    const store = this.recordStoreInstance;
+    this.closePromise = store ? store.close() : Promise.resolve();
+    return this.closePromise;
+  }
+
+  /**
+   * Test-only seam for records that used to be directly manipulated as
+   * `{runsRoot}/{runId}/run.json`. Production callers use the public methods.
+   */
+  recordStoreForTest(): LmdbRecordStore {
+    if (process.env.VITEST === undefined && process.env.NODE_ENV !== "test") {
+      throw new Error("recordStoreForTest is a test-only seam and must not be called outside the test runner.");
+    }
+    return this.recordStore();
+  }
 
   private attach(record: ObserverRunRecord, capture: RunCaptureRecord, ref: ManagedArtifactRef): Record<string, unknown> {
     if (capture.artifact && JSON.stringify(capture.artifact) !== JSON.stringify(ref)) throw new ObserverError("ARTIFACT_INVALID", "Run capture already references a different artifact", 409);
@@ -510,14 +557,9 @@ export class ObserverRunStore {
     return record;
   }
   private require(runId: string): ObserverRunRecord {
-    const root = this.rootFor(runId);
-    if (!existsSync(root)) throw new ObserverError("INVALID_REQUEST", "Observer run was not found", 404);
-    if (lstatSync(root).isSymbolicLink() || !lstatSync(root).isDirectory()) throw new ObserverError("INVALID_REQUEST", "Observer run path is invalid", 409);
+    this.assertRunId(runId);
     try {
-      const record = this.store(root).read(assertRegularManagedFile(root, join(root, "run.json")));
-      if (!record) throw new Error("missing run record");
-      this.assertRecord(record, runId);
-      return record;
+      return this.readRecord(this.recordId(runId), runId);
     } catch (error) {
       if (error instanceof ObserverError) throw error;
       throw new ObserverError("INVALID_REQUEST", "Observer run record is invalid", 409);
@@ -525,26 +567,55 @@ export class ObserverRunStore {
   }
   private records(): ObserverRunRecord[] {
     const result: ObserverRunRecord[] = [];
-    for (const entry of readdirSync(this.runsRoot, { withFileTypes: true })) {
-      if (!entry.isDirectory() || entry.isSymbolicLink() || !RUN_ID_PATTERN.test(entry.name)) continue;
-      try { result.push(this.require(entry.name)); } catch { /* preserve malformed records */ }
+    for (const recordId of this.recordStore().listIds(RUN_RECORD_FAMILY)) {
+      try { result.push(this.readRecord(recordId)); } catch { /* preserve malformed records */ }
     }
     return result;
   }
-  private write(record: ObserverRunRecord): void {
-    const root = ensureCanonicalDirectory(this.rootFor(record.runId));
-    this.store(root).write(join(root, "run.json"), record);
+  private write(record: ObserverRunRecord, exclusive = false): void {
+    const bytes = Buffer.from(`${JSON.stringify(record, null, 2)}\n`, "utf8");
+    this.recordStore().putRaw(RUN_RECORD_FAMILY, this.recordId(record.runId), bytes, { exclusive });
   }
-  private store(root: string): BoundedJsonStore<ObserverRunRecord> {
-    return new BoundedJsonStore({
-      root,
-      minRecordBytes: 2,
-      maxRecordBytes: MAX_RUN_RECORD_BYTES,
-      parse: (value) => {
-        if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("run record must be an object");
-        return value as ObserverRunRecord;
-      },
-    });
+  private readRecord(recordId: string, expectedRunId?: string): ObserverRunRecord {
+    const raw = this.recordStore().getRaw(RUN_RECORD_FAMILY, recordId);
+    if (raw === null) {
+      if (expectedRunId) throw new ObserverError("INVALID_REQUEST", "Observer run was not found", 404);
+      throw new Error("missing run record");
+    }
+    if (raw.byteLength < 2 || raw.byteLength > MAX_RUN_RECORD_BYTES) throw new Error("run record size is invalid");
+    const value: unknown = JSON.parse(Buffer.from(raw).toString("utf8"));
+    if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("run record must be an object");
+    const record = value as ObserverRunRecord;
+    if (typeof record.runId !== "string") throw new Error("run record ID is invalid");
+    if (expectedRunId && record.runId !== expectedRunId) throw new Error("run record ID does not match its key");
+    this.assertRecord(record, record.runId);
+    if (this.recordId(record.runId) !== recordId) throw new Error("run record key does not match its ID");
+    return record;
+  }
+  private removeArtifactDirectory(runId: string): void {
+    const root = this.rootFor(runId);
+    if (!existsSync(root)) return;
+    const info = lstatSync(root);
+    if (info.isSymbolicLink() || !info.isDirectory()) {
+      throw new ObserverError("INVALID_REQUEST", "Observer run path is invalid", 409);
+    }
+    rmSync(root, { recursive: true, force: false });
+  }
+  private recordStore(): LmdbRecordStore {
+    if (this.closed) throw new ObserverError("INVALID_REQUEST", "Observer run store is closed", 409);
+    if (!this.recordStoreInstance) {
+      this.recordStoreInstance = new LmdbRecordStore({
+        storageRoot: this.recordStorageRoot,
+        keyPrefix: RUN_RECORD_KEY_PREFIX,
+        maxRecordBytes: MAX_RUN_RECORD_BYTES,
+      });
+    }
+    return this.recordStoreInstance;
+  }
+  /** Durable-key segments are lowercase; the public run ID remains byte-for-byte unchanged in the value. */
+  private recordId(runId: string): string {
+    this.assertRunId(runId);
+    return runId.toLowerCase();
   }
   private assertRecord(record: ObserverRunRecord, runId: string): void {
     if (record.version !== RUN_RECORD_VERSION || record.runId !== runId || !["open", "finalized", "expired"].includes(record.state) || !Array.isArray(record.captures) || typeof record.title !== "string" || typeof record.createdAt !== "string" || typeof record.updatedAt !== "string") throw new ObserverError("INVALID_REQUEST", "Observer run record is invalid", 409);

@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { join } from "node:path";
 import { ArtifactStore } from "./artifacts.js";
 import { ObserverControlApi, type ObserverControlOptions } from "./control-api.js";
 import { JobStore, type JobStoreOptions } from "./jobs.js";
@@ -41,7 +42,14 @@ export function createObserverApplication(options: CreateObserverApplicationOpti
   const evidenceBundle = (options.evidenceRoots?.length ?? 0) > 0
     ? new FileEvidenceBundleService(control.paths.exportWork, options.evidenceRoots!, [control.paths.logs, ...(options.supportingLogRoots ?? [])])
     : undefined;
-  const runs = new ObserverRunStore(control.paths.runs, artifacts, evidenceBundle);
+  // Run records are agent-private LMDB state. Keep `paths.runs` exclusively
+  // for any per-run evidence/artifact directories that a future exporter uses.
+  const runs = new ObserverRunStore(
+    control.paths.runs,
+    artifacts,
+    evidenceBundle,
+    join(control.paths.state, "run-records-v1"),
+  );
   const server = new ObserverAgentServer(agentInstanceId, control, registry, jobs, artifacts, runs, options);
   const application = { agentInstanceId, control, registry, jobs, artifacts, runs, server, ...(evidenceBundle ? { evidenceBundle } : {}) } as ObserverApplication;
   const operations = new ObserverApplicationOperations(application);

@@ -19,6 +19,7 @@ import {
   LmdbCasStore,
   type LmdbCasInspection,
 } from "../foundation/lmdb-cas-store.js";
+import { LmdbEnvironment } from "../foundation/lmdb-store.js";
 import {
   deadlineAfter,
   pollUntil,
@@ -764,6 +765,7 @@ export class WorkbenchProcessGuard {
   private readonly beforeSpawnJournalReplace: WorkbenchProcessGuardOptions["beforeSpawnJournalReplace"];
   private readonly afterSpawnJournalReplace: WorkbenchProcessGuardOptions["afterSpawnJournalReplace"];
   private identityPromise: Promise<ExactProcessIdentity & { userSid: string }> | null = null;
+  private durableEnvironment: LmdbEnvironment | null = null;
   private lifecycleCasStore: LmdbCasStore<WorkbenchLifecycleStateV3> | null = null;
   private spawnCasStore: LmdbCasStore<WorkbenchSpawnJournalStateV3> | null = null;
 
@@ -794,12 +796,9 @@ export class WorkbenchProcessGuard {
     return `${WORKBENCH_OWNER_ARG_PREFIX}${token}`;
   }
 
-  /** Close the LMDB environments backing lifecycle and spawn-journal state, if opened. */
+  /** Release the single LMDB environment backing lifecycle and spawn-journal state, if opened. */
   async close(): Promise<void> {
-    await Promise.all([
-      this.lifecycleCasStore?.close(),
-      this.spawnCasStore?.close(),
-    ]);
+    await this.durableEnvironment?.close();
   }
 
   /**
@@ -870,10 +869,22 @@ export class WorkbenchProcessGuard {
     }
   }
 
-  private lifecycleStore(): LmdbCasStore<WorkbenchLifecycleStateV3> {
+  /**
+   * The single LMDB environment shared by the lifecycle and spawn-journal CAS
+   * stores. One `WorkbenchProcessGuard` owns exactly one environment (plan 92),
+   * opened once and closed once by {@link close}; the two CAS stores are typed
+   * views over distinct namespaced keys within it.
+   */
+  private durableEnv(): LmdbEnvironment {
     mkdirSync(this.stateDir, { recursive: true });
+    this.durableEnvironment ??= new LmdbEnvironment(this.stateDir);
+    return this.durableEnvironment;
+  }
+
+  private lifecycleStore(): LmdbCasStore<WorkbenchLifecycleStateV3> {
     this.lifecycleCasStore ??= new LmdbCasStore({
       storageRoot: this.stateDir,
+      environment: this.durableEnv(),
       key: encodeDurableKey("workbench", "lifecycle"),
       recordLabel: "lifecycle",
       schema: "workbench-lifecycle-v3",
@@ -894,9 +905,9 @@ export class WorkbenchProcessGuard {
   }
 
   private spawnStore(): LmdbCasStore<WorkbenchSpawnJournalStateV3> {
-    mkdirSync(this.stateDir, { recursive: true });
     this.spawnCasStore ??= new LmdbCasStore({
       storageRoot: this.stateDir,
+      environment: this.durableEnv(),
       key: encodeDurableKey("workbench", "spawn-journal"),
       recordLabel: "spawn-journal",
       schema: "workbench-spawn-journal-v3",

@@ -1,7 +1,7 @@
 import { mkdirSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { createObserverApplication } from "../../observer/agent/application.js";
 import { MailboxCoordinator } from "../../observer/agent/mailbox-coordinator.js";
 import { OBSERVER_BUILD_IDENTITY } from "../../observer/protocol/index.js";
@@ -271,6 +271,39 @@ describe("observer in-memory retention", () => {
     });
     await agent.server.close();
     expect(agent.server.storeDiagnostics()).toMatchObject({ lastSweep: { retentionApplied: true } });
+  });
+
+  scopedIt("charges private run-record bytes against the coordinated artifact budget", async (root) => {
+    const clock = new ManualTime();
+    const evidenceRoot = join(root, "evidence");
+    mkdirSync(evidenceRoot, { recursive: true });
+    const maxBytes = 4 * 1024;
+    const agent = createObserverApplication({
+      root: join(root, "managed"),
+      sourceDirectory: observerAddonSource,
+      evidenceRoots: [evidenceRoot],
+      clock,
+      retentionMaxBytes: maxBytes,
+    });
+    try {
+      agent.runs.begin({ title: "Budgeted record" });
+      const runUsage = agent.runs.recordUsage();
+      expect(runUsage).toMatchObject({ records: 1, bytes: expect.any(Number) });
+      const artifactRetention = vi.spyOn(agent.artifacts, "applyRetention");
+
+      agent.server.sweep(clock.now(), true);
+
+      expect(artifactRetention).toHaveBeenCalledWith(
+        7 * 24 * 60 * 60 * 1_000,
+        maxBytes - runUsage.bytes,
+        expect.any(Set),
+      );
+      expect(agent.server.managedStorageDiagnostics()).toMatchObject({
+        runs: { recordBytes: runUsage.bytes, recordCount: 1 },
+      });
+    } finally {
+      await agent.server.close();
+    }
   });
 
   scopedIt("does not let stale heartbeat job IDs outlive the authoritative job obligation", async (root) => {

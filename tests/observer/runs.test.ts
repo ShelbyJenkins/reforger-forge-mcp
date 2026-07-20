@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { join, relative, sep } from "node:path";
 import { describe, expect, it } from "vitest";
 import { ArtifactStore } from "../../observer/agent/artifacts.js";
@@ -41,14 +41,40 @@ function setup(root: string) {
   );
   const exporter = new FileEvidenceBundleService(join(root, "export-work"), [evidence], [logs]);
   const runs = new ObserverRunStore(join(root, "runs"), artifacts, exporter);
+  runStoresByRoot.set(root, runs);
   return { root, evidence, logs, artifacts, runs };
 }
+
+const runStoresByRoot = new Map<string, ObserverRunStore>();
 
 function scopedIt(
   name: string,
   run: (root: string) => Promise<void> | void,
 ): void {
-  it(name, () => withTemporaryDirectory(run, { prefix: "rfo-runs-" }));
+  it(name, () => withTemporaryDirectory(async (root) => {
+    try {
+      await run(root);
+    } finally {
+      const store = runStoresByRoot.get(root);
+      runStoresByRoot.delete(root);
+      await store?.close();
+    }
+  }, { prefix: "rfo-runs-" }));
+}
+
+function readRunRecord(value: ReturnType<typeof setup>, runId: string): Record<string, unknown> {
+  const raw = value.runs.recordStoreForTest().getRaw("run", runId.toLowerCase());
+  if (raw === null) throw new Error(`Missing run record ${runId}`);
+  return JSON.parse(Buffer.from(raw).toString("utf8")) as Record<string, unknown>;
+}
+
+function writeRunRecord(value: ReturnType<typeof setup>, runId: string, record: Record<string, unknown>): void {
+  value.runs.recordStoreForTest().putRaw(
+    "run",
+    runId.toLowerCase(),
+    Buffer.from(`${JSON.stringify(record, null, 2)}\n`, "utf8"),
+    { exclusive: false },
+  );
 }
 
 function completedCapture(
@@ -146,18 +172,18 @@ function reattestBundleMember(
   const manifestBytes = Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`);
   writeFileSync(manifestPath, manifestBytes);
 
-  const recordPath = join(value.root, "runs", runId, "run.json");
-  const record = JSON.parse(readFileSync(recordPath, "utf8")) as {
+  const record = readRunRecord(value, runId) as {
     exportReceipt: { manifestSha256: string };
   };
   record.exportReceipt.manifestSha256 = createHash("sha256").update(manifestBytes).digest("hex");
-  writeFileSync(recordPath, `${JSON.stringify(record, null, 2)}\n`, "utf8");
+  writeRunRecord(value, runId, record);
 }
 
 describe("managed observer runs", () => {
   scopedIt("normalizes unique labels and rejects collisions", (root) => {
     const value = setup(root);
     const begun = value.runs.begin({ title: "Labels" });
+    expect(existsSync(join(root, "runs", begun.runId as string))).toBe(false);
     const input = {
       runId: begun.runId as string,
       captureLabel: "Arena / Overhead",
@@ -325,13 +351,12 @@ describe("managed observer runs", () => {
     const { runId, ref } = completedCapture(value);
     const input = reviewedFinalizeInput(value, runId);
     value.runs.finalize(input);
-    const recordPath = join(value.root, "runs", runId, "run.json");
-    const record = JSON.parse(readFileSync(recordPath, "utf8"));
+    const record = readRunRecord(value, runId);
     record.state = "open";
     delete record.finalizedAt;
     delete record.finalizeFingerprint;
     delete record.exportReceipt;
-    writeFileSync(recordPath, `${JSON.stringify(record, null, 2)}\n`, "utf8");
+    writeRunRecord(value, runId, record);
 
     expect(value.runs.finalize(input)).toMatchObject({
       run: { state: "finalized" },
@@ -411,13 +436,30 @@ describe("managed observer runs", () => {
     expect(value.artifacts.hasRef(ref)).toBe(false);
   });
 
+  scopedIt("keeps the LMDB record when artifact-directory cleanup cannot complete", (root) => {
+    const value = setup(root);
+    const run = value.runs.begin({ title: "resumable discard" });
+    const artifactPath = join(root, "runs", run.runId as string);
+    // A non-directory at the reserved artifact location is invalid. The run
+    // record must survive that failure so a corrected cleanup can resume.
+    writeFileSync(artifactPath, "invalid artifact root", "utf8");
+
+    expect(() => value.runs.discard(run.runId as string))
+      .toThrowError(expect.objectContaining({ code: "INVALID_REQUEST" }));
+    expect(value.runs.status(run.runId as string)).toMatchObject({ state: "open" });
+
+    rmSync(artifactPath);
+    expect(value.runs.discard(run.runId as string)).toMatchObject({ discarded: true });
+    expect(() => value.runs.status(run.runId as string))
+      .toThrowError(expect.objectContaining({ code: "INVALID_REQUEST", httpStatus: 404 }));
+  });
+
   scopedIt("expires abandoned open runs and interrupted export work", (root) => {
     const value = setup(root);
     const { runId, ref } = completedCapture(value);
-    const recordPath = join(value.root, "runs", runId, "run.json");
-    const record = JSON.parse(readFileSync(recordPath, "utf8"));
+    const record = readRunRecord(value, runId);
     record.updatedAt = "2020-01-01T00:00:00.000Z";
-    writeFileSync(recordPath, `${JSON.stringify(record, null, 2)}\n`, "utf8");
+    writeRunRecord(value, runId, record);
     const interrupted = join(value.root, "export-work", "interrupted");
     mkdirSync(interrupted);
     writeFileSync(join(interrupted, "partial.png"), "partial");

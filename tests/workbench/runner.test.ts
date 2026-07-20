@@ -195,6 +195,51 @@ function runnerDependencies(
   };
 }
 
+/**
+ * Deterministic voluntary child exit for tests whose expected outcome depends
+ * on Workbench surviving until readiness is proven. The exit is driven by the
+ * readiness probe rather than a wall-clock timer, which would otherwise race
+ * durable lifecycle publication and surface ENDPOINT_UNVERIFIABLE instead.
+ */
+function exitAfterReadinessProbe(): {
+  companionProbe: NonNullable<WorkbenchRunnerDependencies["companionProbe"]>;
+  onExit: (exit: () => void) => void;
+} {
+  let exit: (() => void) | null = null;
+  return {
+    onExit: (next) => { exit = next; },
+    companionProbe: vi.fn(async () => {
+      setTimeout(() => exit?.(), 1);
+      return {
+        status: "ok",
+        helperAddonId: WORKBENCH_HELPER_ADDON_ID,
+        helperAddonGuid: WORKBENCH_HELPER_ADDON_GUID,
+        helperAddonVersion: WORKBENCH_HELPER_ADDON_VERSION,
+        helperProtocolVersion: WORKBENCH_HELPER_PROTOCOL_VERSION,
+        workbenchProtocol: WORKBENCH_HELPER_PROTOCOL_VERSION,
+        helperBuildIdentity: WORKBENCH_HELPER_BUILD_IDENTITY,
+      };
+    }),
+  };
+}
+
+/**
+ * Deterministic voluntary exit for a build child, which has no readiness probe
+ * to key off. The exit fires once the spawn journal records durable
+ * publication, so it can never race exact-ownership establishment the way a
+ * wall-clock timer does under parallel-suite load.
+ */
+function exitAfterDurablePublication(harness: RunnerHarness): (exit: () => void) => void {
+  let pending: (() => void) | null = null;
+  harness.backend.afterSpawnJournalReplace = ({ next }) => {
+    if (next.record.phase !== "published" || !pending) return;
+    const exit = pending;
+    pending = null;
+    setTimeout(exit, 0);
+  };
+  return (exit) => { pending = exit; };
+}
+
 function createBuildSpawner(
   harness: RunnerHarness,
   options: {
@@ -212,6 +257,7 @@ function createBuildSpawner(
 } {
   let count = 0;
   const pidBase = options.pidBase ?? 22_000;
+  const onBuildExit = exitAfterDurablePublication(harness);
   return {
     spawnProcess: (command, args) => {
       const index = count++;
@@ -232,12 +278,12 @@ function createBuildSpawner(
         ownerArgument
       );
       if (index === 1) {
-        setTimeout(() => {
+        onBuildExit(() => {
           options.onBuildBeforeExit?.(args);
           harness.backend.processes.delete(child.pid);
           harness.backend.workbenchPids.delete(child.pid);
           child.close(options.buildExitCode ?? 0);
-        }, 5);
+        });
       }
       return child as unknown as ChildProcess;
     },
@@ -257,6 +303,7 @@ describe("standalone Workbench lifecycle runner", () => {
     const childSupervisor = new ChildSupervisor();
     let observedArgs: readonly string[] = [];
     let observedOptions: SpawnOptions | undefined;
+    const readiness = exitAfterReadinessProbe();
     const dependencies = runnerDependencies(harness, (command, args, options) => {
       expect(command).toBe(harness.executablePath);
       observedArgs = args;
@@ -269,14 +316,14 @@ describe("standalone Workbench lifecycle runner", () => {
         executablePath: command,
         creationTime: "133900000000021001",
       }, ownerArgument);
-      setTimeout(() => {
-        addAttributedLog(harness.logRoot, "editor-run", ownerArgument);
+      addAttributedLog(harness.logRoot, "editor-run", ownerArgument);
+      readiness.onExit(() => {
         harness.backend.processes.delete(child.pid);
         harness.backend.workbenchPids.delete(child.pid);
         child.close(0);
-      }, 5);
+      });
       return child as unknown as ChildProcess;
-    }, { childSupervisor });
+    }, { childSupervisor, companionProbe: readiness.companionProbe });
 
     const receipt = await runWorkbenchIntent(harness.config, {
       kind: "editor",
@@ -669,6 +716,7 @@ describe("standalone Workbench lifecycle runner", () => {
       return harness.companion;
     });
     let spawnIndex = 0;
+    const onBuildExit = exitAfterDurablePublication(harness);
     const receipt = await runWorkbenchIntent(harness.config, {
       kind: "build",
       gprojPath: harness.projectPath,
@@ -691,7 +739,7 @@ describe("standalone Workbench lifecycle runner", () => {
         ownerArgument
       );
       if (current === 1) {
-        setTimeout(() => {
+        onBuildExit(() => {
           const artifactRoot = join(harness.outputPath, "ExampleMod");
           mkdirSync(artifactRoot, { recursive: true });
           writeFileSync(join(artifactRoot, "resourceDatabase.rdb"), "fresh database");
@@ -699,7 +747,7 @@ describe("standalone Workbench lifecycle runner", () => {
           harness.backend.processes.delete(child.pid);
           harness.backend.workbenchPids.delete(child.pid);
           child.close(0);
-        }, 5);
+        });
       }
       return child as unknown as ChildProcess;
     }, { childSupervisor }));
@@ -1369,6 +1417,7 @@ describe("standalone Workbench lifecycle runner", () => {
     const harness = createHarness();
     let spawnIndex = 0;
     const reusedPid = 22_900;
+    const onBuildExit = exitAfterDurablePublication(harness);
     const receipt = await runWorkbenchIntent(harness.config, {
       kind: "build",
       gprojPath: harness.projectPath,
@@ -1386,14 +1435,14 @@ describe("standalone Workbench lifecycle runner", () => {
       }, ownerArgument);
       addAttributedLog(harness.logRoot, current === 0 ? "reused-preflight" : "reused-build", ownerArgument);
       if (current === 1) {
-        setTimeout(() => {
+        onBuildExit(() => {
           const artifactRoot = join(harness.outputPath, "ExampleMod");
           mkdirSync(artifactRoot, { recursive: true });
           writeFileSync(join(artifactRoot, "resourceDatabase.rdb"), "reused pid database");
           harness.backend.processes.delete(reusedPid);
           harness.backend.workbenchPids.delete(reusedPid);
           child.close(0);
-        }, 5);
+        });
       }
       return child as unknown as ChildProcess;
     }));
@@ -1741,6 +1790,7 @@ describe("standalone Workbench lifecycle runner", () => {
 
   it("fails closed when the private token appears in more than one log directory", async () => {
     const harness = createHarness();
+    const readiness = exitAfterReadinessProbe();
     const dependencies = runnerDependencies(harness, (command, args) => {
       const child = new FakeRunnerChild(21_004);
       const ownerArgument = args.find((arg) => arg.startsWith("-reforgerForgeOwnerToken="))!;
@@ -1749,15 +1799,15 @@ describe("standalone Workbench lifecycle runner", () => {
         executablePath: command,
         creationTime: "133900000000021004",
       }, ownerArgument);
-      setTimeout(() => {
-        addAttributedLog(harness.logRoot, "ambiguous-a", ownerArgument);
-        addAttributedLog(harness.logRoot, "ambiguous-b", ownerArgument);
+      addAttributedLog(harness.logRoot, "ambiguous-a", ownerArgument);
+      addAttributedLog(harness.logRoot, "ambiguous-b", ownerArgument);
+      readiness.onExit(() => {
         harness.backend.processes.delete(child.pid);
         harness.backend.workbenchPids.delete(child.pid);
         child.close(0);
-      }, 5);
+      });
       return child as unknown as ChildProcess;
-    });
+    }, { companionProbe: readiness.companionProbe });
 
     await expect(runWorkbenchIntent(harness.config, {
       kind: "editor",

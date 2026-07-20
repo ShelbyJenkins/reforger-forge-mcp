@@ -204,14 +204,23 @@ function installPhaseHooks(args: {
   captured: () => Promise<CapturedWorkbenchCut>;
 } {
   const { harness, cut, pid } = args;
-  let reached = false;
   let capturedProcess: CapturedWorkbenchCut["process"] = null;
+  let snapshot: Promise<Pick<CapturedWorkbenchCut, "state" | "journal">> | null = null;
   let child: FakeCrashChild | null = null;
   let ownerArgument = "";
+  /**
+   * Snapshot the durable authority at the exact instant of the injected crash.
+   * A real crash kills the process, so the recovery/rollback writes the
+   * injected `Error` unwind performs must not be observed here. LMDB reads run
+   * synchronously inside `LmdbDurableKvStore.inspect`, so starting the read
+   * from this synchronous hook pins the point-in-time record even though the
+   * value is awaited later.
+   */
   const markReached = (): void => {
-    reached = true;
     const processIdentity = child ? harness.backend.processes.get(child.pid) ?? null : null;
     capturedProcess = processIdentity ? { identity: { ...processIdentity }, ownerArgument } : null;
+    snapshot ??= Promise.all([readDurableState(harness), readDurableJournal(harness)])
+      .then(([state, journal]) => ({ state, journal }));
   };
   const originalInspect = harness.guard.inspectSpawnedWorkbench.bind(harness.guard);
   if (cut === "after_exact_inspection") {
@@ -267,14 +276,9 @@ function installPhaseHooks(args: {
   return {
     spawnProcess,
     captured: async () => {
-      if (!reached) throw new Error(`F8 cut ${cut} was not reached`);
-      return {
-        cut,
-        state: await readDurableState(harness),
-        journal: await readDurableJournal(harness),
-        process: capturedProcess,
-        harness,
-      };
+      if (!snapshot) throw new Error(`F8 cut ${cut} was not reached`);
+      const { state, journal } = await snapshot;
+      return { cut, state, journal, process: capturedProcess, harness };
     },
   };
 }

@@ -2,9 +2,7 @@ import type { ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
 import {
-  existsSync,
   mkdtempSync,
-  readFileSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -169,12 +167,31 @@ interface ExitHarness {
 }
 
 const fixtureRoots: string[] = [];
+const fixtureManagers: OwnedRuntimeManager[] = [];
 
-afterEach(() => {
+afterEach(async () => {
+  // Release the LMDB environment before rmSync (open memory maps block it on Windows).
+  for (const manager of fixtureManagers.splice(0)) {
+    await manager.closeStorageForTest().catch(() => undefined);
+  }
   for (const root of fixtureRoots.splice(0)) {
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+function exitRecordText(manager: OwnedRuntimeManager, family: string, id: string): string {
+  const raw = manager.recordStoreForTest().getRaw(family, id);
+  if (raw === null) throw new Error(`Expected record ${family}/${id}`);
+  return Buffer.from(raw).toString("utf8");
+}
+
+function exitRecordPresent(manager: OwnedRuntimeManager, family: string, id: string): boolean {
+  return manager.recordStoreForTest().has(family, id);
+}
+
+function putExitRecord(manager: OwnedRuntimeManager, family: string, id: string, text: string): void {
+  manager.recordStoreForTest().putRaw(family, id, Buffer.from(text, "utf8"), { exclusive: false });
+}
 
 function makeHarness(): ExitHarness {
   const root = mkdtempSync(join(tmpdir(), "rfo-owned-exit-retry-"));
@@ -220,6 +237,7 @@ function makeHarness(): ExitHarness {
     terminationTimeoutMs: 500,
     lockTimeoutMs: 500,
   });
+  fixtureManagers.push(manager);
   return {
     root,
     executable,
@@ -303,12 +321,7 @@ describe("OwnedRuntimeManager child-exit retry", () => {
     expect(value.backend.injectedMutexFailures).toBe(1);
     expect(value.manager.diagnosticSupervisedChildCount()).toBe(0);
     expect(supervisor(value.manager).reconciliationSize).toBe(1);
-    const exitPath = join(
-      value.manager.storageRoot,
-      "child-exits",
-      `${started.runtimeId}.json`
-    );
-    await vi.waitFor(() => expect(existsSync(exitPath)).toBe(true), {
+    await vi.waitFor(() => expect(exitRecordPresent(value.manager, "child-exits", started.runtimeId)).toBe(true), {
       timeout: 2_000,
       interval: 10,
     });
@@ -318,7 +331,7 @@ describe("OwnedRuntimeManager child-exit retry", () => {
     });
     await waitForReconciliationDrain(value.manager);
 
-    expect(JSON.parse(readFileSync(exitPath, "utf8"))).toMatchObject({
+    expect(JSON.parse(exitRecordText(value.manager, "child-exits", started.runtimeId))).toMatchObject({
       runtimeId: started.runtimeId,
       sessionId: started.sessionId,
       pid: started.pid,
@@ -338,12 +351,7 @@ describe("OwnedRuntimeManager child-exit retry", () => {
       idempotencyKey: "stale-exit-retry",
     });
     const oldChild = value.children[0];
-    const runtimePath = join(
-      value.manager.storageRoot,
-      "runtimes",
-      `${started.runtimeId}.json`
-    );
-    const oldReceipt = JSON.parse(readFileSync(runtimePath, "utf8")) as OwnedRuntimeReceipt;
+    const oldReceipt = JSON.parse(exitRecordText(value.manager, "runtimes", started.runtimeId)) as OwnedRuntimeReceipt;
     const oldGeneration = lifecycleGeneration(oldReceipt);
 
     value.backend.mutexFailures = 1;
@@ -372,7 +380,7 @@ describe("OwnedRuntimeManager child-exit retry", () => {
         creationTimeFileTime: String(900_000 + newChild.pid),
       },
     };
-    writeFileSync(runtimePath, `${JSON.stringify(newReceipt)}\n`);
+    putExitRecord(value.manager, "runtimes", started.runtimeId, `${JSON.stringify(newReceipt)}\n`);
     const newGeneration = lifecycleGeneration(newReceipt);
     expect(newGeneration).not.toBe(oldGeneration);
     await value.gate.retainRuntimeLifecycle(
@@ -408,12 +416,7 @@ describe("OwnedRuntimeManager child-exit retry", () => {
     expect(supervisor(value.manager).reconciliationSize).toBe(0);
     await new Promise((resolve) => setTimeout(resolve, 150));
     expect(value.gate.released).toEqual([]);
-    const exitPath = join(
-      value.manager.storageRoot,
-      "child-exits",
-      `${started.runtimeId}.json`
-    );
-    expect(existsSync(exitPath)).toBe(false);
+    expect(exitRecordPresent(value.manager, "child-exits", started.runtimeId)).toBe(false);
 
     value.backend.processes.delete(newChild.pid);
     newChild.exit(0);
@@ -424,7 +427,7 @@ describe("OwnedRuntimeManager child-exit retry", () => {
     }]), { timeout: 2_000, interval: 10 });
     await waitForReconciliationDrain(value.manager);
 
-    expect(JSON.parse(readFileSync(exitPath, "utf8"))).toMatchObject({
+    expect(JSON.parse(exitRecordText(value.manager, "child-exits", started.runtimeId))).toMatchObject({
       runtimeId: newReceipt.runtimeId,
       sessionId: newReceipt.sessionId,
       pid: newReceipt.pid,

@@ -6,6 +6,9 @@ import {
   decodeDurableKey,
   encodeDurableEnvelope,
   encodeDurableKey,
+  type DurableKvListEntry,
+  type DurableKvListPage,
+  type DurableKvNamespaceStats,
   type DurableKvPutResult,
   type DurableKvRecord,
   type DurableKvStore,
@@ -43,6 +46,14 @@ export interface LmdbDurableKvStoreOptions<T> {
   readonly storageRoot: string;
   /** One safe directory name beneath storageRoot, not an arbitrary path. */
   readonly databaseDirectory?: string;
+  /**
+   * A shared {@link LmdbEnvironment} to open against instead of owning one.
+   * When provided, this store is a typed view over an environment owned and
+   * closed by the caller, so several record schemas can share one environment
+   * without opening it more than once. When omitted, the store opens and owns
+   * its own environment (the standalone default).
+   */
+  readonly environment?: LmdbEnvironment;
   /** Envelope schema accepted by this store. */
   readonly schema: string;
   readonly codec: DurableRecordCodec<T>;
@@ -52,12 +63,70 @@ export interface LmdbDurableKvStoreOptions<T> {
   readonly maxRecordBytes?: number;
 }
 
+interface LmdbRangeEntry {
+  key: Uint8Array;
+  value: unknown;
+  version?: number;
+}
+
+interface LmdbRangeOptions {
+  start?: Uint8Array;
+  end?: Uint8Array;
+  versions?: boolean;
+  snapshot?: boolean;
+}
+
 interface LmdbBinaryDatabase {
   getEntry(key: Uint8Array): { value: unknown; version?: number } | undefined;
   putSync(key: Uint8Array, value: unknown, version: number): void;
   removeSync(key: Uint8Array, ifVersion?: number): boolean;
+  getRange(options: LmdbRangeOptions): Iterable<LmdbRangeEntry>;
   transaction<T>(action: () => T): Promise<T>;
   close(): Promise<void>;
+}
+
+/** Whether `segments` begins with every component of `prefix`, in order. */
+function segmentsHavePrefix(segments: readonly string[], prefix: readonly string[]): boolean {
+  if (segments.length < prefix.length) return false;
+  for (let index = 0; index < prefix.length; index += 1) {
+    if (segments[index] !== prefix[index]) return false;
+  }
+  return true;
+}
+
+/**
+ * Smallest key byte sequence that sorts strictly after every key sharing the
+ * given byte prefix. Durable key segment bytes never reach 0xFF, so in practice
+ * only the final byte increments; the carry loop is defensive.
+ */
+function namespaceUpperBound(prefix: Uint8Array): Uint8Array {
+  const upper = Uint8Array.from(prefix);
+  for (let index = upper.length - 1; index >= 0; index -= 1) {
+    if (upper[index] < 0xff) {
+      upper[index] += 1;
+      return upper.subarray(0, index + 1);
+    }
+  }
+  // An all-0xFF prefix has no finite successor; the per-entry decoded-prefix
+  // guard then bounds the scan instead of this range end.
+  return upper;
+}
+
+/**
+ * Decode a range key and confirm it belongs to the namespace prefix. Matching
+ * on decoded components rather than a raw byte substring makes a prefix such as
+ * `observer\0runtime` refuse to match `observer\0runtime-index`.
+ */
+function matchNamespaceKey(rawKey: Uint8Array, prefix: readonly string[]): string | null {
+  const key = Buffer.from(rawKey).toString("utf8");
+  let segments: readonly string[];
+  try {
+    segments = decodeDurableKey(key);
+  } catch {
+    // A key outside our canonical namespace cannot belong to this prefix.
+    return null;
+  }
+  return segmentsHavePrefix(segments, prefix) ? key : null;
 }
 
 function assertSafeDatabaseDirectory(value: string): string {
@@ -149,6 +218,69 @@ function entryVersion(entry: { version?: number }): number {
 }
 
 /**
+ * Sole owner of one LMDB environment (`open()` once, `close()` once), shareable
+ * by several typed {@link LmdbDurableKvStore} views over distinct namespaced
+ * keys. Plan 90 mandates one environment per *managed store*, not one per record
+ * type; injecting a single environment keeps that invariant even when several
+ * record schemas coexist in the same environment — for example the workbench
+ * lifecycle and spawn-journal records under one `WorkbenchProcessGuard`, which
+ * must not open the environment twice.
+ */
+export class LmdbEnvironment {
+  private readonly databaseDirectory: string;
+  private database: LmdbBinaryDatabase | null = null;
+  private closed = false;
+  private closePromise: Promise<void> | null = null;
+
+  constructor(
+    private readonly storageRoot: string,
+    databaseDirectory: string = DEFAULT_DATABASE_DIRECTORY,
+  ) {
+    this.databaseDirectory = assertSafeDatabaseDirectory(databaseDirectory);
+  }
+
+  /** Lazily open (once) and return the shared binary database handle. */
+  open(): LmdbBinaryDatabase {
+    if (this.closed) throw new LmdbStoreError("CLOSED", "LMDB store is closed.");
+    if (this.database) return this.database;
+    const environmentPath = openEnvironmentDirectory(this.storageRoot, this.databaseDirectory);
+    try {
+      this.database = open<unknown, Uint8Array>(environmentPath, {
+        encoding: "binary",
+        keyEncoding: "binary",
+        useVersions: true,
+        maxDbs: 1,
+        commitDelay: 0,
+        noSync: false,
+        noMetaSync: false,
+        // Windows uses ordinary synchronous commits here. A separate durable
+        // flush operation can be added only after callers require that claim.
+        overlappingSync: false,
+      });
+    } catch (error) {
+      throw new LmdbStoreError("INVALID_ROOT", `Could not open LMDB environment: ${environmentPath}`, {
+        cause: error,
+      });
+    }
+    return this.database;
+  }
+
+  async close(): Promise<void> {
+    if (this.closePromise) return this.closePromise;
+    this.closed = true;
+    if (!this.database) {
+      this.closePromise = Promise.resolve();
+      return this.closePromise;
+    }
+    const database = this.database;
+    this.closePromise = database.close().finally(() => {
+      this.database = null;
+    });
+    return this.closePromise;
+  }
+}
+
+/**
  * LMDB-backed implementation of the narrow durable KV port.
  *
  * Reads are synchronous inside the LMDB read transaction, while public writes
@@ -159,9 +291,8 @@ export class LmdbDurableKvStore<T> implements DurableKvStore<T> {
   private readonly databaseDirectory: string;
   private readonly maxRecordBytes: number;
   private readonly nowMs: () => number;
-  private database: LmdbBinaryDatabase | null = null;
-  private closed = false;
-  private closePromise: Promise<void> | null = null;
+  private readonly environment: LmdbEnvironment;
+  private readonly ownsEnvironment: boolean;
 
   constructor(private readonly options: LmdbDurableKvStoreOptions<T>) {
     this.databaseDirectory = assertSafeDatabaseDirectory(
@@ -175,6 +306,10 @@ export class LmdbDurableKvStore<T> implements DurableKvStore<T> {
       throw new LmdbStoreError("INVALID_OPTIONS", "LMDB maxRecordBytes must be a positive safe integer.");
     }
     this.nowMs = options.nowMs ?? Date.now;
+    // Share a caller-owned environment when injected; otherwise own one. A
+    // shared environment is closed by its provider, never by this typed view.
+    this.environment = options.environment ?? new LmdbEnvironment(options.storageRoot, this.databaseDirectory);
+    this.ownsEnvironment = options.environment === undefined;
   }
 
   async read(key: string): Promise<DurableKvRecord<T> | null> {
@@ -273,46 +408,123 @@ export class LmdbDurableKvStore<T> implements DurableKvStore<T> {
     });
   }
 
-  async close(): Promise<void> {
-    if (this.closePromise) return this.closePromise;
-    this.closed = true;
-    if (!this.database) {
-      this.closePromise = Promise.resolve();
-      return this.closePromise;
+  async list(prefix: readonly string[], limit: number): Promise<DurableKvListPage<T>> {
+    if (!Number.isSafeInteger(limit) || limit < 1) {
+      throw new LmdbStoreError("INVALID_OPTIONS", "LMDB list limit must be a positive safe integer.");
     }
-    const database = this.database;
-    this.closePromise = database.close().finally(() => {
-      this.database = null;
-    });
-    return this.closePromise;
+    const scan = this.namespaceScan(prefix);
+    const entries: DurableKvListEntry<T>[] = [];
+    let truncated = false;
+    // `snapshot` pins one read view for the whole iteration so a concurrent
+    // writer cannot tear the page; iteration is synchronous, so nothing else
+    // in this process interleaves either.
+    for (const entry of scan.database.getRange({
+      start: scan.start,
+      end: scan.end,
+      versions: true,
+      snapshot: true,
+    })) {
+      const key = matchNamespaceKey(entry.key, scan.prefix);
+      if (key === null) continue;
+      if (entries.length >= limit) {
+        truncated = true;
+        break;
+      }
+      entries.push(this.classifyListEntry(key, entry));
+    }
+    return { entries, truncated };
+  }
+
+  async stats(prefix: readonly string[]): Promise<DurableKvNamespaceStats> {
+    const scan = this.namespaceScan(prefix);
+    let count = 0;
+    let totalValueBytes = 0;
+    for (const entry of scan.database.getRange({
+      start: scan.start,
+      end: scan.end,
+      snapshot: true,
+    })) {
+      if (matchNamespaceKey(entry.key, scan.prefix) === null) continue;
+      count += 1;
+      // Corrupt records still occupy the store, so they count toward both the
+      // record total and the aggregate stored-byte budget.
+      totalValueBytes += entry.value instanceof Uint8Array ? entry.value.byteLength : 0;
+    }
+    return { count, totalValueBytes };
+  }
+
+  async close(): Promise<void> {
+    // Only release an environment this store opened; a shared, injected
+    // environment is owned and closed by its provider.
+    if (this.ownsEnvironment) return this.environment.close();
+    return Promise.resolve();
   }
 
   private openDatabase(): LmdbBinaryDatabase {
-    if (this.closed) throw new LmdbStoreError("CLOSED", "LMDB store is closed.");
-    if (this.database) return this.database;
-    const environmentPath = openEnvironmentDirectory(
-      this.options.storageRoot,
-      this.databaseDirectory,
-    );
+    return this.environment.open();
+  }
+
+  private namespaceScan(prefix: readonly string[]): {
+    database: LmdbBinaryDatabase;
+    start: Uint8Array;
+    end: Uint8Array;
+    prefix: readonly string[];
+  } {
+    let encoded: string;
     try {
-      this.database = open<unknown, Uint8Array>(environmentPath, {
-        encoding: "binary",
-        keyEncoding: "binary",
-        useVersions: true,
-        maxDbs: 1,
-        commitDelay: 0,
-        noSync: false,
-        noMetaSync: false,
-        // Windows uses ordinary synchronous commits here. A separate durable
-        // flush operation can be added only after callers require that claim.
-        overlappingSync: false,
-      });
+      encoded = encodeDurableKey(...prefix);
     } catch (error) {
-      throw new LmdbStoreError("INVALID_ROOT", `Could not open LMDB environment: ${environmentPath}`, {
-        cause: error,
-      });
+      throw new LmdbStoreError(
+        "INVALID_KEY",
+        "LMDB namespace prefix must use the canonical durable-key namespace.",
+        { cause: error },
+      );
     }
-    return this.database;
+    const start = Buffer.from(encoded, "utf8");
+    return { database: this.openDatabase(), start, end: namespaceUpperBound(start), prefix };
+  }
+
+  private classifyListEntry(key: string, entry: LmdbRangeEntry): DurableKvListEntry<T> {
+    const raw = entry.value;
+    const rawBytes = raw instanceof Uint8Array ? new Uint8Array(raw) : new Uint8Array();
+    const valueBytes = rawBytes.byteLength;
+    let version: number;
+    try {
+      version = entryVersion(entry);
+    } catch (error) {
+      // A record without a usable storage version is corrupt at the storage
+      // layer; surface it without a version instead of aborting the scan.
+      return {
+        kind: "corrupt",
+        key,
+        version: 0,
+        valueBytes,
+        rawSha256: sha256Hex(rawBytes),
+        message: error instanceof Error ? error.message : String(error),
+      };
+    }
+    if (!(raw instanceof Uint8Array)) {
+      return {
+        kind: "corrupt",
+        key,
+        version,
+        valueBytes: 0,
+        rawSha256: sha256Hex(new Uint8Array()),
+        message: "LMDB record is not stored as binary bytes.",
+      };
+    }
+    try {
+      return { kind: "valid", key, value: this.decodeStoredValue(rawBytes), version, valueBytes };
+    } catch (error) {
+      return {
+        kind: "corrupt",
+        key,
+        version,
+        valueBytes,
+        rawSha256: sha256Hex(rawBytes),
+        message: error instanceof Error ? error.message : String(error),
+      };
+    }
   }
 
   private encodeStoredValue(value: T): Uint8Array {

@@ -13,6 +13,41 @@ export type DurableKvPutResult<T> =
   | { readonly kind: "replaced"; readonly current: DurableKvRecord<T> }
   | { readonly kind: "conflict"; readonly actualVersion: number | null };
 
+/** Count and aggregate stored-byte accounting for a namespace prefix. */
+export interface DurableKvNamespaceStats {
+  readonly count: number;
+  /** Encoded envelope bytes actually occupying the store, not decoded bytes. */
+  readonly totalValueBytes: number;
+}
+
+/**
+ * One record encountered during a namespace scan. Corrupt siblings are reported
+ * in place, mirroring single-record inspection, so a sweep can see the whole
+ * namespace instead of aborting on the first bad record.
+ */
+export type DurableKvListEntry<T> =
+  | {
+      readonly kind: "valid";
+      readonly key: string;
+      readonly value: T;
+      readonly version: number;
+      readonly valueBytes: number;
+    }
+  | {
+      readonly kind: "corrupt";
+      readonly key: string;
+      readonly version: number;
+      readonly valueBytes: number;
+      readonly rawSha256: string;
+      readonly message: string;
+    };
+
+export interface DurableKvListPage<T> {
+  readonly entries: ReadonlyArray<DurableKvListEntry<T>>;
+  /** True when the namespace holds more matching records than `limit` returned. */
+  readonly truncated: boolean;
+}
+
 export interface DurableKvStore<T> {
   read(key: string): Promise<DurableKvRecord<T> | null>;
   put(
@@ -21,6 +56,19 @@ export interface DurableKvStore<T> {
     expectedVersion: number | null,
   ): Promise<DurableKvPutResult<T>>;
   remove(key: string, expectedVersion: number): Promise<boolean>;
+  /**
+   * Enumerate up to `limit` records whose key begins with the namespace
+   * `prefix`, matched over decoded key components (never a raw substring).
+   * A corrupt sibling is surfaced as a `corrupt` entry rather than aborting
+   * the scan; `truncated` reports whether more records matched than returned.
+   */
+  list(prefix: readonly string[], limit: number): Promise<DurableKvListPage<T>>;
+  /**
+   * Count records and sum their stored value bytes for a namespace `prefix`
+   * inside a single read snapshot, so a caller can enforce an aggregate budget
+   * before admitting a new record. Corrupt records still contribute to both.
+   */
+  stats(prefix: readonly string[]): Promise<DurableKvNamespaceStats>;
   close(): Promise<void>;
 }
 

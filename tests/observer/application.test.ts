@@ -1,4 +1,4 @@
-import { mkdirSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -26,7 +26,14 @@ describe("observer application composition roots", () => {
       const app = createAgentApplication({ root: join(root, "managed"), sourceDirectory: observerAddonSource, evidenceRoots: [evidence] });
       expect(app.evidenceBundle).toBeDefined();
       expect(app.runs.evidenceDiagnostics()).toMatchObject({ enabled: true, evidenceRootCount: 1 });
+      const run = app.runs.begin({ title: "record only" });
+      expect(existsSync(join(root, "managed", "runs", run.runId as string))).toBe(false);
+      const store = app.runs.recordStoreForTest();
       await app.server.close();
+      expect(() => store.listIds("run")).toThrowError(/closed/);
+      // Windows cannot remove an open LMDB memory map. This directly proves
+      // server shutdown closed the run-record environment as well.
+      rmSync(join(root, "managed", "state", "run-records-v1"), { recursive: true, force: false });
     }, { prefix: "rfo-agent-exporter-" });
   });
 

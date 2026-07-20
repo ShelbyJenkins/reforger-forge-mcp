@@ -1,11 +1,8 @@
 import { EventEmitter } from "node:events";
 import type { ChildProcess } from "node:child_process";
 import {
-  cpSync,
   mkdirSync,
   mkdtempSync,
-  readFileSync,
-  readdirSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -15,6 +12,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ObserverLaunchInput, ObserverPreparedLaunch } from "../../src/observer/launch.js";
 import {
   OWNED_RUNTIME_OWNER_ARGUMENT_PREFIX,
+  OWNED_RUNTIME_RECORD_DIRECTORIES,
   OwnedRuntimeManager,
   type OwnedRuntimeExactIdentity,
   type OwnedRuntimeInspection,
@@ -22,6 +20,7 @@ import {
   type OwnedRuntimeProcessBackend,
   type RuntimeStopPreflight,
 } from "../../src/observer/owned-runtime-manager.js";
+import { LmdbRecordStore } from "../../src/foundation/lmdb-record-store.js";
 
 type OwnedSpawnCrashCut =
   | "before_spawn"
@@ -225,10 +224,19 @@ interface OwnedCrashSnapshot {
 }
 
 const roots: string[] = [];
+const managersToClose: OwnedRuntimeManager[] = [];
+const storesToClose: LmdbRecordStore[] = [];
 const CLOCK_MS = Date.parse("2026-07-18T12:00:00.000Z");
+const SNAPSHOT_MAX_RECORD_BYTES = 128 * 1024 * 1024;
 
-function readOnlyJson(path: string): Record<string, unknown> {
-  return JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+function readStoreRecord(
+  store: LmdbRecordStore,
+  family: string,
+  id: string,
+): Record<string, unknown> {
+  const raw = store.getRaw(family, id);
+  if (raw === null) throw new Error(`Expected record ${family}/${id}`);
+  return JSON.parse(Buffer.from(raw).toString("utf8")) as Record<string, unknown>;
 }
 
 async function captureOwnedCut(cut: OwnedSpawnCrashCut): Promise<OwnedCrashSnapshot> {
@@ -248,14 +256,28 @@ async function captureOwnedCut(cut: OwnedSpawnCrashCut): Promise<OwnedCrashSnaps
 
   const capture = (): void => {
     if (snapshot) throw new Error(`F8 owned-runtime cut ${cut} fired twice`);
-    const pendingNames = readdirSync(join(manager.storageRoot, "pending-starts"));
-    if (pendingNames.length !== 1) throw new Error("F8 snapshot expected one pending start");
-    const pendingPath = join(manager.storageRoot, "pending-starts", pendingNames[0]);
-    const pending = readOnlyJson(pendingPath);
+    const store = manager.recordStoreForTest();
+    const pendingIds = store.listIds("pending-starts");
+    if (pendingIds.length !== 1) throw new Error("F8 snapshot expected one pending start");
+    const pending = readStoreRecord(store, "pending-starts", pendingIds[0]);
     const runtimeId = String(pending.runtimeId);
-    const destination = join(snapshotManagedRoot, "state", "owned-runtimes-v1");
-    mkdirSync(dirname(destination), { recursive: true });
-    cpSync(manager.storageRoot, destination, { recursive: true });
+    // Take a consistent logical copy of the durable records into an independent
+    // record store at the snapshot managed root, reproducing a crash-time copy
+    // of the storage tree. A physical file copy of the open LMDB environment is
+    // neither consistent nor permitted while it is memory-mapped on Windows.
+    const destStorageRoot = join(snapshotManagedRoot, "state", "owned-runtimes-v1");
+    mkdirSync(destStorageRoot, { recursive: true });
+    const dest = new LmdbRecordStore({
+      storageRoot: destStorageRoot,
+      maxRecordBytes: SNAPSHOT_MAX_RECORD_BYTES,
+    });
+    storesToClose.push(dest);
+    for (const family of OWNED_RUNTIME_RECORD_DIRECTORIES) {
+      for (const id of store.listIds(family)) {
+        const raw = store.getRaw(family, id);
+        if (raw) dest.putRaw(family, id, raw, { exclusive: false });
+      }
+    }
     snapshot = {
       cut,
       managedRoot: snapshotManagedRoot,
@@ -264,7 +286,7 @@ async function captureOwnedCut(cut: OwnedSpawnCrashCut): Promise<OwnedCrashSnaps
       idempotencyKey,
       runtimeId,
       pending,
-      runtimePublished: readdirSync(join(manager.storageRoot, "runtimes")).length === 1,
+      runtimePublished: store.listIds("runtimes").length === 1,
       lifecycleRetained: gate.retained.some((entry) => entry.runtimeId === runtimeId),
       processes: [...backend.processes.values()].map((entry) => ({
         identity: { ...entry.identity },
@@ -310,6 +332,7 @@ async function captureOwnedCut(cut: OwnedSpawnCrashCut): Promise<OwnedCrashSnaps
     terminationTimeoutMs: 200,
     lockTimeoutMs: 200,
   });
+  managersToClose.push(manager);
 
   const managerInternals = manager as unknown as {
     awaitSpawn(child: ChildProcess): Promise<void>;
@@ -406,41 +429,40 @@ function createReplacement(snapshot: OwnedCrashSnapshot): {
   }
   const gate = new CrashGate();
   let id = 100;
-  return {
+  const manager = new OwnedRuntimeManager({
+    managedRoot: snapshot.managedRoot,
+    gamePath: dirname(snapshot.executablePath),
+    observerGate: gate,
     backend,
-    gate,
-    manager: new OwnedRuntimeManager({
-      managedRoot: snapshot.managedRoot,
-      gamePath: dirname(snapshot.executablePath),
-      observerGate: gate,
-      backend,
-      spawnProcess: vi.fn(() => {
-        throw new Error("F8 recovery must not spawn a second runtime");
-      }) as unknown as typeof import("node:child_process").spawn,
-      executableResolver: () => snapshot.executablePath,
-      installationRoot: process.cwd(),
-      clock: () => CLOCK_MS,
-      ownerToken: () => "replacement_".padEnd(64, "0"),
-      randomId: () => `00000000-0000-4000-8000-${String(id++).padStart(12, "0")}`,
-      inspectionTimeoutMs: 200,
-      terminationTimeoutMs: 200,
-      lockTimeoutMs: 200,
-    }),
-  };
+    spawnProcess: vi.fn(() => {
+      throw new Error("F8 recovery must not spawn a second runtime");
+    }) as unknown as typeof import("node:child_process").spawn,
+    executableResolver: () => snapshot.executablePath,
+    installationRoot: process.cwd(),
+    clock: () => CLOCK_MS,
+    ownerToken: () => "replacement_".padEnd(64, "0"),
+    randomId: () => `00000000-0000-4000-8000-${String(id++).padStart(12, "0")}`,
+    inspectionTimeoutMs: 200,
+    terminationTimeoutMs: 200,
+    lockTimeoutMs: 200,
+  });
+  managersToClose.push(manager);
+  return { backend, gate, manager };
 }
 
-function readSnapshotPending(snapshot: OwnedCrashSnapshot): Record<string, unknown> {
-  return readOnlyJson(join(
-    snapshot.managedRoot,
-    "state",
-    "owned-runtimes-v1",
-    "pending-starts",
-    `${snapshot.runtimeId}.json`
-  ));
+function readSnapshotPending(
+  replacement: { manager: OwnedRuntimeManager },
+  snapshot: OwnedCrashSnapshot,
+): Record<string, unknown> {
+  return readStoreRecord(replacement.manager.recordStoreForTest(), "pending-starts", snapshot.runtimeId);
 }
 
-afterEach(() => {
+afterEach(async () => {
   vi.restoreAllMocks();
+  // Release every record-store environment before removing the roots: an open
+  // LMDB memory map blocks rmSync on Windows.
+  for (const store of storesToClose.splice(0)) await store.close().catch(() => undefined);
+  for (const manager of managersToClose.splice(0)) await manager.closeStorageForTest().catch(() => undefined);
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
@@ -490,13 +512,12 @@ describe("F8 owned-runtime spawn crash characterization", () => {
       }
 
       await expect(retry).rejects.toMatchObject({ code: "START_UNVERIFIABLE" });
-      expect(readdirSync(join(snapshot.managedRoot, "state", "owned-runtimes-v1", "runtimes")))
-        .toEqual([]);
+      expect(replacement.manager.recordStoreForTest().listIds("runtimes")).toEqual([]);
       if (recovery === "cleanup_only") {
         expect(replacement.backend.terminationCalls).toHaveLength(1);
         expect(replacement.backend.processes).toHaveLength(0);
         expect(replacement.gate.released).toHaveLength(1);
-        expect(readSnapshotPending(snapshot)).toMatchObject({
+        expect(readSnapshotPending(replacement, snapshot)).toMatchObject({
           state: "release_acknowledged",
           lifecycleGeneration: snapshot.pending.lifecycleGeneration,
         });
@@ -504,7 +525,7 @@ describe("F8 owned-runtime spawn crash characterization", () => {
         expect(replacement.backend.terminationCalls).toEqual([]);
         expect(replacement.backend.processes).toHaveLength(snapshot.processes.length);
         expect(replacement.gate.released).toEqual([]);
-        expect(readSnapshotPending(snapshot)).toMatchObject({ state: pendingState });
+        expect(readSnapshotPending(replacement, snapshot)).toMatchObject({ state: pendingState });
       }
     }
   );
