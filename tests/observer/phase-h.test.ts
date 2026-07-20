@@ -8,11 +8,9 @@ import type { ChildProcess, fork } from "node:child_process";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import {
-  ObserverCoordinator,
-  ObserverCoordinatorError,
-  redactChildLine,
-} from "../../src/observer/coordinator.js";
+import { createObserverApplication, type ObserverApplication } from "../../src/observer/application.js";
+import { ObserverCoordinatorError } from "../../src/observer/errors.js";
+import { redactChildLine } from "../../src/observer/agent-client.js";
 import { registerObserverTools } from "../../src/observer/tools.js";
 import { prepareObserverLaunch } from "../../src/observer/launch.js";
 import {
@@ -208,7 +206,7 @@ interface RegisteredTool {
 }
 
 function toolRegistry(
-  coordinator: ObserverCoordinator,
+  coordinator: ObserverApplication,
   ownedRuntimeManager: OwnedRuntimeManager = {} as OwnedRuntimeManager
 ): Map<string, RegisteredTool> {
   const tools = new Map<string, RegisteredTool>();
@@ -316,7 +314,7 @@ function fakeWorkbenchAdapter(options: { unavailable?: boolean } = {}) {
   };
 }
 
-describe("Phase H observer coordinator", () => {
+describe("Phase H observer application", () => {
   it("preserves sessions and staging while a cancelled job still requires restoration", () => {
     const cancel = vi.fn();
     const revoke = vi.fn();
@@ -344,15 +342,15 @@ describe("Phase H observer coordinator", () => {
   });
 
   it("refuses managed or profile roots that overlap the configured project", () => {
-    expect(() => new ObserverCoordinator({
+    expect(() => createObserverApplication({
       projectPath: process.cwd(),
       managedRoot: join(process.cwd(), "observer-managed"),
     })).toThrowError(expect.objectContaining<Partial<ObserverCoordinatorError>>({ code: "INVALID_REQUEST" }));
-    expect(() => new ObserverCoordinator({
+    expect(() => createObserverApplication({
       projectPath: process.cwd(),
       profileRoot: join(process.cwd(), "observer-profiles"),
     })).toThrowError(expect.objectContaining<Partial<ObserverCoordinatorError>>({ code: "INVALID_REQUEST" }));
-    expect(() => new ObserverCoordinator({
+    expect(() => createObserverApplication({
       projectPath: process.cwd(),
       defaultManagedRoot: join(process.cwd(), "observer-default-managed"),
     })).toThrowError(expect.objectContaining<Partial<ObserverCoordinatorError>>({ code: "INVALID_REQUEST" }));
@@ -366,7 +364,7 @@ describe("Phase H observer coordinator", () => {
       forkArguments = argumentsArray ?? [];
       return child as unknown as ChildProcess;
     }) as typeof fork;
-    const coordinator = new ObserverCoordinator({
+    const coordinator = createObserverApplication({
       projectPath: process.cwd(),
       defaultManagedRoot: managedRoot,
       agentPath: "private-child.js",
@@ -387,7 +385,7 @@ describe("Phase H observer coordinator", () => {
   it("deduplicates concurrent lazy startup and requests graceful child shutdown", async () => {
     const child = new FakeChild();
     const count = { value: 0 };
-    const coordinator = new ObserverCoordinator({
+    const coordinator = createObserverApplication({
       agentPath: "private-child.js",
       forkChild: fakeFork(child, count),
       startupTimeoutMs: 1_000,
@@ -409,7 +407,7 @@ describe("Phase H observer coordinator", () => {
 
   it("keeps a timed-out private child counted until its actual exit", async () => {
     const child = new FakeChild();
-    const coordinator = new ObserverCoordinator({
+    const coordinator = createObserverApplication({
       agentPath: "private-child.js",
       forkChild: fakeFork(child, { value: 0 }),
       startupTimeoutMs: 1_000,
@@ -440,7 +438,7 @@ describe("Phase H observer coordinator", () => {
   it("rejects active operations when its exact child exits", async () => {
     const child = new FakeChild();
     const count = { value: 0 };
-    const coordinator = new ObserverCoordinator({
+    const coordinator = createObserverApplication({
       agentPath: "private-child.js",
       forkChild: fakeFork(child, count),
       startupTimeoutMs: 1_000,
@@ -467,7 +465,7 @@ describe("Phase H observer coordinator", () => {
     const parent = mkdtempSync(join(tmpdir(), "rfo-idle-diagnostics-"));
     const managedRoot = join(parent, "managed-root-must-not-be-created");
     const count = { value: 0 };
-    const coordinator = new ObserverCoordinator({
+    const coordinator = createObserverApplication({
       managedRoot,
       forkChild: fakeFork(new FakeChild(), count),
     });
@@ -514,7 +512,7 @@ describe("Phase H observer coordinator", () => {
     const adapter = fakeWorkbenchAdapter();
     adapter.complete();
     const count = { value: 0 };
-    const coordinator = new ObserverCoordinator({
+    const coordinator = createObserverApplication({
       forkChild: fakeFork(new FakeChild(), count),
       pollIntervalMs: 10,
       workbenchAdapter: adapter as never,
@@ -544,7 +542,7 @@ describe("Phase H observer coordinator", () => {
 
   it("routes asynchronous Workbench status, cancellation, and release without sessionId", async () => {
     const adapter = fakeWorkbenchAdapter();
-    const coordinator = new ObserverCoordinator({
+    const coordinator = createObserverApplication({
       agentPath: "private-child.js",
       forkChild: fakeFork(new FakeChild(), { value: 0 }),
       workbenchAdapter: adapter as never,
@@ -578,7 +576,7 @@ describe("Phase H observer coordinator", () => {
 
   it("deduplicates Workbench captures by a hashed public idempotency key and rejects conflicting reuse", async () => {
     const adapter = fakeWorkbenchAdapter();
-    const coordinator = new ObserverCoordinator({
+    const coordinator = createObserverApplication({
       agentPath: "private-child.js",
       forkChild: fakeFork(new FakeChild(), { value: 0 }),
       workbenchAdapter: adapter as never,
@@ -652,7 +650,7 @@ describe("Phase H observer coordinator", () => {
         worldEpoch: 0,
       };
     });
-    const coordinator = new ObserverCoordinator({
+    const coordinator = createObserverApplication({
       agentPath: "private-child.js",
       forkChild: fakeFork(child, { value: 0 }),
       startupTimeoutMs: 1_000,
@@ -681,7 +679,7 @@ describe("Phase H observer coordinator", () => {
   it("returns the same retained completed Workbench PNG for a synchronous response retry", async () => {
     const adapter = fakeWorkbenchAdapter();
     adapter.complete();
-    const coordinator = new ObserverCoordinator({ workbenchAdapter: adapter as never });
+    const coordinator = createObserverApplication({ workbenchAdapter: adapter as never });
     const request = {
       idempotencyKey: "sync-retry-key",
       view: { kind: "current" } as const,
@@ -710,7 +708,7 @@ describe("Phase H observer coordinator", () => {
     };
     const healthyChild = new FakeChild();
     healthyChild.instances = [runtime];
-    const healthy = new ObserverCoordinator({
+    const healthy = createObserverApplication({
       agentPath: "private-child.js",
       forkChild: fakeFork(healthyChild, { value: 0 }),
       startupTimeoutMs: 1_000,
@@ -726,7 +724,7 @@ describe("Phase H observer coordinator", () => {
 
     const unavailableChild = new FakeChild();
     unavailableChild.instances = [runtime];
-    const unavailable = new ObserverCoordinator({
+    const unavailable = createObserverApplication({
       agentPath: "private-child.js",
       forkChild: fakeFork(unavailableChild, { value: 0 }),
       startupTimeoutMs: 1_000,
@@ -756,7 +754,7 @@ describe("Phase H observer MCP tools", () => {
         stagedAddon: { reused: true },
       })),
       revokeSession: vi.fn(),
-    } as unknown as ObserverCoordinator;
+    } as unknown as ObserverApplication;
 
     const recorder = {
       recordPreparedLaunch: vi.fn(async () => "pl-00000000-0000-4000-8000-000000000001"),
@@ -796,7 +794,7 @@ describe("Phase H observer MCP tools", () => {
   });
 
   it("registers the seven exact public tools", () => {
-    const coordinator = { defaultCaptureTimeoutMs: 30_000, maxInlineImageBytes: 1_024 } as ObserverCoordinator;
+    const coordinator = { defaultCaptureTimeoutMs: 30_000, maxInlineImageBytes: 1_024 } as ObserverApplication;
     const tools = toolRegistry(coordinator);
     expect([...tools.keys()].sort()).toEqual([
       "observer_capture",
@@ -816,7 +814,7 @@ describe("Phase H observer MCP tools", () => {
       status: vi.fn(async () => ({ runtimeId: "rt-one", state: "running", exactOwned: true })),
       stop: vi.fn(async () => ({ runtimeId: "rt-one", state: "exited", identityVacant: true })),
     } as unknown as OwnedRuntimeManager;
-    const coordinator = { defaultCaptureTimeoutMs: 30_000, maxInlineImageBytes: 1_024 } as ObserverCoordinator;
+    const coordinator = { defaultCaptureTimeoutMs: 30_000, maxInlineImageBytes: 1_024 } as ObserverApplication;
     const handler = toolRegistry(coordinator, manager).get("observer_runtime")!.handler;
     const signal = new AbortController().signal;
     const started = await handler({
@@ -868,7 +866,7 @@ describe("Phase H observer MCP tools", () => {
           { originalDiagnostic: secret }
         );
       }),
-    } as unknown as ObserverCoordinator;
+    } as unknown as ObserverApplication;
     const tools = toolRegistry(coordinator, manager);
     const signal = new AbortController().signal;
 
@@ -889,7 +887,7 @@ describe("Phase H observer MCP tools", () => {
 
   it("rejects stale Workbench expected-world binding before adapter submission", async () => {
     const adapter = fakeWorkbenchAdapter();
-    const coordinator = new ObserverCoordinator({
+    const coordinator = createObserverApplication({
       agentPath: "private-child.js",
       forkChild: fakeFork(new FakeChild(), { value: 0 }),
       workbenchAdapter: adapter as never,
@@ -932,7 +930,7 @@ describe("Phase H observer MCP tools", () => {
       events.push("adapter-submit");
       return { ...workbenchJob("queued"), jobId: input.jobId } as never;
     });
-    const coordinator = new ObserverCoordinator({
+    const coordinator = createObserverApplication({
       forkChild: fakeFork(child, { value: 0 }),
       workbenchAdapter: adapter as never,
     });
@@ -988,7 +986,7 @@ describe("Phase H observer MCP tools", () => {
     const durableStatus = { ...workbenchJob("queued"), jobId: "durable-job" } as never;
     adapter.submit.mockResolvedValue(durableStatus);
     adapter.status.mockResolvedValue(durableStatus);
-    const coordinator = new ObserverCoordinator({
+    const coordinator = createObserverApplication({
       forkChild: fakeFork(child, { value: 0 }),
       workbenchAdapter: adapter as never,
     });
@@ -1077,7 +1075,7 @@ describe("Phase H observer MCP tools", () => {
     child.responders.set("releaseWorkbenchArtifact", () => ({ released: true }));
     const adapter = fakeWorkbenchAdapter();
     adapter.complete();
-    const coordinator = new ObserverCoordinator({
+    const coordinator = createObserverApplication({
       forkChild: fakeFork(child, { value: 0 }),
       workbenchAdapter: adapter as never,
     });
@@ -1206,7 +1204,7 @@ describe("Phase H observer MCP tools", () => {
       activeJobId = null;
       return { jobId, restorationConfirmed: true, artifactRemoved: true };
     });
-    const coordinator = new ObserverCoordinator({
+    const coordinator = createObserverApplication({
       forkChild: fakeFork(child, { value: 0 }),
       workbenchAdapter: adapter as never,
     });
@@ -1268,7 +1266,7 @@ describe("Phase H observer MCP tools", () => {
     }));
     const adapter = fakeWorkbenchAdapter();
     adapter.recover.mockRejectedValue(Object.assign(new Error("handler retired"), { code: "JOB_NOT_FOUND" }));
-    const coordinator = new ObserverCoordinator({
+    const coordinator = createObserverApplication({
       forkChild: fakeFork(child, { value: 0 }),
       workbenchAdapter: adapter as never,
     });
@@ -1324,7 +1322,7 @@ describe("Phase H observer MCP tools", () => {
       events.push("adapter-release");
       return { jobId: "wb-job-1", restorationConfirmed: true, artifactRemoved: true };
     });
-    const coordinator = new ObserverCoordinator({
+    const coordinator = createObserverApplication({
       forkChild: fakeFork(child, { value: 0 }),
       workbenchAdapter: adapter as never,
     });
@@ -1395,7 +1393,7 @@ describe("Phase H observer MCP tools", () => {
 
       const adapter = fakeWorkbenchAdapter();
       adapter.complete();
-      const coordinator = new ObserverCoordinator({
+      const coordinator = createObserverApplication({
         forkChild: fakeFork(child, { value: 0 }),
         workbenchAdapter: adapter as never,
       });
@@ -1429,7 +1427,7 @@ describe("Phase H observer MCP tools", () => {
       defaultCaptureTimeoutMs: 30_000,
       maxInlineImageBytes: 1_024,
       capture: vi.fn(),
-    } as unknown as ObserverCoordinator;
+    } as unknown as ObserverApplication;
     const server = new McpServer({ name: "observer-schema-test", version: "1.0.0" });
     registerObserverTools(server, coordinator);
     const client = new Client({ name: "observer-schema-client", version: "1.0.0" });
@@ -1515,7 +1513,7 @@ describe("Phase H observer MCP tools", () => {
         asynchronous: true,
         job: { jobId: "job-null-world", worldId: null, worldEpoch: 7, state: "queued" },
       })),
-    } as unknown as ObserverCoordinator;
+    } as unknown as ObserverApplication;
     const tools = toolRegistry(coordinator);
     const signal = new AbortController().signal;
     const inventory = await tools.get("observer_instances")!.handler({
@@ -1576,7 +1574,7 @@ describe("Phase H observer MCP tools", () => {
           warnings: [],
         },
       })),
-    } as unknown as ObserverCoordinator;
+    } as unknown as ObserverApplication;
     const handler = toolRegistry(coordinator).get("observer_capture")!.handler;
     const result = await handler({
       sessionId: "session-1",
@@ -1606,7 +1604,7 @@ describe("Phase H observer MCP tools", () => {
         job: { jobId: "job-2" },
         metadata: {},
       })),
-    } as unknown as ObserverCoordinator;
+    } as unknown as ObserverApplication;
     const handler = toolRegistry(coordinator).get("observer_capture")!.handler;
     const result = await handler({
       sessionId: "session-1",

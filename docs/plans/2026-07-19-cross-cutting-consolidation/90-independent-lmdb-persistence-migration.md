@@ -1,7 +1,7 @@
 # LMDB persistence migration implementation guide
 
 **Status:** Deferred follow-on work  
-**Parent context:** [Cross-cutting consolidation implementation guide](2026-07-19-cross-cutting-consolidation-implementation-guide.md)  
+**Parent context:** [Cross-cutting consolidation implementation guide](README.md)  
 **Research snapshot:** 2026-07-19, against the active working tree  
 **Entry condition:** The parent consolidation follow-on is separately scheduled or its implementation is complete; this migration must receive its own review and risk acceptance.
 

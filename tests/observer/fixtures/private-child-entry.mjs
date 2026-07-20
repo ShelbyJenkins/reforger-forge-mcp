@@ -1,6 +1,6 @@
 import { register } from "tsx/esm/api";
 
-// ObserverCoordinator intentionally clears inherited execArgv. Register the
+// ObserverApplication intentionally clears inherited execArgv. Register the
 // repository's checked-in TypeScript loader inside this hermetic child, then
 // run the real private-child entry point over a genuine Node IPC boundary.
 register();

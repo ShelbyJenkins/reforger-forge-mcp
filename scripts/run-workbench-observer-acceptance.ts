@@ -17,9 +17,10 @@ import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { loadConfig, type Config } from "../src/config.js";
 import {
-  ObserverCoordinator,
+  createObserverApplication,
+  type ObserverApplication,
   type ObserverCaptureView,
-} from "../src/observer/coordinator.js";
+} from "../src/observer/application.js";
 import { generateGproj } from "../src/templates/gproj.js";
 import { WorkbenchClient } from "../src/workbench/client.js";
 import {
@@ -65,7 +66,6 @@ const WORKBENCH_OPERATIONAL_BASELINE_SOURCES = [
   "package-lock.json",
   "package.json",
   "scripts/windows/workbench-lifecycle.ps1",
-  "src/observer/coordinator.ts",
   "src/observer/application.ts",
   "src/observer/capture-service.ts",
   "src/observer/evidence-run-service.ts",
@@ -387,13 +387,13 @@ function assertNoArmaOrWorkbench(): void {
 }
 
 async function waitForCaptureCapability(
-  coordinator: ObserverCoordinator,
+  application: ObserverApplication,
   deadline: number
 ): Promise<Record<string, unknown>> {
   let lastError = "observer handler has not responded";
   while (Date.now() < deadline) {
     try {
-      const inventory = await coordinator.instances({ renderersOnly: true });
+      const inventory = await application.instances({ renderersOnly: true });
       const eligible = inventory.instances.filter((instance) =>
         instance.backend === "workbench" &&
         Array.isArray(instance.capabilities) &&
@@ -413,7 +413,7 @@ async function waitForCaptureCapability(
 }
 
 async function pollTerminal(
-  coordinator: ObserverCoordinator,
+  application: ObserverApplication,
   jobId: string,
   deadline: number
 ): Promise<Record<string, unknown>> {
@@ -425,7 +425,7 @@ async function pollTerminal(
         : "; no status response was retained";
       throw new Error(`Timed out waiting for Workbench observer job ${jobId}${last}`);
     }
-    status = await coordinator.jobStatus(undefined, jobId);
+    status = await application.jobStatus(undefined, jobId);
     if (typeof status.state !== "string") {
       throw new Error(`Workbench observer job ${jobId} returned no state`);
     }
@@ -442,7 +442,7 @@ async function pollTerminal(
 }
 
 async function captureAndRetainUnmeasured(
-  coordinator: ObserverCoordinator,
+  application: ObserverApplication,
   view: ObserverCaptureView,
   label: string,
   runId: string,
@@ -450,7 +450,7 @@ async function captureAndRetainUnmeasured(
   expectedWorldId: string,
   deadline: number
 ): Promise<RetainedCapture> {
-  const capture = await coordinator.capture({
+  const capture = await application.capture({
     runId,
     captureLabel: label,
     purpose: `Live Workbench acceptance capture: ${label}`,
@@ -469,7 +469,7 @@ async function captureAndRetainUnmeasured(
   }
   const submitted = capture.job;
   const jobId = capture.job.jobId;
-  const managedCompleted = await pollTerminal(coordinator, jobId, deadline);
+  const managedCompleted = await pollTerminal(application, jobId, deadline);
   const completed = {
     ...managedCompleted,
     worldIdentity: requiredString(managedCompleted.worldId, `${label} managed world identity`),
@@ -477,7 +477,7 @@ async function captureAndRetainUnmeasured(
   if (completed.state !== "completed" || completed.cameraLeaseHeld || !completed.restorationConfirmed) {
     throw new Error(`${label} managed job state disagrees with the Workbench adapter's terminal restoration proof`);
   }
-  const retained = await coordinator.readJob(undefined, jobId);
+  const retained = await application.readJob(undefined, jobId);
   const png = analyzePngMaterial(retained.image);
   if (!png.materiallyVaried) {
     throw new Error(`${label} screenshot is blank or lacks material color/luminance variation`);
@@ -498,7 +498,7 @@ async function captureAndRetainUnmeasured(
 }
 
 async function captureAndRetain(
-  coordinator: ObserverCoordinator,
+  application: ObserverApplication,
   view: ObserverCaptureView,
   label: string,
   runId: string,
@@ -509,9 +509,9 @@ async function captureAndRetain(
 ): Promise<RetainedCapture> {
   return baseline.measure(
     "capture",
-    `ObserverCoordinator.capture/jobStatus/readJob(${label})`,
+    `ObserverApplication.capture/jobStatus/readJob(${label})`,
     () => captureAndRetainUnmeasured(
-      coordinator,
+      application,
       view,
       label,
       runId,
@@ -718,7 +718,7 @@ export async function runWorkbenchObserverAcceptance(
   if (!existsSync(observerAgentPath)) {
     throw new Error(`Compiled observer agent is missing: ${observerAgentPath}`);
   }
-  const coordinator = new ObserverCoordinator({
+  const application = createObserverApplication({
     agentPath: observerAgentPath,
     managedRoot,
     profileRoot: join(managedRoot, "profiles"),
@@ -736,7 +736,7 @@ export async function runWorkbenchObserverAcceptance(
     const recovery = cleanupClient === client
       ? { active: 0, reconciling: 0, total: 0 }
       : cleanupClient.diagnosticSupervisedChildCounts();
-    const observerPrivateChildren = coordinator.diagnosticPrivateChildCount();
+    const observerPrivateChildren = application.diagnosticPrivateChildCount();
     return {
       active: primary.active + recovery.active + observerPrivateChildren,
       reconciling: primary.reconciling + recovery.reconciling,
@@ -776,7 +776,7 @@ export async function runWorkbenchObserverAcceptance(
   let baselinePath = "";
   try {
     assertNoArmaOrWorkbench();
-    const begun = await coordinator.beginRun({
+    const begun = await application.beginRun({
       title: "Live Workbench observer screenshot acceptance",
       caseIds: ["WB-OBSERVER-LIVE-CAPTURE"],
       procedureRevision: "workbench-observer-live-acceptance-v3",
@@ -803,12 +803,12 @@ export async function runWorkbenchObserverAcceptance(
     if (open.status !== "ok" || !String(open.message ?? "").startsWith("Opened resource:")) {
       throw new Error(`Disposable acceptance world did not open: ${String(open.message ?? "no response")}`);
     }
-    const selected = await waitForCaptureCapability(coordinator, deadline);
+    const selected = await waitForCaptureCapability(application, deadline);
     const instanceId = requiredString(selected.instanceId, "Selected Workbench observer instance ID");
     const expectedWorldId = requiredString(selected.worldId, "Selected Workbench observer world ID");
 
     const initial = await captureAndRetain(
-      coordinator,
+      application,
       { kind: "current" },
       "initial-current",
       observerRunId,
@@ -817,7 +817,7 @@ export async function runWorkbenchObserverAcceptance(
       deadline,
       baseline
     );
-    const inventory = await coordinator.instances({ renderersOnly: true });
+    const inventory = await application.instances({ renderersOnly: true });
     const workbenchInventory = inventory.instances.filter((instance) => instance.backend === "workbench");
     const ping = await baseline.measure(
       "managed_call",
@@ -850,7 +850,7 @@ export async function runWorkbenchObserverAcceptance(
       fov: poseFov,
     };
     const pose = await captureAndRetain(
-      coordinator,
+      application,
       poseView,
       "explicit-pose",
       observerRunId,
@@ -879,7 +879,7 @@ export async function runWorkbenchObserverAcceptance(
       pose.completed.actualCamera.matrix
     );
     const postPose = await captureAndRetain(
-      coordinator,
+      application,
       { kind: "current" },
       "post-pose-restoration-current",
       observerRunId,
@@ -911,7 +911,7 @@ export async function runWorkbenchObserverAcceptance(
       fov: lookAtFov,
     };
     const lookAt = await captureAndRetain(
-      coordinator,
+      application,
       lookAtView,
       "explicit-look-at",
       observerRunId,
@@ -935,7 +935,7 @@ export async function runWorkbenchObserverAcceptance(
       throw new Error("Explicit look-at rendered FOV differs from the requested FOV");
     }
     const postLookAt = await captureAndRetain(
-      coordinator,
+      application,
       { kind: "current" },
       "post-look-at-restoration-current",
       observerRunId,
@@ -959,8 +959,8 @@ export async function runWorkbenchObserverAcceptance(
       submittedLeaseHeld: capture.submitted.cameraLeaseHeld,
       restorationConfirmed: capture.completed.restorationConfirmed,
     }));
-    summary.observerRunBeforeFinalize = await coordinator.runStatus(observerRunId);
-    const finalized = await coordinator.finalizeRun({
+    summary.observerRunBeforeFinalize = await application.runStatus(observerRunId);
+    const finalized = await application.finalizeRun({
       runId: observerRunId,
       evidenceRoot,
       includeCaptureLabels: captures.map((capture) => capture.label),
@@ -995,7 +995,7 @@ export async function runWorkbenchObserverAcceptance(
   } finally {
     if (observerRunId) {
       try {
-        summary.observerRunFinalStatus = await coordinator.runStatus(observerRunId);
+        summary.observerRunFinalStatus = await application.runStatus(observerRunId);
       } catch (error) {
         summary.observerRunFinalStatus = error instanceof Error ? error.message : String(error);
       }
@@ -1016,14 +1016,14 @@ export async function runWorkbenchObserverAcceptance(
     try {
       await baseline.measure(
         "shutdown",
-        "ObserverCoordinator.close",
-        () => coordinator.close(),
+        "ObserverApplication.close",
+        () => application.close(),
         "observer_cleanup"
       );
-      summary.coordinatorShutdown = "complete";
+      summary.applicationShutdown = "complete";
     } catch (error) {
       failure ??= error;
-      summary.coordinatorShutdown = error instanceof Error ? error.message : String(error);
+      summary.applicationShutdown = error instanceof Error ? error.message : String(error);
       summary.status = "failed";
     }
     try {
@@ -1167,7 +1167,7 @@ export async function runWorkbenchObserverAcceptance(
         source: baselineSource,
         limitations: [
           "Descriptive controlled-run baseline only; no timing or process-count thresholds are applied.",
-          "Supervised counts combine ChildSupervisor-managed Workbench lifecycle children with count-only ObserverCoordinator private-child tracking through actual child exit.",
+          "Supervised counts combine ChildSupervisor-managed Workbench lifecycle children with count-only ObserverApplication private-child tracking through actual child exit.",
           "Configured Workbench add-on roots outside the disposable project and managed helper are represented by path-list cardinality, not external add-on content; compare runs only when those roots are unchanged.",
         ],
         ...(baselineFailed ? {

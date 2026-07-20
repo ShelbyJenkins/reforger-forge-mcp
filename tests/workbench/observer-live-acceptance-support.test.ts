@@ -177,7 +177,7 @@ describe("live observer acceptance support", () => {
     );
     await recorder.measure(
       "capture",
-      "ObserverCoordinator.capture/jobStatus/readJob(initial-current)",
+      "ObserverApplication.capture/jobStatus/readJob(initial-current)",
       async () => {
         wallMs += 100;
         monotonicMs += 100;
@@ -187,7 +187,7 @@ describe("live observer acceptance support", () => {
     );
     await recorder.measure(
       "shutdown",
-      "ObserverCoordinator.close",
+      "ObserverApplication.close",
       async () => {
         wallMs += 5;
         monotonicMs += 5;
@@ -264,10 +264,10 @@ describe("live observer acceptance support", () => {
       "launch.running_confirmation.WorkbenchClient.ensureRunning.after",
       "managed_call.representative_net_api.WorkbenchObserverAdapter.ping(EMCP_WB_Ping).before",
       "managed_call.representative_net_api.WorkbenchObserverAdapter.ping(EMCP_WB_Ping).after",
-      "capture.initial-current.ObserverCoordinator.capture/jobStatus/readJob(initial-current).before",
-      "capture.initial-current.ObserverCoordinator.capture/jobStatus/readJob(initial-current).after",
-      "shutdown.observer_cleanup.ObserverCoordinator.close.before",
-      "shutdown.observer_cleanup.ObserverCoordinator.close.after",
+      "capture.initial-current.ObserverApplication.capture/jobStatus/readJob(initial-current).before",
+      "capture.initial-current.ObserverApplication.capture/jobStatus/readJob(initial-current).after",
+      "shutdown.observer_cleanup.ObserverApplication.close.before",
+      "shutdown.observer_cleanup.ObserverApplication.close.after",
       "shutdown.termination.WorkbenchClient.shutdownOwnedWorkbench.before",
       "shutdown.termination.WorkbenchClient.shutdownOwnedWorkbench.after",
       "shutdown.supervised_exit_settle.waitForOperationalBaselineProcessVacancy.before",
@@ -419,14 +419,14 @@ describe("live observer acceptance support", () => {
         harness: { path: "scripts/run-runtime-observer-acceptance.ts", sha256: "a".repeat(64) },
         recorder: { path: "scripts/observer-live-acceptance-support.ts", sha256: "b".repeat(64) },
         measured: [
-          { path: "src/observer/coordinator.ts", sha256: "c".repeat(64) },
+          { path: "src/observer/application.ts", sha256: "c".repeat(64) },
           { path: "src/observer/owned-runtime-manager.ts", sha256: "d".repeat(64) },
         ],
       },
       measurements: [
         measurement("launch", "OwnedRuntimeManager.start/status(running)", "running_confirmation"),
         measurement("managed_call", "OwnedRuntimeManager.status", "representative_status_api"),
-        measurement("capture", "ObserverCoordinator.capture(initial-current)", "initial-current"),
+        measurement("capture", "ObserverApplication.capture(initial-current)", "initial-current"),
         measurement("shutdown", "OwnedRuntimeManager.stop", "termination", {
           terminationComplete: true,
           identityVacant: true,
@@ -434,7 +434,7 @@ describe("live observer acceptance support", () => {
         measurement("shutdown", "OwnedRuntimeManager.stop", "observer_cleanup", {
           observerCleanupPending: false,
         }),
-        measurement("shutdown", "ObserverCoordinator.close", "observer_cleanup"),
+        measurement("shutdown", "ObserverApplication.close", "observer_cleanup"),
         measurement(
           "shutdown",
           "waitForOperationalBaselineProcessVacancy",
@@ -533,12 +533,12 @@ describe("live observer acceptance support", () => {
       testPath,
       "tests/workbench/observer-live-acceptance-support.test.ts",
       repositoryRoot,
-      ["src/workbench/client.ts", "src/observer/coordinator.ts"],
+      ["src/workbench/client.ts", "src/observer/application.ts"],
       [{ path: "scripts/windows/**/*.ps1", directory: "scripts/windows", extension: ".ps1" }]
     );
     expect(source.measured.map((item) => item.path)).toEqual([
       "scripts/windows/**/*.ps1",
-      "src/observer/coordinator.ts",
+      "src/observer/application.ts",
       "src/workbench/client.ts",
     ]);
     expect(source.measured[0]?.sha256).toMatch(/^[a-f0-9]{64}$/);
@@ -561,7 +561,7 @@ describe("live observer acceptance support", () => {
       ...base,
       source: {
         ...source,
-        measured: [{ path: "C:\\private\\coordinator.ts", sha256: "a".repeat(64) }],
+        measured: [{ path: "C:\\private\\application.ts", sha256: "a".repeat(64) }],
       },
     })).toThrow(/source identity/);
     expect(() => buildOperationalBaselineArtifact({
@@ -569,8 +569,8 @@ describe("live observer acceptance support", () => {
       source: {
         ...source,
         measured: [
-          { path: "src/observer/coordinator.ts", sha256: "a".repeat(64) },
-          { path: "src/observer/coordinator.ts", sha256: "b".repeat(64) },
+          { path: "src/observer/application.ts", sha256: "a".repeat(64) },
+          { path: "src/observer/application.ts", sha256: "b".repeat(64) },
         ],
       },
     })).toThrow(/duplicate path/);

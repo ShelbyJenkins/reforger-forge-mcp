@@ -2050,7 +2050,7 @@ describe("OwnedRuntimeManager", () => {
     });
     await expect(value.manager.close()).resolves.toMatchObject({
       sealedRuntimeIds: [started.runtimeId],
-      coordinatorCloseSafe: true,
+      applicationCloseSafe: true,
     });
 
     const recovered = makeHarness({ root: value.root, backend: value.backend });
@@ -2387,7 +2387,7 @@ describe("OwnedRuntimeManager", () => {
     try {
       const beganAt = Date.now();
       const closing = value.manager.close() as Promise<{
-        coordinatorCloseSafe: boolean;
+        applicationCloseSafe: boolean;
         errorRuntimes: Array<{ runtimeId: string; reason: string }>;
       }>;
       await releaseEntered;
@@ -2396,7 +2396,7 @@ describe("OwnedRuntimeManager", () => {
       const runtimeError = result.errorRuntimes.find((entry) => entry.runtimeId === started.runtimeId);
 
       expect(Date.now() - beganAt).toBe(5_000);
-      expect(result.coordinatorCloseSafe).toBe(false);
+      expect(result.applicationCloseSafe).toBe(false);
       expect(runtimeError?.reason).toContain("aggregate wall-clock deadline");
       expect(value.gate.releaseRuntimeLifecycle).toHaveBeenCalledTimes(1);
       expect(existsSync(join(
@@ -2448,12 +2448,12 @@ describe("OwnedRuntimeManager", () => {
       const beganAt = Date.now();
       const result = await value.manager.close() as {
         errorRuntimes: Array<{ runtimeId: string; reason: string }>;
-        coordinatorCloseSafe: boolean;
+        applicationCloseSafe: boolean;
       };
       const inventoryErrors = result.errorRuntimes.filter((entry) => entry.runtimeId === "inventory");
 
       expect(Date.now() - beganAt).toBe(5_000);
-      expect(result.coordinatorCloseSafe).toBe(false);
+      expect(result.applicationCloseSafe).toBe(false);
       expect(inventoryErrors).toHaveLength(1);
       expect(inventoryErrors[0].reason).toContain("5 runtime(s) were not inspected");
       expect(result.errorRuntimes).toEqual(inventoryErrors);
@@ -2480,7 +2480,7 @@ describe("OwnedRuntimeManager", () => {
         runtimeId: "inventory",
         reason: expect.stringContaining("receipt directory is missing"),
       })],
-      coordinatorCloseSafe: false,
+      applicationCloseSafe: false,
     });
     expect(value.backend.processes.has(started.pid)).toBe(true);
   });
@@ -2516,7 +2516,7 @@ describe("OwnedRuntimeManager", () => {
           runtimeId: started.runtimeId,
           reason: expect.stringContaining("not a regular file"),
         })],
-        coordinatorCloseSafe: false,
+      applicationCloseSafe: false,
       });
       expect(reserve).not.toHaveBeenCalled();
       expect(value.backend.processes.has(started.pid)).toBe(true);
@@ -2564,29 +2564,29 @@ describe("OwnedRuntimeManager", () => {
     expect(value.manager.diagnosticStorageStats().reservedMutationRecords).toBe(5);
   });
 
-  it("seals owned runtime restoration before closing the observer coordinator", async () => {
+  it("seals owned runtime restoration before closing the observer application", async () => {
     const order: string[] = [];
     const result = await closeObserverRuntimeLifecycle({
       close: async () => {
         order.push("manager:start");
         await Promise.resolve();
         order.push("manager:sealed");
-        return { sealedRuntimeIds: ["rt-fixture"], coordinatorCloseSafe: true };
+        return { sealedRuntimeIds: ["rt-fixture"], applicationCloseSafe: true };
       },
     }, {
       close: async () => { order.push("coordinator:closed"); },
     });
-    expect(result).toEqual({ sealedRuntimeIds: ["rt-fixture"], coordinatorCloseSafe: true });
+      expect(result).toEqual({ sealedRuntimeIds: ["rt-fixture"], applicationCloseSafe: true });
     expect(order).toEqual(["manager:start", "manager:sealed", "coordinator:closed"]);
   });
 
-  it("keeps the observer coordinator alive when shutdown sealing is incomplete", async () => {
+  it("keeps the observer application alive when shutdown sealing is incomplete", async () => {
     const coordinatorClose = vi.fn(async () => undefined);
     await expect(closeObserverRuntimeLifecycle({
       close: async () => ({
         sealedRuntimeIds: [],
         busyRuntimeIds: ["rt-ffffffff-ffff-4fff-8fff-ffffffffffff"],
-        coordinatorCloseSafe: false,
+        applicationCloseSafe: false,
       }),
     }, {
       close: coordinatorClose,

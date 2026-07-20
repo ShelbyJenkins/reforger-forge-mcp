@@ -779,7 +779,7 @@ export function buildOperationalBaselineArtifact(input: Omit<
       measurement.outcome === "passed" && measurement.boundary === "capture");
     const observerClose = input.measurements.find((measurement) =>
       measurement.outcome === "passed" && measurement.boundary === "shutdown" &&
-      measurement.operation === "ObserverCoordinator.close");
+      measurement.operation === "ObserverApplication.close");
     if (!capture || !observerClose) {
       throw new Error("A passed operational baseline requires capture availability and observer cleanup evidence");
     }

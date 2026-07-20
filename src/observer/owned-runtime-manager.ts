@@ -1552,7 +1552,7 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
     this.closing = true;
     const attempt = this.closeOwnedRuntimes();
     this.closePromise = attempt.then((result) => {
-      if (result.coordinatorCloseSafe !== true) {
+      if (result.applicationCloseSafe !== true) {
         this.closing = false;
         this.closePromise = null;
       }
@@ -1581,7 +1581,7 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
         sealedRuntimeIds: [],
         busyRuntimeIds: [],
         errorRuntimes: [],
-        coordinatorCloseSafe: true,
+        applicationCloseSafe: true,
       };
     }
     if (!existsSync(runtimeDirectory)) {
@@ -1592,7 +1592,7 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
           runtimeId: "inventory",
           reason: "Owned runtime receipt directory is missing; shutdown safety is unverifiable",
         }],
-        coordinatorCloseSafe: false,
+        applicationCloseSafe: false,
       };
     }
     try {
@@ -1816,7 +1816,7 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
         sealedRuntimeIds,
         busyRuntimeIds,
         errorRuntimes,
-        coordinatorCloseSafe: busyRuntimeIds.length === 0 && errorRuntimes.length === 0,
+        applicationCloseSafe: busyRuntimeIds.length === 0 && errorRuntimes.length === 0,
       };
     } catch (error) {
       throw this.normalizeError(error, "SHUTDOWN_SEAL_FAILED", "Owned runtime shutdown sealing failed");
@@ -4142,16 +4142,16 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
 /** Preserve restoration authority before shutting down the in-memory observer agent. */
 export async function closeObserverRuntimeLifecycle(
   manager: Pick<OwnedRuntimeManager, "close">,
-  coordinator: { close(): Promise<void> }
+  application: { close(): Promise<void> }
 ): Promise<Record<string, unknown>> {
   const result = await manager.close();
-  if (result.coordinatorCloseSafe !== true) {
+  if (result.applicationCloseSafe !== true) {
     throw new OwnedRuntimeError(
       "SHUTDOWN_SEAL_FAILED",
-      "Observer coordinator remains live because one or more exact runtimes were not safely sealed",
+      "Observer application remains live because one or more exact runtimes were not safely sealed",
       result
     );
   }
-  await coordinator.close();
+  await application.close();
   return result;
 }

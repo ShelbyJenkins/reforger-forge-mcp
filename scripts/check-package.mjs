@@ -11,6 +11,7 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
+import { verifyPackagedAddonInventory } from "./lib/addon-inventory.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const npmExecPath = process.env.npm_execpath;
@@ -39,11 +40,54 @@ function directWindowsNpmCli() {
 
 const npmCliPath = npmExecPath ?? directWindowsNpmCli();
 const npmCommand = process.execPath;
-const npmCache = process.env.REFORGER_FORGE_NPM_CACHE
-  ?? join(tmpdir(), "reforger-forge-npm-cache");
+
+function configuredNpmCache() {
+  const inheritedCache = process.env.npm_config_cache?.trim();
+  if (inheritedCache) return inheritedCache;
+
+  const config = spawnSync(
+    npmCommand,
+    [npmCliPath, "config", "get", "cache"],
+    { encoding: "utf8", windowsHide: true, timeout: 10_000 }
+  );
+  if (!config.error && config.status === 0) {
+    const configuredCache = config.stdout.trim();
+    if (configuredCache) return configuredCache;
+  }
+
+  return join(root, ".npm-cache");
+}
+
+function isWritableCache(cachePath) {
+  try {
+    mkdirSync(cachePath, { recursive: true });
+    const probePath = mkdtempSync(join(cachePath, ".reforger-forge-cache-probe-"));
+    rmSync(probePath, { recursive: true, force: true });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Reuse npm's normal cache by default so repeated package smoke checks do not
+// redownload the production dependency tree. Package verification is offline
+// by default; set REFORGER_FORGE_NPM_ONLINE=1 for an explicit cache-warming run.
+const explicitNpmCache = process.env.REFORGER_FORGE_NPM_CACHE?.trim();
+const configuredCache = configuredNpmCache();
+const npmCache = explicitNpmCache
+  ?? (isWritableCache(configuredCache) ? configuredCache : join(root, ".npm-cache"));
+if (!isWritableCache(npmCache)) {
+  throw new Error(
+    `Npm cache is not writable: ${npmCache}. Set REFORGER_FORGE_NPM_CACHE to a writable ` +
+    "directory and retry."
+  );
+}
+const allowNetwork = process.env.REFORGER_FORGE_NPM_ONLINE === "1";
 const npmEnvironment = {
   ...process.env,
   npm_config_cache: npmCache,
+  npm_config_offline: allowNetwork ? (process.env.npm_config_offline ?? "false") : "true",
+  npm_config_prefer_offline: "true",
   npm_config_fund: "false",
   npm_config_audit: "false",
   npm_config_update_notifier: "false",
@@ -145,7 +189,6 @@ const requiredFiles = [
   "dist/observer/capture-job-store.js",
   "dist/observer/capture-request.js",
   "dist/observer/capture-service.js",
-  "dist/observer/coordinator.js",
   "dist/observer/evidence-run-service.js",
   "dist/observer/host-diagnostics.js",
   "dist/observer/launch.js",
@@ -202,6 +245,7 @@ const requiredFiles = [
   "package.json",
   "reforger-forge.config.example.json",
   "scripts/check-package.mjs",
+  "scripts/lib/addon-inventory.mjs",
   "scripts/install-agents.ps1",
   "scripts/list-tools.mjs",
   "scripts/run-observer-enforce-mailbox-acceptance.mjs",
@@ -297,8 +341,9 @@ const forbiddenObserverFiles = [...files].filter((path) =>
   (path.startsWith("observer/") && /(^|\/)resourceDatabase\.rdb$/i.test(path)) ||
   (path.startsWith("observer/") && /\.(bmp|png)$/i.test(path))
 );
+const forbiddenObserverFacade = files.has("dist/observer/coordinator.js");
 
-if (missingFiles.length || missingPrefixes.length || missingHandlers.length || unexpectedHandlers.length || missingObserverScripts.length || legacyPackagedHandlers.length || packagedRepositoryOnlySources.length || duplicateSharedBuildFiles.length || forbiddenObserverFiles.length) {
+if (missingFiles.length || missingPrefixes.length || missingHandlers.length || unexpectedHandlers.length || missingObserverScripts.length || legacyPackagedHandlers.length || packagedRepositoryOnlySources.length || duplicateSharedBuildFiles.length || forbiddenObserverFiles.length || forbiddenObserverFacade) {
   const details = [
     ...missingFiles.map((path) => `missing file: ${path}`),
     ...missingPrefixes.map((prefix) => `missing package content under: ${prefix}`),
@@ -313,6 +358,7 @@ if (missingFiles.length || missingPrefixes.length || missingHandlers.length || u
       `duplicate shared TypeScript build output must not be packaged: ${path}`
     ),
     ...forbiddenObserverFiles.map((path) => `forbidden observer runtime artifact: ${path}`),
+    ...(forbiddenObserverFacade ? ["deleted observer facade must not be packaged: dist/observer/coordinator.js"] : []),
   ];
   throw new Error(`Package content check failed:\n${details.map((line) => `  - ${line}`).join("\n")}`);
 }
@@ -351,8 +397,11 @@ if (missingFiles.length || missingPrefixes.length || missingHandlers.length || u
     throw commandFailure(
       "Fresh npm install --omit=dev of the packed tarball",
       install,
-      ` The smoke install uses isolated cache ${npmCache}; ensure the registry is reachable ` +
-        "or set REFORGER_FORGE_NPM_CACHE to a writable, pre-warmed cache."
+      ` The smoke install uses npm cache ${npmCache} in ` +
+        `${allowNetwork ? "network-enabled" : "offline"} mode; ` +
+        (allowNetwork
+          ? "ensure the registry is reachable or set REFORGER_FORGE_NPM_CACHE to a writable, pre-warmed cache."
+          : "populate it once with REFORGER_FORGE_NPM_ONLINE=1, then retry offline.")
     );
   }
 
@@ -372,6 +421,15 @@ if (missingFiles.length || missingPrefixes.length || missingHandlers.length || u
     );
   }
   const installedManifest = JSON.parse(readFileSync(installedManifestPath, "utf8"));
+  verifyPackagedAddonInventory(join(installedPackageRoot, "observer", "addon"), {
+    manifestName: ".reforger-forge-observer-source.json",
+    displayName: "Packaged observer add-on",
+  });
+  verifyPackagedAddonInventory(join(installedPackageRoot, "observer", "workbench-addon"), {
+    manifestName: ".reforger-forge-workbench-helper-source.json",
+    displayName: "Packaged Workbench helper add-on",
+    role: "workbench-helper",
+  });
   const advertisedBins = typeof installedManifest.bin === "string"
     ? { [installedManifest.name]: installedManifest.bin }
     : installedManifest.bin;

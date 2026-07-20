@@ -3,6 +3,7 @@
 **Status:** Planned maintainer-only validation work  
 **Scope:** Real local graphical-runtime and Workbench observer acceptance  
 **Non-goal:** GitHub-hosted CI, contributor setup, or any always-on product fault-control surface
+**Related context:** [Cross-cutting consolidation implementation guide](README.md), independent local-acceptance follow-on
 
 ## Outcome
 

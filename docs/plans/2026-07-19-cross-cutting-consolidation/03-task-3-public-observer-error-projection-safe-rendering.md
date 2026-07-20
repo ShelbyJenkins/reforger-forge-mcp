@@ -1,7 +1,7 @@
-# Safe-stable-stringify public rendering implementation guide
+# Public observer error projection and safe rendering implementation guide
 
 **Status:** Proposed follow-on work  
-**Parent context:** [Cross-cutting consolidation implementation guide](2026-07-19-cross-cutting-consolidation-implementation-guide.md), Tasks 1 and 3  
+**Parent context:** [Cross-cutting consolidation implementation guide](README.md), Task 3; Task 1 is a prerequisite  
 **Research snapshot:** 2026-07-19, against the active working tree  
 **Entry condition:** The reviewed diagnostic-redaction contract is available. This guide must not cause unredacted values to reach a public renderer.
 
@@ -24,16 +24,22 @@ a formatter failure or reveal a secret through a fallback path.
    runtime code imports it.
 2. Use it only for public diagnostic-detail presentation after the registry
    policy and diagnostic redactor have allowed the detail.
-3. Keep the public error-code classifier, fixed-message gate, subject line,
-   redaction profiles, and character budgets in local code.
-4. Normalize unknown values before serialization. Do not rely on a serializer
+3. The central projector owns code canonicalization, fixed-message selection,
+   diagnostic-detail gating, redaction, safe presentation, and final response
+   bounding. Each tool boundary remains only a classifier and subject-label
+   adapter.
+4. Keep the public error-code classifier, fixed-message gate, subject line,
+   redaction profiles, and character budgets in local code. Unknown errors
+   retain the existing internal public error policy.
+5. Normalize unknown values before serialization. Do not rely on a serializer
    to make arbitrary Error instances, class instances, getters, proxies, or
    toJSON methods safe for a public boundary.
-5. Use deterministic key order and finite depth/breadth limits. A detail that
+6. Use deterministic key order and finite depth/breadth limits. A detail that
    cannot fit safely must become a fixed harmless representation, never a
    sliced JSON fragment.
-6. Do not replace JSON serialization for manifests, protocol artifacts,
-   receipts, evidence, configuration, or persistence with this dependency.
+7. Do not replace JSON serialization for manifests, protocol artifacts,
+   receipts, evidence, configuration, persistence, or successful tool results
+   with this dependency.
 
 ## Non-goals
 
@@ -42,13 +48,14 @@ a formatter failure or reveal a secret through a fallback path.
   or server instance for an MCP response.
 - Do not change stable public error codes or subject lines.
 - Do not promise that arbitrary JavaScript objects are safe to inspect.
-- Do not use this migration to change successful tool-result JSON formatting.
+- Do not add lifecycle, server-composition, or tool-registration dependencies
+  to the public-contract boundary.
 
 ## Starting-point inventory
 
 The two observer tool boundaries currently construct error text locally and
-pass details through JSON.stringify. The parent guide already requires their
-error policy to converge in src/observer/public-contract.ts.
+pass details through JSON.stringify. The target is their convergence in
+src/observer/public-contract.ts.
 
 Run:
 
@@ -95,6 +102,13 @@ The rendering pipeline is:
         -> complete JSON result or fixed truncation result
         -> public-contract transport formatter
 
+public-contract.ts accepts only a narrow error-class extractor or guard for
+known ObserverCoordinatorError and OwnedRuntimeError values. It performs
+canonical code selection and the fixed-message gate before requesting details;
+unknown errors map to the existing internal public result. The two tool
+boundaries provide their stable subject lines ("Observer error" and "Observer
+runtime error") without duplicating rendering policy.
+
 The normalizer accepts primitives, arrays, and plain records only. It applies
 the same depth and breadth policy before reading values, rejects unsupported
 objects with a harmless marker, and must not invoke a getter or a custom
@@ -118,14 +132,14 @@ details entirely when no valid bounded form fits.
 
 ## Implementation tasks
 
-### SSS-0: freeze the existing public contract
+### T3-0: freeze the existing public contract
 
 1. Add characterization tests for both tool boundaries covering known
    bounded-diagnostic errors, fixed-message errors, unknown errors, and their
    existing subject text.
-2. Add sentinels for bearer credentials, owner tokens, contract bodies,
-   Windows paths. Confirm no permitted rendered detail leaks a
-   sentinel after the parent redactor is introduced.
+2. Add sentinels for bearer credentials, owner tokens, contract bodies, and
+   Windows paths. Confirm no permitted rendered detail leaks a sentinel after
+   the parent redactor is introduced.
 3. Add pre-migration cases for a circular record, BigInt, excessive nesting,
    excessive breadth, an unsupported class instance, a throwing getter, and a
    throwing toJSON method.
@@ -136,7 +150,7 @@ details entirely when no valid bounded form fits.
 **Acceptance:** The suite distinguishes error-policy regressions, redaction
 regressions, and serialization-safety regressions.
 
-### SSS-1: add and verify the dependency
+### T3-1: add and verify the dependency
 
 1. Add an exact reviewed safe-stable-stringify version to dependencies and
    regenerate package-lock.json.
@@ -150,7 +164,7 @@ regressions, and serialization-safety regressions.
 **Acceptance:** The installed MCP server can load the adapter on supported
 Node versions, and no dependency version is floating.
 
-### SSS-2: implement the safe public-value adapter
+### T3-2: implement the safe public-value adapter
 
 1. Implement a normalizer that recognizes only primitives, arrays, and records
    with an approved plain-object prototype.
@@ -169,11 +183,13 @@ Node versions, and no dependency version is floating.
 **Acceptance:** Every unknown input produces a finite, deterministic,
 non-throwing result without evaluating accessors or toJSON methods.
 
-### SSS-3: compose it with the redactor and public contract
+### T3-3: compose the projector with the redactor and public contract
 
 1. Extend the central public observer projector in
    src/observer/public-contract.ts to obtain details only from its narrow
-   error-class adapter.
+   error-class adapter. It owns canonical code selection, fixed-message
+   selection, diagnostic-detail gating, redaction, safe presentation, and the
+   final 512-character response bound.
 2. Apply canonical code selection and the fixed-message gate before requesting
    details. A fixed-message result must not inspect or serialize hidden
    diagnostic data.
@@ -190,7 +206,7 @@ non-throwing result without evaluating accessors or toJSON methods.
 **Acceptance:** Both error paths return the same code, gate, redaction, safe
 serialization, and bounded-detail result for equivalent input.
 
-### SSS-4: prove negative cases and package behavior
+### T3-4: prove negative cases and package behavior
 
 1. Assert circular details render their configured marker and do not throw.
 2. Assert BigInt values follow the selected explicit representation.
@@ -219,7 +235,7 @@ test as passing.
 
 ## Completion criteria
 
-This follow-on is complete when:
+This Task 3 follow-on is complete when:
 
 - safe-stable-stringify is pinned, locked, compatible with supported Node
   versions, and available in the packed production installation;

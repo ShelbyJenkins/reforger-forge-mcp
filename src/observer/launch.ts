@@ -1,4 +1,4 @@
-import { ObserverCoordinatorError } from "./coordinator.js";
+import { ObserverCoordinatorError } from "./errors.js";
 
 export interface ObserverLaunchInput {
   runtimeKind: "client" | "listenServer" | "dedicated" | "testRunner";

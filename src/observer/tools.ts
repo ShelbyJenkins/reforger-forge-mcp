@@ -1,12 +1,8 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
-import {
-  ObserverCoordinatorError,
-  type ObserverCaptureResult,
-  type ObserverCoordinator,
-} from "./coordinator.js";
-import type { ObserverApplication } from "./application.js";
+import type { ObserverApplication, ObserverCaptureResult } from "./application.js";
+import { ObserverCoordinatorError } from "./errors.js";
 import { prepareObserverLaunch } from "./launch.js";
 import { runObserverSetup } from "./setup.js";
 import type { WorkbenchClient } from "../workbench/client.js";
@@ -115,7 +111,7 @@ function isPng(image: Buffer): boolean {
 
 export function registerObserverTools(
   server: McpServer,
-  coordinator: ObserverApplication | ObserverCoordinator,
+  application: ObserverApplication,
   defaults: ObserverToolDefaults = {}
 ): void {
   const sessionTtlMs = defaults.sessionTtlMs ?? 20 * 60 * 1_000;
@@ -139,7 +135,7 @@ export function registerObserverTools(
             text: jsonText(
               `Observer ${action} completed.`,
               await runObserverSetup(
-                coordinator,
+                application,
                 action,
                 defaults.workbenchClient
                   ? { client: defaults.workbenchClient, projectPath: defaults.projectPath }
@@ -173,7 +169,7 @@ export function registerObserverTools(
     async (input) => {
       try {
         const prepared = await prepareObserverLaunch(
-          coordinator,
+          application,
           input,
           defaults.ownedRuntimeManager
         );
@@ -198,7 +194,7 @@ export function registerObserverTools(
     },
     async (input, extra) => {
       try {
-        const result = await coordinator.instances({ ...input, signal: extra.signal });
+        const result = await application.instances({ ...input, signal: extra.signal });
         return { content: [{ type: "text" as const, text: jsonText("Observer instance inventory.", result) }] };
       } catch (error) {
         return toolError(error);
@@ -221,7 +217,7 @@ export function registerObserverTools(
         idempotencyKey: z.string().min(1).max(128).optional(),
         asynchronous: z.boolean().default(false),
         timeoutMs: z.number().int().min(1_000).max(5 * 60 * 1_000)
-          .default(defaults.defaultCaptureTimeoutMs ?? coordinator.defaultCaptureTimeoutMs),
+          .default(defaults.defaultCaptureTimeoutMs ?? application.defaultCaptureTimeoutMs),
         settleFrames: z.number().int().min(0).max(30).default(0),
         expectedWorldId: z.string().min(1).max(512).nullable().optional().describe(
           "Exact world ID returned by the immediately preceding observer_instances inventory."
@@ -237,7 +233,7 @@ export function registerObserverTools(
     },
     async (input, extra) => {
       try {
-        const result = await coordinator.capture({
+        const result = await application.capture({
           ...input,
           idempotencyKey: input.idempotencyKey ?? `mcp-${randomUUID()}`,
           signal: extra.signal,
@@ -245,7 +241,7 @@ export function registerObserverTools(
         if (result.asynchronous) {
           return { content: [{ type: "text" as const, text: jsonText("Observer capture queued.", result.job) }] };
         }
-        if (result.image.length > coordinator.maxInlineImageBytes) {
+        if (result.image.length > application.maxInlineImageBytes) {
           throw new ObserverCoordinatorError(
             "ARTIFACT_TOO_LARGE",
             "Validated PNG exceeds the configured MCP inline limit",
@@ -281,7 +277,7 @@ export function registerObserverTools(
     async ({ action, sessionId, jobId }) => {
       try {
         if (action === "read") {
-          const result = await coordinator.readJob(sessionId, jobId);
+          const result = await application.readJob(sessionId, jobId);
           if (!isPng(result.image)) throw new ObserverCoordinatorError("ARTIFACT_INVALID", "Observer agent did not return a validated PNG");
           return {
             content: [
@@ -291,10 +287,10 @@ export function registerObserverTools(
           };
         }
         const result = action === "status"
-          ? await coordinator.jobStatus(sessionId, jobId)
+          ? await application.jobStatus(sessionId, jobId)
           : action === "cancel"
-            ? await coordinator.cancelJob(sessionId, jobId)
-            : await coordinator.releaseJob(sessionId, jobId);
+            ? await application.cancelJob(sessionId, jobId)
+            : await application.releaseJob(sessionId, jobId);
         return { content: [{ type: "text" as const, text: jsonText(`Observer job ${action} completed.`, result) }] };
       } catch (error) {
         return toolError(error);
@@ -345,7 +341,7 @@ export function registerObserverTools(
         let result: Record<string, unknown>;
         if (input.action === "begin") {
           if (!input.title) throw new ObserverCoordinatorError("INVALID_REQUEST", "title is required for observer_run begin");
-          result = await coordinator.beginRun({
+          result = await application.beginRun({
             title: input.title,
             ...(input.caseIds ? { caseIds: input.caseIds } : {}),
             ...(input.sourceRevision ? { sourceRevision: input.sourceRevision } : {}),
@@ -354,10 +350,10 @@ export function registerObserverTools(
           });
         } else if (input.action === "status") {
           if (!input.runId) throw new ObserverCoordinatorError("INVALID_REQUEST", "runId is required for observer_run status");
-          result = await coordinator.runStatus(input.runId);
+          result = await application.runStatus(input.runId);
         } else if (input.action === "discard") {
           if (!input.runId) throw new ObserverCoordinatorError("INVALID_REQUEST", "runId is required for observer_run discard");
-          result = await coordinator.discardRun(input.runId);
+          result = await application.discardRun(input.runId);
         } else {
           if (!input.runId || !input.evidenceRoot || !input.includeCaptureLabels || !input.review) {
             throw new ObserverCoordinatorError(
@@ -365,7 +361,7 @@ export function registerObserverTools(
               "runId, evidenceRoot, includeCaptureLabels, and review are required for observer_run finalize"
             );
           }
-          result = await coordinator.finalizeRun({
+          result = await application.finalizeRun({
             runId: input.runId,
             evidenceRoot: input.evidenceRoot,
             includeCaptureLabels: input.includeCaptureLabels,

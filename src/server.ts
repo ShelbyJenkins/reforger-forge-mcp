@@ -74,7 +74,7 @@ export type RegisteredToolsDisposer = () => Promise<Record<string, unknown>>;
 /**
  * The process-wide Workbench lifecycle object graph owned by the MCP server.
  * Keeping construction here makes it impossible for tool registrars or the
- * observer adapter to accidentally create a second coordinator.
+ * observer adapter to accidentally create a second observer application.
  */
 export interface WorkbenchServerComposition {
   readonly processGuard: WorkbenchProcessGuard;

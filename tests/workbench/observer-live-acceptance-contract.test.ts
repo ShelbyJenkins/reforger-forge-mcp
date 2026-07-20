@@ -95,13 +95,14 @@ describe("live Workbench observer acceptance contract", () => {
       resolve("scripts/run-workbench-observer-acceptance.ts"),
       "utf8"
     );
-    expect(source).toContain("new ObserverCoordinator({");
+    expect(source).toContain("createObserverApplication({");
     expect(source).toContain('"dist", "observer", "agent", "private-child.js"');
-    expect(source).toContain("await coordinator.beginRun({");
-    expect(source).toContain("await coordinator.capture({");
-    expect(source).toContain("await coordinator.jobStatus(undefined, jobId)");
-    expect(source).toContain("await coordinator.readJob(undefined, jobId)");
-    expect(source).toContain("await coordinator.finalizeRun({");
+    expect(source).toContain("await application.beginRun({");
+    expect(source).toContain("await application.capture({");
+    expect(source).toContain("await application.jobStatus(undefined, jobId)");
+    expect(source).toContain("await application.readJob(undefined, jobId)");
+    expect(source).toContain("await application.finalizeRun({");
+    expect(source).toContain('"ObserverApplication.close"');
     expect(source).toContain("bundle = validateFinalizedBundle(");
     expect(source).toContain("comparePngImages(initial.image, pose.image)");
     expect(source).toContain("if (!poseDifference.materiallyDifferent)");

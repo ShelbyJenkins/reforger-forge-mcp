@@ -48,8 +48,9 @@ merged `-addonsDir`, one merged `-addons`, one matching `-profile`, and
 
 The MCP server creates one host observer application. Its shared capture
 service owns routing, public jobs, idempotency, deadlines, run binding,
-promotion, cancellation, and release for both runtime and Workbench backends;
-the historical coordinator only delegates. The application lazily forks
+promotion, cancellation, and release for both runtime and Workbench backends.
+The application also owns orderly shutdown: capture restoration completes
+before the private child closes. It lazily forks
 `dist/observer/agent/private-child.js` with an inherited JSON IPC channel and
 an ephemeral loopback runtime port. The child is never adopted by another MCP,
 exits on parent-channel loss, and is asked to shut down when the MCP transport
@@ -322,7 +323,7 @@ requesting `pose` or `lookAt`; that restoration proof enables
 not prove elapsed gameplay time. Use `performancePolicy="evidence"` normally.
 `instrumented` deliberately marks the result contaminated and adds a warning;
 `performance` is not a public capture policy because no external measurement
-coordinator exists.
+instrumentation exists.
 
 Inventory first, select an explicit renderer, and bind the inventory's
 `worldId` and `worldEpoch` into the request. Submission fails before camera
@@ -481,7 +482,7 @@ On failure, the harness cancels unfinished jobs and requires terminal camera
 restoration before discarding the managed run. If restoration cannot be
 proven, it preserves the open run and managed artifacts for diagnosis instead.
 It then stops only its exact-owned runtime after the restoration gate, closes
-the coordinator, and proves process vacancy. It retains the external
+the host application, and proves process vacancy. It retains the external
 `acceptance-summary.json`; no scratch data is written into a target project or
 its `screenshots` directory. A successful run removes its exact owned managed,
 profile, and diagnostic scratch, leaving only the summary and finalized

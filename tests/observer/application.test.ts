@@ -1,8 +1,10 @@
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
+import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { createObserverApplication as createAgentApplication } from "../../observer/agent/application.js";
 import { createObserverApplication as createHostApplication } from "../../src/observer/application.js";
+import { registerObserverTools } from "../../src/observer/tools.js";
 import { cleanup, observerAddonSource, temporaryDirectory } from "./helpers.js";
 
 describe("observer application composition roots", () => {
@@ -40,5 +42,29 @@ describe("observer application composition roots", () => {
       await app.close();
       expect(app.diagnosticPrivateChildCount()).toBe(0);
     } finally { cleanup(root); }
+  });
+
+  it("registers MCP tools directly against the host application interface", async () => {
+    const root = temporaryDirectory("rfo-host-registration-");
+    const registered: string[] = [];
+    const server = {
+      registerTool(name: string): void { registered.push(name); },
+    } as unknown as McpServer;
+    const app = createHostApplication({ managedRoot: join(root, "managed"), profileRoot: join(root, "profiles") });
+    try {
+      registerObserverTools(server, app, { ownedRuntimeManager: {} as never });
+      expect(registered).toEqual([
+        "observer_setup",
+        "observer_prepare_launch",
+        "observer_instances",
+        "observer_capture",
+        "observer_job",
+        "observer_runtime",
+        "observer_run",
+      ]);
+    } finally {
+      await app.close();
+      cleanup(root);
+    }
   });
 });

@@ -176,7 +176,7 @@ describe("live graphical runtime observer acceptance contract", () => {
   it("uses the public run workflow and exact-owned runtime lifecycle service", () => {
     const source = readFileSync(resolve("scripts/run-runtime-observer-acceptance.ts"), "utf8");
     expect(source).toContain("agentPath: PRIVATE_CHILD_PATH");
-    expect(source).toContain("await prepareObserverLaunch(coordinator");
+    expect(source).toContain("await prepareObserverLaunch(application");
     expect(source).toContain("}, runtimeManager);");
     expect(source).toContain("new OwnedRuntimeManager({");
     expect(source).toContain("executableResolver: () => executable");
@@ -188,12 +188,12 @@ describe("live graphical runtime observer acceptance contract", () => {
     expect(source).toContain("vacantRuntime.identityVacant !== true");
     expect(source).toContain('runtimeKind: "listenServer"');
     expect(source).toContain('"-server", worldResource');
-    expect(source).toContain("await coordinator.beginRun(");
-    expect(source).toContain("coordinator.instances({");
-    expect(source).toContain("await coordinator.capture(");
-    expect(source).toContain("await coordinator.finalizeRun(");
+    expect(source).toContain("await application.beginRun(");
+    expect(source).toContain("application.instances({");
+    expect(source).toContain("await application.capture(");
+    expect(source).toContain("await application.finalizeRun(");
     const stopIndex = source.indexOf("await runtimeManager.stop({");
-    const revokeIndex = source.indexOf("coordinator.revokeSession(sessionId)");
+    const revokeIndex = source.indexOf("application.revokeSession(sessionId)");
     expect(stopIndex).toBeGreaterThan(-1);
     expect(revokeIndex).toBeGreaterThan(stopIndex);
     expect(source).toContain("preserved because exact-process vacancy was not proven");
@@ -246,7 +246,7 @@ describe("live graphical runtime observer acceptance contract", () => {
 
   it("keeps the production observer launcher-neutral", () => {
     const production = [
-      "src/observer/coordinator.ts",
+      "src/observer/application.ts",
       "src/observer/launch.ts",
       "src/observer/setup.ts",
       "src/observer/tools.ts",

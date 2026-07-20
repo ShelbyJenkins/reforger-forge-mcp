@@ -1,7 +1,7 @@
-# Tar package-archive verification implementation guide
+# Task 4 — Source-manifest and tar package-archive verification
 
 **Status:** Proposed follow-on work  
-**Parent context:** [Cross-cutting consolidation implementation guide](2026-07-19-cross-cutting-consolidation-implementation-guide.md), Task 4  
+**Parent context:** [Cross-cutting consolidation implementation guide](README.md), Task 4  
 **Research snapshot:** 2026-07-19, against the active working tree  
 **Entry condition:** The source-manifest contract is implemented or scheduled for the same review boundary. This guide does not redefine that contract.
 
@@ -208,3 +208,72 @@ This follow-on is complete when:
 - package checks have no duplicated hand-maintained add-on filename list; and
 - build, focused tests, full tests, and package smoke tests are green.
 
+## Detailed task plan
+
+**Goal:** Adding or removing an observer add-on file requires updating one
+canonical generated manifest, not hand-maintained lists in packaging, host
+code, and tests.
+
+**Primary files:**
+
+- scripts/update-observer-source-manifest.mjs;
+- scripts/check-package.mjs;
+- scripts/lib/addon-inventory.mjs or an equivalent reusable pure helper;
+- src/workbench/helper-addon.ts, a generated helper-payload descriptor, and
+  observer/agent/staging.ts;
+- tests/observer/package-contract.test.ts;
+- package scripts and the two source manifests.
+
+**Actions:**
+
+1. Extract a pure manifest reader/validator usable by the manifest updater and
+   package checker. It validates manifest version/role, normalized relative
+   paths, no duplicates under the platform comparison rules, digest shape, and
+   the allowed generated resource-database exception.
+2. Add a check mode to the manifest updater, or an equivalent pure rendered
+   comparison. CI must be able to fail for a stale manifest without rewriting
+   the checkout.
+3. Change check-package.mjs to read each manifest from the packed tarball.
+   Verify every manifest entry is packaged and that every add-on payload file
+   is declared, allowing only the manifest itself and explicitly documented
+   derived resources.
+4. Replace hard-coded runtime script arrays, Workbench handler arrays, and
+   tests that assert a manually copied inventory/count with derivation from
+   the appropriate verified manifest. Keep semantic assertions about required
+   handler behavior; remove only copied filenames.
+5. Have source-manifest generation also write a checked-in TypeScript
+   descriptor, such as src/workbench/helper-addon-payload.generated.ts. It
+   exports the exact helper payload/handler lists derived from the verified
+   manifest. Helper staging imports that descriptor rather than dynamically
+   trusting a source manifest at runtime; its fail-closed allowlist and
+   immutable identity checks remain intact.
+6. Include the inventory helper and generated descriptor in package-content
+   expectations where they are needed by the installed package. Remove the
+   current incomplete hard-coded runtime list as well as copied Workbench
+   handler lists.
+7. Establish the generation order:
+
+~~~text
+protocol generation
+    -> generated Enforce C files
+    -> source-manifest generation
+    -> manifest check / package check
+~~~
+
+**Tests:**
+
+- an omitted declared file, undeclared added file, duplicate path, symlink,
+  invalid digest, and stale generated file all fail closed;
+- a tarball fixture proves the package checker reads the archive manifest,
+  not the source working tree;
+- adding a temporary valid source file and regenerating the manifest makes all
+  inventory consumers and the generated helper descriptor see it without
+  editing a copied list;
+- helper staging still rejects a missing or unexpected payload after the
+  descriptor migration;
+- generated resourceDatabase.rdb handling remains narrowly limited to its
+  existing staged-bundle purpose.
+
+**Acceptance:** The manifests are the sole maintained filename inventories.
+No packaging or contract test contains a copied list of observer add-on
+payload filenames.

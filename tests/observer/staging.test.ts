@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { ObserverError } from "../../observer/agent/errors.js";
@@ -28,6 +28,24 @@ describe("observer addon staging", () => {
     const staged = manager.ensureStaged();
     writeFileSync(join(staged.addonDirectory, "addon.gproj"), "modified");
     expect(() => manager.ensureStaged()).toThrowError(expect.objectContaining<Partial<ObserverError>>({ code: "STAGED_ADDON_CONFLICT" }));
+  });
+
+  it("rejects undeclared source additions and manifest-declared source removals", () => {
+    const root = temporaryDirectory();
+    roots.push(root);
+    const added = join(root, "added");
+    cpSync(observerAddonSource, added, { recursive: true });
+    writeFileSync(join(added, "undeclared-source-file.txt"), "not in the source manifest", "utf8");
+    expect(() => verifySourceBundle(added)).toThrowError(expect.objectContaining<Partial<ObserverError>>({
+      code: "ADDON_STAGE_FAILED",
+    }));
+
+    const removed = join(root, "removed");
+    cpSync(observerAddonSource, removed, { recursive: true });
+    unlinkSync(join(removed, "addon.gproj"));
+    expect(() => verifySourceBundle(removed)).toThrowError(expect.objectContaining<Partial<ObserverError>>({
+      code: "ADDON_STAGE_FAILED",
+    }));
   });
 
   it("preserves modified and unrelated files during cleanup", () => {

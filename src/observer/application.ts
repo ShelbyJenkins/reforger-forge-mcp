@@ -287,10 +287,10 @@ class DefaultObserverApplication implements ObserverApplication {
   async closeRuntimeLifecycle(): Promise<Record<string, unknown>> {
     if (!this.ownedRuntimeManager) {
       await this.closeServices();
-      return { sealedRuntimeIds: [], busyRuntimeIds: [], errorRuntimes: [], coordinatorCloseSafe: true };
+      return { sealedRuntimeIds: [], busyRuntimeIds: [], errorRuntimes: [], applicationCloseSafe: true };
     }
     const result = await this.ownedRuntimeManager.close();
-    if (result.coordinatorCloseSafe !== true) {
+    if (result.applicationCloseSafe !== true) {
       throw new OwnedRuntimeError(
         "SHUTDOWN_SEAL_FAILED",
         "Observer application remains live because one or more exact runtimes were not safely sealed",

@@ -11,10 +11,8 @@ import {
 } from "node:fs";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import {
-  ObserverCoordinator,
-  type ObserverChildDescriptor,
-} from "../../src/observer/coordinator.js";
+import { createObserverApplication, type ObserverApplication } from "../../src/observer/application.js";
+import type { ObserverChildDescriptor } from "../../src/observer/agent-client.js";
 import {
   OwnedRuntimeManager,
   type OwnedRuntimeExactIdentity,
@@ -100,11 +98,11 @@ class BoundaryChild extends EventEmitter {
 
 type ReleaseFault = "none" | "before_delivery" | "after_application";
 
-class FaultingCoordinatorGate implements OwnedRuntimeObserverGate {
+class FaultingApplicationGate implements OwnedRuntimeObserverGate {
   releaseAttempts = 0;
 
   constructor(
-    private readonly coordinator: ObserverCoordinator,
+    private readonly application: ObserverApplication,
     private releaseFault: ReleaseFault = "none"
   ) {}
 
@@ -114,7 +112,7 @@ class FaultingCoordinatorGate implements OwnedRuntimeObserverGate {
     generation: string,
     authority: OwnedRuntimeLifecycleAuthority
   ) {
-    return this.coordinator.retainRuntimeLifecycle(sessionId, runtimeId, generation, authority);
+    return this.application.retainRuntimeLifecycle(sessionId, runtimeId, generation, authority);
   }
 
   async releaseRuntimeLifecycle(sessionId: string, runtimeId: string, generation: string) {
@@ -122,7 +120,7 @@ class FaultingCoordinatorGate implements OwnedRuntimeObserverGate {
     const fault = this.releaseFault;
     this.releaseFault = "none";
     if (fault === "before_delivery") throw new Error("fixture lost release before IPC delivery");
-    const result = await this.coordinator.releaseRuntimeLifecycle(sessionId, runtimeId, generation);
+    const result = await this.application.releaseRuntimeLifecycle(sessionId, runtimeId, generation);
     if (fault === "after_application") throw new Error("fixture lost release response after application");
     return result;
   }
@@ -133,7 +131,7 @@ class FaultingCoordinatorGate implements OwnedRuntimeObserverGate {
     exactRuntimeVacant?: boolean,
     lifecycle?: OwnedRuntimeLifecycleIdentity
   ): Promise<RuntimeStopPreflight> {
-    return this.coordinator.reserveRuntimeStop(
+    return this.application.reserveRuntimeStop(
       sessionId,
       proposedReservationId,
       exactRuntimeVacant,
@@ -146,7 +144,7 @@ class FaultingCoordinatorGate implements OwnedRuntimeObserverGate {
     reservationId: string,
     lifecycle?: OwnedRuntimeLifecycleIdentity
   ) {
-    return this.coordinator.releaseRuntimeStop(sessionId, reservationId, lifecycle);
+    return this.application.releaseRuntimeStop(sessionId, reservationId, lifecycle);
   }
 
   completeRuntimeStop(
@@ -155,7 +153,7 @@ class FaultingCoordinatorGate implements OwnedRuntimeObserverGate {
     exactRuntimeVacant?: boolean,
     lifecycle?: OwnedRuntimeLifecycleIdentity
   ) {
-    return this.coordinator.completeRuntimeStop(
+    return this.application.completeRuntimeStop(
       sessionId,
       reservationId,
       exactRuntimeVacant,
@@ -169,8 +167,8 @@ interface BoundaryHarness {
   managedRoot: string;
   profileRoot: string;
   executable: string;
-  coordinator: ObserverCoordinator;
-  gate: FaultingCoordinatorGate;
+  application: ObserverApplication;
+  gate: FaultingApplicationGate;
   backend: BoundaryBackend;
   manager: OwnedRuntimeManager;
   prepare(cycle: string, sessionTtlMs?: number): Promise<{
@@ -182,10 +180,10 @@ interface BoundaryHarness {
 }
 
 const roots: string[] = [];
-const coordinators: ObserverCoordinator[] = [];
+const applications: ObserverApplication[] = [];
 
 afterEach(async () => {
-  await Promise.allSettled(coordinators.splice(0).map((coordinator) => coordinator.close()));
+  await Promise.allSettled(applications.splice(0).map((application) => application.close()));
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
@@ -202,7 +200,7 @@ function makeBoundaryHarness(
   mkdirSync(dirname(executable), { recursive: true });
   mkdirSync(profileRoot, { recursive: true });
   writeFileSync(executable, "private child boundary fixture\n");
-  const coordinator = new ObserverCoordinator({
+  const application = createObserverApplication({
     agentPath: join(repositoryRoot, "tests", "observer", "fixtures", "private-child-entry.mjs"),
     managedRoot,
     profileRoot,
@@ -212,8 +210,8 @@ function makeBoundaryHarness(
     privateChildSweepIntervalMs: 100,
     privateChildSessionTerminalRetentionMs: sessionTerminalRetentionMs,
   });
-  coordinators.push(coordinator);
-  const gate = new FaultingCoordinatorGate(coordinator, releaseFault);
+  applications.push(application);
+  const gate = new FaultingApplicationGate(application, releaseFault);
   const backend = new BoundaryBackend();
   let pid = 51_000;
   let id = 1;
@@ -256,7 +254,7 @@ function makeBoundaryHarness(
     managedRoot,
     profileRoot,
     executable,
-    coordinator,
+    application,
     gate,
     backend,
     manager,
@@ -269,7 +267,7 @@ function makeBoundaryHarness(
         transportPreference: ["rest"],
         forceUpdate: false,
       };
-      const raw = await coordinator.prepareLaunch(input as unknown as Record<string, unknown>);
+      const raw = await application.prepareLaunch(input as unknown as Record<string, unknown>);
       const session = raw.session as Record<string, unknown>;
       const prepared: ObserverPreparedLaunch = {
         arguments: raw.arguments as string[],
@@ -330,8 +328,8 @@ function pendingRecord(value: BoundaryHarness): { path: string; record: Record<s
   return { path, record: JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown> };
 }
 
-async function forceUnexpectedPrivateChildLoss(coordinator: ObserverCoordinator): Promise<void> {
-  const internals = coordinator as unknown as { child: ChildProcess | null };
+async function forceUnexpectedPrivateChildLoss(application: ObserverApplication): Promise<void> {
+  const internals = application as unknown as { child: ChildProcess | null };
   const child = internals.child;
   if (!child) throw new Error("Expected a ready private observer child");
   child.kill("SIGKILL");
@@ -377,7 +375,7 @@ async function putCameraJobIntoRestoring(
   const instanceId = `runtime-private-child-${cycle}`;
   const instanceNonce = `runtime_nonce_private_child_${String(cycle).padStart(32, "0")}`;
   const base = await registerGraphicalRuntime(descriptor, contract, instanceId, instanceNonce);
-  const capture = await value.coordinator.capture({
+  const capture = await value.application.capture({
     sessionId: String(contract.sessionId),
     instanceId,
     idempotencyKey: `camera-private-child-${cycle}`,
@@ -434,11 +432,11 @@ describe("actual private-child owned-runtime recovery boundary", () => {
         preparedLaunchId: prepared.preparedLaunchId,
         idempotencyKey: `start-private-child-${cycle}`,
       });
-      const firstDescriptor = await value.coordinator.ensureStarted();
+      const firstDescriptor = await value.application.ensureStarted();
       const contract = JSON.parse(readFileSync(prepared.contractPath, "utf8")) as Record<string, unknown>;
       const camera = await putCameraJobIntoRestoring(value, firstDescriptor, contract, cycle);
 
-      await forceUnexpectedPrivateChildLoss(value.coordinator);
+      await forceUnexpectedPrivateChildLoss(value.application);
       await new Promise((resolve) => setTimeout(resolve, 3_100));
 
       await expect(value.manager.status(started.runtimeId)).resolves.toMatchObject({
@@ -447,7 +445,7 @@ describe("actual private-child owned-runtime recovery boundary", () => {
         state: "stale",
         exactOwned: true,
       });
-      const replacementStatus = await value.coordinator.status();
+      const replacementStatus = await value.application.status();
       expect(replacementStatus.jobs).toEqual(expect.arrayContaining([
         expect.objectContaining({
           jobId: camera.jobId,
@@ -467,7 +465,7 @@ describe("actual private-child owned-runtime recovery boundary", () => {
         details: { restorationPendingJobIds: [camera.jobId] },
       });
 
-      const replacementDescriptor = await value.coordinator.ensureStarted();
+      const replacementDescriptor = await value.application.ensureStarted();
       const replacementBase = `http://${replacementDescriptor.host}:${replacementDescriptor.port}`;
       const status = (sequence: number, state: string, extra: Record<string, unknown> = {}) => ({
         protocolVersion: "1.0",
@@ -549,7 +547,7 @@ describe("actual private-child owned-runtime recovery boundary", () => {
     });
 
     await new Promise((resolve) => setTimeout(resolve, 1_200));
-    const retainedStatus = await value.coordinator.status();
+    const retainedStatus = await value.application.status();
     expect(retainedStatus.sessions).toEqual(expect.arrayContaining([
       expect.objectContaining({ sessionId: prepared.sessionId }),
     ]));
@@ -571,7 +569,7 @@ describe("actual private-child owned-runtime recovery boundary", () => {
     await value.manager.sweep();
     await waitFor(() => !existsSync(authorityPath(value, runtimeId)));
     await waitFor(async () => {
-      const status = await value.coordinator.status();
+      const status = await value.application.status();
       return !(status.sessions as Array<Record<string, unknown>>)
         .some((session) => session.sessionId === prepared.sessionId);
     });

@@ -97,6 +97,8 @@ describe("observer package and source contracts", () => {
     expect(packageCheck).toContain("dist/observer/agent/application-operations.js");
     expect(packageCheck).toContain("dist/observer/agent/evidence-bundle-service.js");
     expect(packageCheck).toContain("dist/observer/application.js");
+    expect(packageCheck).toContain("deleted observer facade must not be packaged");
+    expect(packageCheck).toContain('files.has("dist/observer/coordinator.js")');
     expect(packageCheck).toContain("dist/observer/capture-service.js");
     expect(packageCheck).toContain("dist/observer/evidence-run-service.js");
     expect(packageCheck).toContain("dist/observer/owned-runtime-manager.js");
@@ -220,9 +222,10 @@ describe("observer package and source contracts", () => {
 
   it("packages and centrally registers the completed Phase H integration", () => {
     const observerSource = join(repositoryRoot, "src", "observer");
-    for (const name of ["application.ts", "agent-client.ts", "capture-service.ts", "evidence-run-service.ts", "coordinator.ts", "setup.ts", "launch.ts", "owned-runtime-manager.ts", "tools.ts"]) {
+    for (const name of ["application.ts", "agent-client.ts", "capture-service.ts", "evidence-run-service.ts", "setup.ts", "launch.ts", "owned-runtime-manager.ts", "tools.ts"]) {
       expect(existsSync(join(observerSource, name))).toBe(true);
     }
+    expect(existsSync(join(observerSource, "coordinator.ts"))).toBe(false);
     expect(existsSync(join(repositoryRoot, "src", "tools", "observer-runtime.ts"))).toBe(true);
     expect(existsSync(join(repositoryRoot, "observer", "agent", "private-child.ts"))).toBe(true);
     const server = readFileSync(join(repositoryRoot, "src", "server.ts"), "utf8");

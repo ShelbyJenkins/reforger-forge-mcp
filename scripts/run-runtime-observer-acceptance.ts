@@ -18,10 +18,11 @@ import { fileURLToPath } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 import { loadConfig } from "../src/config.js";
 import {
-  ObserverCoordinator,
+  createObserverApplication,
+  type ObserverApplication,
   type ObserverCaptureResult,
   type ObserverCaptureView,
-} from "../src/observer/coordinator.js";
+} from "../src/observer/application.js";
 import { prepareObserverLaunch } from "../src/observer/launch.js";
 import { OwnedRuntimeManager } from "../src/observer/owned-runtime-manager.js";
 import {
@@ -74,7 +75,6 @@ const RUNTIME_OPERATIONAL_BASELINE_SOURCES = [
   "package-lock.json",
   "package.json",
   "scripts/windows/workbench-lifecycle.ps1",
-  "src/observer/coordinator.ts",
   "src/observer/application.ts",
   "src/observer/capture-service.ts",
   "src/observer/evidence-run-service.ts",
@@ -528,7 +528,7 @@ function validateCapture(
 }
 
 async function captureIntoRunUnmeasured(
-  coordinator: ObserverCoordinator,
+  application: ObserverApplication,
   input: {
     runId: string;
     label: typeof CAPTURE_LABELS[number];
@@ -541,7 +541,7 @@ async function captureIntoRunUnmeasured(
     timeoutMs: number;
   }
 ): Promise<RetainedCapture> {
-  const result = await coordinator.capture({
+  const result = await application.capture({
     runId: input.runId,
     captureLabel: input.label,
     purpose: input.purpose,
@@ -560,7 +560,7 @@ async function captureIntoRunUnmeasured(
 }
 
 async function captureIntoRun(
-  coordinator: ObserverCoordinator,
+  application: ObserverApplication,
   input: {
     runId: string;
     label: typeof CAPTURE_LABELS[number];
@@ -576,8 +576,8 @@ async function captureIntoRun(
 ): Promise<RetainedCapture> {
   return baseline.measure(
     "capture",
-    `ObserverCoordinator.capture(${input.label})`,
-    () => captureIntoRunUnmeasured(coordinator, input),
+    `ObserverApplication.capture(${input.label})`,
+    () => captureIntoRunUnmeasured(application, input),
     input.label
   );
 }
@@ -770,21 +770,21 @@ function verifyEvidenceBundle(
 }
 
 async function cancelRunJobs(
-  coordinator: ObserverCoordinator,
+  application: ObserverApplication,
   sessionId: string,
   runId: string,
   deadline: number
 ): Promise<void> {
-  const run = await coordinator.runStatus(runId);
+  const run = await application.runStatus(runId);
   const captures = Array.isArray(run.captures) ? run.captures : [];
   for (const raw of captures) {
     if (!raw || typeof raw !== "object" || Array.isArray(raw)) continue;
     const capture = raw as Record<string, unknown>;
     if (typeof capture.jobId !== "string" || TERMINAL_STATES.has(String(capture.state))) continue;
-    let job = await coordinator.cancelJob(sessionId, capture.jobId);
+    let job = await application.cancelJob(sessionId, capture.jobId);
     while (!TERMINAL_STATES.has(String(job.state)) && Date.now() < deadline) {
       await delay(250);
-      job = await coordinator.jobStatus(sessionId, capture.jobId);
+      job = await application.jobStatus(sessionId, capture.jobId);
     }
     const lease = job.cameraLease && typeof job.cameraLease === "object"
       ? job.cameraLease as Record<string, unknown>
@@ -861,7 +861,7 @@ export async function runRuntimeObserverAcceptance(
     options.validationRoot ?? join(REPOSITORY_ROOT, "docs", "validation")
   );
   const deadline = Date.now() + timeoutMs;
-  const coordinator = new ObserverCoordinator({
+  const application = createObserverApplication({
     agentPath: PRIVATE_CHILD_PATH,
     managedRoot,
     profileRoot,
@@ -877,12 +877,12 @@ export async function runRuntimeObserverAcceptance(
     managedRoot,
     gamePath: dirname(executable),
     projectPath: fixture?.addonDirectory,
-    observerGate: coordinator,
+    observerGate: application,
     executableResolver: () => executable,
   });
   const readBaselineProcessCounts = () => {
     const runtimeChildren = runtimeManager.diagnosticSupervisedChildCounts();
-    const observerPrivateChildren = coordinator.diagnosticPrivateChildCount();
+    const observerPrivateChildren = application.diagnosticPrivateChildCount();
     return {
       active: runtimeChildren.active + observerPrivateChildren,
       reconciling: runtimeChildren.reconciling,
@@ -925,8 +925,8 @@ export async function runRuntimeObserverAcceptance(
   let baselinePath = "";
   let failure: unknown = null;
   try {
-    summary.setup = await coordinator.ensureSetup();
-    const begun = await coordinator.beginRun({
+    summary.setup = await application.ensureSetup();
+    const begun = await application.beginRun({
       title: "Live graphical runtime observer screenshot acceptance",
       caseIds: [ACCEPTANCE_CASE_ID],
       procedureRevision: "runtime-observer-acceptance-v2",
@@ -936,7 +936,7 @@ export async function runRuntimeObserverAcceptance(
     managedRunId = begun.runId;
     summary.observerRunId = managedRunId;
 
-    const prepared = await prepareObserverLaunch(coordinator, {
+    const prepared = await prepareObserverLaunch(application, {
       runtimeKind: "listenServer",
       arguments: baseArguments,
       profilePath: join(profileRoot, "graphical-runtime"),
@@ -998,8 +998,8 @@ export async function runRuntimeObserverAcceptance(
     const remainingForInventory = Math.max(1_000, deadline - Date.now());
     const inventory = await baseline.measure(
       "managed_call",
-      "ObserverCoordinator.instances(renderersOnly)",
-      () => coordinator.instances({
+      "ObserverApplication.instances(renderersOnly)",
+      () => application.instances({
         sessionId,
         requiredCapabilities: ["render.capture", "camera.runtime"],
         renderersOnly: true,
@@ -1036,7 +1036,7 @@ export async function runRuntimeObserverAcceptance(
       worldEpoch: worldEpoch as number,
       timeoutMs: captureTimeoutMs,
     };
-    const initial = await captureIntoRun(coordinator, {
+    const initial = await captureIntoRun(application, {
       ...common,
       label: "initial-current",
       purpose: "Prove the initialized graphical runtime can produce a material current-view PNG",
@@ -1045,7 +1045,7 @@ export async function runRuntimeObserverAcceptance(
     const diagnosticCaptures: Record<string, unknown>[] = [];
     diagnosticCaptures.push(retainDiagnosticCapture(diagnosticsRoot, initial));
     summary.diagnosticCaptures = diagnosticCaptures;
-    const pose = await captureIntoRun(coordinator, {
+    const pose = await captureIntoRun(application, {
       ...common,
       label: "explicit-pose",
       purpose: "Prove explicit quaternion pose capture and its independent transactional restoration",
@@ -1066,7 +1066,7 @@ export async function runRuntimeObserverAcceptance(
     if (!poseDifference.materiallyDifferent) {
       throw new Error("Initial and explicit-pose screenshots are not materially different");
     }
-    const postPose = await captureIntoRun(coordinator, {
+    const postPose = await captureIntoRun(application, {
       ...common,
       label: "post-pose-restoration-current",
       purpose: "Prove the runtime current camera was restored after the explicit pose capture",
@@ -1095,7 +1095,7 @@ export async function runRuntimeObserverAcceptance(
       poseRestorationSimilarity
     );
 
-    const lookAt = await captureIntoRun(coordinator, {
+    const lookAt = await captureIntoRun(application, {
       ...common,
       label: "explicit-look-at",
       purpose: "Prove explicit look-at capture and its independent transactional restoration",
@@ -1132,7 +1132,7 @@ export async function runRuntimeObserverAcceptance(
     if (!lookAtDifference.materiallyDifferent) {
       throw new Error("Pre-look-at current and explicit-look-at screenshots are not materially different");
     }
-    const postLookAt = await captureIntoRun(coordinator, {
+    const postLookAt = await captureIntoRun(application, {
       ...common,
       label: "post-look-at-restoration-current",
       purpose: "Prove the runtime current camera was restored after the explicit look-at capture",
@@ -1195,7 +1195,7 @@ export async function runRuntimeObserverAcceptance(
       marker,
     };
 
-    const finalizedResult = await coordinator.finalizeRun({
+    const finalizedResult = await application.finalizeRun({
       runId: managedRunId,
       evidenceRoot,
       includeCaptureLabels: [...CAPTURE_LABELS],
@@ -1251,7 +1251,7 @@ export async function runRuntimeObserverAcceptance(
       let safeToDiscard = sessionId === null;
       if (sessionId) {
         try {
-          await cancelRunJobs(coordinator, sessionId, managedRunId, Date.now() + 30_000);
+          await cancelRunJobs(application, sessionId, managedRunId, Date.now() + 30_000);
           summary.jobCleanup = "restored";
           safeToDiscard = true;
         } catch (error) {
@@ -1262,7 +1262,7 @@ export async function runRuntimeObserverAcceptance(
       }
       if (safeToDiscard) {
         try {
-          summary.runDiscard = await coordinator.discardRun(managedRunId);
+          summary.runDiscard = await application.discardRun(managedRunId);
         } catch (error) {
           failure ??= error;
           summary.runDiscard = error instanceof Error ? error.message : String(error);
@@ -1359,8 +1359,8 @@ export async function runRuntimeObserverAcceptance(
         try {
           summary.sessionRevoke = await baseline.measure(
             "shutdown",
-            "ObserverCoordinator.revokeSession",
-            () => coordinator.revokeSession(sessionId),
+            "ObserverApplication.revokeSession",
+            () => application.revokeSession(sessionId),
             "observer_cleanup_confirmation"
           );
         } catch (error) {
@@ -1375,14 +1375,14 @@ export async function runRuntimeObserverAcceptance(
     try {
       await baseline.measure(
         "shutdown",
-        "ObserverCoordinator.close",
-        () => coordinator.close(),
+        "ObserverApplication.close",
+        () => application.close(),
         "observer_process_cleanup"
       );
-      summary.coordinatorShutdown = "complete";
+      summary.applicationShutdown = "complete";
     } catch (error) {
       failure ??= error;
-      summary.coordinatorShutdown = error instanceof Error ? error.message : String(error);
+      summary.applicationShutdown = error instanceof Error ? error.message : String(error);
       summary.status = "failed";
     }
     try {
@@ -1478,7 +1478,7 @@ export async function runRuntimeObserverAcceptance(
         source: baselineSource,
         limitations: [
           "Descriptive controlled-run baseline only; no timing or process-count thresholds are applied.",
-          "Supervised counts combine ChildSupervisor-managed owned-runtime children with count-only ObserverCoordinator private-child tracking through actual child exit.",
+          "Supervised counts combine ChildSupervisor-managed owned-runtime children with count-only ObserverApplication private-child tracking through actual child exit.",
           "The termination duration ends at the durable stoppedAt timestamp; observer-cleanup duration ends only after stop returns observerCleanupPending=false.",
         ],
         ...(baselineFailed ? {
