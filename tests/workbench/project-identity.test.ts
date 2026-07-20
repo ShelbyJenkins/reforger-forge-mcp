@@ -52,7 +52,7 @@ function captureProjectError(action: () => unknown): ProjectIdentityError {
 }
 
 function expectedKey(path: string): string {
-  return process.platform === "win32" ? path.toLowerCase() : path;
+  return path.toLowerCase();
 }
 
 describe("canonical Workbench project identity", () => {
@@ -77,7 +77,7 @@ describe("canonical Workbench project identity", () => {
     const root = createRoot();
     const projectPath = createProject(root, "RealMod", "RealMod.gproj");
     const aliasDirectory = join(root, "AliasMod");
-    symlinkSync(dirname(projectPath), aliasDirectory, process.platform === "win32" ? "junction" : "dir");
+    symlinkSync(dirname(projectPath), aliasDirectory, "junction");
 
     const realIdentity = canonicalizeGproj(projectPath);
     const aliasIdentity = canonicalizeGproj(join(aliasDirectory, "RealMod.gproj"));
@@ -192,7 +192,7 @@ describe("safe implicit Workbench project resolution", () => {
     symlinkSync(
       dirname(projectPath),
       join(root, "AliasMod"),
-      process.platform === "win32" ? "junction" : "dir"
+      "junction"
     );
 
     const resolved = resolveProjectIdentity({ projectRoot: root });

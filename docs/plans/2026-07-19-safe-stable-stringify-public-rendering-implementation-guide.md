@@ -124,7 +124,7 @@ details entirely when no valid bounded form fits.
    bounded-diagnostic errors, fixed-message errors, unknown errors, and their
    existing subject text.
 2. Add sentinels for bearer credentials, owner tokens, contract bodies,
-   Windows paths, and POSIX paths. Confirm no permitted rendered detail leaks a
+   Windows paths. Confirm no permitted rendered detail leaks a
    sentinel after the parent redactor is introduced.
 3. Add pre-migration cases for a circular record, BigInt, excessive nesting,
    excessive breadth, an unsupported class instance, a throwing getter, and a
@@ -232,4 +232,3 @@ This follow-on is complete when:
   stable subject lines and canonical error policy;
 - direct public-error JSON.stringify detail rendering is removed; and
 - focused tests, full tests, build, and package checks are green.
-

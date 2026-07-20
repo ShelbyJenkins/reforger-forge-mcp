@@ -82,9 +82,7 @@ const defaultTiming: WorkbenchActivityGateTiming = {
 };
 
 function samePath(left: string, right: string): boolean {
-  return process.platform === "win32"
-    ? left.toLowerCase() === right.toLowerCase()
-    : left === right;
+  return left.toLowerCase() === right.toLowerCase();
 }
 
 function sameBinding(left: CaptureActivityBinding, right: CaptureActivityBinding): boolean {

@@ -119,7 +119,7 @@ export interface EvidenceBundleService {
   diagnostics(): Record<string, unknown>;
 }
 
-function comparisonPath(value: string): string { return process.platform === "win32" ? value.toLowerCase() : value; }
+function comparisonPath(value: string): string { return value.toLowerCase(); }
 function contained(root: string, candidate: string): boolean {
   const value = relative(comparisonPath(root), comparisonPath(candidate));
   return value === "" || (!isAbsolute(value) && value !== ".." && !value.startsWith(`..${sep}`));
@@ -130,7 +130,7 @@ function identity(path: string): FilesystemIdentity {
 }
 function sameIdentity(left: FilesystemIdentity, right: FilesystemIdentity): boolean { return left.dev === right.dev && left.ino === right.ino; }
 function assertWindowsPath(value: string, label: string): void {
-  if (process.platform === "win32" && (/^\\\\[.?]\\/.test(value) || value.slice(2).includes(":"))) {
+  if (/^\\\\[.?]\\/.test(value) || value.slice(2).includes(":")) {
     throw new ObserverError("INVALID_REQUEST", `${label} uses a device path or alternate data stream`);
   }
 }

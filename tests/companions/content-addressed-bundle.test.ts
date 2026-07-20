@@ -205,7 +205,7 @@ describe("content-addressed bundle contract", () => {
     symlinkSync(
       outsideRoot,
       join(sourceRoot, "linked"),
-      process.platform === "win32" ? "junction" : "dir"
+      "junction"
     );
 
     expect(() => verifyContentAddressedBundle(policy, sourceRoot)).toThrowError(

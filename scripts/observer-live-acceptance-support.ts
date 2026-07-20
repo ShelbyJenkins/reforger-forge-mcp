@@ -865,7 +865,7 @@ export function inspectExecutableVersion(executablePath: string): ExecutableVers
     fileVersion: null,
     discovery: "unavailable",
   };
-  if (process.platform !== "win32" || !existsSync(executablePath)) return unavailable;
+  if (!existsSync(executablePath)) return unavailable;
   const command = [
     "$ErrorActionPreference = 'Stop'",
     "$item = Get-Item -LiteralPath $env:RFO_OPERATIONAL_BASELINE_VERSION_PATH",
@@ -1149,9 +1149,6 @@ export function findBlockingProcesses(rows: ProcessRow[]): BlockingProcess[] {
 }
 
 export function inspectBlockingProcesses(): BlockingProcess[] {
-  if (process.platform !== "win32") {
-    throw new Error("Live Arma Reforger process inspection is Windows-only");
-  }
   const command = [
     "$ErrorActionPreference = 'Stop'",
     "$items = @(Get-Process -ErrorAction Stop | Select-Object -Property Id,ProcessName)",

@@ -9,7 +9,7 @@ const OBSERVER_FLAGS = new Set([...VALUE_FLAGS, "-forceupdate"]);
 
 function key(path: string): string {
   const resolved = resolve(path);
-  return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+  return resolved.toLowerCase();
 }
 
 function splitCommaValue(value: string, flag: string): string[] {

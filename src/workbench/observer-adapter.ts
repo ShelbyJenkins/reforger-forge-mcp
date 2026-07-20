@@ -241,7 +241,7 @@ function distance(left: readonly number[], right: readonly number[]): number {
 
 function normalizePath(value: string): string {
   const absolute = resolve(value);
-  return process.platform === "win32" ? absolute.toLowerCase() : absolute;
+  return absolute.toLowerCase();
 }
 
 function samePath(left: string, right: string): boolean {

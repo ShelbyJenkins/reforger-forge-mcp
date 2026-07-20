@@ -632,7 +632,7 @@ export class ObserverAgentServer {
     const protectedProfiles = new Set(this.control.sessions.diagnostics().filter((record) =>
       record.revokedAt === null || protectedSessionIds.has(record.sessionId) || this.control.sessions.isPinned(record.sessionId)
     ).map((record) =>
-      process.platform === "win32" ? record.profilePath.toLowerCase() : record.profilePath
+      record.profilePath.toLowerCase()
     ));
     const candidates: Array<{ path: string; bytes: number; mtimeMs: number; protected: boolean }> = [];
     for (const [root, protectProfiles] of [
@@ -646,7 +646,7 @@ export class ObserverAgentServer {
         const path = join(root, entry.name);
         const info = lstatSync(path);
         if (!info.isDirectory() && !info.isFile()) continue;
-        const key = process.platform === "win32" ? path.toLowerCase() : path;
+        const key = path.toLowerCase();
         candidates.push({
           path,
           bytes: info.isDirectory() ? this.directoryUsage(path).bytes : info.size,
@@ -709,12 +709,8 @@ export class ObserverAgentServer {
     session: { profilePath: string; expectedRuntimeKind: string },
     authority: OwnedRuntimeRecoveryAuthority
   ): void {
-    const left = process.platform === "win32"
-      ? resolve(session.profilePath).toLowerCase()
-      : resolve(session.profilePath);
-    const right = process.platform === "win32"
-      ? resolve(authority.profilePath).toLowerCase()
-      : resolve(authority.profilePath);
+    const left = resolve(session.profilePath).toLowerCase();
+    const right = resolve(authority.profilePath).toLowerCase();
     if (left !== right || session.expectedRuntimeKind !== authority.runtimeKind) {
       throw new ObserverError(
         "SESSION_MISMATCH",

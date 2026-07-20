@@ -211,13 +211,13 @@ function atomicWriteJson(root, path, value) {
 }
 
 function containsPath(root, path) {
-  const normalize = (value) => process.platform === "win32" ? resolve(value).toLowerCase() : resolve(value);
+  const normalize = (value) => resolve(value).toLowerCase();
   const rel = relative(normalize(root), normalize(path));
   return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
 }
 
 function samePath(left, right) {
-  const normalize = (value) => process.platform === "win32" ? resolve(value).toLowerCase() : resolve(value);
+  const normalize = (value) => resolve(value).toLowerCase();
   return normalize(left) === normalize(right);
 }
 
@@ -781,7 +781,6 @@ async function terminateWorkbench(child) {
 }
 
 async function runAcceptance(options) {
-  if (process.platform !== "win32") throw new Error("Mailbox acceptance requires Windows Workbench");
   requiredFile(productionProjectPath, "Production observer addon project");
   requiredFile(productionManifestPath, "Production observer source manifest");
   requiredFile(productionMailboxPath, "Production observer mailbox source");

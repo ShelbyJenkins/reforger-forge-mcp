@@ -113,7 +113,7 @@ export function boundedJsonStoreContract(
       mkdirSync(root);
       mkdirSync(outside);
       writeFileSync(join(outside, "record.json"), JSON.stringify({ generation: "g1", value: "outside" }));
-      symlinkSync(outside, join(root, "escape"), process.platform === "win32" ? "junction" : "dir");
+      symlinkSync(outside, join(root, "escape"), "junction");
       const store = createStore({ root, maxRecordBytes: 1_024, parse: parseJsonStoreContractRecord });
 
       expect(() => store.read(join(root, "escape", "record.json"))).toThrow(
@@ -216,7 +216,7 @@ export function jsonCasBackendContract(
       const outside = join(parent, "outside");
       mkdirSync(root);
       mkdirSync(outside);
-      symlinkSync(outside, join(root, "escape"), process.platform === "win32" ? "junction" : "dir");
+      symlinkSync(outside, join(root, "escape"), "junction");
 
       expect(() => createPair(root, join(root, "escape", "state.json"))).toThrow();
       expect(readdirSync(outside)).toEqual([]);
@@ -255,7 +255,7 @@ export function atomicWriteAdapterContract(
       const outside = join(parent, "outside");
       mkdirSync(root);
       mkdirSync(outside);
-      symlinkSync(outside, join(root, "escape"), process.platform === "win32" ? "junction" : "dir");
+      symlinkSync(outside, join(root, "escape"), "junction");
       expect(() => write(root, join(root, "escape", "record.json"), "value")).toThrow();
       expect(readdirSync(outside)).toEqual([]);
     });

@@ -586,7 +586,7 @@ export interface JsonCasMutationBackend {
 const pathLockTails = new Map<string, Promise<void>>();
 
 async function withProcessPathLock<T>(path: string, action: () => Promise<T> | T): Promise<T> {
-  const key = process.platform === "win32" ? resolve(path).toLowerCase() : resolve(path);
+  const key = resolve(path).toLowerCase();
   const previous = pathLockTails.get(key) ?? Promise.resolve();
   let release!: () => void;
   const turn = new Promise<void>((resolveTurn) => { release = resolveTurn; });

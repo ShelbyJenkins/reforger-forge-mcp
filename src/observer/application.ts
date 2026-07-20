@@ -122,9 +122,8 @@ function defaultAgentPath(): string {
 }
 
 export function defaultObserverManagedRoot(): string {
-  if (process.platform === "win32" && process.env.LOCALAPPDATA) return join(process.env.LOCALAPPDATA, "ReforgerForge", "Observer", "v1");
-  if (process.env.XDG_STATE_HOME) return join(process.env.XDG_STATE_HOME, "reforger-forge", "observer", "v1");
-  return join(homedir(), ".local", "state", "reforger-forge", "observer", "v1");
+  const localAppData = process.env.LOCALAPPDATA ?? join(homedir(), "AppData", "Local");
+  return join(localAppData, "ReforgerForge", "Observer", "v1");
 }
 
 function assertPaths(projectPath: string | undefined, managedRoot: string, profileRoot: string): void {

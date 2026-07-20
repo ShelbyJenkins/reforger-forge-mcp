@@ -1228,7 +1228,6 @@ describe("OwnedRuntimeManager", () => {
     expect(receipt.ownerTokenArgument).toBe(call.arguments.at(-1));
     expect(receipt.argvSha256).toBe(createHash("sha256").update(JSON.stringify(call.arguments)).digest("hex"));
     expect(started).not.toHaveProperty("ownerTokenArgument");
-    if (process.platform !== "win32") expect(statSync(receiptPath).mode & 0o077).toBe(0);
   });
 
   it("fences start before spawn and ownership publication when the mutex lease is lost", async () => {
@@ -2329,7 +2328,7 @@ describe("OwnedRuntimeManager", () => {
     const linkedManagedRoot = join(outside, "managed");
     mkdirSync(project);
     mkdirSync(outside);
-    symlinkSync(project, linkedManagedRoot, process.platform === "win32" ? "junction" : "dir");
+    symlinkSync(project, linkedManagedRoot, "junction");
 
     expect(() => new OwnedRuntimeManager({
       managedRoot: linkedManagedRoot,

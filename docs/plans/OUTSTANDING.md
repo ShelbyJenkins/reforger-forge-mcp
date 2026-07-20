@@ -6,8 +6,8 @@
 
 ### Require the CI checks on `main`
 
-**Remaining:** A repository administrator must require the applicable Ubuntu and Windows CI contexts in `main` branch protection.  
-**Completion proof:** Branch-protection settings show both contexts as required.  
+**Remaining:** A repository administrator must require the Windows CI context in `main` branch protection.
+**Completion proof:** Branch-protection settings show the Windows context as required.
 **Source:** Consolidated from Stage 1 task 1.
 
 ### Complete the one-spawn Workbench build cutover
@@ -66,8 +66,8 @@
 
 ### Close the remaining validation tiers
 
-**Remaining:** Restore the explicit `.gitattributes` policy required by package contracts, resolve the Windows temporary-file rename failure if it still blocks the suite, run the retry-disabled full suite, finish a fresh `--omit=dev` installed-package smoke, and retain the required Ubuntu/Node CI results.  
-**Completion proof:** `npm test -- --retry=0`, `npm run test:package`, and the required Ubuntu/Windows CI tiers pass with recorded results and no waiver.  
+**Remaining:** Restore the explicit `.gitattributes` policy required by package contracts, resolve the Windows temporary-file rename failure if it still blocks the suite, run the retry-disabled full suite, finish a fresh `--omit=dev` installed-package smoke, and retain the required Windows/Node CI results.
+**Completion proof:** `npm test -- --retry=0`, `npm run test:package`, and the required Windows CI tier pass with recorded results and no waiver.
 **Source:** Consolidated from Stage 4/5/6 validation and exit criteria.
 
 ## Deferred work

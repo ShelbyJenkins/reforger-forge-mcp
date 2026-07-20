@@ -192,7 +192,7 @@ function sha256(value: Buffer): string {
 
 function comparisonPath(path: string): string {
   const resolved = resolve(path);
-  return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+  return resolved.toLowerCase();
 }
 
 function contained(root: string, candidate: string): boolean {
@@ -804,7 +804,6 @@ export async function runRuntimeObserverAcceptance(
   options: RuntimeObserverAcceptanceOptions
 ): Promise<RuntimeObserverAcceptanceResult> {
   assertLiveRuntimeObserverAuthorized(options.confirmed, options.environment);
-  if (process.platform !== "win32") throw new Error("Live runtime observer acceptance is Windows-only");
   const timeoutMs = options.timeoutMs ?? 300_000;
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 60_000 || timeoutMs > 900_000) {
     throw new Error("Live runtime observer timeout must be 60000..900000 ms");

@@ -541,7 +541,7 @@ function requiredString(value: unknown, label: string): string {
 
 function comparisonPath(value: string): string {
   const absolute = resolve(value);
-  return process.platform === "win32" ? absolute.toLowerCase() : absolute;
+  return absolute.toLowerCase();
 }
 
 function bundleFiles(root: string): string[] {

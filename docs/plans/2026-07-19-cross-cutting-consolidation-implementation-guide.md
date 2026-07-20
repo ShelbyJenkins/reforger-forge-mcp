@@ -389,8 +389,8 @@ and portability-sensitive paths at every output sink.
      values, owner arguments, and contract bodies;
    - command_argument: exact owner-token argument forms in either
      equals-separated or whitespace-separated notation;
-   - evidence_portability: diagnostic rules plus absolute Windows and POSIX
-     path substitution, including comma-separated all-absolute path lists.
+   - evidence_portability: diagnostic rules plus absolute Windows-path
+     substitution, including comma-separated all-absolute path lists.
 2. Make structured redaction recursive only over arrays and plain record-like
    data. Bound recursion/depth and preserve primitives. Do not claim an
    arbitrary class instance is safely serializable.
@@ -419,8 +419,7 @@ and portability-sensitive paths at every output sink.
 **Tests:**
 
 - Use distinct sentinel values for a bearer token, nonce, authorization header,
-  owner argument, contract body, nested token key, Windows path, and POSIX
-  path.
+  owner argument, contract body, nested token key, and Windows path.
 - Assert that no sentinel occurs anywhere in the rendered string or serialized
   structured result for each applicable profile.
 - Cover case variation, quoted JSON assignments, repeated application,

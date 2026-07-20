@@ -81,7 +81,7 @@ function packageRootFromModule(): string {
 }
 
 function comparisonPath(path: string): string {
-  return process.platform === "win32" ? path.toLowerCase() : path;
+  return path.toLowerCase();
 }
 
 export async function probeAgentLease(contract: SessionContract): Promise<AgentLeaseProbeResult> {

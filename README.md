@@ -18,18 +18,14 @@ Describe what you want to build — your AI agent handles API research, code gen
 
 ## Quick Start
 
-```bash
+```powershell
 git clone https://github.com/wastelandgoats/reforger-forge-mcp.git
 cd reforger-forge-mcp
 npm install
 npm run build
 ```
 
-Or on Windows:
-
-```powershell
-.\scripts\setup.ps1
-```
+Windows is required.
 
 Then install into your agent(s):
 
@@ -48,8 +44,8 @@ Restart your agent and run `node scripts/list-tools.mjs` to verify the complete 
 
 Copy and edit the config file:
 
-```bash
-cp reforger-forge.config.example.json reforger-forge.config.json
+```powershell
+Copy-Item reforger-forge.config.example.json reforger-forge.config.json
 ```
 
 | Key | Description |
@@ -226,16 +222,11 @@ Restart → **MCP: Restart Servers**
 Merge `configs/claude-desktop.json` or run install script.
 
 - Windows: `%APPDATA%\Claude\claude_desktop_config.json`
-- macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
 
 ### Claude Code
 
-```bash
-# Windows
+```powershell
 claude mcp add --scope user reforger-forge -- cmd /c node "FULL_PATH\reforger-forge-mcp\dist\index.js"
-
-# macOS / Linux
-claude mcp add --scope user reforger-forge -- node /path/to/reforger-forge-mcp/dist/index.js
 ```
 
 ### VS Code (GitHub Copilot)
@@ -246,11 +237,11 @@ Command palette: **MCP: List Servers** → verify `reforger-forge` is running.
 
 ### Windsurf (Cascade)
 
-Global config only at `~/.codeium/windsurf/mcp_config.json`. Run install script, then refresh MCP list in Cascade panel.
+Global config only at `%USERPROFILE%\.codeium\windsurf\mcp_config.json`. Run install script, then refresh MCP list in Cascade panel.
 
 ### Continue.dev
 
-Run install script. MCP servers live inside `~/.continue/config.json` under `mcpServers`.
+Run install script. MCP servers live inside `%USERPROFILE%\.continue\config.json` under `mcpServers`.
 
 ### Any other MCP client
 
@@ -605,7 +596,7 @@ both.
 
 ## Development
 
-```bash
+```powershell
 npm run build                  # Compile TypeScript
 npm run observer:manifest      # Regenerate Workbench helper identity/manifest after helper changes
 npm run observer:validate:enforce                 # Compile the production observer addon in Workbench
@@ -744,7 +735,7 @@ The canonical repository is
 [wastelandgoats/reforger-forge-mcp](https://github.com/wastelandgoats/reforger-forge-mcp).
 After cloning your GitHub fork, keep the canonical repository as `upstream`:
 
-```bash
+```powershell
 git remote add upstream https://github.com/wastelandgoats/reforger-forge-mcp.git
 git fetch upstream
 ```

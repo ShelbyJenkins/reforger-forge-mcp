@@ -35,7 +35,7 @@ describe("managed path policies", () => {
     const outside = join(parent, "shared-assets");
     mkdirSync(project);
     mkdirSync(outside);
-    symlinkSync(outside, join(project, "linked-assets"), process.platform === "win32" ? "junction" : "dir");
+    symlinkSync(outside, join(project, "linked-assets"), "junction");
 
     const throughLink = join(project, "linked-assets", "texture.edds");
     expect(resolveManagedPath(project, throughLink, "lexical")).toBe(throughLink);
@@ -48,7 +48,7 @@ describe("managed path policies", () => {
     const outside = join(parent, "outside");
     mkdirSync(managed);
     mkdirSync(outside);
-    symlinkSync(outside, join(managed, "escape"), process.platform === "win32" ? "junction" : "dir");
+    symlinkSync(outside, join(managed, "escape"), "junction");
 
     expect(() => resolveManagedPath(managed, join(managed, "escape", "record.json"), "link-safe"))
       .toThrow(expect.objectContaining<Partial<ManagedPathError>>({ reason: "link_escape" }));
@@ -59,7 +59,7 @@ describe("managed path policies", () => {
     const actual = join(managed, "actual");
     const linked = join(managed, "linked");
     mkdirSync(actual);
-    symlinkSync(actual, linked, process.platform === "win32" ? "junction" : "dir");
+    symlinkSync(actual, linked, "junction");
 
     expect(resolveManagedPath(managed, join(linked, "record.json"), "link-safe"))
       .toBe(join(linked, "record.json"));
@@ -72,7 +72,7 @@ describe("managed path policies", () => {
     const actual = join(root, "actual");
     const linked = join(root, "linked");
     mkdirSync(actual);
-    symlinkSync(actual, linked, process.platform === "win32" ? "junction" : "dir");
+    symlinkSync(actual, linked, "junction");
 
     const target = join(linked, "future", "records");
     expect(canonicalizePotentialPath(target, {
@@ -86,7 +86,7 @@ describe("managed path policies", () => {
     const actual = join(root, "actual");
     const linked = join(root, "linked");
     mkdirSync(actual);
-    symlinkSync(actual, linked, process.platform === "win32" ? "junction" : "dir");
+    symlinkSync(actual, linked, "junction");
 
     expect(() => canonicalizePotentialPath(join(linked, "future"), {
       linkPolicy: "no-links",

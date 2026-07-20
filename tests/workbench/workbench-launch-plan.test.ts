@@ -468,7 +468,7 @@ describe("launch-plan validation", () => {
     } as unknown as Parameters<typeof buildWorkbenchLaunchPlan>[0])).toThrow(/windowsHide policy override/);
     expect(() => buildTargetBuildLaunchPlan({
       ...target,
-      platform: "Linux",
+      platform: "Console",
     } as unknown as Parameters<typeof buildTargetBuildLaunchPlan>[0])).toThrow(/only platform PC/);
     for (const timeoutMs of [0, -1, 3_600_001, Number.POSITIVE_INFINITY]) {
       expect(() => buildTargetBuildLaunchPlan({ ...target, timeoutMs })).toThrow(/timeoutMs/);

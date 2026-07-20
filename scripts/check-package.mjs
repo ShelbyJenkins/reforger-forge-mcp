@@ -37,9 +37,8 @@ function directWindowsNpmCli() {
   );
 }
 
-const npmCliPath = npmExecPath
-  ?? (process.platform === "win32" ? directWindowsNpmCli() : null);
-const npmCommand = npmCliPath ? process.execPath : "npm";
+const npmCliPath = npmExecPath ?? directWindowsNpmCli();
+const npmCommand = process.execPath;
 const npmCache = process.env.REFORGER_FORGE_NPM_CACHE
   ?? join(tmpdir(), "reforger-forge-npm-cache");
 const npmEnvironment = {
@@ -58,7 +57,7 @@ mkdirSync(installRoot, { recursive: true });
 function npmRun(argumentsArray, options = {}) {
   return spawnSync(
     npmCommand,
-    npmCliPath ? [npmCliPath, ...argumentsArray] : argumentsArray,
+    [npmCliPath, ...argumentsArray],
     {
       cwd: options.cwd ?? root,
       encoding: "utf8",
@@ -429,7 +428,7 @@ if (missingFiles.length || missingPrefixes.length || missingHandlers.length || u
     if (!existsSync(targetPath)) {
       throw new Error(`Advertised bin "${binName}" is missing its installed target: ${target}`);
     }
-    const shimName = process.platform === "win32" ? `${binName}.cmd` : binName;
+    const shimName = `${binName}.cmd`;
     const shimPath = join(installRoot, "node_modules", ".bin", shimName);
     if (!existsSync(shimPath)) {
       throw new Error(`Fresh install did not create the advertised bin shim "${binName}"`);

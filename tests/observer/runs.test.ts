@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, utimesSync, writeFileSync } from "node:fs";
 import { join, relative, sep } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { ArtifactStore } from "../../observer/agent/artifacts.js";
@@ -371,21 +371,6 @@ describe("managed observer runs", () => {
     expect(result).not.toContain("\n## Forged");
     expect(result).toContain("\\*Title\\*");
     expect(result).toContain("\\[link\\]\\(https://example\\.invalid\\)");
-  });
-
-  it.runIf(process.platform !== "win32")("refuses a supporting-log symlink even when its target is readable", () => {
-    const value = setup();
-    const { runId, ref } = completedCapture(value);
-    const outside = join(value.root, "outside.log");
-    const linked = join(value.logs, "linked.log");
-    writeFileSync(outside, "outside allowlist", "utf8");
-    symlinkSync(outside, linked, "file");
-
-    expect(() => value.runs.finalize({
-      ...reviewedFinalizeInput(value, runId),
-      supportingFiles: [{ kind: "relevantLog", label: "linked", path: linked }],
-    })).toThrowError(expect.objectContaining({ code: "INVALID_REQUEST" }));
-    expect(value.artifacts.hasRef(ref)).toBe(true);
   });
 
   it("refuses arbitrary roots, secret config, and unreviewed pass claims", () => {

@@ -35,7 +35,7 @@ const readyGate: OwnedRuntimeObserverGate = {
   completeRuntimeStop: async () => ({ completed: true }),
 };
 
-describe.skipIf(process.platform !== "win32")("owned runtime native Windows integration", () => {
+describe("owned runtime native Windows integration", () => {
   it("inspects and terminates a harmless exact-owned fixture through retained native handles", async () => {
     const root = mkdtempSync(join(tmpdir(), "rfo-owned-runtime-native-"));
     roots.push(root);

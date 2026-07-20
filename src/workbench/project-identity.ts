@@ -53,7 +53,7 @@ export interface ResolveProjectIdentityOptions {
 }
 
 function comparisonKey(path: string): string {
-  return process.platform === "win32" ? path.toLowerCase() : path;
+  return path.toLowerCase();
 }
 
 function invalidTarget(message: string): ProjectIdentityError {

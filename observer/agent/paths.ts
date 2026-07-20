@@ -165,14 +165,8 @@ export function listRegularFiles(rootPath: string): string[] {
 }
 
 export function defaultObserverRoot(): string {
-  if (process.platform === "win32") {
-    const local = process.env.LOCALAPPDATA;
-    if (local) return join(local, "ReforgerForge", "Observer", "v1");
-  }
-  const stateHome = process.env.XDG_STATE_HOME;
-  return stateHome
-    ? join(stateHome, "reforger-forge", "observer", "v1")
-    : join(homedir(), ".local", "state", "reforger-forge", "observer", "v1");
+  const localAppData = process.env.LOCALAPPDATA ?? join(homedir(), "AppData", "Local");
+  return join(localAppData, "ReforgerForge", "Observer", "v1");
 }
 
 export function ensurePaths(rootPath = defaultObserverRoot(), profileRoot?: string): ObserverManagedPaths {

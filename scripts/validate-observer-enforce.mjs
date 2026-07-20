@@ -110,7 +110,6 @@ function readConfiguration(path) {
 }
 
 function workbenchIsRunning() {
-  if (process.platform !== "win32") return false;
   const result = spawnSync("tasklist.exe", ["/FI", `IMAGENAME eq ${workbenchExecutableName}`, "/FO", "CSV", "/NH"], {
     encoding: "utf8",
     windowsHide: true,
@@ -121,7 +120,6 @@ function workbenchIsRunning() {
 }
 
 function executableVersion(path) {
-  if (process.platform !== "win32") return null;
   const escaped = path.replaceAll("'", "''");
   const result = spawnSync(
     "powershell.exe",
@@ -211,7 +209,6 @@ if (!options) {
 } else {
   let temporaryProfileRoot = null;
   try {
-    if (process.platform !== "win32") throw new Error("Enforce validation requires the Windows Arma Reforger Workbench");
     requiredFile(addonProjectPath, "Observer addon project");
     requiredFile(addonManifestPath, "Observer addon source manifest");
     requiredFile(mailboxSourcePath, "Observer mailbox source");

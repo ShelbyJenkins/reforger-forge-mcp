@@ -73,7 +73,7 @@ export class ManagedPathError extends Error {
 /** Stable absolute spelling for path identity maps and equality checks. */
 export function pathComparisonKey(path: string): string {
   const absolute = resolve(path);
-  return process.platform === "win32" ? absolute.toLowerCase() : absolute;
+  return absolute.toLowerCase();
 }
 
 /** Prefix-safe containment; unlike `startsWith`, sibling names cannot collide. */

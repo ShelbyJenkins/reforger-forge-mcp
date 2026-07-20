@@ -1272,7 +1272,7 @@ describe("standalone Workbench lifecycle runner", () => {
         symlinkSync(
           externalRoot,
           join(harness.outputPath, `${privateOwnerArgument}-escape`),
-          process.platform === "win32" ? "junction" : "dir"
+          "junction"
         );
       },
     });
@@ -1795,7 +1795,7 @@ describe("standalone Workbench runner argument contract", () => {
       "build", "--gproj", "Example.gproj", "--platform", "PC", "--output", "out",
     ])).toThrow(/requires exactly/i);
     expect(() => parseWorkbenchRunnerArguments([
-      "build", "--gproj", "Example.gproj", "--platform", "Linux",
+      "build", "--gproj", "Example.gproj", "--platform", "Console",
       "--output", "out", "--timeout-ms", "1000",
     ])).toThrow(/must be PC/i);
   });
