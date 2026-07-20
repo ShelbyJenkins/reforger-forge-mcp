@@ -11,6 +11,7 @@ reforger-forge.config.json
 enfusion-mcp.config.json
 .scraper-cache/
 .artifacts/
+docs/validation/
 *.tsbuildinfo
 **/resourceDatabase.rdb
 *.pdf

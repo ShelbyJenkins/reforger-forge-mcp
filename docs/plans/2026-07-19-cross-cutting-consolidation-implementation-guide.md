@@ -1,9 +1,12 @@
 # Cross-cutting consolidation implementation guide
-
-**Status:** Deferred follow-on work  
-**Parent context:** [Post-fork MCP maintainability implementation guide](2026-07-18-post-fork-maintainability-implementation-guide.md)  
-**Research snapshot:** 2026-07-19, against the active working tree  
-**Entry condition:** The remaining work in the parent plan is complete and its closeout evidence has been accepted. This guide deliberately does not reopen or renumber that plan.
+ 
+OUTSTANDING closeout
+  → Cross-cutting 0–2
+  → reforger-forge-mcp\docs\plans\2026-07-19-safe-stable-stringify-public-rendering-implementation-guide.md + Cross-cutting 3
+  → Cross-cutting 4–5 + reforger-forge-mcp\docs\plans\2026-07-19-tar-package-archive-verification-implementation-guide.md
+  → Cross-cutting 6–7
+  → reforger-forge-mcp\docs\plans\2026-07-19-lmdb-persistence-migration-implementation-guide.md
+  -> reforger-forge-mcp\docs\plans\2026-07-19-local-observer-failure-matrix-implementation.md
 
 ## Outcome
 
@@ -48,55 +51,6 @@ This is consolidation, not a protocol or behavior redesign. Existing public
 error codes, supported capture states, ownership checks, deadline bounds, and
 Enforce transport semantics remain unchanged unless a separately reviewed
 change says otherwise.
-
-## Why this is a separate deferred guide
-
-The parent roadmap already has an active, ordered sequence. Its Stage 3
-implementation is substantially complete, and its remaining stages have their
-own closeout criteria. Adding these tasks to that document would blur whether
-they are prerequisites for already-in-progress work.
-
-Use this guide only after that sequence closes. It preserves the useful
-relationship to the parent plan without editing it:
-
-| Follow-on concern | Parent-plan area it extends after closeout |
-| --- | --- |
-| Generated Enforce vocabulary | Stage 5 generated-schema consumer migration |
-| Redaction, time, and public error projection | Stage 4 capture-service concerns |
-| Canonical add-on inventory | Stage 1-style packaging evidence, without reopening Stage 1 |
-| Shared test support and dedup guardrails | Stage 6 test/code deletion and architecture-lint policy |
-
-Do not change the parent roadmap's task numbers as part of this work. Link a
-future completion record to this document instead.
-
-## Pre-step: establish the repository line-ending policy
-
-Complete this as its own reviewed commit before Task 0. The repository has
-text source, generated artifacts, JSON, and documentation checked out by both
-Windows and non-Windows contributors. Leaving text classification entirely to
-each contributor's `core.autocrlf` setting makes an incidental checkout or
-attribute change appear as hundreds of unrelated modifications.
-
-1. Start from a clean worktree; do not mix this change with any consolidation
-   implementation, generated-artifact refresh, or local tool output.
-2. Add `* text=auto` at the top of the repository-root `.gitattributes`.
-   Retain the existing `-text` exceptions for binary/add-on payloads and the
-   targeted `eol=lf` rules for protocol artifacts that already require it.
-3. Do **not** add a blanket `eol=lf` rule. That would rewrite every text
-   checkout and requires a separately approved, repository-wide normalization
-   migration if it is ever desired.
-4. Run `git add --renormalize .`, inspect the staged diff and
-   `git diff --cached --check`, and commit only the attribute policy plus any
-   reviewed canonical-content normalization it proves necessary. An empty
-   normalization diff is valid; do not manufacture a mass rewrite.
-5. Verify a fresh clone or clean checkout on Windows and a non-Windows runner
-   has no spurious modified files. If a dirty checkout already reports
-   line-ending-only changes, preserve its real edits first; do not use the
-   normalization command to stage an implementation batch.
-
-**Acceptance:** `.gitattributes` explicitly classifies ordinary text while
-preserving binary and protocol exceptions; the isolated commit has an audited
-diff; and fresh checkouts on supported platforms report a clean status.
 
 ## Starting-point inventory
 
@@ -337,14 +291,11 @@ existing duplicates are moved or deleted.
 
 **Actions:**
 
-1. Confirm the parent plan is closed. Record the parent revision and the
-   retained closeout evidence. If it is not closed, stop; this follow-on is
-   intentionally deferred.
-2. Record fresh search results for the categories in
+. Record fresh search results for the categories in
    [Starting-point inventory](#starting-point-inventory). Include both source
    and test occurrences, with no hard-coded expectation that an old count is
    still correct.
-3. Add characterization tests before changing behavior:
+. Add characterization tests before changing behavior:
    - every known secret sentinel is absent from diagnostic and evidence output;
    - each existing wait/poll path retains its first-attempt, interval, timeout,
      cancellation, and error-mapping behavior;
@@ -353,10 +304,10 @@ existing duplicates are moved or deleted.
    - a source-manifest file addition/removal is detected by staging and
      packaging checks;
    - generated C output is stable for a representative registry input.
-4. Make the protocol generator's render function accept an injected registry
+. Make the protocol generator's render function accept an injected registry
    source, as its current artifact tests already do. This permits pure tests
    of generated C without mutating the real add-ons.
-5. Add a focused follow-on test command only after the new suites exist. It
+. Add a focused follow-on test command only after the new suites exist. It
    should be additive; do not weaken the existing full-suite command.
 
 **Acceptance:** The baseline is recorded, the focused tests are green without
@@ -793,6 +744,37 @@ recreate the old owners.
 **Acceptance:** The architecture check is green with no broad allowlist, the
 full suite is green, and each deleted owner has one clearly named replacement.
 
+### Task 8: remove temporary validation artifacts from the repository
+
+**Goal:** Validation artifacts are local, temporary evidence—not repository
+content or release documentation.
+
+**Actions:**
+
+1. Keep `docs/validation/` in the root `.gitignore` immediately. New logs,
+   receipts, screenshots, package-smoke reports, and live-acceptance evidence
+   under that path must remain untracked and must never be staged or committed.
+2. Audit every script, test, and document that currently defaults to
+   `docs/validation`. Change production and local-acceptance defaults to a
+   caller-selected external evidence root or a fresh directory beneath the OS
+   temporary root. Retain an explicit path option for a maintainer who needs
+   to preserve sanitized evidence outside the repository.
+3. Update the related hermetic tests so they use temporary roots and prove no
+   default execution creates a repository `docs/validation` directory.
+4. After all retained claims have been reviewed, delete the existing tracked
+   `docs/validation/` directory and remove every tracked artifact beneath it.
+   Do not copy its machine-local evidence to another repository location.
+5. Update documentation and package checks to describe validation evidence as
+   external and uncommitted. A final source search must find no production
+   default or user instruction that writes validation artifacts into the
+   repository.
+
+**Acceptance:** `git ls-files docs/validation` returns no paths;
+`git check-ignore docs/validation/example.json` confirms the ignore rule; a
+clean checkout has no `docs/validation` directory; package contents contain no
+validation artifact; and the validation harnesses retain evidence only in an
+external or OS-temporary location.
+
 ## Review boundaries
 
 Keep reviews small enough that a behavioral regression has an obvious source:
@@ -805,6 +787,8 @@ Keep reviews small enough that a behavioral regression has an obvious source:
    generated-file and controlled Enforce evidence.
 4. **Test ergonomics and guardrails:** Tasks 6-7, including the final
    deletion diff and architecture-check configuration.
+5. **Temporary validation cleanup:** Task 8, after all other validation has
+   been accepted; keep it as one deletion-and-defaults review.
 
 Do not combine a numeric camera-tolerance decision with a bulk generated-file
 move. It needs independent review and real acceptance evidence.
@@ -831,8 +815,8 @@ npm run observer:acceptance:enforce-mailbox
 
 The exact Enforce command may require the existing local configuration and
 controlled add-on roots. Record the Workbench version, compiler result, and
-any live acceptance evidence. Do not describe a skipped controlled check as a
-pass.
+any live acceptance evidence outside the repository in an ignored or external
+location. Do not describe a skipped controlled check as a pass.
 
 Focused checks should additionally prove:
 
@@ -865,6 +849,8 @@ This follow-on is complete when all of the following are true:
   unreviewed exception.
 - The normal build, full tests, package smoke test, protocol/manifest checks,
   and available controlled Enforce checks pass.
+- `docs/validation/` is absent from the repository, ignored for local output,
+  and no validation harness defaults to recreating it.
 
 ## Non-goals
 

@@ -1,3 +1,4 @@
+* text=auto eol=lf
 observer/addon/** -text
 observer/workbench-addon/** -text
 observer/protocol/generated/** text eol=lf
