@@ -11,7 +11,6 @@ import {
 import {
   mkdirSync,
   mkdtempSync,
-  readFileSync,
   rmSync,
   unlinkSync,
   writeFileSync,
@@ -33,10 +32,7 @@ import {
   type CompanionReadinessOptions,
   type WorkbenchCompanionIdentity,
 } from "../../src/workbench/readiness.js";
-import {
-  LifecycleGuardError,
-  WorkbenchProcessGuard,
-} from "../../src/workbench/process-guard.js";
+import { LifecycleGuardError } from "../../src/workbench/process-guard.js";
 import {
   createFakeLifecycleBackend,
   type FakeLifecycleBackend,
@@ -46,6 +42,10 @@ import {
   fakeCompanionProvider,
   WORKBENCH_HELPER_PING_RESPONSE,
 } from "./fake-companion.js";
+import {
+  closeTrackedWorkbenchProcessGuards,
+  WorkbenchProcessGuard,
+} from "./tracked-process-guard.js";
 
 const roots: string[] = [];
 
@@ -128,6 +128,8 @@ function createHarness(options: HarnessOptions = {}): Harness {
     backend,
     stateDir,
     mutexName,
+    beforeLifecycleReplace: (args) => backend.replaceFailure?.(args) ?? undefined,
+    afterLifecycleReplace: (args) => backend.afterReplace?.(args),
   });
   const companion = createFakeCompanionLaunch(root);
   const companionProvider = fakeCompanionProvider(companion);
@@ -216,7 +218,8 @@ function readinessIdentity(
   };
 }
 
-afterEach(() => {
+afterEach(async () => {
+  await closeTrackedWorkbenchProcessGuards();
   for (const root of roots.splice(0)) {
     rmSync(root, { recursive: true, force: true });
   }
@@ -405,11 +408,22 @@ describe("exact owner-scoped Workbench restart", () => {
       mutexName: harness.mutexName,
     });
     let contenderAttempt: ReturnType<typeof contenderGuard.withLifecycleLock> | null = null;
+    let reservedBeforeUninstall: {
+      phase: string;
+      workbench: unknown;
+      operation: { kind: string } | null;
+    } | null = null;
+    harness.backend.afterReplace = ({ next }) => {
+      if (next.phase === "starting" && next.workbench === null && next.operation?.kind === "recovery") {
+        reservedBeforeUninstall = {
+          phase: next.phase,
+          workbench: next.workbench,
+          operation: next.operation,
+        };
+      }
+    };
     harness.companionProvider.uninstall = vi.fn(() => {
-      const reserved = JSON.parse(
-        readFileSync(harness.guard.statePath, "utf8")
-      ) as { phase: string; workbench: unknown; operation: { kind: string } | null };
-      expect(reserved).toMatchObject({
+      expect(reservedBeforeUninstall).toMatchObject({
         phase: "starting",
         workbench: null,
         operation: { kind: "recovery" },

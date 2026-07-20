@@ -9,6 +9,11 @@ export const ADDON_GUID = "7F3A91C2E40B6D58" as const;
 export const OBSERVER_BUILD_IDENTITY = "000cec19226673ce911c68dca027dca7449ff58a604fe0cef6509afbc4d7ec22" as const;
 export const SESSION_DIRECTORY_NAME = "ReforgerForgeObserver" as const;
 export const SESSION_CONTRACT_NAME = "session.json" as const;
+/**
+ * The Workbench observer adapter speaks a separate protocol from both the
+ * runtime observer and the independently-versioned helper bundle.
+ */
+export const WORKBENCH_OBSERVER_ADAPTER_PROTOCOL = "reforger-forge-workbench-observer/1" as const;
 
 export {
   CAPABILITIES,

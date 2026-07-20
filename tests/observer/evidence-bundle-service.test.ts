@@ -3,15 +3,14 @@ import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { FileEvidenceBundleService, type EvidenceRunExportSnapshot } from "../../observer/agent/evidence-bundle-service.js";
-import { cleanup, temporaryDirectory } from "./helpers.js";
+import { withTemporaryDirectory } from "../support/temporary-directory.js";
 import { contractPng } from "./capture-policy-fixture.js";
 
 function sha256(value: Buffer): string { return createHash("sha256").update(value).digest("hex"); }
 
 describe("FileEvidenceBundleService", () => {
-  it("publishes manifest last, verifies every member, redacts logs, and recovers an attested output", () => {
-    const root = temporaryDirectory("rfo-bundle-");
-    try {
+  it("publishes manifest last, verifies every member, redacts logs, and recovers an attested output", async () => {
+    await withTemporaryDirectory((root) => {
       const exportWork = join(root, "export-work");
       const evidence = join(root, "evidence");
       const logs = join(root, "logs");
@@ -55,12 +54,11 @@ describe("FileEvidenceBundleService", () => {
       expect(copiedLog).toContain("[REDACTED]");
       service.verifyReceipt(snapshot, receipt, prepared.fingerprint);
       expect(service.export(snapshot, prepared)).toMatchObject({ recovered: true, manifestSha256: receipt.manifestSha256 });
-    } finally { cleanup(root); }
+    }, { prefix: "rfo-bundle-" });
   });
 
-  it("rejects secret-bearing runtime configuration before creating output", () => {
-    const root = temporaryDirectory("rfo-bundle-secret-");
-    try {
+  it("rejects secret-bearing runtime configuration before creating output", async () => {
+    await withTemporaryDirectory((root) => {
       const evidence = join(root, "evidence");
       mkdirSync(evidence);
       const service = new FileEvidenceBundleService(join(root, "work"), [evidence]);
@@ -71,6 +69,6 @@ describe("FileEvidenceBundleService", () => {
         review: { imagesReviewed: false, outcome: "Unreviewed", summary: "Pending review." },
         runtimeConfig: { configurationId: "unsafe", values: { apiToken: "secret" } },
       })).toThrowError(expect.objectContaining({ code: "INVALID_REQUEST" }));
-    } finally { cleanup(root); }
+    }, { prefix: "rfo-bundle-secret-" });
   });
 });

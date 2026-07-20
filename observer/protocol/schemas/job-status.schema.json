@@ -11,7 +11,7 @@
     "instanceNonce": { "type": "string", "minLength": 32, "maxLength": 256 },
     "jobId": { "$ref": "#/$defs/id" },
     "sequence": { "type": "integer", "minimum": 0 },
-    "state": { "enum": ["queued", "dispatched", "accepted", "resolving", "preloading", "acquiringCamera", "positioning", "settling", "capturing", "awaitingArtifact", "restoring", "completed", "failed", "cancelled"] },
+    "state": { "enum": ["queued","dispatched","accepted","resolving","preloading","acquiringCamera","positioning","settling","capturing","awaitingArtifact","restoring","completed","failed","cancelled"] },
     "worldId": { "oneOf": [{ "type": "string", "minLength": 1, "maxLength": 512 }, { "type": "null" }] },
     "worldEpoch": { "type": "integer", "minimum": 0 },
     "timestamp": { "type": "string", "format": "date-time" },

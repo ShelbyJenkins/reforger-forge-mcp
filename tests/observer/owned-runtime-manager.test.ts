@@ -37,11 +37,11 @@ import { createObserverApplication } from "../../observer/agent/application.js";
 import { runtimeStopObligations } from "../../observer/agent/private-child.js";
 import { OBSERVER_BUILD_IDENTITY } from "../../observer/protocol/index.js";
 import {
-  FakeClock,
   graphicalRegistration,
   observerAddonSource,
   testBundleDigest,
-} from "./helpers.js";
+} from "../support/observer-fixtures.js";
+import { ManualTime } from "../support/manual-time.js";
 
 interface FakeProcess extends FakeExactProcessRecord {}
 
@@ -766,7 +766,7 @@ describe("OwnedRuntimeManager", () => {
     roots.push(root);
     const executable = join(root, "ArmaReforgerSteamDiag.exe");
     writeFileSync(executable, "fixture");
-    const clock = new FakeClock(Date.parse("2026-07-18T12:00:00.000Z"));
+    const clock = new ManualTime({ nowMs: Date.parse("2026-07-18T12:00:00.000Z") });
     const profileRoot = join(root, "agent-profiles");
     mkdirSync(profileRoot, { recursive: true });
     const agent = createObserverApplication({
@@ -919,7 +919,7 @@ describe("OwnedRuntimeManager", () => {
     roots.push(root);
     const executable = join(root, "ArmaReforgerSteamDiag.exe");
     writeFileSync(executable, "fixture");
-    const clock = new FakeClock(Date.parse("2026-07-18T12:00:00.000Z"));
+    const clock = new ManualTime({ nowMs: Date.parse("2026-07-18T12:00:00.000Z") });
     const agentRoot = join(root, "agent-managed");
     const profileRoot = join(root, "agent-profiles");
     const profilePath = join(profileRoot, "runtime-profile");

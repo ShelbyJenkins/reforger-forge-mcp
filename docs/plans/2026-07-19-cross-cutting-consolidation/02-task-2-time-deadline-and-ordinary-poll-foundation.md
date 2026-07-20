@@ -314,8 +314,9 @@ ordinary wait implementation is shared and testable.
 2. Re-run the inventory searches. Document every retained specialized timer
    and any newly discovered ordinary loop; do not leave a silent exception.
 3. Add only a scoped architecture assertion if it can distinguish a newly
-   introduced ordinary poll from known specialized timing seams. Task 7 owns
-   the broader cross-cutting architecture check.
+   introduced ordinary poll from known specialized timing seams. Keep it
+   local to the time-foundation migration; there is no broader architecture
+   check in this follow-on.
 
 **Acceptance:** New ordinary sleeps and polling loops have one reviewed
 foundation owner, while specialized lifecycle and I/O timing remain explicit.

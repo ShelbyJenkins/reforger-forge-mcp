@@ -1,4 +1,11 @@
 import { pathComparisonKey } from "../foundation/managed-path.js";
+import {
+  assertTimerDurationMs,
+  deadlineAt,
+  remainingMs,
+  type Clock,
+  type Deadline,
+} from "../foundation/time.js";
 import type {
   SupervisedChildHandle,
 } from "../foundation/child-supervisor.js";
@@ -197,12 +204,9 @@ export async function waitForCompanionReady(
   options: CompanionReadinessOptions
 ): Promise<WorkbenchCompanionIdentity> {
   const timing = options.timing ?? defaultTiming;
-  if (!Number.isFinite(options.deadlineMs)) {
-    throw new TypeError("Workbench readiness deadline must be finite.");
-  }
-  if (!Number.isFinite(options.pollIntervalMs) || options.pollIntervalMs < 0) {
-    throw new TypeError("Workbench readiness poll interval must be finite and non-negative.");
-  }
+  const clock: Clock = timing;
+  const deadline = deadlineAt(options.deadlineMs);
+  assertTimerDurationMs(options.pollIntervalMs, "Workbench readiness poll interval");
 
   assertNotTerminated(options.child, options.signal, "Workbench companion readiness");
   let attested: WorkbenchCompanionLaunch;
@@ -224,7 +228,7 @@ export async function waitForCompanionReady(
   }
 
   let lastError: unknown;
-  while (timing.now() < options.deadlineMs) {
+  while (remainingMs(clock, deadline) > 0) {
     assertNotTerminated(options.child, options.signal, "Workbench companion readiness");
     const ownership = await options.verifyEndpointOwner(
       { ...options.endpoint },
@@ -232,10 +236,11 @@ export async function waitForCompanionReady(
     );
     assertNotTerminated(options.child, options.signal, "Workbench companion readiness");
     if (ownership.kind === "owned") {
-      const remainingMs = Math.max(1, options.deadlineMs - timing.now());
+      const remaining = remainingMs(clock, deadline);
+      if (remaining === 0) break;
       try {
         const response = await options.netApi.call<Record<string, unknown>>(PING_API, {}, {
-          timeoutMs: Math.min(MAX_PING_CALL_MS, remainingMs),
+          timeoutMs: Math.min(MAX_PING_CALL_MS, remaining),
           responseCapBytes: PING_RESPONSE_CAP_BYTES,
         });
         assertNotTerminated(options.child, options.signal, "Workbench companion readiness");
@@ -252,10 +257,10 @@ export async function waitForCompanionReady(
       );
     }
 
-    const remainingMs = options.deadlineMs - timing.now();
-    if (remainingMs <= 0) break;
+    const remaining = remainingMs(clock, deadline);
+    if (remaining === 0) break;
     await waitForNextAttempt(
-      Math.min(options.pollIntervalMs, remainingMs),
+      Math.min(options.pollIntervalMs, remaining),
       options.child,
       options.signal,
       timing,
@@ -295,8 +300,11 @@ export async function waitForVacancy(options: {
   readonly timing?: WorkbenchReadinessTiming;
 }): Promise<void> {
   const timing = options.timing ?? defaultTiming;
+  const clock: Clock = timing;
+  const deadline: Deadline = deadlineAt(options.deadlineMs);
+  assertTimerDurationMs(options.pollIntervalMs, "Endpoint vacancy poll interval");
   let last: VerifyEndpointVacantResult | null = null;
-  while (timing.now() < options.deadlineMs) {
+  while (remainingMs(clock, deadline) > 0) {
     if (options.signal?.aborted) {
       throw new WorkbenchReadinessError("Endpoint vacancy wait was aborted.", "ABORTED");
     }
@@ -308,10 +316,10 @@ export async function waitForVacancy(options: {
         "ENDPOINT_UNVERIFIABLE"
       );
     }
-    const remainingMs = options.deadlineMs - timing.now();
-    if (remainingMs <= 0) break;
+    const remaining = remainingMs(clock, deadline);
+    if (remaining === 0) break;
     await waitForNextAttempt(
-      Math.min(options.pollIntervalMs, remainingMs),
+      Math.min(options.pollIntervalMs, remaining),
       undefined,
       options.signal,
       timing,

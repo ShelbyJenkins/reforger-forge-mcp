@@ -349,10 +349,10 @@ published `.mjs` code has no copied redactor or unbuilt-TypeScript import.
    arguments and cannot emit diagnostics.
 2. Update focused tests to import the foundation boundary rather than testing
    deleted implementation details.
-3. Add a source/architecture assertion suitable for this task's scope: no
-   migrated production output sink defines a redact-prefixed helper or owner
-   token masking regular expression. Task 7 will own the final repository-wide
-   AST guard, so do not create a broad brittle text scan here.
+3. Add a focused source/architecture assertion suitable for this task's
+   scope: no migrated production output sink defines a redact-prefixed helper
+   or owner token masking regular expression. Keep it narrow and tied to the
+   migrated sinks; do not create a broad brittle repository scan.
 4. Run `npm pack`/package tests after the source tests. Confirm the installed
    package import map resolves `#foundation/redact`, the compiled JavaScript is
    included, and the acceptance script cannot fall back to a second

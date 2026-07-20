@@ -28,6 +28,10 @@ import {
   verifyContentAddressedBundle,
   type ContentAddressedBundlePolicy,
 } from "../companions/content-addressed-bundle.js";
+import {
+  WORKBENCH_HELPER_HANDLER_FILES as generatedWorkbenchHelperHandlerFiles,
+  WORKBENCH_HELPER_PAYLOAD_FILES,
+} from "./helper-addon-payload.generated.js";
 
 export const WORKBENCH_HELPER_SOURCE_MANIFEST =
   ".reforger-forge-workbench-helper-source.json" as const;
@@ -37,42 +41,8 @@ export const WORKBENCH_HELPER_ADDON_VERSION = "0.1.0" as const;
 export const WORKBENCH_HELPER_PROTOCOL_VERSION = "2.0" as const;
 /** Content identity of the helper payload, excluding only its generated identity source. */
 export const WORKBENCH_HELPER_BUILD_IDENTITY =
-  "1c23de814274c130d32b665a84e6be3ee1a69a5747759fdba54a684e998936b3" as const;
-export const WORKBENCH_HELPER_HANDLER_FILES = [
-  "EMCP_WB_Clipboard.c",
-  "EMCP_WB_Components.c",
-  "EMCP_WB_CreateEntity.c",
-  "EMCP_WB_DeleteEntity.c",
-  "EMCP_WB_EditorControl.c",
-  "EMCP_WB_ExecuteAction.c",
-  "EMCP_WB_GetCameraPos.c",
-  "EMCP_WB_GetEntity.c",
-  "EMCP_WB_GetState.c",
-  "EMCP_WB_Layers.c",
-  "EMCP_WB_ListEntities.c",
-  "EMCP_WB_Localization.c",
-  "EMCP_WB_ModifyEntity.c",
-  "EMCP_WB_ObserverCancel.c",
-  "EMCP_WB_ObserverCommon.c",
-  "EMCP_WB_ObserverPing.c",
-  "EMCP_WB_ObserverRelease.c",
-  "EMCP_WB_ObserverStatus.c",
-  "EMCP_WB_ObserverSubmit.c",
-  "EMCP_WB_Ping.c",
-  "EMCP_WB_Prefabs.c",
-  "EMCP_WB_Reload.c",
-  "EMCP_WB_Resources.c",
-  "EMCP_WB_ScriptEditor.c",
-  "EMCP_WB_SelectEntity.c",
-  "EMCP_WB_Terrain.c",
-] as const;
-const WORKBENCH_HELPER_PAYLOAD_FILES = [
-  "addon.gproj",
-  ...WORKBENCH_HELPER_HANDLER_FILES.map((name) =>
-    `Scripts/WorkbenchGame/EnfusionMCP/${name}`
-  ),
-  "Scripts/WorkbenchGame/EnfusionMCP/RFWB_HelperBuild.c",
-] as const;
+  "8a187406f40702829a2f967e7aa24ef6ba609e50c228ecb8d8c22b8623267238" as const;
+export const WORKBENCH_HELPER_HANDLER_FILES = generatedWorkbenchHelperHandlerFiles;
 /** Workbench creates this cache beside addon.gproj after loading a staged add-on. */
 const WORKBENCH_GENERATED_STAGED_FILES = new Set(["resourceDatabase.rdb"]);
 

@@ -101,7 +101,7 @@ class RFO_ObserverRuntimeCommand : JsonApiStruct
 
 	bool IsBoundedEnvelope()
 	{
-		if (protocolVersion != "1.0" || !RFO_ObserverValidation.Identifier(jobId) || !RFO_ObserverValidation.Identifier(instanceId))
+		if (protocolVersion != RFO_ObserverProtocol.RUNTIME_PROTOCOL_VERSION || !RFO_ObserverValidation.Identifier(jobId) || !RFO_ObserverValidation.Identifier(instanceId))
 			return false;
 		if (idempotencyKey.IsEmpty() || idempotencyKey.Length() > 128)
 			return false;
@@ -339,20 +339,20 @@ class RFO_ObserverJob
 	{
 		switch (state)
 		{
-			case RFO_ObserverJobState.ACCEPTED: return "accepted";
-			case RFO_ObserverJobState.RESOLVING: return "resolving";
-			case RFO_ObserverJobState.PRELOADING: return "preloading";
-			case RFO_ObserverJobState.ACQUIRING_CAMERA: return "acquiringCamera";
-			case RFO_ObserverJobState.POSITIONING: return "positioning";
-			case RFO_ObserverJobState.SETTLING: return "settling";
-			case RFO_ObserverJobState.CAPTURING: return "capturing";
-			case RFO_ObserverJobState.AWAITING_ARTIFACT: return "awaitingArtifact";
-			case RFO_ObserverJobState.RESTORING: return "restoring";
-			case RFO_ObserverJobState.COMPLETED: return "completed";
-			case RFO_ObserverJobState.FAILED: return "failed";
-			case RFO_ObserverJobState.CANCELLED: return "cancelled";
+			case RFO_ObserverJobState.ACCEPTED: return RFO_ObserverProtocol.STATE_ACCEPTED;
+			case RFO_ObserverJobState.RESOLVING: return RFO_ObserverProtocol.STATE_RESOLVING;
+			case RFO_ObserverJobState.PRELOADING: return RFO_ObserverProtocol.STATE_PRELOADING;
+			case RFO_ObserverJobState.ACQUIRING_CAMERA: return RFO_ObserverProtocol.STATE_ACQUIRING_CAMERA;
+			case RFO_ObserverJobState.POSITIONING: return RFO_ObserverProtocol.STATE_POSITIONING;
+			case RFO_ObserverJobState.SETTLING: return RFO_ObserverProtocol.STATE_SETTLING;
+			case RFO_ObserverJobState.CAPTURING: return RFO_ObserverProtocol.STATE_CAPTURING;
+			case RFO_ObserverJobState.AWAITING_ARTIFACT: return RFO_ObserverProtocol.STATE_AWAITING_ARTIFACT;
+			case RFO_ObserverJobState.RESTORING: return RFO_ObserverProtocol.STATE_RESTORING;
+			case RFO_ObserverJobState.COMPLETED: return RFO_ObserverProtocol.STATE_COMPLETED;
+			case RFO_ObserverJobState.FAILED: return RFO_ObserverProtocol.STATE_FAILED;
+			case RFO_ObserverJobState.CANCELLED: return RFO_ObserverProtocol.STATE_CANCELLED;
 		}
-		return "queued";
+		return RFO_ObserverProtocol.STATE_QUEUED;
 	}
 
 	protected bool ValidateView(RFO_ObserverCommandView captureView, RFO_ObserverSession session)

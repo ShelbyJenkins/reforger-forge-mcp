@@ -5,18 +5,12 @@ import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import type { Config } from "../config.js";
 import { loadConfig } from "../config.js";
+import { redactText } from "../foundation/redact.js";
 import {
   parseWorkbenchRunnerArguments,
   runWorkbenchIntent,
   type WorkbenchRunnerReceipt,
 } from "./runner.js";
-
-export function redactPrivateOwnerTokens(message: string): string {
-  return message.replace(
-    /-reforgerForgeOwnerToken(?:=|\s+)[^\s"']+/gi,
-    "-reforgerForgeOwnerToken=[redacted]"
-  );
-}
 
 export function receiptExitCode(receipt: WorkbenchRunnerReceipt): number {
   if (receipt.intent === "build" && receipt.validationFailure) return 1;
@@ -77,9 +71,10 @@ export async function executeWorkbenchRunnerCli(
     return receiptExitCode(receipt);
   } catch (error) {
     const record = error && typeof error === "object" ? error as { code?: unknown } : null;
-    const message = redactPrivateOwnerTokens(
-      error instanceof Error ? error.message : String(error)
-    );
+    const message = redactText(error instanceof Error ? error.message : String(error), {
+      profile: "command_argument",
+      replacement: "[redacted]",
+    });
     stderr.write(`${JSON.stringify({
       ok: false,
       code: typeof record?.code === "string" ? record.code : "RUNNER_FAILED",

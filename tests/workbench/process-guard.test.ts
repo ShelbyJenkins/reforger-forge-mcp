@@ -1,25 +1,29 @@
 import { afterEach, describe, expect, it } from "vitest";
 import {
-  existsSync,
+  mkdirSync,
   mkdtempSync,
-  readFileSync,
   readdirSync,
   rmSync,
-  writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { asBinary, open } from "lmdb";
 import {
   LifecycleGuardError,
-  WorkbenchProcessGuard,
   type WorkbenchIdentity,
 } from "../../src/workbench/process-guard.js";
+import { encodeDurableKey } from "../../src/foundation/durable-kv.js";
 import { createFakeLifecycleBackend } from "./fake-lifecycle-backend.js";
 import { companionLifecycleState, createFakeCompanionLaunch } from "./fake-companion.js";
+import {
+  closeTrackedWorkbenchProcessGuards,
+  WorkbenchProcessGuard,
+} from "./tracked-process-guard.js";
 
 const roots: string[] = [];
 
-afterEach(() => {
+afterEach(async () => {
+  await closeTrackedWorkbenchProcessGuards();
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
@@ -27,6 +31,21 @@ function root(): string {
   const value = mkdtempSync(join(tmpdir(), "reforger-forge-lifecycle-"));
   roots.push(value);
   return value;
+}
+
+/** Inject raw bytes at the lifecycle LMDB key, mirroring corruption or a stale schema. */
+async function writeRawLifecycleBytes(stateDir: string, bytes: Uint8Array): Promise<void> {
+  const environmentPath = join(stateDir, "durable-kv-v1");
+  mkdirSync(environmentPath, { recursive: true, mode: 0o700 });
+  const database = open<unknown, Uint8Array>(environmentPath, {
+    encoding: "binary",
+    keyEncoding: "binary",
+    useVersions: true,
+    maxDbs: 1,
+    overlappingSync: false,
+  });
+  database.putSync(Buffer.from(encodeDurableKey("workbench", "lifecycle"), "utf8"), asBinary(bytes), 1);
+  await database.close();
 }
 
 function target(name = "A"): { path: string; comparisonKey: string } {
@@ -52,8 +71,9 @@ describe("WorkbenchProcessGuard v3 lifecycle state", () => {
     expect(result.state.mcpOwner?.instanceId).toBe(guard.mcpInstanceId);
     expect(result.state.mcpOwner?.leaseId).toBe(guard.leaseId);
     expect(result.state.mcpOwner?.creationTime).toBe(backend.current.creationTime);
-    expect(existsSync(guard.statePath)).toBe(true);
-    expect(JSON.parse(readFileSync(guard.statePath, "utf8")).version).toBe(3);
+    const persisted = await guard.readLifecycleState();
+    expect(persisted.kind).toBe("valid");
+    if (persisted.kind === "valid") expect(persisted.state.version).toBe(3);
     expect("lockPath" in guard).toBe(false);
   });
 
@@ -262,14 +282,14 @@ describe("WorkbenchProcessGuard v3 lifecycle state", () => {
     const stateDir = root();
     const backend = createFakeLifecycleBackend();
     const guard = new WorkbenchProcessGuard({ stateDir, backend });
-    writeFileSync(guard.statePath, "{ malformed", "utf8");
+    await writeRawLifecycleBytes(stateDir, new TextEncoder().encode("{ malformed"));
 
     const result = await guard.withLifecycleLock((session) => session.validateAndClaim({
       endpoint: { host: "127.0.0.1", port: 5775 }, target: target(),
     }));
 
     expect(result).toMatchObject({ kind: "claimed", source: "malformed" });
-    expect(readdirSync(stateDir).some((name) => name.startsWith("malformed-"))).toBe(true);
+    expect(readdirSync(join(stateDir, "corrupt")).some((name) => name.startsWith("malformed-"))).toBe(true);
     expect((await guard.readLifecycleState()).kind).toBe("valid");
   });
 
@@ -277,7 +297,7 @@ describe("WorkbenchProcessGuard v3 lifecycle state", () => {
     const stateDir = root();
     const backend = createFakeLifecycleBackend();
     const guard = new WorkbenchProcessGuard({ stateDir, backend });
-    writeFileSync(guard.statePath, JSON.stringify({ version: 2, pid: 900 }), "utf8");
+    await writeRawLifecycleBytes(stateDir, new TextEncoder().encode(JSON.stringify({ version: 2, pid: 900 })));
     backend.addWorkbench({ pid: 900, executablePath: "C:\\Workbench.exe", creationTime: "900" });
 
     const result = await guard.withLifecycleLock((session) => session.validateAndClaim({
@@ -285,7 +305,7 @@ describe("WorkbenchProcessGuard v3 lifecycle state", () => {
     }));
 
     expect(result).toMatchObject({ kind: "refused", code: "STATE_INVALID" });
-    expect(JSON.parse(readFileSync(guard.statePath, "utf8")).version).toBe(2);
+    expect((await guard.readLifecycleState()).kind).toBe("malformed");
   });
 
   it("captures a spawned process only when path and exact owner argument match", async () => {
@@ -399,7 +419,7 @@ describe("WorkbenchProcessGuard v3 lifecycle state", () => {
     }));
 
     expect(result).toMatchObject({ kind: "refused", code: "IDENTITY_UNVERIFIABLE" });
-    expect(existsSync(guard.statePath)).toBe(false);
+    expect((await guard.readLifecycleState()).kind).toBe("missing");
   });
 
   it("delegates termination as one exact handle-bound backend operation", async () => {

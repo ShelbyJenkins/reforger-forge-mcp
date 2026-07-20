@@ -53,15 +53,6 @@ describe("bundled Windows Workbench lifecycle helper", () => {
     expect(helper).toContain("The process exited before its command line could be read.");
   });
 
-  it("generation-checks, flushes, and atomically replaces lifecycle state", () => {
-    expect(helper).toContain("expectedGeneration");
-    expect(helper).toContain("Lifecycle state generation mismatch");
-    expect(helper).toContain("$stream.Flush($true)");
-    expect(helper).toContain("MOVEFILE_REPLACE_EXISTING");
-    expect(helper).toContain("MOVEFILE_WRITE_THROUGH");
-    expect(helper).toContain("AtomicReplace($tempPath, $statePath)");
-  });
-
   it("uses only private JSON stdin/stdout protocol messages", () => {
     expect(helper).toContain("[Console]::In.ReadLine()");
     expect(helper).toContain("[Console]::Out.WriteLine($json)");

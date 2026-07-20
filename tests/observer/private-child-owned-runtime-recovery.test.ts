@@ -5,12 +5,11 @@ import {
   mkdirSync,
   readFileSync,
   readdirSync,
-  rmSync,
   statSync,
   writeFileSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import { createObserverApplication, type ObserverApplication } from "../../src/observer/application.js";
 import type { ObserverChildDescriptor } from "../../src/observer/agent-client.js";
 import {
@@ -24,7 +23,8 @@ import {
   type RuntimeStopPreflight,
 } from "../../src/observer/owned-runtime-manager.js";
 import type { ObserverLaunchInput, ObserverPreparedLaunch } from "../../src/observer/launch.js";
-import { observerAddonSource, repositoryRoot, temporaryDirectory } from "./helpers.js";
+import { observerAddonSource, repositoryRoot } from "../support/observer-fixtures.js";
+import { withTemporaryDirectory } from "../support/temporary-directory.js";
 
 interface FixtureProcess {
   identity: OwnedRuntimeExactIdentity;
@@ -179,20 +179,11 @@ interface BoundaryHarness {
   }>;
 }
 
-const roots: string[] = [];
-const applications: ObserverApplication[] = [];
-
-afterEach(async () => {
-  await Promise.allSettled(applications.splice(0).map((application) => application.close()));
-  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
-});
-
 function makeBoundaryHarness(
+  root: string,
   releaseFault: ReleaseFault = "none",
   sessionTerminalRetentionMs = 0
 ): BoundaryHarness {
-  const root = temporaryDirectory("rfo-private-child-owned-");
-  roots.push(root);
   const managedRoot = join(root, "observer-managed");
   const profileRoot = join(root, "profiles");
   const runtimeManagedRoot = join(root, "runtime-managed");
@@ -210,7 +201,6 @@ function makeBoundaryHarness(
     privateChildSweepIntervalMs: 100,
     privateChildSessionTerminalRetentionMs: sessionTerminalRetentionMs,
   });
-  applications.push(application);
   const gate = new FaultingApplicationGate(application, releaseFault);
   const backend = new BoundaryBackend();
   let pid = 51_000;
@@ -286,6 +276,21 @@ function makeBoundaryHarness(
       };
     },
   };
+}
+
+function withBoundaryHarness<T>(
+  run: (value: BoundaryHarness) => Promise<T>,
+  releaseFault: ReleaseFault = "none",
+  sessionTerminalRetentionMs = 0,
+): Promise<T> {
+  return withTemporaryDirectory(async (root) => {
+    const value = makeBoundaryHarness(root, releaseFault, sessionTerminalRetentionMs);
+    try {
+      return await run(value);
+    } finally {
+      await value.application.close();
+    }
+  }, { prefix: "rfo-private-child-owned-" });
 }
 
 async function postJson(base: string, path: string, token: string, body: Record<string, unknown>) {
@@ -422,8 +427,7 @@ async function putCameraJobIntoRestoring(
 }
 
 describe("actual private-child owned-runtime recovery boundary", () => {
-  it("reconstructs exact camera obligations after repeated unexpected child replacement without authority growth", async () => {
-    const value = makeBoundaryHarness();
+  it("reconstructs exact camera obligations after repeated unexpected child replacement without authority growth", async () => withBoundaryHarness(async (value) => {
     const authorityBounds: Array<{ records: number; bytes: number }> = [];
 
     for (let cycle = 1; cycle <= 3; cycle += 1) {
@@ -515,13 +519,12 @@ describe("actual private-child owned-runtime recovery boundary", () => {
       { records: 0, bytes: 0 },
       { records: 0, bytes: 0 },
     ]);
-  }, 30_000);
+  }), 30_000);
 
-  it("keeps release-required authority pinned past retention when release is lost before delivery", async () => {
+  it("keeps release-required authority pinned past retention when release is lost before delivery", async () => withBoundaryHarness(async (value) => {
     // The child durably acknowledges release before its IPC reply. Keep that
     // terminal proof for one second so the assertion cannot race the fixture's
     // otherwise immediate 100 ms terminal sweep.
-    const value = makeBoundaryHarness("before_delivery", 1_000);
     const prepared = await value.prepare("release-before-delivery");
     const managerInternals = value.manager as unknown as {
       atomicWrite(root: string, target: string, record: unknown, exclusive: boolean, durable?: boolean): void;
@@ -577,10 +580,9 @@ describe("actual private-child owned-runtime recovery boundary", () => {
       records: 0,
       activeOrRecoverableRuntimes: 0,
     });
-  }, 20_000);
+  }, "before_delivery", 1_000), 20_000);
 
-  it("replays the exact generation idempotently when release applied but its response was lost", async () => {
-    const value = makeBoundaryHarness("after_application");
+  it("replays the exact generation idempotently when release applied but its response was lost", async () => withBoundaryHarness(async (value) => {
     const prepared = await value.prepare("release-response-lost");
     const managerInternals = value.manager as unknown as {
       atomicWrite(root: string, target: string, record: unknown, exclusive: boolean, durable?: boolean): void;
@@ -618,5 +620,5 @@ describe("actual private-child owned-runtime recovery boundary", () => {
       state: "release_acknowledged",
       lifecycleGeneration: pending.record.lifecycleGeneration,
     });
-  }, 15_000);
+  }, "after_application"), 15_000);
 });

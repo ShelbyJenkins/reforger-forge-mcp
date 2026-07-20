@@ -4,26 +4,32 @@ import {
   OwnedRuntimeError,
   type OwnedRuntimeManager,
 } from "../observer/owned-runtime-manager.js";
-import { canonicalPublicObserverError } from "../observer/public-contract.js";
+import {
+  projectPublicObserverToolError,
+  type PublicObserverErrorCandidate,
+} from "../observer/public-contract.js";
 
 function jsonText(heading: string, value: unknown): string {
   return `${heading}\n\n\`\`\`json\n${JSON.stringify(value, null, 2)}\n\`\`\``;
 }
 
+function extractOwnedRuntimeError(error: unknown): PublicObserverErrorCandidate | undefined {
+  if (!(error instanceof OwnedRuntimeError)) return undefined;
+  return {
+    code: error.code,
+    readDiagnosticMessage: () => error.message,
+    readDetails: () => error.details,
+  };
+}
+
 function toolError(error: unknown) {
-  const publicError = canonicalPublicObserverError(
-    error instanceof OwnedRuntimeError ? error.code : "INTERNAL_ERROR",
-    error instanceof Error ? error.message : undefined
-  );
-  const { code, message } = publicError;
-  const details = publicError.diagnosticDetailsAllowed && error instanceof OwnedRuntimeError
-    ? error.details
-    : undefined;
   return {
     content: [{
       type: "text" as const,
-      text: `Observer runtime error (${code}): ${message.slice(0, 512)}` +
-        (details ? `\n\n\`\`\`json\n${JSON.stringify(details, null, 2)}\n\`\`\`` : ""),
+      text: projectPublicObserverToolError(error, {
+        subject: "Observer runtime error",
+        extract: extractOwnedRuntimeError,
+      }),
     }],
     isError: true,
   };

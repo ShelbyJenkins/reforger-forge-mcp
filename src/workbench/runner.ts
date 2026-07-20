@@ -12,6 +12,16 @@ import {
 import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import type { Config } from "../config.js";
+import { redactText } from "../foundation/redact.js";
+import {
+  deadlineAt,
+  deadlineAfter,
+  deriveDeadline,
+  pollUntil,
+  systemClock,
+  systemSleeper,
+  type Deadline,
+} from "../foundation/time.js";
 import {
   canonicalizeExistingDirectory,
   isPathContained,
@@ -782,13 +792,6 @@ function companionProbePort(
   });
 }
 
-function delay(ms: number): Promise<void> {
-  return new Promise((resolvePromise) => {
-    const timer = setTimeout(resolvePromise, ms);
-    timer.unref();
-  });
-}
-
 function snapshotLogDirectories(logRoot: string): Map<string, number> {
   const snapshot = new Map<string, number>();
   for (const entry of readdirSync(logRoot, { withFileTypes: true })) {
@@ -860,25 +863,30 @@ async function attributeLogDirectory(args: {
   before: ReadonlyMap<string, number>;
   launchedAtMs: number;
   ownerToken: string;
-  timeoutMs: number;
+  deadline: Deadline;
   pollMs: number;
 }): Promise<string> {
-  const deadline = Date.now() + args.timeoutMs;
-  do {
-    const matches: string[] = [];
-    const candidates = candidateLogDirectories(args.logRoot, args.before, args.launchedAtMs);
-    for (const candidate of candidates) {
-      if (await logDirectoryContainsOwner(candidate, args.ownerToken)) matches.push(candidate.path);
-    }
-    if (matches.length > 1) {
-      throw new WorkbenchRunnerError(
-        `The exact private owner token appeared in ${matches.length} Workbench log directories.`,
-        "LOG_ATTRIBUTION_FAILED"
-      );
-    }
-    if (matches.length === 1) return matches[0];
-    if (Date.now() < deadline) await delay(args.pollMs);
-  } while (Date.now() < deadline);
+  const result = await pollUntil<string>({
+    clock: systemClock,
+    sleeper: systemSleeper,
+    deadline: args.deadline,
+    intervalMs: args.pollMs,
+    probe: async (): Promise<string | undefined> => {
+      const matches: string[] = [];
+      const candidates = candidateLogDirectories(args.logRoot, args.before, args.launchedAtMs);
+      for (const candidate of candidates) {
+        if (await logDirectoryContainsOwner(candidate, args.ownerToken)) matches.push(candidate.path);
+      }
+      if (matches.length > 1) {
+        throw new WorkbenchRunnerError(
+          `The exact private owner token appeared in ${matches.length} Workbench log directories.`,
+          "LOG_ATTRIBUTION_FAILED"
+        );
+      }
+      return matches.length === 1 ? matches[0] : undefined;
+    },
+  });
+  if (result.kind === "value") return result.value;
   throw new WorkbenchRunnerError(
     "No Workbench log directory contained the exact private owner token before the attribution deadline.",
     "LOG_ATTRIBUTION_FAILED"
@@ -976,7 +984,11 @@ async function runBuildCompanionPreflight(
       qualify: (context) => args.controller.qualifyCompanion(context, {
         netApi: companionProbePort(args.endpoint, args.companionProbe),
         attestCompanion: args.reattestCompanion,
-        deadlineMs: Math.min(args.deadlineMs, Date.now() + args.endpointProbeTimeoutMs),
+        deadlineMs: deriveDeadline(
+          systemClock,
+          deadlineAt(args.deadlineMs),
+          args.endpointProbeTimeoutMs
+        ).atMs,
         pollIntervalMs: args.endpointPollMs,
         signal: args.signal,
       }),
@@ -988,7 +1000,11 @@ async function runBuildCompanionPreflight(
           before: beforeLogs,
           launchedAtMs: proof.process.launchedAtMs,
           ownerToken: owner.token,
-          timeoutMs: args.logAttributionTimeoutMs,
+          deadline: deriveDeadline(
+            systemClock,
+            deadlineAt(args.deadlineMs),
+            args.logAttributionTimeoutMs
+          ),
           pollMs: args.logPollMs,
         });
       },
@@ -1133,10 +1149,10 @@ async function runTargetBuildStageWithHandoff(
       if (error instanceof WorkbenchRunnerError && error.code === "OUTPUT_ATTESTATION_FAILED") {
         validationFailure = {
           code: "OUTPUT_ATTESTATION_FAILED",
-          message: error.message.replace(
-            /-reforgerForgeOwnerToken(?:=|\s+)[^\s"']+/gi,
-            "-reforgerForgeOwnerToken=[redacted]"
-          ),
+          message: redactText(error.message, {
+            profile: "command_argument",
+            replacement: "[redacted]",
+          }),
         };
       } else {
         throw error;
@@ -1150,7 +1166,11 @@ async function runTargetBuildStageWithHandoff(
     before: beforeLogs,
     launchedAtMs: run.process.launchedAtMs,
     ownerToken: owner.token,
-    timeoutMs: args.logAttributionTimeoutMs,
+    deadline: deriveDeadline(
+      systemClock,
+      deadlineAt(args.deadlineMs),
+      args.logAttributionTimeoutMs
+    ),
     pollMs: args.logPollMs,
   });
   return {
@@ -1475,7 +1495,7 @@ export async function runWorkbenchIntent(
       qualify: (context) => controller.qualifyCompanion(context, {
         netApi: companionProbePort(endpoint, dependencies.companionProbe ?? runnerCompanionPing),
         attestCompanion: reattestCompanion,
-        deadlineMs: Date.now() + endpointProbeTimeoutMs,
+        deadlineMs: deadlineAfter(systemClock, endpointProbeTimeoutMs).atMs,
         pollIntervalMs: endpointPollMs,
         signal: dependencies.signal,
       }),
@@ -1489,7 +1509,7 @@ export async function runWorkbenchIntent(
     before: beforeLogs,
     launchedAtMs: run.process.launchedAtMs,
     ownerToken: owner.token,
-    timeoutMs: logAttributionTimeoutMs,
+    deadline: deadlineAfter(systemClock, logAttributionTimeoutMs),
     pollMs: logPollMs,
   });
   return {

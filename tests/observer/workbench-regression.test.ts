@@ -1,17 +1,14 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import { StagingManager } from "../../observer/agent/staging.js";
 import { resolveProjectIdentity } from "../../src/workbench/project-identity.js";
-import { cleanup, observerAddonSource, temporaryDirectory } from "./helpers.js";
-
-const roots: string[] = [];
-afterEach(() => roots.splice(0).forEach(cleanup));
+import { observerAddonSource } from "../support/observer-fixtures.js";
+import { withTemporaryDirectory } from "../support/temporary-directory.js";
 
 describe("observer/Workbench isolation", () => {
-  it("staging outside projectPath leaves implicit canonical target resolution unchanged", () => {
-    const root = temporaryDirectory();
-    roots.push(root);
+  it("staging outside projectPath leaves implicit canonical target resolution unchanged", async () => {
+    await withTemporaryDirectory((root) => {
     const projectRoot = join(root, "projects");
     const target = join(projectRoot, "TargetAddon");
     mkdirSync(target, { recursive: true });
@@ -22,5 +19,6 @@ describe("observer/Workbench isolation", () => {
     const after = resolveProjectIdentity({ projectRoot });
     expect(after.comparisonKey).toBe(before.comparisonKey);
     expect(staged.addonDirectory.startsWith(projectRoot)).toBe(false);
+    });
   });
 });

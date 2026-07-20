@@ -16,6 +16,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "nod
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { isDeepStrictEqual } from "node:util";
+import { OBSERVER_TERMINAL_STATES } from "../observer/protocol/enforce-contract.js";
 import { loadConfig } from "../src/config.js";
 import {
   createObserverApplication,
@@ -99,7 +100,7 @@ const PRIVATE_CHILD_PATH = join(
   "private-child.js"
 );
 const OBSERVER_SOURCE_PATH = join(REPOSITORY_ROOT, "observer", "addon");
-const TERMINAL_STATES = new Set(["completed", "failed", "cancelled"]);
+const TERMINAL_STATES = new Set<string>(OBSERVER_TERMINAL_STATES);
 const ACCEPTANCE_CASE_ID = "RFO-LIVE-RUNTIME-SCREENSHOT";
 const CAPTURE_LABELS = [
   "initial-current",

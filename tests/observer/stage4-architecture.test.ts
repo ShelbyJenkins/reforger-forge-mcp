@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { repositoryRoot } from "./helpers.js";
+import { repositoryRoot } from "../support/observer-fixtures.js";
 
 describe("Stage 4 observer architecture", () => {
   it("keeps the host application as the sole host composition root", () => {

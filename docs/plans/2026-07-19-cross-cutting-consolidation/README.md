@@ -11,13 +11,12 @@
 | 4 | [Source-manifest and tar package-archive verification](04-task-4-tar-package-archive-verification.md) |
 | 5 | [Enforce protocol generation and consumer migration](05-task-5-enforce-protocol-generation.md) |
 | 6 | [Shared test support](06-task-6-test-support.md) |
-| 7 | [Ownership-boundary enforcement](07-task-7-ownership-boundaries.md) |
-| 8 | [Validation-artifact cleanup](08-task-8-validation-artifact-cleanup.md) |
 
 ## Independent follow-ons
 
 - [LMDB persistence migration](90-independent-lmdb-persistence-migration.md)
 - [Local observer failure-matrix acceptance](91-independent-local-observer-failure-matrix.md)
+- [LMDB lifecycle Node-authority migration](92-lmdb-lifecycle-node-authority-migration.md)
 
 The `90` and `91` prefixes are sort keys only; they are not parent task
 numbers.
@@ -38,8 +37,6 @@ main maintainability roadmap:
    inventories; packaging and tests consume them.
 6. A shared test-support package replaces repetitive temporary-directory,
    clock, polling, and observer fixture setup.
-7. A deliberately small architecture check prevents the same categories from
-   returning.
 
 The desired dependency direction is:
 
@@ -58,7 +55,6 @@ observer/public-contract --> both MCP tool error boundaries
 
 source manifests ------> staging, package check, contract tests
 tests/support ---------> observer and Workbench suites
-architecture check ----> prevents new local owners
 ~~~
 
 This is consolidation, not a protocol or behavior redesign. Existing public
@@ -81,7 +77,6 @@ than a stale count, as the contract.
 | Tool error formatting | src/observer/tools.ts and src/tools/observer-runtime.ts | src/observer/public-contract.ts |
 | Add-on inventory | both source manifests, helper-addon.ts, check-package.mjs, package-contract.test.ts | The two source manifests |
 | Test setup | tests/observer/helpers.ts and direct temporary-directory setup across observer/Workbench suites | tests/support/ |
-| Regression guards | local redaction/sleep/path-key implementations and raw test mkdtemp calls | One scoped architecture check |
 
 Suggested characterization commands:
 
@@ -326,13 +321,18 @@ and every payload file is declared.
 
 [Task 6 shared test support](06-task-6-test-support.md)
 
-### Task 7: enforce the new ownership boundaries and delete stragglers
+### Manual closeout: remove temporary validation artifacts
 
-[Task 7 ownership-boundary enforcement](07-task-7-ownership-boundaries.md)
+After the other consolidation checks are reviewed, perform this cleanup
+manually:
 
-### Task 8: remove temporary validation artifacts from the repository
-
-[Task 8 validation-artifact cleanup](08-task-8-validation-artifact-cleanup.md)
+1. Keep `docs/validation/` ignored at the repository root.
+2. Audit scripts, tests, and documentation so validation evidence defaults to
+   an external evidence root or a fresh OS-temporary directory.
+3. Remove any tracked `docs/validation/` artifacts and confirm that a clean
+   checkout does not recreate that directory by default.
+4. Verify package contents contain no validation artifacts and that maintainers
+   can still select an explicit external evidence location.
 
 ## Review boundaries
 
@@ -344,10 +344,7 @@ Keep reviews small enough that a behavioral regression has an obvious source:
    redaction tests.
 3. **Inventory and generated Enforce vocabulary:** Tasks 4-5, including
    generated-file and controlled Enforce evidence.
-4. **Test ergonomics and guardrails:** Tasks 6-7, including the final
-   deletion diff and architecture-check configuration.
-5. **Temporary validation cleanup:** Task 8, after all other validation has
-   been accepted; keep it as one deletion-and-defaults review.
+4. **Test ergonomics:** Task 6, including the final deletion diff.
 
 Do not combine a numeric camera-tolerance decision with a bulk generated-file
 move. It needs independent review and real acceptance evidence.
@@ -385,7 +382,6 @@ Focused checks should additionally prove:
 - deadlines, cancellation, and durable recovery behavior remain intact;
 - both public tool error boundaries return the same policy result;
 - tests/support cleanup works under parallel test execution;
-- the architecture check has no stale exceptions.
 
 ## Completion criteria
 
@@ -404,12 +400,11 @@ This follow-on is complete when all of the following are true:
   the packed tarball is verified against it.
 - Shared test support is adopted by ordinary observer and Workbench suites;
   remaining direct temporary-directory calls are intentional and documented.
-- A narrow architecture check prevents new duplicate owners and has no
-  unreviewed exception.
 - The normal build, full tests, package smoke test, protocol/manifest checks,
   and available controlled Enforce checks pass.
-- `docs/validation/` is absent from the repository, ignored for local output,
-  and no validation harness defaults to recreating it.
+- Manual closeout confirms `docs/validation/` is absent from the repository,
+  ignored for local output, and no validation harness defaults to recreating
+  it.
 
 ## Non-goals
 

@@ -1,14 +1,14 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { ArtifactStore } from "../../observer/agent/artifacts.js";
 import { convertBmpToPng, validatePng } from "../../observer/agent/bmp.js";
 import { JobStore, type JobStoreOptions } from "../../observer/agent/jobs.js";
 import { InstanceRegistry } from "../../observer/agent/registry.js";
-import { cleanup, createSessionFixture, FakeClock, graphicalRegistration, temporaryDirectory } from "./helpers.js";
-
-const roots: string[] = [];
-afterEach(() => roots.splice(0).forEach(cleanup));
+import type { Sleeper } from "../../src/foundation/time.js";
+import { withTemporaryDirectory } from "../support/temporary-directory.js";
+import { createObserverSessionFixture, graphicalRegistration } from "../support/observer-fixtures.js";
+import { ManualTime } from "../support/manual-time.js";
 
 function bmp24(width = 2, height = 2): Buffer {
   const rowStride = Math.floor((24 * width + 31) / 32) * 4;
@@ -32,22 +32,37 @@ function bmp24(width = 2, height = 2): Buffer {
   return data;
 }
 
-function setup(jobOptions: JobStoreOptions = {}) {
-  const root = temporaryDirectory();
-  roots.push(root);
-  const clock = new FakeClock();
-  const fixture = createSessionFixture(root, clock);
+function setup(
+  root: string,
+  jobOptions: JobStoreOptions = {},
+  timing: {
+    clock?: ManualTime;
+    sleeper?: Sleeper;
+    stableIntervalMs?: number;
+    stableTimeoutMs?: number;
+  } = {}
+) {
+  const clock = timing.clock ?? new ManualTime();
+  const fixture = createObserverSessionFixture({ root, clock });
   const registry = new InstanceRegistry(fixture.store, { clock });
   const registration = graphicalRegistration(fixture.created);
   registry.register(registration, fixture.created.contract.sessionToken);
   const jobs = new JobStore(fixture.store, registry, clock, jobOptions);
   const artifacts = new ArtifactStore(join(root, "artifacts"), fixture.store, jobs, {
-    stableIntervalMs: 2,
+    stableIntervalMs: timing.stableIntervalMs ?? 2,
     // Success-path stability checks need scheduler headroom under a parallel
     // full-suite run; the production default is 2 seconds.
-    stableTimeoutMs: 2_000,
+    stableTimeoutMs: timing.stableTimeoutMs ?? 2_000,
+    ...(timing.sleeper ? { clock, sleeper: timing.sleeper } : {}),
   });
   return { root, ...fixture, registry, registration, jobs, artifacts };
+}
+
+function scopedIt(
+  name: string,
+  run: (root: string) => Promise<void> | void,
+): void {
+  it(name, () => withTemporaryDirectory(run, { prefix: "rfo-artifacts-" }));
 }
 
 function advanceCurrentJob(value: ReturnType<typeof setup>, jobId: string): string {
@@ -70,6 +85,47 @@ function advanceCurrentJob(value: ReturnType<typeof setup>, jobId: string): stri
 }
 
 describe("observer artifacts", () => {
+  scopedIt("maps stable-file expiry to ARTIFACT_INCOMPLETE without wall-clock waiting", async (root) => {
+    const clock = new ManualTime();
+    const delays: number[] = [];
+    const sleeper: Sleeper = {
+      async sleep(durationMs: number): Promise<void> {
+        delays.push(durationMs);
+        clock.advance(durationMs);
+      },
+    };
+    const value = setup(root, {}, { clock, sleeper, stableTimeoutMs: 4 });
+    const job = value.jobs.submit({
+      sessionId: value.registration.sessionId,
+      idempotencyKey: "artifact-timeout",
+      deadlineAt: new Date(clock.now() + 10_000).toISOString(),
+      view: { kind: "current" },
+    });
+    advanceCurrentJob(value, job.request.jobId);
+
+    await expect(value.artifacts.intake({
+      protocolVersion: "1.0",
+      sessionId: value.registration.sessionId,
+      instanceId: value.registration.instanceId,
+      instanceNonce: value.registration.instanceNonce,
+      jobId: job.request.jobId,
+      artifactId: "artifact-timeout",
+      relativeScreenshotFilename: `${job.request.jobId}.bmp`,
+      screenshotIssuedAt: new Date(clock.now()).toISOString(),
+      completedAt: new Date(clock.now()).toISOString(),
+      worldId: value.registration.worldId,
+      worldEpoch: value.registration.worldEpoch,
+      actualCamera: {},
+      requestedSettleFrames: 0,
+      actualSettleFrames: 0,
+      contaminated: false,
+      warnings: [],
+    }, value.created.contract.sessionToken)).rejects.toMatchObject({
+      code: "ARTIFACT_INCOMPLETE",
+    });
+    expect(delays).toEqual([2, 2]);
+  });
+
   it("validates narrow BMP input and emits deterministic PNG", () => {
     const first = convertBmpToPng(bmp24());
     const second = convertBmpToPng(bmp24());
@@ -87,8 +143,8 @@ describe("observer artifacts", () => {
     expect(() => convertBmpToPng(bmp24(), { maxWidth: 1 })).toThrowError(expect.objectContaining({ code: "ARTIFACT_INVALID" }));
   });
 
-  it("confines, validates, hashes, and retains an announced artifact", async () => {
-    const value = setup();
+  scopedIt("confines, validates, hashes, and retains an announced artifact", async (root) => {
+    const value = setup(root);
     const job = value.jobs.submit({
       sessionId: value.registration.sessionId,
       idempotencyKey: "artifact-1",
@@ -142,8 +198,8 @@ describe("observer artifacts", () => {
     )).toThrowError(expect.objectContaining({ code: "JOB_RELEASED" }));
   });
 
-  it("retains a bounded release receipt after terminal job metadata is swept", async () => {
-    const value = setup({ terminalJobRetentionMs: 1, idempotencyReceiptRetentionMs: 1 });
+  scopedIt("retains a bounded release receipt after terminal job metadata is swept", async (root) => {
+    const value = setup(root, { terminalJobRetentionMs: 1, idempotencyReceiptRetentionMs: 1 });
     const job = value.jobs.submit({
       sessionId: value.registration.sessionId,
       idempotencyKey: "late-artifact-release",
@@ -181,8 +237,8 @@ describe("observer artifacts", () => {
     expect(value.jobs.stats()).toMatchObject({ jobs: 0, releaseTombstones: 1 });
   });
 
-  it("retries job completion after atomic promotion without duplicating the artifact", async () => {
-    const value = setup();
+  scopedIt("retries job completion after atomic promotion without duplicating the artifact", async (root) => {
+    const value = setup(root);
     const job = value.jobs.submit({
       sessionId: value.registration.sessionId,
       idempotencyKey: "artifact-crash-window",
@@ -227,8 +283,8 @@ describe("observer artifacts", () => {
     expect(existsSync(join(captureRoot, filename))).toBe(false);
   });
 
-  it("rejects traversal-shaped filenames before filesystem access", async () => {
-    const value = setup();
+  scopedIt("rejects traversal-shaped filenames before filesystem access", async (root) => {
+    const value = setup(root);
     await expect(value.artifacts.intake({
       protocolVersion: "1.0",
       sessionId: value.registration.sessionId,

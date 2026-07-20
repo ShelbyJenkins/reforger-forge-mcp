@@ -16,6 +16,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "nod
 import { isDeepStrictEqual } from "node:util";
 import { sha256File, sha256Hex } from "#foundation/digest";
 import { BoundedJsonStore, JsonStoreError } from "#foundation/json-store";
+import { redactText } from "#foundation/redact";
 import { AGENT_VERSION, DEFAULT_LIMITS, PROTOCOL_VERSION, SHA256_PATTERN } from "../protocol/index.js";
 import type { ManagedArtifactRef } from "./artifacts.js";
 import { ObserverError } from "./errors.js";
@@ -154,10 +155,6 @@ function assertNoSecrets(value: unknown, path = "runtimeConfig"): void {
     if (SECRET_KEY_PATTERN.test(key)) throw new ObserverError("INVALID_REQUEST", `${path}.${key} looks secret-bearing and cannot be exported`);
     assertNoSecrets(item, `${path}.${key}`);
   }
-}
-function redactLog(value: string): string {
-  return value.replace(/Bearer\s+[A-Za-z0-9._~-]+/gi, "Bearer [REDACTED]")
-    .replace(/((?:authorization|credential|password|secret|token)\s*[:=]\s*)[^\s,;]+/gi, "$1[REDACTED]");
 }
 function presentation(value: unknown): string {
   return String(value ?? "").replace(/[\u0000-\u001f\u007f-\u009f]/g, " ").replace(/\s+/g, " ").trim();
@@ -414,7 +411,7 @@ export class FileEvidenceBundleService implements EvidenceBundleService {
       } finally { closeSync(descriptor); }
       total += bytes.length;
       if (bytes.includes(0)) throw new ObserverError("INVALID_REQUEST", "Relevant log attachments must be text files");
-      const filtered = Buffer.from(redactLog(new TextDecoder("utf-8", { fatal: true }).decode(bytes)), "utf8");
+      const filtered = Buffer.from(redactText(new TextDecoder("utf-8", { fatal: true }).decode(bytes), { profile: "diagnostic" }), "utf8");
       const path = `relevant-logs/${file.label}.log`;
       atomicWriteFile(workRoot, join(workRoot, path), filtered);
       result.push({ kind: "relevantLog", label: file.label, path, bytes: filtered.length, sha256: sha256Hex(filtered) });

@@ -1,0 +1,424 @@
+{
+  "descriptorVersion": 1,
+  "identities": {
+    "runtimeObserver": "1.0",
+    "workbenchAdapter": "reforger-forge-workbench-observer/1",
+    "workbenchHelperBundle": "2.0"
+  },
+  "terminalStates": [
+    "completed",
+    "failed",
+    "cancelled"
+  ],
+  "targets": {
+    "game": {
+      "className": "RFO_ObserverProtocol",
+      "outputPath": "observer/addon/Scripts/Game/ReforgerForgeObserver/RFO_ObserverProtocol.c",
+      "strings": [
+        {
+          "field": "RUNTIME_PROTOCOL_VERSION",
+          "value": "1.0"
+        },
+        {
+          "field": "STATE_QUEUED",
+          "value": "queued"
+        },
+        {
+          "field": "STATE_DISPATCHED",
+          "value": "dispatched"
+        },
+        {
+          "field": "STATE_ACCEPTED",
+          "value": "accepted"
+        },
+        {
+          "field": "STATE_RESOLVING",
+          "value": "resolving"
+        },
+        {
+          "field": "STATE_PRELOADING",
+          "value": "preloading"
+        },
+        {
+          "field": "STATE_ACQUIRING_CAMERA",
+          "value": "acquiringCamera"
+        },
+        {
+          "field": "STATE_POSITIONING",
+          "value": "positioning"
+        },
+        {
+          "field": "STATE_SETTLING",
+          "value": "settling"
+        },
+        {
+          "field": "STATE_CAPTURING",
+          "value": "capturing"
+        },
+        {
+          "field": "STATE_AWAITING_ARTIFACT",
+          "value": "awaitingArtifact"
+        },
+        {
+          "field": "STATE_RESTORING",
+          "value": "restoring"
+        },
+        {
+          "field": "STATE_COMPLETED",
+          "value": "completed"
+        },
+        {
+          "field": "STATE_FAILED",
+          "value": "failed"
+        },
+        {
+          "field": "STATE_CANCELLED",
+          "value": "cancelled"
+        },
+        {
+          "field": "ERROR_PROTOCOL_MISMATCH",
+          "value": "PROTOCOL_MISMATCH"
+        },
+        {
+          "field": "ERROR_SESSION_NOT_FOUND",
+          "value": "SESSION_NOT_FOUND"
+        },
+        {
+          "field": "ERROR_SESSION_EXPIRED",
+          "value": "SESSION_EXPIRED"
+        },
+        {
+          "field": "ERROR_SESSION_MISMATCH",
+          "value": "SESSION_MISMATCH"
+        },
+        {
+          "field": "ERROR_UNAUTHORIZED",
+          "value": "UNAUTHORIZED"
+        },
+        {
+          "field": "ERROR_PROFILE_CONFLICT",
+          "value": "PROFILE_CONFLICT"
+        },
+        {
+          "field": "ERROR_INSTANCE_NOT_FOUND",
+          "value": "INSTANCE_NOT_FOUND"
+        },
+        {
+          "field": "ERROR_INSTANCE_STALE",
+          "value": "INSTANCE_STALE"
+        },
+        {
+          "field": "ERROR_INSTANCE_CONFLICT",
+          "value": "INSTANCE_CONFLICT"
+        },
+        {
+          "field": "ERROR_NO_RENDER_ENDPOINT",
+          "value": "NO_RENDER_ENDPOINT"
+        },
+        {
+          "field": "ERROR_CAPABILITY_UNAVAILABLE",
+          "value": "CAPABILITY_UNAVAILABLE"
+        },
+        {
+          "field": "ERROR_JOB_NOT_FOUND",
+          "value": "JOB_NOT_FOUND"
+        },
+        {
+          "field": "ERROR_JOB_RELEASED",
+          "value": "JOB_RELEASED"
+        },
+        {
+          "field": "ERROR_IDEMPOTENCY_CONFLICT",
+          "value": "IDEMPOTENCY_CONFLICT"
+        },
+        {
+          "field": "ERROR_UNSUPPORTED_VIEW",
+          "value": "UNSUPPORTED_VIEW"
+        },
+        {
+          "field": "ERROR_INVALID_REQUEST",
+          "value": "INVALID_REQUEST"
+        },
+        {
+          "field": "ERROR_WORLD_UNAVAILABLE",
+          "value": "WORLD_UNAVAILABLE"
+        },
+        {
+          "field": "ERROR_WORLD_CHANGED",
+          "value": "WORLD_CHANGED"
+        },
+        {
+          "field": "ERROR_CAMERA_BUSY",
+          "value": "CAMERA_BUSY"
+        },
+        {
+          "field": "ERROR_CAMERA_OWNERSHIP_LOST",
+          "value": "CAMERA_OWNERSHIP_LOST"
+        },
+        {
+          "field": "ERROR_RESTORATION_UNCONFIRMED",
+          "value": "RESTORATION_UNCONFIRMED"
+        },
+        {
+          "field": "ERROR_CAPTURE_REJECTED",
+          "value": "CAPTURE_REJECTED"
+        },
+        {
+          "field": "ERROR_CAPTURE_TIMEOUT",
+          "value": "CAPTURE_TIMEOUT"
+        },
+        {
+          "field": "ERROR_ARTIFACT_INCOMPLETE",
+          "value": "ARTIFACT_INCOMPLETE"
+        },
+        {
+          "field": "ERROR_ARTIFACT_INVALID",
+          "value": "ARTIFACT_INVALID"
+        },
+        {
+          "field": "ERROR_ARTIFACT_TOO_LARGE",
+          "value": "ARTIFACT_TOO_LARGE"
+        },
+        {
+          "field": "ERROR_TRANSPORT_UNAVAILABLE",
+          "value": "TRANSPORT_UNAVAILABLE"
+        },
+        {
+          "field": "ERROR_PERFORMANCE_POLICY_BLOCKED",
+          "value": "PERFORMANCE_POLICY_BLOCKED"
+        },
+        {
+          "field": "ERROR_CANCELLED",
+          "value": "CANCELLED"
+        },
+        {
+          "field": "ERROR_INTERNAL_ERROR",
+          "value": "INTERNAL_ERROR"
+        },
+        {
+          "field": "CAP_RENDER_CAPTURE",
+          "value": "render.capture"
+        },
+        {
+          "field": "CAP_CAMERA_RUNTIME",
+          "value": "camera.runtime"
+        },
+        {
+          "field": "CAP_WORLD_QUERY",
+          "value": "world.query"
+        },
+        {
+          "field": "CAP_AUTHORITY_SERVER",
+          "value": "authority.server"
+        },
+        {
+          "field": "CAP_TRANSPORT_REST",
+          "value": "transport.rest"
+        },
+        {
+          "field": "CAP_TRANSPORT_MAILBOX",
+          "value": "transport.mailbox"
+        },
+        {
+          "field": "DIRECTORY_SESSION_ROOT",
+          "value": "ReforgerForgeObserver"
+        },
+        {
+          "field": "FILE_SESSION_CONTRACT",
+          "value": "session.json"
+        }
+      ],
+      "numbers": []
+    },
+    "workbench": {
+      "className": "EMCP_WB_ObserverProtocol",
+      "outputPath": "observer/workbench-addon/Scripts/WorkbenchGame/EnfusionMCP/EMCP_WB_ObserverProtocol.c",
+      "strings": [
+        {
+          "field": "ADAPTER_PROTOCOL",
+          "value": "reforger-forge-workbench-observer/1"
+        },
+        {
+          "field": "STATE_ACCEPTED",
+          "value": "accepted"
+        },
+        {
+          "field": "STATE_SETTLING",
+          "value": "settling"
+        },
+        {
+          "field": "STATE_CAPTURING",
+          "value": "capturing"
+        },
+        {
+          "field": "STATE_AWAITING_ARTIFACT",
+          "value": "awaitingArtifact"
+        },
+        {
+          "field": "STATE_RESTORING",
+          "value": "restoring"
+        },
+        {
+          "field": "STATE_COMPLETED",
+          "value": "completed"
+        },
+        {
+          "field": "STATE_FAILED",
+          "value": "failed"
+        },
+        {
+          "field": "STATE_CANCELLED",
+          "value": "cancelled"
+        },
+        {
+          "field": "ERROR_SESSION_MISMATCH",
+          "value": "SESSION_MISMATCH"
+        },
+        {
+          "field": "ERROR_STALE_INSTANCE",
+          "value": "STALE_INSTANCE"
+        },
+        {
+          "field": "ERROR_AMBIGUOUS_INSTANCE",
+          "value": "AMBIGUOUS_INSTANCE"
+        },
+        {
+          "field": "ERROR_NO_RENDER_ENDPOINT",
+          "value": "NO_RENDER_ENDPOINT"
+        },
+        {
+          "field": "ERROR_CAPABILITY_UNAVAILABLE",
+          "value": "CAPABILITY_UNAVAILABLE"
+        },
+        {
+          "field": "ERROR_WORKBENCH_ADAPTER_UNAVAILABLE",
+          "value": "WORKBENCH_ADAPTER_UNAVAILABLE"
+        },
+        {
+          "field": "ERROR_HANDLER_UNAVAILABLE",
+          "value": "HANDLER_UNAVAILABLE"
+        },
+        {
+          "field": "ERROR_HANDLER_REJECTED",
+          "value": "HANDLER_REJECTED"
+        },
+        {
+          "field": "ERROR_STALE_LIFECYCLE",
+          "value": "STALE_LIFECYCLE"
+        },
+        {
+          "field": "ERROR_WORKBENCH_EXITED",
+          "value": "WORKBENCH_EXITED"
+        },
+        {
+          "field": "ERROR_JOB_NOT_FOUND",
+          "value": "JOB_NOT_FOUND"
+        },
+        {
+          "field": "ERROR_JOB_RELEASED",
+          "value": "JOB_RELEASED"
+        },
+        {
+          "field": "ERROR_IDEMPOTENCY_CONFLICT",
+          "value": "IDEMPOTENCY_CONFLICT"
+        },
+        {
+          "field": "ERROR_UNSUPPORTED_VIEW",
+          "value": "UNSUPPORTED_VIEW"
+        },
+        {
+          "field": "ERROR_INVALID_REQUEST",
+          "value": "INVALID_REQUEST"
+        },
+        {
+          "field": "ERROR_WORLD_UNAVAILABLE",
+          "value": "WORLD_UNAVAILABLE"
+        },
+        {
+          "field": "ERROR_WORLD_CHANGED",
+          "value": "WORLD_CHANGED"
+        },
+        {
+          "field": "ERROR_CAMERA_BUSY",
+          "value": "CAMERA_BUSY"
+        },
+        {
+          "field": "ERROR_RESTORATION_UNCONFIRMED",
+          "value": "RESTORATION_UNCONFIRMED"
+        },
+        {
+          "field": "ERROR_CAPTURE_REJECTED",
+          "value": "CAPTURE_REJECTED"
+        },
+        {
+          "field": "ERROR_CAPTURE_TIMEOUT",
+          "value": "CAPTURE_TIMEOUT"
+        },
+        {
+          "field": "ERROR_ARTIFACT_INCOMPLETE",
+          "value": "ARTIFACT_INCOMPLETE"
+        },
+        {
+          "field": "ERROR_ARTIFACT_INVALID",
+          "value": "ARTIFACT_INVALID"
+        },
+        {
+          "field": "ERROR_ARTIFACT_TOO_LARGE",
+          "value": "ARTIFACT_TOO_LARGE"
+        },
+        {
+          "field": "ERROR_PERFORMANCE_POLICY_BLOCKED",
+          "value": "PERFORMANCE_POLICY_BLOCKED"
+        },
+        {
+          "field": "ERROR_CANCELLED",
+          "value": "CANCELLED"
+        },
+        {
+          "field": "ERROR_RECOVERY_REQUIRED",
+          "value": "RECOVERY_REQUIRED"
+        },
+        {
+          "field": "ERROR_INTERNAL_ERROR",
+          "value": "INTERNAL_ERROR"
+        },
+        {
+          "field": "CAP_RENDER_CAPTURE",
+          "value": "render.capture"
+        },
+        {
+          "field": "CAP_CAMERA_EDITOR",
+          "value": "camera.editor"
+        },
+        {
+          "field": "DIRECTORY_SESSION_ROOT",
+          "value": "ReforgerForgeObserver"
+        }
+      ],
+      "numbers": []
+    }
+  },
+  "backendTuning": [
+    {
+      "owner": "runtime",
+      "source": "observer/addon/Scripts/Game/ReforgerForgeObserver/RFO_ObserverCameraProjection.c",
+      "value": 0.001,
+      "reason": "Runtime camera-projection matrix comparison.",
+      "acceptance": "Runtime capture/restoration acceptance."
+    },
+    {
+      "owner": "workbench",
+      "source": "observer/workbench-addon/Scripts/WorkbenchGame/EnfusionMCP/EMCP_WB_ObserverCommon.c",
+      "value": 0.0001,
+      "reason": "Exact Workbench editor-camera restoration matrix comparison.",
+      "acceptance": "Workbench editor-camera restoration acceptance."
+    },
+    {
+      "owner": "workbench",
+      "source": "observer/workbench-addon/Scripts/WorkbenchGame/EnfusionMCP/EMCP_WB_ObserverCommon.c",
+      "value": 0.001,
+      "reason": "Workbench submitted matrix orthonormality/input validation.",
+      "acceptance": "Workbench invalid-input acceptance."
+    }
+  ]
+}

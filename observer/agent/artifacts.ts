@@ -14,6 +14,14 @@ import { extname, join } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { BoundedJsonStore, JsonStoreError } from "#foundation/json-store";
 import {
+  deadlineAfter,
+  pollUntil,
+  systemClock,
+  systemSleeper,
+  type Clock,
+  type Sleeper,
+} from "#foundation/time";
+import {
   SESSION_DIRECTORY_NAME,
   artifactManifestSchema,
   parseProtocolMessage,
@@ -73,6 +81,10 @@ export interface ArtifactPin {
 export interface ArtifactStoreOptions {
   stableIntervalMs?: number;
   stableTimeoutMs?: number;
+  /** Test seam; production artifact intake uses the wall clock. */
+  clock?: Clock;
+  /** Test seam; production artifact intake uses cancellable native timers. */
+  sleeper?: Sleeper;
 }
 
 interface RetainedArtifactMetadata {
@@ -96,15 +108,21 @@ function parseMetadataObject(value: unknown): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
-async function wait(delay: number): Promise<void> {
-  await new Promise<void>((resolve) => setTimeout(resolve, delay));
-}
-
-async function waitForStableRegularFile(path: string, timeoutMs: number, intervalMs: number): Promise<number> {
-  const deadline = Date.now() + timeoutMs;
+async function waitForStableRegularFile(
+  path: string,
+  timeoutMs: number,
+  intervalMs: number,
+  clock: Clock,
+  sleeper: Sleeper
+): Promise<number> {
   let previous = -1;
   let stableChecks = 0;
-  while (Date.now() <= deadline) {
+  const result = await pollUntil({
+    clock,
+    sleeper,
+    deadline: deadlineAfter(clock, timeoutMs),
+    intervalMs,
+    probe: async (): Promise<number | undefined> => {
     let size = -1;
     try {
       const entry = lstatSync(path);
@@ -120,14 +138,18 @@ async function waitForStableRegularFile(path: string, timeoutMs: number, interva
       stableChecks = 0;
       previous = size;
     }
-    await wait(intervalMs);
-  }
+      return undefined;
+    },
+  });
+  if (result.kind === "value") return result.value;
   throw new ObserverError("ARTIFACT_INCOMPLETE", "Screenshot did not become stable before the artifact deadline", 408);
 }
 
 export class ArtifactStore {
   private readonly stableIntervalMs: number;
   private readonly stableTimeoutMs: number;
+  private readonly clock: Clock;
+  private readonly sleeper: Sleeper;
   private readonly inUse = new Set<string>();
 
   constructor(
@@ -139,6 +161,8 @@ export class ArtifactStore {
     this.artifactsRoot = ensureCanonicalDirectory(artifactsRoot);
     this.stableIntervalMs = options.stableIntervalMs ?? 50;
     this.stableTimeoutMs = options.stableTimeoutMs ?? 2_000;
+    this.clock = options.clock ?? systemClock;
+    this.sleeper = options.sleeper ?? systemSleeper;
   }
 
   async intake(input: unknown, token: string): Promise<StoredArtifact> {
@@ -201,7 +225,13 @@ export class ArtifactStore {
       };
     }
 
-    const stableSize = await waitForStableRegularFile(sourcePath, this.stableTimeoutMs, this.stableIntervalMs);
+    const stableSize = await waitForStableRegularFile(
+      sourcePath,
+      this.stableTimeoutMs,
+      this.stableIntervalMs,
+      this.clock,
+      this.sleeper
+    );
     assertRegularManagedFile(captureRoot, sourcePath);
     if (stableSize > session.limits.maxArtifactBytes) throw new ObserverError("ARTIFACT_TOO_LARGE", "Screenshot exceeds the session byte limit");
     if (manifest.expectedByteCount !== undefined && manifest.expectedByteCount !== stableSize) {

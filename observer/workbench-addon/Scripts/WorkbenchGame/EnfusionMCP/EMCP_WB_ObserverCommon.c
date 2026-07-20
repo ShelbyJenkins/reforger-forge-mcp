@@ -55,7 +55,7 @@ class EMCP_WB_ObserverJob
 
 	bool IsTerminal()
 	{
-		return state == "completed" || state == "failed" || state == "cancelled";
+		return state == EMCP_WB_ObserverProtocol.STATE_COMPLETED || state == EMCP_WB_ObserverProtocol.STATE_FAILED || state == EMCP_WB_ObserverProtocol.STATE_CANCELLED;
 	}
 }
 
@@ -181,8 +181,10 @@ class EMCP_WB_ObserverJobResponse : JsonApiStruct
 
 class EMCP_WB_ObserverService
 {
-	static const string PROTOCOL = "reforger-forge-workbench-observer/1";
-	static const string CAPTURE_DIRECTORY = "$profile:ReforgerForgeObserver/workbench";
+	static const string PROFILE_DIRECTORY = "$profile:" + EMCP_WB_ObserverProtocol.DIRECTORY_SESSION_ROOT;
+	static const string CAPTURE_DIRECTORY = PROFILE_DIRECTORY + "/workbench";
+	// Workbench restoration uses a deliberately local 0.0001 tolerance; see
+	// observer/protocol/generated/enforce-contract.json's backendTuning ledger.
 	static const float MATRIX_EPSILON = 0.0001;
 	static const float FOV_EPSILON = 0.01;
 	static const float FOV_SYMMETRY_EPSILON = 0.05;
@@ -205,7 +207,7 @@ class EMCP_WB_ObserverService
 
 	string GetProtocol()
 	{
-		return PROTOCOL;
+		return EMCP_WB_ObserverProtocol.ADAPTER_PROTOCOL;
 	}
 
 	bool HasJob()
@@ -385,7 +387,7 @@ class EMCP_WB_ObserverService
 		job.requestedMatrix2 = matrix2;
 		job.requestedMatrix3 = matrix3;
 		job.requestedFov = fov;
-		job.state = "accepted";
+		job.state = EMCP_WB_ObserverProtocol.STATE_ACCEPTED;
 		job.message = "Workbench observer camera lease acquired";
 		job.sequence = 1;
 		job.settlePolls = settlePolls;
@@ -454,10 +456,10 @@ class EMCP_WB_ObserverService
 			bool requestedInstalled = projectionMeasured && Math.AbsFloat(job.installedFov - fov) <= FOV_EPSILON && InstalledStateStillOwned(job);
 			if (!requestedInstalled)
 			{
-				job.state = "restoring";
+				job.state = EMCP_WB_ObserverProtocol.STATE_RESTORING;
 				job.sequence++;
 				bool restoredAfterRejectedInstall = RestoreJob(job);
-				job.state = "failed";
+				job.state = EMCP_WB_ObserverProtocol.STATE_FAILED;
 				if (restoredAfterRejectedInstall)
 				{
 					job.terminalErrorCode = "CAMERA_POSITION_REJECTED";
@@ -465,7 +467,7 @@ class EMCP_WB_ObserverService
 				}
 				else
 				{
-					job.terminalErrorCode = "RESTORATION_UNCONFIRMED";
+					job.terminalErrorCode = EMCP_WB_ObserverProtocol.ERROR_RESTORATION_UNCONFIRMED;
 					job.message = "Workbench camera installation changed unexpectedly and exact restoration was not safe: " + m_LastRestorationDiagnostic;
 				}
 				job.sequence++;
@@ -473,13 +475,13 @@ class EMCP_WB_ObserverService
 				return true;
 			}
 			job.actualFov = job.installedFov;
-			job.state = "settling";
+			job.state = EMCP_WB_ObserverProtocol.STATE_SETTLING;
 			job.message = "Requested editor camera state installed";
 			job.sequence++;
 		}
 		else
 		{
-			job.state = "settling";
+			job.state = EMCP_WB_ObserverProtocol.STATE_SETTLING;
 			job.message = "Current editor view snapshotted";
 			job.sequence++;
 		}
@@ -516,13 +518,13 @@ class EMCP_WB_ObserverService
 			}
 			if (m_Job.settledPolls <= m_Job.settlePolls)
 			{
-				m_Job.state = "settling";
+				m_Job.state = EMCP_WB_ObserverProtocol.STATE_SETTLING;
 				m_Job.message = "Waiting for bounded rendered-frame settle polling";
 				message = m_Job.message;
 				return true;
 			}
 
-			if ((!FileIO.FileExists("$profile:ReforgerForgeObserver") && !FileIO.MakeDirectory("$profile:ReforgerForgeObserver")) || (!FileIO.FileExists(CAPTURE_DIRECTORY) && !FileIO.MakeDirectory(CAPTURE_DIRECTORY)))
+			if ((!FileIO.FileExists(PROFILE_DIRECTORY) && !FileIO.MakeDirectory(PROFILE_DIRECTORY)) || (!FileIO.FileExists(CAPTURE_DIRECTORY) && !FileIO.MakeDirectory(CAPTURE_DIRECTORY)))
 			{
 				FailAndRestore("SCREENSHOT_PATH_UNAVAILABLE", "Could not create the managed Workbench capture directory");
 				message = m_Job.message;
@@ -562,7 +564,7 @@ class EMCP_WB_ObserverService
 				return true;
 			}
 			m_Job.screenshotIssued = true;
-			m_Job.state = "capturing";
+			m_Job.state = EMCP_WB_ObserverProtocol.STATE_CAPTURING;
 			m_Job.message = "Screenshot issued; waiting for a stable artifact";
 			m_Job.sequence++;
 			message = m_Job.message;
@@ -571,7 +573,7 @@ class EMCP_WB_ObserverService
 
 		if (!FileIO.FileExists(m_Job.outputLogicalPath))
 		{
-			m_Job.state = "awaitingArtifact";
+			m_Job.state = EMCP_WB_ObserverProtocol.STATE_AWAITING_ARTIFACT;
 			m_Job.message = "Waiting for the generated PNG to appear";
 			m_Job.sequence++;
 			message = m_Job.message;
@@ -580,7 +582,7 @@ class EMCP_WB_ObserverService
 		FileHandle artifact = FileIO.OpenFile(m_Job.outputLogicalPath, FileMode.READ);
 		if (!artifact || !artifact.IsOpen())
 		{
-			m_Job.state = "awaitingArtifact";
+			m_Job.state = EMCP_WB_ObserverProtocol.STATE_AWAITING_ARTIFACT;
 			m_Job.message = "Waiting for the generated PNG to become readable";
 			m_Job.sequence++;
 			message = m_Job.message;
@@ -591,10 +593,10 @@ class EMCP_WB_ObserverService
 		if (length <= 33 || length > MAX_ARTIFACT_BYTES)
 		{
 			if (length > MAX_ARTIFACT_BYTES)
-				FailAndRestore("ARTIFACT_TOO_LARGE", "Generated Workbench PNG exceeds the reviewed size bound");
+				FailAndRestore(EMCP_WB_ObserverProtocol.ERROR_ARTIFACT_TOO_LARGE, "Generated Workbench PNG exceeds the reviewed size bound");
 			else
 			{
-				m_Job.state = "awaitingArtifact";
+				m_Job.state = EMCP_WB_ObserverProtocol.STATE_AWAITING_ARTIFACT;
 				m_Job.message = "Waiting for the generated PNG header and chunks";
 				m_Job.sequence++;
 			}
@@ -610,7 +612,7 @@ class EMCP_WB_ObserverService
 		}
 		if (m_Job.stableArtifactPolls < 2)
 		{
-			m_Job.state = "awaitingArtifact";
+			m_Job.state = EMCP_WB_ObserverProtocol.STATE_AWAITING_ARTIFACT;
 			m_Job.message = "Waiting for two stable generated-PNG polls";
 			m_Job.sequence++;
 			message = m_Job.message;
@@ -618,20 +620,20 @@ class EMCP_WB_ObserverService
 		}
 
 		m_Job.artifactBytes = length;
-		m_Job.state = "restoring";
+		m_Job.state = EMCP_WB_ObserverProtocol.STATE_RESTORING;
 		m_Job.sequence++;
 		if (!RestoreJob(m_Job))
 		{
 			m_RestorationProven = false;
-			m_Job.state = "failed";
-			m_Job.terminalErrorCode = "RESTORATION_UNCONFIRMED";
+			m_Job.state = EMCP_WB_ObserverProtocol.STATE_FAILED;
+			m_Job.terminalErrorCode = EMCP_WB_ObserverProtocol.ERROR_RESTORATION_UNCONFIRMED;
 			m_Job.message = "Screenshot completed, but exact editor camera restoration could not be proven: " + m_LastRestorationDiagnostic;
 			m_Job.sequence++;
 			message = m_Job.message;
 			return true;
 		}
 		m_RestorationProven = true;
-		m_Job.state = "completed";
+		m_Job.state = EMCP_WB_ObserverProtocol.STATE_COMPLETED;
 		m_Job.message = "Workbench PNG completed and exact editor camera state was restored";
 		m_Job.sequence++;
 		message = m_Job.message;
@@ -647,20 +649,20 @@ class EMCP_WB_ObserverService
 			message = m_Job.message;
 			return true;
 		}
-		m_Job.state = "restoring";
+		m_Job.state = EMCP_WB_ObserverProtocol.STATE_RESTORING;
 		m_Job.sequence++;
 		bool restored = RestoreJob(m_Job);
 		m_RestorationProven = restored;
 		if (restored)
 		{
-			m_Job.state = "cancelled";
-			m_Job.terminalErrorCode = "CANCELLED";
+			m_Job.state = EMCP_WB_ObserverProtocol.STATE_CANCELLED;
+			m_Job.terminalErrorCode = EMCP_WB_ObserverProtocol.ERROR_CANCELLED;
 			m_Job.message = "Workbench observer capture cancelled after exact camera restoration";
 		}
 		else
 		{
-			m_Job.state = "failed";
-			m_Job.terminalErrorCode = "RESTORATION_UNCONFIRMED";
+			m_Job.state = EMCP_WB_ObserverProtocol.STATE_FAILED;
+			m_Job.terminalErrorCode = EMCP_WB_ObserverProtocol.ERROR_RESTORATION_UNCONFIRMED;
 			m_Job.message = "Capture cancellation could not prove exact camera restoration: " + m_LastRestorationDiagnostic;
 		}
 		m_Job.sequence++;
@@ -754,12 +756,12 @@ class EMCP_WB_ObserverService
 
 	protected void FailAndRestore(string code, string failureMessage)
 	{
-		m_Job.state = "restoring";
+		m_Job.state = EMCP_WB_ObserverProtocol.STATE_RESTORING;
 		m_Job.sequence++;
 		bool restored = RestoreJob(m_Job);
 		if (!restored)
 			m_RestorationProven = false;
-		m_Job.state = "failed";
+		m_Job.state = EMCP_WB_ObserverProtocol.STATE_FAILED;
 		if (restored)
 		{
 			m_Job.terminalErrorCode = code;
@@ -767,7 +769,7 @@ class EMCP_WB_ObserverService
 		}
 		else
 		{
-			m_Job.terminalErrorCode = "RESTORATION_UNCONFIRMED";
+			m_Job.terminalErrorCode = EMCP_WB_ObserverProtocol.ERROR_RESTORATION_UNCONFIRMED;
 			m_Job.message = failureMessage + "; exact restoration also failed: " + m_LastRestorationDiagnostic;
 		}
 		m_Job.sequence++;
@@ -1047,6 +1049,8 @@ class EMCP_WB_ObserverService
 
 	protected bool CameraMatrixValid(vector matrix[4])
 	{
+		// Keep the 0.001 submitted-matrix validation local; it is distinct from
+		// MATRIX_EPSILON restoration equality in the contract tuning ledger.
 		float len0 = matrix[0].Length();
 		float len1 = matrix[1].Length();
 		float len2 = matrix[2].Length();

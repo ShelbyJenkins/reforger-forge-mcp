@@ -68,7 +68,6 @@ registry characterization is the pre-migration seam that Task 5 extends.
 | 4: manifests | Source staging and packed-add-on inventory checks reject incomplete and undeclared payload sets. |
 | 5: protocol generation | Injected registry rendering is deterministic without touching checked-in add-ons. |
 | 6: test support | Direct temporary-directory usage inventory above. |
-| 7: architecture checks | Search categories above define the narrow owner patterns to guard. |
 
 ## Detailed task plan
 

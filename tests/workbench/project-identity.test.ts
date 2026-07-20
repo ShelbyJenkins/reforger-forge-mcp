@@ -1,14 +1,11 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import {
   mkdirSync,
-  mkdtempSync,
   realpathSync,
-  rmSync,
   symlinkSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import {
   canonicalizeGproj,
@@ -18,19 +15,13 @@ import {
   sameProjectIdentity,
   type CanonicalProjectIdentity,
 } from "../../src/workbench/project-identity.js";
+import { withTemporaryDirectory } from "../support/temporary-directory.js";
 
-const roots: string[] = [];
-
-afterEach(() => {
-  for (const root of roots.splice(0)) {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
-function createRoot(): string {
-  const root = mkdtempSync(join(tmpdir(), "reforger-forge-project-identity-"));
-  roots.push(root);
-  return root;
+function scopedIt(
+  name: string,
+  run: (root: string) => Promise<void> | void,
+): void {
+  it(name, () => withTemporaryDirectory(run, { prefix: "reforger-forge-project-identity-" }));
 }
 
 function createProject(root: string, folder: string, filename = `${folder}.gproj`): string {
@@ -56,8 +47,7 @@ function expectedKey(path: string): string {
 }
 
 describe("canonical Workbench project identity", () => {
-  it("trims, resolves, and canonicalizes a regular .gproj case-insensitively", () => {
-    const root = createRoot();
+  scopedIt("trims, resolves, and canonicalizes a regular .gproj case-insensitively", (root) => {
     const projectPath = createProject(root, "Example Mod", "Example.GpRoJ");
     const relativePath = relative(process.cwd(), projectPath);
 
@@ -73,8 +63,7 @@ describe("canonical Workbench project identity", () => {
     });
   });
 
-  it("uses native realpath identity through a linked mod directory", () => {
-    const root = createRoot();
+  scopedIt("uses native realpath identity through a linked mod directory", (root) => {
     const projectPath = createProject(root, "RealMod", "RealMod.gproj");
     const aliasDirectory = join(root, "AliasMod");
     symlinkSync(dirname(projectPath), aliasDirectory, "junction");
@@ -92,8 +81,7 @@ describe("canonical Workbench project identity", () => {
     expect(error.message).toContain("nonempty .gproj path");
   });
 
-  it("rejects missing paths, directories, and non-.gproj files", () => {
-    const root = createRoot();
+  scopedIt("rejects missing paths, directories, and non-.gproj files", (root) => {
     const directoryTarget = join(root, "Directory.gproj");
     mkdirSync(directoryTarget);
     const textTarget = join(root, "notes.txt");
@@ -107,8 +95,7 @@ describe("canonical Workbench project identity", () => {
       .toContain("must have a .gproj extension");
   });
 
-  it("revalidates the exact canonical key and current file", () => {
-    const root = createRoot();
+  scopedIt("revalidates the exact canonical key and current file", (root) => {
     const projectPath = createProject(root, "Example");
     const identity = canonicalizeGproj(projectPath);
 
@@ -128,8 +115,7 @@ describe("canonical Workbench project identity", () => {
 });
 
 describe("safe implicit Workbench project resolution", () => {
-  it("prefers and revalidates a prior lifecycle target", () => {
-    const root = createRoot();
+  scopedIt("prefers and revalidates a prior lifecycle target", (root) => {
     const priorPath = createProject(root, "Prior");
     createProject(root, "Preferred");
     const prior = canonicalizeGproj(priorPath);
@@ -143,8 +129,7 @@ describe("safe implicit Workbench project resolution", () => {
     expect(resolved).toEqual(prior);
   });
 
-  it("uses a configured default only when it has one direct project", () => {
-    const root = createRoot();
+  scopedIt("uses a configured default only when it has one direct project", (root) => {
     const preferredPath = createProject(root, "Preferred", "Preferred.GPROJ");
     createProject(root, "Other");
 
@@ -156,8 +141,7 @@ describe("safe implicit Workbench project resolution", () => {
     expect(resolved.displayPath).toBe(realpathSync.native(preferredPath));
   });
 
-  it("falls through an empty configured default to one unique root candidate", () => {
-    const root = createRoot();
+  scopedIt("falls through an empty configured default to one unique root candidate", (root) => {
     mkdirSync(join(root, "EmptyDefault"));
     const onlyPath = createProject(root, "OnlyMod");
 
@@ -169,8 +153,7 @@ describe("safe implicit Workbench project resolution", () => {
     expect(resolved.displayPath).toBe(realpathSync.native(onlyPath));
   });
 
-  it("searches only the project root and its direct child directories", () => {
-    const root = createRoot();
+  scopedIt("searches only the project root and its direct child directories", (root) => {
     const directPath = createProject(root, "DirectMod");
     createProject(root, join("Nested", "TooDeep"), "Ignored.gproj");
 
@@ -178,16 +161,14 @@ describe("safe implicit Workbench project resolution", () => {
       .toBe(realpathSync.native(directPath));
   });
 
-  it("accepts one project directly in the configured root", () => {
-    const root = createRoot();
+  scopedIt("accepts one project directly in the configured root", (root) => {
     const projectPath = createProject(root, "", "RootProject.GpRoJ");
 
     expect(resolveProjectIdentity({ projectRoot: root }).displayPath)
       .toBe(realpathSync.native(projectPath));
   });
 
-  it("deduplicates linked spellings of the same canonical candidate", () => {
-    const root = createRoot();
+  scopedIt("deduplicates linked spellings of the same canonical candidate", (root) => {
     const projectPath = createProject(root, "RealMod");
     symlinkSync(
       dirname(projectPath),
@@ -199,8 +180,7 @@ describe("safe implicit Workbench project resolution", () => {
     expect(resolved.displayPath).toBe(realpathSync.native(projectPath));
   });
 
-  it("refuses ambiguity with a stable sorted candidate list", () => {
-    const root = createRoot();
+  scopedIt("refuses ambiguity with a stable sorted candidate list", (root) => {
     const zuluPath = createProject(root, "Zulu");
     const alphaPath = createProject(root, "Alpha");
 
@@ -220,8 +200,7 @@ describe("safe implicit Workbench project resolution", () => {
     expect(error.message.indexOf(expected[0])).toBeLessThan(error.message.indexOf(expected[1]));
   });
 
-  it("does not choose among multiple projects in the configured default", () => {
-    const root = createRoot();
+  scopedIt("does not choose among multiple projects in the configured default", (root) => {
     createProject(root, "Preferred", "One.gproj");
     createProject(root, "Preferred", "Two.gproj");
 
@@ -234,8 +213,7 @@ describe("safe implicit Workbench project resolution", () => {
     expect(error.candidates).toHaveLength(2);
   });
 
-  it("requires an explicit target when no candidate exists", () => {
-    const root = createRoot();
+  scopedIt("requires an explicit target when no candidate exists", (root) => {
     mkdirSync(join(root, "Empty"));
 
     const error = captureProjectError(() => resolveProjectIdentity({ projectRoot: root }));
@@ -243,8 +221,7 @@ describe("safe implicit Workbench project resolution", () => {
     expect(error.candidates).toEqual([]);
   });
 
-  it("never selects the legacy standalone EnfusionMCP project", () => {
-    const root = createRoot();
+  scopedIt("never selects the legacy standalone EnfusionMCP project", (root) => {
     createProject(root, "EnfusionMCP", "EnfusionMCP.gproj");
 
     expect(captureProjectError(() => resolveProjectIdentity({ projectRoot: root })).code)
@@ -255,8 +232,7 @@ describe("safe implicit Workbench project resolution", () => {
     })).code).toBe("TARGET_REQUIRED");
   });
 
-  it("rejects a defaultMod that is not one direct child folder name", () => {
-    const root = createRoot();
+  scopedIt("rejects a defaultMod that is not one direct child folder name", (root) => {
 
     const error = captureProjectError(() => resolveProjectIdentity({
       projectRoot: root,
@@ -266,8 +242,7 @@ describe("safe implicit Workbench project resolution", () => {
     expect(error.message).toContain("one direct project folder");
   });
 
-  it("an explicit target always bypasses fallback ambiguity", () => {
-    const root = createRoot();
+  scopedIt("an explicit target always bypasses fallback ambiguity", (root) => {
     const explicitPath = createProject(root, "Explicit");
     createProject(root, "Other");
 

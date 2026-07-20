@@ -3,14 +3,21 @@ import { lstatSync, readFileSync, realpathSync } from "node:fs";
 import { basename, dirname, isAbsolute, resolve } from "node:path";
 import { inflateSync } from "node:zlib";
 import { z } from "zod";
+import {
+  WORKBENCH_ADAPTER_CAPABILITIES,
+  WORKBENCH_ADAPTER_ERROR_CODES,
+  WORKBENCH_ADAPTER_PROTOCOL,
+  WORKBENCH_ADAPTER_STATE_VALUES,
+  WORKBENCH_ADAPTER_TERMINAL_STATES,
+  type WorkbenchObserverProtocolErrorCode,
+} from "#observer-protocol/enforce-contract";
 import type {
   WorkbenchCallOptions,
   WorkbenchCaptureActivityLease,
   WorkbenchObserverSnapshot,
 } from "./client.js";
 
-const ADAPTER_PROTOCOL = "reforger-forge-workbench-observer/1";
-const TERMINAL_STATES = new Set(["completed", "failed", "cancelled"]);
+const TERMINAL_STATES = new Set<string>(WORKBENCH_ADAPTER_TERMINAL_STATES);
 const DEFAULT_HANDLER_TIMEOUT_MS = 5_000;
 const DEFAULT_MAX_ARTIFACT_BYTES = 64 * 1024 * 1024;
 const DEFAULT_MAX_PIXELS = 32_000_000;
@@ -59,7 +66,7 @@ const submitSchema = z.object({
 const pingResponseSchema = z.object({
   status: z.enum(["ok", "error"]),
   message: z.string(),
-  adapterProtocol: z.literal(ADAPTER_PROTOCOL),
+  adapterProtocol: z.literal(WORKBENCH_ADAPTER_PROTOCOL),
   projectFile: z.string(),
   worldIdentity: z.string(),
   activeJobId: z.string().optional().default(""),
@@ -71,7 +78,7 @@ const pingResponseSchema = z.object({
 const jobResponseSchema = z.object({
   status: z.enum(["ok", "error"]),
   message: z.string(),
-  adapterProtocol: z.literal(ADAPTER_PROTOCOL),
+  adapterProtocol: z.literal(WORKBENCH_ADAPTER_PROTOCOL),
   jobId: z.string().default(""),
   leaseId: z.string().default(""),
   lifecycleGeneration: z.string().default(""),
@@ -102,7 +109,7 @@ const jobResponseSchema = z.object({
 const releaseResponseSchema = z.object({
   status: z.enum(["ok", "error"]),
   message: z.string(),
-  adapterProtocol: z.literal(ADAPTER_PROTOCOL),
+  adapterProtocol: z.literal(WORKBENCH_ADAPTER_PROTOCOL),
   jobId: z.string(),
   restorationConfirmed: workbenchBoolean,
   artifactRemoved: workbenchBoolean,
@@ -196,17 +203,7 @@ export interface WorkbenchObserverClient {
   releaseCaptureActivity(lease: WorkbenchCaptureActivityLease): void;
 }
 
-export type WorkbenchObserverAdapterErrorCode =
-  | "INVALID_REQUEST"
-  | "HANDLER_UNAVAILABLE"
-  | "HANDLER_REJECTED"
-  | "CAPABILITY_UNAVAILABLE"
-  | "JOB_NOT_FOUND"
-  | "STALE_LIFECYCLE"
-  | "ARTIFACT_INVALID"
-  | "ARTIFACT_TOO_LARGE"
-  | "CAMERA_BUSY"
-  | "RESTORATION_UNCONFIRMED";
+export type WorkbenchObserverAdapterErrorCode = WorkbenchObserverProtocolErrorCode;
 
 export class WorkbenchObserverAdapterError extends Error {
   constructor(
@@ -266,7 +263,7 @@ function vectorToString(value: readonly number[]): string {
 
 function decimalWireValue(value: number): string {
   if (!Number.isFinite(value) || Math.abs(value) > 1_000_000_000) {
-    throw new WorkbenchObserverAdapterError("INVALID_REQUEST", "Workbench wire value is not a bounded finite number");
+    throw new WorkbenchObserverAdapterError(WORKBENCH_ADAPTER_ERROR_CODES.INVALID_REQUEST, "Workbench wire value is not a bounded finite number");
   }
   const fixed = (Object.is(value, -0) ? 0 : value).toFixed(9).replace(/\.?0+$/, "");
   return fixed === "-0" ? "0" : fixed;
@@ -275,7 +272,7 @@ function decimalWireValue(value: number): string {
 function vectorFromString(value: string): [number, number, number] {
   const parts = value.trim().split(/\s+/).map(Number);
   if (parts.length !== 3 || parts.some((entry) => !Number.isFinite(entry))) {
-    throw new WorkbenchObserverAdapterError("HANDLER_UNAVAILABLE", "Workbench observer returned an invalid camera matrix");
+    throw new WorkbenchObserverAdapterError(WORKBENCH_ADAPTER_ERROR_CODES.HANDLER_UNAVAILABLE, "Workbench observer returned an invalid camera matrix");
   }
   return [parts[0], parts[1], parts[2]];
 }
@@ -289,7 +286,7 @@ function crc32(data: Buffer): number {
 function normalize(value: [number, number, number]): [number, number, number] {
   const length = Math.hypot(...value);
   if (!Number.isFinite(length) || length <= 0.000001) {
-    throw new WorkbenchObserverAdapterError("INVALID_REQUEST", "Camera basis contains a degenerate vector");
+    throw new WorkbenchObserverAdapterError(WORKBENCH_ADAPTER_ERROR_CODES.INVALID_REQUEST, "Camera basis contains a degenerate vector");
   }
   return [value[0] / length, value[1] / length, value[2] / length];
 }
@@ -367,8 +364,8 @@ export class WorkbenchObserverAdapter {
     const snapshot = await this.client.getRunningObserverSnapshot();
     const ping = await this.pingSnapshot();
     const capabilities: string[] = [];
-    if (ping.captureCurrent) capabilities.push("render.capture");
-    if (ping.cameraEditor) capabilities.push("camera.editor");
+    if (ping.captureCurrent) capabilities.push(WORKBENCH_ADAPTER_CAPABILITIES.RENDER_CAPTURE);
+    if (ping.cameraEditor) capabilities.push(WORKBENCH_ADAPTER_CAPABILITIES.CAMERA_EDITOR);
     return [{
       instanceId: instanceId(snapshot),
       lifecycleGeneration: snapshot.generation,
@@ -395,37 +392,37 @@ export class WorkbenchObserverAdapter {
   async submit(input: WorkbenchObserverSubmitInput): Promise<WorkbenchObserverJobStatus> {
     const parsed = submitSchema.safeParse(input);
     if (!parsed.success) {
-      throw new WorkbenchObserverAdapterError("INVALID_REQUEST", parsed.error.issues.map((issue) => issue.message).join("; "));
+      throw new WorkbenchObserverAdapterError(WORKBENCH_ADAPTER_ERROR_CODES.INVALID_REQUEST, parsed.error.issues.map((issue) => issue.message).join("; "));
     }
     const snapshot = await this.client.getRunningObserverSnapshot();
     const ping = await this.pingSnapshot();
     if (!ping.captureCurrent) {
-      throw new WorkbenchObserverAdapterError("CAPABILITY_UNAVAILABLE", ping.message || "Workbench current-view capture is unavailable");
+      throw new WorkbenchObserverAdapterError(WORKBENCH_ADAPTER_ERROR_CODES.CAPABILITY_UNAVAILABLE, ping.message || "Workbench current-view capture is unavailable");
     }
     if (parsed.data.view.kind !== "current" && !ping.cameraEditor) {
       throw new WorkbenchObserverAdapterError(
-        "CAPABILITY_UNAVAILABLE",
+        WORKBENCH_ADAPTER_ERROR_CODES.CAPABILITY_UNAVAILABLE,
         "camera.editor is not advertised until this exact Workbench process has completed an exact current-view restoration proof"
       );
     }
 
     const jobId = parsed.data.jobId ?? this.createJobId();
     if (!/^[A-Za-z0-9_-]{1,96}$/.test(jobId) || this.jobs.has(jobId)) {
-      throw new WorkbenchObserverAdapterError("INVALID_REQUEST", "Workbench observer job ID is invalid or already retained");
+      throw new WorkbenchObserverAdapterError(WORKBENCH_ADAPTER_ERROR_CODES.INVALID_REQUEST, "Workbench observer job ID is invalid or already retained");
     }
     const handlerLeaseId = this.createLeaseId(jobId);
     if (!/^[A-Za-z0-9_-]{1,128}$/.test(handlerLeaseId)) {
-      throw new WorkbenchObserverAdapterError("INVALID_REQUEST", "Generated Workbench observer handler lease is invalid");
+      throw new WorkbenchObserverAdapterError(WORKBENCH_ADAPTER_ERROR_CODES.INVALID_REQUEST, "Generated Workbench observer handler lease is invalid");
     }
     const activityLease = this.client.acquireCaptureActivity(snapshot);
     try {
       const current = await this.client.revalidateCaptureActivity(activityLease);
       if (current.generation !== snapshot.generation || current.target.comparisonKey !== snapshot.target.comparisonKey) {
-        throw new WorkbenchObserverAdapterError("STALE_LIFECYCLE", "Workbench lifecycle changed before observer submission");
+        throw new WorkbenchObserverAdapterError(WORKBENCH_ADAPTER_ERROR_CODES.STALE_LIFECYCLE, "Workbench lifecycle changed before observer submission");
       }
     } catch (error) {
       this.client.releaseCaptureActivity(activityLease);
-      throw this.mapError(error, "STALE_LIFECYCLE");
+      throw this.mapError(error, WORKBENCH_ADAPTER_ERROR_CODES.STALE_LIFECYCLE);
     }
     let markReady!: () => void;
     const ready = new Promise<void>((resolveReady) => { markReady = resolveReady; });
@@ -471,21 +468,21 @@ export class WorkbenchObserverAdapter {
         deliveryUncertain = true;
         this.convergeAbort(record);
         if (record.gateReleased) {
-          throw new WorkbenchObserverAdapterError("HANDLER_UNAVAILABLE", "Workbench exited before observer submit acknowledgement");
+          throw new WorkbenchObserverAdapterError(WORKBENCH_ADAPTER_ERROR_CODES.HANDLER_UNAVAILABLE, "Workbench exited before observer submit acknowledgement");
         }
         // Submit is idempotent for this exact command tuple. One bounded retry
         // recovers an acknowledgement lost after handler-side camera retention.
         response = await this.handlerJobCall("EMCP_WB_ObserverSubmit", submitRequest);
       }
       if (response.status !== "ok") {
-        throw new WorkbenchObserverAdapterError("HANDLER_REJECTED", response.message);
+        throw new WorkbenchObserverAdapterError(WORKBENCH_ADAPTER_ERROR_CODES.HANDLER_REJECTED, response.message);
       }
       // An ok response means the command may own camera state until all
       // acknowledgement bindings and the public status parse are proven.
       deliveryUncertain = true;
       this.assertResponseBinding(response, record);
       if (response.leaseId !== handlerLeaseId) {
-        throw new WorkbenchObserverAdapterError("STALE_LIFECYCLE", "Workbench observer submit acknowledged a different handler lease");
+        throw new WorkbenchObserverAdapterError(WORKBENCH_ADAPTER_ERROR_CODES.STALE_LIFECYCLE, "Workbench observer submit acknowledged a different handler lease");
       }
       record.lastStatus = this.publicStatus(record, response);
       deliveryUncertain = false;
@@ -497,7 +494,7 @@ export class WorkbenchObserverAdapter {
       }
       if (!safeToRelease) {
         throw new WorkbenchObserverAdapterError(
-          "RESTORATION_UNCONFIRMED",
+          WORKBENCH_ADAPTER_ERROR_CODES.RESTORATION_UNCONFIRMED,
           `Workbench observer submit ${jobId} could not be acknowledged or proven restored; lifecycle mutation remains blocked`
         );
       }
@@ -518,7 +515,7 @@ export class WorkbenchObserverAdapter {
     await this.revalidate(record);
     const response = await this.handlerJobCall("EMCP_WB_ObserverStatus", this.boundRequest(record));
     if (response.status !== "ok") {
-      throw new WorkbenchObserverAdapterError("HANDLER_REJECTED", response.message);
+      throw new WorkbenchObserverAdapterError(WORKBENCH_ADAPTER_ERROR_CODES.HANDLER_REJECTED, response.message);
     }
     this.assertResponseBinding(response, record);
     let status: WorkbenchObserverJobStatus;
@@ -547,12 +544,12 @@ export class WorkbenchObserverAdapter {
    */
   async recover(input: WorkbenchObserverRecoverInput): Promise<WorkbenchObserverJobStatus> {
     if (!/^[A-Za-z0-9_-]{1,96}$/.test(input.jobId)) {
-      throw new WorkbenchObserverAdapterError("INVALID_REQUEST", "Workbench observer recovery job ID is invalid");
+      throw new WorkbenchObserverAdapterError(WORKBENCH_ADAPTER_ERROR_CODES.INVALID_REQUEST, "Workbench observer recovery job ID is invalid");
     }
     const retained = this.jobs.get(input.jobId);
     if (retained) {
       if (input.expectedInstanceId && retained.instanceId !== input.expectedInstanceId) {
-        throw new WorkbenchObserverAdapterError("STALE_LIFECYCLE", "Retained Workbench observer job belongs to a different lifecycle instance");
+        throw new WorkbenchObserverAdapterError(WORKBENCH_ADAPTER_ERROR_CODES.STALE_LIFECYCLE, "Retained Workbench observer job belongs to a different lifecycle instance");
       }
       return this.status(input.jobId);
     }
@@ -560,26 +557,26 @@ export class WorkbenchObserverAdapter {
     const snapshot = await this.client.getRunningObserverSnapshot();
     const recoveredInstanceId = instanceId(snapshot);
     if (input.expectedInstanceId && recoveredInstanceId !== input.expectedInstanceId) {
-      throw new WorkbenchObserverAdapterError("STALE_LIFECYCLE", "Workbench observer job belongs to an old lifecycle generation or canonical target");
+      throw new WorkbenchObserverAdapterError(WORKBENCH_ADAPTER_ERROR_CODES.STALE_LIFECYCLE, "Workbench observer job belongs to an old lifecycle generation or canonical target");
     }
     const ping = await this.pingSnapshot();
     if (ping.activeJobId !== input.jobId) {
-      throw new WorkbenchObserverAdapterError("JOB_NOT_FOUND", `Workbench observer job ${input.jobId} is not retained by the current handler`);
+      throw new WorkbenchObserverAdapterError(WORKBENCH_ADAPTER_ERROR_CODES.JOB_NOT_FOUND, `Workbench observer job ${input.jobId} is not retained by the current handler`);
     }
     const handlerLeaseId = this.createLeaseId(input.jobId);
     if (!/^[A-Za-z0-9_-]{1,128}$/.test(handlerLeaseId)) {
-      throw new WorkbenchObserverAdapterError("INVALID_REQUEST", "Recovered Workbench observer handler lease is invalid");
+      throw new WorkbenchObserverAdapterError(WORKBENCH_ADAPTER_ERROR_CODES.INVALID_REQUEST, "Recovered Workbench observer handler lease is invalid");
     }
 
     const activityLease = this.client.acquireCaptureActivity(snapshot);
     try {
       const current = await this.client.revalidateCaptureActivity(activityLease);
       if (current.generation !== snapshot.generation || current.target.comparisonKey !== snapshot.target.comparisonKey) {
-        throw new WorkbenchObserverAdapterError("STALE_LIFECYCLE", "Workbench lifecycle changed during observer recovery");
+        throw new WorkbenchObserverAdapterError(WORKBENCH_ADAPTER_ERROR_CODES.STALE_LIFECYCLE, "Workbench lifecycle changed during observer recovery");
       }
     } catch (error) {
       this.client.releaseCaptureActivity(activityLease);
-      throw this.mapError(error, "STALE_LIFECYCLE");
+      throw this.mapError(error, WORKBENCH_ADAPTER_ERROR_CODES.STALE_LIFECYCLE);
     }
 
     const ready = Promise.resolve();
@@ -622,7 +619,7 @@ export class WorkbenchObserverAdapter {
   async release(jobId: string): Promise<{ jobId: string; restorationConfirmed: boolean; artifactRemoved: boolean }> {
     const record = this.requireJob(jobId);
     this.convergeAbort(record);
-    if (record.lastStatus?.terminalErrorCode === "WORKBENCH_EXITED") {
+    if (record.lastStatus?.terminalErrorCode === WORKBENCH_ADAPTER_ERROR_CODES.WORKBENCH_EXITED) {
       record.released = true;
       this.jobs.delete(jobId);
       this.completedImages.delete(jobId);
@@ -632,25 +629,25 @@ export class WorkbenchObserverAdapter {
     const status = record.lastStatus;
     if (!status || !TERMINAL_STATES.has(status.state) || status.cameraLeaseHeld || !status.restorationConfirmed) {
       throw new WorkbenchObserverAdapterError(
-        "CAMERA_BUSY",
+      WORKBENCH_ADAPTER_ERROR_CODES.CAMERA_BUSY,
         "Workbench observer release requires a terminal job with proven restoration; cancel the active job first"
       );
     }
     if (!record.gateReleased) await this.revalidate(record);
     if (!record.handlerLeaseId) {
-      throw new WorkbenchObserverAdapterError("HANDLER_UNAVAILABLE", "Workbench observer handler lease is unavailable");
+      throw new WorkbenchObserverAdapterError(WORKBENCH_ADAPTER_ERROR_CODES.HANDLER_UNAVAILABLE, "Workbench observer handler lease is unavailable");
     }
     const raw = await this.client.call<unknown>("EMCP_WB_ObserverRelease", this.boundRequest(record), this.callOptions());
     const parsed = releaseResponseSchema.safeParse(raw);
-    if (!parsed.success) throw new WorkbenchObserverAdapterError("HANDLER_UNAVAILABLE", "Workbench observer release returned an invalid response");
-    if (parsed.data.status !== "ok") throw new WorkbenchObserverAdapterError("HANDLER_REJECTED", parsed.data.message);
+    if (!parsed.success) throw new WorkbenchObserverAdapterError(WORKBENCH_ADAPTER_ERROR_CODES.HANDLER_UNAVAILABLE, "Workbench observer release returned an invalid response");
+    if (parsed.data.status !== "ok") throw new WorkbenchObserverAdapterError(WORKBENCH_ADAPTER_ERROR_CODES.HANDLER_REJECTED, parsed.data.message);
     if (parsed.data.restorationConfirmed) {
       record.released = true;
       this.jobs.delete(jobId);
       this.completedImages.delete(jobId);
       this.releaseGate(record);
     } else {
-      throw new WorkbenchObserverAdapterError("RESTORATION_UNCONFIRMED", parsed.data.message);
+      throw new WorkbenchObserverAdapterError(WORKBENCH_ADAPTER_ERROR_CODES.RESTORATION_UNCONFIRMED, parsed.data.message);
     }
     return {
       jobId,
@@ -663,8 +660,8 @@ export class WorkbenchObserverAdapter {
     const record = this.requireJob(jobId);
     const status = record.lastStatus;
     const image = this.completedImages.get(jobId);
-    if (!status || status.state !== "completed" || !status.artifact || !image) {
-      throw new WorkbenchObserverAdapterError("JOB_NOT_FOUND", `Workbench observer job ${jobId} has no completed retained image`);
+    if (!status || status.state !== WORKBENCH_ADAPTER_STATE_VALUES.COMPLETED || !status.artifact || !image) {
+      throw new WorkbenchObserverAdapterError(WORKBENCH_ADAPTER_ERROR_CODES.JOB_NOT_FOUND, `Workbench observer job ${jobId} has no completed retained image`);
     }
     return {
       image: Buffer.from(image),
@@ -705,7 +702,7 @@ export class WorkbenchObserverAdapter {
         }
         if (status.cameraLeaseHeld || !status.restorationConfirmed) {
           throw new WorkbenchObserverAdapterError(
-            "RESTORATION_UNCONFIRMED",
+            WORKBENCH_ADAPTER_ERROR_CODES.RESTORATION_UNCONFIRMED,
             `Workbench observer job ${record.jobId} could not prove restoration during shutdown`
           );
         }
@@ -727,13 +724,13 @@ export class WorkbenchObserverAdapter {
         .map((issue) => `${issue.path.join(".") || "response"}: ${issue.message}`)
         .join("; ");
       throw new WorkbenchObserverAdapterError(
-        "HANDLER_UNAVAILABLE",
+        WORKBENCH_ADAPTER_ERROR_CODES.HANDLER_UNAVAILABLE,
         `Workbench observer ping returned an invalid response (${issues})`
       );
     }
-    if (parsed.data.status !== "ok") throw new WorkbenchObserverAdapterError("HANDLER_REJECTED", parsed.data.message);
+    if (parsed.data.status !== "ok") throw new WorkbenchObserverAdapterError(WORKBENCH_ADAPTER_ERROR_CODES.HANDLER_REJECTED, parsed.data.message);
     if (!parsed.data.projectFile) {
-      throw new WorkbenchObserverAdapterError("HANDLER_UNAVAILABLE", "Workbench observer handler omitted its base game project identity");
+      throw new WorkbenchObserverAdapterError(WORKBENCH_ADAPTER_ERROR_CODES.HANDLER_UNAVAILABLE, "Workbench observer handler omitted its base game project identity");
     }
     return parsed.data;
   }
@@ -773,14 +770,14 @@ export class WorkbenchObserverAdapter {
   private async handlerJobCall(apiFunc: string, params: Record<string, unknown>): Promise<z.infer<typeof jobResponseSchema>> {
     const raw = await this.client.call<unknown>(apiFunc, params, this.callOptions());
     const parsed = jobResponseSchema.safeParse(raw);
-    if (!parsed.success) throw new WorkbenchObserverAdapterError("HANDLER_UNAVAILABLE", `${apiFunc} returned an invalid response`);
+    if (!parsed.success) throw new WorkbenchObserverAdapterError(WORKBENCH_ADAPTER_ERROR_CODES.HANDLER_UNAVAILABLE, `${apiFunc} returned an invalid response`);
     return parsed.data;
   }
 
   private assertResponseBinding(response: z.infer<typeof jobResponseSchema>, record: AdapterJobRecord): void {
     if (response.jobId !== record.jobId || response.lifecycleGeneration !== record.snapshot.generation ||
         !samePath(response.canonicalTarget, record.snapshot.target.path) || !response.projectFile) {
-      throw new WorkbenchObserverAdapterError("STALE_LIFECYCLE", "Workbench observer response is bound to a different job, lifecycle generation, or canonical target");
+      throw new WorkbenchObserverAdapterError(WORKBENCH_ADAPTER_ERROR_CODES.STALE_LIFECYCLE, "Workbench observer response is bound to a different job, lifecycle generation, or canonical target");
     }
   }
 
@@ -817,9 +814,9 @@ export class WorkbenchObserverAdapter {
         farPlane: response.farPlane,
       },
     };
-    if (response.state === "completed" && validateArtifact) result.artifact = this.validateArtifact(record, response);
-    if (response.terminalErrorCode === "RESTORATION_UNCONFIRMED") {
-      result.terminalErrorCode = "RESTORATION_UNCONFIRMED";
+    if (response.state === WORKBENCH_ADAPTER_STATE_VALUES.COMPLETED && validateArtifact) result.artifact = this.validateArtifact(record, response);
+    if (response.terminalErrorCode === WORKBENCH_ADAPTER_ERROR_CODES.RESTORATION_UNCONFIRMED) {
+      result.terminalErrorCode = WORKBENCH_ADAPTER_ERROR_CODES.RESTORATION_UNCONFIRMED;
     }
     return result;
   }
@@ -839,26 +836,26 @@ export class WorkbenchObserverAdapter {
     if (response.artifactLogicalPath !== expectedLogical || !isAbsolute(response.artifactPath) ||
         basename(response.artifactPath).toLowerCase() !== `${record.jobId.toLowerCase()}.png` ||
         !samePath(response.artifactPath, expectedPhysical)) {
-      throw new WorkbenchObserverAdapterError("ARTIFACT_INVALID", "Workbench returned an unexpected generated artifact path");
+      throw new WorkbenchObserverAdapterError(WORKBENCH_ADAPTER_ERROR_CODES.ARTIFACT_INVALID, "Workbench returned an unexpected generated artifact path");
     }
     const captureDirectory = dirname(response.artifactPath);
     if (basename(captureDirectory).toLowerCase() !== "workbench" ||
         basename(dirname(captureDirectory)).toLowerCase() !== "reforgerforgeobserver") {
-      throw new WorkbenchObserverAdapterError("ARTIFACT_INVALID", "Workbench artifact escaped the generated profile capture directory");
+      throw new WorkbenchObserverAdapterError(WORKBENCH_ADAPTER_ERROR_CODES.ARTIFACT_INVALID, "Workbench artifact escaped the generated profile capture directory");
     }
     const info = lstatSync(response.artifactPath);
     if (!info.isFile() || info.isSymbolicLink()) {
-      throw new WorkbenchObserverAdapterError("ARTIFACT_INVALID", "Workbench artifact is not a regular file");
+      throw new WorkbenchObserverAdapterError(WORKBENCH_ADAPTER_ERROR_CODES.ARTIFACT_INVALID, "Workbench artifact is not a regular file");
     }
     if (info.size <= 33 || info.size > this.maxArtifactBytes) {
-      throw new WorkbenchObserverAdapterError("ARTIFACT_TOO_LARGE", "Workbench artifact is empty or exceeds the reviewed size bound");
+      throw new WorkbenchObserverAdapterError(WORKBENCH_ADAPTER_ERROR_CODES.ARTIFACT_TOO_LARGE, "Workbench artifact is empty or exceeds the reviewed size bound");
     }
     if (response.artifactBytes !== info.size) {
-      throw new WorkbenchObserverAdapterError("ARTIFACT_INVALID", "Workbench artifact length changed after stable completion");
+      throw new WorkbenchObserverAdapterError(WORKBENCH_ADAPTER_ERROR_CODES.ARTIFACT_INVALID, "Workbench artifact length changed after stable completion");
     }
     const canonical = realpathSync.native(response.artifactPath);
     if (!samePath(canonical, response.artifactPath)) {
-      throw new WorkbenchObserverAdapterError("ARTIFACT_INVALID", "Workbench artifact path changed during canonicalization");
+      throw new WorkbenchObserverAdapterError(WORKBENCH_ADAPTER_ERROR_CODES.ARTIFACT_INVALID, "Workbench artifact path changed during canonicalization");
     }
     const bytes = readFileSync(canonical);
     const dimensions = this.validatePng(bytes);
@@ -880,7 +877,7 @@ export class WorkbenchObserverAdapter {
 
   private validatePng(bytes: Buffer): { width: number; height: number } {
     if (bytes.length < 45 || !bytes.subarray(0, PNG_SIGNATURE.length).equals(PNG_SIGNATURE)) {
-      throw new WorkbenchObserverAdapterError("ARTIFACT_INVALID", "Workbench artifact is not a PNG file");
+      throw new WorkbenchObserverAdapterError(WORKBENCH_ADAPTER_ERROR_CODES.ARTIFACT_INVALID, "Workbench artifact is not a PNG file");
     }
     let offset = PNG_SIGNATURE.length;
     let width = 0;
@@ -891,7 +888,7 @@ export class WorkbenchObserverAdapter {
     const imageData: Buffer[] = [];
     while (offset < bytes.length) {
       if (offset + 12 > bytes.length) {
-        throw new WorkbenchObserverAdapterError("ARTIFACT_INVALID", "Workbench PNG contains a truncated chunk header");
+        throw new WorkbenchObserverAdapterError(WORKBENCH_ADAPTER_ERROR_CODES.ARTIFACT_INVALID, "Workbench PNG contains a truncated chunk header");
       }
       const length = bytes.readUInt32BE(offset);
       const typeOffset = offset + 4;
@@ -899,15 +896,15 @@ export class WorkbenchObserverAdapter {
       const dataEnd = dataOffset + length;
       const chunkEnd = dataEnd + 4;
       if (dataEnd < dataOffset || chunkEnd > bytes.length) {
-        throw new WorkbenchObserverAdapterError("ARTIFACT_INVALID", "Workbench PNG contains a truncated or overflowing chunk");
+        throw new WorkbenchObserverAdapterError(WORKBENCH_ADAPTER_ERROR_CODES.ARTIFACT_INVALID, "Workbench PNG contains a truncated or overflowing chunk");
       }
       const type = bytes.toString("ascii", typeOffset, dataOffset);
       if (!/^[A-Za-z]{4}$/.test(type) || bytes.readUInt32BE(dataEnd) !== crc32(bytes.subarray(typeOffset, dataEnd))) {
-        throw new WorkbenchObserverAdapterError("ARTIFACT_INVALID", "Workbench PNG contains an invalid chunk type or checksum");
+        throw new WorkbenchObserverAdapterError(WORKBENCH_ADAPTER_ERROR_CODES.ARTIFACT_INVALID, "Workbench PNG contains an invalid chunk type or checksum");
       }
       if (!sawHeader) {
         if (type !== "IHDR" || length !== 13) {
-          throw new WorkbenchObserverAdapterError("ARTIFACT_INVALID", "Workbench PNG does not begin with one valid IHDR chunk");
+          throw new WorkbenchObserverAdapterError(WORKBENCH_ADAPTER_ERROR_CODES.ARTIFACT_INVALID, "Workbench PNG does not begin with one valid IHDR chunk");
         }
         width = bytes.readUInt32BE(dataOffset);
         height = bytes.readUInt32BE(dataOffset + 4);
@@ -916,20 +913,20 @@ export class WorkbenchObserverAdapter {
         channels = colorType === 2 ? 3 : colorType === 6 ? 4 : 0;
         if (width <= 0 || height <= 0 || bitDepth !== 8 || channels === 0 ||
             bytes[dataOffset + 10] !== 0 || bytes[dataOffset + 11] !== 0 || bytes[dataOffset + 12] !== 0) {
-          throw new WorkbenchObserverAdapterError("ARTIFACT_INVALID", "Workbench PNG uses an unsupported image format");
+          throw new WorkbenchObserverAdapterError(WORKBENCH_ADAPTER_ERROR_CODES.ARTIFACT_INVALID, "Workbench PNG uses an unsupported image format");
         }
         const pixels = width * height;
         if (!Number.isSafeInteger(pixels) || pixels <= 0 || pixels > this.maxPixels) {
-          throw new WorkbenchObserverAdapterError("ARTIFACT_INVALID", "Workbench PNG dimensions exceed the reviewed pixel bound");
+          throw new WorkbenchObserverAdapterError(WORKBENCH_ADAPTER_ERROR_CODES.ARTIFACT_INVALID, "Workbench PNG dimensions exceed the reviewed pixel bound");
         }
         sawHeader = true;
       } else if (type === "IHDR") {
-        throw new WorkbenchObserverAdapterError("ARTIFACT_INVALID", "Workbench PNG contains more than one IHDR chunk");
+        throw new WorkbenchObserverAdapterError(WORKBENCH_ADAPTER_ERROR_CODES.ARTIFACT_INVALID, "Workbench PNG contains more than one IHDR chunk");
       } else if (type === "IDAT") {
         imageData.push(bytes.subarray(dataOffset, dataEnd));
       } else if (type === "IEND") {
         if (length !== 0 || imageData.length === 0 || chunkEnd !== bytes.length) {
-          throw new WorkbenchObserverAdapterError("ARTIFACT_INVALID", "Workbench PNG has an invalid IEND or trailing data");
+          throw new WorkbenchObserverAdapterError(WORKBENCH_ADAPTER_ERROR_CODES.ARTIFACT_INVALID, "Workbench PNG has an invalid IEND or trailing data");
         }
         sawEnd = true;
       }
@@ -937,25 +934,25 @@ export class WorkbenchObserverAdapter {
       if (sawEnd) break;
     }
     if (!sawHeader || !sawEnd || imageData.length === 0) {
-      throw new WorkbenchObserverAdapterError("ARTIFACT_INVALID", "Workbench PNG is missing required chunks");
+      throw new WorkbenchObserverAdapterError(WORKBENCH_ADAPTER_ERROR_CODES.ARTIFACT_INVALID, "Workbench PNG is missing required chunks");
     }
     const scanlineBytes = 1 + width * channels;
     const expectedInflated = scanlineBytes * height;
     if (!Number.isSafeInteger(expectedInflated) || expectedInflated <= 0) {
-      throw new WorkbenchObserverAdapterError("ARTIFACT_INVALID", "Workbench PNG scanline dimensions overflowed");
+      throw new WorkbenchObserverAdapterError(WORKBENCH_ADAPTER_ERROR_CODES.ARTIFACT_INVALID, "Workbench PNG scanline dimensions overflowed");
     }
     let inflated: Buffer;
     try {
       inflated = inflateSync(Buffer.concat(imageData), { maxOutputLength: expectedInflated });
     } catch {
-      throw new WorkbenchObserverAdapterError("ARTIFACT_INVALID", "Workbench PNG image data is not a valid bounded zlib stream");
+      throw new WorkbenchObserverAdapterError(WORKBENCH_ADAPTER_ERROR_CODES.ARTIFACT_INVALID, "Workbench PNG image data is not a valid bounded zlib stream");
     }
     if (inflated.length !== expectedInflated) {
-      throw new WorkbenchObserverAdapterError("ARTIFACT_INVALID", "Workbench PNG image data length is inconsistent with its dimensions");
+      throw new WorkbenchObserverAdapterError(WORKBENCH_ADAPTER_ERROR_CODES.ARTIFACT_INVALID, "Workbench PNG image data length is inconsistent with its dimensions");
     }
     for (let row = 0; row < height; row += 1) {
       if (inflated[row * scanlineBytes] > 4) {
-        throw new WorkbenchObserverAdapterError("ARTIFACT_INVALID", "Workbench PNG contains an invalid scanline filter");
+        throw new WorkbenchObserverAdapterError(WORKBENCH_ADAPTER_ERROR_CODES.ARTIFACT_INVALID, "Workbench PNG contains an invalid scanline filter");
       }
     }
     return { width, height };
@@ -963,7 +960,7 @@ export class WorkbenchObserverAdapter {
 
   private requireJob(jobId: string): AdapterJobRecord {
     const record = this.jobs.get(jobId);
-    if (!record || record.released) throw new WorkbenchObserverAdapterError("JOB_NOT_FOUND", `Workbench observer job ${jobId} is not retained`);
+    if (!record || record.released) throw new WorkbenchObserverAdapterError(WORKBENCH_ADAPTER_ERROR_CODES.JOB_NOT_FOUND, `Workbench observer job ${jobId} is not retained`);
     return record;
   }
 
@@ -971,18 +968,18 @@ export class WorkbenchObserverAdapter {
     try {
       const current = await this.client.revalidateCaptureActivity(record.activityLease);
       if (current.generation !== record.snapshot.generation || current.target.comparisonKey !== record.snapshot.target.comparisonKey) {
-        throw new WorkbenchObserverAdapterError("STALE_LIFECYCLE", "Workbench observer job belongs to an old lifecycle generation or canonical target");
+        throw new WorkbenchObserverAdapterError(WORKBENCH_ADAPTER_ERROR_CODES.STALE_LIFECYCLE, "Workbench observer job belongs to an old lifecycle generation or canonical target");
       }
     } catch (error) {
       await this.cancelForLifecycle(record);
-      throw this.mapError(error, "STALE_LIFECYCLE");
+      throw this.mapError(error, WORKBENCH_ADAPTER_ERROR_CODES.STALE_LIFECYCLE);
     }
   }
 
   private async cancelForLifecycle(record: AdapterJobRecord): Promise<void> {
     await record.ready;
     this.convergeAbort(record);
-    if (record.lastStatus?.terminalErrorCode === "WORKBENCH_EXITED") return;
+    if (record.lastStatus?.terminalErrorCode === WORKBENCH_ADAPTER_ERROR_CODES.WORKBENCH_EXITED) return;
     if (record.released || record.gateReleased || !record.handlerLeaseId) return;
     try {
       await this.cancelBound(record, false);
@@ -995,13 +992,13 @@ export class WorkbenchObserverAdapter {
   private convergeAbort(record: AdapterJobRecord): void {
     if (!record.activityLease.signal.aborted) return;
     const reason = record.activityLease.signal.reason as { code?: unknown; message?: unknown } | undefined;
-    if (reason?.code === "WORKBENCH_EXITED") {
+    if (reason?.code === WORKBENCH_ADAPTER_ERROR_CODES.WORKBENCH_EXITED) {
       this.failForUnexpectedExit(record, typeof reason.message === "string" ? reason.message : undefined);
     }
   }
 
   private failForUnexpectedExit(record: AdapterJobRecord, detail?: string): void {
-    if (record.released || record.lastStatus?.terminalErrorCode === "WORKBENCH_EXITED") return;
+    if (record.released || record.lastStatus?.terminalErrorCode === WORKBENCH_ADAPTER_ERROR_CODES.WORKBENCH_EXITED) return;
     const previous = record.lastStatus;
     if (!previous) {
       // Submission cannot have returned a public job yet. Its in-flight NET API
@@ -1012,10 +1009,10 @@ export class WorkbenchObserverAdapter {
     }
     record.lastStatus = {
       ...previous,
-      state: "failed",
+      state: WORKBENCH_ADAPTER_STATE_VALUES.FAILED,
       sequence: previous.sequence + 1,
       message: detail ?? "The exact owned Workbench process exited during observer capture",
-      terminalErrorCode: "WORKBENCH_EXITED",
+      terminalErrorCode: WORKBENCH_ADAPTER_ERROR_CODES.WORKBENCH_EXITED,
       cameraLeaseHeld: false,
       // Process exit destroys the camera/world; this is terminal invalidation,
       // not a claim that an exact restoration round trip was observed.
@@ -1027,13 +1024,13 @@ export class WorkbenchObserverAdapter {
   private async cancelBound(record: AdapterJobRecord, rethrow = true): Promise<WorkbenchObserverJobStatus> {
     try {
       const response = await this.handlerJobCall("EMCP_WB_ObserverCancel", this.boundRequest(record));
-      if (response.status !== "ok") throw new WorkbenchObserverAdapterError("HANDLER_REJECTED", response.message);
+      if (response.status !== "ok") throw new WorkbenchObserverAdapterError(WORKBENCH_ADAPTER_ERROR_CODES.HANDLER_REJECTED, response.message);
       this.assertResponseBinding(response, record);
       const status = this.publicStatus(record, response);
       record.lastStatus = status;
       if (!status.cameraLeaseHeld && status.restorationConfirmed) this.releaseGate(record);
-      if (!status.restorationConfirmed && status.terminalErrorCode === "RESTORATION_UNCONFIRMED") {
-        throw new WorkbenchObserverAdapterError("RESTORATION_UNCONFIRMED", status.message);
+      if (!status.restorationConfirmed && status.terminalErrorCode === WORKBENCH_ADAPTER_ERROR_CODES.RESTORATION_UNCONFIRMED) {
+        throw new WorkbenchObserverAdapterError(WORKBENCH_ADAPTER_ERROR_CODES.RESTORATION_UNCONFIRMED, status.message);
       }
       return status;
     } catch (error) {
@@ -1049,12 +1046,12 @@ export class WorkbenchObserverAdapter {
     this.client.releaseCaptureActivity(record.activityLease);
   }
 
-  private mapError(error: unknown, fallback: WorkbenchObserverAdapterErrorCode = "HANDLER_UNAVAILABLE"): Error {
+  private mapError(error: unknown, fallback: WorkbenchObserverAdapterErrorCode = WORKBENCH_ADAPTER_ERROR_CODES.HANDLER_UNAVAILABLE): Error {
     if (error instanceof WorkbenchObserverAdapterError) return error;
-    if (error instanceof z.ZodError) return new WorkbenchObserverAdapterError("INVALID_REQUEST", error.message);
+    if (error instanceof z.ZodError) return new WorkbenchObserverAdapterError(WORKBENCH_ADAPTER_ERROR_CODES.INVALID_REQUEST, error.message);
     const candidate = error as { code?: unknown; message?: unknown };
     if (candidate?.code === "CAPTURE_INVALIDATED" || candidate?.code === "LIFECYCLE_BUSY") {
-      return new WorkbenchObserverAdapterError("STALE_LIFECYCLE", typeof candidate.message === "string" ? candidate.message : "Workbench lifecycle changed");
+      return new WorkbenchObserverAdapterError(WORKBENCH_ADAPTER_ERROR_CODES.STALE_LIFECYCLE, typeof candidate.message === "string" ? candidate.message : "Workbench lifecycle changed");
     }
     return new WorkbenchObserverAdapterError(fallback, error instanceof Error ? error.message : String(error));
   }

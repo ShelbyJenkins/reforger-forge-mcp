@@ -11,6 +11,7 @@ import { randomUUID } from "node:crypto";
 import { spawn, type ChildProcess, type SpawnOptions } from "node:child_process";
 import { join, resolve } from "node:path";
 import type { Config } from "../config.js";
+import { redactArguments } from "../foundation/redact.js";
 import { logger } from "../utils/logger.js";
 import {
   WorkbenchActivityError,
@@ -2616,7 +2617,10 @@ export class WorkbenchSessionController {
 
     const ownerArgument = preflight.ownerArgument;
     const args = [...preflight.argv];
-    const redactedArgs = args.map((arg) => arg === ownerArgument ? "[owner-token-redacted]" : arg);
+    const redactedArgs = redactArguments(args, {
+      profile: "command_argument",
+      replacement: "[owner-token-redacted]",
+    });
     logger.info(
       `Launching Workbench: ${preflight.executablePath} ${redactedArgs.join(" ")} ` +
         `(cwd: ${preflight.spawnOptions.cwd})`

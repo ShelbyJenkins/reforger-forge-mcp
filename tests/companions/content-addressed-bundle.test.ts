@@ -4,15 +4,12 @@ import {
   readFileSync,
   readdirSync,
   renameSync,
-  rmSync,
   symlinkSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { randomUUID } from "node:crypto";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import {
   ContentAddressedBundleError,
@@ -23,6 +20,7 @@ import {
   verifyContentAddressedBundle,
   type ContentAddressedBundlePolicy,
 } from "../../src/companions/content-addressed-bundle.js";
+import { withTemporaryDirectory } from "../support/temporary-directory.js";
 
 const descriptorRace = vi.hoisted(() => ({
   beforeOpen: undefined as ((path: string) => void) | undefined,
@@ -53,15 +51,6 @@ const policy: ContentAddressedBundlePolicy<TestManifest> = {
   allowedStagedExtraFiles: new Set(["generated.cache"]),
 };
 
-const roots: string[] = [];
-
-function temporaryDirectory(): string {
-  const root = join(tmpdir(), `reforger-forge-bundle-${randomUUID()}`);
-  mkdirSync(root, { recursive: true });
-  roots.push(root);
-  return root;
-}
-
 function writeSource(
   root: string,
   payload: Readonly<Record<string, string>> = {
@@ -85,10 +74,18 @@ function writeSource(
   return manifest;
 }
 
-afterEach(() => {
-  descriptorRace.beforeOpen = undefined;
-  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
-});
+function scopedIt(
+  name: string,
+  run: (root: string) => Promise<void> | void,
+): void {
+  it(name, () => withTemporaryDirectory(async (root) => {
+    try {
+      await run(root);
+    } finally {
+      descriptorRace.beforeOpen = undefined;
+    }
+  }, { prefix: "reforger-forge-bundle-" }));
+}
 
 describe("content-addressed bundle contract", () => {
   it("computes one order-independent canonical digest", () => {
@@ -101,8 +98,7 @@ describe("content-addressed bundle contract", () => {
     );
   });
 
-  it("verifies, atomically publishes, re-attests, and reuses an immutable bundle", () => {
-    const root = temporaryDirectory();
+  scopedIt("verifies, atomically publishes, re-attests, and reuses an immutable bundle", (root) => {
     const sourceRoot = join(root, "source");
     const addonsRoot = join(root, "addons");
     mkdirSync(sourceRoot, { recursive: true });
@@ -126,8 +122,7 @@ describe("content-addressed bundle contract", () => {
     }).manifest).toEqual(manifest);
   });
 
-  it("fails closed on case-folded duplicate and traversal manifest paths", () => {
-    const root = temporaryDirectory();
+  scopedIt("fails closed on case-folded duplicate and traversal manifest paths", (root) => {
     const sourceRoot = join(root, "source");
     mkdirSync(sourceRoot, { recursive: true });
     const manifest = writeSource(sourceRoot, { "Scripts/main.c": "payload" });
@@ -156,8 +151,7 @@ describe("content-addressed bundle contract", () => {
     );
   });
 
-  it("bounds manifest bytes before parsing untrusted JSON", () => {
-    const root = temporaryDirectory();
+  scopedIt("bounds manifest bytes before parsing untrusted JSON", (root) => {
     const sourceRoot = join(root, "source");
     mkdirSync(sourceRoot, { recursive: true });
     writeSource(sourceRoot);
@@ -170,8 +164,7 @@ describe("content-addressed bundle contract", () => {
     );
   });
 
-  it("fails closed when a same-size manifest is replaced before descriptor open", () => {
-    const root = temporaryDirectory();
+  scopedIt("fails closed when a same-size manifest is replaced before descriptor open", (root) => {
     const sourceRoot = join(root, "source");
     mkdirSync(sourceRoot, { recursive: true });
     writeSource(sourceRoot);
@@ -195,8 +188,7 @@ describe("content-addressed bundle contract", () => {
     expect(replaced).toBe(true);
   });
 
-  it("rejects symbolic links before reading payload content", () => {
-    const root = temporaryDirectory();
+  scopedIt("rejects symbolic links before reading payload content", (root) => {
     const sourceRoot = join(root, "source");
     const outsideRoot = join(root, "outside");
     mkdirSync(sourceRoot, { recursive: true });
@@ -213,8 +205,7 @@ describe("content-addressed bundle contract", () => {
     );
   });
 
-  it("cleans an unpublished temporary root when the verified source changes", () => {
-    const root = temporaryDirectory();
+  scopedIt("cleans an unpublished temporary root when the verified source changes", (root) => {
     const sourceRoot = join(root, "source");
     const addonsRoot = join(root, "addons");
     mkdirSync(sourceRoot, { recursive: true });
@@ -229,8 +220,7 @@ describe("content-addressed bundle contract", () => {
     expect(readdirSync(addonsRoot)).toEqual([]);
   });
 
-  it("permits declared host-generated files only during explicit staged attestation", () => {
-    const root = temporaryDirectory();
+  scopedIt("permits declared host-generated files only during explicit staged attestation", (root) => {
     const sourceRoot = join(root, "source");
     const addonsRoot = join(root, "addons");
     mkdirSync(sourceRoot, { recursive: true });

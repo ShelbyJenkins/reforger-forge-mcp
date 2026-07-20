@@ -27,9 +27,10 @@ class RFO_ObserverMailboxQuarantineEvidence : JsonApiStruct
 
 class RFO_ObserverMailboxTransport : RFO_ObserverTransport
 {
-	static const string COMMAND_DIRECTORY = "$profile:ReforgerForgeObserver/mailbox/commands";
-	static const string STATUS_DIRECTORY = "$profile:ReforgerForgeObserver/mailbox/status";
-	static const string QUARANTINE_DIRECTORY = "$profile:ReforgerForgeObserver/mailbox/quarantine/commands";
+	static const string PROFILE_DIRECTORY = "$profile:" + RFO_ObserverProtocol.DIRECTORY_SESSION_ROOT;
+	static const string COMMAND_DIRECTORY = PROFILE_DIRECTORY + "/mailbox/commands";
+	static const string STATUS_DIRECTORY = PROFILE_DIRECTORY + "/mailbox/status";
+	static const string QUARANTINE_DIRECTORY = PROFILE_DIRECTORY + "/mailbox/quarantine/commands";
 	static const int MAX_COMMAND_FILES = 256;
 	static const int MAX_STATUS_FILES = 512;
 	static const int MAX_TRANSIENT_ATTEMPTS = 8;

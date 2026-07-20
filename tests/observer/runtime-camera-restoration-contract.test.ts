@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { observerAddonSource } from "./helpers.js";
+import { observerAddonSource } from "../support/observer-fixtures.js";
 
 const runtimeSource = (...parts: string[]) => readFileSync(join(
   observerAddonSource,

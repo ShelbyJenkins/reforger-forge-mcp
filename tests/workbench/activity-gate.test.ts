@@ -27,16 +27,19 @@ import {
   WorkbenchError,
 } from "../../src/workbench/client.js";
 import { canonicalizeGproj } from "../../src/workbench/project-identity.js";
-import {
-  WorkbenchProcessGuard,
-  type WorkbenchIdentity,
-  type WorkbenchLifecycleStateV3,
+import type {
+  WorkbenchIdentity,
+  WorkbenchLifecycleStateV3,
 } from "../../src/workbench/process-guard.js";
 import {
   companionLifecycleState,
   createFakeCompanionLaunch,
   fakeCompanionProvider,
 } from "./fake-companion.js";
+import {
+  closeTrackedWorkbenchProcessGuards,
+  WorkbenchProcessGuard,
+} from "./tracked-process-guard.js";
 import {
   createFakeLifecycleBackend,
   type FakeLifecycleBackend,
@@ -94,7 +97,8 @@ function expectActivityCode(action: () => unknown, code: string): void {
   }
 }
 
-afterEach(() => {
+afterEach(async () => {
+  await closeTrackedWorkbenchProcessGuards();
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 

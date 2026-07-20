@@ -1,19 +1,14 @@
-import { afterEach, describe, expect, it } from "vitest";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { describe, expect, it } from "vitest";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   buildWorkbenchLaunchArgs,
   WorkbenchError,
 } from "../../src/workbench/client.js";
+import { withTemporaryDirectory } from "../support/temporary-directory.js";
 import { createFakeCompanionLaunch } from "./fake-companion.js";
 
-const tempRoots: string[] = [];
-
-function createAddonRoots(): { root: string; base: string; workshop: string } {
-  const root = mkdtempSync(join(tmpdir(), "reforger-forge-launch-"));
-  tempRoots.push(root);
-
+function createAddonRoots(root: string): { root: string; base: string; workshop: string } {
   const base = join(root, "Arma Reforger", "addons");
   const workshop = join(root, "My Games", "ArmaReforger", "addons");
   mkdirSync(base, { recursive: true });
@@ -21,15 +16,16 @@ function createAddonRoots(): { root: string; base: string; workshop: string } {
   return { root, base, workshop };
 }
 
-afterEach(() => {
-  for (const root of tempRoots.splice(0)) {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
+function scopedIt(
+  name: string,
+  run: (root: string) => Promise<void> | void,
+): void {
+  it(name, () => withTemporaryDirectory(run, { prefix: "reforger-forge-launch-" }));
+}
 
 describe("buildWorkbenchLaunchArgs", () => {
-  it("emits one comma-separated addon argument and deduplicates roots", () => {
-    const { base, workshop } = createAddonRoots();
+  scopedIt("emits one comma-separated addon argument and deduplicates roots", (root) => {
+    const { base, workshop } = createAddonRoots(root);
     const gproj = join("C:\\mods", "Example Mod", "ExampleMod.gproj");
 
     const args = buildWorkbenchLaunchArgs(
@@ -50,8 +46,8 @@ describe("buildWorkbenchLaunchArgs", () => {
     expect(args.filter((arg) => arg === "-addonsDir")).toHaveLength(1);
   });
 
-  it("merges the managed companion root and activates its GUID and isolated profile", () => {
-    const { root, base, workshop } = createAddonRoots();
+  scopedIt("merges the managed companion root and activates its GUID and isolated profile", (root) => {
+    const { base, workshop } = createAddonRoots(root);
     const companion = createFakeCompanionLaunch(root);
     const gproj = join(root, "ExampleMod", "ExampleMod.gproj");
 
@@ -103,9 +99,7 @@ describe("buildWorkbenchLaunchArgs", () => {
     ]);
   });
 
-  it("rejects missing configured addon roots before launch", () => {
-    const root = mkdtempSync(join(tmpdir(), "reforger-forge-launch-"));
-    tempRoots.push(root);
+  scopedIt("rejects missing configured addon roots before launch", (root) => {
     const missing = join(root, "missing-addon-root");
 
     try {
@@ -118,9 +112,7 @@ describe("buildWorkbenchLaunchArgs", () => {
     }
   });
 
-  it("rejects configured paths that are not directories", () => {
-    const root = mkdtempSync(join(tmpdir(), "reforger-forge-launch-"));
-    tempRoots.push(root);
+  scopedIt("rejects configured paths that are not directories", (root) => {
     const filePath = join(root, "not-an-addon-directory");
     writeFileSync(filePath, "test");
 

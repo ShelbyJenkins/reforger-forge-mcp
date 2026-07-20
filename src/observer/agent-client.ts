@@ -1,5 +1,6 @@
 import { fork, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { redactText } from "#foundation/redact";
 import { logger } from "../utils/logger.js";
 import { canonicalPublicObserverErrorCode } from "./public-contract.js";
 import { ObserverCoordinatorError } from "./errors.js";
@@ -51,14 +52,8 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value);
 }
 
-const CONTRACT_BODY = /((?:"?[A-Za-z0-9]*contract(?:body|payload)?"?)\s*[:=]\s*).*/i;
-
 export function redactChildLine(value: string): string {
-  return value
-    .replace(/Bearer\s+[A-Za-z0-9._~-]+/gi, "Bearer [REDACTED]")
-    .replace(/((?:[A-Za-z0-9_-]*nonce|(?:session|control)?token|authorization|credential|secret)(?:"?\s*[:=]\s*"?))[^\s",}]+/gi, "$1[REDACTED]")
-    .replace(CONTRACT_BODY, "$1[REDACTED]")
-    .slice(0, 1_024);
+  return redactText(value, { profile: "diagnostic", maxLength: 1_024 });
 }
 
 function abortError(): ObserverCoordinatorError {
@@ -213,7 +208,7 @@ export class ObserverAgentClient {
     child.once("error", (error) => {
       if (child.pid === undefined) this.liveChildren.delete(child);
       if (this.child !== child) return;
-      this.rejectStartup?.(new ObserverCoordinatorError("TRANSPORT_UNAVAILABLE", `Private observer agent failed: ${error.message}`));
+      this.rejectStartup?.(new ObserverCoordinatorError("TRANSPORT_UNAVAILABLE", redactText(`Private observer agent failed: ${error.message}`, { profile: "diagnostic", maxLength: 1_024 })));
       this.descriptor = null;
       this.rejectAll(new ObserverCoordinatorError("TRANSPORT_UNAVAILABLE", "Private observer agent became unavailable"));
       child.kill();
@@ -238,7 +233,7 @@ export class ObserverAgentClient {
       const error = isRecord(message.error) ? message.error : {};
       this.rejectStartup?.(new ObserverCoordinatorError(
         canonicalPublicObserverErrorCode(error.code, "TRANSPORT_UNAVAILABLE"),
-        typeof error.message === "string" ? error.message : "Private observer agent failed during startup"
+        typeof error.message === "string" ? redactChildLine(error.message) : "Private observer agent failed during startup"
       ));
       this.rejectStartup = null;
       this.child?.kill();
@@ -255,7 +250,7 @@ export class ObserverAgentClient {
       const error = isRecord(message.error) ? message.error : {};
       pending.reject(new ObserverCoordinatorError(
         canonicalPublicObserverErrorCode(error.code),
-        typeof error.message === "string" ? error.message : "Observer operation failed"
+        typeof error.message === "string" ? redactChildLine(error.message) : "Observer operation failed"
       ));
     }
   }

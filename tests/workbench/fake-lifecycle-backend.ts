@@ -1,11 +1,3 @@
-import { createHash } from "node:crypto";
-import {
-  existsSync,
-  readFileSync,
-  renameSync,
-  unlinkSync,
-  writeFileSync,
-} from "node:fs";
 import type {
   ExactProcessIdentity,
   LifecycleEndpoint,
@@ -15,7 +7,14 @@ import type {
   WorkbenchLifecycleBackend,
   WorkbenchLifecycleStateV3,
   WorkbenchProcessScan,
+  WorkbenchSpawnRecord,
 } from "../../src/workbench/process-guard.js";
+
+interface FakeSpawnJournalState {
+  version: 3;
+  generation: string;
+  record: WorkbenchSpawnRecord;
+}
 import {
   createFakeExactProcessBackend,
   type FakeExactProcessBackend,
@@ -32,10 +31,16 @@ interface FakeLifecycleControls {
   endpointOwnershipResult: VerifyEndpointOwnerResult | null;
   endpointVacancyResult: VerifyEndpointVacantResult | null;
   replaceFailure: ((args: {
-    path: string;
     expectedGeneration: string | null;
     next: WorkbenchLifecycleStateV3;
   }) => Error | null) | null;
+  /** Fires after a lifecycle write commits, before its caller observes success. May throw. */
+  afterReplace: ((args: { generation: string; next: WorkbenchLifecycleStateV3 }) => void) | null;
+  spawnJournalReplaceFailure: ((args: {
+    expectedGeneration: string | null;
+    next: FakeSpawnJournalState;
+  }) => Error | null) | null;
+  afterSpawnJournalReplace: ((args: { generation: string; next: FakeSpawnJournalState }) => void) | null;
   addWorkbench(identity: ExactProcessIdentity, ownerArgument?: string): void;
 }
 
@@ -61,6 +66,9 @@ export function createFakeLifecycleBackend(
   backend.endpointOwnershipResult = null;
   backend.endpointVacancyResult = null;
   backend.replaceFailure = null;
+  backend.afterReplace = null;
+  backend.spawnJournalReplaceFailure = null;
+  backend.afterSpawnJournalReplace = null;
 
   backend.scanWorkbenchProcesses = async () => ({
     processes: [...backend.workbenchPids]
@@ -109,29 +117,6 @@ export function createFakeLifecycleBackend(
     const result = await verifyExactAndTerminate(expected, timeoutMs);
     if (result.kind === "terminated") backend.workbenchPids.delete(expected.pid);
     return result;
-  };
-
-  backend.replaceState = async (args) => {
-    const failure = backend.replaceFailure?.(args);
-    if (failure) throw failure;
-    if (args.expectedGeneration === null) {
-      if (existsSync(args.path)) throw new Error("generation mismatch: expected missing");
-    } else {
-      if (!existsSync(args.path)) throw new Error("generation mismatch: missing state");
-      const currentState = JSON.parse(readFileSync(args.path, "utf8")) as { generation?: string };
-      if (currentState.generation !== args.expectedGeneration) throw new Error("generation mismatch");
-    }
-    const temp = `${args.path}.fake.tmp`;
-    writeFileSync(temp, `${JSON.stringify(args.next, null, 2)}\n`, "utf8");
-    if (existsSync(args.path)) unlinkSync(args.path);
-    renameSync(temp, args.path);
-  };
-
-  backend.archiveState = async (args) => {
-    const bytes = readFileSync(args.path);
-    const actual = createHash("sha256").update(bytes).digest("hex");
-    if (actual !== args.expectedSha256) throw new Error("hash mismatch");
-    renameSync(args.path, args.archivePath);
   };
 
   backend.addWorkbench = (identity, ownerArgument) => {

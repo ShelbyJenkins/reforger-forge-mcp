@@ -1,16 +1,22 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { MailboxTransport } from "../../observer/agent/mailbox.js";
 import { MailboxCoordinator } from "../../observer/agent/mailbox-coordinator.js";
 import { ArtifactStore } from "../../observer/agent/artifacts.js";
 import { JobStore } from "../../observer/agent/jobs.js";
 import { InstanceRegistry } from "../../observer/agent/registry.js";
 import { atomicWriteFile } from "../../observer/agent/paths.js";
-import { cleanup, createSessionFixture, graphicalRegistration, observerAddonSource, temporaryDirectory } from "./helpers.js";
+import { withTemporaryDirectory } from "../support/temporary-directory.js";
+import { createObserverSessionFixture, graphicalRegistration, observerAddonSource } from "../support/observer-fixtures.js";
 
-const roots: string[] = [];
-afterEach(() => roots.splice(0).forEach(cleanup));
+function scopedIt(
+  name: string,
+  run: (root: string) => Promise<void> | void,
+  timeoutMs = 5_000,
+): void {
+  it(name, () => withTemporaryDirectory(run, { prefix: "rfo-mailbox-" }), timeoutMs);
+}
 
 function errno(code: string): NodeJS.ErrnoException {
   return Object.assign(new Error(code), { code });
@@ -32,10 +38,8 @@ function enforceMethod(source: string, signature: string): string {
 }
 
 describe("observer mailbox", () => {
-  it("writes generated ordered commands and reads status in sequence order", () => {
-    const root = temporaryDirectory();
-    roots.push(root);
-    const fixture = createSessionFixture(root);
+  scopedIt("writes generated ordered commands and reads status in sequence order", (root) => {
+    const fixture = createObserverSessionFixture({ root });
     const mailbox = new MailboxTransport(fixture.profilePath);
     const command = {
       protocolVersion: "1.0" as const,
@@ -75,10 +79,8 @@ describe("observer mailbox", () => {
     expect(mailbox.acknowledgeStatus("job-1", 1)).toBe(false);
   });
 
-  it("connects mailbox registration and command publication to the agent stores", async () => {
-    const root = temporaryDirectory();
-    roots.push(root);
-    const fixture = createSessionFixture(root);
+  scopedIt("connects mailbox registration and command publication to the agent stores", async (root) => {
+    const fixture = createObserverSessionFixture({ root });
     const registry = new InstanceRegistry(fixture.store, { clock: fixture.clock });
     const jobs = new JobStore(fixture.store, registry, fixture.clock);
     const artifacts = new ArtifactStore(join(root, "artifacts"), fixture.store, jobs);
@@ -106,10 +108,8 @@ describe("observer mailbox", () => {
     expect(readdirSync(mailbox.commandsDirectory).some((name) => name.includes(`-capture-${job.request.jobId}-1.json`))).toBe(true);
   });
 
-  it("accounts for exact pretty-printed command bytes before writing", () => {
-    const root = temporaryDirectory();
-    roots.push(root);
-    const fixture = createSessionFixture(root);
+  scopedIt("accounts for exact pretty-printed command bytes before writing", (root) => {
+    const fixture = createObserverSessionFixture({ root });
     const command = {
       protocolVersion: "1.0" as const,
       jobId: `job-${"j".repeat(80)}`,
@@ -136,10 +136,8 @@ describe("observer mailbox", () => {
     expect(mailbox.stats().commandFiles).toBe(0);
   });
 
-  it("wraps an imported maximum command sequence without emitting a rejected 13-digit filename", () => {
-    const root = temporaryDirectory();
-    roots.push(root);
-    const fixture = createSessionFixture(root);
+  scopedIt("wraps an imported maximum command sequence without emitting a rejected 13-digit filename", (root) => {
+    const fixture = createObserverSessionFixture({ root });
     const initial = new MailboxTransport(fixture.profilePath);
     writeFileSync(
       join(initial.commandsDirectory, "999999999999-capture-poison-1.json"),
@@ -170,10 +168,8 @@ describe("observer mailbox", () => {
     expect(JSON.parse(readFileSync(commandPath, "utf8"))).toMatchObject({ sequence: 1, jobId: command.jobId });
   });
 
-  it("rejects imported command usage atomically when aggregate admission is over budget", async () => {
-    const root = temporaryDirectory();
-    roots.push(root);
-    const fixture = createSessionFixture(root);
+  scopedIt("rejects imported command usage atomically when aggregate admission is over budget", async (root) => {
+    const fixture = createObserverSessionFixture({ root });
     const registry = new InstanceRegistry(fixture.store, { clock: fixture.clock });
     const jobs = new JobStore(fixture.store, registry, fixture.clock);
     const artifacts = new ArtifactStore(join(root, "artifacts"), fixture.store, jobs);
@@ -205,10 +201,8 @@ describe("observer mailbox", () => {
     expect(coordinator.stats().estimatedBytes).toBeLessThanOrEqual(1_024);
   });
 
-  it("rolls back transport admission when the command-usage index fails during commit", async () => {
-    const root = temporaryDirectory();
-    roots.push(root);
-    const fixture = createSessionFixture(root);
+  scopedIt("rolls back transport admission when the command-usage index fails during commit", async (root) => {
+    const fixture = createObserverSessionFixture({ root });
     const registry = new InstanceRegistry(fixture.store, { clock: fixture.clock });
     const jobs = new JobStore(fixture.store, registry, fixture.clock);
     const artifacts = new ArtifactStore(join(root, "artifacts"), fixture.store, jobs);
@@ -230,10 +224,8 @@ describe("observer mailbox", () => {
     expect(coordinator.stats().transports).toBe(1);
   });
 
-  it("consumes restored ownership-loss status and the following heartbeat without quarantine", async () => {
-    const root = temporaryDirectory();
-    roots.push(root);
-    const fixture = createSessionFixture(root);
+  scopedIt("consumes restored ownership-loss status and the following heartbeat without quarantine", async (root) => {
+    const fixture = createObserverSessionFixture({ root });
     const registry = new InstanceRegistry(fixture.store, { clock: fixture.clock });
     const registration = graphicalRegistration(fixture.created, {
       selectedTransport: "mailbox",
@@ -324,10 +316,8 @@ describe("observer mailbox", () => {
     expect(existsSync(join(mailbox.statusDirectory, "quarantine"))).toBe(false);
   });
 
-  it("permanently rejects malformed ingress into bounded quarantine immediately", async () => {
-    const root = temporaryDirectory();
-    roots.push(root);
-    const fixture = createSessionFixture(root);
+  scopedIt("permanently rejects malformed ingress into bounded quarantine immediately", async (root) => {
+    const fixture = createObserverSessionFixture({ root });
     const registry = new InstanceRegistry(fixture.store, { clock: fixture.clock });
     const jobs = new JobStore(fixture.store, registry, fixture.clock);
     const artifacts = new ArtifactStore(join(root, "artifacts"), fixture.store, jobs);
@@ -343,10 +333,8 @@ describe("observer mailbox", () => {
     expect(coordinator.stats()).toMatchObject({ permanentRejected: 1, quarantined: 1, trackedRetries: 0 });
   });
 
-  it("bounds transient retries by attempt count before quarantining", async () => {
-    const root = temporaryDirectory();
-    roots.push(root);
-    const fixture = createSessionFixture(root);
+  scopedIt("bounds transient retries by attempt count before quarantining", async (root) => {
+    const fixture = createObserverSessionFixture({ root });
     const registry = new InstanceRegistry(fixture.store, { clock: fixture.clock });
     const jobs = new JobStore(fixture.store, registry, fixture.clock);
     const artifacts = new ArtifactStore(join(root, "artifacts"), fixture.store, jobs);
@@ -365,10 +353,8 @@ describe("observer mailbox", () => {
     expect(coordinator.stats()).toMatchObject({ transientRetries: 3, quarantined: 1, trackedRetries: 0 });
   });
 
-  it("admits the newest retry through the shared bounded map before applying mailbox eviction policy", async () => {
-    const root = temporaryDirectory();
-    roots.push(root);
-    const fixture = createSessionFixture(root);
+  scopedIt("admits the newest retry through the shared bounded map before applying mailbox eviction policy", async (root) => {
+    const fixture = createObserverSessionFixture({ root });
     const registry = new InstanceRegistry(fixture.store, { clock: fixture.clock });
     const jobs = new JobStore(fixture.store, registry, fixture.clock);
     const artifacts = new ArtifactStore(join(root, "artifacts"), fixture.store, jobs);
@@ -395,10 +381,8 @@ describe("observer mailbox", () => {
     });
   });
 
-  it("stores a bounded summary when rejected ingress exceeds the quarantine byte budget", async () => {
-    const root = temporaryDirectory();
-    roots.push(root);
-    const fixture = createSessionFixture(root);
+  scopedIt("stores a bounded summary when rejected ingress exceeds the quarantine byte budget", async (root) => {
+    const fixture = createObserverSessionFixture({ root });
     const registry = new InstanceRegistry(fixture.store, { clock: fixture.clock });
     const jobs = new JobStore(fixture.store, registry, fixture.clock);
     const artifacts = new ArtifactStore(join(root, "artifacts"), fixture.store, jobs);
@@ -425,10 +409,8 @@ describe("observer mailbox", () => {
     expect(coordinator.stats().estimatedBytes).toBeLessThanOrEqual(8 * 1_024);
   });
 
-  it("drops forensic evidence when non-removable metadata leaves no aggregate byte budget", async () => {
-    const root = temporaryDirectory();
-    roots.push(root);
-    const fixture = createSessionFixture(root);
+  scopedIt("drops forensic evidence when non-removable metadata leaves no aggregate byte budget", async (root) => {
+    const fixture = createObserverSessionFixture({ root });
     const registry = new InstanceRegistry(fixture.store, { clock: fixture.clock });
     const jobs = new JobStore(fixture.store, registry, fixture.clock);
     const artifacts = new ArtifactStore(join(root, "artifacts"), fixture.store, jobs);
@@ -451,10 +433,8 @@ describe("observer mailbox", () => {
     expect(coordinator.stats().quarantineDropped).toBeGreaterThan(0);
   });
 
-  it("consumes valid ingress after more than one batch of poison while bounding forensic evidence", async () => {
-    const root = temporaryDirectory();
-    roots.push(root);
-    const fixture = createSessionFixture(root);
+  scopedIt("consumes valid ingress after more than one batch of poison while bounding forensic evidence", async (root) => {
+    const fixture = createObserverSessionFixture({ root });
     const registry = new InstanceRegistry(fixture.store, { clock: fixture.clock });
     const jobs = new JobStore(fixture.store, registry, fixture.clock);
     const artifacts = new ArtifactStore(join(root, "artifacts"), fixture.store, jobs);
@@ -507,10 +487,8 @@ describe("observer mailbox", () => {
     expect(coordinator.stats().transports).toBe(0);
   }, 20_000);
 
-  it("isolates raced and busy command cleanup so unrelated transport retention continues", async () => {
-    const root = temporaryDirectory();
-    roots.push(root);
-    const fixture = createSessionFixture(root);
+  scopedIt("isolates raced and busy command cleanup so unrelated transport retention continues", async (root) => {
+    const fixture = createObserverSessionFixture({ root });
     const secondProfile = join(root, "profiles", "run-2");
     mkdirSync(secondProfile, { recursive: true });
     const second = fixture.store.create({
@@ -563,12 +541,10 @@ describe("observer mailbox", () => {
       cleanupFailures: 1,
       lastCleanupFailure: { operation: "expire_command", file: busyName, errorCode: "EBUSY" },
     });
-  });
+  }, 10_000);
 
-  it("does not reclaim a live writer paused before marker publication", async () => {
-    const root = temporaryDirectory();
-    roots.push(root);
-    const fixture = createSessionFixture(root);
+  scopedIt("does not reclaim a live writer paused before marker publication", async (root) => {
+    const fixture = createObserverSessionFixture({ root });
     const registry = new InstanceRegistry(fixture.store, { clock: fixture.clock });
     const jobs = new JobStore(fixture.store, registry, fixture.clock);
     const artifacts = new ArtifactStore(join(root, "artifacts"), fixture.store, jobs);
@@ -610,10 +586,8 @@ describe("observer mailbox", () => {
     expect(coordinator.stats().accepted).toBe(1);
   });
 
-  it("reclaims more than the runtime egress cap only after writer authority is terminal", async () => {
-    const root = temporaryDirectory();
-    roots.push(root);
-    const fixture = createSessionFixture(root);
+  scopedIt("reclaims more than the runtime egress cap only after writer authority is terminal", async (root) => {
+    const fixture = createObserverSessionFixture({ root });
     const registry = new InstanceRegistry(fixture.store, { clock: fixture.clock });
     const jobs = new JobStore(fixture.store, registry, fixture.clock);
     const artifacts = new ArtifactStore(join(root, "artifacts"), fixture.store, jobs);
@@ -647,10 +621,8 @@ describe("observer mailbox", () => {
     expect(coordinator.stats()).toMatchObject({ orphanIngressRemoved: 513, cleanupFailures: 0 });
   });
 
-  it("retains a busy quarantine file and refuses new evidence instead of exceeding its bound", async () => {
-    const root = temporaryDirectory();
-    roots.push(root);
-    const fixture = createSessionFixture(root);
+  scopedIt("retains a busy quarantine file and refuses new evidence instead of exceeding its bound", async (root) => {
+    const fixture = createObserverSessionFixture({ root });
     const registry = new InstanceRegistry(fixture.store, { clock: fixture.clock });
     const jobs = new JobStore(fixture.store, registry, fixture.clock);
     const artifacts = new ArtifactStore(join(root, "artifacts"), fixture.store, jobs);
@@ -688,10 +660,8 @@ describe("observer mailbox", () => {
     });
   });
 
-  it("rescans quarantine disk state before reserving space for new evidence", async () => {
-    const root = temporaryDirectory();
-    roots.push(root);
-    const fixture = createSessionFixture(root);
+  scopedIt("rescans quarantine disk state before reserving space for new evidence", async (root) => {
+    const fixture = createObserverSessionFixture({ root });
     const registry = new InstanceRegistry(fixture.store, { clock: fixture.clock });
     const jobs = new JobStore(fixture.store, registry, fixture.clock);
     const artifacts = new ArtifactStore(join(root, "artifacts"), fixture.store, jobs);
@@ -730,10 +700,8 @@ describe("observer mailbox", () => {
     });
   });
 
-  it("retains and accounts for a busy command temporary without allocating another", () => {
-    const root = temporaryDirectory();
-    roots.push(root);
-    const fixture = createSessionFixture(root);
+  scopedIt("retains and accounts for a busy command temporary without allocating another", (root) => {
+    const fixture = createObserverSessionFixture({ root });
     const initial = new MailboxTransport(fixture.profilePath);
     const temporaryName = ".00000000-0000-4000-8000-000000000001.tmp";
     const temporaryPath = join(initial.commandsDirectory, temporaryName);
@@ -772,9 +740,7 @@ describe("observer mailbox", () => {
     expect(mailbox.stats()).toMatchObject({ commandFiles: 1, commandUsageReliable: true });
   });
 
-  it("cleans an atomic-write temporary when final publication fails", () => {
-    const root = temporaryDirectory();
-    roots.push(root);
+  scopedIt("cleans an atomic-write temporary when final publication fails", (root) => {
     const occupiedTarget = join(root, "occupied.json");
     mkdirSync(occupiedTarget);
 

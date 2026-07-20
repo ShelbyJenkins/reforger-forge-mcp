@@ -130,20 +130,27 @@ for an active session: host reclamation begins only after durable session state
 proves the writer terminal and unpinned. Thus a writer paused after data copy but
 before marker publication can resume without finding its payload removed.
 
-After changing the runtime add-on, regenerate its source manifest, build the
-host, compile Enforce, and run the real mailbox behavior gate:
+After changing canonical observer protocol vocabulary, regenerate protocol
+artifacts and both source manifests before static or controlled checks. The
+protocol-only command needs no Workbench installation; target compilation and
+mailbox acceptance remain controlled Windows checks:
 
 ```powershell
-npm run observer:manifest
+npm run observer:generate
+npm run protocol:check
+npm run observer:manifest:check
 npm run build
-npm run observer:validate:enforce
+npm run observer:validate:enforce -- --protocol-only --target both
+npm run observer:validate:enforce -- --target both
 npm run observer:acceptance:enforce-mailbox
 ```
 
-Both commands read only Workbench/add-on paths from the gitignored local config,
-refuse an already-running Workbench, use isolated temporary profiles, and write
-sanitized JSON evidence. `observer:validate:enforce` is compile-only and
-deliberately records `behavioralMailboxAcceptance.result: "not_run"`.
+The controlled commands read only Workbench/add-on paths from the gitignored
+local config, refuse an already-running Workbench, use isolated temporary
+profiles, and write sanitized JSON evidence. `observer:validate:enforce` checks
+canonical source and descriptor/C/consumer drift before any compiler launch;
+its compile artifact is target-specific and deliberately records
+`behavioralMailboxAcceptance.result: "not_run"`.
 `observer:acceptance:enforce-mailbox` is the V10 behavioral gate: it verifies the
 source manifest and just-built host modules, compiles Game and WorkbenchGame,
 executes all five cases, and proves final Workbench vacancy.

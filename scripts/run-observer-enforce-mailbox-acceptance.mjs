@@ -17,6 +17,7 @@ import {
 import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { redactDiagnostic, redactText } from "#foundation/redact";
 
 const scriptDirectory = dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = resolve(scriptDirectory, "..");
@@ -166,29 +167,29 @@ function boundedTail(value, maximum = 16_384) {
   return value.length <= maximum ? value : value.slice(-maximum);
 }
 
-function sanitizeText(value, replacements) {
-  let result = typeof value === "string" ? value : String(value ?? "");
+function replacePortablePaths(value, replacements) {
+  let result = value;
   for (const [path, label] of replacements) {
     result = result.replaceAll(path, label);
     result = result.replaceAll(path.replaceAll("\\", "/"), label);
   }
-  return result
-    .replace(/\b7656119\d{10}\b/g, "<steam-id>")
-    .replace(/(sessionToken|launchNonce|ownerToken)["'=:\s]+[A-Za-z0-9._~-]+/gi, "$1=<redacted>");
+  return result;
 }
 
-function sanitizeValue(value, replacements, depth = 0) {
-  if (depth > 8) return "<depth-limit>";
-  if (typeof value === "string") return boundedTail(sanitizeText(value, replacements), 4_096);
-  if (typeof value === "number" || typeof value === "boolean" || value === null) return value;
-  if (Array.isArray(value)) return value.slice(0, 256).map((item) => sanitizeValue(item, replacements, depth + 1));
-  if (!value || typeof value !== "object") return null;
-  const result = {};
-  for (const [key, item] of Object.entries(value).slice(0, 256)) {
-    if (/token|nonce|secret|credential/i.test(key)) result[key] = "<redacted>";
-    else result[key] = sanitizeValue(item, replacements, depth + 1);
-  }
-  return result;
+function portableText(value, replacements) {
+  return replacePortablePaths(redactText(typeof value === "string" ? value : String(value ?? ""), {
+    profile: "evidence_portability",
+    replacement: "<redacted>",
+  }), replacements);
+}
+
+function portableValue(value, replacements) {
+  const safe = redactDiagnostic(value, {
+    profile: "evidence_portability",
+    replacement: "<redacted>",
+    maxLength: 4_096,
+  });
+  return JSON.parse(replacePortablePaths(JSON.stringify(safe), replacements));
 }
 
 function readBoundedJson(path, label, maximum = maxSentinelBytes) {
@@ -400,7 +401,7 @@ function collectDiagnostics(root, replacements) {
             continue;
           }
           const bytes = readFileSync(path);
-          const text = sanitizeText(bytes.toString("utf8"), replacements);
+          const text = portableText(bytes.toString("utf8"), replacements);
           result.push({
             path: relative(root, path).replaceAll("\\", "/"),
             bytes: bytes.length,
@@ -1229,10 +1230,10 @@ async function runAcceptance(options) {
       timedOut,
       stdoutBytes: stdout.bytes,
       stdoutSha256: stdout.sha256,
-      stdoutTail: boundedTail(sanitizeText(stdout.tail, pathReplacements), 4_096),
+      stdoutTail: boundedTail(portableText(stdout.tail, pathReplacements), 4_096),
       stderrBytes: stderr.bytes,
       stderrSha256: stderr.sha256,
-      stderrTail: boundedTail(sanitizeText(stderr.tail, pathReplacements), 4_096),
+      stderrTail: boundedTail(portableText(stderr.tail, pathReplacements), 4_096),
     },
     enforceCompilation,
     plugin: {
@@ -1240,7 +1241,7 @@ async function runAcceptance(options) {
       available: pluginResult !== null,
       contractValid: pluginContractValid,
       parseError: pluginResultError,
-      reported: sanitizeValue(pluginResult, pathReplacements),
+      reported: portableValue(pluginResult, pathReplacements),
       requiredCases,
       missingOrFailedCases,
       duplicates: caseContract.duplicates,
@@ -1252,18 +1253,18 @@ async function runAcceptance(options) {
       fileShareNone: {
         proven: fileShareNoneProof,
         byCase: lockProofByCase,
-        events: lockEvents.map((event) => sanitizeValue(event, pathReplacements)),
+        events: lockEvents.map((event) => portableValue(event, pathReplacements)),
       },
       writerPause: {
         phaseObserved: writerPauseObserved,
         hostCleanerProof,
-        exactlyOnceDelivery: sanitizeValue(writerDeliveryProof, pathReplacements),
-        hostAction: sanitizeValue(writerHostAction, pathReplacements),
+        exactlyOnceDelivery: portableValue(writerDeliveryProof, pathReplacements),
+        hostAction: portableValue(writerHostAction, pathReplacements),
         note: "Host proof requires production MailboxCoordinator preservation during the pause, first-poll delivery/removal, and no second-poll redelivery after Workbench exit and vacancy.",
       },
       phaseEvents: phaseEvents.map((event) => ({
         at: event.at,
-        phase: sanitizeValue(event.phase, pathReplacements),
+        phase: portableValue(event.phase, pathReplacements),
       })),
     },
     environmentBlocker: platformInitializationFailed ? "steam_platform_initialization_failed" : null,

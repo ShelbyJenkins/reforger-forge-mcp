@@ -232,7 +232,11 @@ describe("WorkbenchNetApiClient", () => {
   it("classifies a non-Ok Workbench status as an API error and redacts owner tokens", async () => {
     const ownerToken = "private-owner-token-123";
     const response = encodePascalString(`Undefined API func (${ownerToken})`);
-    const fixture = await startServer((socket) => respondAfterRequest(socket, response));
+    let decodedRequest: DecodedRequest | undefined;
+    const fixture = await startServer((socket) => respondAfterRequest(socket, (request) => {
+      decodedRequest = decodeRequest(request);
+      return response;
+    }));
     const client = new WorkbenchNetApiClient("127.0.0.1", fixture.port);
 
     const error = await expectTransportError(
@@ -243,6 +247,7 @@ describe("WorkbenchNetApiClient", () => {
     expect(error.message).toContain("Undefined API func");
     expect(error.message).toContain("[redacted]");
     expect(error.message).not.toContain(ownerToken);
+    expect(decodedRequest?.payload.ownerToken).toBe(ownerToken);
   });
 
   it("rejects trailing response bytes as a protocol failure", async () => {

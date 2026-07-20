@@ -1,17 +1,11 @@
 import { mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import { createObserverApplication } from "../../observer/agent/application.js";
 import { probeAgentLease } from "../../observer/agent/control-api.js";
 import { requestObserverControl } from "../../observer/agent/control-client.js";
-import { cleanup, observerAddonSource, temporaryDirectory } from "./helpers.js";
-
-const roots: string[] = [];
-const closers: Array<() => Promise<void>> = [];
-afterEach(async () => {
-  await Promise.allSettled(closers.splice(0).map((close) => close()));
-  roots.splice(0).forEach(cleanup);
-});
+import { observerAddonSource } from "../support/observer-fixtures.js";
+import { withTemporaryDirectory } from "../support/temporary-directory.js";
 
 async function post(url: string, body: unknown, token?: string) {
   return fetch(url, {
@@ -23,13 +17,12 @@ async function post(url: string, body: unknown, token?: string) {
 
 describe("observer runtime HTTP API", () => {
   it("binds ephemerally to loopback and isolates runtime from control credentials", async () => {
-    const root = temporaryDirectory();
-    roots.push(root);
+    await withTemporaryDirectory(async (root) => {
     const profileRoot = join(root, "profiles");
     mkdirSync(profileRoot, { recursive: true });
     const agent = createObserverApplication({ root: join(root, "managed"), profileRoot, sourceDirectory: observerAddonSource, enableControlHttp: true });
     const descriptor = await agent.server.start();
-    closers.push(() => agent.server.close());
+    try {
     expect(descriptor.host).toBe("127.0.0.1");
     expect(descriptor.port).toBeGreaterThan(0);
     const base = `http://${descriptor.host}:${descriptor.port}`;
@@ -87,24 +80,31 @@ describe("observer runtime HTTP API", () => {
     });
     expect(readFileSync(preparedThroughLiveAgent.session.contractPath, "utf8")).toContain("sessionToken");
 
-    await agent.server.close();
-    await expect(agent.control.prepareLaunch({
+      await agent.server.close();
+      await expect(agent.control.prepareLaunch({
       runtimeKind: "client",
       arguments: ["-client"],
       profilePath: join(profileRoot, "run-3"),
       sessionTtlMs: 60_000,
       transportPreference: ["rest"],
       forceUpdate: false,
-    })).rejects.toMatchObject({ code: "TRANSPORT_UNAVAILABLE" });
+      })).rejects.toMatchObject({ code: "TRANSPORT_UNAVAILABLE" });
+    } finally {
+      await agent.server.close();
+    }
+    });
   });
 
   it("enforces the body limit before JSON parsing", async () => {
-    const root = temporaryDirectory();
-    roots.push(root);
+    await withTemporaryDirectory(async (root) => {
     const agent = createObserverApplication({ root: join(root, "managed"), sourceDirectory: observerAddonSource, maxBodyBytes: 64 });
     const descriptor = await agent.server.start();
-    closers.push(() => agent.server.close());
-    const response = await post(`http://${descriptor.host}:${descriptor.port}/v1/runtime/register`, { padding: "x".repeat(200) });
-    expect(response.status).toBe(413);
+    try {
+      const response = await post(`http://${descriptor.host}:${descriptor.port}/v1/runtime/register`, { padding: "x".repeat(200) });
+      expect(response.status).toBe(413);
+    } finally {
+      await agent.server.close();
+    }
+    });
   });
 });

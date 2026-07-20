@@ -1,12 +1,9 @@
 import {
   mkdirSync,
-  mkdtempSync,
   readFileSync,
   readdirSync,
-  rmSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -18,12 +15,13 @@ import {
   assertSanitizedBuildAcceptanceArtifact,
   attestFreshBuildOutput,
   parseWorkbenchBuildAcceptanceArguments,
+  redactConsoleError,
   runWorkbenchBuildAcceptance,
   type RepositoryAcceptanceEvidence,
   type TargetBuildAcceptanceRunEvidence,
 } from "../../scripts/run-workbench-build-acceptance.js";
+import { withTemporaryDirectory } from "../support/temporary-directory.js";
 
-const roots: string[] = [];
 const SHA_A = "a".repeat(64);
 const SHA_B = "b".repeat(64);
 const ZERO_COUNTS = Object.freeze({ active: 0, reconciling: 0, total: 0 });
@@ -36,9 +34,7 @@ interface Harness {
   config: Config;
 }
 
-function createHarness(): Harness {
-  const root = mkdtempSync(join(tmpdir(), "reforger-forge-build-acceptance-"));
-  roots.push(root);
+function createHarness(root: string): Harness {
   const targetRoot = join(root, "target", "ExampleAddon");
   const gprojPath = join(targetRoot, "ExampleAddon.gproj");
   const outputParent = join(root, "retained-output");
@@ -152,10 +148,31 @@ function validRun(sequence: 1 | 2): TargetBuildAcceptanceRunEvidence {
 
 afterEach(() => {
   vi.restoreAllMocks();
-  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
+function scopedIt(
+  name: string,
+  run: (root: string) => Promise<void> | void,
+  prefix = "reforger-forge-build-acceptance-",
+): void {
+  it(name, () => withTemporaryDirectory(run, { prefix }));
+}
+
 describe("controlled target-only Workbench build acceptance", () => {
+  it("keeps owner-token and path replacement contracts distinct", () => {
+    const target = "C:\\Users\\name\\target.gproj";
+    const owner = "-reforgerForgeOwnerToken=owner-console-sentinel";
+    const message = redactConsoleError(
+      new Error(`spawn failed at ${target} with ${owner}`),
+      ["--gproj", target, owner]
+    );
+
+    expect(message).toContain("<redacted-path>");
+    expect(message).toContain("-reforgerForgeOwnerToken=<redacted>");
+    expect(message).not.toContain("target.gproj");
+    expect(message).not.toContain("owner-console-sentinel");
+    expect(message).not.toContain("--gproj");
+  });
   it("requires independent environment and command-line confirmation", () => {
     expect(() => assertLiveWorkbenchBuildAuthorized(false, {
       [LIVE_WORKBENCH_BUILD_ENVIRONMENT]: "1",
@@ -192,8 +209,8 @@ describe("controlled target-only Workbench build acceptance", () => {
     expect(() => parseWorkbenchBuildAcceptanceArguments(["--unknown"])).toThrow(/Unknown/);
   });
 
-  it("runs exactly two sequential exclusive outputs and publishes only sanitized proof", async () => {
-    const harness = createHarness();
+  scopedIt("runs exactly two sequential exclusive outputs and publishes only sanitized proof", async (root) => {
+    const harness = createHarness(root);
     const observedOutputs: string[] = [];
     const ids = [
       "11111111-1111-4111-8111-111111111111",
@@ -250,8 +267,8 @@ describe("controlled target-only Workbench build acceptance", () => {
     } as unknown as typeof result.artifact, [harness.gprojPath])).toThrow(/raw path|sensitive/);
   });
 
-  it("rejects claimed evidence that used a second spawn or any NET call", async () => {
-    const harness = createHarness();
+  scopedIt("rejects claimed evidence that used a second spawn or any NET call", async (root) => {
+    const harness = createHarness(root);
     const executeRun = vi.fn(async ({ sequence }: { sequence: 1 | 2 }) => ({
       ...validRun(sequence),
       spawnCount: 2,
@@ -274,9 +291,7 @@ describe("controlled target-only Workbench build acceptance", () => {
     expect(executeRun).toHaveBeenCalledTimes(1);
   });
 
-  it("attests exactly one fresh nonempty regular resource database", async () => {
-    const root = mkdtempSync(join(tmpdir(), "reforger-forge-build-output-proof-"));
-    roots.push(root);
+  scopedIt("attests exactly one fresh nonempty regular resource database", async (root) => {
     writeFileSync(join(root, "resourceDatabase.rdb"), "fresh-database");
     writeFileSync(join(root, "build.info"), "fresh-metadata");
     const proof = await attestFreshBuildOutput(root, new Map());

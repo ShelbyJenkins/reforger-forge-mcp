@@ -13,9 +13,15 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
-import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
+import { OBSERVER_TERMINAL_STATES } from "../observer/protocol/enforce-contract.js";
 import { loadConfig, type Config } from "../src/config.js";
+import {
+  deadlineAt,
+  pollUntil,
+  systemClock,
+  systemSleeper,
+} from "../src/foundation/time.js";
 import {
   createObserverApplication,
   type ObserverApplication,
@@ -103,7 +109,7 @@ const WORKBENCH_CAPTURE_LABELS = [
   "explicit-look-at",
   "post-look-at-restoration-current",
 ] as const;
-const TERMINAL_STATES = new Set(["completed", "failed", "cancelled"]);
+const TERMINAL_STATES = new Set<string>(OBSERVER_TERMINAL_STATES);
 
 export interface WorkbenchObserverAcceptanceOptions {
   confirmed: boolean;
@@ -391,24 +397,31 @@ async function waitForCaptureCapability(
   deadline: number
 ): Promise<Record<string, unknown>> {
   let lastError = "observer handler has not responded";
-  while (Date.now() < deadline) {
-    try {
-      const inventory = await application.instances({ renderersOnly: true });
-      const eligible = inventory.instances.filter((instance) =>
-        instance.backend === "workbench" &&
-        Array.isArray(instance.capabilities) &&
-        instance.capabilities.includes("render.capture")
-      );
-      if (eligible.length === 1) return eligible[0];
-      if (eligible.length > 1) {
-        throw new Error("Multiple compatible Workbench observer instances are available");
+  const result = await pollUntil<Record<string, unknown>>({
+    clock: systemClock,
+    sleeper: systemSleeper,
+    deadline: deadlineAt(deadline),
+    intervalMs: 1_000,
+    probe: async (): Promise<Record<string, unknown> | undefined> => {
+      try {
+        const inventory = await application.instances({ renderersOnly: true });
+        const eligible = inventory.instances.filter((instance) =>
+          instance.backend === "workbench" &&
+          Array.isArray(instance.capabilities) &&
+          instance.capabilities.includes("render.capture")
+        );
+        if (eligible.length === 1) return eligible[0];
+        if (eligible.length > 1) {
+          throw new Error("Multiple compatible Workbench observer instances are available");
+        }
+        lastError = inventory.warnings?.join("; ") || "an editor world is not yet renderer-ready";
+      } catch (error) {
+        lastError = error instanceof Error ? error.message : String(error);
       }
-      lastError = inventory.warnings?.join("; ") || "an editor world is not yet renderer-ready";
-    } catch (error) {
-      lastError = error instanceof Error ? error.message : String(error);
-    }
-    await delay(1_000);
-  }
+      return undefined;
+    },
+  });
+  if (result.kind === "value") return result.value;
   throw new Error(`Timed out waiting for Workbench observer capture capability: ${lastError}`);
 }
 
@@ -418,19 +431,26 @@ async function pollTerminal(
   deadline: number
 ): Promise<Record<string, unknown>> {
   let status: Record<string, unknown> | null = null;
-  do {
-    if (Date.now() >= deadline) {
-      const last = status
-        ? `; last state=${String(status.state)}, message=${String(status.terminalMessage ?? "")}`
-        : "; no status response was retained";
-      throw new Error(`Timed out waiting for Workbench observer job ${jobId}${last}`);
-    }
-    status = await application.jobStatus(undefined, jobId);
-    if (typeof status.state !== "string") {
-      throw new Error(`Workbench observer job ${jobId} returned no state`);
-    }
-    if (!TERMINAL_STATES.has(status.state)) await delay(250);
-  } while (typeof status.state !== "string" || !TERMINAL_STATES.has(status.state));
+  const result = await pollUntil<Record<string, unknown>>({
+    clock: systemClock,
+    sleeper: systemSleeper,
+    deadline: deadlineAt(deadline),
+    intervalMs: 250,
+    probe: async (): Promise<Record<string, unknown> | undefined> => {
+      status = await application.jobStatus(undefined, jobId);
+      if (typeof status.state !== "string") {
+        throw new Error(`Workbench observer job ${jobId} returned no state`);
+      }
+      return TERMINAL_STATES.has(status.state) ? status : undefined;
+    },
+  });
+  if (result.kind === "expired") {
+    const last = status
+      ? `; last state=${String(status.state)}, message=${String(status.terminalMessage ?? "")}`
+      : "; no status response was retained";
+    throw new Error(`Timed out waiting for Workbench observer job ${jobId}${last}`);
+  }
+  status = result.value;
   if (status.state !== "completed" || status.cameraLeaseHeld || !status.restorationConfirmed) {
     throw new Error(
       `Workbench observer job ${jobId} ended ${status.state}; ` +

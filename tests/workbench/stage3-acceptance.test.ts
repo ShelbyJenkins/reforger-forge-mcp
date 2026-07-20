@@ -13,10 +13,7 @@ import {
 } from "../../src/workbench/helper-addon.js";
 import { buildCliEditorLaunchPlan } from "../../src/workbench/launch-plan.js";
 import type { CompanionReadinessOptions } from "../../src/workbench/readiness.js";
-import {
-  WORKBENCH_OWNER_ARG_PREFIX,
-  WorkbenchProcessGuard,
-} from "../../src/workbench/process-guard.js";
+import { WORKBENCH_OWNER_ARG_PREFIX } from "../../src/workbench/process-guard.js";
 import type {
   WorkbenchBuildRunnerReceipt,
   WorkbenchBuildRunnerReceiptV4,
@@ -28,6 +25,10 @@ import {
   FakeWorkbenchChild,
   type WorkbenchPolicyFixture,
 } from "./workbench-policy-fixture.js";
+import {
+  closeTrackedWorkbenchProcessGuards,
+  WorkbenchProcessGuard,
+} from "./tracked-process-guard.js";
 
 const fixtures: WorkbenchPolicyFixture[] = [];
 
@@ -46,7 +47,8 @@ function deferred<T = void>(): {
   return { promise, resolve };
 }
 
-afterEach(() => {
+afterEach(async () => {
+  await closeTrackedWorkbenchProcessGuards();
   for (const fixture of fixtures.splice(0)) fixture.cleanup();
 });
 
@@ -233,16 +235,6 @@ describe("Stage 3 shared session-controller adapter trace", () => {
       const trace: string[] = [];
       const backend = fixture.backend;
       backend.beforeTerminate = () => { trace.push("process:terminate"); };
-      const replaceState = backend.replaceState.bind(backend);
-      backend.replaceState = async (args) => {
-        const next = args.next as unknown as {
-          phase?: string; workbench?: unknown; record?: { phase?: string };
-        };
-        trace.push(next.record
-          ? `journal:${next.record.phase}`
-          : `state:${next.phase}:${next.workbench === null ? "unbound" : "bound"}`);
-        return replaceState(args);
-      };
       const inspectProcess = backend.inspectProcess.bind(backend);
       backend.inspectProcess = async (...args) => {
         trace.push("process:inspect");
@@ -274,6 +266,12 @@ describe("Stage 3 shared session-controller adapter trace", () => {
         backend,
         stateDir: join(fixture.root, `trace-${kind}`),
         mutexName: `Global\\ReforgerForge.Stage3Trace.${kind}.${fixture.root}`,
+        beforeLifecycleReplace: ({ next }) => {
+          trace.push(`state:${next.phase}:${next.workbench === null ? "unbound" : "bound"}`);
+        },
+        beforeSpawnJournalReplace: ({ next }) => {
+          trace.push(`journal:${next.record.phase}`);
+        },
       });
       const supervisor = new ChildSupervisor();
       const spawns: Array<{ argv: readonly string[]; options: Readonly<SpawnOptions> }> = [];

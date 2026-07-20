@@ -1,12 +1,9 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import {
   mkdirSync,
-  mkdtempSync,
   realpathSync,
-  rmSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { Config } from "../../src/config.js";
 import {
@@ -29,9 +26,9 @@ import {
   WORKBENCH_OWNER_ARG_PREFIX,
   WORKBENCH_PROCESS_NAME,
 } from "../../src/workbench/process-guard.js";
+import { withTemporaryDirectory } from "../support/temporary-directory.js";
 import { createFakeCompanionLaunch } from "./fake-companion.js";
 
-const roots: string[] = [];
 const OWNER_ARGUMENT = `${WORKBENCH_OWNER_ARG_PREFIX}owner-a`;
 
 interface LaunchHarness {
@@ -55,9 +52,7 @@ interface LaunchHarness {
   outputPath: string;
 }
 
-function createHarness(): LaunchHarness {
-  const root = mkdtempSync(join(tmpdir(), "reforger-forge-plan-"));
-  roots.push(root);
+function createHarness(root: string): LaunchHarness {
   const toolsRoot = join(root, "Arma Reforger Tools");
   const executablePath = join(toolsRoot, "Workbench", WORKBENCH_PROCESS_NAME);
   const gameRoot = join(root, "Arma Reforger");
@@ -105,15 +100,16 @@ function createHarness(): LaunchHarness {
   };
 }
 
-afterEach(() => {
-  for (const root of roots.splice(0)) {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
+function scopedIt(
+  name: string,
+  run: (root: string) => Promise<void> | void,
+): void {
+  it(name, () => withTemporaryDirectory(run, { prefix: "reforger-forge-plan-" }));
+}
 
 describe("canonical Workbench launch-plan policy", () => {
-  it("builds the visible detached MCP editor plan with exact helper readiness", () => {
-    const harness = createHarness();
+  scopedIt("builds the visible detached MCP editor plan with exact helper readiness", (root) => {
+    const harness = createHarness(root);
     const plan = buildMcpEditorLaunchPlan({
       kind: "mcp_editor",
       config: harness.config,
@@ -171,8 +167,8 @@ describe("canonical Workbench launch-plan policy", () => {
     ]);
   });
 
-  it("builds the visible foreground CLI editor plan with World Editor lifetime policy", () => {
-    const harness = createHarness();
+  scopedIt("builds the visible foreground CLI editor plan with World Editor lifetime policy", (root) => {
+    const harness = createHarness(root);
     const plan = buildWorkbenchLaunchPlan({
       kind: "cli_editor",
       config: harness.config,
@@ -216,8 +212,8 @@ describe("canonical Workbench launch-plan policy", () => {
     ]);
   });
 
-  it("builds a hidden target-only Resource Manager plan with no helper or NET capability", () => {
-    const harness = createHarness();
+  scopedIt("builds a hidden target-only Resource Manager plan with no helper or NET capability", (root) => {
+    const harness = createHarness(root);
     const plan = buildTargetBuildLaunchPlan({
       kind: "target_build",
       config: harness.config,
@@ -285,8 +281,8 @@ describe("canonical Workbench launch-plan policy", () => {
     ]);
   });
 
-  it("returns deeply immutable policy objects and the one lifecycle target projection", () => {
-    const harness = createHarness();
+  scopedIt("returns deeply immutable policy objects and the one lifecycle target projection", (root) => {
+    const harness = createHarness(root);
     const plan = buildCliEditorLaunchPlan({
       kind: "cli_editor",
       config: harness.config,
@@ -311,8 +307,8 @@ describe("canonical Workbench launch-plan policy", () => {
 });
 
 describe("launch-plan validation", () => {
-  it("deduplicates canonical add-on roots and rejects missing, comma, and non-array inputs", () => {
-    const harness = createHarness();
+  scopedIt("deduplicates canonical add-on roots and rejects missing, comma, and non-array inputs", (root) => {
+    const harness = createHarness(root);
     expect(canonicalizeWorkbenchAddonDirectories([
       harness.baseAddonRoot,
       harness.baseAddonRoot,
@@ -328,8 +324,8 @@ describe("launch-plan validation", () => {
     )).toThrow(/array/);
   });
 
-  it("rejects malformed owners and non-numeric loopback editor endpoints", () => {
-    const harness = createHarness();
+  scopedIt("rejects malformed owners and non-numeric loopback editor endpoints", (root) => {
+    const harness = createHarness(root);
     const base = {
       kind: "mcp_editor" as const,
       config: harness.config,
@@ -351,8 +347,8 @@ describe("launch-plan validation", () => {
     })).toThrow(/numeric loopback/);
   });
 
-  it("rejects a duplicate helper identity exposed by another configured add-on root", () => {
-    const harness = createHarness();
+  scopedIt("rejects a duplicate helper identity exposed by another configured add-on root", (root) => {
+    const harness = createHarness(root);
     const duplicateRoot = join(harness.root, "duplicate-addons");
     mkdirSync(join(duplicateRoot, WORKBENCH_HELPER_ADDON_ID), { recursive: true });
     expect(() => buildMcpEditorLaunchPlan({
@@ -366,8 +362,8 @@ describe("launch-plan validation", () => {
     })).toThrow(/second ReforgerForgeWorkbenchHelper/);
   });
 
-  it("rejects helper profile and managed-root overlap with the target", () => {
-    const harness = createHarness();
+  scopedIt("rejects helper profile and managed-root overlap with the target", (root) => {
+    const harness = createHarness(root);
     const profileInTarget = join(harness.project.modDirectory, "profile");
     mkdirSync(profileInTarget, { recursive: true });
     expect(() => buildMcpEditorLaunchPlan({
@@ -385,8 +381,8 @@ describe("launch-plan validation", () => {
     )).toThrow(/must not overlap the target project/);
   });
 
-  it("rejects forged build profiles, overlapping output, and managed add-on roots", () => {
-    const harness = createHarness();
+  scopedIt("rejects forged build profiles, overlapping output, and managed add-on roots", (root) => {
+    const harness = createHarness(root);
     const outsideProfile = join(harness.root, "outside-profile");
     mkdirSync(outsideProfile, { recursive: true });
     expect(() => buildTargetBuildLaunchPlan({
@@ -440,8 +436,8 @@ describe("launch-plan validation", () => {
     })).toThrow(/must not expose ReforgerForgeWorkbenchHelper/);
   });
 
-  it("rejects cross-kind fields, policy overrides, unsupported platforms, and unbounded builds", () => {
-    const harness = createHarness();
+  scopedIt("rejects cross-kind fields, policy overrides, unsupported platforms, and unbounded builds", (root) => {
+    const harness = createHarness(root);
     const target = {
       kind: "target_build" as const,
       config: harness.config,
@@ -475,8 +471,8 @@ describe("launch-plan validation", () => {
     }
   });
 
-  it("enforces -noThrow as an invariant of managed editor launches", () => {
-    const harness = createHarness();
+  scopedIt("enforces -noThrow as an invariant of managed editor launches", (root) => {
+    const harness = createHarness(root);
     const plan = buildMcpEditorLaunchPlan({
       kind: "mcp_editor",
       config: harness.config,

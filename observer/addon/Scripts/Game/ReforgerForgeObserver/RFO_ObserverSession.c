@@ -41,7 +41,7 @@ class RFO_ObserverLimits : JsonApiStruct
 
 class RFO_ObserverSession : JsonApiStruct
 {
-	static const string CONTRACT_PATH = "$profile:ReforgerForgeObserver/session.json";
+	static const string CONTRACT_PATH = "$profile:" + RFO_ObserverProtocol.DIRECTORY_SESSION_ROOT + "/" + RFO_ObserverProtocol.FILE_SESSION_CONTRACT;
 	static const int MAX_CONTRACT_BYTES = 65536;
 
 	string protocolVersion;
@@ -98,7 +98,7 @@ class RFO_ObserverSession : JsonApiStruct
 			return Reject("contract_size");
 		if (!LoadFromFile(CONTRACT_PATH))
 			return Reject("contract_json");
-		if (protocolVersion != "1.0" || addonVersion != "0.1.0")
+		if (protocolVersion != RFO_ObserverProtocol.RUNTIME_PROTOCOL_VERSION || addonVersion != "0.1.0")
 			return Reject("protocol_version");
 		if (buildIdentity != RFO_ObserverBuild.IDENTITY)
 			return Reject("build_identity");
@@ -108,7 +108,7 @@ class RFO_ObserverSession : JsonApiStruct
 			return Reject("runtime_kind");
 		if (!IsIdentifier(sessionId) || !IsSecretIdentifier(launchNonce) || !IsSecretIdentifier(sessionToken) || !IsLowerHex64(bundleDigest))
 			return Reject("identifiers");
-		if (profileDirectoryName != "ReforgerForgeObserver")
+		if (profileDirectoryName != RFO_ObserverProtocol.DIRECTORY_SESSION_ROOT)
 			return Reject("profile_directory");
 		if (!agent || (agent.host != "127.0.0.1" && agent.host != "::1") || !IsIdentifier(agent.instanceId))
 			return Reject("agent_identity");

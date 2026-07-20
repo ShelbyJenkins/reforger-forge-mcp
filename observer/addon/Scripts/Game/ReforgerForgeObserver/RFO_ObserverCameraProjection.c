@@ -1,5 +1,7 @@
 class RFO_ObserverCameraProjection
 {
+	// Runtime-only camera projection tolerance; do not conflate this with the
+	// Workbench restoration tolerance recorded in enforce-contract.json.
 	static const float MATRIX_EPSILON = 0.001;
 	static const float FOV_SYMMETRY_EPSILON = 0.05;
 

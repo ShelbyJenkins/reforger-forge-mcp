@@ -1,25 +1,32 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import { JobStore, type JobRecord, type JobStoreOptions } from "../../observer/agent/jobs.js";
 import { InstanceRegistry } from "../../observer/agent/registry.js";
 import { COMMAND_DELIVERY_LEASE_MS, type ArtifactManifest, type CameraLeaseStatus } from "../../observer/protocol/index.js";
-import { cleanup, createSessionFixture, FakeClock, graphicalRegistration, temporaryDirectory } from "./helpers.js";
-
-const roots: string[] = [];
-afterEach(() => roots.splice(0).forEach(cleanup));
+import { deadlineAfter } from "../../src/foundation/time.js";
+import { withTemporaryDirectory } from "../support/temporary-directory.js";
+import { createObserverSessionFixture, graphicalRegistration } from "../support/observer-fixtures.js";
+import { ManualTime } from "../support/manual-time.js";
+import { waitForValue } from "../support/wait.js";
 
 function setup(
+  root: string,
   jobOptions: JobStoreOptions = {},
   registrationOverrides: NonNullable<Parameters<typeof graphicalRegistration>[1]> = {}
 ) {
-  const root = temporaryDirectory();
-  roots.push(root);
-  const clock = new FakeClock();
-  const fixture = createSessionFixture(root, clock);
+  const clock = new ManualTime();
+  const fixture = createObserverSessionFixture({ root, clock });
   const registry = new InstanceRegistry(fixture.store, { clock });
   const registration = graphicalRegistration(fixture.created, registrationOverrides);
   registry.register(registration, fixture.created.contract.sessionToken);
   const jobs = new JobStore(fixture.store, registry, clock, jobOptions);
   return { ...fixture, registry, registration, jobs, clock };
+}
+
+function scopedIt(
+  name: string,
+  run: (root: string) => Promise<void> | void,
+): void {
+  it(name, () => withTemporaryDirectory(run, { prefix: "rfo-jobs-" }));
 }
 
 const noCamera = (): CameraLeaseStatus => ({ held: false, restorationConfirmed: false });
@@ -109,8 +116,8 @@ function manifest(value: ReturnType<typeof setup>, job: JobRecord, artifactId = 
 }
 
 describe("observer jobs", () => {
-  it("returns the original job for one session idempotency key", () => {
-    const value = setup();
+  scopedIt("returns the original job for one session idempotency key", async (root) => {
+    const value = setup(root);
     const input = {
       sessionId: value.registration.sessionId,
       idempotencyKey: "capture-1",
@@ -119,10 +126,24 @@ describe("observer jobs", () => {
     };
     expect(value.jobs.submit(input)).toBe(value.jobs.submit(input));
     expect(value.jobs.diagnostics()).toHaveLength(1);
+
+    let ready = false;
+    const pending = waitForValue({
+      clock: value.clock,
+      sleeper: value.clock,
+      deadline: deadlineAfter(value.clock, 100),
+      intervalMs: 10,
+      probe: () => ready ? "ready" : undefined,
+    });
+    await Promise.resolve();
+    expect(value.clock.pendingSleepCount).toBe(1);
+    ready = true;
+    await value.clock.runNextSleep();
+    await expect(pending).resolves.toEqual({ kind: "value", value: "ready" });
   });
 
-  it("replays equivalent canonical capture requests", () => {
-    const value = setup();
+  scopedIt("replays equivalent canonical capture requests", (root) => {
+    const value = setup(root);
     const first = value.jobs.submit({
       sessionId: value.registration.sessionId,
       idempotencyKey: "canonical-replay",
@@ -141,8 +162,8 @@ describe("observer jobs", () => {
     expect(value.jobs.stats()).toMatchObject({ jobs: 1, idempotencyReceipts: 1 });
   });
 
-  it("replays a policy-derived deadline and conflicts when its timeout policy changes", () => {
-    const value = setup();
+  scopedIt("replays a policy-derived deadline and conflicts when its timeout policy changes", (root) => {
+    const value = setup(root);
     const first = value.jobs.submit({
       sessionId: value.registration.sessionId,
       idempotencyKey: "relative-deadline-replay",
@@ -176,8 +197,8 @@ describe("observer jobs", () => {
     ["performance policy", { performancePolicy: "instrumented" as const }],
     ["nullable world expectation", { expectedWorldId: null }],
     ["world epoch", { expectedWorldEpoch: 1 }],
-  ])("rejects idempotency-key reuse after changing %s", (_label, changed) => {
-    const value = setup();
+  ])("rejects idempotency-key reuse after changing %s", (_label, changed) => withTemporaryDirectory((root) => {
+    const value = setup(root);
     const base = {
       sessionId: value.registration.sessionId,
       idempotencyKey: "semantic-conflict",
@@ -188,10 +209,10 @@ describe("observer jobs", () => {
     expect(() => value.jobs.submit({ ...base, ...changed }))
       .toThrowError(expect.objectContaining({ code: "IDEMPOTENCY_CONFLICT" }));
     expect(value.jobs.stats()).toMatchObject({ jobs: 1, idempotencyReceipts: 1 });
-  });
+  }, { prefix: "rfo-jobs-" }));
 
-  it("allows a key to name a new request after its bounded receipt expires", () => {
-    const value = setup({ idempotencyReceiptRetentionMs: 100 });
+  scopedIt("allows a key to name a new request after its bounded receipt expires", (root) => {
+    const value = setup(root, { idempotencyReceiptRetentionMs: 100 });
     const first = value.jobs.submit({
       sessionId: value.registration.sessionId,
       idempotencyKey: "expired-receipt",
@@ -210,8 +231,8 @@ describe("observer jobs", () => {
     expect(value.jobs.stats()).toMatchObject({ jobs: 2, idempotencyReceipts: 1 });
   });
 
-  it("fails closed before exceeding the retained-record budget", () => {
-    const value = setup({ maxRecords: 1 });
+  scopedIt("fails closed before exceeding the retained-record budget", (root) => {
+    const value = setup(root, { maxRecords: 1 });
     submitCurrent(value, "bounded-record-1");
 
     expect(() => submitCurrent(value, "bounded-record-2"))
@@ -224,8 +245,8 @@ describe("observer jobs", () => {
     });
   });
 
-  it("fails closed without partial insertion when the byte budget is exhausted", () => {
-    const value = setup({ maxEstimatedBytes: 1_024 });
+  scopedIt("fails closed without partial insertion when the byte budget is exhausted", (root) => {
+    const value = setup(root, { maxEstimatedBytes: 1_024 });
 
     expect(() => submitCamera(value, "bounded-byte-budget"))
       .toThrowError(expect.objectContaining({ code: "TRANSPORT_UNAVAILABLE" }));
@@ -237,8 +258,8 @@ describe("observer jobs", () => {
     });
   });
 
-  it("rejects an oversized mutable job record without partially completing it", () => {
-    const value = setup({
+  scopedIt("rejects an oversized mutable job record without partially completing it", (root) => {
+    const value = setup(root, {
       maxEstimatedBytes: 64 * 1024,
       maxRecordEstimatedBytes: 2 * 1024,
     });
@@ -261,8 +282,8 @@ describe("observer jobs", () => {
     expect(value.jobs.stats().approximateBytes).toBeLessThanOrEqual(64 * 1024);
   });
 
-  it("rejects a stale expected world before queueing camera work", () => {
-    const value = setup();
+  scopedIt("rejects a stale expected world before queueing camera work", (root) => {
+    const value = setup(root);
     const base = {
       sessionId: value.registration.sessionId,
       deadlineAt: new Date(value.clock.now() + 10_000).toISOString(),
@@ -283,8 +304,8 @@ describe("observer jobs", () => {
     expect(value.jobs.diagnostics()).toHaveLength(0);
   });
 
-  it("captures the current view when inventory explicitly reports no world", () => {
-    const value = setup({}, { worldId: null, worldEpoch: 7 });
+  scopedIt("captures the current view when inventory explicitly reports no world", (root) => {
+    const value = setup(root, {}, { worldId: null, worldEpoch: 7 });
     const job = value.jobs.submit({
       sessionId: value.registration.sessionId,
       idempotencyKey: "null-world-current",
@@ -296,8 +317,8 @@ describe("observer jobs", () => {
     expect(job).toMatchObject({ worldId: null, worldEpoch: 7, state: "queued" });
   });
 
-  it("emits a canonical decimal-string wire view for Enforce float decoding", () => {
-    const value = setup();
+  scopedIt("emits a canonical decimal-string wire view for Enforce float decoding", (root) => {
+    const value = setup(root);
     const job = value.jobs.submit({
       sessionId: value.registration.sessionId,
       idempotencyKey: "pose-wire-view",
@@ -317,8 +338,8 @@ describe("observer jobs", () => {
     });
   });
 
-  it("redelivers an unacknowledged capture with a stable acknowledgement token and renewed lease", () => {
-    const value = setup();
+  scopedIt("redelivers an unacknowledged capture with a stable acknowledgement token and renewed lease", (root) => {
+    const value = setup(root);
     const job = submitCurrent(value);
     const first = dispatch(value, job);
     const lostResponseRetry = value.jobs.nextCommand(value.registration.sessionId, value.registration.instanceId, value.registration.instanceNonce)!;
@@ -335,8 +356,8 @@ describe("observer jobs", () => {
     expect(job.state).toBe("accepted");
   });
 
-  it("keeps exactly one capture in flight per renderer", () => {
-    const value = setup();
+  scopedIt("keeps exactly one capture in flight per renderer", (root) => {
+    const value = setup(root);
     const first = submitCurrent(value, "first");
     const second = submitCurrent(value, "second");
     const command = accept(value, first);
@@ -352,8 +373,8 @@ describe("observer jobs", () => {
     });
   });
 
-  it("delivers cancellation explicitly after dispatch and acknowledges its token", () => {
-    const value = setup();
+  scopedIt("delivers cancellation explicitly after dispatch and acknowledges its token", (root) => {
+    const value = setup(root);
     const job = submitCurrent(value);
     accept(value, job);
     value.jobs.cancel(value.registration.sessionId, job.request.jobId);
@@ -374,8 +395,8 @@ describe("observer jobs", () => {
     expect(value.jobs.diagnostics()).toMatchObject([{ cancellationDeliveryAcknowledged: true }]);
   });
 
-  it("uses the explicit transition graph and rejects illegal jumps", () => {
-    const value = setup();
+  scopedIt("uses the explicit transition graph and rejects illegal jumps", (root) => {
+    const value = setup(root);
     const job = submitCurrent(value);
     const command = dispatch(value, job);
     expect(() => value.jobs.update(status(value, job.request.jobId, 1, "capturing", {
@@ -392,8 +413,8 @@ describe("observer jobs", () => {
       .toThrowError(expect.objectContaining({ code: "INVALID_REQUEST" }));
   });
 
-  it("allows acquisition failure without a lease but requires confirmed restoration after one was held", () => {
-    const value = setup();
+  scopedIt("allows acquisition failure without a lease but requires confirmed restoration after one was held", (root) => {
+    const value = setup(root);
     const acquisitionFailure = submitCamera(value, "acquisition-failure");
     accept(value, acquisitionFailure);
     value.jobs.update(status(value, acquisitionFailure.request.jobId, 2, "acquiringCamera"), value.created.contract.sessionToken);
@@ -426,8 +447,8 @@ describe("observer jobs", () => {
     });
   });
 
-  it("pins an unresolved restoration obligation past normal terminal retention", () => {
-    const value = setup({ terminalJobRetentionMs: 1, idempotencyReceiptRetentionMs: 1 });
+  scopedIt("pins an unresolved restoration obligation past normal terminal retention", (root) => {
+    const value = setup(root, { terminalJobRetentionMs: 1, idempotencyReceiptRetentionMs: 1 });
     const job = submitCamera(value, "restoration-unconfirmed");
     accept(value, job);
     value.jobs.update(status(value, job.request.jobId, 2, "acquiringCamera", {
@@ -452,8 +473,8 @@ describe("observer jobs", () => {
     expect(value.jobs.sessionPins()).toContain(value.registration.sessionId);
   });
 
-  it("does not dispatch a queued successor past terminal unconfirmed restoration", () => {
-    const value = setup();
+  scopedIt("does not dispatch a queued successor past terminal unconfirmed restoration", (root) => {
+    const value = setup(root);
     const first = submitCamera(value, "unconfirmed-first");
     accept(value, first);
     value.jobs.update(status(value, first.request.jobId, 2, "acquiringCamera", {
@@ -481,8 +502,8 @@ describe("observer jobs", () => {
     )).toBeNull();
   });
 
-  it("terminalizes an accepted current-view job when its deadline expires", () => {
-    const value = setup({ terminalJobRetentionMs: 1, idempotencyReceiptRetentionMs: 1 });
+  scopedIt("terminalizes an accepted current-view job when its deadline expires", (root) => {
+    const value = setup(root, { terminalJobRetentionMs: 1, idempotencyReceiptRetentionMs: 1 });
     const job = submitCurrent(value, "expired-current-view");
     accept(value, job);
     value.clock.advance(30_001);
@@ -493,8 +514,8 @@ describe("observer jobs", () => {
     expect(value.jobs.sweep(value.clock.now()).removedJobs).toContain(job.request.jobId);
   });
 
-  it("disposes unresolved work only after the host proves exact runtime vacancy", () => {
-    const value = setup();
+  scopedIt("disposes unresolved work only after the host proves exact runtime vacancy", (root) => {
+    const value = setup(root);
     const job = submitCamera(value, "exact-runtime-vacancy");
     accept(value, job);
     value.jobs.update(status(value, job.request.jobId, 2, "acquiringCamera", {
@@ -520,15 +541,15 @@ describe("observer jobs", () => {
     expect(value.jobs.vacateSession(value.registration.sessionId)).toEqual([]);
   });
 
-  it("enforces per-session rate, FOV, settle-frame, and capture-distance limits before routing", () => {
-    const rate = setup();
+  scopedIt("enforces per-session rate, FOV, settle-frame, and capture-distance limits before routing", async (root) => {
+    const rate = setup(root);
     rate.created.record.limits.maxCaptureRatePerMinute = 1;
     const first = submitCurrent(rate, "rate-1");
     expect(() => submitCurrent(rate, "rate-2")).toThrowError(expect.objectContaining({ code: "CAPTURE_REJECTED" }));
     first.createdAt -= 60_001;
     expect(() => submitCurrent(rate, "rate-3")).not.toThrow();
 
-    const limits = setup();
+    const limits = await withTemporaryDirectory((limitsRoot) => setup(limitsRoot), { prefix: "rfo-jobs-" });
     limits.created.record.limits.minFov = 40;
     limits.created.record.limits.maxFov = 80;
     limits.created.record.limits.maxSettleFrames = 2;
@@ -550,8 +571,8 @@ describe("observer jobs", () => {
     } })).toThrowError(expect.objectContaining({ code: "CAPTURE_REJECTED" }));
   });
 
-  it("preflights artifact state and completes matching retries idempotently", () => {
-    const value = setup();
+  scopedIt("preflights artifact state and completes matching retries idempotently", (root) => {
+    const value = setup(root);
     const job = submitCurrent(value);
     accept(value, job);
     const artifact = manifest(value, job);
@@ -570,8 +591,8 @@ describe("observer jobs", () => {
     }, "C:\\retained\\image.png")).toThrowError(expect.objectContaining({ code: "ARTIFACT_INVALID" }));
   });
 
-  it("accepts a camera artifact only after awaitingArtifact and restoration confirmation", () => {
-    const value = setup();
+  scopedIt("accepts a camera artifact only after awaitingArtifact and restoration confirmation", (root) => {
+    const value = setup(root);
     const job = submitCamera(value);
     accept(value, job);
     value.jobs.update(status(value, job.request.jobId, 2, "acquiringCamera", { cameraLease: heldCamera() }), value.created.contract.sessionToken);
@@ -587,8 +608,8 @@ describe("observer jobs", () => {
     expect(value.jobs.completeArtifact(value.registration.sessionId, job.request.jobId, artifact, "C:\\retained\\camera.png").state).toBe("completed");
   });
 
-  it("rejects performance policy until a coordinator exists", () => {
-    const value = setup();
+  scopedIt("rejects performance policy until a coordinator exists", (root) => {
+    const value = setup(root);
     expect(() => value.jobs.submit({
       sessionId: value.registration.sessionId,
       idempotencyKey: "performance",
@@ -598,8 +619,8 @@ describe("observer jobs", () => {
     })).toThrowError(expect.objectContaining({ code: "PERFORMANCE_POLICY_BLOCKED" }));
   });
 
-  it("invalidates late old-world status", () => {
-    const value = setup();
+  scopedIt("invalidates late old-world status", (root) => {
+    const value = setup(root);
     const job = submitCurrent(value);
     const command = dispatch(value, job);
     expect(() => value.jobs.update(status(value, job.request.jobId, 1, "accepted", {

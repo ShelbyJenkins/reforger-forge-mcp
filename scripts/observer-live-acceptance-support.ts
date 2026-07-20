@@ -22,6 +22,7 @@ import { performance } from "node:perf_hooks";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { inflateSync } from "node:zlib";
+import { redactArguments } from "#foundation/redact";
 
 const PNG_SIGNATURE = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
 const MAX_PNG_BYTES = 64 * 1024 * 1024;
@@ -353,25 +354,9 @@ export function operationalBaselineLaunchArgumentIdentity(
       argumentsArray.some((token) => typeof token !== "string" || token.length > 32_768 || /[\0\r\n]/.test(token))) {
     throw new Error("Operational baseline launch arguments are invalid");
   }
-  const redactAbsoluteValue = (value: string): string | null => {
-    const list = value.split(",");
-    if (list.length > 1 && list.every((item) => portableIsAbsolute(item))) {
-      return `<absolute-path-list:${list.length}>`;
-    }
-    return portableIsAbsolute(value) ? "<absolute-path>" : null;
-  };
-  const canonicalArguments = argumentsArray.map((token) => {
-    if (token.toLowerCase().startsWith("-reforgerforgeownertoken=")) {
-      return "-reforgerForgeOwnerToken=<redacted>";
-    }
-    const redactedToken = redactAbsoluteValue(token);
-    if (redactedToken) return redactedToken;
-    const equals = token.indexOf("=");
-    if (equals > 0) {
-      const redactedValue = redactAbsoluteValue(token.slice(equals + 1));
-      if (redactedValue) return `${token.slice(0, equals + 1)}${redactedValue}`;
-    }
-    return token;
+  const canonicalArguments = redactArguments(argumentsArray, {
+    profile: "evidence_portability",
+    replacement: "<redacted>",
   });
   const sha256 = createHash("sha256")
     .update("rfo-operational-baseline-launch-arguments-v1\0")

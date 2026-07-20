@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
 	[Parameter(Mandatory = $true)]
-	[ValidateSet('HoldMutex', 'InspectCurrent', 'InspectProcess', 'ListWorkbench', 'VerifyEndpointOwner', 'VerifyEndpointVacant', 'VerifyTerminate', 'ReplaceState', 'ArchiveState')]
+	[ValidateSet('HoldMutex', 'InspectCurrent', 'InspectProcess', 'ListWorkbench', 'VerifyEndpointOwner', 'VerifyEndpointVacant', 'VerifyTerminate')]
 	[string]$Mode,
 
 	[long]$DeadlineUnixMs = 0
@@ -317,27 +317,6 @@ public sealed class LifecycleProcessHandle : IDisposable
     ~LifecycleProcessHandle()
     {
         Dispose();
-    }
-}
-
-public static class LifecycleFile
-{
-    private const uint MOVEFILE_REPLACE_EXISTING = 0x1;
-    private const uint MOVEFILE_WRITE_THROUGH = 0x8;
-
-    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    private static extern bool MoveFileEx(string existingPath, string newPath, uint flags);
-
-    public static void AtomicReplace(string temporaryPath, string destinationPath)
-    {
-        if (!MoveFileEx(temporaryPath, destinationPath, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
-            throw new Win32Exception(Marshal.GetLastWin32Error(), "Atomic lifecycle-state replacement failed.");
-    }
-
-    public static void AtomicMoveNew(string sourcePath, string destinationPath)
-    {
-        if (!MoveFileEx(sourcePath, destinationPath, MOVEFILE_WRITE_THROUGH))
-            throw new Win32Exception(Marshal.GetLastWin32Error(), "Lifecycle-state archival failed.");
     }
 }
 
@@ -980,96 +959,6 @@ function Invoke-VerifyTerminate
 	}
 }
 
-function Invoke-ReplaceState
-{
-	$request = Read-LifecycleRequest
-	$statePath = [IO.Path]::GetFullPath([string](Get-LifecycleProperty -Object $request -Name 'statePath' -Default ''))
-	$expectedGeneration = Get-LifecycleProperty -Object $request -Name 'expectedGeneration'
-	$nextJson = [string](Get-LifecycleProperty -Object $request -Name 'nextJson' -Default '')
-	Assert-LifecycleDeadline
-	$next = $nextJson.TrimStart([char]0xFEFF) | ConvertFrom-Json
-	if ([int](Get-LifecycleProperty -Object $next -Name 'version' -Default 0) -ne 3 -or
-		[string]::IsNullOrWhiteSpace([string](Get-LifecycleProperty -Object $next -Name 'generation' -Default '')))
-	{
-		throw 'Replacement lifecycle state is not a valid version-3 record.'
-	}
-
-	$exists = [IO.File]::Exists($statePath)
-	if ($null -eq $expectedGeneration)
-	{
-		if ($exists) { throw 'Lifecycle state generation mismatch: expected no active record.' }
-	}
-	else
-	{
-		if (-not $exists) { throw 'Lifecycle state generation mismatch: the active record is missing.' }
-		$currentJson = [IO.File]::ReadAllText($statePath, [Text.Encoding]::UTF8).TrimStart([char]0xFEFF)
-		$current = $currentJson | ConvertFrom-Json
-		$currentVersion = [int](Get-LifecycleProperty -Object $current -Name 'version' -Default 0)
-		$currentGeneration = [string](Get-LifecycleProperty -Object $current -Name 'generation' -Default '')
-		if ($currentVersion -ne 3 -or -not [StringComparer]::Ordinal.Equals([string]$expectedGeneration, $currentGeneration))
-		{
-			throw 'Lifecycle state generation mismatch; no state was replaced.'
-		}
-	}
-
-	$directory = [IO.Path]::GetDirectoryName($statePath)
-	[IO.Directory]::CreateDirectory($directory) | Out-Null
-	$tempPath = Join-Path $directory ('.lifecycle-' + [Guid]::NewGuid().ToString('N') + '.tmp')
-	$stream = $null
-	try
-	{
-		$bytes = [Text.UTF8Encoding]::new($false).GetBytes($nextJson)
-		Assert-LifecycleDeadline
-		$stream = [IO.FileStream]::new(
-			$tempPath,
-			[IO.FileMode]::CreateNew,
-			[IO.FileAccess]::Write,
-			[IO.FileShare]::None,
-			4096,
-			[IO.FileOptions]::WriteThrough)
-		$stream.Write($bytes, 0, $bytes.Length)
-		$stream.Flush($true)
-		$stream.Dispose()
-		$stream = $null
-		Assert-LifecycleDeadline
-		[LifecycleFile]::AtomicReplace($tempPath, $statePath)
-	}
-	finally
-	{
-		if ($null -ne $stream) { $stream.Dispose() }
-		if ([IO.File]::Exists($tempPath)) { [IO.File]::Delete($tempPath) }
-	}
-	Write-LifecycleProtocol ([ordered]@{ ok = $true; status = 'replaced' })
-}
-
-function Invoke-ArchiveState
-{
-	$request = Read-LifecycleRequest
-	$statePath = [IO.Path]::GetFullPath([string](Get-LifecycleProperty -Object $request -Name 'statePath' -Default ''))
-	$archivePath = [IO.Path]::GetFullPath([string](Get-LifecycleProperty -Object $request -Name 'archivePath' -Default ''))
-	$expectedHash = [string](Get-LifecycleProperty -Object $request -Name 'expectedSha256' -Default '')
-	Assert-LifecycleDeadline
-	if (-not [IO.File]::Exists($statePath)) { throw 'Lifecycle state archival failed because the active record is missing.' }
-	$bytes = [IO.File]::ReadAllBytes($statePath)
-	$sha = [Security.Cryptography.SHA256]::Create()
-	try
-	{
-		$actualHash = ([BitConverter]::ToString($sha.ComputeHash($bytes))).Replace('-', '').ToLowerInvariant()
-	}
-	finally
-	{
-		$sha.Dispose()
-	}
-	if (-not [StringComparer]::OrdinalIgnoreCase.Equals($expectedHash, $actualHash))
-	{
-		throw 'Lifecycle state archival hash mismatch; no state was moved.'
-	}
-	Assert-LifecycleDeadline
-	[IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($archivePath)) | Out-Null
-	[LifecycleFile]::AtomicMoveNew($statePath, $archivePath)
-	Write-LifecycleProtocol ([ordered]@{ ok = $true; status = 'archived' })
-}
-
 try
 {
 	Assert-LifecycleDeadline
@@ -1082,8 +971,6 @@ try
 		'VerifyEndpointOwner' { Invoke-VerifyEndpointOwner }
 		'VerifyEndpointVacant' { Invoke-VerifyEndpointVacant }
 		'VerifyTerminate' { Invoke-VerifyTerminate }
-		'ReplaceState' { Invoke-ReplaceState }
-		'ArchiveState' { Invoke-ArchiveState }
 	}
 }
 catch

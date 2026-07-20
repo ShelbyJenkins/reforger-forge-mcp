@@ -598,8 +598,11 @@ both.
 
 ```powershell
 npm run build                  # Compile TypeScript
+npm run observer:generate      # Regenerate observer protocol artifacts and both add-on manifests
 npm run observer:manifest      # Regenerate Workbench helper identity/manifest after helper changes
-npm run observer:validate:enforce                 # Compile the production observer addon in Workbench
+npm run protocol:check         # Verify generated JSON, schemas, Markdown, and Enforce classes
+npm run observer:validate:enforce -- --protocol-only --target both  # Static descriptor/C/consumer check; no Workbench launch
+npm run observer:validate:enforce -- --target both  # Compile Game and WorkbenchGame in a controlled Workbench install
 npm run observer:acceptance:enforce-mailbox       # Execute the five-case real Enforce mailbox gate
 npm test                       # Run hermetic default unit/contract suite
 npm run test:integration       # Run explicitly gated environment integration tests
@@ -609,15 +612,17 @@ node scripts/list-tools.mjs    # Verify every required tool registers
 .\scripts\install-agents.ps1 -All   # Push config to all agents
 ```
 
-After changing anything under `observer/workbench-addon`, run
-`npm run observer:manifest`, then `npm run test:package`. The first command
-regenerates the compiled helper identity and source manifest; the second checks
-that the complete helper payload is packaged correctly.
+After changing canonical observer protocol vocabulary, run
+`npm run observer:generate`, then `npm run protocol:check` and
+`npm run observer:manifest:check`. It refreshes the descriptor, both generated
+Enforce classes, helper identity, and source manifests in the required order.
+For a helper-only change, `npm run observer:manifest` remains sufficient.
 
-The two Enforce commands require Windows, an installed Arma Reforger Workbench,
-and Steam initialization. They refuse an existing Workbench process and use an
+The protocol-only Enforce check is hermetic. The target compilation and mailbox
+acceptance commands require Windows, an installed Arma Reforger Workbench, and
+Steam initialization. They refuse an existing Workbench process and use an
 isolated profile. See [the observer validation guide](observer/README.md#bounded-mailbox-and-retention-behavior)
-for the compile-only versus behavioral evidence contract.
+for the static, compile-only, and behavioral evidence contract.
 
 The observer screenshot harnesses are repository-development commands and are
 not shipped in the npm package. They are opt-in because they launch installed

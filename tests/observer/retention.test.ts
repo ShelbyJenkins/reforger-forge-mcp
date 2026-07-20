@@ -1,33 +1,35 @@
 import { mkdirSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import { createObserverApplication } from "../../observer/agent/application.js";
 import { MailboxCoordinator } from "../../observer/agent/mailbox-coordinator.js";
 import { OBSERVER_BUILD_IDENTITY } from "../../observer/protocol/index.js";
+import { withTemporaryDirectory } from "../support/temporary-directory.js";
 import {
-  cleanup,
-  createSessionFixture,
-  FakeClock,
+  createObserverSessionFixture,
   graphicalRegistration,
   observerAddonSource,
-  temporaryDirectory,
   testBundleDigest,
-} from "./helpers.js";
+} from "../support/observer-fixtures.js";
+import { ManualTime } from "../support/manual-time.js";
 
-const roots: string[] = [];
-afterEach(() => roots.splice(0).forEach(cleanup));
+function scopedIt(
+  name: string,
+  run: (root: string) => Promise<void> | void,
+  prefix = "rfo-retention-",
+): void {
+  it(name, () => withTemporaryDirectory(run, { prefix }));
+}
 
 describe("observer in-memory retention", () => {
-  it("retains a session tombstone through its retry window and explicit recovery pin", () => {
-    const root = temporaryDirectory();
-    roots.push(root);
-    const clock = new FakeClock();
-    const fixture = createSessionFixture(root, clock, {
+  scopedIt("retains a session tombstone through its retry window and explicit recovery pin", (root) => {
+    const clock = new ManualTime();
+    const fixture = createObserverSessionFixture({ root, clock, sessionOptions: {
       terminalRetentionMs: 100,
       maxRecords: 4,
       maxEstimatedBytes: 64 * 1024,
-    });
+    }});
     const sessionId = fixture.created.record.sessionId;
     expect(fixture.store.pin(sessionId, "recovery-test")).toBe(true);
     fixture.store.revoke(sessionId);
@@ -42,10 +44,8 @@ describe("observer in-memory retention", () => {
     expect(fixture.store.stats()).toMatchObject({ records: 0, pinned: 0 });
   });
 
-  it("never resurrects an explicitly revoked session as a lifecycle lease", () => {
-    const root = temporaryDirectory();
-    roots.push(root);
-    const fixture = createSessionFixture(root);
+  scopedIt("never resurrects an explicitly revoked session as a lifecycle lease", (root) => {
+    const fixture = createObserverSessionFixture({ root });
     const sessionId = fixture.created.record.sessionId;
     fixture.store.revoke(sessionId);
 
@@ -57,10 +57,8 @@ describe("observer in-memory retention", () => {
     expect(fixture.store.stats()).toMatchObject({ lifecycleLeased: 0, active: 0, terminal: 1 });
   });
 
-  it("allows only the exact existing lifecycle owner to reassert retention after revoke", () => {
-    const root = temporaryDirectory();
-    roots.push(root);
-    const fixture = createSessionFixture(root);
+  scopedIt("allows only the exact existing lifecycle owner to reassert retention after revoke", (root) => {
+    const fixture = createObserverSessionFixture({ root });
     const sessionId = fixture.created.record.sessionId;
     const owner = "owned-runtime:rt-00000000-0000-4000-8000-000000000098";
     expect(fixture.store.retainLifecycle(sessionId, owner)).toBe(true);
@@ -76,10 +74,8 @@ describe("observer in-memory retention", () => {
     expect(fixture.store.releaseLifecycle(sessionId, owner)).toBe(true);
   });
 
-  it("leases a live owned-runtime session, instance, and transport past TTL until exact release", async () => {
-    const root = temporaryDirectory("rfo-runtime-lifecycle-lease-");
-    roots.push(root);
-    const clock = new FakeClock();
+  scopedIt("leases a live owned-runtime session, instance, and transport past TTL until exact release", async (root) => {
+    const clock = new ManualTime();
     const profileRoot = join(root, "profiles");
     mkdirSync(profileRoot, { recursive: true });
     const evidenceRoot = join(root, "evidence");
@@ -189,10 +185,8 @@ describe("observer in-memory retention", () => {
     await agent.server.close();
   });
 
-  it("orders application sweeping so jobs and open runs pin session-owned instances", async () => {
-    const root = temporaryDirectory("rfo-retention-");
-    roots.push(root);
-    const clock = new FakeClock();
+  scopedIt("orders application sweeping so jobs and open runs pin session-owned instances", async (root) => {
+    const clock = new ManualTime();
     const profileRoot = join(root, "profiles");
     mkdirSync(profileRoot, { recursive: true });
     const evidenceRoot = join(root, "evidence");
@@ -279,10 +273,8 @@ describe("observer in-memory retention", () => {
     expect(agent.server.storeDiagnostics()).toMatchObject({ lastSweep: { retentionApplied: true } });
   });
 
-  it("does not let stale heartbeat job IDs outlive the authoritative job obligation", async () => {
-    const root = temporaryDirectory("rfo-stale-heartbeat-");
-    roots.push(root);
-    const clock = new FakeClock();
+  scopedIt("does not let stale heartbeat job IDs outlive the authoritative job obligation", async (root) => {
+    const clock = new ManualTime();
     const profileRoot = join(root, "profiles");
     mkdirSync(profileRoot, { recursive: true });
     const agent = createObserverApplication({
@@ -344,10 +336,8 @@ describe("observer in-memory retention", () => {
     await agent.server.close();
   });
 
-  it("does not perform an uncoordinated retention sweep during session or job admission", async () => {
-    const root = temporaryDirectory("rfo-admission-retention-");
-    roots.push(root);
-    const clock = new FakeClock();
+  scopedIt("does not perform an uncoordinated retention sweep during session or job admission", async (root) => {
+    const clock = new ManualTime();
     const profileRoot = join(root, "profiles");
     mkdirSync(profileRoot, { recursive: true });
     const evidenceRoot = join(root, "evidence");

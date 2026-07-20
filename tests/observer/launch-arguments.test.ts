@@ -1,19 +1,16 @@
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import { ObserverControlApi } from "../../observer/agent/control-api.js";
 import { mergeLaunchArguments } from "../../observer/agent/launch-arguments.js";
 import { MailboxTransport } from "../../observer/agent/mailbox.js";
 import { ADDON_GUID, SESSION_CONTRACT_NAME, SESSION_DIRECTORY_NAME } from "../../observer/protocol/index.js";
-import { cleanup, observerAddonSource, temporaryDirectory } from "./helpers.js";
-
-const roots: string[] = [];
-afterEach(() => roots.splice(0).forEach(cleanup));
+import { observerAddonSource } from "../support/observer-fixtures.js";
+import { withTemporaryDirectory } from "../support/temporary-directory.js";
 
 describe("observer launch preparation", () => {
-  it("preserves unrelated tokens, merges singleton flags, and does not quote paths", () => {
-    const root = temporaryDirectory("rfo space test-");
-    roots.push(root);
+  it("preserves unrelated tokens, merges singleton flags, and does not quote paths", async () => {
+    await withTemporaryDirectory((root) => {
     const profile = join(root, "profiles", "run 1");
     const search = join(root, "staged root");
     const addon = join(search, "ReforgerForgeObserver");
@@ -33,12 +30,12 @@ describe("observer launch preparation", () => {
     expect(result.filter((value) => value.toLowerCase() === "-profile")).toHaveLength(1);
     expect(result).not.toContain("-forceUpdate");
     expect(result.some((value) => value.startsWith('"'))).toBe(false);
-    expect(result[result.indexOf("-addons") + 1].split(",")).toEqual(["TargetAddon", ADDON_GUID]);
+      expect(result[result.indexOf("-addons") + 1].split(",")).toEqual(["TargetAddon", ADDON_GUID]);
+    }, { prefix: "rfo space test-" });
   });
 
-  it("refuses a conflicting profile", () => {
-    const root = temporaryDirectory();
-    roots.push(root);
+  it("refuses a conflicting profile", async () => {
+    await withTemporaryDirectory((root) => {
     const profile = join(root, "profiles", "one");
     const otherProfile = join(root, "profiles", "two");
     const search = join(root, "search");
@@ -46,11 +43,11 @@ describe("observer launch preparation", () => {
     [profile, otherProfile, addon].forEach((path) => mkdirSync(path, { recursive: true }));
     expect(() => mergeLaunchArguments({ arguments: ["-profile", otherProfile], profilePath: profile, addonSearchRoot: search, stagedAddonPath: addon, forceUpdate: false }))
       .toThrowError(expect.objectContaining({ code: "PROFILE_CONFLICT" }));
+    });
   });
 
   it("prepares idempotently and writes the session contract last", async () => {
-    const root = temporaryDirectory();
-    roots.push(root);
+    await withTemporaryDirectory(async (root) => {
     const profiles = join(root, "profiles");
     mkdirSync(profiles, { recursive: true });
     const control = new ObserverControlApi({ root: join(root, "managed"), profileRoot: profiles, sourceDirectory: observerAddonSource });
@@ -81,5 +78,6 @@ describe("observer launch preparation", () => {
     const mailbox = new MailboxTransport(launchProfile);
     expect(mailbox.commandsDirectory).toBe(join(observerDirectory, "mailbox", "commands"));
     expect(mailbox.statusDirectory).toBe(join(observerDirectory, "mailbox", "status"));
+    });
   });
 });

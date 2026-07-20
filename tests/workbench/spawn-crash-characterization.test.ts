@@ -3,7 +3,6 @@ import type { ChildProcess } from "node:child_process";
 import {
   mkdirSync,
   mkdtempSync,
-  readFileSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -12,16 +11,17 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Config } from "../../src/config.js";
 import { WorkbenchClient } from "../../src/workbench/client.js";
-import {
-  WorkbenchProcessGuard,
-  type ExactProcessIdentity,
-  type WorkbenchLifecycleStateV3,
-  type WorkbenchSpawnRecord,
+import type {
+  ExactProcessIdentity,
+  WorkbenchLifecycleStateV3,
+  WorkbenchSpawnRecord,
 } from "../../src/workbench/process-guard.js";
 import {
   runWorkbenchIntent,
   type WorkbenchRunnerDependencies,
 } from "../../src/workbench/runner.js";
+import { encodeDurableKey, jsonDurableRecordCodec } from "../../src/foundation/durable-kv.js";
+import { LmdbCasStore } from "../../src/foundation/lmdb-cas-store.js";
 import {
   createFakeCompanionLaunch,
   fakeCompanionProvider,
@@ -31,6 +31,10 @@ import {
   createFakeLifecycleBackend,
   type FakeLifecycleBackend,
 } from "./fake-lifecycle-backend.js";
+import {
+  closeTrackedWorkbenchProcessGuards,
+  WorkbenchProcessGuard,
+} from "./tracked-process-guard.js";
 
 type SpawnCrashCut =
   | "before_spawn"
@@ -157,6 +161,8 @@ function createHarness(label: string): WorkbenchCrashHarness {
     backend,
     stateDir,
     mutexName: `Global\\ReforgerForge.F8.${label}.${root}`,
+    beforeLifecycleReplace: (args) => backend.replaceFailure?.(args) ?? undefined,
+    afterLifecycleReplace: (args) => backend.afterReplace?.(args),
   });
   return {
     root,
@@ -171,18 +177,22 @@ function createHarness(label: string): WorkbenchCrashHarness {
   };
 }
 
-function readDurableState(harness: WorkbenchCrashHarness): WorkbenchLifecycleStateV3 {
-  return JSON.parse(readFileSync(harness.guard.statePath, "utf8")) as WorkbenchLifecycleStateV3;
+async function readDurableState(harness: WorkbenchCrashHarness): Promise<WorkbenchLifecycleStateV3> {
+  const state = await harness.guard.readLifecycleState();
+  if (state.kind !== "valid") {
+    throw new Error(`F8 fixture expected a valid durable lifecycle state, got ${state.kind}`);
+  }
+  return state.state;
 }
 
-function readDurableJournal(
+async function readDurableJournal(
   harness: WorkbenchCrashHarness
-): { version: 3; generation: string; record: WorkbenchSpawnRecord } {
-  return JSON.parse(readFileSync(harness.guard.spawnJournalPath, "utf8")) as {
-    version: 3;
-    generation: string;
-    record: WorkbenchSpawnRecord;
-  };
+): Promise<{ version: 3; generation: string; record: WorkbenchSpawnRecord }> {
+  const journal = await harness.guard.readSpawnJournal();
+  if (journal.kind !== "valid") {
+    throw new Error(`F8 fixture expected a valid durable spawn journal, got ${journal.kind}`);
+  }
+  return { version: 3, generation: journal.generation, record: journal.record };
 }
 
 function installPhaseHooks(args: {
@@ -191,44 +201,46 @@ function installPhaseHooks(args: {
   pid: number;
 }): {
   spawnProcess: NonNullable<WorkbenchRunnerDependencies["spawnProcess"]>;
-  captured: () => CapturedWorkbenchCut;
+  captured: () => Promise<CapturedWorkbenchCut>;
 } {
   const { harness, cut, pid } = args;
-  let captured: CapturedWorkbenchCut | null = null;
+  let reached = false;
+  let capturedProcess: CapturedWorkbenchCut["process"] = null;
   let child: FakeCrashChild | null = null;
   let ownerArgument = "";
-  const capture = (): void => {
+  const markReached = (): void => {
+    reached = true;
     const processIdentity = child ? harness.backend.processes.get(child.pid) ?? null : null;
-    captured = {
-      cut,
-      state: readDurableState(harness),
-      journal: readDurableJournal(harness),
-      process: processIdentity
-        ? { identity: { ...processIdentity }, ownerArgument }
-        : null,
-      harness,
-    };
+    capturedProcess = processIdentity ? { identity: { ...processIdentity }, ownerArgument } : null;
   };
   const originalInspect = harness.guard.inspectSpawnedWorkbench.bind(harness.guard);
   if (cut === "after_exact_inspection") {
     vi.spyOn(harness.guard, "inspectSpawnedWorkbench").mockImplementation(async (inspection) => {
       await originalInspect(inspection);
-      capture();
+      markReached();
       throw new Error("F8 injected crash after exact inspection");
     });
   }
   if (cut === "before_durable_publication" || cut === "after_durable_publication") {
-    const originalReplace = harness.backend.replaceState.bind(harness.backend);
     let injected = false;
-    harness.backend.replaceState = vi.fn(async (replacement) => {
-      if (!injected && replacement.next.phase === "starting" && replacement.next.workbench) {
-        injected = true;
-        if (cut === "after_durable_publication") await originalReplace(replacement);
-        capture();
-        throw new Error(`F8 injected crash ${cut.replaceAll("_", " ")}`);
-      }
-      await originalReplace(replacement);
-    });
+    if (cut === "before_durable_publication") {
+      harness.backend.replaceFailure = ({ next }) => {
+        if (!injected && next.phase === "starting" && next.workbench) {
+          injected = true;
+          markReached();
+          return new Error(`F8 injected crash ${cut.replaceAll("_", " ")}`);
+        }
+        return null;
+      };
+    } else {
+      harness.backend.afterReplace = ({ next }) => {
+        if (!injected && next.phase === "starting" && next.workbench) {
+          injected = true;
+          markReached();
+          throw new Error(`F8 injected crash ${cut.replaceAll("_", " ")}`);
+        }
+      };
+    }
   }
   const spawnProcess: NonNullable<WorkbenchRunnerDependencies["spawnProcess"]> =
     (command, launchArguments) => {
@@ -237,7 +249,7 @@ function installPhaseHooks(args: {
       ) ?? "";
       if (!ownerArgument) throw new Error("F8 fixture launch omitted its owner argument");
       if (cut === "before_spawn") {
-        capture();
+        markReached();
         throw new Error("F8 injected crash before spawn");
       }
       child = new FakeCrashChild(pid);
@@ -247,16 +259,22 @@ function installPhaseHooks(args: {
         creationTime: String(133_900_000_000_000_000n + BigInt(pid)),
       }, ownerArgument);
       if (cut === "after_spawn") {
-        capture();
+        markReached();
         throw new Error("F8 injected crash after spawn");
       }
       return child as unknown as ChildProcess;
     };
   return {
     spawnProcess,
-    captured: () => {
-      if (!captured) throw new Error(`F8 cut ${cut} was not reached`);
-      return captured;
+    captured: async () => {
+      if (!reached) throw new Error(`F8 cut ${cut} was not reached`);
+      return {
+        cut,
+        state: await readDurableState(harness),
+        journal: await readDurableJournal(harness),
+        process: capturedProcess,
+        harness,
+      };
     },
   };
 }
@@ -305,18 +323,44 @@ async function captureRunnerCut(cut: SpawnCrashCut): Promise<CapturedWorkbenchCu
   return hooks.captured();
 }
 
-function createReplacement(captured: CapturedWorkbenchCut, label: string): {
+/** Seed a fresh LMDB environment with captured state, mirroring what a restarted MCP process finds on disk. */
+async function seedReplacementStore(stateDir: string, captured: CapturedWorkbenchCut): Promise<void> {
+  const corruptArchiveDir = join(stateDir, "corrupt");
+  const lifecycleSeed = new LmdbCasStore<WorkbenchLifecycleStateV3>({
+    storageRoot: stateDir,
+    key: encodeDurableKey("workbench", "lifecycle"),
+    recordLabel: "lifecycle",
+    schema: "workbench-lifecycle-v3",
+    codec: jsonDurableRecordCodec((value) => value as WorkbenchLifecycleStateV3),
+    generationOf: (value) => value.generation,
+    corruptArchiveDir,
+  });
+  await lifecycleSeed.compareAndSwap(null, captured.state);
+  await lifecycleSeed.close();
+
+  const journalSeed = new LmdbCasStore<{ version: 3; generation: string; record: WorkbenchSpawnRecord }>({
+    storageRoot: stateDir,
+    key: encodeDurableKey("workbench", "spawn-journal"),
+    recordLabel: "spawn-journal",
+    schema: "workbench-spawn-journal-v3",
+    codec: jsonDurableRecordCodec(
+      (value) => value as { version: 3; generation: string; record: WorkbenchSpawnRecord }
+    ),
+    generationOf: (value) => value.generation,
+    corruptArchiveDir,
+  });
+  await journalSeed.compareAndSwap(null, captured.journal);
+  await journalSeed.close();
+}
+
+async function createReplacement(captured: CapturedWorkbenchCut, label: string): Promise<{
   backend: FakeLifecycleBackend;
   guard: WorkbenchProcessGuard;
   stateDir: string;
-} {
+}> {
   const stateDir = join(captured.harness.root, `replacement-${label}`);
   mkdirSync(stateDir, { recursive: true });
-  writeFileSync(join(stateDir, "lifecycle.json"), `${JSON.stringify(captured.state, null, 2)}\n`);
-  writeFileSync(
-    join(stateDir, "spawn-journal.json"),
-    `${JSON.stringify(captured.journal, null, 2)}\n`
-  );
+  await seedReplacementStore(stateDir, captured);
   const backend = createFakeLifecycleBackend({
     pid: 2_001,
     executablePath: process.execPath,
@@ -333,12 +377,15 @@ function createReplacement(captured: CapturedWorkbenchCut, label: string): {
       backend,
       stateDir,
       mutexName: `Global\\ReforgerForge.F8.Replacement.${label}.${captured.harness.root}`,
+      beforeLifecycleReplace: (args) => backend.replaceFailure?.(args) ?? undefined,
+      afterLifecycleReplace: (args) => backend.afterReplace?.(args),
     }),
   };
 }
 
-afterEach(() => {
+afterEach(async () => {
   vi.restoreAllMocks();
+  await closeTrackedWorkbenchProcessGuards();
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
@@ -383,7 +430,7 @@ describe("F8 Workbench spawn crash characterization", () => {
     "client replacement maps $cut to $clientRecovery without PID-only cleanup",
     async ({ cut, clientRecovery }) => {
       const captured = await captureClientCut(cut);
-      const replacement = createReplacement(captured, `client-${cut}`);
+      const replacement = await createReplacement(captured, `client-${cut}`);
       const spawnProcess = vi.fn(() => {
         throw new Error("replacement launch intentionally stopped at spawn");
       });
@@ -429,7 +476,7 @@ describe("F8 Workbench spawn crash characterization", () => {
     "standalone runner replacement preserves $cut for attended/MCP recovery",
     async ({ cut }) => {
       const captured = await captureRunnerCut(cut);
-      const replacement = createReplacement(captured, `runner-${cut}`);
+      const replacement = await createReplacement(captured, `runner-${cut}`);
       const spawnProcess = vi.fn();
       await expect(runWorkbenchIntent(captured.harness.config, {
         kind: "editor",

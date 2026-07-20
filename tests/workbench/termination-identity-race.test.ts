@@ -2,12 +2,16 @@ import { afterEach, describe, expect, it } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { WorkbenchProcessGuard } from "../../src/workbench/process-guard.js";
 import { createFakeLifecycleBackend } from "./fake-lifecycle-backend.js";
+import {
+  closeTrackedWorkbenchProcessGuards,
+  WorkbenchProcessGuard,
+} from "./tracked-process-guard.js";
 
 const roots: string[] = [];
 
-afterEach(() => {
+afterEach(async () => {
+  await closeTrackedWorkbenchProcessGuards();
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 

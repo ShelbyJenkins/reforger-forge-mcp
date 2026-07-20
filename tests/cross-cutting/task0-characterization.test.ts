@@ -21,7 +21,7 @@ import {
   type WorkbenchReadinessTiming,
 } from "../../src/workbench/readiness.js";
 import { contractPng } from "../observer/capture-policy-fixture.js";
-import { cleanup, temporaryDirectory } from "../observer/helpers.js";
+import { withTemporaryDirectory } from "../support/temporary-directory.js";
 
 interface ToolResult {
   content: Array<{ type: "text"; text: string }>;
@@ -113,7 +113,7 @@ function deterministicTiming(now: { value: number }, waits: number[]): Workbench
 }
 
 describe("cross-cutting Task 0 characterization baseline", () => {
-  it("keeps known secret sentinels out of diagnostic and evidence sinks", () => {
+  it("keeps known secret sentinels out of diagnostic and evidence sinks", async () => {
     const diagnostic = JSON.stringify(redactForDiagnostics({
       token: "token-sentinel",
       authorization: "authorization-sentinel",
@@ -144,8 +144,7 @@ describe("cross-cutting Task 0 characterization baseline", () => {
       expect(childLine, `child diagnostic leaked ${sentinel}`).not.toContain(sentinel);
     }
 
-    const root = temporaryDirectory("rfo-task0-redaction-");
-    try {
+    await withTemporaryDirectory((root) => {
       const evidence = join(root, "evidence");
       const logs = join(root, "logs");
       mkdirSync(evidence);
@@ -183,9 +182,7 @@ describe("cross-cutting Task 0 characterization baseline", () => {
       ]) {
         expect(copiedLog, `evidence leaked ${sentinel}`).not.toContain(sentinel);
       }
-    } finally {
-      cleanup(root);
-    }
+    }, { prefix: "rfo-task0-redaction-" });
   });
 
   it("keeps both MCP boundaries' current fixed public code and message policy", async () => {
@@ -224,6 +221,58 @@ describe("cross-cutting Task 0 characterization baseline", () => {
       }],
       isError: true,
     });
+  });
+
+  it("projects equivalent permitted diagnostics through both MCP boundaries", async () => {
+    const diagnostics = {
+      token: "token-sentinel",
+      nonce: "nonce-sentinel",
+      contractBody: { private: "contract-body-sentinel" },
+      path: "C:\\Users\\name\\observer-private",
+      safe: "control-sentinel",
+    };
+    const message =
+      "Authorization: Bearer bearer-sentinel -reforgerForgeOwnerToken=owner-token-sentinel " +
+      "at C:\\Users\\name\\observer-private";
+    const application = {
+      defaultCaptureTimeoutMs: 30_000,
+      maxInlineImageBytes: 1_024,
+      async instances(): Promise<never> {
+        throw new ObserverCoordinatorError("INVALID_REQUEST", message, diagnostics);
+      },
+    } as unknown as ObserverApplication;
+    const ownedRuntimeManager = {
+      async status(): Promise<never> {
+        throw new OwnedRuntimeError("INVALID_REQUEST", message, diagnostics);
+      },
+    } as unknown as OwnedRuntimeManager;
+    const tools = registeredTools(application, ownedRuntimeManager);
+    const signal = new AbortController().signal;
+
+    const observer = await tools.get("observer_instances")!.handler({}, { signal });
+    const runtime = await tools.get("observer_runtime")!.handler({
+      action: "status",
+      runtimeId: "rt-00000000-0000-4000-8000-000000000001",
+    }, { signal });
+    const observerText = observer.content[0].text;
+    const runtimeText = runtime.content[0].text;
+
+    expect(runtimeText.replace("Observer runtime error", "Observer error")).toBe(observerText);
+    expect(observerText).toContain("```json");
+    expect(observerText).toContain("control-sentinel");
+    expect(observerText.length).toBeLessThanOrEqual(512);
+    expect(runtimeText.length).toBeLessThanOrEqual(512);
+    for (const sentinel of [
+      "bearer-sentinel",
+      "owner-token-sentinel",
+      "token-sentinel",
+      "nonce-sentinel",
+      "contract-body-sentinel",
+      "C:\\Users\\name\\observer-private",
+    ]) {
+      expect(observerText, `observer public error leaked ${sentinel}`).not.toContain(sentinel);
+      expect(runtimeText, `runtime public error leaked ${sentinel}`).not.toContain(sentinel);
+    }
   });
 
   it("preserves immediate probing, bounded intervals, timeout, cancellation, and error mapping", async () => {

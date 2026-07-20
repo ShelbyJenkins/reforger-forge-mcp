@@ -1,6 +1,6 @@
 class RFO_ObserverCapture
 {
-	static const string CAPTURE_DIRECTORY = "$profile:ReforgerForgeObserver/captures";
+	static const string CAPTURE_DIRECTORY = "$profile:" + RFO_ObserverProtocol.DIRECTORY_SESSION_ROOT + "/captures";
 	static const int MAX_SCREENSHOT_WAIT_FRAMES = 300;
 	static const int MINIMUM_RENDER_READY_MS = 3000;
 	static const float MAX_PRELOAD_RADIUS = 10000.0;

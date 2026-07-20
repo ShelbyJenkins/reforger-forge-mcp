@@ -27,6 +27,13 @@ import {
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { loadConfig, type Config } from "../src/config.js";
 import { ChildSupervisor, type SupervisedChildCounts } from "../src/foundation/child-supervisor.js";
+import { redactText } from "../src/foundation/redact.js";
+import {
+  deadlineAt,
+  pollUntil,
+  systemClock,
+  systemSleeper,
+} from "../src/foundation/time.js";
 import {
   canonicalizeExistingDirectory,
   isPathContained,
@@ -94,6 +101,7 @@ export const WORKBENCH_BUILD_ACCEPTANCE_SOURCE_PATHS = [
   "src/foundation/managed-path.ts",
   "src/foundation/recoverable-spawn.ts",
   "src/foundation/reservation-gate.ts",
+  "src/foundation/time.ts",
   "src/platform/windows/exact-process-backend.ts",
   "src/utils/logger.ts",
   "src/workbench/activity-gate.ts",
@@ -543,37 +551,41 @@ async function attributeLogDirectory(args: {
   ownerToken: string;
   deadlineMs: number;
 }): Promise<string> {
-  do {
-    const matches: string[] = [];
-    for (const entry of readdirSync(args.logRoot, { withFileTypes: true })) {
-      if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
-      const lexical = join(args.logRoot, entry.name);
-      const modifiedMs = statSync(lexical).mtimeMs;
-      if (args.before.has(pathComparisonKey(lexical)) &&
-          modifiedMs < args.launchedAtMs - LOG_CLOCK_SKEW_MS) continue;
-      const candidate = realpathSync.native(lexical);
-      if (pathComparisonKey(dirname(candidate)) !== pathComparisonKey(args.logRoot)) {
-        throw acceptanceError("Workbench log candidate escapes its managed root.");
-      }
-      const logs = readdirSync(candidate, { withFileTypes: true })
-        .filter((file) => file.isFile() && !file.isSymbolicLink() &&
-          file.name.toLowerCase().endsWith(".log"))
-        .map((file) => join(candidate, file.name));
-      for (const log of logs) {
-        if (await fileContainsOwner(log, args.ownerToken)) {
-          matches.push(candidate);
-          break;
+  const result = await pollUntil<string>({
+    clock: systemClock,
+    sleeper: systemSleeper,
+    deadline: deadlineAt(args.deadlineMs),
+    intervalMs: LOG_POLL_MS,
+    probe: async (): Promise<string | undefined> => {
+      const matches: string[] = [];
+      for (const entry of readdirSync(args.logRoot, { withFileTypes: true })) {
+        if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
+        const lexical = join(args.logRoot, entry.name);
+        const modifiedMs = statSync(lexical).mtimeMs;
+        if (args.before.has(pathComparisonKey(lexical)) &&
+            modifiedMs < args.launchedAtMs - LOG_CLOCK_SKEW_MS) continue;
+        const candidate = realpathSync.native(lexical);
+        if (pathComparisonKey(dirname(candidate)) !== pathComparisonKey(args.logRoot)) {
+          throw acceptanceError("Workbench log candidate escapes its managed root.");
+        }
+        const logs = readdirSync(candidate, { withFileTypes: true })
+          .filter((file) => file.isFile() && !file.isSymbolicLink() &&
+            file.name.toLowerCase().endsWith(".log"))
+          .map((file) => join(candidate, file.name));
+        for (const log of logs) {
+          if (await fileContainsOwner(log, args.ownerToken)) {
+            matches.push(candidate);
+            break;
+          }
         }
       }
-    }
-    if (matches.length > 1) {
-      throw acceptanceError("Owner evidence appeared in multiple Workbench log directories.");
-    }
-    if (matches.length === 1) return matches[0];
-    if (Date.now() < args.deadlineMs) {
-      await new Promise((resolvePromise) => setTimeout(resolvePromise, LOG_POLL_MS));
-    }
-  } while (Date.now() < args.deadlineMs);
+      if (matches.length > 1) {
+        throw acceptanceError("Owner evidence appeared in multiple Workbench log directories.");
+      }
+      return matches.length === 1 ? matches[0] : undefined;
+    },
+  });
+  if (result.kind === "value") return result.value;
   throw acceptanceError("No exactly attributed Workbench log appeared before the run deadline.");
 }
 
@@ -1135,15 +1147,21 @@ export function workbenchBuildAcceptanceUsage(): string {
     "two-phase build command or emit a version-4 receipt.\n";
 }
 
-function redactConsoleError(error: unknown, values: readonly string[]): string {
-  let message = error instanceof Error ? error.message : String(error);
-  for (const value of values) {
-    if (value) message = message.split(value).join("<redacted-path>");
-  }
-  return message.replace(
-    /-reforgerForgeOwnerToken(?:=|\s+)[^\s"']+/gi,
-    "-reforgerForgeOwnerToken=<redacted>"
-  );
+export function redactConsoleError(error: unknown, values: readonly string[]): string {
+  const pathValues = values.filter((value) => value.length > 0 && (
+    isAbsolute(value) || /^[A-Za-z]:[\\/]/.test(value) || /^\\\\/.test(value)
+  ));
+  const message = redactText(error instanceof Error ? error.message : String(error), {
+    profile: "diagnostic",
+    replacement: "<redacted-path>",
+    knownSecretValues: pathValues,
+    maxLength: 4_096,
+  });
+  return redactText(message, {
+    profile: "command_argument",
+    replacement: "<redacted>",
+    maxLength: 4_096,
+  });
 }
 
 async function main(): Promise<void> {

@@ -1,8 +1,6 @@
-import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { cpSync, existsSync, mkdirSync, readFileSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { randomUUID } from "node:crypto";
-import { afterEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import {
   WORKBENCH_HELPER_ADDON_GUID,
   WORKBENCH_HELPER_ADDON_ID,
@@ -13,23 +11,11 @@ import {
   defaultWorkbenchHelperSource,
   verifyWorkbenchHelperSource,
 } from "../../src/workbench/helper-addon.js";
-
-const roots: string[] = [];
-
-function temporaryDirectory(prefix = "reforger-forge-helper-"): string {
-  const root = join(tmpdir(), `${prefix}${randomUUID()}`);
-  mkdirSync(root, { recursive: true });
-  roots.push(root);
-  return root;
-}
-
-afterEach(() => {
-  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
-});
+import { withTemporaryDirectory } from "../support/temporary-directory.js";
 
 describe("MCP-managed Workbench helper add-on", () => {
-  it("verifies, stages, and reuses the fixed companion with a deterministic external profile", () => {
-    const root = temporaryDirectory();
+  it("verifies, stages, and reuses the fixed companion with a deterministic external profile", async () => {
+    await withTemporaryDirectory((root) => {
     const managedRoot = join(root, "managed");
     const stager = new WorkbenchHelperStager({ managedRoot });
 
@@ -48,10 +34,11 @@ describe("MCP-managed Workbench helper add-on", () => {
     expect(second.addonDirectory).toBe(first.addonDirectory);
     expect(second.addonSearchRoot).toBe(first.addonSearchRoot);
     expect(second.addonDirectory.startsWith(managedRoot)).toBe(true);
+    }, { prefix: "reforger-forge-helper-" });
   });
 
-  it("fails closed when a staged payload is modified", () => {
-    const root = temporaryDirectory();
+  it("fails closed when a staged payload is modified", async () => {
+    await withTemporaryDirectory((root) => {
     const stager = new WorkbenchHelperStager({ managedRoot: join(root, "managed") });
     const staged = stager.ensureStaged();
     writeFileSync(join(staged.addonDirectory, "addon.gproj"), "modified", "utf8");
@@ -61,10 +48,11 @@ describe("MCP-managed Workbench helper add-on", () => {
         code: "WORKBENCH_HELPER_STAGE_CONFLICT",
       })
     );
+    }, { prefix: "reforger-forge-helper-" });
   });
 
-  it("re-attests an existing descriptor and rejects post-stage mutation", () => {
-    const root = temporaryDirectory();
+  it("re-attests an existing descriptor and rejects post-stage mutation", async () => {
+    await withTemporaryDirectory((root) => {
     const stager = new WorkbenchHelperStager({ managedRoot: join(root, "managed") });
     const staged = stager.ensureStaged();
 
@@ -79,10 +67,11 @@ describe("MCP-managed Workbench helper add-on", () => {
         code: "WORKBENCH_HELPER_STAGE_CONFLICT",
       })
     );
+    }, { prefix: "reforger-forge-helper-" });
   });
 
-  it("re-attests the packaged source digest and rejects source mutation after staging", () => {
-    const root = temporaryDirectory();
+  it("re-attests the packaged source digest and rejects source mutation after staging", async () => {
+    await withTemporaryDirectory((root) => {
     const source = join(root, "source");
     cpSync(defaultWorkbenchHelperSource(), source, { recursive: true });
     const stager = new WorkbenchHelperStager({
@@ -98,10 +87,11 @@ describe("MCP-managed Workbench helper add-on", () => {
         code: "WORKBENCH_HELPER_SOURCE_INVALID",
       })
     );
+    }, { prefix: "reforger-forge-helper-" });
   });
 
-  it("allows Workbench's generated resource database only in an existing staged bundle", () => {
-    const root = temporaryDirectory();
+  it("allows Workbench's generated resource database only in an existing staged bundle", async () => {
+    await withTemporaryDirectory((root) => {
     const stager = new WorkbenchHelperStager({ managedRoot: join(root, "managed") });
     const staged = stager.ensureStaged();
     writeFileSync(join(staged.addonDirectory, "resourceDatabase.rdb"), "generated", "utf8");
@@ -123,10 +113,11 @@ describe("MCP-managed Workbench helper add-on", () => {
         code: "WORKBENCH_HELPER_STAGE_CONFLICT",
       })
     );
+    }, { prefix: "reforger-forge-helper-" });
   });
 
-  it("rejects a generated resource database in the canonical helper source", () => {
-    const root = temporaryDirectory();
+  it("rejects a generated resource database in the canonical helper source", async () => {
+    await withTemporaryDirectory((root) => {
     const source = join(root, "source");
     cpSync(defaultWorkbenchHelperSource(), source, { recursive: true });
     writeFileSync(join(source, "resourceDatabase.rdb"), "generated", "utf8");
@@ -136,10 +127,11 @@ describe("MCP-managed Workbench helper add-on", () => {
         code: "WORKBENCH_HELPER_SOURCE_INVALID",
       })
     );
+    }, { prefix: "reforger-forge-helper-" });
   });
 
-  it("rejects project overlap before creating a managed staging or profile root", () => {
-    const root = temporaryDirectory();
+  it("rejects project overlap before creating a managed staging or profile root", async () => {
+    await withTemporaryDirectory((root) => {
     const project = join(root, "ExampleMod");
     const gproj = join(project, "ExampleMod.gproj");
     const managedRoot = join(project, ".managed-helper");
@@ -153,6 +145,7 @@ describe("MCP-managed Workbench helper add-on", () => {
       })
     );
     expect(existsSync(managedRoot)).toBe(false);
+    }, { prefix: "reforger-forge-helper-" });
   });
 
   it("keeps the generated compiled identity synchronized with the manifest", () => {
@@ -173,8 +166,8 @@ describe("MCP-managed Workbench helper add-on", () => {
     ));
   });
 
-  it("expires old digest roots and orphaned profile captures without touching the current bundle", () => {
-    const root = temporaryDirectory();
+  it("expires old digest roots and orphaned profile captures without touching the current bundle", async () => {
+    await withTemporaryDirectory((root) => {
     const stager = new WorkbenchHelperStager({ managedRoot: join(root, "managed") });
     const staged = stager.ensureStaged();
     const roleRoot = join(root, "managed", "workbench-helper");
@@ -203,5 +196,6 @@ describe("MCP-managed Workbench helper add-on", () => {
     });
     expect(stager.uninstall()).toMatchObject({ removed: true });
     expect(existsSync(roleRoot)).toBe(false);
+    }, { prefix: "reforger-forge-helper-" });
   });
 });

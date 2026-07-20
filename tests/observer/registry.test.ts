@@ -1,15 +1,13 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import { InstanceRegistry } from "../../observer/agent/registry.js";
-import { cleanup, createSessionFixture, FakeClock, graphicalRegistration, temporaryDirectory } from "./helpers.js";
-
-const roots: string[] = [];
-afterEach(() => roots.splice(0).forEach(cleanup));
+import { createObserverSessionFixture, graphicalRegistration } from "../support/observer-fixtures.js";
+import { ManualTime } from "../support/manual-time.js";
+import { withTemporaryDirectory } from "../support/temporary-directory.js";
 
 describe("observer instance registry", () => {
-  it("authenticates registration, normalizes capabilities, and strips headless rendering", () => {
-    const root = temporaryDirectory();
-    roots.push(root);
-    const fixture = createSessionFixture(root);
+  it("authenticates registration, normalizes capabilities, and strips headless rendering", async () => {
+    await withTemporaryDirectory((root) => {
+    const fixture = createObserverSessionFixture({ root });
     const registry = new InstanceRegistry(fixture.store, { clock: fixture.clock });
     const registration = graphicalRegistration(fixture.created, {
       headless: true,
@@ -21,12 +19,12 @@ describe("observer instance registry", () => {
     expect(record.knownCapabilities).toEqual(["world.query"]);
     expect(record.unknownCapabilities).toEqual(["future.capability"]);
     expect(() => registry.select(registration.sessionId, ["render.capture"])).toThrowError(expect.objectContaining({ code: "NO_RENDER_ENDPOINT" }));
+    });
   });
 
-  it("keeps workbench-only capabilities diagnostic and non-routable for runtime instances", () => {
-    const root = temporaryDirectory();
-    roots.push(root);
-    const fixture = createSessionFixture(root);
+  it("keeps workbench-only capabilities diagnostic and non-routable for runtime instances", async () => {
+    await withTemporaryDirectory((root) => {
+    const fixture = createObserverSessionFixture({ root });
     const registry = new InstanceRegistry(fixture.store, { clock: fixture.clock });
     const registration = graphicalRegistration(fixture.created, {
       capabilities: ["render.capture", "camera.editor", "transport.rest"],
@@ -51,25 +49,25 @@ describe("observer instance registry", () => {
     }, fixture.created.contract.sessionToken);
     expect(record.knownCapabilities).not.toContain("camera.editor");
     expect(record.unknownCapabilities).toContain("camera.editor");
+    });
   });
 
-  it("refuses a second process for the same launch nonce", () => {
-    const root = temporaryDirectory();
-    roots.push(root);
-    const fixture = createSessionFixture(root);
+  it("refuses a second process for the same launch nonce", async () => {
+    await withTemporaryDirectory((root) => {
+    const fixture = createObserverSessionFixture({ root });
     const registry = new InstanceRegistry(fixture.store, { clock: fixture.clock });
     registry.register(graphicalRegistration(fixture.created), fixture.created.contract.sessionToken);
     expect(() => registry.register(graphicalRegistration(fixture.created, {
       instanceId: "instance-2",
       instanceNonce: "different_nonce_123456789012345678901234",
     }), fixture.created.contract.sessionToken)).toThrowError(expect.objectContaining({ code: "INSTANCE_CONFLICT" }));
+    });
   });
 
-  it("rejects stale heartbeat sequences and deterministically marks liveness", () => {
-    const root = temporaryDirectory();
-    roots.push(root);
-    const clock = new FakeClock();
-    const fixture = createSessionFixture(root, clock);
+  it("rejects stale heartbeat sequences and deterministically marks liveness", async () => {
+    await withTemporaryDirectory((root) => {
+    const clock = new ManualTime();
+    const fixture = createObserverSessionFixture({ root, clock });
     const registry = new InstanceRegistry(fixture.store, { clock, staleAfterMs: 10_000 });
     const registration = graphicalRegistration(fixture.created);
     registry.register(registration, fixture.created.contract.sessionToken);
@@ -89,12 +87,12 @@ describe("observer instance registry", () => {
     expect(() => registry.heartbeat(heartbeat, fixture.created.contract.sessionToken)).toThrowError(expect.objectContaining({ code: "INVALID_REQUEST" }));
     clock.advance(10_001);
     expect(() => registry.select(registration.sessionId, ["render.capture"])).toThrowError(expect.objectContaining({ code: "NO_RENDER_ENDPOINT" }));
+    });
   });
 
-  it("rejects an over-budget heartbeat without partially mutating the instance", () => {
-    const root = temporaryDirectory();
-    roots.push(root);
-    const fixture = createSessionFixture(root);
+  it("rejects an over-budget heartbeat without partially mutating the instance", async () => {
+    await withTemporaryDirectory((root) => {
+    const fixture = createObserverSessionFixture({ root });
     const registry = new InstanceRegistry(fixture.store, {
       clock: fixture.clock,
       maxRecords: 4,
@@ -125,12 +123,12 @@ describe("observer instance registry", () => {
       transportHealthy: true,
     });
     expect(record.knownCapabilities).toEqual(originalCapabilities);
+    });
   });
 
-  it("does not bind a session nonce when registry admission fails", () => {
-    const root = temporaryDirectory();
-    roots.push(root);
-    const fixture = createSessionFixture(root);
+  it("does not bind a session nonce when registry admission fails", async () => {
+    await withTemporaryDirectory((root) => {
+    const fixture = createObserverSessionFixture({ root });
     const registry = new InstanceRegistry(fixture.store, {
       clock: fixture.clock,
       maxRecords: 4,
@@ -153,18 +151,19 @@ describe("observer instance registry", () => {
     }), fixture.created.contract.sessionToken);
     expect(retry.registration.instanceNonce).toBe("accepted_nonce_123456789012345678901234");
     expect(fixture.created.record.registeredInstanceNonce).toBe(retry.registration.instanceNonce);
+    });
   });
 
   it.each([
     { field: "buildIdentity", value: "2".repeat(64) },
     { field: "agentInstanceId", value: "different-agent" },
     { field: "runtimeKind", value: "listenServer" },
-  ] as const)("rejects mismatched runtime attestation field $field", ({ field, value }) => {
-    const root = temporaryDirectory();
-    roots.push(root);
-    const fixture = createSessionFixture(root);
+  ] as const)("rejects mismatched runtime attestation field $field", async ({ field, value }) => {
+    await withTemporaryDirectory((root) => {
+    const fixture = createObserverSessionFixture({ root });
     const registry = new InstanceRegistry(fixture.store, { clock: fixture.clock });
     expect(() => registry.register(graphicalRegistration(fixture.created, { [field]: value }), fixture.created.contract.sessionToken))
       .toThrowError(expect.objectContaining({ code: "UNAUTHORIZED" }));
+    });
   });
 });

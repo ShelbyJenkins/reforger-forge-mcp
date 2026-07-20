@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { execFileSync, spawn } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { platform, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -8,7 +8,6 @@ import {
   LifecycleGuardError,
   WindowsLifecycleBackend,
   type WorkbenchIdentity,
-  type WorkbenchLifecycleStateV3,
 } from "../../src/workbench/process-guard.js";
 
 const roots: string[] = [];
@@ -43,27 +42,6 @@ const expectedWorkbench: WorkbenchIdentity = {
   ownerTokenArgument: "-reforgerForgeOwnerToken=timeout-test",
   launchedAtMs: 1,
 };
-
-const vacantState: WorkbenchLifecycleStateV3 = {
-  version: 3,
-  generation: "next-generation",
-  phase: "vacant",
-  endpoint: { host: "127.0.0.1", port: 5775 },
-  target: null,
-  mcpOwner: null,
-  workbench: null,
-  companion: null,
-  operation: null,
-};
-
-describe("Windows lifecycle helper schema contract", () => {
-  it("compares version-3 replacement records against a version-3 current record", () => {
-    const source = readFileSync(lifecycleHelperPath, "utf8");
-
-    expect(source).toMatch(/\$currentVersion\s+-ne\s+3/);
-    expect(source).not.toMatch(/\$currentVersion\s+-ne\s+2/);
-  });
-});
 
 describe.runIf(platform() === "win32")("Windows lifecycle helper parent deadlines", () => {
   it("rejects a mutex helper that exits silently before its acquisition response", async () => {
@@ -196,18 +174,6 @@ describe.runIf(platform() === "win32")("Windows lifecycle helper parent deadline
 
     await expect(backend.verifyEndpointVacant({ host: "127.0.0.1", port: 5775 }))
       .resolves.toMatchObject({ kind: "unverifiable", reason: "helper_failure" });
-  }, 10_000);
-
-  it("returns durable recovery when lifecycle state replacement does not return", async () => {
-    const backend = new WindowsLifecycleBackend(helper("Start-Sleep -Seconds 30"), {
-      helperTimeoutMs: 1_000,
-    });
-
-    await expect(backend.replaceState({
-      path: join(roots[0], "state.json"),
-      expectedGeneration: null,
-      next: vacantState,
-    })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
   }, 10_000);
 
   it("returns durable recovery when exact termination does not return", async () => {

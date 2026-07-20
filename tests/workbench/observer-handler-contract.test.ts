@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { WORKBENCH_HELPER_HANDLER_FILES } from "../../src/workbench/helper-addon.js";
+import { WORKBENCH_HELPER_PAYLOAD_FILES } from "../../src/workbench/helper-addon-payload.generated.js";
 
 const handlerRoot = join(
   process.cwd(),
@@ -21,18 +22,25 @@ describe("dedicated Workbench observer handler contract", () => {
     const names = WORKBENCH_HELPER_HANDLER_FILES.filter((name) => name.includes("Observer"));
     expect(names).toEqual([
       "EMCP_WB_ObserverCancel.c",
-      "EMCP_WB_ObserverCommon.c",
       "EMCP_WB_ObserverPing.c",
       "EMCP_WB_ObserverRelease.c",
       "EMCP_WB_ObserverStatus.c",
       "EMCP_WB_ObserverSubmit.c",
     ]);
+    for (const name of WORKBENCH_HELPER_HANDLER_FILES) {
+      expect(source(name)).toMatch(/\bclass\s+[A-Za-z_][A-Za-z0-9_]*\s*:\s*NetApiHandler\b/);
+    }
     for (const operation of ["Ping", "Submit", "Status", "Release", "Cancel"]) {
       expect(source(`EMCP_WB_Observer${operation}.c`)).toContain(
         `class EMCP_WB_Observer${operation} : NetApiHandler`
       );
     }
     expect(source("EMCP_WB_ObserverCommon.c")).not.toContain(": NetApiHandler");
+
+    const protocolPayloadPath = "Scripts/WorkbenchGame/EnfusionMCP/EMCP_WB_ObserverProtocol.c";
+    expect(WORKBENCH_HELPER_PAYLOAD_FILES).toContain(protocolPayloadPath);
+    expect(WORKBENCH_HELPER_HANDLER_FILES).not.toContain("EMCP_WB_ObserverProtocol.c");
+    expect(source("EMCP_WB_ObserverProtocol.c")).not.toContain(": NetApiHandler");
   });
 
   it("snapshots and verifies the native editor transform, projection, camera slot, viewport, world, and project identity", () => {
@@ -52,10 +60,11 @@ describe("dedicated Workbench observer handler contract", () => {
       "api.SetCamera(job.originalWorldMatrix[3], job.originalWorldMatrix[2])",
       "SetCameraVerticalFOV(job.originalWorldCameraId, job.originalFov)",
       "MatrixEquals(restoredWorld, job.originalWorldMatrix)",
-      '"RESTORATION_UNCONFIRMED"',
+      "EMCP_WB_ObserverProtocol.ERROR_RESTORATION_UNCONFIRMED",
     ]) {
       expect(common).toContain(required);
     }
+    expect(common).toContain("return EMCP_WB_ObserverProtocol.ADAPTER_PROTOCOL;");
     expect(common.indexOf("m_Job = job;")).toBeLessThan(
       common.indexOf("world.SetCameraEx(job.originalWorldCameraId, job.requestedMatrix)")
     );
@@ -87,9 +96,10 @@ describe("dedicated Workbench observer handler contract", () => {
   });
 
   it("uses only the generated native profile PNG and never generic editor execution paths", () => {
-    const observerSource = WORKBENCH_HELPER_HANDLER_FILES
-      .filter((name) => name.includes("Observer"))
-      .map(source)
+    const observerSource = [
+      ...WORKBENCH_HELPER_HANDLER_FILES.filter((name) => name.includes("Observer")).map(source),
+      source("EMCP_WB_ObserverCommon.c"),
+    ]
       .join("\n");
     expect(observerSource).toContain('string screenshotRequestPath = CAPTURE_DIRECTORY + "/" + m_Job.jobId');
     expect(observerSource).toContain('m_Job.outputLogicalPath = screenshotRequestPath + ".png"');

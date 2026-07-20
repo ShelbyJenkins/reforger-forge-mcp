@@ -100,7 +100,7 @@ class RFO_ObserverService
 
 		bool worldChanged = m_RFO_World.Refresh(world);
 		if (worldChanged && m_RFO_ActiveJob && !m_RFO_ActiveJob.IsTerminal())
-			RecordFailure("WORLD_CHANGED", "The active world generation changed during capture", false);
+			RecordFailure(RFO_ObserverProtocol.ERROR_WORLD_CHANGED, "The active world generation changed during capture", false);
 
 		if (!m_RFO_Registered)
 		{
@@ -126,7 +126,7 @@ class RFO_ObserverService
 		m_RFO_Transport.Update();
 
 		if (m_RFO_TransportFailures >= 3 && System.GetUnixTime() - m_RFO_LastTransportSuccessUnix >= 5 && m_RFO_ActiveJob && m_RFO_CameraLease.HasOutstandingLease())
-			RecordFailure("TRANSPORT_UNAVAILABLE", "Observer transport was unavailable while a camera lease was held", false);
+			RecordFailure(RFO_ObserverProtocol.ERROR_TRANSPORT_UNAVAILABLE, "Observer transport was unavailable while a camera lease was held", false);
 	}
 
 	// RFO_ObserverCamera invokes this after all normal frame updates. Explicit
@@ -189,14 +189,14 @@ class RFO_ObserverService
 				m_RFO_ActiveJob.RequestCancellation(command.deliveryToken);
 				return true;
 			}
-			return RejectCommand(command, "CANCELLED", "Capture cancellation was acknowledged after local work ended", true);
+			return RejectCommand(command, RFO_ObserverProtocol.ERROR_CANCELLED, "Capture cancellation was acknowledged after local work ended", true);
 		}
 		if (m_RFO_ActiveJob)
 			return m_RFO_ActiveJob.MatchesRequest(command) && m_RFO_ActiveJob.deliveryToken == command.deliveryToken;
 
 		RFO_ObserverJob job = new RFO_ObserverJob();
 		if (!job.Initialize(command, m_RFO_Session, m_RFO_World))
-			return RejectCommand(command, "CAPTURE_REJECTED", "Runtime capture validation rejected the command", false);
+			return RejectCommand(command, RFO_ObserverProtocol.ERROR_CAPTURE_REJECTED, "Runtime capture validation rejected the command", false);
 		m_RFO_ActiveJob = job;
 		m_RFO_PostFrameCaptureArmed = false;
 		m_RFO_PostFrameCaptureFailed = false;
@@ -204,18 +204,18 @@ class RFO_ObserverService
 		Print(string.Format("ReforgerForge Observer: job accepted jobId=%1 view=%2", job.jobId, job.viewKind));
 		if (!CaptureRateAvailable())
 		{
-			RecordFailure("CAPTURE_REJECTED", "Runtime session capture rate limit was reached", false);
+			RecordFailure(RFO_ObserverProtocol.ERROR_CAPTURE_REJECTED, "Runtime session capture rate limit was reached", false);
 			return true;
 		}
 		m_RFO_CaptureTimes.Insert(System.GetUnixTime());
 		if (!m_RFO_Capture.IsReady())
 		{
-			RecordFailure("CAPABILITY_UNAVAILABLE", "This runtime has no proven screenshot capability", false);
+			RecordFailure(RFO_ObserverProtocol.ERROR_CAPABILITY_UNAVAILABLE, "This runtime has no proven screenshot capability", false);
 			return true;
 		}
 		if (job.IsCameraView() && !RFO_ObserverCapabilities.CAMERA_RESTORE_PROVEN)
 		{
-			RecordFailure("CAPABILITY_UNAVAILABLE", "This runtime has no proven camera restoration capability", false);
+			RecordFailure(RFO_ObserverProtocol.ERROR_CAPABILITY_UNAVAILABLE, "This runtime has no proven camera restoration capability", false);
 			return true;
 		}
 		PublishStatus();
@@ -277,14 +277,14 @@ class RFO_ObserverService
 	void OnTransportFailure(string operation, int errorCode)
 	{
 		m_RFO_TransportFailures++;
-		m_RFO_LastErrorCode = "TRANSPORT_UNAVAILABLE";
+		m_RFO_LastErrorCode = RFO_ObserverProtocol.ERROR_TRANSPORT_UNAVAILABLE;
 	}
 
 	string BuildRegistrationJson()
 	{
 		string selectedTransport = m_RFO_Transport.GetName();
 		array<string> capabilities = CurrentCapabilities();
-		string result = "{\"protocolVersion\":\"1.0\",\"addonVersion\":\"0.1.0\"";
+		string result = "{\"protocolVersion\":" + RFO_ObserverJson.Quote(RFO_ObserverProtocol.RUNTIME_PROTOCOL_VERSION) + ",\"addonVersion\":\"0.1.0\"";
 		result += ",\"bundleDigest\":" + RFO_ObserverJson.Quote(m_RFO_Session.bundleDigest);
 		result += ",\"buildIdentity\":" + RFO_ObserverJson.Quote(RFO_ObserverBuild.IDENTITY);
 		result += ",\"agentInstanceId\":" + RFO_ObserverJson.Quote(m_RFO_Session.agent.instanceId);
@@ -315,7 +315,7 @@ class RFO_ObserverService
 		string lastError = "null";
 		if (!m_RFO_LastErrorCode.IsEmpty())
 			lastError = RFO_ObserverJson.Quote(m_RFO_LastErrorCode);
-		string result = "{\"protocolVersion\":\"1.0\"";
+		string result = "{\"protocolVersion\":" + RFO_ObserverJson.Quote(RFO_ObserverProtocol.RUNTIME_PROTOCOL_VERSION);
 		result += ",\"sessionId\":" + RFO_ObserverJson.Quote(m_RFO_Session.sessionId);
 		result += ",\"instanceId\":" + RFO_ObserverJson.Quote(m_RFO_InstanceId);
 		result += ",\"instanceNonce\":" + RFO_ObserverJson.Quote(m_RFO_InstanceNonce);
@@ -441,7 +441,7 @@ class RFO_ObserverService
 			string diagnostic = m_RFO_PostFrameCaptureDiagnostic;
 			if (diagnostic.IsEmpty())
 				diagnostic = "Committed observer screenshot request was rejected";
-			RecordFailure("CAPTURE_REJECTED", diagnostic, false);
+			RecordFailure(RFO_ObserverProtocol.ERROR_CAPTURE_REJECTED, diagnostic, false);
 			m_RFO_PostFrameCaptureFailed = false;
 			m_RFO_PostFrameCaptureDiagnostic = string.Empty;
 		}
@@ -454,9 +454,9 @@ class RFO_ObserverService
 			return;
 
 		if (job.cancellationRequested && job.terminalErrorCode.IsEmpty())
-			RecordFailure("CANCELLED", "Capture was cancelled", true);
+			RecordFailure(RFO_ObserverProtocol.ERROR_CANCELLED, "Capture was cancelled", true);
 		else if (job.DeadlineExpired() && job.terminalErrorCode.IsEmpty())
-			RecordFailure("CAPTURE_TIMEOUT", "Capture deadline expired", false);
+			RecordFailure(RFO_ObserverProtocol.ERROR_CAPTURE_TIMEOUT, "Capture deadline expired", false);
 		if (!job.terminalErrorCode.IsEmpty() && job.state != RFO_ObserverJobState.RESTORING && !job.IsTerminal())
 		{
 			BeginTerminalTransition();
@@ -480,7 +480,7 @@ class RFO_ObserverService
 						string diagnostic = m_RFO_Capture.GetLastPreloadDiagnostic();
 						if (diagnostic.IsEmpty())
 							diagnostic = "Current gameplay camera could not begin screenshot preload";
-						RecordFailure("CAPTURE_REJECTED", diagnostic, false);
+						RecordFailure(RFO_ObserverProtocol.ERROR_CAPTURE_REJECTED, diagnostic, false);
 						BeginTerminalTransition();
 						break;
 					}
@@ -497,7 +497,7 @@ class RFO_ObserverService
 				{
 					if (m_RFO_CameraLease.AwaitingFirstPostFrameCommit(job.jobId))
 						break;
-					RecordFailure("CAMERA_OWNERSHIP_LOST", "Observer camera view could not be confirmed before preloading", false);
+					RecordFailure(RFO_ObserverProtocol.ERROR_CAMERA_OWNERSHIP_LOST, "Observer camera view could not be confirmed before preloading", false);
 					BeginTerminalTransition();
 					break;
 				}
@@ -506,7 +506,7 @@ class RFO_ObserverService
 					string diagnostic = m_RFO_Capture.GetLastPreloadDiagnostic();
 					if (diagnostic.IsEmpty())
 						diagnostic = "Positioned gameplay camera could not begin screenshot preload";
-					RecordFailure("CAPTURE_REJECTED", diagnostic, false);
+					RecordFailure(RFO_ObserverProtocol.ERROR_CAPTURE_REJECTED, diagnostic, false);
 					BeginTerminalTransition();
 					break;
 				}
@@ -555,7 +555,7 @@ class RFO_ObserverService
 		if (!built || !acquired)
 		{
 			m_RFO_ActiveJob.cameraWasAcquired = m_RFO_CameraLease.HasOutstandingLease();
-			RecordFailure("CAMERA_BUSY", "Observer camera lease could not be acquired", false);
+			RecordFailure(RFO_ObserverProtocol.ERROR_CAMERA_BUSY, "Observer camera lease could not be acquired", false);
 			if (m_RFO_ActiveJob.cameraWasAcquired)
 			{
 				// Initial ownership evidence is valid only in acquiringCamera. Once
@@ -576,7 +576,7 @@ class RFO_ObserverService
 	{
 		if (m_RFO_ActiveJob.IsCameraView() && !m_RFO_CameraLease.MaintainRequestedView(m_RFO_ActiveJob.jobId))
 		{
-			RecordFailure("CAMERA_OWNERSHIP_LOST", "Observer camera view could not be maintained while settling", false);
+			RecordFailure(RFO_ObserverProtocol.ERROR_CAMERA_OWNERSHIP_LOST, "Observer camera view could not be maintained while settling", false);
 			BeginTerminalTransition();
 			return false;
 		}
@@ -595,7 +595,7 @@ class RFO_ObserverService
 		RFO_ObserverJob job = m_RFO_ActiveJob;
 		if (job.IsCameraView() && !m_RFO_CameraLease.MaintainRequestedView(job.jobId))
 		{
-			RecordFailure("CAMERA_OWNERSHIP_LOST", "Observer camera view could not be maintained while preloading", false);
+			RecordFailure(RFO_ObserverProtocol.ERROR_CAMERA_OWNERSHIP_LOST, "Observer camera view could not be maintained while preloading", false);
 			BeginTerminalTransition();
 			return;
 		}
@@ -613,7 +613,7 @@ class RFO_ObserverService
 		RFO_ObserverJob job = m_RFO_ActiveJob;
 		if (job.IsCameraView() && !m_RFO_CameraLease.MaintainRequestedView(job.jobId))
 		{
-			RecordFailure("CAMERA_OWNERSHIP_LOST", "Observer camera ownership changed before screenshot issuance", false);
+			RecordFailure(RFO_ObserverProtocol.ERROR_CAMERA_OWNERSHIP_LOST, "Observer camera ownership changed before screenshot issuance", false);
 			BeginTerminalTransition();
 			return;
 		}
@@ -633,14 +633,14 @@ class RFO_ObserverService
 			string diagnostic = m_RFO_Capture.GetLastIssueDiagnostic();
 			if (diagnostic.IsEmpty())
 				diagnostic = "Engine screenshot request was rejected";
-			RecordFailure("CAPTURE_REJECTED", diagnostic, false);
+			RecordFailure(RFO_ObserverProtocol.ERROR_CAPTURE_REJECTED, diagnostic, false);
 			BeginTerminalTransition();
 			return;
 		}
 		int stable = m_RFO_Capture.CheckStable(job, world, m_RFO_FrameCounter, m_RFO_Session.limits.maxArtifactBytes);
 		if (stable < 0)
 		{
-			RecordFailure("ARTIFACT_INCOMPLETE", "Screenshot file did not become stable within bounds", false);
+			RecordFailure(RFO_ObserverProtocol.ERROR_ARTIFACT_INCOMPLETE, "Screenshot file did not become stable within bounds", false);
 			BeginTerminalTransition();
 			return;
 		}
@@ -669,7 +669,7 @@ class RFO_ObserverService
 				m_RFO_CameraSubsystemSafe = false;
 			if (!job.restorationConfirmed)
 			{
-				job.terminalErrorCode = "RESTORATION_UNCONFIRMED";
+				job.terminalErrorCode = RFO_ObserverProtocol.ERROR_RESTORATION_UNCONFIRMED;
 				job.terminalMessage = "Observer camera ownership or exact restoration could not be confirmed";
 				m_RFO_LastErrorCode = job.terminalErrorCode;
 			}
@@ -691,7 +691,7 @@ class RFO_ObserverService
 		}
 		if (!job.terminalErrorCode.IsEmpty())
 		{
-			if (job.terminalErrorCode == "CANCELLED")
+			if (job.terminalErrorCode == RFO_ObserverProtocol.ERROR_CANCELLED)
 				job.state = RFO_ObserverJobState.CANCELLED;
 			else
 				job.state = RFO_ObserverJobState.FAILED;
@@ -718,7 +718,7 @@ class RFO_ObserverService
 			return;
 		if (m_RFO_ActiveJob.cameraWasAcquired)
 			m_RFO_ActiveJob.state = RFO_ObserverJobState.RESTORING;
-		else if (m_RFO_ActiveJob.terminalErrorCode == "CANCELLED")
+		else if (m_RFO_ActiveJob.terminalErrorCode == RFO_ObserverProtocol.ERROR_CANCELLED)
 			m_RFO_ActiveJob.state = RFO_ObserverJobState.CANCELLED;
 		else
 			m_RFO_ActiveJob.state = RFO_ObserverJobState.FAILED;
@@ -763,7 +763,7 @@ class RFO_ObserverService
 			cameraLease += ",\"observerCameraId\":" + m_RFO_CameraLease.GetObserverCameraId().ToString();
 			cameraLease += "}";
 		}
-		string result = "{\"protocolVersion\":\"1.0\"";
+		string result = "{\"protocolVersion\":" + RFO_ObserverJson.Quote(RFO_ObserverProtocol.RUNTIME_PROTOCOL_VERSION);
 		result += ",\"sessionId\":" + RFO_ObserverJson.Quote(m_RFO_Session.sessionId);
 		result += ",\"instanceId\":" + RFO_ObserverJson.Quote(m_RFO_InstanceId);
 		result += ",\"instanceNonce\":" + RFO_ObserverJson.Quote(m_RFO_InstanceNonce);
@@ -791,7 +791,7 @@ class RFO_ObserverService
 		string localManifest = BuildArtifactManifest(job, false);
 		if (!m_RFO_Capture.WriteCompletionManifest(job, localManifest))
 		{
-			RecordFailure("ARTIFACT_INCOMPLETE", "Runtime completion manifest could not be written", false);
+			RecordFailure(RFO_ObserverProtocol.ERROR_ARTIFACT_INCOMPLETE, "Runtime completion manifest could not be written", false);
 			BeginTerminalTransition();
 			return;
 		}
@@ -821,7 +821,7 @@ class RFO_ObserverService
 		string actualCamera = "{}";
 		if (hasCamera)
 			actualCamera = "{\"matrix\":" + RFO_ObserverJson.Matrix4(actualMatrix) + "}";
-		string result = "{\"protocolVersion\":\"1.0\"";
+		string result = "{\"protocolVersion\":" + RFO_ObserverJson.Quote(RFO_ObserverProtocol.RUNTIME_PROTOCOL_VERSION);
 		result += ",\"sessionId\":" + RFO_ObserverJson.Quote(m_RFO_Session.sessionId);
 		result += ",\"instanceId\":" + RFO_ObserverJson.Quote(m_RFO_InstanceId);
 		result += ",\"instanceNonce\":" + RFO_ObserverJson.Quote(m_RFO_InstanceNonce);

@@ -5,7 +5,7 @@
   "addonId": "ReforgerForgeObserver",
   "addonGuid": "7F3A91C2E40B6D58",
   "buildIdentity": "000cec19226673ce911c68dca027dca7449ff58a604fe0cef6509afbc4d7ec22",
-  "bundleDigest": "c7edb7caf5e979bbe78a3c2e5f803ac758060558ba237e389a93efff725655c6",
+  "bundleDigest": "c519bf76261b2657463f97f1f16ecb7082130edeac0931f54769b045327c4458",
   "files": [
     {
       "path": "addon.gproj",
@@ -29,19 +29,19 @@
     },
     {
       "path": "Scripts/Game/ReforgerForgeObserver/RFO_ObserverCameraProjection.c",
-      "sha256": "80483f10bf3932c6626429c001c353313501fa4345e587ce96604951b635661f"
+      "sha256": "c9a70ded6091f2d3da1673dd61bc9afcaffb78a9e654d3c04f7cca24654a471d"
     },
     {
       "path": "Scripts/Game/ReforgerForgeObserver/RFO_ObserverCapabilities.c",
-      "sha256": "cec20659406022ed35fa504c2f83db4373958a6cd4a5d63d0ce56629221b9904"
+      "sha256": "f996c1930605f821a7f0a9ec45241f7249bd19e9f7f35f27d7288e3ba9b031fb"
     },
     {
       "path": "Scripts/Game/ReforgerForgeObserver/RFO_ObserverCapture.c",
-      "sha256": "d1e65b6b021962c93ad6d6824acd97194a05f7aab6d6d51ae1c1f0b1d76d2b14"
+      "sha256": "24702033236d0c7b78e56b7c394cb3bb668cbea180217219dbe18a5ecb64b20e"
     },
     {
       "path": "Scripts/Game/ReforgerForgeObserver/RFO_ObserverJob.c",
-      "sha256": "3dc70f682f2459bc2d6cb2f13c89359059c2e6505fa22a51b7eafc9d6f63e46b"
+      "sha256": "d7f22f10079f16f65a45151d647f13eaa6ec42e6cb2d3b06cc16ba01e2bd7f99"
     },
     {
       "path": "Scripts/Game/ReforgerForgeObserver/RFO_ObserverJson.c",
@@ -49,7 +49,11 @@
     },
     {
       "path": "Scripts/Game/ReforgerForgeObserver/RFO_ObserverMailboxTransport.c",
-      "sha256": "bb750fb609573579cc52e4f20878bbc6a0b097d66f96b59c9011d5974161d8f4"
+      "sha256": "edea7f87acb91156d2e58bec61651340c516509b9a75935d9cb402f005d87606"
+    },
+    {
+      "path": "Scripts/Game/ReforgerForgeObserver/RFO_ObserverProtocol.c",
+      "sha256": "043b0a9d13bbcdba52162c29bbcd82440c0b74cfdda2c11e28744fbdca6551cc"
     },
     {
       "path": "Scripts/Game/ReforgerForgeObserver/RFO_ObserverRestTransport.c",
@@ -57,11 +61,11 @@
     },
     {
       "path": "Scripts/Game/ReforgerForgeObserver/RFO_ObserverService.c",
-      "sha256": "b944a2a79d2e89aca8510bb98831de30c91e550085c56ce65de82b213b127c32"
+      "sha256": "81c62ddd5178c8a8c207e1e1f956bcb3b983cfd1ce2be24430db025f66330923"
     },
     {
       "path": "Scripts/Game/ReforgerForgeObserver/RFO_ObserverSession.c",
-      "sha256": "4323b0ff1cf365467f89116d951ba864cc76a79ea320b47b72ad94f05fad520d"
+      "sha256": "fcfabe67482e1fa6d15214c5dd0c629d24e8dec6b0a96171f7164982de529ff4"
     },
     {
       "path": "Scripts/Game/ReforgerForgeObserver/RFO_ObserverTime.c",

@@ -27,7 +27,10 @@ import {
   type WorkbenchCompanionLaunch,
   type WorkbenchCompanionProvider,
 } from "../../src/workbench/helper-addon.js";
-import { WorkbenchProcessGuard } from "../../src/workbench/process-guard.js";
+import {
+  closeTrackedWorkbenchProcessGuards,
+  WorkbenchProcessGuard,
+} from "./tracked-process-guard.js";
 import {
   parseWorkbenchRunnerArguments,
   runWorkbenchIntent,
@@ -118,6 +121,10 @@ function createHarness(): RunnerHarness {
     backend,
     stateDir: join(root, "state"),
     mutexName: `Global\\ReforgerForge.Runner.${root}`,
+    beforeLifecycleReplace: (args) => backend.replaceFailure?.(args) ?? undefined,
+    afterLifecycleReplace: (args) => backend.afterReplace?.(args),
+    beforeSpawnJournalReplace: (args) => backend.spawnJournalReplaceFailure?.(args) ?? undefined,
+    afterSpawnJournalReplace: (args) => backend.afterSpawnJournalReplace?.(args),
   });
   const companion: WorkbenchCompanionLaunch = {
     addonId: WORKBENCH_HELPER_ADDON_ID,
@@ -238,8 +245,9 @@ function createBuildSpawner(
   };
 }
 
-afterEach(() => {
+afterEach(async () => {
   vi.restoreAllMocks();
+  await closeTrackedWorkbenchProcessGuards();
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
@@ -651,16 +659,10 @@ describe("standalone Workbench lifecycle runner", () => {
     const harness = createHarness();
     const childSupervisor = new ChildSupervisor();
     const journalPhases: string[] = [];
-    const replaceState = harness.backend.replaceState.bind(harness.backend);
-    harness.backend.replaceState = vi.fn(async (replacement) => {
-      const journal = replacement.next as unknown as {
-        record?: { phase?: string; metadata?: { purpose?: string } };
-      };
-      if (journal.record?.phase && journal.record.metadata?.purpose) {
-        journalPhases.push(`${journal.record.metadata.purpose}:${journal.record.phase}`);
-      }
-      await replaceState(replacement);
-    });
+    harness.backend.spawnJournalReplaceFailure = ({ next }) => {
+      journalPhases.push(`${next.record.metadata.purpose}:${next.record.phase}`);
+      return null;
+    };
     const reattestationAbsence: boolean[] = [];
     harness.companionProvider.verifyStaged = vi.fn(() => {
       reattestationAbsence.push(harness.backend.workbenchPids.size === 0);
@@ -1071,13 +1073,11 @@ describe("standalone Workbench lifecycle runner", () => {
 
   it("revalidates output after lifecycle reservation and before companion preflight spawn", async () => {
     const harness = createHarness();
-    const replaceState = harness.backend.replaceState.bind(harness.backend);
-    vi.spyOn(harness.backend, "replaceState").mockImplementation(async (args) => {
-      await replaceState(args);
-      if (args.next.phase === "starting" && args.next.workbench === null) {
+    harness.backend.afterReplace = ({ next }) => {
+      if (next.phase === "starting" && next.workbench === null) {
         writeFileSync(join(harness.outputPath, "raced-after-reservation.txt"), "occupied");
       }
-    });
+    };
     const spawnProcess = vi.fn();
 
     await expect(runWorkbenchIntent(harness.config, {

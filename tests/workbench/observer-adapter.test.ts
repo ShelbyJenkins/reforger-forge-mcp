@@ -1,8 +1,7 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { deflateSync } from "node:zlib";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type {
   WorkbenchCallOptions,
   WorkbenchCaptureActivityLease,
@@ -17,12 +16,7 @@ import {
   companionLifecycleState,
   createFakeCompanionLaunch,
 } from "./fake-companion.js";
-
-const roots: string[] = [];
-
-afterEach(() => {
-  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
-});
+import { withTemporaryDirectory } from "../support/temporary-directory.js";
 
 function testCrc32(data: Buffer): number {
   let crc = 0xffffffff;
@@ -119,12 +113,10 @@ class FakeObserverClient implements WorkbenchObserverClient {
   lostReleaseAcknowledgement = false;
   releaseReceipt: Record<string, unknown> | null = null;
 
-  constructor(private readonly options: FakeOptions = {}) {
+  constructor(private readonly options: FakeOptions = {}, root: string) {
 	this.failRevalidation = options.failRevalidation ?? false;
-    this.root = mkdtempSync(join(tmpdir(), "reforger-forge-wb-observer-"));
-    roots.push(this.root);
-    const managedRoot = mkdtempSync(join(tmpdir(), "reforger-forge-wb-profile-"));
-    roots.push(managedRoot);
+    this.root = root;
+    const managedRoot = join(root, "managed-profile");
     const companion = createFakeCompanionLaunch(managedRoot);
     this.project = join(this.root, "Example", "Example.gproj");
     this.artifactDirectory = join(
@@ -273,6 +265,17 @@ class FakeObserverClient implements WorkbenchObserverClient {
   }
 }
 
+function fakeClient(root: string, options: FakeOptions = {}): FakeObserverClient {
+  return new FakeObserverClient(options, root);
+}
+
+function scopedIt(
+  name: string,
+  run: (root: string) => Promise<void> | void,
+): void {
+  it(name, () => withTemporaryDirectory(run, { prefix: "reforger-forge-wb-observer-" }));
+}
+
 describe("Workbench observer adapter", () => {
   it("builds deterministic orthonormal pose and near-vertical look-at camera bases", () => {
     expect(workbenchCameraMatrix({
@@ -299,8 +302,8 @@ describe("Workbench observer adapter", () => {
     expect(matrix[2]).toEqual([0, 1, 0]);
   });
 
-  it("captures current view through the exact owned client, validates the native PNG, and releases the gate", async () => {
-    const client = new FakeObserverClient({ completeOnStatus: true });
+  scopedIt("captures current view through the exact owned client, validates the native PNG, and releases the gate", async (root) => {
+    const client = fakeClient(root, { completeOnStatus: true });
     const adapter = new WorkbenchObserverAdapter(client, { createJobId: () => "job-current" });
 
     const submitted = await adapter.submit({ view: { kind: "current" }, settlePolls: 2 });
@@ -325,8 +328,8 @@ describe("Workbench observer adapter", () => {
     expect(client.calls.some((call) => /ExecuteAction|Reload|Play|Save/.test(call.apiFunc))).toBe(false);
   });
 
-  it("rejects a corrupt native PNG after releasing the already-restored lifecycle gate", async () => {
-    const client = new FakeObserverClient({ completeOnStatus: true, corruptArtifact: true });
+  scopedIt("rejects a corrupt native PNG after releasing the already-restored lifecycle gate", async (root) => {
+    const client = fakeClient(root, { completeOnStatus: true, corruptArtifact: true });
     const adapter = new WorkbenchObserverAdapter(client, { createJobId: () => "corrupt-png" });
 
     await adapter.submit({ view: { kind: "current" } });
@@ -337,8 +340,8 @@ describe("Workbench observer adapter", () => {
     });
   });
 
-  it("normalizes Enforce numeric boolean responses at the adapter boundary", async () => {
-    const client = new FakeObserverClient({
+  scopedIt("normalizes Enforce numeric boolean responses at the adapter boundary", async (root) => {
+    const client = fakeClient(root, {
       cameraEditor: true,
       completeOnStatus: true,
       numericBooleans: true,
@@ -366,8 +369,8 @@ describe("Workbench observer adapter", () => {
     });
   });
 
-  it("recovers a lost submit acknowledgement by replaying the exact idempotent command once", async () => {
-    const client = new FakeObserverClient({ loseFirstSubmitAcknowledgement: true });
+  scopedIt("recovers a lost submit acknowledgement by replaying the exact idempotent command once", async (root) => {
+    const client = fakeClient(root, { loseFirstSubmitAcknowledgement: true });
     const adapter = new WorkbenchObserverAdapter(client, {
       createJobId: () => "ack-job",
       createLeaseId: () => "ack-lease",
@@ -384,8 +387,8 @@ describe("Workbench observer adapter", () => {
     expect(client.submitMutations).toBe(1);
   });
 
-  it("recovers a retained handler transaction after an adapter restart with the durable lifecycle binding", async () => {
-    const client = new FakeObserverClient({ completeOnStatus: true });
+  scopedIt("recovers a retained handler transaction after an adapter restart with the durable lifecycle binding", async (root) => {
+    const client = fakeClient(root, { completeOnStatus: true });
     const original = new WorkbenchObserverAdapter(client, { createJobId: () => "restart-job" });
     const submitted = await original.submit({ view: { kind: "current" } });
     const submitCall = client.calls.find((call) => call.apiFunc === "EMCP_WB_ObserverSubmit");
@@ -420,8 +423,8 @@ describe("Workbench observer adapter", () => {
     });
   });
 
-  it("refuses restart recovery when the durable Workbench instance binding is stale", async () => {
-    const client = new FakeObserverClient();
+  scopedIt("refuses restart recovery when the durable Workbench instance binding is stale", async (root) => {
+    const client = fakeClient(root);
     const original = new WorkbenchObserverAdapter(client, { createJobId: () => "stale-restart-job" });
     await original.submit({ view: { kind: "current" } });
 
@@ -433,8 +436,8 @@ describe("Workbench observer adapter", () => {
     expect(client.calls.filter((call) => call.apiFunc === "EMCP_WB_ObserverStatus")).toHaveLength(0);
   });
 
-  it("refuses public release while camera state is held and replays a lost terminal release acknowledgement", async () => {
-    const client = new FakeObserverClient({ loseFirstReleaseAcknowledgement: true });
+  scopedIt("refuses public release while camera state is held and replays a lost terminal release acknowledgement", async (root) => {
+    const client = fakeClient(root, { loseFirstReleaseAcknowledgement: true });
     const adapter = new WorkbenchObserverAdapter(client, { createJobId: () => "release-job" });
     await adapter.submit({ view: { kind: "current" } });
 
@@ -450,8 +453,8 @@ describe("Workbench observer adapter", () => {
     expect(client.releaseMutations).toBe(1);
   });
 
-  it("graceful restoreAll cancels active jobs and exactly releases restored handler transactions", async () => {
-    const client = new FakeObserverClient();
+  scopedIt("graceful restoreAll cancels active jobs and exactly releases restored handler transactions", async (root) => {
+    const client = fakeClient(root);
     const adapter = new WorkbenchObserverAdapter(client, { createJobId: () => "shutdown-job" });
     await adapter.submit({ view: { kind: "current" } });
 
@@ -464,8 +467,8 @@ describe("Workbench observer adapter", () => {
     expect(client.releaseMutations).toBe(1);
   });
 
-  it("graceful restoreAll releases a completed gate-released handler job", async () => {
-    const client = new FakeObserverClient({ completeOnStatus: true });
+  scopedIt("graceful restoreAll releases a completed gate-released handler job", async (root) => {
+    const client = fakeClient(root, { completeOnStatus: true });
     const adapter = new WorkbenchObserverAdapter(client, { createJobId: () => "completed-shutdown-job" });
     await adapter.submit({ view: { kind: "current" } });
     await adapter.status("completed-shutdown-job");
@@ -477,8 +480,8 @@ describe("Workbench observer adapter", () => {
     expect(client.releaseMutations).toBe(1);
   });
 
-  it("refuses camera.editor views until exact restoration was proven in that Workbench process", async () => {
-    const client = new FakeObserverClient({ cameraEditor: false });
+  scopedIt("refuses camera.editor views until exact restoration was proven in that Workbench process", async (root) => {
+    const client = fakeClient(root, { cameraEditor: false });
     const adapter = new WorkbenchObserverAdapter(client);
 
     await expect(adapter.submit({
@@ -487,8 +490,8 @@ describe("Workbench observer adapter", () => {
     expect(client.acquireCaptureActivity).not.toHaveBeenCalled();
   });
 
-  it("binds explicit camera jobs to generation and target and restores on lifecycle cancellation", async () => {
-    const client = new FakeObserverClient({ cameraEditor: true });
+  scopedIt("binds explicit camera jobs to generation and target and restores on lifecycle cancellation", async (root) => {
+    const client = fakeClient(root, { cameraEditor: true });
     const adapter = new WorkbenchObserverAdapter(client, { createJobId: () => "pose-job" });
     await adapter.submit({
       view: { kind: "pose", position: [1, 2, 3], orientation: [0, 0, 0, 1], fov: 55 },
@@ -512,8 +515,8 @@ describe("Workbench observer adapter", () => {
     });
   });
 
-  it("rejects an old lifecycle generation and requests handler restoration", async () => {
-    const client = new FakeObserverClient({ cameraEditor: true });
+  scopedIt("rejects an old lifecycle generation and requests handler restoration", async (root) => {
+    const client = fakeClient(root, { cameraEditor: true });
     const adapter = new WorkbenchObserverAdapter(client, { createJobId: () => "stale-job" });
     await adapter.submit({ view: { kind: "current" } });
     client.failRevalidation = true;
@@ -522,8 +525,8 @@ describe("Workbench observer adapter", () => {
     expect(client.calls.some((call) => call.apiFunc === "EMCP_WB_ObserverCancel")).toBe(true);
   });
 
-  it("records exact process exit as terminal invalidation without claiming restoration", async () => {
-    const client = new FakeObserverClient({ cameraEditor: true });
+  scopedIt("records exact process exit as terminal invalidation without claiming restoration", async (root) => {
+    const client = fakeClient(root, { cameraEditor: true });
     const adapter = new WorkbenchObserverAdapter(client, { createJobId: () => "exit-job" });
     await adapter.submit({ view: { kind: "current" } });
 
@@ -545,8 +548,8 @@ describe("Workbench observer adapter", () => {
     expect(client.calls.filter((call) => call.apiFunc === "EMCP_WB_ObserverCancel")).toHaveLength(0);
   });
 
-  it("reports only capabilities returned by the dedicated ping handler", async () => {
-    const adapter = new WorkbenchObserverAdapter(new FakeObserverClient({ cameraEditor: false }));
+  scopedIt("reports only capabilities returned by the dedicated ping handler", async (root) => {
+    const adapter = new WorkbenchObserverAdapter(fakeClient(root, { cameraEditor: false }));
     await expect(adapter.instances()).resolves.toEqual([
       expect.objectContaining({
         lifecycleGeneration: "generation-a",
@@ -556,9 +559,9 @@ describe("Workbench observer adapter", () => {
     ]);
   });
 
-  it("fails closed before acquiring a lifecycle lease when projection capture is unavailable", async () => {
+  scopedIt("fails closed before acquiring a lifecycle lease when projection capture is unavailable", async (root) => {
     const diagnostic = "The active editor projection is asymmetric or unsupported";
-    const client = new FakeObserverClient({
+    const client = fakeClient(root, {
       captureCurrent: false,
       restorationApiAvailable: false,
       readinessMessage: diagnostic,

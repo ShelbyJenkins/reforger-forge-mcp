@@ -3,6 +3,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { boundedOption, type BoundedOptionErrorFactory } from "../foundation/bounded-option.js";
 import { canonicalizePotentialPath, isPathContained } from "../foundation/managed-path.js";
+import { redactDiagnostic, redactText } from "../foundation/redact.js";
 import { logger } from "../utils/logger.js";
 import type { WorkbenchObserverAdapter } from "../workbench/observer-adapter.js";
 import { ObserverAgentClient, type ObserverAgentClientOptions, type ObserverChildDescriptor, redactChildLine } from "./agent-client.js";
@@ -328,7 +329,14 @@ class DefaultObserverApplication implements ObserverApplication {
   private mapError(error: unknown): ObserverCoordinatorError {
     if (error instanceof ObserverCoordinatorError) return error;
     const value = error as { code?: unknown; details?: Record<string, unknown> };
-    return new ObserverCoordinatorError(typeof value?.code === "string" ? value.code : "INTERNAL_ERROR", error instanceof Error ? error.message : "Observer operation failed", value?.details);
+    const details = value?.details === undefined
+      ? undefined
+      : redactDiagnostic(value.details, { profile: "diagnostic" }) as Record<string, unknown>;
+    return new ObserverCoordinatorError(
+      typeof value?.code === "string" ? value.code : "INTERNAL_ERROR",
+      error instanceof Error ? redactText(error.message, { profile: "diagnostic", maxLength: 1_024 }) : "Observer operation failed",
+      details
+    );
   }
 }
 

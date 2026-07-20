@@ -1,7 +1,6 @@
 import { EventEmitter } from "node:events";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { PassThrough } from "node:stream";
-import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import type { ChildProcess, fork } from "node:child_process";
@@ -13,6 +12,7 @@ import { ObserverCoordinatorError } from "../../src/observer/errors.js";
 import { redactChildLine } from "../../src/observer/agent-client.js";
 import { registerObserverTools } from "../../src/observer/tools.js";
 import { prepareObserverLaunch } from "../../src/observer/launch.js";
+import { withTemporaryDirectory } from "../support/temporary-directory.js";
 import {
   OwnedRuntimeError,
   type OwnedRuntimeManager,
@@ -461,8 +461,7 @@ describe("Phase H observer application", () => {
     await coordinator.close();
   });
 
-  it("keeps idle status and doctor strictly read-only without forking or creating managed roots", async () => {
-    const parent = mkdtempSync(join(tmpdir(), "rfo-idle-diagnostics-"));
+  it("keeps idle status and doctor strictly read-only without forking or creating managed roots", async () => withTemporaryDirectory(async (parent) => {
     const managedRoot = join(parent, "managed-root-must-not-be-created");
     const count = { value: 0 };
     const coordinator = createObserverApplication({
@@ -504,9 +503,8 @@ describe("Phase H observer application", () => {
       expect(existsSync(managedRoot)).toBe(false);
     } finally {
       await coordinator.close();
-      rmSync(parent, { recursive: true, force: true });
     }
-  });
+  }, { prefix: "rfo-idle-diagnostics-" }));
 
   it("returns a host-validated Workbench PNG without starting the private runtime child", async () => {
     const adapter = fakeWorkbenchAdapter();
@@ -883,6 +881,40 @@ describe("Phase H observer MCP tools", () => {
     expect(instancesResult.content[0].text).not.toContain(secret);
     expect(runtimeResult.content[0].text).not.toContain("originalDiagnostic");
     expect(instancesResult.content[0].text).not.toContain("originalDiagnostic");
+  });
+
+  it("renders permitted runtime diagnostics through the central safe public projector", async () => {
+    const manager = {
+      status: vi.fn(async () => {
+        throw new OwnedRuntimeError(
+          "INVALID_REQUEST",
+          "Authorization: Bearer bearer-sentinel at C:\\Users\\name\\runtime-private",
+          {
+            token: "token-sentinel",
+            path: "C:\\Users\\name\\runtime-private",
+            safe: "safe-control",
+          },
+        );
+      }),
+    } as unknown as OwnedRuntimeManager;
+    const coordinator = {
+      defaultCaptureTimeoutMs: 30_000,
+      maxInlineImageBytes: 1_024,
+    } as ObserverApplication;
+    const handler = toolRegistry(coordinator, manager).get("observer_runtime")!.handler;
+    const result = await handler({
+      action: "status",
+      runtimeId: "rt-00000000-0000-4000-8000-000000000001",
+    }, { signal: new AbortController().signal });
+    const text = result.content[0].text!;
+
+    expect(text).toContain("Observer runtime error (INVALID_REQUEST):");
+    expect(text).toContain("```json");
+    expect(text).toContain("safe-control");
+    expect(text.length).toBeLessThanOrEqual(512);
+    expect(text).not.toContain("bearer-sentinel");
+    expect(text).not.toContain("token-sentinel");
+    expect(text).not.toContain("C:\\Users\\name\\runtime-private");
   });
 
   it("rejects stale Workbench expected-world binding before adapter submission", async () => {
@@ -1618,7 +1650,7 @@ describe("Phase H observer MCP tools", () => {
     expect(result.isError).toBe(true);
     expect(result.content).toHaveLength(1);
     expect(result.content[0].text).toContain("ARTIFACT_TOO_LARGE");
-    expect(result.content[0].text).toContain('"jobId": "job-2"');
+    expect(result.content[0].text).toContain('"jobId":"job-2"');
     expect(result.content.some((item) => item.type === "image")).toBe(false);
   });
 });

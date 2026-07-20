@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync } from "node:fs";
+import { mkdirSync } from "node:fs";
 import { homedir, platform } from "node:os";
 import { isIP } from "node:net";
 import { dirname, isAbsolute, join, resolve } from "node:path";
@@ -14,11 +14,17 @@ import type {
   MachineMutex,
   MachineMutexLeaseLoss,
 } from "../foundation/machine-mutex.js";
+import { encodeDurableKey, jsonDurableRecordCodec } from "../foundation/durable-kv.js";
 import {
-  HelperMediatedJsonCasBackend,
-  JsonCasStore,
-  type JsonCasInspection,
-} from "../foundation/json-store.js";
+  LmdbCasStore,
+  type LmdbCasInspection,
+} from "../foundation/lmdb-cas-store.js";
+import {
+  deadlineAfter,
+  pollUntil,
+  systemClock,
+  systemSleeper,
+} from "../foundation/time.js";
 import type {
   RecoverableSpawnJournal,
   RecoverableSpawnRecord,
@@ -228,12 +234,6 @@ export interface WorkbenchLifecycleBackend extends ExactProcessBackend, MachineM
     expected: WorkbenchIdentity
   ): Promise<VerifyEndpointOwnerResult>;
   verifyEndpointVacant(endpoint: LifecycleEndpoint): Promise<VerifyEndpointVacantResult>;
-  replaceState(args: {
-    path: string;
-    expectedGeneration: string | null;
-    next: WorkbenchLifecycleStateV3;
-  }): Promise<void>;
-  archiveState(args: { path: string; archivePath: string; expectedSha256: string }): Promise<void>;
 }
 
 export interface WorkbenchProcessGuardOptions {
@@ -242,6 +242,34 @@ export interface WorkbenchProcessGuardOptions {
   lockTimeoutMs?: number;
   backend?: WorkbenchLifecycleBackend;
   helperPath?: string;
+  /**
+   * Test-only injection seam fired immediately before the lifecycle record
+   * is written. Returning an Error aborts the write, propagating exactly as
+   * a real durable-write failure would. Production callers must not set this.
+   */
+  beforeLifecycleReplace?: (args: {
+    expectedGeneration: string | null;
+    next: WorkbenchLifecycleStateV3;
+  }) => Error | void;
+  /**
+   * Test-only injection seam fired immediately after the lifecycle record
+   * commits, before the caller observes success. Throwing simulates a crash
+   * between durable publication and its caller's continuation.
+   */
+  afterLifecycleReplace?: (args: {
+    generation: string;
+    next: WorkbenchLifecycleStateV3;
+  }) => void;
+  /** Test-only injection seam fired immediately before the spawn journal record is written. */
+  beforeSpawnJournalReplace?: (args: {
+    expectedGeneration: string | null;
+    next: WorkbenchSpawnJournalStateV3;
+  }) => Error | void;
+  /** Test-only injection seam fired immediately after the spawn journal record commits. */
+  afterSpawnJournalReplace?: (args: {
+    generation: string;
+    next: WorkbenchSpawnJournalStateV3;
+  }) => void;
 }
 
 export type LifecycleGuardErrorCode =
@@ -291,10 +319,6 @@ export interface WorkbenchLifecycleSession {
   assertNoWorkbenchProcesses(): Promise<void>;
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
-}
-
 function normalizedPath(path: string): string {
   const absolute = resolve(path);
   return platform() === "win32" ? absolute.toLowerCase() : absolute;
@@ -327,10 +351,6 @@ function processMatches(left: ExactProcessIdentity, right: ExactProcessIdentity)
   return left.pid === right.pid &&
     normalizedPath(left.executablePath) === normalizedPath(right.executablePath) &&
     left.creationTime === right.creationTime;
-}
-
-function parseJsonText(text: string): unknown {
-  return JSON.parse(text.replace(/^\uFEFF/, "")) as unknown;
 }
 
 function isString(value: unknown): value is string {
@@ -625,42 +645,6 @@ export class WindowsLifecycleBackend extends WindowsExactProcessBackend
       message: response.message ?? "The Workbench endpoint is not provably vacant.",
     };
   }
-
-  async replaceState(args: {
-    path: string;
-    expectedGeneration: string | null;
-    next: WorkbenchLifecycleStateV3;
-  }): Promise<void> {
-    const response = await this.invoke("ReplaceState", {
-      statePath: args.path,
-      expectedGeneration: args.expectedGeneration,
-      nextJson: `${JSON.stringify(args.next, null, 2)}\n`,
-    }, this.helperTimeoutMs, true);
-    if (response.ok !== true || response.status !== "replaced") {
-      throw new LifecycleGuardError(
-        `Lifecycle state replacement failed: ${response.message ?? response.reason ?? "unknown helper error"}`,
-        response.message?.includes("generation mismatch") ? "GENERATION_MISMATCH" : "HELPER_FAILURE"
-      );
-    }
-  }
-
-  async archiveState(args: {
-    path: string;
-    archivePath: string;
-    expectedSha256: string;
-  }): Promise<void> {
-    const response = await this.invoke("ArchiveState", {
-      statePath: args.path,
-      archivePath: args.archivePath,
-      expectedSha256: args.expectedSha256,
-    }, this.helperTimeoutMs, true);
-    if (response.ok !== true || response.status !== "archived") {
-      throw new LifecycleGuardError(
-        `Lifecycle state archival failed: ${response.message ?? response.reason ?? "unknown helper error"}`,
-        "HELPER_FAILURE"
-      );
-    }
-  }
 }
 
 class LifecycleSession implements WorkbenchLifecycleSession {
@@ -769,24 +753,29 @@ class LifecycleSession implements WorkbenchLifecycleSession {
 
 export class WorkbenchProcessGuard {
   readonly stateDir: string;
-  readonly statePath: string;
-  readonly spawnJournalPath: string;
   readonly mcpInstanceId = randomUUID();
   readonly leaseId = randomUUID();
   readonly backend: WorkbenchLifecycleBackend;
   private readonly mutexName: string;
   private readonly lockTimeoutMs: number;
+  private readonly corruptDir: string;
+  private readonly beforeLifecycleReplace: WorkbenchProcessGuardOptions["beforeLifecycleReplace"];
+  private readonly afterLifecycleReplace: WorkbenchProcessGuardOptions["afterLifecycleReplace"];
+  private readonly beforeSpawnJournalReplace: WorkbenchProcessGuardOptions["beforeSpawnJournalReplace"];
+  private readonly afterSpawnJournalReplace: WorkbenchProcessGuardOptions["afterSpawnJournalReplace"];
   private identityPromise: Promise<ExactProcessIdentity & { userSid: string }> | null = null;
-  private helperCasBackend: HelperMediatedJsonCasBackend | null = null;
-  private lifecycleCasStore: JsonCasStore<WorkbenchLifecycleStateV3> | null = null;
-  private spawnCasStore: JsonCasStore<WorkbenchSpawnJournalStateV3> | null = null;
+  private lifecycleCasStore: LmdbCasStore<WorkbenchLifecycleStateV3> | null = null;
+  private spawnCasStore: LmdbCasStore<WorkbenchSpawnJournalStateV3> | null = null;
 
   constructor(options: WorkbenchProcessGuardOptions = {}) {
     this.stateDir = resolve(options.stateDir ?? defaultStateDir());
-    this.statePath = join(this.stateDir, "lifecycle.json");
-    this.spawnJournalPath = join(this.stateDir, "spawn-journal.json");
+    this.corruptDir = join(this.stateDir, "corrupt");
     this.mutexName = options.mutexName ?? DEFAULT_LIFECYCLE_MUTEX;
     this.lockTimeoutMs = options.lockTimeoutMs ?? DEFAULT_LOCK_TIMEOUT_MS;
+    this.beforeLifecycleReplace = options.beforeLifecycleReplace;
+    this.afterLifecycleReplace = options.afterLifecycleReplace;
+    this.beforeSpawnJournalReplace = options.beforeSpawnJournalReplace;
+    this.afterSpawnJournalReplace = options.afterSpawnJournalReplace;
     const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
     const helperPath = resolve(
       options.helperPath ?? join(packageRoot, "scripts", "windows", "workbench-lifecycle.ps1")
@@ -803,6 +792,14 @@ export class WorkbenchProcessGuard {
       throw new LifecycleGuardError("Workbench owner token must not be empty.", "STATE_INVALID");
     }
     return `${WORKBENCH_OWNER_ARG_PREFIX}${token}`;
+  }
+
+  /** Close the LMDB environments backing lifecycle and spawn-journal state, if opened. */
+  async close(): Promise<void> {
+    await Promise.all([
+      this.lifecycleCasStore?.close(),
+      this.spawnCasStore?.close(),
+    ]);
   }
 
   /**
@@ -873,70 +870,54 @@ export class WorkbenchProcessGuard {
     }
   }
 
-  private casBackend(): HelperMediatedJsonCasBackend {
-    this.helperCasBackend ??= new HelperMediatedJsonCasBackend({
-      compareAndSwap: async ({ path, expectedGeneration, nextJson }) => {
-        const next = parseJsonText(nextJson) as WorkbenchLifecycleStateV3;
-        await this.backend.replaceState({ path, expectedGeneration, next });
-      },
-      archive: ({ path, archivePath, expectedSha256 }) =>
-        this.backend.archiveState({ path, archivePath, expectedSha256 }),
-      isConflict: (error) => error instanceof LifecycleGuardError
-        ? error.code === "GENERATION_MISMATCH"
-        : error instanceof Error && /generation mismatch/i.test(error.message),
-    });
-    return this.helperCasBackend;
-  }
-
-  private lifecycleStore(): JsonCasStore<WorkbenchLifecycleStateV3> {
+  private lifecycleStore(): LmdbCasStore<WorkbenchLifecycleStateV3> {
     mkdirSync(this.stateDir, { recursive: true });
-    this.lifecycleCasStore ??= new JsonCasStore({
-      root: this.stateDir,
-      path: this.statePath,
-      minRecordBytes: 1,
+    this.lifecycleCasStore ??= new LmdbCasStore({
+      storageRoot: this.stateDir,
+      key: encodeDurableKey("workbench", "lifecycle"),
+      recordLabel: "lifecycle",
+      schema: "workbench-lifecycle-v3",
       maxRecordBytes: MAX_LIFECYCLE_STATE_BYTES,
-      maxTotalBytes: MAX_LIFECYCLE_STATE_BYTES * 4,
-      maxRecords: 16,
-      durable: true,
-      parse: (value) => {
+      corruptArchiveDir: this.corruptDir,
+      codec: jsonDurableRecordCodec((value) => {
         const parsed = parseLifecycleState(value);
         if (!parsed) {
           throw new TypeError("Lifecycle state does not satisfy the strict version-3 schema.");
         }
         return parsed;
-      },
+      }),
       generationOf: (state) => state.generation,
-      backend: this.casBackend(),
+      beforeCompareAndSwap: this.beforeLifecycleReplace,
+      afterCompareAndSwap: this.afterLifecycleReplace,
     });
     return this.lifecycleCasStore;
   }
 
-  private spawnStore(): JsonCasStore<WorkbenchSpawnJournalStateV3> {
+  private spawnStore(): LmdbCasStore<WorkbenchSpawnJournalStateV3> {
     mkdirSync(this.stateDir, { recursive: true });
-    this.spawnCasStore ??= new JsonCasStore({
-      root: this.stateDir,
-      path: this.spawnJournalPath,
-      minRecordBytes: 1,
+    this.spawnCasStore ??= new LmdbCasStore({
+      storageRoot: this.stateDir,
+      key: encodeDurableKey("workbench", "spawn-journal"),
+      recordLabel: "spawn-journal",
+      schema: "workbench-spawn-journal-v3",
       maxRecordBytes: MAX_SPAWN_JOURNAL_BYTES,
-      maxTotalBytes: MAX_SPAWN_JOURNAL_BYTES * 8,
-      maxRecords: 16,
-      durable: true,
-      parse: parseWorkbenchSpawnJournalState,
+      corruptArchiveDir: this.corruptDir,
+      codec: jsonDurableRecordCodec(parseWorkbenchSpawnJournalState),
       generationOf: (state) => state.generation,
-      backend: this.casBackend(),
+      beforeCompareAndSwap: this.beforeSpawnJournalReplace,
+      afterCompareAndSwap: this.afterSpawnJournalReplace,
     });
     return this.spawnCasStore;
   }
 
   async readLifecycleState(): Promise<LifecycleStateRead> {
-    if (!existsSync(this.statePath)) return { kind: "missing" };
-    let inspected: JsonCasInspection<WorkbenchLifecycleStateV3>;
+    let inspected: LmdbCasInspection<WorkbenchLifecycleStateV3>;
     try {
       inspected = await this.lifecycleStore().inspect();
     } catch (error) {
       return {
         kind: "malformed",
-        path: this.statePath,
+        path: join(this.corruptDir, "lifecycle.json"),
         rawSha256: "unreadable",
         message: `Lifecycle state cannot be read: ${error instanceof Error ? error.message : String(error)}`,
       };
@@ -952,14 +933,13 @@ export class WorkbenchProcessGuard {
   }
 
   async readSpawnJournal(): Promise<WorkbenchSpawnJournalRead> {
-    if (!existsSync(this.spawnJournalPath)) return { kind: "missing" };
-    let inspected: JsonCasInspection<WorkbenchSpawnJournalStateV3>;
+    let inspected: LmdbCasInspection<WorkbenchSpawnJournalStateV3>;
     try {
       inspected = await this.spawnStore().inspect();
     } catch (error) {
       return {
         kind: "malformed",
-        path: this.spawnJournalPath,
+        path: join(this.corruptDir, "spawn-journal.json"),
         rawSha256: "unreadable",
         message: `Workbench spawn journal cannot be read: ${error instanceof Error
           ? error.message
@@ -1122,36 +1102,41 @@ export class WorkbenchProcessGuard {
     ownerTokenArgument: string;
     launchedAtMs: number;
   }): Promise<WorkbenchIdentity> {
-    const deadline = Date.now() + PROCESS_CAPTURE_TIMEOUT_MS;
     let lastError: unknown;
-    while (Date.now() < deadline) {
-      let inspection: ProcessInspection | null = null;
-      try {
-        inspection = await this.backend.inspectProcess(args.pid, args.ownerTokenArgument);
-      } catch (error) {
-        lastError = error;
-      }
-      if (inspection?.identity.pid !== undefined && inspection.identity.pid !== args.pid) {
-        throw new LifecycleGuardError(
-          `Process inspection for spawned PID ${args.pid} returned PID ${inspection.identity.pid}.`,
-          "IDENTITY_UNVERIFIABLE"
-        );
-      }
-      if (inspection && normalizedPath(inspection.identity.executablePath) !== normalizedPath(args.executablePath)) {
-        throw new LifecycleGuardError(
-          `Spawned PID ${args.pid} executable path does not match Workbench.`,
-          "IDENTITY_UNVERIFIABLE"
-        );
-      }
-      if (inspection?.ownerArgumentMatched === true) {
-        return {
-          ...inspection.identity,
-          ownerTokenArgument: args.ownerTokenArgument,
-          launchedAtMs: args.launchedAtMs,
-        };
-      }
-      await sleep(PROCESS_POLL_MS);
-    }
+    const result = await pollUntil<WorkbenchIdentity>({
+      clock: systemClock,
+      sleeper: systemSleeper,
+      deadline: deadlineAfter(systemClock, PROCESS_CAPTURE_TIMEOUT_MS),
+      intervalMs: PROCESS_POLL_MS,
+      probe: async (): Promise<WorkbenchIdentity | undefined> => {
+        let inspection: ProcessInspection | null = null;
+        try {
+          inspection = await this.backend.inspectProcess(args.pid, args.ownerTokenArgument);
+        } catch (error) {
+          lastError = error;
+        }
+        if (inspection?.identity.pid !== undefined && inspection.identity.pid !== args.pid) {
+          throw new LifecycleGuardError(
+            `Process inspection for spawned PID ${args.pid} returned PID ${inspection.identity.pid}.`,
+            "IDENTITY_UNVERIFIABLE"
+          );
+        }
+        if (inspection && normalizedPath(inspection.identity.executablePath) !== normalizedPath(args.executablePath)) {
+          throw new LifecycleGuardError(
+            `Spawned PID ${args.pid} executable path does not match Workbench.`,
+            "IDENTITY_UNVERIFIABLE"
+          );
+        }
+        return inspection?.ownerArgumentMatched === true
+          ? {
+              ...inspection.identity,
+              ownerTokenArgument: args.ownerTokenArgument,
+              launchedAtMs: args.launchedAtMs,
+            }
+          : undefined;
+      },
+    });
+    if (result.kind === "value") return result.value;
     throw new LifecycleGuardError(
       `Could not verify spawned Workbench PID ${args.pid} by exact handle identity and owner argument` +
         `${lastError instanceof Error ? `: ${lastError.message}` : "."}`,

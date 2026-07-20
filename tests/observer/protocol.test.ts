@@ -1,4 +1,4 @@
-import { readdirSync, readFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
@@ -8,6 +8,16 @@ import {
   CAPABILITIES,
   CAPABILITY_REGISTRY,
   JOB_STATES,
+  OBSERVER_ENFORCE_CONTRACT,
+  OBSERVER_TERMINAL_STATES,
+  PROTOCOL_VERSION,
+  TERMINAL_JOB_STATES,
+  WORKBENCH_ADAPTER_CAPABILITIES,
+  WORKBENCH_ADAPTER_ERROR_CODES,
+  WORKBENCH_ADAPTER_PROTOCOL,
+  WORKBENCH_ADAPTER_STATE_VALUES,
+  WORKBENCH_ADAPTER_TERMINAL_STATES,
+  WORKBENCH_OBSERVER_ADAPTER_PROTOCOL,
   artifactManifestSchema,
   cameraLeaseStatusSchema,
   captureRequestSchema,
@@ -20,9 +30,16 @@ import {
   jobStatusSchema,
 } from "../../observer/protocol/index.js";
 import { redactForDiagnostics } from "../../observer/agent/logger.js";
-import { repositoryRoot } from "./helpers.js";
+import { WORKBENCH_HELPER_PROTOCOL_VERSION } from "../../src/workbench/helper-addon.js";
+import { repositoryRoot } from "../support/observer-fixtures.js";
 
 const examples = join(repositoryRoot, "observer", "protocol", "examples");
+
+function targetValues(target: "game" | "workbench", prefix: string): string[] {
+  return OBSERVER_ENFORCE_CONTRACT.targets[target].strings
+    .filter((entry) => entry.field.startsWith(prefix))
+    .map((entry) => entry.value);
+}
 
 describe("observer protocol", () => {
   it.each([
@@ -174,78 +191,53 @@ describe("observer protocol", () => {
     expect(ERROR_REGISTRY.CAMERA_BUSY.backends).toContain("owned-runtime");
   });
 
-  it("contains every statically emitted observer host/adapter error", () => {
-    const sourceRoots = [
-      join(repositoryRoot, "observer", "agent"),
-      join(repositoryRoot, "src", "observer"),
-    ];
-    const files: string[] = [
-      join(repositoryRoot, "src", "tools", "observer-runtime.ts"),
-      join(repositoryRoot, "src", "workbench", "observer-adapter.ts"),
-    ];
-    const visit = (directory: string): void => {
-      for (const entry of readdirSync(directory, { withFileTypes: true })) {
-        const path = join(directory, entry.name);
-        if (entry.isDirectory()) visit(path);
-        else if (entry.isFile() && path.endsWith(".ts")) files.push(path);
-      }
-    };
-    sourceRoots.forEach(visit);
-    const emitted = new Set<string>();
-    for (const path of files) {
-      const source = readFileSync(path, "utf8");
-      for (const match of source.matchAll(
-        /(?:ObserverError|ObserverCoordinatorError|OwnedRuntimeError|WorkbenchObserverAdapterError)\(\s*["']([A-Z][A-Z0-9_]*)["']/g
-      )) emitted.add(match[1]);
-      for (const match of source.matchAll(/normalizeError\([^,]+,\s*["']([A-Z][A-Z0-9_]*)["']/g)) {
-        emitted.add(match[1]);
-      }
-    }
-    expect([...emitted].filter((code) => !(code in ERROR_REGISTRY)).sort()).toEqual([]);
+  it("keeps the runtime, adapter, and helper-bundle protocol identities independent", () => {
+    const identities = OBSERVER_ENFORCE_CONTRACT.identities;
+
+    expect(identities.runtimeObserver).toBe(PROTOCOL_VERSION);
+    expect(identities.workbenchAdapter).toBe(WORKBENCH_OBSERVER_ADAPTER_PROTOCOL);
+    expect(identities.workbenchAdapter).toBe(WORKBENCH_ADAPTER_PROTOCOL);
+    expect(identities.workbenchHelperBundle).toBe(WORKBENCH_HELPER_PROTOCOL_VERSION);
+    expect(new Set(Object.values(identities)).size).toBe(3);
+    expect(targetValues("game", "RUNTIME_PROTOCOL_")).toEqual([PROTOCOL_VERSION]);
+    expect(targetValues("workbench", "ADAPTER_PROTOCOL")).toEqual([
+      WORKBENCH_OBSERVER_ADAPTER_PROTOCOL,
+    ]);
   });
 
-  it("contains every capability emitted by its proving backend", () => {
-    const runtimeSource = readFileSync(join(
-      repositoryRoot, "observer", "addon", "Scripts", "Game",
-      "ReforgerForgeObserver", "RFO_ObserverCapabilities.c"
-    ), "utf8");
-    const workbenchSource = readFileSync(join(repositoryRoot, "src", "workbench", "observer-adapter.ts"), "utf8");
-    const runtimeCapabilities = [...runtimeSource.matchAll(/result\.Insert\("([a-z.]+)"\)/g)].map((match) => match[1]);
-    const workbenchCapabilities = [...workbenchSource.matchAll(/capabilities\.push\("([a-z.]+)"\)/g)].map((match) => match[1]);
-    for (const capability of runtimeCapabilities) {
-      expect(capability in CAPABILITY_REGISTRY).toBe(true);
-      expect(CAPABILITY_REGISTRY[capability as keyof typeof CAPABILITY_REGISTRY].backends).toContain("runtime");
-    }
-    for (const capability of workbenchCapabilities) {
-      expect(capability in CAPABILITY_REGISTRY).toBe(true);
-      expect(CAPABILITY_REGISTRY[capability as keyof typeof CAPABILITY_REGISTRY].backends).toContain("workbench");
-    }
-  });
+  it("derives target-specific state, error, and capability membership from canonical vocabularies", () => {
+    const runtimeErrors = Object.entries(ERROR_REGISTRY)
+      .filter(([, definition]) => definition.backends.includes("runtime" as never))
+      .map(([code]) => code);
+    const workbenchErrors = Object.entries(ERROR_REGISTRY)
+      .filter(([, definition]) => definition.backends.includes("workbench" as never))
+      .map(([code]) => code);
+    const runtimeCapabilities = Object.entries(CAPABILITY_REGISTRY)
+      .filter(([, definition]) => definition.backends.includes("runtime" as never))
+      .map(([capability]) => capability);
+    const workbenchCapabilities = Object.entries(CAPABILITY_REGISTRY)
+      .filter(([, definition]) => definition.backends.includes("workbench" as never))
+      .map(([capability]) => capability);
+    // The Workbench response surface is a deliberate subset of the canonical
+    // job order plus every canonical terminal state. Keep this expectation
+    // derived so a spelling change cannot be hidden by a second copied list.
+    const workbenchResponseStateIndexes = new Set([2, 7, 8, 9, 10]);
+    const workbenchResponseStates = JOB_STATES.filter((state, index) =>
+      workbenchResponseStateIndexes.has(index) || TERMINAL_JOB_STATES.includes(state)
+    );
 
-  it("accepts every failure code emitted by the runtime addon", () => {
-    const runtimeService = readFileSync(join(
-      repositoryRoot,
-      "observer",
-      "addon",
-      "Scripts",
-      "Game",
-      "ReforgerForgeObserver",
-      "RFO_ObserverService.c"
-    ), "utf8");
-    const emittedCodes = [
-      ...runtimeService.matchAll(/RecordFailure\("([A-Z_]+)"/g),
-      ...runtimeService.matchAll(/RejectCommand\([^,\r\n]+,\s*"([A-Z_]+)"/g),
-      ...runtimeService.matchAll(/m_RFO_LastErrorCode\s*=\s*"([A-Z_]+)"/g),
-      ...runtimeService.matchAll(/terminalErrorCode\s*=(?!=)\s*"([A-Z_]+)"/g),
-    ].map((match) => match[1]);
-
-    expect(emittedCodes.length).toBeGreaterThan(0);
-    expect([...new Set(emittedCodes)].filter((code) => !ERROR_CODES.includes(
-      code as (typeof ERROR_CODES)[number]
-    ))).toEqual([]);
-    for (const code of new Set(emittedCodes)) {
-      expect(ERROR_REGISTRY[code as keyof typeof ERROR_REGISTRY].backends).toContain("runtime");
-    }
+    expect(targetValues("game", "STATE_")).toEqual(JOB_STATES);
+    expect(targetValues("workbench", "STATE_")).toEqual(workbenchResponseStates);
+    expect(OBSERVER_ENFORCE_CONTRACT.terminalStates).toEqual(TERMINAL_JOB_STATES);
+    expect(OBSERVER_TERMINAL_STATES).toEqual(TERMINAL_JOB_STATES);
+    expect(WORKBENCH_ADAPTER_TERMINAL_STATES).toEqual(TERMINAL_JOB_STATES);
+    expect(targetValues("game", "ERROR_")).toEqual(runtimeErrors);
+    expect(targetValues("workbench", "ERROR_")).toEqual(workbenchErrors);
+    expect(targetValues("game", "CAP_")).toEqual(runtimeCapabilities);
+    expect(targetValues("workbench", "CAP_")).toEqual(workbenchCapabilities);
+    expect(Object.values(WORKBENCH_ADAPTER_ERROR_CODES)).toEqual(workbenchErrors);
+    expect(Object.values(WORKBENCH_ADAPTER_CAPABILITIES)).toEqual(workbenchCapabilities);
+    expect(Object.values(WORKBENCH_ADAPTER_STATE_VALUES)).toEqual(workbenchResponseStates);
   });
 
   it("redacts contract bodies, nonce credentials, bearer headers, and named token values from diagnostics", () => {

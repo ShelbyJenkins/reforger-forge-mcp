@@ -15,6 +15,7 @@ import {
 import { dirname, join, parse, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
+import { redactText } from "../foundation/redact.js";
 import type {
   ExactProcessBackend,
   ExactProcessInspection,
@@ -29,6 +30,10 @@ import {
   DurableReservationGate,
   ReservationCancelledError,
 } from "../foundation/reservation-gate.js";
+import {
+  systemSleeper,
+  type Sleeper,
+} from "../foundation/time.js";
 import {
   runRecoverableSpawn,
   type RecoverableSpawnRecord,
@@ -222,6 +227,8 @@ export interface OwnedRuntimeManagerOptions {
   spawnProcess?: typeof nodeSpawn;
   executableResolver?: () => string;
   clock?: () => number;
+  /** Ordinary local-delay seam; durable deadlines and recovery remain local. */
+  sleeper?: Sleeper;
   ownerToken?: () => string;
   randomId?: () => string;
   installationRoot?: string;
@@ -716,23 +723,6 @@ function nowIso(clock: () => number): string {
   return new Date(clock()).toISOString();
 }
 
-function wait(milliseconds: number, signal?: AbortSignal): Promise<void> {
-  if (signal?.aborted) return Promise.reject(new OwnedRuntimeError("CANCELLED", "Owned runtime stop was cancelled"));
-  return new Promise((resolvePromise, reject) => {
-    const timer = setTimeout(() => {
-      signal?.removeEventListener("abort", abort);
-      resolvePromise();
-    }, milliseconds);
-    timer.unref();
-    const abort = (): void => {
-      clearTimeout(timer);
-      signal?.removeEventListener("abort", abort);
-      reject(new OwnedRuntimeError("CANCELLED", "Owned runtime stop was cancelled"));
-    };
-    signal?.addEventListener("abort", abort, { once: true });
-  });
-}
-
 /** Resolve only allowlisted graphical runtime names beneath the configured game installation. */
 export function resolveGraphicalRuntimeExecutable(gamePath: string): string {
   const gameRoot = canonicalDirectory(gamePath, false);
@@ -766,6 +756,7 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
   private readonly durableReservations = new DurableReservationGate();
   private readonly spawnProcess: typeof nodeSpawn;
   private readonly clock: () => number;
+  private readonly sleeper: Sleeper;
   private readonly createOwnerToken: () => string;
   private readonly createId: () => string;
   private readonly resolveExecutable: () => string;
@@ -795,6 +786,7 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
     this.machineMutex = machineMutex;
     this.spawnProcess = options.spawnProcess ?? nodeSpawn;
     this.clock = options.clock ?? Date.now;
+    this.sleeper = options.sleeper ?? systemSleeper;
     this.createOwnerToken = options.ownerToken ?? (() => randomBytes(32).toString("base64url"));
     this.createId = options.randomId ?? randomUUID;
     this.resolveExecutable = options.executableResolver ?? (() => resolveGraphicalRuntimeExecutable(options.gamePath));
@@ -2939,7 +2931,7 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
       } catch (error) {
         lastError = error;
       }
-      await wait(PROCESS_POLL_MS);
+      await this.sleeper.sleep(PROCESS_POLL_MS);
     }
     throw new OwnedRuntimeError(
       "IDENTITY_UNVERIFIABLE",
@@ -2976,7 +2968,7 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
     // ChildProcess returned by the direct structured spawn.
     const signalled = child.kill();
     if (!signalled && child.exitCode === null && child.signalCode === null) return false;
-    await Promise.race([exited, wait(5_000)]);
+    await Promise.race([exited, this.sleeper.sleep(5_000)]);
     return exitObserved || child.exitCode !== null || child.signalCode !== null;
   }
 
@@ -4133,9 +4125,11 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
 
   private message(error: unknown): string {
     const value = error instanceof Error ? error.message : String(error);
-    return value
-      .replace(/-reforgerForgeOwnerToken=[^\s"']+/gi, "[owner-token-redacted]")
-      .slice(0, 512);
+    return redactText(value, {
+      profile: "command_argument",
+      replacement: "[owner-token-redacted]",
+      maxLength: 512,
+    });
   }
 }
 

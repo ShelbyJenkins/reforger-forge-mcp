@@ -1,15 +1,12 @@
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, utimesSync, writeFileSync } from "node:fs";
 import { join, relative, sep } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import { ArtifactStore } from "../../observer/agent/artifacts.js";
 import { convertBmpToPng } from "../../observer/agent/bmp.js";
 import { ObserverRunStore } from "../../observer/agent/runs.js";
 import { FileEvidenceBundleService } from "../../observer/agent/evidence-bundle-service.js";
-import { cleanup, temporaryDirectory } from "./helpers.js";
-
-const roots: string[] = [];
-afterEach(() => roots.splice(0).forEach(cleanup));
+import { withTemporaryDirectory } from "../support/temporary-directory.js";
 
 function bmp24(width = 2, height = 2): Buffer {
   const rowStride = Math.floor((24 * width + 31) / 32) * 4;
@@ -32,9 +29,7 @@ function bmp24(width = 2, height = 2): Buffer {
   return data;
 }
 
-function setup() {
-  const root = temporaryDirectory("rfo-runs-");
-  roots.push(root);
+function setup(root: string) {
   const evidence = join(root, "evidence");
   const logs = join(root, "logs");
   mkdirSync(evidence);
@@ -47,6 +42,13 @@ function setup() {
   const exporter = new FileEvidenceBundleService(join(root, "export-work"), [evidence], [logs]);
   const runs = new ObserverRunStore(join(root, "runs"), artifacts, exporter);
   return { root, evidence, logs, artifacts, runs };
+}
+
+function scopedIt(
+  name: string,
+  run: (root: string) => Promise<void> | void,
+): void {
+  it(name, () => withTemporaryDirectory(run, { prefix: "rfo-runs-" }));
 }
 
 function completedCapture(
@@ -153,8 +155,8 @@ function reattestBundleMember(
 }
 
 describe("managed observer runs", () => {
-  it("normalizes unique labels and rejects collisions", () => {
-    const value = setup();
+  scopedIt("normalizes unique labels and rejects collisions", (root) => {
+    const value = setup(root);
     const begun = value.runs.begin({ title: "Labels" });
     const input = {
       runId: begun.runId as string,
@@ -169,8 +171,8 @@ describe("managed observer runs", () => {
       .toThrowError(expect.objectContaining({ code: "INVALID_REQUEST" }));
   });
 
-  it("exports a reviewed manifest-last bundle and releases managed artifacts", () => {
-    const value = setup();
+  scopedIt("exports a reviewed manifest-last bundle and releases managed artifacts", (root) => {
+    const value = setup(root);
     const { runId, ref } = completedCapture(value);
     const log = join(value.logs, "runtime.log");
     writeFileSync(log, "ready\ntoken=do-not-export\nfinished\n", "utf8");
@@ -233,8 +235,8 @@ describe("managed observer runs", () => {
     expect(retried).toMatchObject({ receipt: { manifestSha256: finalized.receipt && (finalized.receipt as Record<string, unknown>).manifestSha256 } });
   });
 
-  it("rejects corrupted and unmanifested members when a finalized receipt is retried", () => {
-    const value = setup();
+  scopedIt("rejects corrupted and unmanifested members when a finalized receipt is retried", (root) => {
+    const value = setup(root);
     const { runId, ref } = completedCapture(value);
     const input = reviewedFinalizeInput(value, runId);
     value.runs.finalize(input);
@@ -251,8 +253,8 @@ describe("managed observer runs", () => {
     expect(value.artifacts.hasRef(ref)).toBe(true);
   });
 
-  it("rejects an oversized evidence manifest through the bounded descriptor reader", () => {
-    const value = setup();
+  scopedIt("rejects an oversized evidence manifest through the bounded descriptor reader", (root) => {
+    const value = setup(root);
     const { runId } = completedCapture(value);
     const input = reviewedFinalizeInput(value, runId);
     value.runs.finalize(input);
@@ -268,8 +270,8 @@ describe("managed observer runs", () => {
     }));
   });
 
-  it("rejects re-attested capture metadata whose JSON representation exceeds its descriptor bound", () => {
-    const value = setup();
+  scopedIt("rejects re-attested capture metadata whose JSON representation exceeds its descriptor bound", (root) => {
+    const value = setup(root);
     const { runId } = completedCapture(value);
     const input = reviewedFinalizeInput(value, runId);
     value.runs.finalize(input);
@@ -284,8 +286,8 @@ describe("managed observer runs", () => {
     }));
   });
 
-  it("rejects re-attested runtime JSON whose representation exceeds the runtime-config bound", () => {
-    const value = setup();
+  scopedIt("rejects re-attested runtime JSON whose representation exceeds the runtime-config bound", (root) => {
+    const value = setup(root);
     const { runId } = completedCapture(value);
     const runtimeConfig = { configurationId: "rr-test", values: { warmupDurationSeconds: 60 } };
     const input = { ...reviewedFinalizeInput(value, runId), runtimeConfig };
@@ -299,8 +301,8 @@ describe("managed observer runs", () => {
     }));
   });
 
-  it("refuses a manifest-only forged recovery without releasing its managed artifact", () => {
-    const value = setup();
+  scopedIt("refuses a manifest-only forged recovery without releasing its managed artifact", (root) => {
+    const value = setup(root);
     const { runId, ref } = completedCapture(value);
     const input = reviewedFinalizeInput(value, runId);
     const fingerprint = createHash("sha256").update(JSON.stringify(input)).digest("hex");
@@ -318,8 +320,8 @@ describe("managed observer runs", () => {
     expect(value.artifacts.hasRef(ref)).toBe(true);
   });
 
-  it("recovers a fully attested manifest-last bundle after the run-record commit was interrupted", () => {
-    const value = setup();
+  scopedIt("recovers a fully attested manifest-last bundle after the run-record commit was interrupted", (root) => {
+    const value = setup(root);
     const { runId, ref } = completedCapture(value);
     const input = reviewedFinalizeInput(value, runId);
     value.runs.finalize(input);
@@ -338,8 +340,8 @@ describe("managed observer runs", () => {
     expect(value.artifacts.hasRef(ref)).toBe(true);
   });
 
-  it("refuses an evidence root that was replaced after it was allowlisted", () => {
-    const value = setup();
+  scopedIt("refuses an evidence root that was replaced after it was allowlisted", (root) => {
+    const value = setup(root);
     const { runId, ref } = completedCapture(value);
     const original = `${value.evidence}-original`;
     renameSync(value.evidence, original);
@@ -351,8 +353,8 @@ describe("managed observer runs", () => {
     expect(value.artifacts.hasRef(ref)).toBe(true);
   });
 
-  it("escapes control characters and Markdown structure in RESULT.md presentation fields", () => {
-    const value = setup();
+  scopedIt("escapes control characters and Markdown structure in RESULT.md presentation fields", (root) => {
+    const value = setup(root);
     const { runId } = completedCapture(value, "Feature -- Proof", "Trusted\n# Forged *Title*");
     value.runs.finalize({
       ...reviewedFinalizeInput(value, runId),
@@ -373,8 +375,8 @@ describe("managed observer runs", () => {
     expect(result).toContain("\\[link\\]\\(https://example\\.invalid\\)");
   });
 
-  it("refuses arbitrary roots, secret config, and unreviewed pass claims", () => {
-    const value = setup();
+  scopedIt("refuses arbitrary roots, secret config, and unreviewed pass claims", (root) => {
+    const value = setup(root);
     const { runId } = completedCapture(value);
     const base = {
       runId,
@@ -399,8 +401,8 @@ describe("managed observer runs", () => {
     })).toThrowError(expect.objectContaining({ code: "INVALID_REQUEST" }));
   });
 
-  it("protects artifacts retained by an open run from independent release", () => {
-    const value = setup();
+  scopedIt("protects artifacts retained by an open run from independent release", (root) => {
+    const value = setup(root);
     const { runId, ref } = completedCapture(value);
     expect(value.runs.protectedStoreKeys()).toContain(ref.storeKey);
     expect(() => value.runs.assertJobReleaseAllowed("workbench", ref.jobId))
@@ -409,8 +411,8 @@ describe("managed observer runs", () => {
     expect(value.artifacts.hasRef(ref)).toBe(false);
   });
 
-  it("expires abandoned open runs and interrupted export work", () => {
-    const value = setup();
+  scopedIt("expires abandoned open runs and interrupted export work", (root) => {
+    const value = setup(root);
     const { runId, ref } = completedCapture(value);
     const recordPath = join(value.root, "runs", runId, "run.json");
     const record = JSON.parse(readFileSync(recordPath, "utf8"));

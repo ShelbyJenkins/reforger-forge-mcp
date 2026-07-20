@@ -10,11 +10,97 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
-import { fileURLToPath } from "node:url";
-import { verifyPackagedAddonInventory } from "./lib/addon-inventory.mjs";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import {
+  MAX_SOURCE_MANIFEST_BYTES,
+  verifyPackedArchiveAddonInventory,
+  verifyPackagedAddonInventory,
+} from "./lib/addon-inventory.mjs";
+import { inspectPackedArchive } from "./lib/packed-archive.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const npmExecPath = process.env.npm_execpath;
+const enforceContractDescriptorPath = "observer/protocol/generated/enforce-contract.json";
+const packedEnforceContractDescriptorPath = `package/${enforceContractDescriptorPath}`;
+
+function isNormalizedPackagePath(value) {
+  return typeof value === "string" && value.length > 0 &&
+    /^[A-Za-z0-9._/-]+$/.test(value) && !value.startsWith("/") &&
+    value.split("/").every((segment) => segment !== "" && segment !== "." && segment !== "..");
+}
+
+function readPackedEnforceContractTargets(packedArchive) {
+  const descriptorText = packedArchive.textEntries.get(packedEnforceContractDescriptorPath);
+  if (typeof descriptorText !== "string") {
+    throw new Error(`Packed package is missing ${enforceContractDescriptorPath}`);
+  }
+
+  let descriptor;
+  try {
+    descriptor = JSON.parse(descriptorText);
+  } catch (error) {
+    throw new Error(
+      `Packed Enforce contract descriptor is malformed: ${error instanceof Error ? error.message : String(error)}`
+    );
+  }
+  if (!descriptor || typeof descriptor !== "object" || Array.isArray(descriptor) ||
+      !descriptor.targets || typeof descriptor.targets !== "object" || Array.isArray(descriptor.targets)) {
+    throw new Error("Packed Enforce contract descriptor has no target map");
+  }
+
+  const targetEntries = Object.entries(descriptor.targets);
+  if (targetEntries.length === 0) {
+    throw new Error("Packed Enforce contract descriptor has no generated targets");
+  }
+  const outputPaths = new Set();
+  return targetEntries.map(([targetName, target]) => {
+    const outputPath = target?.outputPath;
+    if (typeof targetName !== "string" || targetName.length === 0 ||
+        !target || typeof target !== "object" || Array.isArray(target) ||
+        !isNormalizedPackagePath(outputPath) || !outputPath.endsWith(".c")) {
+      throw new Error(`Packed Enforce contract target ${JSON.stringify(targetName)} is invalid`);
+    }
+    if (outputPaths.has(outputPath.toLowerCase())) {
+      throw new Error(`Packed Enforce contract repeats generated target path: ${outputPath}`);
+    }
+    outputPaths.add(outputPath.toLowerCase());
+    return Object.freeze({ name: targetName, outputPath });
+  });
+}
+
+/**
+ * The tarball descriptor is the sole inventory of generated Enforce C files.
+ * Its target path must be both present in the archive and declared by exactly
+ * one of the shipped add-on manifests; no copied C filename list is kept here.
+ */
+function verifyPackedEnforceProtocolTargets(packedArchive, addonManifests) {
+  const targets = readPackedEnforceContractTargets(packedArchive);
+  for (const target of targets) {
+    if (!packedArchive.files.has(target.outputPath)) {
+      throw new Error(
+        `Packed Enforce target ${target.name} is absent from the tarball: ${target.outputPath}`
+      );
+    }
+    const candidateManifests = addonManifests.filter(({ addonRoot }) =>
+      target.outputPath.startsWith(`${addonRoot}/`)
+    );
+    if (candidateManifests.length !== 1) {
+      throw new Error(
+        `Packed Enforce target ${target.name} does not belong to exactly one add-on manifest: ` +
+        target.outputPath
+      );
+    }
+    const [{ addonRoot, manifestName, manifest }] = candidateManifests;
+    const payloadPath = target.outputPath.slice(addonRoot.length + 1);
+    if (!manifest.files.some((entry) => entry.path === payloadPath)) {
+      throw new Error(
+        `Packed Enforce target ${target.name} is not declared by ${addonRoot}/${manifestName}: ` +
+        payloadPath
+      );
+    }
+  }
+  return targets;
+}
 
 function directWindowsNpmCli() {
   const candidates = [
@@ -167,7 +253,49 @@ try {
     );
   }
 
-const files = new Set((report[0]?.files ?? []).map((file) => file.path));
+  const packedFilename = report[0]?.filename;
+  if (typeof packedFilename !== "string" || packedFilename.length === 0) {
+    throw new Error("npm pack did not report the produced tarball filename");
+  }
+  const tarballPath = resolve(packDestination, packedFilename);
+  assertContained(packDestination, tarballPath, "Packed tarball");
+  if (!existsSync(tarballPath)) {
+    throw new Error(`npm pack reported a tarball that does not exist: ${tarballPath}`);
+  }
+  const packedArchive = await inspectPackedArchive({
+    tarballPath,
+    tarballRoot: packDestination,
+    packagePrefix: "package/",
+    maximumEntryBytes: MAX_SOURCE_MANIFEST_BYTES,
+    textEntries: [
+      "package/observer/addon/.reforger-forge-observer-source.json",
+      "package/observer/workbench-addon/.reforger-forge-workbench-helper-source.json",
+      packedEnforceContractDescriptorPath,
+    ],
+  });
+  const packedAddonManifests = [
+    {
+      addonRoot: "observer/addon",
+      manifestName: ".reforger-forge-observer-source.json",
+      displayName: "Packed observer add-on",
+      allowedGeneratedFiles: new Set(["resourceDatabase.rdb"]),
+    },
+    {
+      addonRoot: "observer/workbench-addon",
+      manifestName: ".reforger-forge-workbench-helper-source.json",
+      displayName: "Packed Workbench helper add-on",
+      role: "workbench-helper",
+      allowedGeneratedFiles: new Set(["resourceDatabase.rdb"]),
+    },
+  ].map((options) => ({
+    ...options,
+    manifest: verifyPackedArchiveAddonInventory(packedArchive, options),
+  }));
+  const packedEnforceTargets = verifyPackedEnforceProtocolTargets(
+    packedArchive,
+    packedAddonManifests
+  );
+  const files = new Set(packedArchive.files.keys());
 const requiredFiles = [
   "LICENSE",
   "README.md",
@@ -202,10 +330,13 @@ const requiredFiles = [
   "dist/tools/observer-runtime.js",
   "dist/tools/wb-shutdown.js",
   "dist/foundation/child-supervisor.js",
+  "dist/foundation/public-json.js",
+  "dist/foundation/redact.js",
   "dist/workbench/activity-gate.js",
   "dist/workbench/client.js",
   "dist/workbench/diagnostics.js",
   "dist/workbench/helper-addon.js",
+  "dist/workbench/helper-addon-payload.generated.js",
   "dist/workbench/launch-plan.js",
   "dist/workbench/lifecycle-execution.js",
   "dist/workbench/managed-build-profile.js",
@@ -222,11 +353,6 @@ const requiredFiles = [
   "configs/cursor-global.json",
   "docs/AGENTS.md",
   "observer/README.md",
-  "observer/addon/addon.gproj",
-  "observer/addon/.reforger-forge-observer-source.json",
-  "observer/workbench-addon/addon.gproj",
-  "observer/workbench-addon/.reforger-forge-workbench-helper-source.json",
-  "observer/workbench-addon/Scripts/WorkbenchGame/EnfusionMCP/RFWB_HelperBuild.c",
   "observer/protocol/VERSION",
   "observer/protocol/capabilities.md",
   "observer/protocol/errors.md",
@@ -246,6 +372,7 @@ const requiredFiles = [
   "reforger-forge.config.example.json",
   "scripts/check-package.mjs",
   "scripts/lib/addon-inventory.mjs",
+  "scripts/lib/packed-archive.mjs",
   "scripts/install-agents.ps1",
   "scripts/list-tools.mjs",
   "scripts/run-observer-enforce-mailbox-acceptance.mjs",
@@ -255,67 +382,12 @@ const requiredFiles = [
   "tests/fixtures/enforce-mailbox-acceptance-addon/addon.gproj",
   "tests/fixtures/enforce-mailbox-acceptance-addon/Scripts/WorkbenchGame/RFO_MailboxAcceptancePlugin.c",
 ];
-const requiredPrefixes = ["configs/", "data/", "observer/workbench-addon/"];
-const requiredObserverScripts = [
-  "Scripts/Game/ReforgerForgeObserver/RFO_ObserverBuild.c",
-  "Scripts/Game/ReforgerForgeObserver/RFO_ObserverCameraLease.c",
-  "Scripts/Game/ReforgerForgeObserver/RFO_ObserverCapabilities.c",
-  "Scripts/Game/ReforgerForgeObserver/RFO_ObserverCapture.c",
-  "Scripts/Game/ReforgerForgeObserver/RFO_ObserverJob.c",
-  "Scripts/Game/ReforgerForgeObserver/RFO_ObserverJson.c",
-  "Scripts/Game/ReforgerForgeObserver/RFO_ObserverMailboxTransport.c",
-  "Scripts/Game/ReforgerForgeObserver/RFO_ObserverRestTransport.c",
-  "Scripts/Game/ReforgerForgeObserver/RFO_ObserverService.c",
-  "Scripts/Game/ReforgerForgeObserver/RFO_ObserverSession.c",
-  "Scripts/Game/ReforgerForgeObserver/RFO_ObserverTime.c",
-  "Scripts/Game/ReforgerForgeObserver/RFO_ObserverTransport.c",
-  "Scripts/Game/ReforgerForgeObserver/RFO_ObserverWorld.c",
-  "Scripts/Game/ReforgerForgeObserver/RFO_ObserverBootstrap.c",
-].map((path) => `observer/addon/${path}`);
-const requiredHandlers = [
-  "EMCP_WB_Clipboard.c",
-  "EMCP_WB_Components.c",
-  "EMCP_WB_CreateEntity.c",
-  "EMCP_WB_DeleteEntity.c",
-  "EMCP_WB_EditorControl.c",
-  "EMCP_WB_ExecuteAction.c",
-  "EMCP_WB_GetCameraPos.c",
-  "EMCP_WB_GetEntity.c",
-  "EMCP_WB_GetState.c",
-  "EMCP_WB_Layers.c",
-  "EMCP_WB_ListEntities.c",
-  "EMCP_WB_Localization.c",
-  "EMCP_WB_ModifyEntity.c",
-  "EMCP_WB_ObserverCancel.c",
-  "EMCP_WB_ObserverCommon.c",
-  "EMCP_WB_ObserverPing.c",
-  "EMCP_WB_ObserverRelease.c",
-  "EMCP_WB_ObserverStatus.c",
-  "EMCP_WB_ObserverSubmit.c",
-  "EMCP_WB_Ping.c",
-  "EMCP_WB_Prefabs.c",
-  "EMCP_WB_Reload.c",
-  "EMCP_WB_Resources.c",
-  "EMCP_WB_ScriptEditor.c",
-  "EMCP_WB_SelectEntity.c",
-  "EMCP_WB_Terrain.c",
-].map((name) => `observer/workbench-addon/Scripts/WorkbenchGame/EnfusionMCP/${name}`);
+const requiredPrefixes = ["configs/", "data/"];
 
 const missingFiles = requiredFiles.filter((path) => !files.has(path));
 const missingPrefixes = requiredPrefixes.filter(
   (prefix) => ![...files].some((path) => path.startsWith(prefix))
 );
-const handlerPrefix = "observer/workbench-addon/Scripts/WorkbenchGame/EnfusionMCP/";
-const requiredHelperScripts = [
-  ...requiredHandlers,
-  `${handlerPrefix}RFWB_HelperBuild.c`,
-].sort();
-const packagedHandlers = [...files]
-  .filter((path) => path.startsWith(handlerPrefix) && path.toLowerCase().endsWith(".c"))
-  .sort();
-const missingHandlers = requiredHandlers.filter((path) => !files.has(path));
-const unexpectedHandlers = packagedHandlers.filter((path) => !requiredHelperScripts.includes(path));
-const missingObserverScripts = requiredObserverScripts.filter((path) => !files.has(path));
 const legacyPackagedHandlers = [...files].filter((path) =>
   path.startsWith("mod/Scripts/WorkbenchGame/EnfusionMCP/")
 );
@@ -331,6 +403,10 @@ const packagedRepositoryOnlySources = repositoryOnlyAcceptanceSources.filter((pa
 const duplicateSharedBuildFiles = [...files].filter((path) =>
   path.startsWith("dist/src/foundation/") || path.startsWith("dist/src/companions/")
 );
+const permittedGeneratedAddonFiles = new Set([
+  "observer/addon/resourceDatabase.rdb",
+  "observer/workbench-addon/resourceDatabase.rdb",
+]);
 const forbiddenObserverFiles = [...files].filter((path) =>
   path.startsWith("tests/observer/") ||
   path.startsWith("observer/artifacts/") ||
@@ -338,18 +414,16 @@ const forbiddenObserverFiles = [...files].filter((path) =>
   path.startsWith("observer/state/") ||
   path.startsWith("observer/profiles/") ||
   (path.startsWith("observer/") && /(^|\/)session\.json$/i.test(path)) ||
-  (path.startsWith("observer/") && /(^|\/)resourceDatabase\.rdb$/i.test(path)) ||
+  (path.startsWith("observer/") && /(^|\/)resourceDatabase\.rdb$/i.test(path) &&
+    !permittedGeneratedAddonFiles.has(path)) ||
   (path.startsWith("observer/") && /\.(bmp|png)$/i.test(path))
 );
 const forbiddenObserverFacade = files.has("dist/observer/coordinator.js");
 
-if (missingFiles.length || missingPrefixes.length || missingHandlers.length || unexpectedHandlers.length || missingObserverScripts.length || legacyPackagedHandlers.length || packagedRepositoryOnlySources.length || duplicateSharedBuildFiles.length || forbiddenObserverFiles.length || forbiddenObserverFacade) {
+if (missingFiles.length || missingPrefixes.length || legacyPackagedHandlers.length || packagedRepositoryOnlySources.length || duplicateSharedBuildFiles.length || forbiddenObserverFiles.length || forbiddenObserverFacade) {
   const details = [
     ...missingFiles.map((path) => `missing file: ${path}`),
     ...missingPrefixes.map((prefix) => `missing package content under: ${prefix}`),
-    ...missingHandlers.map((path) => `missing supported handler: ${path}`),
-    ...unexpectedHandlers.map((path) => `unexpected packaged handler: ${path}`),
-    ...missingObserverScripts.map((path) => `missing observer addon script: ${path}`),
     ...legacyPackagedHandlers.map((path) => `legacy project-injection handler must not be packaged: ${path}`),
     ...packagedRepositoryOnlySources.map((path) =>
       `repository-only TypeScript acceptance harness must not be packaged: ${path}`
@@ -362,16 +436,6 @@ if (missingFiles.length || missingPrefixes.length || missingHandlers.length || u
   ];
   throw new Error(`Package content check failed:\n${details.map((line) => `  - ${line}`).join("\n")}`);
 }
-
-  const packedFilename = report[0]?.filename;
-  if (typeof packedFilename !== "string" || packedFilename.length === 0) {
-    throw new Error("npm pack did not report the produced tarball filename");
-  }
-  const tarballPath = resolve(packDestination, packedFilename);
-  assertContained(packDestination, tarballPath, "Packed tarball");
-  if (!existsSync(tarballPath)) {
-    throw new Error(`npm pack reported a tarball that does not exist: ${tarballPath}`);
-  }
 
   writeFileSync(
     join(installRoot, "package.json"),
@@ -556,6 +620,53 @@ if (missingFiles.length || missingPrefixes.length || missingHandlers.length || u
     );
   }
 
+  const publicContractPath = join(installedPackageRoot, "dist", "observer", "public-contract.js");
+  const publicProjectionProbe = spawnSync(process.execPath, [
+    "--input-type=module",
+    "--eval",
+    `import { projectPublicObserverToolError } from ${JSON.stringify(pathToFileURL(publicContractPath).href)};
+const details = {}; details.self = details;
+const text = projectPublicObserverToolError({}, {
+  subject: "Observer error",
+  extract: () => ({
+    code: "INVALID_REQUEST",
+    readDiagnosticMessage: () => "installed package probe",
+    readDetails: () => details,
+  }),
+});
+const fence = String.fromCharCode(96).repeat(3) + "json";
+if (!text.includes("[REDACTED:CYCLE]") || !text.includes(fence)) process.exitCode = 1;`,
+  ], {
+    cwd: installRoot,
+    encoding: "utf8",
+    env: probeEnvironment,
+    timeout: 30_000,
+    maxBuffer: 8 * 1024 * 1024,
+  });
+  if (publicProjectionProbe.error || publicProjectionProbe.status !== 0) {
+    throw commandFailure("Installed public observer error projection probe", publicProjectionProbe);
+  }
+
+  const mailboxAcceptanceScript = join(
+    installedPackageRoot,
+    "scripts",
+    "run-observer-enforce-mailbox-acceptance.mjs"
+  );
+  const mailboxHelp = spawnSync(process.execPath, [mailboxAcceptanceScript, "--help"], {
+    cwd: installRoot,
+    encoding: "utf8",
+    env: probeEnvironment,
+    timeout: 30_000,
+    maxBuffer: 8 * 1024 * 1024,
+  });
+  if (mailboxHelp.error || mailboxHelp.status !== 0 ||
+      !mailboxHelp.stdout.includes("run-observer-enforce-mailbox-acceptance.mjs")) {
+    throw commandFailure(
+      "Installed mailbox acceptance built-foundation import check",
+      mailboxHelp
+    );
+  }
+
   const missingDoctorRoot = join(temporaryRoot, "installed-doctor", "missing-root");
   const missingDoctorProfile = join(temporaryRoot, "installed-doctor", "missing-profile");
   const doctorCheck = spawnSync(process.execPath, [
@@ -581,7 +692,8 @@ if (missingFiles.length || missingPrefixes.length || missingHandlers.length || u
 
   console.log(
     `Package tarball verified: ${files.size} files; fresh --omit=dev install and ` +
-      `${Object.keys(advertisedBins).length} advertised bins passed.`
+      `${Object.keys(advertisedBins).length} advertised bins, ${packedEnforceTargets.length} descriptor-derived ` +
+      `Enforce target(s), plus the public projection and mailbox acceptance import checks passed.`
   );
 } finally {
   rmSync(temporaryRoot, {

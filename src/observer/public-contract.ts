@@ -1,6 +1,19 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { renderRedactedPublicJson } from "../foundation/public-json.js";
+import { redactDiagnostic, redactText } from "../foundation/redact.js";
 import type { CaptureErrorCode } from "./capture-contract.js";
+
+export const PUBLIC_OBSERVER_ERROR_TEXT_MAXIMUM = 512;
+
+const JSON_FENCE_PREFIX = "\n\n```json\n";
+const JSON_FENCE_SUFFIX = "\n```";
+const MINIMUM_JSON_DETAIL_BLOCK = JSON_FENCE_PREFIX.length + JSON_FENCE_SUFFIX.length + 2;
+const PUBLIC_DETAIL_MAXIMUM_DEPTH = 6;
+const PUBLIC_DETAIL_MAXIMUM_BREADTH = 24;
+const PUBLIC_DETAIL_MAXIMUM_NODES = 128;
+const PUBLIC_DETAIL_MAXIMUM_STRING_LENGTH = 256;
+const OBSERVER_OPERATION_FAILED = "Observer operation failed.";
 
 function generatedStringArray(name: string): readonly [string, ...string[]] {
   const path = fileURLToPath(new URL(`../../observer/protocol/generated/${name}.json`, import.meta.url));
@@ -56,4 +69,96 @@ export function canonicalPublicObserverError(
     // Verbatim structured details must not reintroduce the hidden diagnostic.
     diagnosticDetailsAllowed: fixed === undefined,
   };
+}
+
+export interface PublicObserverErrorCandidate {
+  readonly code: unknown;
+  readonly readDiagnosticMessage: () => unknown;
+  readonly readDetails: () => unknown;
+}
+
+export interface PublicObserverErrorProjectionOptions {
+  readonly subject: "Observer error" | "Observer runtime error";
+  readonly extract: (error: unknown) => PublicObserverErrorCandidate | undefined;
+}
+
+function completeHeader(
+  subject: PublicObserverErrorProjectionOptions["subject"],
+  code: CaptureErrorCode,
+  message: string,
+): string {
+  const prefix = `${subject} (${code}): `;
+  const allowance = Math.max(0, PUBLIC_OBSERVER_ERROR_TEXT_MAXIMUM - prefix.length);
+  return `${prefix}${message.slice(0, allowance)}`;
+}
+
+function internalPublicError(subject: PublicObserverErrorProjectionOptions["subject"]): string {
+  return completeHeader(
+    subject,
+    "INTERNAL_ERROR",
+    FIXED_ERROR_MESSAGES.INTERNAL_ERROR ?? OBSERVER_OPERATION_FAILED,
+  );
+}
+
+/**
+ * Project a known observer error into the one bounded MCP public-error text.
+ * Readers are intentionally lazy so fixed messages never inspect diagnostics.
+ */
+export function projectPublicObserverToolError(
+  error: unknown,
+  options: PublicObserverErrorProjectionOptions,
+): string {
+  let candidate: PublicObserverErrorCandidate | undefined;
+  try {
+    candidate = options.extract(error);
+  } catch {
+    return internalPublicError(options.subject);
+  }
+  if (!candidate) return internalPublicError(options.subject);
+
+  try {
+    const code = canonicalPublicObserverErrorCode(candidate.code);
+    const fixed = FIXED_ERROR_MESSAGES[code];
+    // This gate is deliberately ahead of both diagnostic readers. Fixed public
+    // messages are a complete boundary, not merely a preferred presentation.
+    if (fixed !== undefined) return completeHeader(options.subject, code, fixed);
+
+    const diagnostic = candidate.readDiagnosticMessage();
+    const redactedMessage = typeof diagnostic === "string"
+      ? redactText(diagnostic, {
+        profile: "diagnostic",
+        maxLength: PUBLIC_OBSERVER_ERROR_TEXT_MAXIMUM,
+      }).trim()
+      : "";
+    const header = completeHeader(
+      options.subject,
+      code,
+      redactedMessage || OBSERVER_OPERATION_FAILED,
+    );
+
+    const available = PUBLIC_OBSERVER_ERROR_TEXT_MAXIMUM - header.length;
+    if (available < MINIMUM_JSON_DETAIL_BLOCK) return header;
+
+    const details = candidate.readDetails();
+    if (details === undefined) return header;
+
+    const rendered = renderRedactedPublicJson(
+      redactDiagnostic(details, { profile: "diagnostic" }),
+      {
+        maximumDepth: PUBLIC_DETAIL_MAXIMUM_DEPTH,
+        maximumBreadth: PUBLIC_DETAIL_MAXIMUM_BREADTH,
+        maximumNodes: PUBLIC_DETAIL_MAXIMUM_NODES,
+        maximumStringLength: PUBLIC_DETAIL_MAXIMUM_STRING_LENGTH,
+        maximumCharacters: available - JSON_FENCE_PREFIX.length - JSON_FENCE_SUFFIX.length,
+      },
+    );
+    if (rendered.fallback || rendered.text === undefined) return rendered.fallback
+      ? internalPublicError(options.subject)
+      : header;
+
+    const result = `${header}${JSON_FENCE_PREFIX}${rendered.text}${JSON_FENCE_SUFFIX}`;
+    return result.length <= PUBLIC_OBSERVER_ERROR_TEXT_MAXIMUM ? result : header;
+  } catch {
+    return internalPublicError(options.subject);
+  }
 }

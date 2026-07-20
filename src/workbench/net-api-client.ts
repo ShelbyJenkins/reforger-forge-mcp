@@ -1,4 +1,5 @@
 import { Socket } from "node:net";
+import { redactText } from "../foundation/redact.js";
 import { decodePascalString, encodeRequest } from "./protocol.js";
 
 export const DEFAULT_WORKBENCH_NET_API_CLIENT_ID = "EnfusionMCP";
@@ -104,14 +105,10 @@ function collectOwnerTokenValues(
   }
 }
 
-function redactOwnerTokens(message: string, params: Record<string, unknown>): string {
+function collectDynamicTokenValues(params: Record<string, unknown>): string[] {
   const values = new Set<string>();
   collectOwnerTokenValues(params, values, new Set<object>(), new Set<object>());
-  let redacted = message;
-  for (const value of [...values].sort((left, right) => right.length - left.length)) {
-    redacted = redacted.replaceAll(value, "[redacted]");
-  }
-  return redacted;
+  return [...values];
 }
 
 /**
@@ -288,7 +285,11 @@ export class WorkbenchNetApiClient implements WorkbenchNetApiPort {
       );
     }
     if (status.value !== "Ok") {
-      const message = redactOwnerTokens(`Workbench error: ${status.value}`, params);
+      const message = redactText(`Workbench error: ${status.value}`, {
+        profile: "diagnostic",
+        replacement: "[redacted]",
+        knownSecretValues: collectDynamicTokenValues(params),
+      });
       throw new WorkbenchNetApiError(message, "api_error");
     }
     if (response.length === status.bytesRead) {

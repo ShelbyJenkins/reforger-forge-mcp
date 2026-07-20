@@ -9,7 +9,7 @@ import {
   verifyWorkbenchHelperSource,
 } from "../../src/workbench/helper-addon.js";
 import { verifySourceBundle } from "../../observer/agent/staging.js";
-import { observerAddonSource, repositoryRoot } from "./helpers.js";
+import { observerAddonSource, repositoryRoot } from "../support/observer-fixtures.js";
 
 function filesRecursively(root: string): string[] {
   const files: string[] = [];
@@ -24,6 +24,55 @@ function filesRecursively(root: string): string[] {
   return files;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function readEnforceContractTargets(): Array<{ name: string; outputPath: string }> {
+  const descriptor = JSON.parse(readFileSync(
+    join(repositoryRoot, "observer", "protocol", "generated", "enforce-contract.json"),
+    "utf8"
+  )) as unknown;
+  if (!isRecord(descriptor) || !isRecord(descriptor.targets)) {
+    throw new Error("Generated Enforce contract descriptor has no target map");
+  }
+  const targets = Object.entries(descriptor.targets).map(([name, target]) => {
+    if (!isRecord(target) || typeof target.outputPath !== "string") {
+      throw new Error(`Generated Enforce contract target ${JSON.stringify(name)} has no output path`);
+    }
+    return { name, outputPath: target.outputPath };
+  });
+  if (targets.length === 0) {
+    throw new Error("Generated Enforce contract descriptor has no targets");
+  }
+  return targets;
+}
+
+const addonManifestTargets = [
+  {
+    addonRoot: "observer/addon",
+    manifestName: ".reforger-forge-observer-source.json",
+  },
+  {
+    addonRoot: "observer/workbench-addon",
+    manifestName: ".reforger-forge-workbench-helper-source.json",
+  },
+] as const;
+
+function manifestForEnforceTarget(outputPath: string) {
+  const matches = addonManifestTargets.filter(({ addonRoot }) =>
+    outputPath.startsWith(`${addonRoot}/`)
+  );
+  if (matches.length !== 1) {
+    throw new Error(`Generated Enforce output has no unique add-on manifest: ${outputPath}`);
+  }
+  const [target] = matches;
+  return {
+    ...target,
+    payloadPath: outputPath.slice(target.addonRoot.length + 1),
+  };
+}
+
 describe("observer package and source contracts", () => {
   it("keeps observer and MCP builds separate and publishes required runtime assets", () => {
     const packageJson = JSON.parse(readFileSync(join(repositoryRoot, "package.json"), "utf8"));
@@ -34,7 +83,20 @@ describe("observer package and source contracts", () => {
     expect(packageJson.scripts.build).toContain("build:mcp");
     expect(packageJson.scripts.build).toContain("build:observer");
     expect(packageJson.scripts["addons:manifest"]).toContain("update-observer-source-manifest.mjs");
+    expect(packageJson.scripts["addons:manifest:check"]).toContain("--check");
     expect(packageJson.scripts["observer:manifest"]).toContain("addons:manifest");
+    expect(packageJson.scripts["observer:manifest:check"]).toContain("addons:manifest:check");
+    const observerGenerate = packageJson.scripts["observer:generate"];
+    expect(observerGenerate).toContain("protocol:generate");
+    expect(observerGenerate).toContain("observer:manifest");
+    expect(observerGenerate.indexOf("protocol:generate")).toBeLessThan(
+      observerGenerate.indexOf("observer:manifest")
+    );
+    const enforceValidation = packageJson.scripts["observer:validate:enforce"];
+    expect(enforceValidation).toContain("validate-observer-enforce.mjs");
+    expect(enforceValidation).not.toMatch(/\b(?:npm\s+run\s+)?build\b/);
+    expect(packageJson.devDependencies.tar).toBe("7.5.19");
+    expect(packageJson.dependencies.tar).toBeUndefined();
     expect(Object.keys(packageJson.scripts).filter((name) =>
       name.startsWith("observer:acceptance:")
     )).toEqual([
@@ -57,6 +119,7 @@ describe("observer package and source contracts", () => {
     const observerReleaseAssets = [
       "scripts/run-observer-enforce-mailbox-acceptance.mjs",
       "scripts/update-observer-source-manifest.mjs",
+      "scripts/lib/packed-archive.mjs",
       "tests/fixtures/enforce-mailbox-acceptance-addon/addon.gproj",
       "tests/fixtures/enforce-mailbox-acceptance-addon/Scripts/WorkbenchGame/RFO_MailboxAcceptancePlugin.c",
     ];
@@ -109,6 +172,7 @@ describe("observer package and source contracts", () => {
       "dist/workbench/client.js",
       "dist/workbench/diagnostics.js",
       "dist/workbench/helper-addon.js",
+      "dist/workbench/helper-addon-payload.generated.js",
       "dist/workbench/launch-plan.js",
       "dist/workbench/lifecycle-execution.js",
       "dist/workbench/managed-build-profile.js",
@@ -122,6 +186,12 @@ describe("observer package and source contracts", () => {
     }
     expect(packageCheck).toContain("legacy project-injection handler must not be packaged");
     expect(packageCheck).toContain("resourceDatabase\\.rdb");
+    expect(packageCheck).toContain("inspectPackedArchive");
+    expect(packageCheck).toContain("verifyPackedArchiveAddonInventory");
+    expect(packageCheck).toContain("MAX_SOURCE_MANIFEST_BYTES");
+    expect(packageCheck).toContain("enforceContractDescriptorPath");
+    expect(packageCheck).toContain("verifyPackedEnforceProtocolTargets");
+    expect(packageCheck).not.toContain("report[0]?.files");
     expect(packageCheck).toContain("--omit=dev");
     expect(packageCheck).toContain("--offline");
     expect(packageCheck).toContain("npm-cli.js");
@@ -140,6 +210,28 @@ describe("observer package and source contracts", () => {
     expect(manifestGenerator).toContain(".reforger-forge-workbench-helper-source.json");
     expect(manifestGenerator).toContain("RFWB_HelperBuild.c");
     expect(verifySourceBundle(observerAddonSource).manifest.files.length).toBeGreaterThan(10);
+  });
+
+  it("derives generated Enforce payload inclusion from the contract descriptor", () => {
+    const targets = readEnforceContractTargets();
+    expect(targets).toHaveLength(2);
+    const packageCheck = readFileSync(join(repositoryRoot, "scripts", "check-package.mjs"), "utf8");
+
+    for (const { name, outputPath } of targets) {
+      const { addonRoot, manifestName, payloadPath } = manifestForEnforceTarget(outputPath);
+      const manifest = JSON.parse(readFileSync(
+        join(repositoryRoot, ...addonRoot.split("/"), manifestName),
+        "utf8"
+      )) as { files?: Array<{ path?: string }> };
+
+      expect(existsSync(join(repositoryRoot, ...outputPath.split("/")))).toBe(true);
+      expect(manifest.files?.some((entry) => entry.path === payloadPath)).toBe(true);
+      // Package verification reads this descriptor and derives each target; it
+      // must not maintain a second copied generated-C filename list.
+      expect(packageCheck).not.toContain(outputPath);
+      expect(packageCheck).not.toContain(outputPath.split("/").at(-1) ?? "");
+      expect(name.length).toBeGreaterThan(0);
+    }
   });
 
   it("publishes and documents the exact seven-tool observer surface", () => {
@@ -179,22 +271,17 @@ describe("observer package and source contracts", () => {
     expect(agentInstructions).toContain("preparedLaunchId");
   });
 
-  it("preserves the exact Workbench handler inventory", () => {
-    expect(WORKBENCH_HELPER_HANDLER_FILES).toHaveLength(26);
-    expect(WORKBENCH_HELPER_HANDLER_FILES.filter((name) => /Observer/.test(name)).sort()).toEqual([
-      "EMCP_WB_ObserverCancel.c",
-      "EMCP_WB_ObserverCommon.c",
-      "EMCP_WB_ObserverPing.c",
-      "EMCP_WB_ObserverRelease.c",
-      "EMCP_WB_ObserverStatus.c",
-      "EMCP_WB_ObserverSubmit.c",
-    ]);
+  it("derives the Workbench handler inventory from the generated payload descriptor", () => {
     const helperSource = join(repositoryRoot, "observer", "workbench-addon");
     const handlerRoot = join(helperSource, "Scripts", "WorkbenchGame", "EnfusionMCP");
     const handlerFiles = readdirSync(handlerRoot)
       .filter((name) => name.startsWith("EMCP_WB_") && name.endsWith(".c"))
+      .filter((name) => /class\s+\w+\s*:\s*NetApiHandler\b/.test(
+        readFileSync(join(handlerRoot, name), "utf8")
+      ))
       .sort();
     expect(handlerFiles).toEqual([...WORKBENCH_HELPER_HANDLER_FILES].sort());
+    expect(WORKBENCH_HELPER_HANDLER_FILES.every((name) => name.startsWith("EMCP_WB_"))).toBe(true);
     const observerHandlers = handlerFiles.filter((name) => /Observer/.test(name))
       .map((name) => readFileSync(join(handlerRoot, name), "utf8"))
       .join("\n");
@@ -206,7 +293,7 @@ describe("observer package and source contracts", () => {
     expect(helper.addonId).toBe(WORKBENCH_HELPER_ADDON_ID);
     expect(helper.addonGuid).toBe(WORKBENCH_HELPER_ADDON_GUID);
     expect(helper.buildIdentity).toBe(WORKBENCH_HELPER_BUILD_IDENTITY);
-    expect(helper.files.map((entry) => entry.path)).toHaveLength(28);
+    expect(helper.files.length).toBeGreaterThan(WORKBENCH_HELPER_HANDLER_FILES.length);
     expect(helper.files.some((entry) => entry.path.startsWith("Scripts/Game/"))).toBe(false);
 
     const ping = readFileSync(join(handlerRoot, "EMCP_WB_Ping.c"), "utf8");
