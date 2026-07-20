@@ -39,38 +39,7 @@ function stubClient(initialState: WorkbenchState, refreshedMode?: WorkbenchState
   return { client, call };
 }
 
-describe("registered unattended editor refusals", () => {
-  it("wb_play refuses without making any NET API call", async () => {
-    const client = new WorkbenchClient("127.0.0.1", 1);
-    const call = vi.spyOn(client, "call");
-    const handler = registeredEditorTools(client).get("wb_play");
-
-    expect(handler).toBeDefined();
-    const result = await handler?.({ debugMode: true, fullScreen: true });
-
-    expect(result?.isError).toBe(true);
-    expect(result?.content[0]?.text).toContain("Play Refused");
-    expect(result?.content[0]?.text).toContain("standalone diagnostic/autotest runtime launcher");
-    expect(call).not.toHaveBeenCalled();
-  });
-
-  it("wb_save and save-as refuse before any operation that could open a modal", async () => {
-    const client = new WorkbenchClient("127.0.0.1", 1);
-    const call = vi.spyOn(client, "call");
-    const handler = registeredEditorTools(client).get("wb_save");
-
-    expect(handler).toBeDefined();
-    const save = await handler?.({});
-    const saveAs = await handler?.({ path: "Worlds/NeverOpened.ent" });
-
-    expect(save?.isError).toBe(true);
-    expect(save?.content[0]?.text).toContain("Save Refused");
-    expect(saveAs?.isError).toBe(true);
-    expect(saveAs?.content[0]?.text).toContain("unattended save-as");
-    expect(saveAs?.content[0]?.text).not.toContain("Save Pending");
-    expect(call).not.toHaveBeenCalled();
-  });
-
+describe("registered editor stop safeguards", () => {
   it("wb_stop is an idempotent success in edit mode without a NET API mutation", async () => {
     const { client, call } = stubClient({
       connected: true,

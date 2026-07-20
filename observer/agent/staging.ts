@@ -1,42 +1,36 @@
-import { createHash, randomUUID } from "node:crypto";
 import {
-  copyFileSync,
   existsSync,
   lstatSync,
-  mkdirSync,
-  readFileSync,
-  renameSync,
-  rmSync,
   rmdirSync,
   unlinkSync,
 } from "node:fs";
-import { dirname, join, relative, resolve, sep } from "node:path";
+import { dirname, join } from "node:path";
 import { z } from "zod";
 import { ADDON_GUID, ADDON_ID, ADDON_VERSION, OBSERVER_BUILD_IDENTITY, PROTOCOL_VERSION, SHA256_PATTERN } from "../protocol/index.js";
+import {
+  ContentAddressedBundleError,
+  createContentAddressedBundleManifestSchema,
+  readContentAddressedBundleManifest,
+  sha256ContentFile,
+  stageContentAddressedBundle,
+  verifyContentAddressedBundle,
+  type ContentAddressedBundlePolicy,
+} from "#companions/content-addressed-bundle";
 import { ObserverError } from "./errors.js";
 import {
   assertManagedPath,
-  assertRegularManagedFile,
-  atomicWriteJson,
-  canonicalizeExistingDirectory,
   ensureCanonicalDirectory,
   listRegularFiles,
 } from "./paths.js";
 
 export const SOURCE_MANIFEST_NAME = ".reforger-forge-observer-source.json";
 
-const sourceManifestSchema = z.object({
-  manifestVersion: z.literal(1),
-  addonVersion: z.string().min(1).max(32),
-  protocolVersion: z.string().regex(/^\d+\.\d+$/),
+const sourceManifestSchema = createContentAddressedBundleManifestSchema({
+  addonVersion: z.literal(ADDON_VERSION),
+  protocolVersion: z.literal(PROTOCOL_VERSION),
   addonId: z.literal(ADDON_ID),
   addonGuid: z.literal(ADDON_GUID),
   buildIdentity: z.literal(OBSERVER_BUILD_IDENTITY),
-  bundleDigest: z.string().regex(SHA256_PATTERN),
-  files: z.array(z.object({
-    path: z.string().regex(/^[A-Za-z0-9._/-]+$/).refine((value) => !value.startsWith("/") && !value.includes("..")),
-    sha256: z.string().regex(SHA256_PATTERN),
-  })).min(1),
 });
 
 export type ObserverSourceManifest = z.infer<typeof sourceManifestSchema>;
@@ -61,73 +55,38 @@ export interface StagedCleanupResult {
   unrelated: string[];
 }
 
-export function sha256File(path: string): string {
-  return createHash("sha256").update(readFileSync(path)).digest("hex");
-}
+const observerBundlePolicy: ContentAddressedBundlePolicy<ObserverSourceManifest> = {
+  displayName: "Observer",
+  addonDirectoryName: ADDON_ID,
+  manifestName: SOURCE_MANIFEST_NAME,
+  manifestSchema: sourceManifestSchema,
+};
 
-export function computeBundleDigest(files: readonly { path: string; sha256: string }[]): string {
-  const hash = createHash("sha256");
-  for (const file of [...files].sort((a, b) => a.path.localeCompare(b.path))) {
-    hash.update(file.path, "utf8");
-    hash.update("\0", "utf8");
-    hash.update(file.sha256, "ascii");
-    hash.update("\n", "utf8");
+function asObserverError(error: unknown): never {
+  if (error instanceof ObserverError) throw error;
+  if (error instanceof ContentAddressedBundleError) {
+    const invalidPath = error.issue === "directory_unavailable" ||
+      error.issue === "directory_not_directory" || error.issue === "unsafe_path";
+    throw new ObserverError(
+      invalidPath
+        ? "INVALID_REQUEST"
+        : error.mode === "staged" ? "STAGED_ADDON_CONFLICT" : "ADDON_STAGE_FAILED",
+      error.message
+    );
   }
-  return hash.digest("hex");
-}
-
-function parseManifest(path: string, conflict: boolean): ObserverSourceManifest {
-  let raw: unknown;
-  try {
-    raw = JSON.parse(readFileSync(path, "utf8"));
-  } catch {
-    throw new ObserverError(conflict ? "STAGED_ADDON_CONFLICT" : "ADDON_STAGE_FAILED", `Observer manifest is missing or malformed: ${path}`);
-  }
-  const parsed = sourceManifestSchema.safeParse(raw);
-  if (!parsed.success) {
-    throw new ObserverError(conflict ? "STAGED_ADDON_CONFLICT" : "ADDON_STAGE_FAILED", "Observer manifest does not match version 1");
-  }
-  const duplicate = new Set<string>();
-  for (const file of parsed.data.files) {
-    if (duplicate.has(file.path)) {
-      throw new ObserverError(conflict ? "STAGED_ADDON_CONFLICT" : "ADDON_STAGE_FAILED", `Observer manifest repeats a payload path: ${file.path}`);
-    }
-    duplicate.add(file.path);
-  }
-  if (computeBundleDigest(parsed.data.files) !== parsed.data.bundleDigest) {
-    throw new ObserverError(conflict ? "STAGED_ADDON_CONFLICT" : "ADDON_STAGE_FAILED", "Observer aggregate bundle digest does not match its file manifest");
-  }
-  return parsed.data;
+  throw error;
 }
 
 function verifyBundleDirectory(directoryPath: string, expectedDigest?: string, staged = false): VerifiedBundle {
-  const directory = canonicalizeExistingDirectory(directoryPath, staged ? "Staged addon" : "Observer package source");
-  const manifestPath = join(directory, SOURCE_MANIFEST_NAME);
-  if (!existsSync(manifestPath)) {
-    throw new ObserverError(staged ? "STAGED_ADDON_CONFLICT" : "ADDON_STAGE_FAILED", `Observer source manifest is missing: ${manifestPath}`);
+  try {
+    return verifyContentAddressedBundle(observerBundlePolicy, directoryPath, {
+      mode: staged ? "staged" : "source",
+      expectedDigest,
+      allowStagedExtraFiles: staged,
+    });
+  } catch (error) {
+    return asObserverError(error);
   }
-  assertRegularManagedFile(directory, manifestPath);
-  const manifest = parseManifest(manifestPath, staged);
-  if (expectedDigest && manifest.bundleDigest !== expectedDigest) {
-    throw new ObserverError("STAGED_ADDON_CONFLICT", "Staged addon digest does not match its content-addressed directory");
-  }
-  if (manifest.addonVersion !== ADDON_VERSION || manifest.protocolVersion !== PROTOCOL_VERSION) {
-    throw new ObserverError(staged ? "STAGED_ADDON_CONFLICT" : "ADDON_STAGE_FAILED", "Observer package version is not supported by this agent");
-  }
-
-  const actualFiles = listRegularFiles(directory).filter((path) => path !== SOURCE_MANIFEST_NAME).sort();
-  const expectedFiles = manifest.files.map((file) => file.path).sort();
-  if (actualFiles.join("\n") !== expectedFiles.join("\n")) {
-    throw new ObserverError(staged ? "STAGED_ADDON_CONFLICT" : "ADDON_STAGE_FAILED", "Observer payload file set is incomplete or contains unexpected files");
-  }
-  for (const file of manifest.files) {
-    const payloadPath = join(directory, ...file.path.split("/"));
-    assertRegularManagedFile(directory, payloadPath);
-    if (sha256File(payloadPath) !== file.sha256) {
-      throw new ObserverError(staged ? "STAGED_ADDON_CONFLICT" : "ADDON_STAGE_FAILED", `Observer payload hash mismatch: ${file.path}`);
-    }
-  }
-  return { sourceDirectory: directory, manifest };
 }
 
 export function verifySourceBundle(sourceDirectory: string): VerifiedBundle {
@@ -148,44 +107,10 @@ export class StagingManager {
 
   ensureStaged(): StagedAddon {
     const source = verifySourceBundle(this.sourceDirectory);
-    const digestRoot = join(this.addonsRoot, source.manifest.bundleDigest);
-    const addonDirectory = join(digestRoot, ADDON_ID);
-    assertManagedPath(this.addonsRoot, addonDirectory);
-
-    if (existsSync(addonDirectory)) {
-      const verified = verifyBundleDirectory(addonDirectory, source.manifest.bundleDigest, true);
-      return { bundleDigest: verified.manifest.bundleDigest, addonDirectory, addonSearchRoot: digestRoot, reused: true, manifest: verified.manifest };
-    }
-    if (existsSync(digestRoot)) {
-      throw new ObserverError("STAGED_ADDON_CONFLICT", `Digest directory exists without a valid observer addon: ${digestRoot}`);
-    }
-
-    const temporaryRoot = join(this.addonsRoot, `.${source.manifest.bundleDigest}.${randomUUID()}.tmp`);
-    const temporaryAddon = join(temporaryRoot, ADDON_ID);
     try {
-      mkdirSync(temporaryAddon, { recursive: true, mode: 0o700 });
-      for (const file of source.manifest.files) {
-        const sourcePath = join(source.sourceDirectory, ...file.path.split("/"));
-        const targetPath = join(temporaryAddon, ...file.path.split("/"));
-        assertManagedPath(temporaryRoot, targetPath);
-        mkdirSync(dirname(targetPath), { recursive: true, mode: 0o700 });
-        copyFileSync(sourcePath, targetPath);
-      }
-      atomicWriteJson(temporaryAddon, join(temporaryAddon, SOURCE_MANIFEST_NAME), source.manifest);
-      verifyBundleDirectory(temporaryAddon, source.manifest.bundleDigest, true);
-      try {
-        renameSync(temporaryRoot, digestRoot);
-      } catch (error) {
-        if (!existsSync(addonDirectory)) throw error;
-        verifyBundleDirectory(addonDirectory, source.manifest.bundleDigest, true);
-        rmSync(temporaryRoot, { recursive: true, force: true });
-        return { bundleDigest: source.manifest.bundleDigest, addonDirectory, addonSearchRoot: digestRoot, reused: true, manifest: source.manifest };
-      }
-      return { bundleDigest: source.manifest.bundleDigest, addonDirectory, addonSearchRoot: digestRoot, reused: false, manifest: source.manifest };
+      return stageContentAddressedBundle(observerBundlePolicy, source, this.addonsRoot);
     } catch (error) {
-      rmSync(temporaryRoot, { recursive: true, force: true });
-      if (error instanceof ObserverError) throw error;
-      throw new ObserverError("ADDON_STAGE_FAILED", `Could not stage observer addon: ${error instanceof Error ? error.message : String(error)}`);
+      return asObserverError(error);
     }
   }
 
@@ -207,7 +132,12 @@ export class StagingManager {
     if (!existsSync(manifestPath) || lstatSync(manifestPath).isSymbolicLink()) {
       throw new ObserverError("STAGED_ADDON_CONFLICT", "Staged addon has no trustworthy observer manifest; it was preserved");
     }
-    const manifest = parseManifest(manifestPath, true);
+    let manifest: ObserverSourceManifest;
+    try {
+      manifest = readContentAddressedBundleManifest(observerBundlePolicy, manifestPath, "staged");
+    } catch (error) {
+      return asObserverError(error);
+    }
     if (manifest.bundleDigest !== bundleDigest) throw new ObserverError("STAGED_ADDON_CONFLICT", "Staged manifest digest does not match its directory");
     const actualFiles = listRegularFiles(addonDirectory);
     const managed = new Set(manifest.files.map((file) => file.path));
@@ -216,7 +146,7 @@ export class StagingManager {
     const removed: string[] = [];
     for (const file of manifest.files) {
       const target = join(addonDirectory, ...file.path.split("/"));
-      if (!existsSync(target) || lstatSync(target).isSymbolicLink() || sha256File(target) !== file.sha256) {
+      if (!existsSync(target) || lstatSync(target).isSymbolicLink() || sha256ContentFile(target) !== file.sha256) {
         modified.push(file.path);
         continue;
       }

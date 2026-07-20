@@ -14,7 +14,7 @@ import {
   WorkbenchProcessGuard,
   type WorkbenchIdentity,
 } from "../../src/workbench/process-guard.js";
-import { FakeLifecycleBackend } from "./fake-lifecycle-backend.js";
+import { createFakeLifecycleBackend } from "./fake-lifecycle-backend.js";
 import { companionLifecycleState, createFakeCompanionLaunch } from "./fake-companion.js";
 
 const roots: string[] = [];
@@ -36,7 +36,7 @@ function target(name = "A"): { path: string; comparisonKey: string } {
 describe("WorkbenchProcessGuard v3 lifecycle state", () => {
   it("creates a durable vacant record with an exact MCP lease", async () => {
     const stateDir = root();
-    const backend = new FakeLifecycleBackend();
+    const backend = createFakeLifecycleBackend();
     const guard = new WorkbenchProcessGuard({ stateDir, backend });
 
     const result = await guard.withLifecycleLock((session) => session.validateAndClaim({
@@ -59,10 +59,10 @@ describe("WorkbenchProcessGuard v3 lifecycle state", () => {
 
   it("refuses a live different MCP owner", async () => {
     const stateDir = root();
-    const ownerBackend = new FakeLifecycleBackend({
+    const ownerBackend = createFakeLifecycleBackend({
       pid: 1101, executablePath: "C:\\node.exe", creationTime: "10001", userSid: "SID-A",
     });
-    const contenderBackend = new FakeLifecycleBackend({
+    const contenderBackend = createFakeLifecycleBackend({
       pid: 2202, executablePath: "C:\\node.exe", creationTime: "20002", userSid: "SID-A",
     });
     contenderBackend.processes.set(ownerBackend.current.pid, ownerBackend.current);
@@ -81,13 +81,13 @@ describe("WorkbenchProcessGuard v3 lifecycle state", () => {
 
   it("claims only after the prior exact MCP owner is absent", async () => {
     const stateDir = root();
-    const first = new WorkbenchProcessGuard({ stateDir, backend: new FakeLifecycleBackend({
+    const first = new WorkbenchProcessGuard({ stateDir, backend: createFakeLifecycleBackend({
       pid: 1101, executablePath: "C:\\node.exe", creationTime: "10001", userSid: "SID-A",
     }) });
     await first.withLifecycleLock((session) => session.validateAndClaim({
       endpoint: { host: "127.0.0.1", port: 5775 }, target: target(),
     }));
-    const replacementBackend = new FakeLifecycleBackend({
+    const replacementBackend = createFakeLifecycleBackend({
       pid: 2202, executablePath: "C:\\node.exe", creationTime: "20002", userSid: "SID-A",
     });
     const replacement = new WorkbenchProcessGuard({ stateDir, backend: replacementBackend });
@@ -102,14 +102,14 @@ describe("WorkbenchProcessGuard v3 lifecycle state", () => {
 
   it("treats a reused MCP PID with another creation time as a dead prior owner", async () => {
     const stateDir = root();
-    const ownerBackend = new FakeLifecycleBackend({
+    const ownerBackend = createFakeLifecycleBackend({
       pid: 77, executablePath: "C:\\node.exe", creationTime: "111", userSid: "SID-A",
     });
     const owner = new WorkbenchProcessGuard({ stateDir, backend: ownerBackend });
     await owner.withLifecycleLock((session) => session.validateAndClaim({
       endpoint: { host: "127.0.0.1", port: 5775 }, target: target(),
     }));
-    const nextBackend = new FakeLifecycleBackend({
+    const nextBackend = createFakeLifecycleBackend({
       pid: 88, executablePath: "C:\\node.exe", creationTime: "333", userSid: "SID-A",
     });
     nextBackend.processes.set(77, { pid: 77, executablePath: "C:\\node.exe", creationTime: "222" });
@@ -124,7 +124,7 @@ describe("WorkbenchProcessGuard v3 lifecycle state", () => {
 
   it("refuses endpoint and live-target mismatches without changing state", async () => {
     const stateDir = root();
-    const backend = new FakeLifecycleBackend();
+    const backend = createFakeLifecycleBackend();
     const guard = new WorkbenchProcessGuard({ stateDir, backend });
     const wb: WorkbenchIdentity = {
       pid: 3333,
@@ -163,13 +163,13 @@ describe("WorkbenchProcessGuard v3 lifecycle state", () => {
 
   it("refuses a different Windows user even after the old owner dies", async () => {
     const stateDir = root();
-    const owner = new WorkbenchProcessGuard({ stateDir, backend: new FakeLifecycleBackend({
+    const owner = new WorkbenchProcessGuard({ stateDir, backend: createFakeLifecycleBackend({
       pid: 10, executablePath: "C:\\node.exe", creationTime: "10", userSid: "SID-A",
     }) });
     await owner.withLifecycleLock((session) => session.validateAndClaim({
       endpoint: { host: "127.0.0.1", port: 5775 }, target: target(),
     }));
-    const other = new WorkbenchProcessGuard({ stateDir, backend: new FakeLifecycleBackend({
+    const other = new WorkbenchProcessGuard({ stateDir, backend: createFakeLifecycleBackend({
       pid: 20, executablePath: "C:\\node.exe", creationTime: "20", userSid: "SID-B",
     }) });
 
@@ -182,7 +182,7 @@ describe("WorkbenchProcessGuard v3 lifecycle state", () => {
 
   it("generation-checks every state transition and rejects stale callbacks", async () => {
     const stateDir = root();
-    const guard = new WorkbenchProcessGuard({ stateDir, backend: new FakeLifecycleBackend() });
+    const guard = new WorkbenchProcessGuard({ stateDir, backend: createFakeLifecycleBackend() });
     await guard.withLifecycleLock(async (session) => {
       const claim = await session.validateAndClaim({
         endpoint: { host: "127.0.0.1", port: 5775 }, target: target(),
@@ -201,9 +201,66 @@ describe("WorkbenchProcessGuard v3 lifecycle state", () => {
     });
   });
 
+  it("serializes first spawn-journal phases and requires the exact lifecycle authority", async () => {
+    const stateDir = root();
+    const backend = createFakeLifecycleBackend();
+    const guard = new WorkbenchProcessGuard({ stateDir, backend });
+    const authority = await guard.withLifecycleLock(async (session) => {
+      const claim = await session.validateAndClaim({
+        endpoint: { host: "127.0.0.1", port: 5775 }, target: target(),
+      });
+      if (claim.kind !== "claimed") throw new Error("claim failed");
+      return session.transition(
+        { generation: claim.state.generation, leaseId: claim.state.mcpOwner!.leaseId },
+        {
+          ...claim.state,
+          phase: "starting",
+          operation: { kind: "launch", operationId: "spawn-reservation" },
+        }
+      );
+    });
+    const preSpawn = (transactionId: string) => ({
+      transactionId,
+      phase: "pre_spawn" as const,
+      pid: null,
+      identity: null,
+      createdAtMs: 1,
+      updatedAtMs: 1,
+      metadata: {
+        purpose: "client_launch" as const,
+        lifecycleGeneration: authority.generation,
+        targetKey: authority.target!.comparisonKey,
+      },
+    });
+
+    const overlapping = await Promise.allSettled([
+      guard.createSpawnJournal(authority).persist(null, preSpawn("transaction-a")),
+      guard.createSpawnJournal(authority).persist(null, preSpawn("transaction-b")),
+    ]);
+
+    expect(overlapping.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    expect(overlapping.filter((result) => result.status === "rejected")).toHaveLength(1);
+    const durable = await guard.readSpawnJournal();
+    expect(durable).toMatchObject({
+      kind: "valid",
+      record: { phase: "pre_spawn" },
+    });
+
+    await guard.withLifecycleLock(async (session) => session.transition(
+      { generation: authority.generation, leaseId: authority.mcpOwner!.leaseId },
+      {
+        ...authority,
+        operation: { kind: "launch", operationId: "replacement-reservation" },
+      }
+    ));
+    await expect(
+      guard.createSpawnJournal(authority).persist(null, preSpawn("stale-transaction"))
+    ).rejects.toMatchObject({ code: "GENERATION_MISMATCH" });
+  });
+
   it("archives malformed state only after proving Workbench absence", async () => {
     const stateDir = root();
-    const backend = new FakeLifecycleBackend();
+    const backend = createFakeLifecycleBackend();
     const guard = new WorkbenchProcessGuard({ stateDir, backend });
     writeFileSync(guard.statePath, "{ malformed", "utf8");
 
@@ -218,7 +275,7 @@ describe("WorkbenchProcessGuard v3 lifecycle state", () => {
 
   it("never adopts a live obsolete lifecycle marker", async () => {
     const stateDir = root();
-    const backend = new FakeLifecycleBackend();
+    const backend = createFakeLifecycleBackend();
     const guard = new WorkbenchProcessGuard({ stateDir, backend });
     writeFileSync(guard.statePath, JSON.stringify({ version: 2, pid: 900 }), "utf8");
     backend.addWorkbench({ pid: 900, executablePath: "C:\\Workbench.exe", creationTime: "900" });
@@ -233,7 +290,7 @@ describe("WorkbenchProcessGuard v3 lifecycle state", () => {
 
   it("captures a spawned process only when path and exact owner argument match", async () => {
     const stateDir = root();
-    const backend = new FakeLifecycleBackend();
+    const backend = createFakeLifecycleBackend();
     const guard = new WorkbenchProcessGuard({ stateDir, backend });
     const ownerArgument = guard.ownerArgument("capture-token");
     backend.addWorkbench({
@@ -258,7 +315,7 @@ describe("WorkbenchProcessGuard v3 lifecycle state", () => {
 
   it("rejects a process inspection that returns a different PID", async () => {
     const stateDir = root();
-    const backend = new FakeLifecycleBackend();
+    const backend = createFakeLifecycleBackend();
     const guard = new WorkbenchProcessGuard({ stateDir, backend });
     const ownerArgument = guard.ownerArgument("wrong-pid-token");
     backend.inspectProcess = async () => ({
@@ -280,7 +337,7 @@ describe("WorkbenchProcessGuard v3 lifecycle state", () => {
 
   it("binds a loopback listener to the exact sole owned Workbench", async () => {
     const stateDir = root();
-    const backend = new FakeLifecycleBackend();
+    const backend = createFakeLifecycleBackend();
     const guard = new WorkbenchProcessGuard({ stateDir, backend });
     const expected: WorkbenchIdentity = {
       pid: 5250,
@@ -304,7 +361,7 @@ describe("WorkbenchProcessGuard v3 lifecycle state", () => {
 
   it("refuses a valid foreign endpoint response while the spawned child remains live", async () => {
     const stateDir = root();
-    const backend = new FakeLifecycleBackend();
+    const backend = createFakeLifecycleBackend();
     const guard = new WorkbenchProcessGuard({ stateDir, backend });
     const expected: WorkbenchIdentity = {
       pid: 5350,
@@ -333,7 +390,7 @@ describe("WorkbenchProcessGuard v3 lifecycle state", () => {
 
   it("refuses non-loopback automated lifecycle endpoints before claiming state", async () => {
     const stateDir = root();
-    const backend = new FakeLifecycleBackend();
+    const backend = createFakeLifecycleBackend();
     const guard = new WorkbenchProcessGuard({ stateDir, backend });
 
     const result = await guard.withLifecycleLock((session) => session.validateAndClaim({
@@ -347,7 +404,7 @@ describe("WorkbenchProcessGuard v3 lifecycle state", () => {
 
   it("delegates termination as one exact handle-bound backend operation", async () => {
     const stateDir = root();
-    const backend = new FakeLifecycleBackend();
+    const backend = createFakeLifecycleBackend();
     const guard = new WorkbenchProcessGuard({ stateDir, backend });
     const expected: WorkbenchIdentity = {
       pid: 6060,
@@ -369,7 +426,7 @@ describe("WorkbenchProcessGuard v3 lifecycle state", () => {
 
   it("fails closed on zero or unknown current-process creation time", async () => {
     const stateDir = root();
-    const backend = new FakeLifecycleBackend({
+    const backend = createFakeLifecycleBackend({
       pid: 1, executablePath: "C:\\node.exe", creationTime: "0", userSid: "SID-A",
     });
     const guard = new WorkbenchProcessGuard({ stateDir, backend });
@@ -379,7 +436,7 @@ describe("WorkbenchProcessGuard v3 lifecycle state", () => {
 
   it("serializes simultaneous callbacks through the backend mutex", async () => {
     const stateDir = root();
-    const backend = new FakeLifecycleBackend();
+    const backend = createFakeLifecycleBackend();
     const guard = new WorkbenchProcessGuard({ stateDir, backend });
     let releaseFirst!: () => void;
     const barrier = new Promise<void>((resolve) => { releaseFirst = resolve; });

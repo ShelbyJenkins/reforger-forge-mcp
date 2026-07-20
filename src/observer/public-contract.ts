@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import type { CaptureErrorCode } from "./capture-contract.js";
 
 function generatedStringArray(name: string): readonly [string, ...string[]] {
   const path = fileURLToPath(new URL(`../../observer/protocol/generated/${name}.json`, import.meta.url));
@@ -32,16 +33,19 @@ const FIXED_ERROR_MESSAGES: Readonly<Record<string, string>> = (() => {
   return parsed as Record<string, string>;
 })();
 
-export function canonicalPublicObserverErrorCode(value: unknown, fallback = "INTERNAL_ERROR"): string {
-  if (typeof value === "string" && PUBLIC_ERROR_SET.has(value)) return value;
+export function canonicalPublicObserverErrorCode(
+  value: unknown,
+  fallback: CaptureErrorCode = "INTERNAL_ERROR"
+): CaptureErrorCode {
+  if (typeof value === "string" && PUBLIC_ERROR_SET.has(value)) return value as CaptureErrorCode;
   return PUBLIC_ERROR_SET.has(fallback) ? fallback : "INTERNAL_ERROR";
 }
 
 export function canonicalPublicObserverError(
   value: unknown,
   diagnostic: unknown,
-  fallback = "INTERNAL_ERROR"
-): { code: string; message: string; diagnosticDetailsAllowed: boolean } {
+  fallback: CaptureErrorCode = "INTERNAL_ERROR"
+): { code: CaptureErrorCode; message: string; diagnosticDetailsAllowed: boolean } {
   const code = canonicalPublicObserverErrorCode(value, fallback);
   const fixed = FIXED_ERROR_MESSAGES[code];
   const bounded = typeof diagnostic === "string" ? diagnostic.trim().slice(0, 512) : "";

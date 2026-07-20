@@ -1,14 +1,17 @@
 {
   "extends": "../tsconfig.json",
   "compilerOptions": {
-    "rootDir": ".",
-    "outDir": "../dist/observer"
+    "rootDir": "..",
+    "outDir": "../dist",
+    "composite": true,
+    "tsBuildInfoFile": "../dist/.tsbuildinfo/observer-agent.tsbuildinfo"
   },
-  "include": [
-    "agent/**/*.ts",
-    "protocol/**/*.ts"
-  ],
+  "include": ["agent/**/*.ts"],
   "exclude": [
     "**/*.test.ts"
+  ],
+  "references": [
+    { "path": "../tsconfig.shared.build.json" },
+    { "path": "./protocol/tsconfig.build.json" }
   ]
 }

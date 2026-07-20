@@ -18,10 +18,11 @@ projects and from Workbench lifecycle ownership.
 - Runtime process IDs returned by inventory are diagnostic only. Preparation and capture never adopt or signal a game process; only an explicit `observer_runtime` lifecycle action may affect the exact child it started and verified.
 - Exact-owned runtime lifecycle state is atomic beneath the external managed root and uses owner-only creation modes where supported. On Windows it inherits that root's ACL, so a custom managed root must be current-user-private rather than shared or broadly writable. The lifecycle never uses process names, a PID alone, a shell command, or broad process-tree termination, and it never adopts a pre-existing Arma process.
 - MCP tools remain thin orchestration over the lazy private child and the shared exact-process lifecycle service; they do not duplicate staging, job, artifact, camera, or process-identity behavior.
-- Workbench capture reuses the existing shared `WorkbenchClient`, version-3
-  lifecycle lease, activity gate, externally staged Workbench companion, and
-  dedicated external profile. It never creates a parallel Workbench owner or
-  writes helper sources into a target project.
+- Workbench capture reuses the shared `WorkbenchSessionController` through the
+  stable `WorkbenchClient` facade, its version-3 lifecycle lease, local
+  writer-preferring reader/writer gate, externally staged Workbench companion,
+  and dedicated external profile. It never creates a parallel Workbench owner
+  or writes helper sources into a target project.
 
 ## Build and standalone CLI
 
@@ -45,11 +46,14 @@ merged `-addonsDir`, one merged `-addons`, one matching `-profile`, and
 
 ## MCP integration
 
-The MCP server lazily forks `dist/observer/agent/private-child.js` with an
-inherited JSON IPC channel and an ephemeral loopback runtime port. The child is
-never adopted by another MCP, exits on parent-channel loss, and is asked to
-shut down when the MCP transport closes. The public surface is exactly seven MCP
-tools:
+The MCP server creates one host observer application. Its shared capture
+service owns routing, public jobs, idempotency, deadlines, run binding,
+promotion, cancellation, and release for both runtime and Workbench backends;
+the historical coordinator only delegates. The application lazily forks
+`dist/observer/agent/private-child.js` with an inherited JSON IPC channel and
+an ephemeral loopback runtime port. The child is never adopted by another MCP,
+exits on parent-channel loss, and is asked to shut down when the MCP transport
+closes. The public surface is exactly seven MCP tools:
 
 - `observer_setup` verifies/stages both immutable companion add-ons, reports
   both managed roots, applies bounded Workbench-helper retention while vacant,
@@ -77,12 +81,27 @@ Synchronous capture embeds one host-validated PNG plus concise metadata when it
 fits the configured inline limit. Oversized artifacts remain retained for
 run finalization, without disclosing a private managed path.
 
+Inventory and jobs include an opaque, versioned `worldRevision` that represents
+nullable runtime worlds and Workbench composite world identity without
+inventing backend epochs. New callers should echo it as
+`expectedWorldRevision`; legacy world ID/epoch fields remain projected for
+compatibility. The durable run store is backend-neutral. Filesystem bundle
+construction, member hashing, log redaction, manifest-last publication,
+verification, and interrupted-export recovery live in an optional exporter.
+Without configured evidence roots, new begin/reserve/finalize requests fail
+immediately, while status, failure, discard, and cleanup remain available for
+existing durable records.
+
 Runtime sessions support acknowledged REST delivery with a confined mailbox
 fallback. Registration, heartbeats, job idempotency, artifact completion, and
 release receipts are bounded and replay-safe. A job is never reported complete
 until the host has validated the regular PNG file, dimensions, stable size,
 digest, and session/job binding. Status and doctor remain non-mutating while the
 private child is idle.
+
+The installed `observer-agent doctor` command calls lexical/read-only path
+inspection directly. Missing managed and profile roots remain missing: doctor
+does not construct stores, stage files, create directories, or start a child.
 
 ### Bounded mailbox and retention behavior
 
@@ -501,11 +520,12 @@ file hashes, and bundle digest; rejects target overlap with the managed root,
 staged add-on, search root, or profile; and re-hashes the payload after copying
 it into digest-addressed immutable external storage.
 
-Workbench launches record the helper add-on ID, GUID, staged directory, search
-root, bundle digest, build identity, and profile in the version-3 lifecycle.
-Readiness and reuse require `EMCP_WB_Ping` to return the exact helper add-on ID,
-GUID, version, protocol, and build identity expected by the current MCP build.
-A reachable NET API with a different helper identity is refused.
+Workbench editor launches record the helper add-on ID, GUID, staged directory,
+search root, bundle digest, build identity, and profile in the version-3
+lifecycle. Editor readiness and reuse require `EMCP_WB_Ping` to return the exact
+helper add-on ID, GUID, version, protocol, and build identity expected by the
+current MCP build. A reachable NET API with a different helper identity is
+refused. The target-build launch plan has no helper or NET-readiness capability.
 
 Observer inventory and capture reuse the same long-lived client, canonical
 `.gproj`, lifecycle generation, endpoint, and exact process identity. They do
@@ -524,8 +544,9 @@ viewport dimensions. `BaseWorld` exposes no near-plane getter and the observer
 does not mutate the near plane. Completion, cancellation, failure, release,
 restart and shutdown must converge on exact slot/matrix/FOV
 restoration. If the active slot, world, lifecycle, or requested camera state
-changes unexpectedly, the adapter returns `RESTORATION_UNCONFIRMED` and the
-shared activity gate blocks lifecycle mutation.
+changes unexpectedly, the adapter returns `RESTORATION_UNCONFIRMED`. The shared
+controller's local writer gate blocks new managed reads and requires active
+reads and capture restoration to drain before a lifecycle mutation proceeds.
 
 A freshly started Workbench may advertise `render.capture` for current-view
 captures, but it does not advertise `camera.editor` immediately. The exact
@@ -539,16 +560,20 @@ bytes in the same one-image plus metadata MCP result as the runtime backend.
 
 For project launch/build wrappers, use the packaged
 `reforger-forge-workbench` foreground editor or bounded build command. It shares
-the same lifecycle and companion staging, so a project does not need its own
-Workbench process guard. A build holds one machine lock and absolute deadline
-across two exact children: a managed-companion preflight proves endpoint/Ping
-identity and post-termination endpoint vacancy before a distinct target-only
-child starts. Its version-3 receipt keeps the preflight and build PIDs,
-generations, and attributed log directories distinct and requires a fresh
-nonempty `resourceDatabase.rdb` for success from a caller-supplied unique empty
-output root. It also binds the project and output-database SHA-256 values.
-Timeout, nonzero exit, and output-attestation failure remain machine-readable
-without being promoted to success.
+the lifecycle and companion staging, so a project does not need its own
+Workbench process guard. The target-build plan itself is helper-free, uses a
+dedicated profile, and makes no NET call. At this pre-removal boundary, the
+public build still holds one machine lock and absolute deadline across two exact
+children: a managed-companion editor preflight proves endpoint/Ping identity and
+post-termination endpoint vacancy before the distinct target-only child starts.
+Its version-3 receipt keeps the preflight and build PIDs, generations, and
+attributed log directories distinct and requires a fresh nonempty
+`resourceDatabase.rdb` for success from a caller-exclusive unique empty output
+root. It also binds the project and output-database SHA-256 values. Timeout,
+nonzero exit, and output-attestation failure remain machine-readable without
+being promoted to success. Removing the preflight and changing the public
+receipt to version 4 remain gated on two consecutive controlled target-only
+Workbench acceptance runs and green hermetic contracts.
 
 Installed Workbench 1.7.0.54 successfully dispatches the guarded build with the
 exact sequence

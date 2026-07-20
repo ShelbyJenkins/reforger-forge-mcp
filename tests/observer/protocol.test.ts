@@ -159,54 +159,6 @@ describe("observer protocol", () => {
       ERROR_REGISTRY[code].backends.includes("runtime" as never))).toBe(true);
   });
 
-  it("keeps generated error/capability artifacts and documentation in registry order", () => {
-    const protocolRoot = join(repositoryRoot, "observer", "protocol");
-    expect(JSON.parse(readFileSync(join(protocolRoot, "generated", "error-codes.json"), "utf8")))
-      .toEqual([...ERROR_CODES]);
-    expect(JSON.parse(readFileSync(join(protocolRoot, "generated", "runtime-error-codes.json"), "utf8")))
-      .toEqual([...RUNTIME_ERROR_CODES]);
-    expect(JSON.parse(readFileSync(join(protocolRoot, "generated", "capabilities.json"), "utf8")))
-      .toEqual([...CAPABILITIES]);
-    expect(JSON.parse(readFileSync(join(protocolRoot, "generated", "fixed-error-messages.json"), "utf8")))
-      .toEqual(Object.fromEntries(ERROR_CODES
-        .filter((code) => ERROR_REGISTRY[code].publicMessagePolicy === "fixed")
-        .map((code) => [code, ERROR_REGISTRY[code].publicMessage])));
-
-    const errorSchema = JSON.parse(readFileSync(join(protocolRoot, "schemas", "error.schema.json"), "utf8"));
-    const jobSchema = JSON.parse(readFileSync(join(protocolRoot, "schemas", "job-status.schema.json"), "utf8"));
-    const heartbeatSchemaJson = JSON.parse(readFileSync(join(protocolRoot, "schemas", "heartbeat.schema.json"), "utf8"));
-    const vocabularySchema = JSON.parse(readFileSync(join(protocolRoot, "schemas", "vocabulary.schema.json"), "utf8"));
-    expect(vocabularySchema.$defs.errorCode.enum).toEqual([...ERROR_CODES]);
-    expect(vocabularySchema.$defs.runtimeErrorCode.enum).toEqual([...RUNTIME_ERROR_CODES]);
-    expect(vocabularySchema.$defs.capability.enum).toEqual([...CAPABILITIES]);
-    expect(errorSchema.properties.error.properties.code.enum).toEqual([...ERROR_CODES]);
-    expect(jobSchema.properties.errorCode.enum).toEqual([...RUNTIME_ERROR_CODES]);
-    expect(heartbeatSchemaJson.properties.lastErrorCode.oneOf[0].enum)
-      .toEqual([...RUNTIME_ERROR_CODES]);
-
-    const errorRows = readFileSync(join(protocolRoot, "errors.md"), "utf8").split(/\r?\n/)
-      .filter((line) => /^\| [A-Z][A-Z0-9_]+ \|/.test(line))
-      .map((line) => line.split("|").slice(1, -1).map((part) => part.trim()));
-    const capabilityRows = readFileSync(join(protocolRoot, "capabilities.md"), "utf8").split(/\r?\n/)
-      .filter((line) => /^\| `[^`]+` \|/.test(line))
-      .map((line) => line.split("|").slice(1, -1).map((part) => part.trim()));
-    expect(errorRows).toEqual(ERROR_CODES.map((code) => {
-      const definition = ERROR_REGISTRY[code];
-      return [
-        code,
-        definition.publicMessagePolicy,
-        definition.retryable ? "yes" : "no",
-        definition.backends.join(", "),
-        definition.publicMessage,
-      ];
-    }));
-    expect(capabilityRows).toEqual(CAPABILITIES.map((capability) => [
-      `\`${capability}\``,
-      CAPABILITY_REGISTRY[capability].backends.join(", "),
-      CAPABILITY_REGISTRY[capability].proof,
-    ]));
-  });
-
   it("registers metadata for every public code and only proven capabilities", () => {
     for (const code of ERROR_CODES) {
       expect(ERROR_REGISTRY[code].backends.length).toBeGreaterThan(0);

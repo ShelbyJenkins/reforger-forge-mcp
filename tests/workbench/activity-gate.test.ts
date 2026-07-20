@@ -37,7 +37,10 @@ import {
   createFakeCompanionLaunch,
   fakeCompanionProvider,
 } from "./fake-companion.js";
-import { FakeLifecycleBackend } from "./fake-lifecycle-backend.js";
+import {
+  createFakeLifecycleBackend,
+  type FakeLifecycleBackend,
+} from "./fake-lifecycle-backend.js";
 
 const roots: string[] = [];
 
@@ -72,6 +75,15 @@ const binding: CaptureActivityBinding = {
   },
 };
 
+function deferred<T = void>(): {
+  promise: Promise<T>;
+  resolve(value: T): void;
+} {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((resolvePromise) => { resolve = resolvePromise; });
+  return { promise, resolve };
+}
+
 function expectActivityCode(action: () => unknown, code: string): void {
   try {
     action();
@@ -87,6 +99,137 @@ afterEach(() => {
 });
 
 describe("WorkbenchActivityGate", () => {
+  it("admits concurrent managed readers", async () => {
+    const gate = new WorkbenchActivityGate();
+    const release = deferred();
+    const entered: string[] = [];
+    const first = gate.runManaged("first reader", async () => {
+      entered.push("first");
+      await release.promise;
+      return 1;
+    });
+    const second = gate.runManaged("second reader", async () => {
+      entered.push("second");
+      await release.promise;
+      return 2;
+    });
+
+    await vi.waitFor(() => expect(entered).toEqual(["first", "second"]));
+    release.resolve();
+    await expect(Promise.all([first, second])).resolves.toEqual([1, 2]);
+  });
+
+  it("records writer intent synchronously and blocks readers arriving behind it", async () => {
+    const gate = new WorkbenchActivityGate();
+    const releaseReader = deferred();
+    const readerEntered = deferred();
+    const reader = gate.runManaged("blocking reader", async () => {
+      readerEntered.resolve();
+      await releaseReader.promise;
+    });
+    await readerEntered.promise;
+
+    const writerAction = vi.fn(async () => "written");
+    const writer = gate.runLifecycle("restart", writerAction);
+    await expect(gate.runManaged("late reader", async () => "late")).rejects.toMatchObject({
+      code: "LIFECYCLE_BUSY",
+    });
+    expect(writerAction).not.toHaveBeenCalled();
+
+    releaseReader.resolve();
+    await reader;
+    await expect(writer).resolves.toBe("written");
+    expect(writerAction).toHaveBeenCalledOnce();
+  });
+
+  it("bounds writer admission while existing readers drain and removes timed-out intent", async () => {
+    const timing = new ManualTiming();
+    const gate = new WorkbenchActivityGate({ restoreTimeoutMs: 25, timing });
+    const releaseReader = deferred();
+    const readerEntered = deferred();
+    const reader = gate.runManaged("blocking reader", async () => {
+      readerEntered.resolve();
+      await releaseReader.promise;
+    });
+    await readerEntered.promise;
+
+    const writerAction = vi.fn(async () => undefined);
+    const writer = gate.runLifecycle("shutdown", writerAction);
+    const rejected = expect(writer).rejects.toMatchObject({ code: "LIFECYCLE_BUSY" });
+    timing.fireNext();
+    await rejected;
+    expect(writerAction).not.toHaveBeenCalled();
+
+    await expect(gate.runManaged("reader after timeout", async () => "admitted")).resolves.toBe(
+      "admitted"
+    );
+    releaseReader.resolve();
+    await reader;
+    await expect(gate.runLifecycle("later writer", async () => "written")).resolves.toBe(
+      "written"
+    );
+  });
+
+  it("removes a cancelled writer and admits the next FIFO writer without starvation", async () => {
+    const gate = new WorkbenchActivityGate();
+    const releaseReader = deferred();
+    const readerEntered = deferred();
+    const reader = gate.runManaged("blocking reader", async () => {
+      readerEntered.resolve();
+      await releaseReader.promise;
+    });
+    await readerEntered.promise;
+
+    const controller = new AbortController();
+    const cancelledAction = vi.fn(async () => undefined);
+    const cancelled = gate.runLifecycle("cancelled writer", cancelledAction, {
+      signal: controller.signal,
+    });
+    const cancelledResult = expect(cancelled).rejects.toMatchObject({
+      code: "LIFECYCLE_BUSY",
+    });
+    const order: string[] = [];
+    const next = gate.runLifecycle("next writer", async () => {
+      order.push("next");
+      return "done";
+    });
+
+    controller.abort("caller stopped waiting");
+    await cancelledResult;
+    expect(cancelledAction).not.toHaveBeenCalled();
+    expect(order).toEqual([]);
+    releaseReader.resolve();
+    await reader;
+    await expect(next).resolves.toBe("done");
+    expect(order).toEqual(["next"]);
+  });
+
+  it("admits queued writers one at a time in FIFO order", async () => {
+    const gate = new WorkbenchActivityGate();
+    const releaseFirst = deferred();
+    const firstEntered = deferred();
+    const order: string[] = [];
+    const first = gate.runLifecycle("first writer", async () => {
+      order.push("first-enter");
+      firstEntered.resolve();
+      await releaseFirst.promise;
+      order.push("first-exit");
+    });
+    await firstEntered.promise;
+    const second = gate.runLifecycle("second writer", async () => {
+      order.push("second");
+    });
+    const third = gate.runLifecycle("third writer", async () => {
+      order.push("third");
+    });
+
+    await Promise.resolve();
+    expect(order).toEqual(["first-enter"]);
+    releaseFirst.resolve();
+    await Promise.all([first, second, third]);
+    expect(order).toEqual(["first-enter", "first-exit", "second", "third"]);
+  });
+
   it("allows only one capture activity lease", () => {
     const gate = new WorkbenchActivityGate({ createLeaseId: () => "capture-a" });
     const lease = gate.acquireCapture(binding);
@@ -218,7 +361,7 @@ async function createRunningHarness(activityGate?: WorkbenchActivityGate): Promi
     workbenchHost: "127.0.0.1",
     workbenchPort: 5775,
   };
-  const backend = new FakeLifecycleBackend();
+  const backend = createFakeLifecycleBackend();
   const guard = new WorkbenchProcessGuard({
     backend,
     stateDir,
@@ -414,31 +557,63 @@ describe("WorkbenchClient observer activity integration", () => {
 
   it("invalidates a matching capture immediately when the exact child exits", async () => {
     const harness = await createRunningHarness();
-    const snapshot = await harness.client.getRunningObserverSnapshot();
-    const lease = harness.client.acquireCaptureActivity(snapshot);
-    const child = new EventEmitter() as EventEmitter & { pid: number };
-    child.pid = harness.workbench.pid;
-    (harness.client as unknown as {
-      attachOwnedChild(
-        child: ChildProcess,
-        identity: WorkbenchIdentity,
-        generation: string,
-        targetKey: string
-      ): unknown;
-    }).attachOwnedChild(
-      child as unknown as ChildProcess,
-      harness.workbench,
-      snapshot.generation,
-      snapshot.target.comparisonKey
+    const executablePath = join(
+      harness.config.workbenchPath!,
+      "Workbench",
+      "ArmaReforgerWorkbenchSteamDiag.exe"
     );
+    mkdirSync(join(harness.config.workbenchPath!, "Workbench"), { recursive: true });
+    writeFileSync(executablePath, "fake executable");
+    const companion = createFakeCompanionLaunch(harness.root);
+    const child = Object.assign(new EventEmitter(), {
+      pid: 21_001,
+      exitCode: null as number | null,
+      signalCode: null as NodeJS.Signals | null,
+      unref: vi.fn(),
+    });
+    const client = new WorkbenchClient(
+      harness.config.workbenchHost,
+      harness.config.workbenchPort,
+      harness.config,
+      "activity-owned-child-test",
+      harness.guard,
+      {
+        companionProvider: fakeCompanionProvider(companion),
+        spawnProcess: (command, args) => {
+          const ownerArgument = args.find((argument) =>
+            argument.startsWith("-reforgerForgeOwnerToken=")
+          );
+          if (!ownerArgument) throw new Error("test spawn omitted owner credential");
+          harness.backend.addWorkbench({
+            pid: child.pid,
+            executablePath: command,
+            creationTime: "133900000000021001",
+          }, ownerArgument);
+          return child as unknown as ChildProcess;
+        },
+        companionReadiness: async (options) => ({
+          addonId: options.companion.addonId,
+          addonGuid: options.companion.addonGuid,
+          addonVersion: options.companion.addonVersion,
+          protocolVersion: options.companion.protocolVersion,
+          workbenchProtocol: options.companion.protocolVersion,
+          buildIdentity: options.companion.buildIdentity,
+          bundleDigest: options.companion.bundleDigest,
+        }),
+      }
+    );
+    vi.spyOn(client, "ping").mockResolvedValue(true);
+    await client.restartOwnedWorkbench();
+    const snapshot = await client.getRunningObserverSnapshot();
+    const lease = client.acquireCaptureActivity(snapshot);
 
-    harness.backend.processes.delete(harness.workbench.pid);
-    harness.backend.workbenchPids.delete(harness.workbench.pid);
+    harness.backend.processes.delete(child.pid);
+    harness.backend.workbenchPids.delete(child.pid);
     child.emit("exit", 1, null);
 
     expect(lease.signal.aborted).toBe(true);
     expect(lease.signal.reason).toMatchObject({ code: "WORKBENCH_EXITED" });
-    await expect(harness.client.revalidateCaptureActivity(lease)).rejects.toMatchObject({
+    await expect(client.revalidateCaptureActivity(lease)).rejects.toMatchObject({
       code: "CAPTURE_INVALIDATED",
     });
     await vi.waitFor(async () => {

@@ -1,9 +1,13 @@
 observer/addon/** -text
 observer/workbench-addon/** -text
 observer/protocol/generated/** text eol=lf
+observer/protocol/schemas/artifact-manifest.schema.json text eol=lf
+observer/protocol/schemas/capture-request.schema.json text eol=lf
 observer/protocol/schemas/error.schema.json text eol=lf
 observer/protocol/schemas/heartbeat.schema.json text eol=lf
+observer/protocol/schemas/instance-registration.schema.json text eol=lf
 observer/protocol/schemas/job-status.schema.json text eol=lf
+observer/protocol/schemas/session-contract.schema.json text eol=lf
 observer/protocol/schemas/vocabulary.schema.json text eol=lf
 observer/protocol/errors.md text eol=lf
 observer/protocol/capabilities.md text eol=lf

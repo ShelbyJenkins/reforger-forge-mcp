@@ -1,19 +1,33 @@
-import { createHash, randomUUID } from "node:crypto";
 import {
-  copyFileSync,
   existsSync,
   lstatSync,
-  mkdirSync,
   readFileSync,
   readdirSync,
   realpathSync,
-  renameSync,
   rmSync,
   statSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { z } from "zod";
+import { boundedOption, type BoundedOptionErrorFactory } from "../foundation/bounded-option.js";
+import {
+  canonicalizeExistingDirectory,
+  canonicalizePotentialPath,
+  ensureCanonicalDirectory as ensureFoundationDirectory,
+  isPathContained,
+  pathComparisonKey,
+  resolveManagedPath,
+} from "../foundation/managed-path.js";
+import {
+  ContentAddressedBundleError,
+  computeContentAddressedBundleDigest,
+  createContentAddressedBundleManifestSchema,
+  stageContentAddressedBundle,
+  verifyContentAddressedBundle,
+  type ContentAddressedBundlePolicy,
+} from "../companions/content-addressed-bundle.js";
 
 export const WORKBENCH_HELPER_SOURCE_MANIFEST =
   ".reforger-forge-workbench-helper-source.json" as const;
@@ -197,7 +211,6 @@ interface VerifiedHelperBundle {
 }
 
 const SHA256_PATTERN = /^[a-f0-9]{64}$/;
-const SAFE_PAYLOAD_PATTERN = /^[A-Za-z0-9._/-]+$/;
 const DEFAULT_RETENTION_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1_000;
 const DEFAULT_RETENTION_MAX_BYTES = 512 * 1024 * 1024;
 const TEMPORARY_STAGE_MAX_AGE_MS = 60 * 60 * 1_000;
@@ -221,78 +234,49 @@ export function defaultWorkbenchHelperManagedRoot(): string {
   return join(homedir(), ".local", "state", "reforger-forge", "observer", "v1");
 }
 
-function pathKey(path: string): string {
-  const absolute = resolve(path);
-  return process.platform === "win32" ? absolute.toLowerCase() : absolute;
-}
-
-function isContained(root: string, candidate: string): boolean {
-  const rel = relative(pathKey(root), pathKey(candidate));
-  return rel === "" || (!isAbsolute(rel) && rel !== ".." && !rel.startsWith(`..${sep}`));
-}
-
 function pathsOverlap(left: string, right: string): boolean {
-  return isContained(left, right) || isContained(right, left);
+  return isPathContained(left, right) || isPathContained(right, left);
 }
 
 /** Canonicalize all existing path segments without creating the requested path. */
 function potentialCanonicalPath(path: string): string {
-  const absolute = resolve(path);
-  let existing = absolute;
-  while (!existsSync(existing)) {
-    const parent = dirname(existing);
-    if (parent === existing) return absolute;
-    existing = parent;
-  }
-  const canonicalExisting = realpathSync.native(existing);
-  return resolve(canonicalExisting, relative(existing, absolute));
+  return canonicalizePotentialPath(path, {
+    linkPolicy: "follow-existing",
+    existingAncestor: "any",
+    label: "Workbench helper path",
+  });
 }
 
 function canonicalDirectory(path: string, label: string): string {
-  let canonical: string;
   try {
-    canonical = realpathSync.native(resolve(path));
-  } catch {
+    return canonicalizeExistingDirectory(path, label);
+  } catch (error) {
     throw new WorkbenchHelperStageError(
-      `${label} does not exist or cannot be resolved: ${resolve(path)}`,
+      error instanceof Error ? error.message : String(error),
       "WORKBENCH_HELPER_PATH_UNSAFE"
     );
   }
-  if (!statSync(canonical).isDirectory()) {
-    throw new WorkbenchHelperStageError(
-      `${label} is not a directory: ${canonical}`,
-      "WORKBENCH_HELPER_PATH_UNSAFE"
-    );
-  }
-  return canonical;
 }
 
 function ensureCanonicalDirectory(path: string): string {
-  mkdirSync(resolve(path), { recursive: true, mode: 0o700 });
-  return canonicalDirectory(path, "Workbench helper managed directory");
-}
-
-function assertContainedPath(root: string, candidate: string): void {
-  const canonicalRoot = canonicalDirectory(root, "Workbench helper managed root");
-  const absolute = resolve(candidate);
-  if (!isContained(canonicalRoot, absolute)) {
+  try {
+    return ensureFoundationDirectory(path, 0o700);
+  } catch (error) {
     throw new WorkbenchHelperStageError(
-      `Workbench helper path escapes its managed root: ${absolute}`,
+      error instanceof Error ? error.message : String(error),
       "WORKBENCH_HELPER_PATH_UNSAFE"
     );
   }
-  const rel = relative(canonicalRoot, absolute);
-  let current = canonicalRoot;
-  for (const segment of rel.split(sep).filter(Boolean)) {
-    current = join(current, segment);
-    if (!existsSync(current)) continue;
-    const canonical = realpathSync.native(current);
-    if (!isContained(canonicalRoot, canonical)) {
-      throw new WorkbenchHelperStageError(
-        `Workbench helper path traverses a link outside its managed root: ${current}`,
-        "WORKBENCH_HELPER_PATH_UNSAFE"
-      );
-    }
+}
+
+function assertContainedPath(root: string, candidate: string): void {
+  try {
+    resolveManagedPath(root, candidate, "link-safe");
+  } catch (error) {
+    throw new WorkbenchHelperStageError(
+      error instanceof Error ? error.message : String(error),
+      "WORKBENCH_HELPER_PATH_UNSAFE"
+    );
   }
 }
 
@@ -315,132 +299,13 @@ function targetDirectory(targetProjectPath: string): string {
   );
 }
 
-function assertSafePayloadPath(path: unknown): path is string {
-  if (typeof path !== "string" || !SAFE_PAYLOAD_PATTERN.test(path) ||
-      path.startsWith("/") || path.includes("\\")) return false;
-  return path.split("/").every((segment) => segment !== "" && segment !== "." && segment !== "..");
-}
-
-function sha256File(path: string): string {
-  return createHash("sha256").update(readFileSync(path)).digest("hex");
-}
-
 export function computeWorkbenchHelperBundleDigest(
   files: readonly WorkbenchHelperManifestFile[]
 ): string {
-  const aggregate = createHash("sha256");
-  for (const file of [...files].sort((left, right) => left.path.localeCompare(right.path))) {
-    aggregate.update(file.path, "utf8");
-    aggregate.update("\0", "utf8");
-    aggregate.update(file.sha256, "ascii");
-    aggregate.update("\n", "utf8");
-  }
-  return aggregate.digest("hex");
+  return computeContentAddressedBundleDigest(files);
 }
 
-function listPayloadFiles(root: string, conflict: boolean): string[] {
-  const files: string[] = [];
-  const visit = (directory: string): void => {
-    for (const entry of readdirSync(directory, { withFileTypes: true })
-      .sort((left, right) => left.name.localeCompare(right.name))) {
-      const path = join(directory, entry.name);
-      const rel = relative(root, path).split(sep).join("/");
-      const info = lstatSync(path);
-      if (info.isSymbolicLink()) {
-        throw new WorkbenchHelperStageError(
-          `Workbench helper bundle contains a symbolic link: ${rel}`,
-          conflict ? "WORKBENCH_HELPER_STAGE_CONFLICT" : "WORKBENCH_HELPER_SOURCE_INVALID"
-        );
-      }
-      if (info.isDirectory()) visit(path);
-      else if (info.isFile()) files.push(rel);
-      else {
-        throw new WorkbenchHelperStageError(
-          `Workbench helper bundle contains a non-regular entry: ${rel}`,
-          conflict ? "WORKBENCH_HELPER_STAGE_CONFLICT" : "WORKBENCH_HELPER_SOURCE_INVALID"
-        );
-      }
-    }
-  };
-  visit(root);
-  return files;
-}
-
-function parseManifest(path: string, conflict: boolean): WorkbenchHelperSourceManifest {
-  const code = conflict ? "WORKBENCH_HELPER_STAGE_CONFLICT" : "WORKBENCH_HELPER_SOURCE_INVALID";
-  let value: unknown;
-  try {
-    value = JSON.parse(readFileSync(path, "utf8").replace(/^\uFEFF/, ""));
-  } catch {
-    throw new WorkbenchHelperStageError(`Workbench helper manifest is missing or malformed: ${path}`, code);
-  }
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new WorkbenchHelperStageError("Workbench helper manifest root must be an object", code);
-  }
-  const record = value as Record<string, unknown>;
-  if (record.manifestVersion !== 1 || record.role !== WORKBENCH_HELPER_DESCRIPTOR.role ||
-      record.addonId !== WORKBENCH_HELPER_ADDON_ID ||
-      record.addonGuid !== WORKBENCH_HELPER_ADDON_GUID ||
-      record.addonVersion !== WORKBENCH_HELPER_ADDON_VERSION ||
-      record.protocolVersion !== WORKBENCH_HELPER_PROTOCOL_VERSION ||
-      record.buildIdentity !== WORKBENCH_HELPER_BUILD_IDENTITY ||
-      typeof record.bundleDigest !== "string" || !SHA256_PATTERN.test(record.bundleDigest) ||
-      !Array.isArray(record.files) || record.files.length === 0) {
-    throw new WorkbenchHelperStageError(
-      "Workbench helper manifest does not match the supported companion identity",
-      code
-    );
-  }
-  const files: WorkbenchHelperManifestFile[] = [];
-  const seen = new Set<string>();
-  for (const raw of record.files) {
-    if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
-      throw new WorkbenchHelperStageError("Workbench helper manifest contains an invalid file entry", code);
-    }
-    const entry = raw as Record<string, unknown>;
-    if (!assertSafePayloadPath(entry.path) || typeof entry.sha256 !== "string" ||
-        !SHA256_PATTERN.test(entry.sha256)) {
-      throw new WorkbenchHelperStageError("Workbench helper manifest contains an unsafe file entry", code);
-    }
-    const key = entry.path.toLowerCase();
-    if (seen.has(key) || entry.path === WORKBENCH_HELPER_SOURCE_MANIFEST) {
-      throw new WorkbenchHelperStageError(
-        `Workbench helper manifest repeats or manages a reserved path: ${entry.path}`,
-        code
-      );
-    }
-    seen.add(key);
-    files.push({ path: entry.path, sha256: entry.sha256 });
-  }
-  const payloadPaths = files.map((entry) => entry.path)
-    .sort((left, right) => left.localeCompare(right));
-  const requiredPayloadPaths = [...WORKBENCH_HELPER_PAYLOAD_FILES]
-    .sort((left, right) => left.localeCompare(right));
-  if (payloadPaths.length !== requiredPayloadPaths.length ||
-      payloadPaths.some((path, index) => path !== requiredPayloadPaths[index])) {
-    throw new WorkbenchHelperStageError(
-      "Workbench helper manifest does not contain the exact supported helper payload",
-      code
-    );
-  }
-  if (computeWorkbenchHelperBundleDigest(files) !== record.bundleDigest) {
-    throw new WorkbenchHelperStageError("Workbench helper aggregate bundle digest is invalid", code);
-  }
-  return {
-    manifestVersion: 1,
-    role: "workbench-helper",
-    addonVersion: WORKBENCH_HELPER_ADDON_VERSION,
-    protocolVersion: WORKBENCH_HELPER_PROTOCOL_VERSION,
-    addonId: WORKBENCH_HELPER_ADDON_ID,
-    addonGuid: WORKBENCH_HELPER_ADDON_GUID,
-    buildIdentity: WORKBENCH_HELPER_BUILD_IDENTITY,
-    bundleDigest: record.bundleDigest,
-    files,
-  };
-}
-
-function verifyCompiledHelperIdentity(directory: string, conflict: boolean): void {
-  const code = conflict ? "WORKBENCH_HELPER_STAGE_CONFLICT" : "WORKBENCH_HELPER_SOURCE_INVALID";
+function verifyCompiledHelperIdentity(directory: string): void {
   const gproj = readFileSync(join(directory, "addon.gproj"), "utf8");
   const build = readFileSync(
     join(directory, "Scripts", "WorkbenchGame", "EnfusionMCP", "RFWB_HelperBuild.c"),
@@ -462,14 +327,46 @@ function verifyCompiledHelperIdentity(directory: string, conflict: boolean): voi
     [ping, "resp.helperAddonGuid = RFWB_HelperBuild.ADDON_GUID"],
     [ping, "resp.helperAddonVersion = RFWB_HelperBuild.ADDON_VERSION"],
     [ping, "resp.helperProtocolVersion = RFWB_HelperBuild.PROTOCOL_VERSION"],
+    [ping, "resp.workbenchProtocol = RFWB_HelperBuild.PROTOCOL_VERSION"],
     [ping, "resp.helperBuildIdentity = RFWB_HelperBuild.IDENTITY"],
   ] as const;
   if (requiredDeclarations.some(([source, declaration]) => !source.includes(declaration))) {
+    throw new Error("compiled identity does not match its fixed package descriptor");
+  }
+}
+
+const workbenchHelperManifestSchema = createContentAddressedBundleManifestSchema({
+  role: z.literal(WORKBENCH_HELPER_DESCRIPTOR.role),
+  addonVersion: z.literal(WORKBENCH_HELPER_ADDON_VERSION),
+  protocolVersion: z.literal(WORKBENCH_HELPER_PROTOCOL_VERSION),
+  addonId: z.literal(WORKBENCH_HELPER_ADDON_ID),
+  addonGuid: z.literal(WORKBENCH_HELPER_ADDON_GUID),
+  buildIdentity: z.literal(WORKBENCH_HELPER_BUILD_IDENTITY),
+});
+
+const workbenchHelperBundlePolicy: ContentAddressedBundlePolicy<WorkbenchHelperSourceManifest> = {
+  displayName: "Workbench helper",
+  addonDirectoryName: WORKBENCH_HELPER_ADDON_ID,
+  manifestName: WORKBENCH_HELPER_SOURCE_MANIFEST,
+  manifestSchema: workbenchHelperManifestSchema,
+  requiredPayloadPaths: WORKBENCH_HELPER_PAYLOAD_FILES,
+  allowedStagedExtraFiles: WORKBENCH_GENERATED_STAGED_FILES,
+  validatePayload: (directory) => verifyCompiledHelperIdentity(directory),
+};
+
+function asWorkbenchHelperStageError(error: unknown): never {
+  if (error instanceof WorkbenchHelperStageError) throw error;
+  if (error instanceof ContentAddressedBundleError) {
     throw new WorkbenchHelperStageError(
-      "Workbench helper compiled identity does not match its fixed package descriptor",
-      code
+      error.message,
+      error.issue === "unsafe_path"
+        ? "WORKBENCH_HELPER_PATH_UNSAFE"
+        : error.mode === "staged"
+          ? "WORKBENCH_HELPER_STAGE_CONFLICT"
+          : "WORKBENCH_HELPER_SOURCE_INVALID"
     );
   }
+  throw error;
 }
 
 export function verifyWorkbenchHelperSource(sourceDirectory: string): VerifiedHelperBundle {
@@ -482,53 +379,15 @@ function verifyBundleDirectory(
   expectedDigest?: string,
   allowGeneratedStagedFiles = false
 ): VerifiedHelperBundle {
-  const code = conflict ? "WORKBENCH_HELPER_STAGE_CONFLICT" : "WORKBENCH_HELPER_SOURCE_INVALID";
-  let directory: string;
   try {
-    directory = realpathSync.native(resolve(directoryPath));
-  } catch {
-    throw new WorkbenchHelperStageError(
-      `Workbench helper ${conflict ? "staged bundle" : "source"} is unavailable: ${resolve(directoryPath)}`,
-      code
-    );
+    return verifyContentAddressedBundle(workbenchHelperBundlePolicy, directoryPath, {
+      mode: conflict ? "staged" : "source",
+      expectedDigest,
+      allowStagedExtraFiles: allowGeneratedStagedFiles,
+    });
+  } catch (error) {
+    return asWorkbenchHelperStageError(error);
   }
-  if (!statSync(directory).isDirectory()) {
-    throw new WorkbenchHelperStageError(`Workbench helper bundle is not a directory: ${directory}`, code);
-  }
-  const manifestPath = join(directory, WORKBENCH_HELPER_SOURCE_MANIFEST);
-  if (!existsSync(manifestPath) || lstatSync(manifestPath).isSymbolicLink() ||
-      !lstatSync(manifestPath).isFile()) {
-    throw new WorkbenchHelperStageError(`Workbench helper manifest is unavailable: ${manifestPath}`, code);
-  }
-  const manifest = parseManifest(manifestPath, conflict);
-  if (expectedDigest && manifest.bundleDigest !== expectedDigest) {
-    throw new WorkbenchHelperStageError(
-      "Staged Workbench helper digest does not match its content-addressed directory",
-      "WORKBENCH_HELPER_STAGE_CONFLICT"
-    );
-  }
-  const actual = listPayloadFiles(directory, conflict)
-    .filter((path) => path !== WORKBENCH_HELPER_SOURCE_MANIFEST)
-    .filter((path) =>
-      !(allowGeneratedStagedFiles && WORKBENCH_GENERATED_STAGED_FILES.has(path)))
-    .sort((left, right) => left.localeCompare(right));
-  const expected = manifest.files.map((entry) => entry.path)
-    .sort((left, right) => left.localeCompare(right));
-  if (actual.length !== expected.length || actual.some((path, index) => path !== expected[index])) {
-    throw new WorkbenchHelperStageError(
-      "Workbench helper payload is incomplete or contains unexpected files",
-      code
-    );
-  }
-  for (const file of manifest.files) {
-    const payload = join(directory, ...file.path.split("/"));
-    if (lstatSync(payload).isSymbolicLink() || !lstatSync(payload).isFile() ||
-        sha256File(payload) !== file.sha256) {
-      throw new WorkbenchHelperStageError(`Workbench helper payload hash mismatch: ${file.path}`, code);
-    }
-  }
-  verifyCompiledHelperIdentity(directory, conflict);
-  return { sourceDirectory: directory, manifest };
 }
 
 interface ManagedEntryUsage {
@@ -572,16 +431,11 @@ function managedTreeUsage(root: string): ManagedEntryUsage {
   return { path: root, bytes, modifiedAtMs };
 }
 
-function boundedRetentionInteger(value: number | undefined, fallback: number, label: string): number {
-  const selected = value ?? fallback;
-  if (!Number.isSafeInteger(selected) || selected < 1) {
-    throw new WorkbenchHelperStageError(
-      `${label} must be a positive safe integer`,
-      "WORKBENCH_HELPER_PATH_UNSAFE"
-    );
-  }
-  return selected;
-}
+const retentionOptionError: BoundedOptionErrorFactory = ({ label }) =>
+  new WorkbenchHelperStageError(
+    `${label} must be a positive safe integer`,
+    "WORKBENCH_HELPER_PATH_UNSAFE"
+  );
 
 export class WorkbenchHelperStager implements WorkbenchCompanionProvider {
   readonly managedRoot: string;
@@ -631,52 +485,21 @@ export class WorkbenchHelperStager implements WorkbenchCompanionProvider {
     const profilePath = ensureCanonicalDirectory(join(roleRoot, "profile"));
     assertContainedPath(roleRoot, profilePath);
 
-    const digestRoot = join(addonsRoot, source.manifest.bundleDigest);
-    const addonDirectory = join(digestRoot, WORKBENCH_HELPER_ADDON_ID);
-    assertContainedPath(addonsRoot, addonDirectory);
-    if (existsSync(addonDirectory)) {
-      verifyBundleDirectory(addonDirectory, true, source.manifest.bundleDigest, true);
-      return this.launchDescriptor(source.manifest.bundleDigest, addonDirectory, digestRoot, profilePath, true);
-    }
-    if (existsSync(digestRoot)) {
-      throw new WorkbenchHelperStageError(
-        `Workbench helper digest directory exists without its verified add-on: ${digestRoot}`,
-        "WORKBENCH_HELPER_STAGE_CONFLICT"
-      );
-    }
-
-    const temporaryRoot = join(addonsRoot, `.${source.manifest.bundleDigest}.${randomUUID()}.tmp`);
-    const temporaryAddon = join(temporaryRoot, WORKBENCH_HELPER_ADDON_ID);
     try {
-      mkdirSync(temporaryAddon, { recursive: true, mode: 0o700 });
-      for (const file of source.manifest.files) {
-        const from = join(source.sourceDirectory, ...file.path.split("/"));
-        const to = join(temporaryAddon, ...file.path.split("/"));
-        assertContainedPath(temporaryRoot, to);
-        mkdirSync(dirname(to), { recursive: true, mode: 0o700 });
-        copyFileSync(from, to);
-      }
-      copyFileSync(
-        join(source.sourceDirectory, WORKBENCH_HELPER_SOURCE_MANIFEST),
-        join(temporaryAddon, WORKBENCH_HELPER_SOURCE_MANIFEST)
+      const staged = stageContentAddressedBundle(
+        workbenchHelperBundlePolicy,
+        source,
+        addonsRoot
       );
-      verifyBundleDirectory(temporaryAddon, true, source.manifest.bundleDigest);
-      try {
-        renameSync(temporaryRoot, digestRoot);
-      } catch (error) {
-        if (!existsSync(addonDirectory)) throw error;
-        verifyBundleDirectory(addonDirectory, true, source.manifest.bundleDigest, true);
-        rmSync(temporaryRoot, { recursive: true, force: true });
-        return this.launchDescriptor(source.manifest.bundleDigest, addonDirectory, digestRoot, profilePath, true);
-      }
-      return this.launchDescriptor(source.manifest.bundleDigest, addonDirectory, digestRoot, profilePath, false);
+      return this.launchDescriptor(
+        staged.bundleDigest,
+        staged.addonDirectory,
+        staged.addonSearchRoot,
+        profilePath,
+        staged.reused
+      );
     } catch (error) {
-      rmSync(temporaryRoot, { recursive: true, force: true });
-      if (error instanceof WorkbenchHelperStageError) throw error;
-      throw new WorkbenchHelperStageError(
-        `Could not stage the Workbench helper add-on: ${error instanceof Error ? error.message : String(error)}`,
-        "WORKBENCH_HELPER_STAGE_CONFLICT"
-      );
+      return asWorkbenchHelperStageError(error);
     }
   }
 
@@ -712,9 +535,9 @@ export class WorkbenchHelperStager implements WorkbenchCompanionProvider {
     const actualAddonDirectory = canonicalDirectory(companion.addonDirectory, "Recorded Workbench helper add-on directory");
     const actualProfile = canonicalDirectory(companion.workbenchProfilePath, "Recorded Workbench helper profile root");
 
-    if (pathKey(actualSearchRoot) !== pathKey(expectedSearchRoot) ||
-        pathKey(actualAddonDirectory) !== pathKey(expectedAddonDirectory) ||
-        pathKey(actualProfile) !== pathKey(expectedProfile)) {
+    if (pathComparisonKey(actualSearchRoot) !== pathComparisonKey(expectedSearchRoot) ||
+        pathComparisonKey(actualAddonDirectory) !== pathComparisonKey(expectedAddonDirectory) ||
+        pathComparisonKey(actualProfile) !== pathComparisonKey(expectedProfile)) {
       throw new WorkbenchHelperStageError(
         "Recorded Workbench helper paths do not match the content-addressed managed layout",
         "WORKBENCH_HELPER_STAGE_CONFLICT"
@@ -819,17 +642,23 @@ export class WorkbenchHelperStager implements WorkbenchCompanionProvider {
   }
 
   applyRetention(options: WorkbenchCompanionRetentionOptions = {}): WorkbenchCompanionRetentionResult {
-    const maxAgeMs = boundedRetentionInteger(
+    const maxAgeMs = boundedOption(
       options.maxAgeMs,
       DEFAULT_RETENTION_MAX_AGE_MS,
-      "Workbench helper retention maximum age"
+      1,
+      Number.MAX_SAFE_INTEGER,
+      "Workbench helper retention maximum age",
+      retentionOptionError
     );
-    const maxBytes = boundedRetentionInteger(
+    const maxBytes = boundedOption(
       options.maxBytes,
       DEFAULT_RETENTION_MAX_BYTES,
-      "Workbench helper retention maximum bytes"
+      1,
+      Number.MAX_SAFE_INTEGER,
+      "Workbench helper retention maximum bytes",
+      retentionOptionError
     );
-    const nowMs = boundedRetentionInteger(options.nowMs, Date.now(), "Workbench helper retention clock");
+    const nowMs = boundedOption(options.nowMs, Date.now(), 1, Number.MAX_SAFE_INTEGER, "Workbench helper retention clock", retentionOptionError);
     const protectedDigests = new Set(options.protectedDigests ?? []);
     for (const digest of protectedDigests) {
       if (!SHA256_PATTERN.test(digest)) {
@@ -968,7 +797,8 @@ export class WorkbenchHelperStager implements WorkbenchCompanionProvider {
     const managedRoot = canonicalDirectory(this.managedRoot, "Workbench helper managed root");
     const roleRoot = canonicalDirectory(rolePath, "Workbench helper role root");
     assertContainedPath(managedRoot, roleRoot);
-    if (pathKey(dirname(roleRoot)) !== pathKey(managedRoot) || lstatSync(rolePath).isSymbolicLink()) {
+    if (pathComparisonKey(dirname(roleRoot)) !== pathComparisonKey(managedRoot) ||
+        lstatSync(rolePath).isSymbolicLink()) {
       throw new WorkbenchHelperStageError(
         `Refusing to remove a Workbench helper role root with an unexpected identity: ${rolePath}`,
         "WORKBENCH_HELPER_PATH_UNSAFE"

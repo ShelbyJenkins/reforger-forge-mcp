@@ -45,7 +45,7 @@ class BoundaryBackend implements OwnedRuntimeProcessBackend {
     return {
       pid,
       executablePath: process.execPath,
-      creationTimeFileTime: "900001",
+      creationTime: "900001",
       userSid: "S-1-5-21-private-child-boundary",
     };
   }
@@ -70,7 +70,7 @@ class BoundaryBackend implements OwnedRuntimeProcessBackend {
     if (current.identity.executablePath !== expected.executablePath) {
       return { kind: "refused" as const, reason: "executable_mismatch" as const, message: "path changed" };
     }
-    if (current.identity.creationTimeFileTime !== expected.creationTimeFileTime) {
+    if (current.identity.creationTime !== expected.creationTime) {
       return { kind: "refused" as const, reason: "creation_time_mismatch" as const, message: "creation changed" };
     }
     if (current.ownerArgument !== expected.ownerTokenArgument) {
@@ -225,7 +225,7 @@ function makeBoundaryHarness(
       identity: {
         pid: childPid,
         executablePath: file,
-        creationTimeFileTime: String(800_000 + childPid),
+        creationTime: String(800_000 + childPid),
       },
       ownerArgument,
     });
@@ -243,9 +243,12 @@ function makeBoundaryHarness(
     ownerToken: () => `owner_${String(id).padStart(58, "0")}`,
     randomId: () => `00000000-0000-4000-8000-${String(id++).padStart(12, "0")}`,
     receiptRetentionMs: 0,
-    inspectionTimeoutMs: 500,
-    terminationTimeoutMs: 500,
-    lockTimeoutMs: 500,
+    // This integration fixture exercises private-child recovery across real
+    // IPC and filesystem syncs. Keep its lifecycle budget independent of
+    // parallel-suite load; deadline behavior has dedicated unit coverage.
+    inspectionTimeoutMs: 5_000,
+    terminationTimeoutMs: 5_000,
+    lockTimeoutMs: 5_000,
   });
 
   return {

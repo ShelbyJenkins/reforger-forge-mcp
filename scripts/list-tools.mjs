@@ -88,11 +88,37 @@ if (hybrid.length) {
 }
 
 const registeredNames = new Set(sorted.map((tool) => tool.name));
+const removedToolNames = ["wb_play", "wb_save", "wb_execute_action"];
+const unexpectedlyRegistered = removedToolNames.filter((name) => registeredNames.has(name));
+const modProperties = sorted.find((tool) => tool.name === "mod")?.inputSchema?.properties ?? {};
+const modActions = Array.isArray(modProperties.action?.enum) ? modProperties.action.enum : [];
+const removedModProperties = ["addonName", "platform", "outputPath", "gprojPath", "filterPath"]
+  .filter((name) => Object.hasOwn(modProperties, name));
+const reloadTarget = sorted.find((tool) => tool.name === "wb_reload")
+  ?.inputSchema?.properties?.target;
+const invalidReloadSurface = reloadTarget?.default !== "plugins" ||
+  !Array.isArray(reloadTarget?.enum) ||
+  reloadTarget.enum.length !== 1 ||
+  reloadTarget.enum[0] !== "plugins";
 const missingObserverTools = [...observerNames].filter((name) => !registeredNames.has(name));
 const missingDocumented = [...documentedNames].filter((name) => !registeredNames.has(name));
 const undocumented = [...registeredNames].filter((name) => !documentedNames.has(name));
-if (documentedNames.size === 0 || missingObserverTools.length > 0 || missingDocumented.length > 0 || undocumented.length > 0) {
+if (documentedNames.size === 0 || unexpectedlyRegistered.length > 0 ||
+    modActions.includes("build") || removedModProperties.length > 0 || invalidReloadSurface ||
+    missingObserverTools.length > 0 || missingDocumented.length > 0 || undocumented.length > 0) {
   if (documentedNames.size === 0) console.error("\nREADME tool reference could not be parsed.");
+  if (unexpectedlyRegistered.length > 0) {
+    console.error(`\nRemoved refusal-only tools still registered: ${unexpectedlyRegistered.join(", ")}`);
+  }
+  if (modActions.includes("build") || removedModProperties.length > 0) {
+    console.error(`\nRemoved mod build surface is still advertised: ${[
+      modActions.includes("build") ? "action=build" : "",
+      ...removedModProperties,
+    ].filter(Boolean).join(", ")}`);
+  }
+  if (invalidReloadSurface) {
+    console.error("\nwb_reload must advertise only target=plugins and default to it.");
+  }
   if (missingObserverTools.length > 0) {
     console.error(`\nRequired observer tools missing at runtime: ${missingObserverTools.join(", ")}`);
   }

@@ -158,7 +158,6 @@ describe.runIf(runLive)("live exact-owner Workbench lifecycle acceptance", () =>
       projectPath: root,
       workbenchAddonDirs: [...localPaths.workbenchAddonDirs, root],
       workbenchScriptAuthorizeAll: true,
-      workbenchNoThrow: true,
       dataDir: fileURLToPath(new URL("../../../data", import.meta.url)),
       patternsDir: fileURLToPath(new URL("../../../data/patterns", import.meta.url)),
       workbenchHost: "127.0.0.1",

@@ -30,6 +30,7 @@ describe("observer package and source contracts", () => {
     const gitAttributes = readFileSync(join(repositoryRoot, ".gitattributes"), "utf8");
     expect(gitAttributes.split(/\r?\n/)).toContain("observer/addon/** -text");
     expect(gitAttributes.split(/\r?\n/)).toContain("observer/workbench-addon/** -text");
+    expect(gitAttributes.split(/\r?\n/)).toContain("* text=auto eol=lf");
     expect(packageJson.scripts.build).toContain("build:mcp");
     expect(packageJson.scripts.build).toContain("build:observer");
     expect(packageJson.scripts["addons:manifest"]).toContain("update-observer-source-manifest.mjs");
@@ -62,20 +63,61 @@ describe("observer package and source contracts", () => {
     const repositoryOnlyAcceptanceSources = [
       "scripts/observer-live-acceptance-support.ts",
       "scripts/run-runtime-observer-acceptance.ts",
+      "scripts/run-workbench-build-acceptance.ts",
       "scripts/run-workbench-observer-acceptance.ts",
     ];
     expect(packageJson.files).toEqual(expect.arrayContaining(observerReleaseAssets));
     expect(packageJson.files).toEqual(expect.not.arrayContaining(repositoryOnlyAcceptanceSources));
     const observerConfig = JSON.parse(readFileSync(join(repositoryRoot, "observer", "tsconfig.build.json"), "utf8"));
-    expect(observerConfig.compilerOptions.outDir).toBe("../dist/observer");
-    expect(JSON.parse(readFileSync(join(repositoryRoot, "tsconfig.build.json"), "utf8")).include).toEqual(["src/**/*"]);
+    expect(observerConfig.compilerOptions.rootDir).toBe("..");
+    expect(observerConfig.compilerOptions.outDir).toBe("../dist");
+    expect(observerConfig.include).toEqual(["agent/**/*.ts"]);
+    expect(observerConfig.references).toEqual(expect.arrayContaining([
+      { path: "../tsconfig.shared.build.json" },
+      { path: "./protocol/tsconfig.build.json" },
+    ]));
+    const sharedConfig = JSON.parse(readFileSync(join(repositoryRoot, "tsconfig.shared.build.json"), "utf8"));
+    expect(sharedConfig.include).toEqual([
+      "src/foundation/**/*.ts",
+      "src/companions/**/*.ts",
+    ]);
+    const mcpConfig = JSON.parse(readFileSync(join(repositoryRoot, "tsconfig.build.json"), "utf8"));
+    expect(mcpConfig.include).toEqual(["src/**/*"]);
+    expect(mcpConfig.references).toEqual(expect.arrayContaining([
+      { path: "./tsconfig.shared.build.json" },
+      { path: "./observer/protocol/tsconfig.build.json" },
+    ]));
+    expect(packageJson.imports["#foundation/*"].default).toBe("./dist/foundation/*.js");
+    expect(packageJson.imports["#companions/*"].default).toBe("./dist/companions/*.js");
+    expect(existsSync(join(repositoryRoot, "dist", "src"))).toBe(false);
     expect(existsSync(join(repositoryRoot, "observer", "protocol", "VERSION"))).toBe(true);
     const packageCheck = readFileSync(join(repositoryRoot, "scripts", "check-package.mjs"), "utf8");
     expect(packageCheck).toContain("dist/observer/agent/private-child.js");
+    expect(packageCheck).toContain("dist/observer/agent/application.js");
+    expect(packageCheck).toContain("dist/observer/agent/application-operations.js");
+    expect(packageCheck).toContain("dist/observer/agent/evidence-bundle-service.js");
+    expect(packageCheck).toContain("dist/observer/application.js");
+    expect(packageCheck).toContain("dist/observer/capture-service.js");
+    expect(packageCheck).toContain("dist/observer/evidence-run-service.js");
     expect(packageCheck).toContain("dist/observer/owned-runtime-manager.js");
     expect(packageCheck).toContain("dist/tools/observer-runtime.js");
-    expect(packageCheck).toContain("dist/workbench/observer-adapter.js");
-    expect(packageCheck).toContain("dist/workbench/helper-addon.js");
+    for (const module of [
+      "dist/foundation/child-supervisor.js",
+      "dist/workbench/activity-gate.js",
+      "dist/workbench/client.js",
+      "dist/workbench/diagnostics.js",
+      "dist/workbench/helper-addon.js",
+      "dist/workbench/launch-plan.js",
+      "dist/workbench/lifecycle-execution.js",
+      "dist/workbench/managed-build-profile.js",
+      "dist/workbench/net-api-client.js",
+      "dist/workbench/observer-adapter.js",
+      "dist/workbench/readiness.js",
+      "dist/workbench/session-controller.js",
+      "dist/workbench/session-state.js",
+    ]) {
+      expect(packageCheck).toContain(module);
+    }
     expect(packageCheck).toContain("legacy project-injection handler must not be packaged");
     expect(packageCheck).toContain("resourceDatabase\\.rdb");
     expect(packageCheck).toContain("--omit=dev");
@@ -178,17 +220,19 @@ describe("observer package and source contracts", () => {
 
   it("packages and centrally registers the completed Phase H integration", () => {
     const observerSource = join(repositoryRoot, "src", "observer");
-    for (const name of ["coordinator.ts", "setup.ts", "launch.ts", "owned-runtime-manager.ts", "tools.ts"]) {
+    for (const name of ["application.ts", "agent-client.ts", "capture-service.ts", "evidence-run-service.ts", "coordinator.ts", "setup.ts", "launch.ts", "owned-runtime-manager.ts", "tools.ts"]) {
       expect(existsSync(join(observerSource, name))).toBe(true);
     }
     expect(existsSync(join(repositoryRoot, "src", "tools", "observer-runtime.ts"))).toBe(true);
     expect(existsSync(join(repositoryRoot, "observer", "agent", "private-child.ts"))).toBe(true);
     const server = readFileSync(join(repositoryRoot, "src", "server.ts"), "utf8");
-    expect(server.match(/new ObserverCoordinator\(/g)).toHaveLength(1);
-    expect(server.match(/new OwnedRuntimeManager\(/g)).toHaveLength(1);
+    expect(server.match(/createObserverApplication\(/g)).toHaveLength(1);
+    expect(server).not.toMatch(/new ObserverCoordinator\(|new OwnedRuntimeManager\(/);
     expect(server.match(/registerObserverTools\(/g)).toHaveLength(1);
     expect(server).toContain("return disposeObserverLifecycle");
     expect(server).toContain("observerShutdown ??=");
+    expect(server).not.toContain(".server.onclose");
+    expect(server).not.toContain("protocolServer");
     const entrypoint = readFileSync(join(repositoryRoot, "src", "index.ts"), "utf8");
     expect(entrypoint).toContain("process.stdin.once(\"end\", onStdinEnd)");
     expect(entrypoint).toContain("process.once(\"SIGINT\", onSigint)");

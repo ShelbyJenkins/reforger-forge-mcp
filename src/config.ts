@@ -38,9 +38,6 @@ export interface Config {
   /** Suppress prompts for protected Workbench script operations in trusted
    *  local projects. Disabled by default. */
   workbenchScriptAuthorizeAll?: boolean;
-  /** Pass -noThrow to automated Workbench sessions so assertions are written
-   *  to the log instead of opening a modal dialog. Enabled by default. */
-  workbenchNoThrow?: boolean;
   /** Optional path to a pre-extracted game data library (fully flattened prefabs).
    *  When set, game_duplicate checks here first before falling back to pak loose files.
    *  Set via ENFUSION_EXTRACTED_PATH env var. */
@@ -81,7 +78,6 @@ const DEFAULTS: Config & { observer: ObserverConfig } = {
   ),
   workbenchHost: "127.0.0.1",
   workbenchPort: 5775,
-  workbenchNoThrow: true,
   observer: {
     startupTimeoutMs: 10_000,
     requestTimeoutMs: 30_000,

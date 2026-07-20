@@ -267,6 +267,7 @@ function workbenchJob(state: string, sequence = 1): Record<string, unknown> {
 
 function fakeWorkbenchAdapter(options: { unavailable?: boolean } = {}) {
   let state = "queued";
+  let jobId = "wb-job-1";
   return {
     instances: vi.fn(async () => {
       if (options.unavailable) throw new Error("observer handler is not installed");
@@ -284,14 +285,15 @@ function fakeWorkbenchAdapter(options: { unavailable?: boolean } = {}) {
         readinessMessage: "full camera APIs available",
       }];
     }),
-    submit: vi.fn(async (_input: { jobId?: string }) => {
-      return workbenchJob(state) as never;
+    submit: vi.fn(async (input: { jobId?: string }) => {
+      jobId = input.jobId ?? jobId;
+      return { ...workbenchJob(state), jobId } as never;
     }),
-    recover: vi.fn(async () => workbenchJob(state, 2) as never),
-    status: vi.fn(async () => workbenchJob(state, 2) as never),
+    recover: vi.fn(async () => ({ ...workbenchJob(state, 2), jobId }) as never),
+    status: vi.fn(async () => ({ ...workbenchJob(state, 2), jobId }) as never),
     cancel: vi.fn(async () => {
       state = "cancelled";
-      return workbenchJob(state, 3) as never;
+      return { ...workbenchJob(state, 3), jobId } as never;
     }),
     release: vi.fn(async () => ({
       jobId: "wb-job-1",
@@ -529,7 +531,7 @@ describe("Phase H observer coordinator", () => {
       expect(result.image).toEqual(png);
       expect(result.job).toMatchObject({
         backend: "workbench",
-        jobId: "wb-job-1",
+        jobId: expect.stringMatching(/^[0-9a-f-]{36}$/),
         state: "completed",
         worldId: "world-editor-1",
       });
@@ -542,34 +544,46 @@ describe("Phase H observer coordinator", () => {
 
   it("routes asynchronous Workbench status, cancellation, and release without sessionId", async () => {
     const adapter = fakeWorkbenchAdapter();
-    const coordinator = new ObserverCoordinator({ workbenchAdapter: adapter as never });
+    const coordinator = new ObserverCoordinator({
+      agentPath: "private-child.js",
+      forkChild: fakeFork(new FakeChild(), { value: 0 }),
+      workbenchAdapter: adapter as never,
+    });
+    await coordinator.ensureSetup();
     const submitted = await coordinator.capture({
       idempotencyKey: "workbench-async-1",
       view: { kind: "current" },
       asynchronous: true,
       timeoutMs: 1_000,
     });
-    expect(submitted).toMatchObject({ asynchronous: true, job: { backend: "workbench", jobId: "wb-job-1" } });
+    expect(submitted).toMatchObject({ asynchronous: true, job: { backend: "workbench" } });
+    const jobId = submitted.job.jobId as string;
+    expect(jobId).toMatch(/^[0-9a-f-]{36}$/);
 
-    expect(await coordinator.jobStatus(undefined, "wb-job-1")).toMatchObject({ state: "queued" });
-    expect(await coordinator.cancelJob(undefined, "wb-job-1")).toMatchObject({ state: "cancelled" });
+    expect(await coordinator.jobStatus(undefined, jobId)).toMatchObject({ state: "queued" });
+    expect(await coordinator.cancelJob(undefined, jobId)).toMatchObject({ state: "cancelled" });
     const released = {
       backend: "workbench",
-      jobId: "wb-job-1",
+      jobId,
       restorationConfirmed: true,
       artifactRemoved: true,
     };
-    expect(await coordinator.releaseJob(undefined, "wb-job-1")).toEqual(released);
-    expect(await coordinator.releaseJob(undefined, "wb-job-1")).toEqual(released);
-    expect(adapter.status).toHaveBeenCalledWith("wb-job-1");
-    expect(adapter.cancel).toHaveBeenCalledWith("wb-job-1");
+    expect(await coordinator.releaseJob(undefined, jobId)).toMatchObject(released);
+    expect(await coordinator.releaseJob(undefined, jobId)).toMatchObject(released);
+    expect(adapter.recover).toHaveBeenCalledWith({ jobId, expectedInstanceId: "workbench-generation-1" });
+    expect(adapter.cancel).toHaveBeenCalledWith(jobId);
     expect(adapter.release).toHaveBeenCalledOnce();
     await coordinator.close();
   });
 
   it("deduplicates Workbench captures by a hashed public idempotency key and rejects conflicting reuse", async () => {
     const adapter = fakeWorkbenchAdapter();
-    const coordinator = new ObserverCoordinator({ workbenchAdapter: adapter as never });
+    const coordinator = new ObserverCoordinator({
+      agentPath: "private-child.js",
+      forkChild: fakeFork(new FakeChild(), { value: 0 }),
+      workbenchAdapter: adapter as never,
+    });
+    await coordinator.ensureSetup();
     const request = {
       idempotencyKey: "raw-user-key-must-not-become-a-job-path",
       view: { kind: "current" } as const,
@@ -584,8 +598,8 @@ describe("Phase H observer coordinator", () => {
       coordinator.capture(request),
     ]);
 
-    expect(first).toMatchObject({ asynchronous: true, job: { jobId: "wb-job-1" } });
-    expect(retry).toMatchObject({ asynchronous: true, job: { jobId: "wb-job-1" } });
+    expect(first).toMatchObject({ asynchronous: true, job: { jobId: expect.stringMatching(/^[0-9a-f-]{36}$/) } });
+    expect(retry).toEqual(first);
     expect(adapter.submit).toHaveBeenCalledOnce();
     expect(adapter.submit).not.toHaveBeenCalledWith(expect.objectContaining({
       jobId: "raw-user-key-must-not-become-a-job-path",
@@ -598,15 +612,26 @@ describe("Phase H observer coordinator", () => {
       ...request,
       view: { kind: "lookAt", position: [0, 0, 0], target: [1, 0, 0], fov: 60 },
     })).rejects.toMatchObject({ code: "IDEMPOTENCY_CONFLICT" });
-    await coordinator.cancelJob(undefined, "wb-job-1");
-    await coordinator.releaseJob(undefined, "wb-job-1");
+    const jobId = first.job.jobId as string;
+    await coordinator.cancelJob(undefined, jobId);
+    await coordinator.releaseJob(undefined, jobId);
     await expect(coordinator.capture(request)).rejects.toMatchObject({ code: "JOB_RELEASED" });
     expect(adapter.submit).toHaveBeenCalledOnce();
     await coordinator.close();
   });
 
-  it("replays runtime capture when the same timeout policy derives a later wall-clock deadline", async () => {
+  it("replays runtime capture without extending its original wall-clock deadline", async () => {
     const child = new FakeChild();
+    child.instances = [{
+      instanceId: "runtime-instance-1",
+      sessionId: "runtime-session-1",
+      capabilities: ["render.capture", "camera.runtime"],
+      worldId: null,
+      worldEpoch: 0,
+      stale: false,
+      transportHealthy: true,
+      headless: false,
+    }];
     let retainedFingerprint: string | null = null;
     const submittedPayloads: Record<string, unknown>[] = [];
     child.responders.set("submitJob", (payload) => {
@@ -642,18 +667,12 @@ describe("Phase H observer coordinator", () => {
       timeoutMs: 1_000,
     };
 
-    await expect(coordinator.capture(request)).resolves.toMatchObject({
-      asynchronous: true,
-      job: { jobId: "runtime-job-1" },
-    });
+    const first = await coordinator.capture(request);
+    expect(first).toMatchObject({ asynchronous: true, job: { jobId: expect.stringMatching(/^[0-9a-f-]{36}$/) } });
     await new Promise((resolve) => setTimeout(resolve, 20));
-    await expect(coordinator.capture(request)).resolves.toMatchObject({
-      asynchronous: true,
-      job: { jobId: "runtime-job-1" },
-    });
-    expect(submittedPayloads).toHaveLength(2);
-    expect(submittedPayloads[0].deadlineAt).not.toBe(submittedPayloads[1].deadlineAt);
-    expect(submittedPayloads.map((payload) => payload.deadlinePolicyMs)).toEqual([1_000, 1_000]);
+    await expect(coordinator.capture(request)).resolves.toEqual(first);
+    expect(submittedPayloads).toHaveLength(1);
+    expect(submittedPayloads[0].deadlinePolicyMs).toBe(1_000);
     await expect(coordinator.capture({ ...request, timeoutMs: 2_000 }))
       .rejects.toMatchObject({ code: "IDEMPOTENCY_CONFLICT" });
     await coordinator.close();
@@ -672,8 +691,8 @@ describe("Phase H observer coordinator", () => {
     const first = await coordinator.capture(request);
     const retry = await coordinator.capture(request);
 
-    expect(first).toMatchObject({ asynchronous: false, job: { jobId: "wb-job-1" } });
-    expect(retry).toMatchObject({ asynchronous: false, job: { jobId: "wb-job-1" } });
+    expect(first).toMatchObject({ asynchronous: false, job: { jobId: expect.stringMatching(/^[0-9a-f-]{36}$/) } });
+    expect(retry).toMatchObject({ asynchronous: false, job: { jobId: first.job.jobId } });
     expect(adapter.submit).toHaveBeenCalledOnce();
     expect(adapter.readCompletedArtifact).toHaveBeenCalledTimes(2);
     await coordinator.close();
@@ -715,7 +734,7 @@ describe("Phase H observer coordinator", () => {
       workbenchAdapter: fakeWorkbenchAdapter({ unavailable: true }) as never,
     });
     const runtimeOnly = await unavailable.instances({ sessionId: "session-1" });
-    expect(runtimeOnly.instances).toEqual([runtime]);
+    expect(runtimeOnly.instances).toEqual([expect.objectContaining(runtime)]);
     expect(runtimeOnly.warnings?.[0]).toContain("observer handler is not installed");
     await unavailable.close();
   });
@@ -870,7 +889,11 @@ describe("Phase H observer MCP tools", () => {
 
   it("rejects stale Workbench expected-world binding before adapter submission", async () => {
     const adapter = fakeWorkbenchAdapter();
-    const coordinator = new ObserverCoordinator({ workbenchAdapter: adapter as never });
+    const coordinator = new ObserverCoordinator({
+      agentPath: "private-child.js",
+      forkChild: fakeFork(new FakeChild(), { value: 0 }),
+      workbenchAdapter: adapter as never,
+    });
     await expect(coordinator.capture({
       idempotencyKey: "stale-workbench-world",
       instanceId: "workbench-generation-1",
@@ -1172,8 +1195,9 @@ describe("Phase H observer MCP tools", () => {
       activeJobId = input.jobId;
       return statusFor(input.jobId, "queued");
     });
-    adapter.status.mockImplementation(async () => {
+    adapter.recover.mockImplementation(async ({ jobId }: { jobId: string }) => {
       if (!activeJobId) throw Object.assign(new Error("handler job is absent"), { code: "JOB_NOT_FOUND" });
+      if (jobId !== activeJobId) throw Object.assign(new Error("handler job differs"), { code: "JOB_NOT_FOUND" });
       return statusFor(activeJobId, "completed");
     });
     adapter.release.mockImplementation(async () => {
@@ -1223,35 +1247,41 @@ describe("Phase H observer MCP tools", () => {
     await coordinator.close();
   });
 
-  it("answers Workbench job status from a durable managed artifact after coordinator restart", async () => {
+  it("answers Workbench job status from an exact durable run binding after coordinator restart", async () => {
+    const runId = "20260717T200045Z-a1b2c3d4";
     const child = new FakeChild();
-    child.responders.set("inspectWorkbenchArtifact", () => ({
-      available: true,
-      metadata: {
+    child.responders.set("runStatus", () => ({
+      runId,
+      state: "open",
+      captures: [{
+        captureLabel: "restart-status",
+        state: "completed",
+        backend: "workbench",
+        jobId: "wb-job-1",
         instanceId: "workbench-generation-1",
         worldId: "world-editor-1",
         worldEpoch: 0,
-        width: 1920,
-        height: 1080,
-        contentSha256: "b".repeat(64),
-        completedAt: "2026-07-17T20:00:00.000Z",
-      },
+        artifactAvailable: true,
+        missingArtifact: false,
+      }],
+      warnings: [],
     }));
     const adapter = fakeWorkbenchAdapter();
+    adapter.recover.mockRejectedValue(Object.assign(new Error("handler retired"), { code: "JOB_NOT_FOUND" }));
     const coordinator = new ObserverCoordinator({
       forkChild: fakeFork(child, { value: 0 }),
       workbenchAdapter: adapter as never,
     });
 
+    await coordinator.runStatus(runId);
     await expect(coordinator.jobStatus(undefined, "wb-job-1")).resolves.toMatchObject({
       backend: "workbench",
       jobId: "wb-job-1",
       state: "completed",
       restorationConfirmed: true,
       recoveredFromManagedArtifact: true,
-      artifact: { width: 1920, height: 1080, contentSha256: "b".repeat(64) },
     });
-    expect(adapter.recover).not.toHaveBeenCalled();
+    expect(adapter.recover).toHaveBeenCalledOnce();
     await coordinator.close();
   });
 

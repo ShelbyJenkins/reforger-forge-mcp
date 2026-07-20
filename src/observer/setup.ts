@@ -1,17 +1,33 @@
-import type { ObserverCoordinator } from "./coordinator.js";
-import type { WorkbenchClient } from "../workbench/client.js";
+import type {
+  WorkbenchCompanionManagedStatus,
+  WorkbenchCompanionUninstallResult,
+} from "../workbench/helper-addon.js";
 
 export type ObserverSetupAction = "ensure" | "status" | "doctor" | "uninstall";
+
+export interface WorkbenchCompanionAdministrationPort {
+  ensureManagedCompanion(projectPath?: string): Promise<Record<string, unknown>>;
+  managedCompanionStatus(): WorkbenchCompanionManagedStatus;
+  doctorManagedCompanion(): Record<string, unknown>;
+  uninstallManagedCompanion(): Promise<WorkbenchCompanionUninstallResult>;
+}
+
+export interface ObserverSetupPort {
+  ensureSetup(): Promise<Record<string, unknown>>;
+  status(): Promise<Record<string, unknown>>;
+  doctor(): Promise<Record<string, unknown>>;
+  uninstall(): Promise<Record<string, unknown>>;
+}
 
 /**
  * Thin MCP-side setup facade. All staging, revocation, and cleanup decisions
  * remain inside the private observer agent.
  */
 export async function runObserverSetup(
-  coordinator: ObserverCoordinator,
+  coordinator: ObserverSetupPort,
   action: ObserverSetupAction,
   workbench?: {
-    client: WorkbenchClient;
+    client: WorkbenchCompanionAdministrationPort;
     projectPath?: string;
   }
 ): Promise<Record<string, unknown>> {

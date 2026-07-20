@@ -1,6 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import { z } from "zod";
+import { boundedOption } from "#foundation/bounded-option";
+import { BoundedJsonMap } from "#foundation/json-store";
 import {
   COMMAND_DELIVERY_LEASE_MS,
   ERROR_CODES,
@@ -22,7 +24,7 @@ import {
   type ObserverJobState,
   type RuntimeCommandEnvelope,
 } from "../protocol/index.js";
-import { ObserverError } from "./errors.js";
+import { ObserverError, observerOptionError } from "./errors.js";
 import { InstanceRegistry } from "./registry.js";
 import { type Clock, SessionStore, systemClock } from "./sessions.js";
 
@@ -170,6 +172,8 @@ function runtimeWireView(view: CaptureView): {
 export interface SubmitJobInput {
   sessionId: string;
   idempotencyKey: string;
+  /** Host-assigned ID used for durable pre-binding; generated when omitted. */
+  jobId?: string;
   instanceId?: string;
   deadlineAt: string;
   /** Host-private relative deadline policy used for semantic retry identity. */
@@ -272,10 +276,10 @@ export interface ArtifactCompletionPreflight {
 }
 
 export class JobStore {
-  private readonly jobs = new Map<string, JobRecord>();
-  private readonly idempotency = new Map<string, IdempotencyReceipt>();
-  private readonly artifactReleaseReceipts = new Map<string, ArtifactReleaseReceipt>();
-  private readonly pendingByInstance = new Map<string, string[]>();
+  private readonly jobs: BoundedJsonMap<string, JobRecord>;
+  private readonly idempotency: BoundedJsonMap<string, IdempotencyReceipt>;
+  private readonly artifactReleaseReceipts: BoundedJsonMap<string, ArtifactReleaseReceipt>;
+  private readonly pendingByInstance: BoundedJsonMap<string, string[]>;
   private readonly idempotencyReceiptRetentionMs: number;
   private readonly terminalJobRetentionMs: number;
   readonly maxRecords: number;
@@ -289,37 +293,76 @@ export class JobStore {
     private readonly clock: Clock = systemClock,
     options: JobStoreOptions = {}
   ) {
-    this.idempotencyReceiptRetentionMs = this.retentionOption(
+    this.idempotencyReceiptRetentionMs = boundedOption(
       options.idempotencyReceiptRetentionMs,
       DEFAULT_IDEMPOTENCY_RECEIPT_RETENTION_MS,
-      "Idempotency receipt retention"
+      1,
+      24 * 60 * 60_000,
+      "Idempotency receipt retention",
+      observerOptionError
     );
-    this.terminalJobRetentionMs = this.retentionOption(
+    this.terminalJobRetentionMs = boundedOption(
       options.terminalJobRetentionMs,
       DEFAULT_TERMINAL_JOB_RETENTION_MS,
-      "Terminal job retention"
+      1,
+      24 * 60 * 60_000,
+      "Terminal job retention",
+      observerOptionError
     );
-    this.maxRecords = this.integerOption(
+    this.maxRecords = boundedOption(
       options.maxRecords,
       DEFAULT_JOB_MAX_RECORDS,
       1,
       1_000_000,
-      "Job store record limit"
+      "Job store record limit",
+      observerOptionError
     );
-    this.maxEstimatedBytes = this.integerOption(
+    this.maxEstimatedBytes = boundedOption(
       options.maxEstimatedBytes,
       DEFAULT_JOB_MAX_ESTIMATED_BYTES,
       1_024,
       1024 * 1024 * 1024,
-      "Job store byte limit"
+      "Job store byte limit",
+      observerOptionError
     );
-    this.maxRecordEstimatedBytes = this.integerOption(
+    this.maxRecordEstimatedBytes = boundedOption(
       options.maxRecordEstimatedBytes,
       Math.min(DEFAULT_JOB_MAX_RECORD_ESTIMATED_BYTES, this.maxEstimatedBytes),
       512,
       this.maxEstimatedBytes,
-      "Job record byte limit"
+      "Job record byte limit",
+      observerOptionError
     );
+    const capacityError = () => new ObserverError(
+      "TRANSPORT_UNAVAILABLE",
+      "Observer job store retention budget is exhausted",
+      503
+    );
+    this.jobs = new BoundedJsonMap({
+      maxRecords: this.maxRecords,
+      maxEstimatedBytes: this.maxEstimatedBytes,
+      maxRecordEstimatedBytes: this.maxRecordEstimatedBytes,
+      estimateBytes: (_jobId, record) => this.jobRecordBytes(record),
+      capacityError,
+    });
+    this.idempotency = new BoundedJsonMap({
+      maxRecords: this.maxRecords,
+      maxEstimatedBytes: this.maxEstimatedBytes,
+      estimateBytes: (key, receipt) => Buffer.byteLength(JSON.stringify([key, receipt]), "utf8"),
+      capacityError,
+    });
+    this.artifactReleaseReceipts = new BoundedJsonMap({
+      maxRecords: this.maxRecords,
+      maxEstimatedBytes: this.maxEstimatedBytes,
+      estimateBytes: (key, receipt) => Buffer.byteLength(JSON.stringify([key, receipt]), "utf8"),
+      capacityError,
+    });
+    this.pendingByInstance = new BoundedJsonMap({
+      maxRecords: this.maxRecords,
+      maxEstimatedBytes: this.maxEstimatedBytes,
+      estimateBytes: (key, queue) => Buffer.byteLength(JSON.stringify([key, queue]), "utf8"),
+      capacityError,
+    });
   }
 
   setDurableMutationHook(hook: ((mutation: JobStoreDurableMutation) => void) | null): void {
@@ -462,7 +505,10 @@ export class JobStore {
       throw new ObserverError("WORLD_UNAVAILABLE", "Camera views require an active world", 409);
     }
 
-    const jobId = `j-${randomUUID()}`;
+    const jobId = input.jobId ?? `j-${randomUUID()}`;
+    if (!/^[A-Za-z0-9_-]{1,96}$/.test(jobId)) {
+      throw new ObserverError("INVALID_REQUEST", "Capture job ID is invalid");
+    }
     const request = captureRequestSchema.parse({
       protocolVersion: PROTOCOL_VERSION,
       jobId,
@@ -1212,28 +1258,6 @@ export class JobStore {
   private hasRestorationObligation(record: JobRecord): boolean {
     return record.cameraLease.everHeld && !record.cameraLease.restorationConfirmed &&
       record.cameraLease.vacancyDisposition !== "exact_runtime_vacant";
-  }
-
-  private retentionOption(value: number | undefined, fallback: number, label: string): number {
-    const result = value ?? fallback;
-    if (!Number.isSafeInteger(result) || result < 1 || result > 24 * 60 * 60_000) {
-      throw new ObserverError("INVALID_REQUEST", `${label} must be from 1 through 86400000 milliseconds`);
-    }
-    return result;
-  }
-
-  private integerOption(
-    value: number | undefined,
-    fallback: number,
-    minimum: number,
-    maximum: number,
-    label: string
-  ): number {
-    const result = value ?? fallback;
-    if (!Number.isSafeInteger(result) || result < minimum || result > maximum) {
-      throw new ObserverError("INVALID_REQUEST", `${label} must be from ${minimum} through ${maximum}`);
-    }
-    return result;
   }
 
   private instanceKey(sessionId: string, instanceId: string): string {

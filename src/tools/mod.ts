@@ -330,35 +330,11 @@ export function registerMod(
     "mod",
     {
       description:
-        "Scaffold or validate Arma Reforger addons. The legacy build action is retained only to return a safe refusal; use a project-owned bounded build wrapper.",
+        "Scaffold or validate Arma Reforger addons.",
       inputSchema: {
         action: z
-          .enum(["build", "create", "validate"])
-          .describe("Action to perform: 'create' scaffolds, 'validate' checks, and legacy 'build' returns a safe refusal."),
-
-        // ── build params ──────────────────────────────────────────────────────
-        addonName: z
-          .string()
-          .min(1)
-          .optional()
-          .describe("(build) Name of the addon to build (must match the .gproj ID)"),
-        platform: z
-          .enum(["PC", "PC_WB", "HEADLESS"])
-          .default("PC")
-          .optional()
-          .describe("(build) Target platform for the build"),
-        outputPath: z
-          .string()
-          .optional()
-          .describe("(build) Build output directory. Auto-generated if omitted."),
-        gprojPath: z
-          .string()
-          .optional()
-          .describe("(build) Path to .gproj file. Auto-detected if omitted."),
-        filterPath: z
-          .string()
-          .optional()
-          .describe("(build) Limit build to a single folder or file for faster iteration"),
+          .enum(["create", "validate"])
+          .describe("Action to perform: 'create' scaffolds and 'validate' checks."),
 
         // ── create params ─────────────────────────────────────────────────────
         name: z
@@ -393,26 +369,7 @@ export function registerMod(
           .describe("(validate) Specific checks to run. Runs all checks if omitted."),
       },
     },
-    async ({ action, addonName, platform, outputPath, gprojPath, filterPath, name, description, prefix, pattern: patternName, projectPath, checks }) => {
-
-      // ── build ──────────────────────────────────────────────────────────────
-      if (action === "build") {
-        return {
-          content: [{
-            type: "text",
-            text:
-              "Direct MCP Workbench builds are disabled because a server crash cannot supervise their process lifetime safely. " +
-              "The packaged reforger-forge-workbench runner supports a guarded two-phase lifecycle and version-3 receipt: " +
-              "it holds one machine lock, qualifies and exact-cleans a disposable managed-companion preflight, proves endpoint vacancy, " +
-              "then supervises and exact-cleans a distinct target-only child while requiring hashed fresh output proof. " +
-              "On installed Workbench 1.7.0.54 the runner uses the verified Resource Manager form " +
-              "-wbModule=ResourceManager -builddata PC <fresh-output> <AddonName>, with lowercase -builddata and no target -run. " +
-              "A project-owned bounded build wrapper may invoke that guarded runner, but must still require its hashed fresh-output receipt; " +
-              "child launch or zero exit alone is not build evidence.",
-          }],
-          isError: true,
-        };
-      }
+    async ({ action, name, description, prefix, pattern: patternName, projectPath, checks }) => {
 
       // ── create ─────────────────────────────────────────────────────────────
       if (action === "create") {

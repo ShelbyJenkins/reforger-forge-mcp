@@ -1,19 +1,92 @@
 import { EventEmitter } from "node:events";
 import type { ChildProcess } from "node:child_process";
 import { describe, expect, it, vi } from "vitest";
-import { ChildSupervisor } from "../../src/workbench/child-supervisor.js";
+import { ChildSupervisor } from "../../src/foundation/child-supervisor.js";
 
-function child(): ChildProcess {
+function child(
+  exitCode: number | null = null,
+  signalCode: NodeJS.Signals | null = null,
+  pid?: number
+): ChildProcess {
   const value = new EventEmitter() as EventEmitter & {
     exitCode: number | null;
     signalCode: NodeJS.Signals | null;
+    pid?: number;
   };
-  value.exitCode = null;
-  value.signalCode = null;
+  value.exitCode = exitCode;
+  value.signalCode = signalCode;
+  value.pid = pid;
   return value as unknown as ChildProcess;
 }
 
 describe("ChildSupervisor terminal reconciliation", () => {
+  it("returns an exit handle that remains observable by late listeners", async () => {
+    const supervisor = new ChildSupervisor();
+    const process = child(null, null, 101);
+    const handle = supervisor.supervise("workbench-a", process);
+
+    expect(handle.child).toBe(process);
+    expect(handle.terminalState).toBeNull();
+    process.emit("exit", 0, "SIGTERM");
+
+    const expected = { code: 0, signal: "SIGTERM" };
+    await expect(handle.exit).resolves.toEqual(expected);
+    await expect(handle.terminal).resolves.toEqual({ kind: "exit", exit: expected });
+    expect(handle.terminalState).toEqual({ kind: "exit", exit: expected });
+    const lateListener = vi.fn();
+    await handle.terminal.then(lateListener);
+    expect(lateListener).toHaveBeenCalledWith({ kind: "exit", exit: expected });
+    expect(supervisor.size).toBe(0);
+  });
+
+  it("drains an error-only child that never received a PID or exit event", async () => {
+    const supervisor = new ChildSupervisor();
+    const process = child();
+    const handle = supervisor.supervise("failed-spawn", process);
+    const failure = new Error("spawn ENOENT");
+
+    process.emit("error", failure);
+
+    await expect(handle.terminal).resolves.toEqual({ kind: "error", error: failure });
+    expect(supervisor.counts()).toEqual({ active: 0, reconciling: 0, total: 0 });
+    expect(process.listenerCount("error")).toBe(0);
+    expect(process.listenerCount("exit")).toBe(0);
+    process.emit("close", -2, null);
+    expect(supervisor.counts().total).toBe(0);
+  });
+
+  it("observes error and exit independently while preserving the first terminal event", async () => {
+    const supervisor = new ChildSupervisor();
+    const process = child(null, null, 102);
+    const handle = supervisor.supervise("workbench-a", process);
+    const failure = new Error("spawn channel failed");
+
+    process.emit("error", failure);
+    await expect(handle.error).resolves.toBe(failure);
+    await expect(handle.terminal).resolves.toEqual({ kind: "error", error: failure });
+    expect(handle.terminalState).toEqual({ kind: "error", error: failure });
+    expect(supervisor.size).toBe(1);
+
+    process.emit("exit", 1, null);
+    await expect(handle.exit).resolves.toEqual({ code: 1, signal: null });
+    expect(handle.terminalState).toEqual({ kind: "error", error: failure });
+    expect(supervisor.size).toBe(0);
+  });
+
+  it("publishes terminal state immediately for a child already known to have exited", async () => {
+    const supervisor = new ChildSupervisor();
+    const process = child(7);
+
+    const handle = supervisor.supervise("workbench-a", process);
+
+    expect(handle.terminalState).toEqual({
+      kind: "exit",
+      exit: { code: 7, signal: null },
+    });
+    await expect(handle.exit).resolves.toEqual({ code: 7, signal: null });
+    await vi.waitFor(() => expect(supervisor.size).toBe(0));
+  });
+
   it("automatically retries a failed exact-exit callback and drains retry state", async () => {
     const supervisor = new ChildSupervisor({
       reconciliationAttempts: 3,

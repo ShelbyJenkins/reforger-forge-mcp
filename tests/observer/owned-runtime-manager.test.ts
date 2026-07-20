@@ -26,8 +26,14 @@ import {
   type RuntimeStopPreflight,
 } from "../../src/observer/owned-runtime-manager.js";
 import { LifecycleGuardError } from "../../src/workbench/process-guard.js";
+import type { MachineMutexLeaseLoss } from "../../src/foundation/machine-mutex.js";
+import {
+  createFakeExactProcessBackend,
+  type FakeExactProcessBackend,
+  type FakeExactProcessRecord,
+} from "../foundation/fake-exact-process-backend.js";
 import type { ObserverLaunchInput, ObserverPreparedLaunch } from "../../src/observer/launch.js";
-import { createObserverAgent } from "../../observer/agent/index.js";
+import { createObserverApplication } from "../../observer/agent/application.js";
 import { runtimeStopObligations } from "../../observer/agent/private-child.js";
 import { OBSERVER_BUILD_IDENTITY } from "../../observer/protocol/index.js";
 import {
@@ -37,219 +43,198 @@ import {
   testBundleDigest,
 } from "./helpers.js";
 
-interface FakeProcess {
-  identity: OwnedRuntimeExactIdentity;
-  ownerArgument: string;
+interface FakeProcess extends FakeExactProcessRecord {}
+
+type FakeBackend = FakeExactProcessBackend<FakeProcess> & OwnedRuntimeProcessBackend & {
+  readonly terminateCalls: FakeExactProcessBackend<FakeProcess>["terminationCalls"];
+  currentCreation: string;
+  currentUserSid: string;
+  refuseTermination: boolean;
+};
+
+function createFakeBackend(): FakeBackend {
+  const backend = createFakeExactProcessBackend<FakeProcess>() as FakeBackend;
+  backend.terminateCalls = backend.terminationCalls;
+  backend.currentCreation = "900001";
+  backend.currentUserSid = "S-1-5-21-test-owner";
+  backend.refuseTermination = false;
+  backend.inspectCurrentProcess = async (pid) => ({
+    pid,
+    executablePath: process.execPath,
+    creationTime: backend.currentCreation,
+    userSid: backend.currentUserSid,
+  });
+  const verifyExactAndTerminate = backend.verifyAndTerminate.bind(backend);
+  backend.verifyAndTerminate = async (expected, timeoutMs) => {
+    const previous = backend.terminationResult;
+    if (backend.refuseTermination) {
+      backend.terminationResult = {
+        kind: "refused",
+        reason: "access_denied",
+        message: "fixture refusal",
+      };
+    }
+    try {
+      return await verifyExactAndTerminate(expected, timeoutMs);
+    } finally {
+      backend.terminationResult = previous;
+    }
+  };
+  return backend;
 }
 
-class FakeBackend implements OwnedRuntimeProcessBackend {
-  readonly platform = "test" as const;
-  readonly processes = new Map<number, FakeProcess>();
-  readonly terminateCalls: Array<OwnedRuntimeExactIdentity & { ownerTokenArgument: string }> = [];
-  inspectFailure: Error | null = null;
-  currentCreation = "900001";
-  currentUserSid = "S-1-5-21-test-owner";
-  beforeTerminate: (() => void) | null = null;
-  refuseTermination = false;
-  mutexFailures = 0;
-
-  async withMachineMutex<T>(args: { action: () => Promise<T> }): Promise<T> {
-    if (this.mutexFailures > 0) {
-      this.mutexFailures -= 1;
-      throw new Error("fixture mutex failure");
-    }
-    return args.action();
-  }
-
-  async inspectCurrentProcess(pid: number) {
-    return {
-      pid,
-      executablePath: process.execPath,
-      creationTimeFileTime: this.currentCreation,
-      userSid: this.currentUserSid,
-    };
-  }
-
-  async inspectProcess(pid: number, expectedOwnerTokenArgument?: string): Promise<OwnedRuntimeInspection | null> {
-    if (this.inspectFailure) throw this.inspectFailure;
-    const value = this.processes.get(pid);
-    if (!value) return null;
-    return {
-      identity: { ...value.identity },
-      ownerArgumentMatched: expectedOwnerTokenArgument === undefined
-        ? null
-        : value.ownerArgument === expectedOwnerTokenArgument,
-    };
-  }
-
-  async verifyAndTerminate(expected: OwnedRuntimeExactIdentity & {
-    ownerTokenArgument: string;
-    launchedAtMs: number;
-  }) {
-    this.beforeTerminate?.();
-    this.terminateCalls.push({ ...expected });
-    if (this.refuseTermination) {
-      return { kind: "refused" as const, reason: "access_denied" as const, message: "fixture refusal" };
-    }
-    const value = this.processes.get(expected.pid);
-    if (!value) return { kind: "already_exited" as const };
-    if (value.identity.executablePath !== expected.executablePath) {
-      return { kind: "refused" as const, reason: "executable_mismatch" as const, message: "path changed" };
-    }
-    if (value.identity.creationTimeFileTime !== expected.creationTimeFileTime) {
-      return { kind: "refused" as const, reason: "creation_time_mismatch" as const, message: "creation changed" };
-    }
-    if (value.ownerArgument !== expected.ownerTokenArgument) {
-      return { kind: "refused" as const, reason: "token_mismatch" as const, message: "token changed" };
-    }
-    this.processes.delete(expected.pid);
-    return { kind: "terminated" as const };
-  }
-}
-
-class QueuedBackend extends FakeBackend {
-  private mutexTail: Promise<void> = Promise.resolve();
-  private entryCount = 0;
-  private markFirstEntryBlocked!: () => void;
-  private releaseFirstEntry!: () => void;
+type QueuedBackend = FakeBackend & {
   readonly firstEntryBlocked: Promise<void>;
-  private readonly firstEntryRelease: Promise<void>;
+  allowFirstEntry(): void;
+};
 
-  constructor() {
-    super();
-    this.firstEntryBlocked = new Promise((resolve) => { this.markFirstEntryBlocked = resolve; });
-    this.firstEntryRelease = new Promise((resolve) => { this.releaseFirstEntry = resolve; });
-  }
-
-  allowFirstEntry(): void {
-    this.releaseFirstEntry();
-  }
-
-  override async withMachineMutex<T>(args: { action: () => Promise<T> }): Promise<T> {
-    const prior = this.mutexTail;
+function createQueuedBackend(): QueuedBackend {
+  const backend = createFakeBackend() as QueuedBackend;
+  let mutexTail: Promise<void> = Promise.resolve();
+  let entryCount = 0;
+  let markFirstEntryBlocked!: () => void;
+  let releaseFirstEntry!: () => void;
+  backend.firstEntryBlocked = new Promise((resolve) => { markFirstEntryBlocked = resolve; });
+  const firstEntryRelease = new Promise<void>((resolve) => { releaseFirstEntry = resolve; });
+  backend.allowFirstEntry = () => releaseFirstEntry();
+  backend.withMachineMutex = async (args) => {
+    const prior = mutexTail;
     let releaseCurrent!: () => void;
-    this.mutexTail = new Promise((resolve) => { releaseCurrent = resolve; });
+    mutexTail = new Promise((resolve) => { releaseCurrent = resolve; });
     await prior;
     try {
-      this.entryCount += 1;
+      entryCount += 1;
       // Preparation now owns a short direct-index transaction. Block the
       // following start transaction, which is the race this fixture models.
-      if (this.entryCount === 2) {
-        this.markFirstEntryBlocked();
-        await this.firstEntryRelease;
+      if (entryCount === 2) {
+        markFirstEntryBlocked();
+        await firstEntryRelease;
       }
       return await args.action();
     } finally {
       releaseCurrent();
     }
-  }
+  };
+  return backend;
 }
 
-class SerialBackend extends FakeBackend {
-  private mutexTail: Promise<void> = Promise.resolve();
-
-  override async withMachineMutex<T>(args: { action: () => Promise<T> }): Promise<T> {
-    const prior = this.mutexTail;
+function createSerialBackend(): FakeBackend {
+  const backend = createFakeBackend();
+  let mutexTail: Promise<void> = Promise.resolve();
+  backend.withMachineMutex = async (args) => {
+    const prior = mutexTail;
     let releaseCurrent!: () => void;
     const current = new Promise<void>((resolve) => { releaseCurrent = resolve; });
-    this.mutexTail = prior.then(() => current);
+    mutexTail = prior.then(() => current);
     await prior;
     try {
       return await args.action();
     } finally {
       releaseCurrent();
     }
-  }
+  };
+  return backend;
 }
 
-class HookedSerialBackend extends SerialBackend {
-  entryCount = 0;
-  beforeAction: ((entry: number) => void) | null = null;
+type HookedSerialBackend = FakeBackend & {
+  entryCount: number;
+  beforeAction: ((entry: number) => void) | null;
+};
 
-  override withMachineMutex<T>(args: { action: () => Promise<T> }): Promise<T> {
-    return super.withMachineMutex({
-      action: async () => {
-        this.entryCount += 1;
-        this.beforeAction?.(this.entryCount);
-        return args.action();
-      },
-    });
-  }
+function createHookedSerialBackend(): HookedSerialBackend {
+  const backend = createSerialBackend() as HookedSerialBackend;
+  backend.entryCount = 0;
+  backend.beforeAction = null;
+  const withSerialMutex = backend.withMachineMutex.bind(backend);
+  backend.withMachineMutex = (args) => withSerialMutex({
+    ...args,
+    action: async () => {
+      backend.entryCount += 1;
+      backend.beforeAction?.(backend.entryCount);
+      return args.action();
+    },
+  });
+  return backend;
 }
 
-class DeadlineBackend extends FakeBackend {
-  hangNextMutexAfterAction = false;
-  hangNextInspection = false;
-  mutexEntries = 0;
-  inspectionCalls = 0;
+type DeadlineBackend = FakeBackend & {
+  hangNextMutexAfterAction: boolean;
+  hangNextInspection: boolean;
+  mutexEntries: number;
+  inspectionCalls: number;
+};
 
-  override async withMachineMutex<T>(args: { action: () => Promise<T> }): Promise<T> {
-    this.mutexEntries += 1;
+function createDeadlineBackend(): DeadlineBackend {
+  const backend = createFakeBackend() as DeadlineBackend;
+  backend.hangNextMutexAfterAction = false;
+  backend.hangNextInspection = false;
+  backend.mutexEntries = 0;
+  backend.inspectionCalls = 0;
+  backend.withMachineMutex = async (args) => {
+    backend.mutexEntries += 1;
     const result = await args.action();
-    if (this.hangNextMutexAfterAction) {
-      this.hangNextMutexAfterAction = false;
+    if (backend.hangNextMutexAfterAction) {
+      backend.hangNextMutexAfterAction = false;
       await new Promise<void>(() => undefined);
     }
     return result;
-  }
-
-  override async inspectProcess(
-    pid: number,
-    expectedOwnerTokenArgument?: string
-  ): Promise<OwnedRuntimeInspection | null> {
-    this.inspectionCalls += 1;
-    if (this.hangNextInspection) {
-      this.hangNextInspection = false;
+  };
+  const inspectExactProcess = backend.inspectProcess.bind(backend);
+  backend.inspectProcess = async (pid, expectedOwnerTokenArgument) => {
+    backend.inspectionCalls += 1;
+    if (backend.hangNextInspection) {
+      backend.hangNextInspection = false;
       return new Promise<OwnedRuntimeInspection | null>(() => undefined);
     }
-    return super.inspectProcess(pid, expectedOwnerTokenArgument);
-  }
+    return inspectExactProcess(pid, expectedOwnerTokenArgument);
+  };
+  return backend;
 }
 
-class LeaseLosingBackend extends FakeBackend {
-  loseOnCurrentInspection = false;
-  loseAfterTermination = false;
-  private activeLeaseLoss: ((error: LifecycleGuardError) => void) | null = null;
+type LeaseLosingBackend = FakeBackend & {
+  loseOnCurrentInspection: boolean;
+  loseAfterTermination: boolean;
+};
 
-  override async withMachineMutex<T>(args: {
-    action: () => Promise<T>;
-    onLeaseLost?: (error: LifecycleGuardError) => void;
-  }): Promise<T> {
-    const prior = this.activeLeaseLoss;
-    this.activeLeaseLoss = args.onLeaseLost ?? null;
+function createLeaseLosingBackend(): LeaseLosingBackend {
+  const backend = createFakeBackend() as LeaseLosingBackend;
+  backend.loseOnCurrentInspection = false;
+  backend.loseAfterTermination = false;
+  let activeLeaseLoss: ((error: MachineMutexLeaseLoss) => void) | null = null;
+  backend.withMachineMutex = async (args) => {
+    const prior = activeLeaseLoss;
+    activeLeaseLoss = args.onLeaseLost ?? null;
     try {
       return await args.action();
     } finally {
-      this.activeLeaseLoss = prior;
+      activeLeaseLoss = prior;
     }
-  }
-
-  override async inspectCurrentProcess(pid: number) {
-    const result = await super.inspectCurrentProcess(pid);
-    if (this.loseOnCurrentInspection && this.activeLeaseLoss) {
-      this.loseOnCurrentInspection = false;
-      this.activeLeaseLoss(new LifecycleGuardError(
+  };
+  const inspectCurrent = backend.inspectCurrentProcess.bind(backend);
+  backend.inspectCurrentProcess = async (pid) => {
+    const result = await inspectCurrent(pid);
+    if (backend.loseOnCurrentInspection && activeLeaseLoss) {
+      backend.loseOnCurrentInspection = false;
+      activeLeaseLoss(new LifecycleGuardError(
         "fixture lifecycle mutex holder exited",
         "RECOVERY_REQUIRED"
       ));
     }
     return result;
-  }
-
-  override async verifyAndTerminate(expected: OwnedRuntimeExactIdentity & {
-    ownerTokenArgument: string;
-    launchedAtMs: number;
-  }) {
-    const result = await super.verifyAndTerminate(expected);
-    if (this.loseAfterTermination && this.activeLeaseLoss) {
-      this.loseAfterTermination = false;
-      this.activeLeaseLoss(new LifecycleGuardError(
+  };
+  const verifyExactAndTerminate = backend.verifyAndTerminate.bind(backend);
+  backend.verifyAndTerminate = async (expected, timeoutMs) => {
+    const result = await verifyExactAndTerminate(expected, timeoutMs);
+    if (backend.loseAfterTermination && activeLeaseLoss) {
+      backend.loseAfterTermination = false;
+      activeLeaseLoss(new LifecycleGuardError(
         "fixture lifecycle mutex holder exited during termination",
         "RECOVERY_REQUIRED"
       ));
     }
     return result;
-  }
+  };
+  return backend;
 }
 
 class FakeChild extends EventEmitter {
@@ -353,7 +338,7 @@ class FakeGate implements OwnedRuntimeObserverGate {
 }
 
 class AgentBackedGate extends FakeGate {
-  constructor(private readonly agent: ReturnType<typeof createObserverAgent>) {
+  constructor(private readonly agent: ReturnType<typeof createObserverApplication>) {
     super();
   }
 
@@ -490,7 +475,7 @@ function makeHarness(options: {
   if (!options.root) roots.push(root);
   const executable = join(root, "ArmaReforgerSteamDiag.exe");
   if (!options.root) writeFileSync(executable, "fixture");
-  const backend = options.backend ?? new FakeBackend();
+  const backend = options.backend ?? createFakeBackend();
   const gate = options.gate ?? new FakeGate();
   const spawnCalls: Harness["spawnCalls"] = [];
   let pid = 4100;
@@ -506,7 +491,7 @@ function makeHarness(options: {
     } else {
       const ownerArgument = args.find((argument) => argument.startsWith(OWNED_RUNTIME_OWNER_ARGUMENT_PREFIX)) ?? "";
       backend.processes.set(child.pid, {
-        identity: { pid: child.pid, executablePath: file, creationTimeFileTime: String(800000 + child.pid) },
+        identity: { pid: child.pid, executablePath: file, creationTime: String(800000 + child.pid) },
         ownerArgument,
       });
       queueMicrotask(() => child.emit("spawn"));
@@ -699,7 +684,10 @@ describe("OwnedRuntimeManager", () => {
     expect(readdirSync(join(insufficient.manager.storageRoot, "pending-starts"))).toEqual([]);
     expect(readdirSync(join(insufficient.manager.storageRoot, "idempotency"))).toEqual([]);
 
-    const sufficient = makeHarness({ maxStoreRecords: 11 });
+    // This case exercises storage reservation, not deadline handling. Leave
+    // enough wall-clock headroom for filesystem syncs when the full suite is
+    // running in parallel on a loaded Windows host.
+    const sufficient = makeHarness({ maxStoreRecords: 11, terminationTimeoutMs: 5_000 });
     const sufficientPrepared = await sufficient.prepare();
     const started = await sufficient.manager.start({
       preparedLaunchId: sufficientPrepared.id,
@@ -781,7 +769,7 @@ describe("OwnedRuntimeManager", () => {
     const clock = new FakeClock(Date.parse("2026-07-18T12:00:00.000Z"));
     const profileRoot = join(root, "agent-profiles");
     mkdirSync(profileRoot, { recursive: true });
-    const agent = createObserverAgent({
+    const agent = createObserverApplication({
       root: join(root, "agent-managed"),
       profileRoot,
       sourceDirectory: observerAddonSource,
@@ -806,7 +794,7 @@ describe("OwnedRuntimeManager", () => {
       runtimeKind: "listenServer",
     });
     agent.registry.register(registration, created.contract.sessionToken);
-    const backend = new FakeBackend();
+    const backend = createFakeBackend();
     const gate = new AgentBackedGate(agent);
     const value = makeHarness({
       root,
@@ -938,7 +926,7 @@ describe("OwnedRuntimeManager", () => {
     const stagedAddonPath = join(agentRoot, "addons", testBundleDigest, "ReforgerForgeObserver");
     mkdirSync(profilePath, { recursive: true });
     mkdirSync(stagedAddonPath, { recursive: true });
-    const firstAgent = createObserverAgent({
+    const firstAgent = createObserverApplication({
       root: agentRoot,
       profileRoot,
       sourceDirectory: observerAddonSource,
@@ -962,7 +950,7 @@ describe("OwnedRuntimeManager", () => {
       runtimeKind: "listenServer",
     });
     firstAgent.registry.register(registration, created.contract.sessionToken);
-    const backend = new FakeBackend();
+    const backend = createFakeBackend();
     const first = makeHarness({
       root,
       backend,
@@ -1029,7 +1017,7 @@ describe("OwnedRuntimeManager", () => {
     // zero-retention tombstones before constructing the replacement.
     clock.advance(2_000);
     first.setClock(clock.now());
-    const replacementAgent = createObserverAgent({
+    const replacementAgent = createObserverApplication({
       root: agentRoot,
       profileRoot,
       sourceDirectory: observerAddonSource,
@@ -1244,7 +1232,7 @@ describe("OwnedRuntimeManager", () => {
   });
 
   it("fences start before spawn and ownership publication when the mutex lease is lost", async () => {
-    const backend = new LeaseLosingBackend();
+    const backend = createLeaseLosingBackend();
     const value = makeHarness({ backend });
     const prepared = await value.prepare([], "lease-loss-start-prepare");
     backend.loseOnCurrentInspection = true;
@@ -1463,9 +1451,9 @@ describe("OwnedRuntimeManager", () => {
     value.setClock(Date.parse(prepared.prepared.expiresAt) - 1);
 
     const process = value.backend.processes.get(started.pid)!;
-    process.identity.creationTimeFileTime = "999999";
+    process.identity.creationTime = "999999";
     expect((await value.manager.status(started.runtimeId)).state).toBe("identity_mismatch");
-    process.identity.creationTimeFileTime = String(800000 + started.pid);
+    process.identity.creationTime = String(800000 + started.pid);
     process.ownerArgument = `${OWNED_RUNTIME_OWNER_ARGUMENT_PREFIX}changed`;
     expect((await value.manager.status(started.runtimeId)).state).toBe("identity_mismatch");
     process.ownerArgument = value.spawnCalls[0].arguments.at(-1)!;
@@ -1507,7 +1495,7 @@ describe("OwnedRuntimeManager", () => {
     const prepared = await value.prepare();
     const started = await value.manager.start({ preparedLaunchId: prepared.id, idempotencyKey: "camera-start" });
     value.backend.processes.set(9999, {
-      identity: { pid: 9999, executablePath: value.executable, creationTimeFileTime: "123456" },
+      identity: { pid: 9999, executablePath: value.executable, creationTime: "123456" },
       ownerArgument: `${OWNED_RUNTIME_OWNER_ARGUMENT_PREFIX}unrelated`,
     });
     value.gate.preflights.push({
@@ -1561,7 +1549,7 @@ describe("OwnedRuntimeManager", () => {
   });
 
   it("does not publish vacancy after losing the mutex lease during exact termination", async () => {
-    const backend = new LeaseLosingBackend();
+    const backend = createLeaseLosingBackend();
     const value = makeHarness({ backend });
     const prepared = await value.prepare([], "lease-loss-stop-prepare");
     const started = await value.manager.start({
@@ -1654,7 +1642,7 @@ describe("OwnedRuntimeManager", () => {
   });
 
   it("adopts the same deterministic observer lease after ambiguous proof publication", async () => {
-    const backend = new FakeBackend();
+    const backend = createFakeBackend();
     const value = makeHarness({ backend });
     const prepared = await value.prepare();
     const started = await value.manager.start({
@@ -1674,7 +1662,7 @@ describe("OwnedRuntimeManager", () => {
         activeJobIds: [],
         cameraLeaseJobIds: [],
         restorationPendingJobIds: [],
-        ...(incumbent === proposedReservationId ? { reservationId: incumbent } : {}),
+        ...(incumbent === proposedReservationId ? { reservationId: proposedReservationId } : {}),
       };
     });
 
@@ -1738,7 +1726,7 @@ describe("OwnedRuntimeManager", () => {
   });
 
   it("does not hold the machine mutex while waiting for restoration readiness", async () => {
-    const backend = new SerialBackend();
+    const backend = createSerialBackend();
     const value = makeHarness({ backend });
     const prepared = await value.prepare();
     const started = await value.manager.start({
@@ -1782,7 +1770,7 @@ describe("OwnedRuntimeManager", () => {
   });
 
   it("does not hold the machine mutex while observer stop completion is pending", async () => {
-    const backend = new SerialBackend();
+    const backend = createSerialBackend();
     const value = makeHarness({ backend });
     const prepared = await value.prepare();
     const started = await value.manager.start({
@@ -1921,7 +1909,7 @@ describe("OwnedRuntimeManager", () => {
   });
 
   it("does not call the observer gate after mutex acquisition consumes the stop budget", async () => {
-    const backend = new DeadlineBackend();
+    const backend = createDeadlineBackend();
     const value = makeHarness({
       backend,
       inspectionTimeoutMs: 100,
@@ -1948,7 +1936,7 @@ describe("OwnedRuntimeManager", () => {
   });
 
   it("does not reserve or terminate after exact inspection consumes the stop budget", async () => {
-    const backend = new DeadlineBackend();
+    const backend = createDeadlineBackend();
     const value = makeHarness({
       backend,
       inspectionTimeoutMs: 100,
@@ -1975,7 +1963,7 @@ describe("OwnedRuntimeManager", () => {
   });
 
   it("revalidates the durable restoration reservation after reacquiring the mutex", async () => {
-    const backend = new HookedSerialBackend();
+    const backend = createHookedSerialBackend();
     const value = makeHarness({ backend });
     const prepared = await value.prepare();
     const started = await value.manager.start({
@@ -2009,7 +1997,7 @@ describe("OwnedRuntimeManager", () => {
     const prepared = await value.prepare();
     const started = await value.manager.start({ preparedLaunchId: prepared.id, idempotencyKey: "reuse-start" });
     const replacement = value.backend.processes.get(started.pid)!;
-    replacement.identity.creationTimeFileTime = "777777";
+    replacement.identity.creationTime = "777777";
     replacement.ownerArgument = `${OWNED_RUNTIME_OWNER_ARGUMENT_PREFIX}replacement`;
     await expect(value.manager.stop({
       runtimeId: started.runtimeId,
@@ -2102,7 +2090,7 @@ describe("OwnedRuntimeManager", () => {
       identity: {
         pid: process.pid,
         executablePath: process.execPath,
-        creationTimeFileTime: value.backend.currentCreation,
+        creationTime: value.backend.currentCreation,
       },
       ownerArgument: "",
     });
@@ -2348,7 +2336,7 @@ describe("OwnedRuntimeManager", () => {
       gamePath: root,
       projectPath: project,
       observerGate: new FakeGate(),
-      backend: new FakeBackend(),
+      backend: createFakeBackend(),
       executableResolver: () => join(root, "unused.exe"),
       installationRoot: process.cwd(),
     })).toThrowError(expect.objectContaining({ code: "STORAGE_UNVERIFIABLE" }));
@@ -2356,7 +2344,7 @@ describe("OwnedRuntimeManager", () => {
   });
 
   it("rejects a queued start once clean shutdown begins", async () => {
-    const backend = new QueuedBackend();
+    const backend = createQueuedBackend();
     const value = makeHarness({ backend });
     const prepared = await value.prepare();
     const startPromise = value.manager.start({
@@ -2445,8 +2433,12 @@ describe("OwnedRuntimeManager", () => {
     const releaseRuntimeLifecycle = value.gate.releaseRuntimeLifecycle.bind(value.gate);
     let wallNow = Date.now();
     const wallClock = vi.spyOn(Date, "now").mockImplementation(() => wallNow);
-    value.gate.releaseRuntimeLifecycle = vi.fn(async (...argumentsArray) => {
-      const acknowledgement = await releaseRuntimeLifecycle(...argumentsArray);
+    value.gate.releaseRuntimeLifecycle = vi.fn(async (
+      sessionId: string,
+      runtimeId: string,
+      generation: string
+    ) => {
+      const acknowledgement = await releaseRuntimeLifecycle(sessionId, runtimeId, generation);
       // Deterministically consume the aggregate shutdown budget after one
       // inspected runtime; setup timing and scheduler load are irrelevant.
       wallNow += 5_000;
@@ -2471,7 +2463,7 @@ describe("OwnedRuntimeManager", () => {
     } finally {
       wallClock.mockRestore();
     }
-  });
+  }, 15_000);
 
   it("keeps coordinator shutdown unsafe when the runtime receipt directory disappears", async () => {
     const value = makeHarness();

@@ -1,19 +1,21 @@
 import { randomUUID } from "node:crypto";
 import {
-  closeSync,
   existsSync,
   lstatSync,
-  mkdirSync,
-  openSync,
-  realpathSync,
   readdirSync,
-  renameSync,
-  statSync,
-  unlinkSync,
-  writeFileSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { join, relative, resolve, sep } from "node:path";
+import {
+  assertRegularManagedFile as foundationAssertRegularManagedFile,
+  canonicalizeExistingDirectory as foundationCanonicalizeExistingDirectory,
+  ensureCanonicalDirectory as foundationEnsureCanonicalDirectory,
+  isPathContained as foundationIsPathContained,
+  resolveManagedPath,
+  inspectManagedPath,
+  type ManagedPathInspection,
+} from "#foundation/managed-path";
+import { atomicWriteFile as foundationAtomicWriteFile } from "#foundation/json-store";
 import { IDENTIFIER_PATTERN } from "../protocol/index.js";
 import { ObserverError } from "./errors.js";
 
@@ -42,37 +44,36 @@ export interface EngineProfileDirectoryOptions {
   requireExisting?: boolean;
 }
 
-function pathKey(path: string): string {
-  return process.platform === "win32" ? path.toLowerCase() : path;
+export function isPathContained(root: string, candidate: string): boolean {
+  return foundationIsPathContained(root, candidate);
 }
 
-export function isPathContained(root: string, candidate: string): boolean {
-  const rel = relative(root, candidate);
-  return rel === "" || (!isAbsolute(rel) && rel !== ".." && !rel.startsWith(`..${sep}`));
+export interface ObserverPathInspection {
+  readOnly: true;
+  paths: ObserverManagedPaths;
+  entries: Record<keyof ObserverManagedPaths, ManagedPathInspection>;
 }
 
 export function ensureCanonicalDirectory(directoryPath: string, mode = 0o700): string {
-  const absolute = resolve(directoryPath);
-  mkdirSync(absolute, { recursive: true, mode });
-  const canonical = realpathSync.native(absolute);
-  if (!statSync(canonical).isDirectory()) {
-    throw new ObserverError("INVALID_REQUEST", `Managed path is not a directory: ${canonical}`);
+  try {
+    return foundationEnsureCanonicalDirectory(directoryPath, mode);
+  } catch (error) {
+    throw new ObserverError(
+      "INVALID_REQUEST",
+      error instanceof Error ? error.message : String(error)
+    );
   }
-  return canonical;
 }
 
 export function canonicalizeExistingDirectory(directoryPath: string, label = "Directory"): string {
-  const absolute = resolve(directoryPath);
-  let canonical: string;
   try {
-    canonical = realpathSync.native(absolute);
-  } catch {
-    throw new ObserverError("INVALID_REQUEST", `${label} does not exist or cannot be resolved: ${absolute}`);
+    return foundationCanonicalizeExistingDirectory(directoryPath, label);
+  } catch (error) {
+    throw new ObserverError(
+      "INVALID_REQUEST",
+      error instanceof Error ? error.message : String(error)
+    );
   }
-  if (!statSync(canonical).isDirectory()) {
-    throw new ObserverError("INVALID_REQUEST", `${label} is not a directory: ${canonical}`);
-  }
-  return canonical;
 }
 
 export function resolveEngineProfileDirectory(
@@ -99,36 +100,25 @@ export function resolveEngineProfileDirectory(
 }
 
 export function assertManagedPath(rootPath: string, candidatePath: string): string {
-  const root = canonicalizeExistingDirectory(rootPath, "Managed root");
-  const candidate = resolve(candidatePath);
-  if (!isPathContained(pathKey(root), pathKey(candidate))) {
-    throw new ObserverError("INVALID_REQUEST", `Managed path escapes its root: ${candidate}`);
+  try {
+    return resolveManagedPath(rootPath, candidatePath, "link-safe");
+  } catch (error) {
+    throw new ObserverError(
+      "INVALID_REQUEST",
+      error instanceof Error ? error.message : String(error)
+    );
   }
-
-  const rel = relative(root, candidate);
-  let current = root;
-  for (const segment of rel.split(sep).filter(Boolean)) {
-    current = join(current, segment);
-    if (!existsSync(current)) continue;
-    const canonical = realpathSync.native(current);
-    if (!isPathContained(pathKey(root), pathKey(canonical))) {
-      throw new ObserverError("INVALID_REQUEST", `Managed path traverses a link outside its root: ${current}`);
-    }
-  }
-  return candidate;
 }
 
 export function assertRegularManagedFile(root: string, filePath: string): string {
-  const candidate = assertManagedPath(root, filePath);
-  const entry = lstatSync(candidate);
-  if (entry.isSymbolicLink() || !entry.isFile()) {
-    throw new ObserverError("INVALID_REQUEST", `Managed path is not a regular file: ${candidate}`);
+  try {
+    return foundationAssertRegularManagedFile(root, filePath);
+  } catch (error) {
+    throw new ObserverError(
+      "INVALID_REQUEST",
+      error instanceof Error ? error.message : String(error)
+    );
   }
-  const canonical = realpathSync.native(candidate);
-  if (!isPathContained(pathKey(realpathSync.native(root)), pathKey(canonical))) {
-    throw new ObserverError("INVALID_REQUEST", `Managed file resolves outside its root: ${candidate}`);
-  }
-  return canonical;
 }
 
 export function assertIdentifier(value: string, label = "Identifier"): string {
@@ -139,32 +129,16 @@ export function assertIdentifier(value: string, label = "Identifier"): string {
 }
 
 export function atomicWriteFile(root: string, targetPath: string, data: string | Uint8Array, mode = 0o600): void {
-  const target = assertManagedPath(root, targetPath);
-  const parent = ensureCanonicalDirectory(dirname(target));
-  assertManagedPath(root, parent);
-  const temporary = join(parent, `.${randomUUID()}.tmp`);
-  try {
-    const descriptor = openSync(temporary, "wx", mode);
-    try {
-      writeFileSync(descriptor, data);
-    } finally {
-      closeSync(descriptor);
-    }
-    renameSync(temporary, target);
-  } catch (error) {
-    // A failed write/close/rename must not leave a fresh UUID temporary behind.
-    // Callers that own durable bounded stores also inventory old temporaries so
-    // a raced/busy cleanup failure is visible and prevents further allocation.
-    try {
-      unlinkSync(temporary);
-    } catch (cleanupError) {
-      if ((cleanupError as NodeJS.ErrnoException)?.code !== "ENOENT") {
-        // Preserve the operation's primary failure. The exact temporary remains
-        // discoverable by the bounded store's next inventory pass.
-      }
-    }
-    throw error;
-  }
+  foundationAtomicWriteFile({
+    root,
+    targetPath,
+    data,
+    // Every current observer payload has a tighter protocol/store-specific
+    // bound. Keep a final hard ceiling here so the shared primitive is never
+    // invoked with an unbounded publication.
+    maxBytes: 1024 * 1024 * 1024,
+    mode,
+  });
 }
 
 export function atomicWriteJson(root: string, targetPath: string, value: unknown, mode = 0o600): void {
@@ -202,7 +176,7 @@ export function defaultObserverRoot(): string {
     : join(homedir(), ".local", "state", "reforger-forge", "observer", "v1");
 }
 
-export function createObserverPaths(rootPath = defaultObserverRoot()): ObserverManagedPaths {
+export function ensurePaths(rootPath = defaultObserverRoot(), profileRoot?: string): ObserverManagedPaths {
   const root = ensureCanonicalDirectory(rootPath);
   const paths = {
     root,
@@ -212,10 +186,42 @@ export function createObserverPaths(rootPath = defaultObserverRoot()): ObserverM
     exportWork: ensureCanonicalDirectory(join(root, "export-work")),
     state: ensureCanonicalDirectory(join(root, "state")),
     logs: ensureCanonicalDirectory(join(root, "logs")),
-    profiles: ensureCanonicalDirectory(join(root, "profiles")),
+    profiles: ensureCanonicalDirectory(profileRoot ?? join(root, "profiles")),
   };
-  for (const path of Object.values(paths)) assertManagedPath(root, path);
+  for (const [name, path] of Object.entries(paths)) {
+    // The approved engine profile root may intentionally be outside observer
+    // storage; all other entries are private children of the managed root.
+    if (name === "profiles" && !isPathContained(root, path)) continue;
+    assertManagedPath(root, path);
+  }
   return paths;
+}
+
+/**
+ * Resolve the managed layout lexically and inspect entries without creating
+ * directories, loading stores, resolving real paths, or traversing links.
+ */
+export function inspectPaths(rootPath = defaultObserverRoot(), profileRoot?: string): ObserverPathInspection {
+  const root = resolve(rootPath);
+  const paths: ObserverManagedPaths = {
+    root,
+    addons: join(root, "addons"),
+    artifacts: join(root, "artifacts"),
+    runs: join(root, "runs"),
+    exportWork: join(root, "export-work"),
+    state: join(root, "state"),
+    logs: join(root, "logs"),
+    profiles: resolve(profileRoot ?? join(root, "profiles")),
+  };
+  const entries = Object.fromEntries(
+    Object.entries(paths).map(([key, path]) => [key, inspectManagedPath(path)])
+  ) as Record<keyof ObserverManagedPaths, ManagedPathInspection>;
+  return { readOnly: true, paths, entries };
+}
+
+/** Backwards-compatible mutating constructor. */
+export function createObserverPaths(rootPath = defaultObserverRoot()): ObserverManagedPaths {
+  return ensurePaths(rootPath);
 }
 
 export function createTemporaryObserverPaths(prefix = "rfo-test-"): ObserverManagedPaths {

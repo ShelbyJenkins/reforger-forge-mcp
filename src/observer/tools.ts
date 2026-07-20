@@ -6,6 +6,7 @@ import {
   type ObserverCaptureResult,
   type ObserverCoordinator,
 } from "./coordinator.js";
+import type { ObserverApplication } from "./application.js";
 import { prepareObserverLaunch } from "./launch.js";
 import { runObserverSetup } from "./setup.js";
 import type { WorkbenchClient } from "../workbench/client.js";
@@ -92,6 +93,7 @@ function capturePresentation(result: Extract<ObserverCaptureResult, { asynchrono
   return {
     jobId: result.job.jobId,
     instanceId: result.job.instanceId,
+    worldRevision: result.job.worldRevision,
     worldId: result.job.worldId,
     worldEpoch: result.job.worldEpoch,
     camera: metadata.actualCamera ?? artifact.actualCamera ?? null,
@@ -113,7 +115,7 @@ function isPng(image: Buffer): boolean {
 
 export function registerObserverTools(
   server: McpServer,
-  coordinator: ObserverCoordinator,
+  coordinator: ObserverApplication | ObserverCoordinator,
   defaults: ObserverToolDefaults = {}
 ): void {
   const sessionTtlMs = defaults.sessionTtlMs ?? 20 * 60 * 1_000;
@@ -226,6 +228,9 @@ export function registerObserverTools(
         ),
         expectedWorldEpoch: z.number().int().nonnegative().describe(
           "Exact world epoch returned by the immediately preceding observer_instances inventory."
+        ),
+        expectedWorldRevision: z.string().regex(/^wr1\.(?:runtime|workbench)\.[A-Za-z0-9_-]+$/).optional().describe(
+          "Opaque exact world revision returned by the immediately preceding observer_instances inventory."
         ),
         performancePolicy: z.enum(["evidence", "instrumented"]).default("evidence"),
       },

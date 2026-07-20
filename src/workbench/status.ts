@@ -36,8 +36,8 @@ export function requireEditMode(client: WorkbenchClient, toolAction: string): st
 export function requirePlayMode(client: WorkbenchClient, toolAction: string): string | null {
   if (client.state.mode === "edit") {
     return (
-      `Cannot ${toolAction} while in edit mode. Enter Play mode manually in Workbench because ` +
-      `automated \`wb_play\` is disabled, then call \`wb_state\` to confirm Play mode.`
+      `Cannot ${toolAction} while in edit mode. No automated Play tool exists; enter Play mode ` +
+      `manually in Workbench, then call \`wb_state\` to confirm Play mode.`
     );
   }
   if (client.state.mode === "unknown") {

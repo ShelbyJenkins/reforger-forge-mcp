@@ -17,6 +17,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Config } from "../../src/config.js";
+import { ChildSupervisor } from "../../src/foundation/child-supervisor.js";
 import {
   WORKBENCH_HELPER_ADDON_GUID,
   WORKBENCH_HELPER_ADDON_ID,
@@ -32,7 +33,10 @@ import {
   runWorkbenchIntent,
   type WorkbenchRunnerDependencies,
 } from "../../src/workbench/runner.js";
-import { FakeLifecycleBackend } from "./fake-lifecycle-backend.js";
+import {
+  createFakeLifecycleBackend,
+  type FakeLifecycleBackend,
+} from "./fake-lifecycle-backend.js";
 
 const roots: string[] = [];
 
@@ -47,6 +51,7 @@ class FakeRunnerChild extends EventEmitter {
   close(code: number | null, signal: NodeJS.Signals | null = null): void {
     this.exitCode = code;
     this.signalCode = signal;
+    this.emit("exit", code, signal);
     this.emit("close", code, signal);
   }
 
@@ -103,13 +108,12 @@ function createHarness(): RunnerHarness {
     gamePath: join(root, "Arma Reforger"),
     workbenchAddonDirs: [addonRoot, addonRoot],
     workbenchScriptAuthorizeAll: true,
-    workbenchNoThrow: true,
     dataDir: join(root, "data"),
     patternsDir: join(root, "patterns"),
     workbenchHost: "127.0.0.1",
     workbenchPort: 5775,
   };
-  const backend = new FakeLifecycleBackend();
+  const backend = createFakeLifecycleBackend();
   const guard = new WorkbenchProcessGuard({
     backend,
     stateDir: join(root, "state"),
@@ -162,6 +166,7 @@ function runnerDependencies(
   return {
     processGuard: harness.guard,
     companionProvider: harness.companionProvider,
+    managedRoot: join(harness.root, "managed"),
     logRoot: harness.logRoot,
     spawnProcess,
     endpointProbeTimeoutMs: 20,
@@ -187,6 +192,8 @@ function createBuildSpawner(
   harness: RunnerHarness,
   options: {
     logRoot?: string;
+    preflightLogRoot?: string;
+    buildLogRoot?: string;
     buildExitCode?: number;
     onSpawn?: (index: number, args: readonly string[]) => void;
     onBuildBeforeExit?: (args: readonly string[]) => void;
@@ -211,7 +218,9 @@ function createBuildSpawner(
         creationTime: `1339000000000${String(child.pid).padStart(5, "0")}`,
       }, ownerArgument);
       addAttributedLog(
-        options.logRoot ?? harness.logRoot,
+        index === 0
+          ? options.preflightLogRoot ?? options.logRoot ?? harness.logRoot
+          : options.buildLogRoot ?? options.logRoot ?? harness.logRoot,
         index === 0 ? `preflight-${pidBase}` : `build-${pidBase}`,
         ownerArgument
       );
@@ -237,6 +246,7 @@ afterEach(() => {
 describe("standalone Workbench lifecycle runner", () => {
   it("runs a visible foreground editor under exact ownership and returns a bounded receipt", async () => {
     const harness = createHarness();
+    const childSupervisor = new ChildSupervisor();
     let observedArgs: readonly string[] = [];
     let observedOptions: SpawnOptions | undefined;
     const dependencies = runnerDependencies(harness, (command, args, options) => {
@@ -258,7 +268,7 @@ describe("standalone Workbench lifecycle runner", () => {
         child.close(0);
       }, 5);
       return child as unknown as ChildProcess;
-    });
+    }, { childSupervisor });
 
     const receipt = await runWorkbenchIntent(harness.config, {
       kind: "editor",
@@ -311,6 +321,7 @@ describe("standalone Workbench lifecycle runner", () => {
       exitStatus: { reason: "exited", exitCode: 0, signal: null, timedOut: false },
     });
     expect(JSON.stringify(receipt)).not.toContain("reforgerForgeOwnerToken");
+    expect(childSupervisor.counts()).toEqual({ active: 0, reconciling: 0, total: 0 });
     expect(await harness.guard.readLifecycleState()).toMatchObject({
       kind: "valid",
       state: {
@@ -550,7 +561,7 @@ describe("standalone Workbench lifecycle runner", () => {
       executablePath: harness.executablePath,
       creationTime: "133900000000021004",
     });
-    expect(harness.backend.endpointVacancyCalls).toHaveLength(5);
+    expect(harness.backend.endpointVacancyCalls).toHaveLength(6);
 
     const [preflightArgs, buildArgs] = observedArguments;
     const preflightOwner = preflightArgs.findIndex((arg) => arg.startsWith("-reforgerForgeOwnerToken="));
@@ -583,6 +594,13 @@ describe("standalone Workbench lifecycle runner", () => {
       harness.addonRoot,
       join(harness.root, "addons"),
     ]);
+    expect(buildArgs.slice(buildArgs.indexOf("-profile"), buildArgs.indexOf("-profile") + 2))
+      .toEqual([
+        "-profile",
+        join(harness.root, "managed", "workbench-build", "profile"),
+      ]);
+    expect(buildArgs).not.toContain(harness.companion.addonSearchRoot);
+    expect(buildArgs).not.toContain(harness.companion.workbenchProfilePath);
     expect(buildArgs.slice(buildArgs.indexOf("-builddata"), buildArgs.indexOf("-builddata") + 4))
       .toEqual(["-builddata", "PC", harness.outputPath, "ExampleMod"]);
   });
@@ -631,6 +649,18 @@ describe("standalone Workbench lifecycle runner", () => {
 
   it("runs companion preflight and a distinct exact target build with fresh output proof", async () => {
     const harness = createHarness();
+    const childSupervisor = new ChildSupervisor();
+    const journalPhases: string[] = [];
+    const replaceState = harness.backend.replaceState.bind(harness.backend);
+    harness.backend.replaceState = vi.fn(async (replacement) => {
+      const journal = replacement.next as unknown as {
+        record?: { phase?: string; metadata?: { purpose?: string } };
+      };
+      if (journal.record?.phase && journal.record.metadata?.purpose) {
+        journalPhases.push(`${journal.record.metadata.purpose}:${journal.record.phase}`);
+      }
+      await replaceState(replacement);
+    });
     const reattestationAbsence: boolean[] = [];
     harness.companionProvider.verifyStaged = vi.fn(() => {
       reattestationAbsence.push(harness.backend.workbenchPids.size === 0);
@@ -670,7 +700,7 @@ describe("standalone Workbench lifecycle runner", () => {
         }, 5);
       }
       return child as unknown as ChildProcess;
-    }));
+    }, { childSupervisor }));
 
     expect(spawnIndex).toBe(2);
     expect(receipt).toMatchObject({
@@ -707,9 +737,75 @@ describe("standalone Workbench lifecycle runner", () => {
       exitStatus: { reason: "exited", exitCode: 0, timedOut: false },
     });
     expect(receipt.output?.freshBytes).toBeGreaterThan(0);
-    expect(harness.backend.endpointVacancyCalls).toHaveLength(5);
+    expect(journalPhases).toEqual([
+      "runner_companion_preflight:pre_spawn",
+      "runner_companion_preflight:spawned_unverified",
+      "runner_companion_preflight:identity_verified",
+      "runner_companion_preflight:published",
+      "target_build:pre_spawn",
+      "target_build:spawned_unverified",
+      "target_build:identity_verified",
+      "target_build:published",
+    ]);
+    expect(harness.backend.endpointVacancyCalls).toHaveLength(6);
     expect(reattestationAbsence.at(-1)).toBe(true);
     expect(JSON.stringify(receipt)).not.toContain("reforgerForgeOwnerToken");
+    expect(childSupervisor.counts()).toEqual({ active: 0, reconciling: 0, total: 0 });
+    expect(await harness.guard.readLifecycleState()).toMatchObject({
+      kind: "valid",
+      state: { phase: "vacant", workbench: null, operation: null },
+    });
+  });
+
+  it("waits through one occupied socket-release probe after each build phase", async () => {
+    const harness = createHarness();
+    const laggedPhases = new Set<"preflight" | "target">();
+    const spawner = createBuildSpawner(harness, {
+      pidBase: 21_040,
+      onBuildBeforeExit: () => {
+        const artifactRoot = join(harness.outputPath, "ExampleMod");
+        mkdirSync(artifactRoot, { recursive: true });
+        writeFileSync(join(artifactRoot, "resourceDatabase.rdb"), "fresh database");
+      },
+    });
+    const verifyEndpointVacant = harness.backend.verifyEndpointVacant.bind(harness.backend);
+    harness.backend.verifyEndpointVacant = vi.fn(async (endpoint) => {
+      const result = await verifyEndpointVacant(endpoint);
+      const phase = spawner.spawnCount() === 1
+        ? "preflight" as const
+        : spawner.spawnCount() === 2
+          ? "target" as const
+          : null;
+      if (result.kind === "vacant" && phase && !laggedPhases.has(phase) &&
+          harness.backend.workbenchPids.size === 0) {
+        laggedPhases.add(phase);
+        return {
+          kind: "occupied" as const,
+          listenerPid: phase === "preflight" ? 21_040 : 21_041,
+          message: "socket release lags exact process absence by one probe",
+        };
+      }
+      return result;
+    });
+
+    const receipt = await runWorkbenchIntent(harness.config, {
+      kind: "build",
+      gprojPath: harness.projectPath,
+      platform: "PC",
+      outputPath: harness.outputPath,
+      timeoutMs: 1_000,
+    }, runnerDependencies(harness, spawner.spawnProcess));
+
+    expect(laggedPhases).toEqual(new Set(["preflight", "target"]));
+    expect(harness.backend.endpointVacancyCalls).toHaveLength(8);
+    expect(receipt).toMatchObject({
+      version: 3,
+      intent: "build",
+      output: {
+        resourceDatabasePath: join(harness.outputPath, "ExampleMod", "resourceDatabase.rdb"),
+      },
+      endpointVacancy: "verified",
+    });
     expect(await harness.guard.readLifecycleState()).toMatchObject({
       kind: "valid",
       state: { phase: "vacant", workbench: null, operation: null },
@@ -873,7 +969,7 @@ describe("standalone Workbench lifecycle runner", () => {
       code: "BUILD_DEADLINE_EXCEEDED",
     });
 
-    expect(spawner.spawnCount()).toBe(1);
+    expect(spawner.spawnCount()).toBe(0);
   });
 
   it("does not spawn preflight when the build is already aborted", async () => {
@@ -1001,6 +1097,36 @@ describe("standalone Workbench lifecycle runner", () => {
     });
   });
 
+  it("revalidates output after the final endpoint check and before target spawn", async () => {
+    const harness = createHarness();
+    const originalVacancy = harness.backend.verifyEndpointVacant.bind(harness.backend);
+    let vacancyIndex = 0;
+    harness.backend.verifyEndpointVacant = vi.fn(async (endpoint) => {
+      const result = await originalVacancy(endpoint);
+      if (vacancyIndex++ === 3) {
+        writeFileSync(join(harness.outputPath, "raced-during-final-endpoint-check.txt"), "occupied");
+      }
+      return result;
+    });
+    const spawner = createBuildSpawner(harness, { pidBase: 22_045 });
+
+    await expect(runWorkbenchIntent(harness.config, {
+      kind: "build",
+      gprojPath: harness.projectPath,
+      platform: "PC",
+      outputPath: harness.outputPath,
+      timeoutMs: 1_000,
+    }, runnerDependencies(harness, spawner.spawnProcess))).rejects.toMatchObject({
+      code: "OUTPUT_ATTESTATION_FAILED",
+    });
+
+    expect(spawner.spawnCount()).toBe(1);
+    expect(await harness.guard.readLifecycleState()).toMatchObject({
+      kind: "valid",
+      state: { phase: "vacant", workbench: null, operation: null },
+    });
+  });
+
   it("reserves a shared empty output immediately after the mutex and blocks loser preflight", async () => {
     const harness = createHarness();
     let spawnCount = 0;
@@ -1041,6 +1167,15 @@ describe("standalone Workbench lifecycle runner", () => {
     };
     const first = runWorkbenchIntent(harness.config, intent, runnerDependencies(harness, spawnProcess));
     await targetDidSpawn;
+    for (;;) {
+      const journal = await harness.guard.readSpawnJournal();
+      if (journal.kind === "valid" &&
+          journal.record.metadata.purpose === "target_build" &&
+          (journal.record.phase === "identity_verified" || journal.record.phase === "published")) {
+        break;
+      }
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 1));
+    }
     const second = runWorkbenchIntent(harness.config, intent, runnerDependencies(harness, spawnProcess));
 
     await expect(second).rejects.toMatchObject({ code: "LIFECYCLE_CONFLICT" });
@@ -1159,12 +1294,20 @@ describe("standalone Workbench lifecycle runner", () => {
     expect(JSON.stringify(receipt)).toContain("[redacted]");
   });
 
-  it("attributes both build phases under the managed companion profile log root by default", async () => {
+  it("attributes preflight and target build under their dedicated managed log roots", async () => {
     const harness = createHarness();
-    const managedLogRoot = join(harness.companion.workbenchProfilePath, "logs");
+    const preflightLogRoot = join(harness.companion.workbenchProfilePath, "logs");
+    const buildLogRoot = join(
+      harness.root,
+      "managed",
+      "workbench-build",
+      "profile",
+      "logs"
+    );
     const spawner = createBuildSpawner(harness, {
       pidBase: 22_700,
-      logRoot: managedLogRoot,
+      preflightLogRoot,
+      buildLogRoot,
       onBuildBeforeExit: () => {
         const artifactRoot = join(harness.outputPath, "ExampleMod");
         mkdirSync(artifactRoot, { recursive: true });
@@ -1182,8 +1325,8 @@ describe("standalone Workbench lifecycle runner", () => {
 
     expect(receipt).toMatchObject({
       version: 3,
-      preflight: { logDirectory: join(managedLogRoot, "preflight-22700") },
-      logDirectory: join(managedLogRoot, "build-22700"),
+      preflight: { logDirectory: join(preflightLogRoot, "preflight-22700") },
+      logDirectory: join(buildLogRoot, "build-22700"),
       validationFailure: null,
     });
     expect(receipt.intent === "build" && receipt.output).not.toBeNull();
@@ -1271,7 +1414,7 @@ describe("standalone Workbench lifecycle runner", () => {
       gprojPath: harness.projectPath,
       platform: "PC",
       outputPath: harness.outputPath,
-      timeoutMs: 100,
+      timeoutMs: 1_000,
     }, runnerDependencies(harness, (command, args) => {
       const current = spawnIndex++;
       const child = new FakeRunnerChild(current === 0 ? 21_005 : 21_015);
@@ -1330,13 +1473,18 @@ describe("standalone Workbench lifecycle runner", () => {
     const harness = createHarness();
     let spawnIndex = 0;
     let targetPid = 0;
-    const startedAt = Date.now();
+    let recoveryStartedAt = 0;
+    harness.backend.beforeTerminate = () => {
+      if (targetPid !== 0 && recoveryStartedAt === 0) {
+        recoveryStartedAt = Date.now();
+      }
+    };
     const run = runWorkbenchIntent(harness.config, {
       kind: "build",
       gprojPath: harness.projectPath,
       platform: "PC",
       outputPath: harness.outputPath,
-      timeoutMs: 100,
+      timeoutMs: 1_000,
     }, runnerDependencies(harness, (command, args) => {
       const current = spawnIndex++;
       const child = new FakeRunnerChild(current === 0 ? 21_105 : 21_115);
@@ -1373,7 +1521,7 @@ describe("standalone Workbench lifecycle runner", () => {
       },
     });
     await expect(run).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
-    expect(Date.now() - startedAt).toBeLessThan(500);
+    expect(Date.now() - recoveryStartedAt).toBeLessThan(500);
     expect(await harness.guard.readLifecycleState()).toMatchObject(observedDuringRecovery);
   });
 

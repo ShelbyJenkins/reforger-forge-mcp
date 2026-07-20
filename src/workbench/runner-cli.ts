@@ -1,6 +1,9 @@
 #!/usr/bin/env node
 
 import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
+import { pathToFileURL } from "node:url";
+import type { Config } from "../config.js";
 import { loadConfig } from "../config.js";
 import {
   parseWorkbenchRunnerArguments,
@@ -8,14 +11,14 @@ import {
   type WorkbenchRunnerReceipt,
 } from "./runner.js";
 
-function redactPrivateOwnerTokens(message: string): string {
+export function redactPrivateOwnerTokens(message: string): string {
   return message.replace(
     /-reforgerForgeOwnerToken(?:=|\s+)[^\s"']+/gi,
     "-reforgerForgeOwnerToken=[redacted]"
   );
 }
 
-function receiptExitCode(receipt: WorkbenchRunnerReceipt): number {
+export function receiptExitCode(receipt: WorkbenchRunnerReceipt): number {
   if (receipt.intent === "build" && receipt.validationFailure) return 1;
   if (receipt.exitStatus.reason === "timed_out") return 124;
   if (receipt.exitStatus.reason === "aborted") return 130;
@@ -25,7 +28,7 @@ function receiptExitCode(receipt: WorkbenchRunnerReceipt): number {
     : 1;
 }
 
-function installedPackageVersion(): string {
+export function installedPackageVersion(): string {
   const manifest = JSON.parse(
     readFileSync(new URL("../../package.json", import.meta.url), "utf8")
   ) as { version?: unknown };
@@ -35,35 +38,74 @@ function installedPackageVersion(): string {
   return manifest.version;
 }
 
-const cliArguments = process.argv.slice(2);
-if (cliArguments.length === 1 && cliArguments[0] === "--version") {
-  process.stdout.write(`${installedPackageVersion()}\n`);
-} else {
+interface WorkbenchRunnerCliOutput {
+  write(value: string): unknown;
+}
+
+export interface WorkbenchRunnerCliDependencies {
+  readonly loadConfiguration?: () => Config;
+  readonly runIntent?: typeof runWorkbenchIntent;
+  readonly packageVersion?: () => string;
+  readonly stdout?: WorkbenchRunnerCliOutput;
+  readonly stderr?: WorkbenchRunnerCliOutput;
+  readonly signal?: AbortSignal;
+}
+
+/**
+ * Execute one CLI request and emit exactly one stdout receipt or one stderr
+ * error record. Process signal wiring and `process.exitCode` remain in `main`.
+ */
+export async function executeWorkbenchRunnerCli(
+  cliArguments: readonly string[],
+  dependencies: WorkbenchRunnerCliDependencies = {}
+): Promise<number> {
+  const stdout = dependencies.stdout ?? { write: (value: string) => process.stdout.write(value) };
+  const stderr = dependencies.stderr ?? { write: (value: string) => process.stderr.write(value) };
+  if (cliArguments.length === 1 && cliArguments[0] === "--version") {
+    stdout.write(`${(dependencies.packageVersion ?? installedPackageVersion)()}\n`);
+    return 0;
+  }
+
+  try {
+    const intent = parseWorkbenchRunnerArguments(cliArguments);
+    const receipt = await (dependencies.runIntent ?? runWorkbenchIntent)(
+      (dependencies.loadConfiguration ?? loadConfig)(),
+      intent,
+      dependencies.signal ? { signal: dependencies.signal } : {}
+    );
+    stdout.write(`${JSON.stringify(receipt)}\n`);
+    return receiptExitCode(receipt);
+  } catch (error) {
+    const record = error && typeof error === "object" ? error as { code?: unknown } : null;
+    const message = redactPrivateOwnerTokens(
+      error instanceof Error ? error.message : String(error)
+    );
+    stderr.write(`${JSON.stringify({
+      ok: false,
+      code: typeof record?.code === "string" ? record.code : "RUNNER_FAILED",
+      message,
+    })}\n`);
+    return dependencies.signal?.aborted ? 130 : 1;
+  }
+}
+
+async function main(): Promise<void> {
   const abortController = new AbortController();
   const requestAbort = (): void => abortController.abort();
   process.on("SIGINT", requestAbort);
   process.on("SIGTERM", requestAbort);
 
   try {
-    const intent = parseWorkbenchRunnerArguments(cliArguments);
-    const receipt = await runWorkbenchIntent(loadConfig(), intent, {
+    process.exitCode = await executeWorkbenchRunnerCli(process.argv.slice(2), {
       signal: abortController.signal,
     });
-    process.stdout.write(`${JSON.stringify(receipt)}\n`);
-    process.exitCode = receiptExitCode(receipt);
-  } catch (error) {
-    const record = error && typeof error === "object" ? error as { code?: unknown } : null;
-    const message = redactPrivateOwnerTokens(
-      error instanceof Error ? error.message : String(error)
-    );
-    process.stderr.write(`${JSON.stringify({
-      ok: false,
-      code: typeof record?.code === "string" ? record.code : "RUNNER_FAILED",
-      message,
-    })}\n`);
-    process.exitCode = abortController.signal.aborted ? 130 : 1;
   } finally {
     process.off("SIGINT", requestAbort);
     process.off("SIGTERM", requestAbort);
   }
 }
+
+const invokedPath = process.argv[1]
+  ? pathToFileURL(resolve(process.argv[1])).href
+  : "";
+if (invokedPath === import.meta.url) void main();

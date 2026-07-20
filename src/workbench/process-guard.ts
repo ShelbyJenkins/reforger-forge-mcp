@@ -1,28 +1,47 @@
-import { createHash, randomUUID } from "node:crypto";
-import { spawn } from "node:child_process";
-import type { ChildProcessWithoutNullStreams } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { existsSync, mkdirSync } from "node:fs";
 import { homedir, platform } from "node:os";
 import { isIP } from "node:net";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import type {
+  ExactProcessBackend,
+  ExactProcessInspection,
+  ExactProcessTerminationResult,
+} from "../foundation/exact-process-backend.js";
+import type { ExactProcessIdentity } from "../foundation/identity.js";
+import type {
+  MachineMutex,
+  MachineMutexLeaseLoss,
+} from "../foundation/machine-mutex.js";
+import {
+  HelperMediatedJsonCasBackend,
+  JsonCasStore,
+  type JsonCasInspection,
+} from "../foundation/json-store.js";
+import type {
+  RecoverableSpawnJournal,
+  RecoverableSpawnRecord,
+} from "../foundation/recoverable-spawn.js";
+import {
+  WindowsExactProcessBackend,
+  parseWindowsExactProcessIdentity,
+  type WindowsExactProcessBackendFailureCode,
+  type WindowsHelperResponse,
+} from "../platform/windows/exact-process-backend.js";
+
+export type { ExactProcessIdentity } from "../foundation/identity.js";
 
 export const WORKBENCH_PROCESS_NAME = "ArmaReforgerWorkbenchSteamDiag.exe";
 export const WORKBENCH_OWNER_ARG_PREFIX = "-reforgerForgeOwnerToken=";
 export const DEFAULT_LIFECYCLE_MUTEX = "Global\\ReforgerForge.WorkbenchLifecycle.v3";
 
 const DEFAULT_LOCK_TIMEOUT_MS = 15_000;
-const HELPER_TIMEOUT_MS = 20_000;
 const PROCESS_CAPTURE_TIMEOUT_MS = 5_000;
 const PROCESS_POLL_MS = 100;
 const LIFECYCLE_VERSION = 3;
-
-export interface ExactProcessIdentity {
-  pid: number;
-  executablePath: string;
-  /** Exact decimal Windows FILETIME captured from an opened process handle. */
-  creationTime: string;
-}
+const MAX_LIFECYCLE_STATE_BYTES = 1024 * 1024;
+const MAX_SPAWN_JOURNAL_BYTES = 256 * 1024;
 
 export interface McpOwnerIdentity extends ExactProcessIdentity {
   instanceId: string;
@@ -85,6 +104,50 @@ export interface WorkbenchLifecycleStateV3 {
   operation: { kind: LifecycleOperationKind; operationId: string } | null;
 }
 
+export type WorkbenchPlanSpawnPurpose =
+  | "mcp_editor"
+  | "cli_editor"
+  | "target_build";
+
+/**
+ * @deprecated Remove in Stage 6 after version-3 spawn journals and the
+ * temporary public build preflight reach their compatibility boundary.
+ *
+ * Deprecated version-3 journal compatibility. The temporary public V3 build
+ * preflight may still write `runner_companion_preflight` until its controlled
+ * live-evidence gate passes; all other new launches use plan-shaped purposes.
+ */
+export type LegacyWorkbenchSpawnPurpose =
+  | "client_launch"
+  | "client_restart"
+  | "runner_editor"
+  | "runner_companion_preflight"
+  | "runner_target_build";
+
+export type WorkbenchSpawnPurpose = WorkbenchPlanSpawnPurpose | LegacyWorkbenchSpawnPurpose;
+
+export interface WorkbenchSpawnMetadata {
+  purpose: WorkbenchSpawnPurpose;
+  lifecycleGeneration: string;
+  targetKey: string;
+}
+
+export type WorkbenchSpawnRecord = RecoverableSpawnRecord<
+  WorkbenchIdentity,
+  WorkbenchSpawnMetadata
+>;
+
+interface WorkbenchSpawnJournalStateV3 {
+  version: 3;
+  generation: string;
+  record: WorkbenchSpawnRecord;
+}
+
+export type WorkbenchSpawnJournalRead =
+  | { kind: "missing" }
+  | { kind: "valid"; generation: string; record: WorkbenchSpawnRecord }
+  | { kind: "malformed"; path: string; rawSha256: string; message: string };
+
 export type LifecycleStateDraft = Omit<WorkbenchLifecycleStateV3, "version" | "generation">;
 
 export type LifecycleStateRead =
@@ -118,26 +181,9 @@ export type LifecycleClaimResult =
       state?: WorkbenchLifecycleStateV3;
     };
 
-export type VerifyTerminateResult =
-  | { kind: "terminated" | "already_exited" }
-  | {
-      kind: "refused";
-      reason:
-        | "access_denied"
-        | "pid_reused"
-        | "executable_mismatch"
-        | "creation_time_mismatch"
-        | "command_line_unverifiable"
-        | "token_mismatch"
-        | "timeout"
-        | "helper_failure";
-      message: string;
-    };
+export type VerifyTerminateResult = ExactProcessTerminationResult;
 
-export interface ProcessInspection {
-  identity: ExactProcessIdentity;
-  ownerArgumentMatched: boolean | null;
-}
+export type ProcessInspection = ExactProcessInspection;
 
 export interface WorkbenchProcessScan {
   processes: ExactProcessIdentity[];
@@ -175,23 +221,13 @@ export type VerifyEndpointVacantResult =
       message: string;
     };
 
-export interface WorkbenchLifecycleBackend {
-  readonly platform: "win32" | "test";
-  withMachineMutex<T>(args: {
-    name: string;
-    timeoutMs: number;
-    action: () => Promise<T>;
-    onLeaseLost?: (error: LifecycleGuardError) => void;
-  }): Promise<T>;
-  inspectCurrentProcess(pid: number): Promise<ExactProcessIdentity & { userSid: string }>;
-  inspectProcess(pid: number, expectedOwnerTokenArgument?: string): Promise<ProcessInspection | null>;
+export interface WorkbenchLifecycleBackend extends ExactProcessBackend, MachineMutex {
   scanWorkbenchProcesses(): Promise<WorkbenchProcessScan>;
   verifyEndpointOwner(
     endpoint: LifecycleEndpoint,
     expected: WorkbenchIdentity
   ): Promise<VerifyEndpointOwnerResult>;
   verifyEndpointVacant(endpoint: LifecycleEndpoint): Promise<VerifyEndpointVacantResult>;
-  verifyAndTerminate(expected: WorkbenchIdentity, timeoutMs: number): Promise<VerifyTerminateResult>;
   replaceState(args: {
     path: string;
     expectedGeneration: string | null;
@@ -231,7 +267,6 @@ export interface WorkbenchLifecycleSession {
   validateAndClaim(args: {
     endpoint: LifecycleEndpoint;
     target?: CanonicalProjectIdentity | null;
-    operation?: { kind: LifecycleOperationKind; operationId: string } | null;
   }): Promise<LifecycleClaimResult>;
   transition(
     expected: ExpectedStateVersion,
@@ -254,18 +289,6 @@ export interface WorkbenchLifecycleSession {
   verifyEndpointVacant(endpoint: LifecycleEndpoint): Promise<VerifyEndpointVacantResult>;
   verifyAndTerminate(expected: WorkbenchIdentity, timeoutMs: number): Promise<VerifyTerminateResult>;
   assertNoWorkbenchProcesses(): Promise<void>;
-}
-
-interface HelperResponse {
-  ok?: boolean;
-  status?: string;
-  reason?: string;
-  message?: string;
-  identity?: unknown;
-  ownerArgumentMatched?: unknown;
-  processes?: unknown;
-  unverifiable?: unknown;
-  listenerPid?: unknown;
 }
 
 function sleep(ms: number): Promise<void> {
@@ -296,37 +319,14 @@ export function isLoopbackLifecycleHost(host: string): boolean {
   return false;
 }
 
-function isPositiveFileTime(value: unknown): value is string {
-  if (typeof value !== "string" || !/^[0-9]+$/.test(value)) return false;
-  try {
-    return BigInt(value) > 0n;
-  } catch {
-    return false;
-  }
-}
-
 function parseExactIdentity(value: unknown): ExactProcessIdentity | null {
-  if (!value || typeof value !== "object") return null;
-  const record = value as Record<string, unknown>;
-  const pid = Number(record.pid);
-  if (!Number.isInteger(pid) || pid <= 0 ||
-      typeof record.executablePath !== "string" || record.executablePath.trim().length === 0 ||
-      !isPositiveFileTime(record.creationTime)) return null;
-  return {
-    pid,
-    executablePath: resolve(record.executablePath),
-    creationTime: record.creationTime,
-  };
+  return parseWindowsExactProcessIdentity(value);
 }
 
 function processMatches(left: ExactProcessIdentity, right: ExactProcessIdentity): boolean {
   return left.pid === right.pid &&
     normalizedPath(left.executablePath) === normalizedPath(right.executablePath) &&
     left.creationTime === right.creationTime;
-}
-
-function sha256(buffer: Buffer): string {
-  return createHash("sha256").update(buffer).digest("hex");
 }
 
 function parseJsonText(text: string): unknown {
@@ -411,6 +411,66 @@ function parseLifecycleState(value: unknown): WorkbenchLifecycleStateV3 | null {
   };
 }
 
+function isWorkbenchSpawnMetadata(value: unknown): value is WorkbenchSpawnMetadata {
+  if (!value || typeof value !== "object") return false;
+  const metadata = value as Partial<WorkbenchSpawnMetadata>;
+  return [
+    "mcp_editor",
+    "cli_editor",
+    "target_build",
+    "client_launch",
+    "client_restart",
+    "runner_editor",
+    "runner_companion_preflight",
+    "runner_target_build",
+  ].includes(String(metadata.purpose)) &&
+    isString(metadata.lifecycleGeneration) &&
+    isString(metadata.targetKey);
+}
+
+function parseWorkbenchSpawnRecord(value: unknown): WorkbenchSpawnRecord | null {
+  if (!value || typeof value !== "object") return null;
+  const record = value as Partial<WorkbenchSpawnRecord>;
+  if (!isString(record.transactionId) ||
+      !["pre_spawn", "spawned_unverified", "identity_verified", "published"].includes(
+        String(record.phase)
+      ) ||
+      typeof record.createdAtMs !== "number" || !Number.isFinite(record.createdAtMs) ||
+      typeof record.updatedAtMs !== "number" || !Number.isFinite(record.updatedAtMs) ||
+      !isWorkbenchSpawnMetadata(record.metadata)) return null;
+  const pid = record.pid;
+  if (pid !== null && (typeof pid !== "number" || !Number.isSafeInteger(pid) || pid <= 0)) {
+    return null;
+  }
+  const identity = record.identity;
+  if (identity !== null && !isWorkbenchIdentity(identity)) return null;
+  if (record.phase === "pre_spawn" && (pid !== null || identity !== null)) return null;
+  if (record.phase === "spawned_unverified" && (pid === null || identity !== null)) return null;
+  if ((record.phase === "identity_verified" || record.phase === "published") &&
+      (!identity || pid !== identity.pid)) return null;
+  return {
+    transactionId: record.transactionId,
+    phase: record.phase,
+    pid,
+    identity,
+    createdAtMs: record.createdAtMs!,
+    updatedAtMs: record.updatedAtMs!,
+    metadata: record.metadata,
+  } as WorkbenchSpawnRecord;
+}
+
+function parseWorkbenchSpawnJournalState(value: unknown): WorkbenchSpawnJournalStateV3 {
+  if (!value || typeof value !== "object") {
+    throw new TypeError("Workbench spawn journal must be an object.");
+  }
+  const state = value as Partial<WorkbenchSpawnJournalStateV3>;
+  const record = parseWorkbenchSpawnRecord(state.record);
+  if (state.version !== LIFECYCLE_VERSION || !isString(state.generation) || !record) {
+    throw new TypeError("Workbench spawn journal does not satisfy the strict version-3 schema.");
+  }
+  return { version: 3, generation: state.generation, record };
+}
+
 function defaultStateDir(): string {
   const local = process.env.LOCALAPPDATA;
   return local && local.trim().length > 0
@@ -428,343 +488,22 @@ export interface WindowsLifecycleBackendOptions {
   leaseLossFailStop?: (error: LifecycleGuardError) => never;
 }
 
-export class WindowsLifecycleBackend implements WorkbenchLifecycleBackend {
-  readonly platform = "win32" as const;
-  private readonly helperTimeoutMs: number;
-  private readonly leaseLossFailStop: (error: LifecycleGuardError) => never;
-
+export class WindowsLifecycleBackend extends WindowsExactProcessBackend
+  implements WorkbenchLifecycleBackend {
   constructor(
-    private readonly helperPath: string,
+    helperPath: string,
     options: WindowsLifecycleBackendOptions = {}
   ) {
-    this.helperTimeoutMs = options.helperTimeoutMs ?? HELPER_TIMEOUT_MS;
-    this.leaseLossFailStop = options.leaseLossFailStop ?? (() => process.abort());
-    if (!Number.isInteger(this.helperTimeoutMs) || this.helperTimeoutMs <= 0) {
-      throw new LifecycleGuardError("Windows lifecycle helper timeout must be positive.", "STATE_INVALID");
-    }
-  }
-
-  private assertSupported(): void {
-    if (platform() !== "win32") {
-      throw new LifecycleGuardError(
-        "Automated Workbench lifecycle control is supported only on Windows.",
-        "UNSUPPORTED_PLATFORM"
-      );
-    }
-    if (!existsSync(this.helperPath)) {
-      throw new LifecycleGuardError(
-        `Bundled Windows lifecycle helper is missing: ${this.helperPath}`,
-        "HELPER_FAILURE"
-      );
-    }
-  }
-
-  private powershellArgs(mode: string, deadlineUnixMs: number): string[] {
-    return [
-      "-NoProfile",
-      "-NonInteractive",
-      "-ExecutionPolicy",
-      "Bypass",
-      "-File",
-      this.helperPath,
-      "-Mode",
-      mode,
-      "-DeadlineUnixMs",
-      String(deadlineUnixMs),
-    ];
-  }
-
-  private async waitForMutexHelperExit(
-    child: ChildProcessWithoutNullStreams,
-    closePromise: Promise<number | null>,
-    context: string,
-    killImmediately: boolean,
-    outcomeUncertain = false
-  ): Promise<void> {
-    if (killImmediately) child.kill();
-    let timer: NodeJS.Timeout | undefined;
-    await Promise.race([
-      closePromise.then(() => undefined),
-      new Promise<never>((_resolve, reject) => {
-        timer = setTimeout(() => {
-          child.kill();
-          reject(new LifecycleGuardError(
-            `${context}; the mutex helper did not exit within ${this.helperTimeoutMs}ms. ` +
-              "Durable lifecycle state was preserved for recovery.",
-            outcomeUncertain ? "RECOVERY_REQUIRED" : "HELPER_FAILURE"
-          ));
-        }, this.helperTimeoutMs);
-        timer.unref();
-      }),
-    ]).finally(() => {
-      if (timer) clearTimeout(timer);
+    super(helperPath, {
+      helperTimeoutMs: options.helperTimeoutMs,
+      errorFactory: (message, code) => new LifecycleGuardError(
+        message,
+        code as WindowsExactProcessBackendFailureCode
+      ) as LifecycleGuardError & { readonly code: WindowsExactProcessBackendFailureCode },
+      leaseLossFailStop: options.leaseLossFailStop
+        ? (error) => options.leaseLossFailStop!(error as LifecycleGuardError)
+        : undefined,
     });
-  }
-
-  private async invoke(
-    mode: string,
-    request: unknown,
-    timeoutMs = this.helperTimeoutMs,
-    mutationOutcomeUncertainOnTimeout = false
-  ): Promise<HelperResponse> {
-    this.assertSupported();
-    if (!Number.isInteger(timeoutMs) || timeoutMs <= 0) {
-      throw new LifecycleGuardError("Windows lifecycle helper timeout must be positive.", "STATE_INVALID");
-    }
-    const deadlineUnixMs = Date.now() + timeoutMs;
-    return new Promise<HelperResponse>((resolvePromise, reject) => {
-      const child = spawn("powershell.exe", this.powershellArgs(mode, deadlineUnixMs), {
-        stdio: ["pipe", "pipe", "pipe"],
-        windowsHide: true,
-      }) as ChildProcessWithoutNullStreams;
-      let stdout = "";
-      let stderr = "";
-      let settled = false;
-      const timer = setTimeout(() => {
-        if (settled) return;
-        settled = true;
-        child.kill();
-        const message = `Windows lifecycle helper mode ${mode} exceeded its ${timeoutMs}ms deadline.`;
-        reject(new LifecycleGuardError(
-          mutationOutcomeUncertainOnTimeout
-            ? `${message} The mutation outcome is uncertain; durable lifecycle state was preserved for recovery.`
-            : message,
-          mutationOutcomeUncertainOnTimeout ? "RECOVERY_REQUIRED" : "HELPER_FAILURE"
-        ));
-      }, timeoutMs);
-      timer.unref();
-      child.stdout.setEncoding("utf8");
-      child.stderr.setEncoding("utf8");
-      child.stdin.on("error", () => undefined);
-      child.stdout.on("data", (chunk: string) => { stdout += chunk; });
-      child.stderr.on("data", (chunk: string) => { stderr += chunk; });
-      child.once("error", (error) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        reject(new LifecycleGuardError(
-          `Could not start Windows lifecycle helper: ${error.message}`,
-          "HELPER_FAILURE"
-        ));
-      });
-      child.once("close", (code) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        const lines = stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
-        if (lines.length === 0) {
-          reject(new LifecycleGuardError(
-            `Windows lifecycle helper mode ${mode} returned no private JSON response` +
-              `${stderr.trim() ? `: ${stderr.trim()}` : "."}`,
-            "HELPER_FAILURE"
-          ));
-          return;
-        }
-        try {
-          const response = parseJsonText(lines[lines.length - 1]) as HelperResponse;
-          if (code !== 0 && response.ok !== false) {
-            reject(new LifecycleGuardError(
-              `Windows lifecycle helper mode ${mode} exited with code ${code}.`,
-              "HELPER_FAILURE"
-            ));
-            return;
-          }
-          resolvePromise(response);
-        } catch (error) {
-          reject(new LifecycleGuardError(
-            `Windows lifecycle helper mode ${mode} returned invalid JSON: ` +
-              `${error instanceof Error ? error.message : String(error)}`,
-            "HELPER_FAILURE"
-          ));
-        }
-      });
-      child.stdin.end(`${JSON.stringify(request)}\n`);
-    });
-  }
-
-  async withMachineMutex<T>(args: {
-    name: string;
-    timeoutMs: number;
-    action: () => Promise<T>;
-    onLeaseLost?: (error: LifecycleGuardError) => void;
-  }): Promise<T> {
-    this.assertSupported();
-    const acquisitionBudgetMs = args.timeoutMs + this.helperTimeoutMs;
-    const child = spawn(
-      "powershell.exe",
-      this.powershellArgs("HoldMutex", Date.now() + acquisitionBudgetMs),
-      {
-      stdio: ["pipe", "pipe", "pipe"],
-      windowsHide: true,
-      }
-    ) as ChildProcessWithoutNullStreams;
-    child.stdout.setEncoding("utf8");
-    child.stderr.setEncoding("utf8");
-    child.stdin.on("error", () => undefined);
-    let stderr = "";
-    child.stderr.on("data", (chunk: string) => { stderr += chunk; });
-    const closePromise = new Promise<number | null>((resolveClose) =>
-      child.once("close", (code) => resolveClose(code))
-    );
-    const acquired = await new Promise<HelperResponse>((resolveAcquired, reject) => {
-      let buffer = "";
-      let settled = false;
-      const timer = setTimeout(() => {
-        if (settled) return;
-        settled = true;
-        cleanup();
-        const error = new LifecycleGuardError(
-          `Lifecycle mutex holder produced no acquisition response within ${acquisitionBudgetMs}ms.`,
-          "HELPER_FAILURE"
-        );
-        void this.waitForMutexHelperExit(
-          child,
-          closePromise,
-          "Lifecycle mutex acquisition timed out",
-          true
-        ).then(() => reject(error), reject);
-      }, acquisitionBudgetMs);
-      timer.unref();
-      const cleanup = (): void => {
-        clearTimeout(timer);
-        child.stdout.off("data", onData);
-        child.off("error", onError);
-        child.off("close", onClose);
-      };
-      const onError = (error: Error): void => {
-        if (settled) return;
-        settled = true;
-        cleanup();
-        reject(new LifecycleGuardError(
-          `Could not start the lifecycle mutex holder: ${error.message}`,
-          "HELPER_FAILURE"
-        ));
-      };
-      const onClose = (code: number | null): void => {
-        if (settled) return;
-        settled = true;
-        cleanup();
-        reject(new LifecycleGuardError(
-          `Lifecycle mutex holder exited before its acquisition response (code ${code})` +
-            `${stderr.trim() ? `: ${stderr.trim()}` : "."}`,
-          "HELPER_FAILURE"
-        ));
-      };
-      const onData = (chunk: string): void => {
-        buffer += chunk;
-        const newline = buffer.indexOf("\n");
-        if (newline < 0) return;
-        settled = true;
-        cleanup();
-        try {
-          resolveAcquired(parseJsonText(buffer.slice(0, newline).trim()) as HelperResponse);
-        } catch (error) {
-          const invalidResponse = new LifecycleGuardError(
-            `Lifecycle mutex holder returned invalid JSON: ${error instanceof Error ? error.message : String(error)}`,
-            "HELPER_FAILURE"
-          );
-          void this.waitForMutexHelperExit(
-            child,
-            closePromise,
-            "Lifecycle mutex holder returned invalid JSON",
-            true
-          ).then(() => reject(invalidResponse), reject);
-        }
-      };
-      child.once("error", onError);
-      child.once("close", onClose);
-      child.stdout.on("data", onData);
-      child.stdin.write(`${JSON.stringify({ mutexName: args.name, timeoutMs: args.timeoutMs })}\n`);
-    });
-    if (acquired.ok !== true || acquired.status !== "acquired") {
-      child.stdin.end();
-      await this.waitForMutexHelperExit(
-        child,
-        closePromise,
-        "Lifecycle mutex holder did not exit after refusing acquisition",
-        false
-      );
-      throw new LifecycleGuardError(
-        acquired.status === "timeout"
-          ? `Timed out waiting for the machine-wide Workbench lifecycle mutex ${args.name}.`
-          : `Lifecycle mutex acquisition failed: ${acquired.message ?? acquired.reason ?? stderr.trim()}`,
-        acquired.status === "timeout" ? "LIFECYCLE_BUSY" : "HELPER_FAILURE"
-      );
-    }
-
-    let released = false;
-    const holderFailure = closePromise.then((code) => {
-      if (!released) {
-        const error = new LifecycleGuardError(
-          `Lifecycle mutex holder exited unexpectedly with code ${code}; ` +
-            "the MCP must fail-stop before any unprotected lifecycle work can continue.",
-          "RECOVERY_REQUIRED"
-        );
-        // Promises cannot cancel the losing action in Promise.race. A
-        // cooperative fence is therefore insufficient: another process can
-        // acquire the released OS mutex while that callback keeps running.
-        // Terminate this process synchronously. The finally fallback protects
-        // production even if an invalid injected handler throws or returns.
-        try {
-          this.leaseLossFailStop(error);
-        } finally {
-          process.abort();
-        }
-      }
-      return new Promise<never>(() => undefined);
-    });
-    try {
-      return await Promise.race([args.action(), holderFailure]);
-    } finally {
-      released = true;
-      child.stdin.end("release\n");
-      await this.waitForMutexHelperExit(
-        child,
-        closePromise,
-        "Lifecycle mutex holder did not release",
-        false,
-        true
-      );
-    }
-  }
-
-  async inspectCurrentProcess(pid: number): Promise<ExactProcessIdentity & { userSid: string }> {
-    const response = await this.invoke("InspectCurrent", { pid });
-    const identity = parseExactIdentity(response.identity);
-    const userSid = response.identity && typeof response.identity === "object"
-      ? (response.identity as Record<string, unknown>).userSid
-      : null;
-    if (response.ok !== true || response.status !== "found" || !identity || !isString(userSid)) {
-      throw new LifecycleGuardError(
-        `Current MCP process identity is unverifiable: ${response.message ?? response.reason ?? "invalid helper response"}`,
-        "IDENTITY_UNVERIFIABLE"
-      );
-    }
-    return { ...identity, userSid };
-  }
-
-  async inspectProcess(
-    pid: number,
-    expectedOwnerTokenArgument?: string
-  ): Promise<ProcessInspection | null> {
-    const response = await this.invoke("InspectProcess", {
-      pid,
-      expectedOwnerTokenArgument: expectedOwnerTokenArgument ?? "",
-    });
-    if (response.ok === true && response.status === "absent") return null;
-    const identity = parseExactIdentity(response.identity);
-    if (response.ok !== true || response.status !== "found" || !identity) {
-      throw new LifecycleGuardError(
-        `Process ${pid} is unverifiable: ${response.message ?? response.reason ?? "invalid helper response"}`,
-        "IDENTITY_UNVERIFIABLE"
-      );
-    }
-    return {
-      identity,
-      ownerArgumentMatched: typeof response.ownerArgumentMatched === "boolean"
-        ? response.ownerArgumentMatched
-        : null,
-    };
   }
 
   async scanWorkbenchProcesses(): Promise<WorkbenchProcessScan> {
@@ -851,7 +590,7 @@ export class WindowsLifecycleBackend implements WorkbenchLifecycleBackend {
         message: "Endpoint vacancy requires a numeric loopback endpoint.",
       };
     }
-    let response: HelperResponse;
+    let response: WindowsHelperResponse;
     try {
       response = await this.invoke("VerifyEndpointVacant", { endpoint: normalized });
     } catch (error) {
@@ -884,41 +623,6 @@ export class WindowsLifecycleBackend implements WorkbenchLifecycleBackend {
       kind: "unverifiable",
       reason,
       message: response.message ?? "The Workbench endpoint is not provably vacant.",
-    };
-  }
-
-  async verifyAndTerminate(
-    expected: WorkbenchIdentity,
-    timeoutMs: number
-  ): Promise<VerifyTerminateResult> {
-    const response = await this.invoke(
-      "VerifyTerminate",
-      { expected, timeoutMs },
-      timeoutMs + this.helperTimeoutMs,
-      true
-    );
-    if (response.ok === true && (response.status === "terminated" || response.status === "already_exited")) {
-      return { kind: response.status };
-    }
-    const allowedReasons = new Set<Extract<VerifyTerminateResult, { kind: "refused" }>["reason"]>([
-      "access_denied",
-      "pid_reused",
-      "executable_mismatch",
-      "creation_time_mismatch",
-      "command_line_unverifiable",
-      "token_mismatch",
-      "timeout",
-      "helper_failure",
-    ]);
-    const reason = allowedReasons.has(
-      response.reason as Extract<VerifyTerminateResult, { kind: "refused" }>["reason"]
-    )
-      ? response.reason as Extract<VerifyTerminateResult, { kind: "refused" }>["reason"]
-      : "helper_failure";
-    return {
-      kind: "refused",
-      reason,
-      message: response.message ?? "The exact process helper refused termination.",
     };
   }
 
@@ -961,14 +665,14 @@ export class WindowsLifecycleBackend implements WorkbenchLifecycleBackend {
 
 class LifecycleSession implements WorkbenchLifecycleSession {
   private active = true;
-  private leaseLoss: LifecycleGuardError | null = null;
+  private leaseLoss: MachineMutexLeaseLoss | null = null;
 
   constructor(
     private readonly guard: WorkbenchProcessGuard,
     readonly mcp: McpOwnerIdentity
   ) {}
 
-  close(reason?: LifecycleGuardError): void {
+  close(reason?: MachineMutexLeaseLoss): void {
     this.leaseLoss ??= reason ?? null;
     this.active = false;
   }
@@ -991,7 +695,6 @@ class LifecycleSession implements WorkbenchLifecycleSession {
   async validateAndClaim(args: {
     endpoint: LifecycleEndpoint;
     target?: CanonicalProjectIdentity | null;
-    operation?: { kind: LifecycleOperationKind; operationId: string } | null;
   }): Promise<LifecycleClaimResult> {
     this.assertActive();
     return this.guard.validateAndClaimLocked(this, args);
@@ -1067,16 +770,21 @@ class LifecycleSession implements WorkbenchLifecycleSession {
 export class WorkbenchProcessGuard {
   readonly stateDir: string;
   readonly statePath: string;
+  readonly spawnJournalPath: string;
   readonly mcpInstanceId = randomUUID();
   readonly leaseId = randomUUID();
   readonly backend: WorkbenchLifecycleBackend;
   private readonly mutexName: string;
   private readonly lockTimeoutMs: number;
   private identityPromise: Promise<ExactProcessIdentity & { userSid: string }> | null = null;
+  private helperCasBackend: HelperMediatedJsonCasBackend | null = null;
+  private lifecycleCasStore: JsonCasStore<WorkbenchLifecycleStateV3> | null = null;
+  private spawnCasStore: JsonCasStore<WorkbenchSpawnJournalStateV3> | null = null;
 
   constructor(options: WorkbenchProcessGuardOptions = {}) {
     this.stateDir = resolve(options.stateDir ?? defaultStateDir());
     this.statePath = join(this.stateDir, "lifecycle.json");
+    this.spawnJournalPath = join(this.stateDir, "spawn-journal.json");
     this.mutexName = options.mutexName ?? DEFAULT_LIFECYCLE_MUTEX;
     this.lockTimeoutMs = options.lockTimeoutMs ?? DEFAULT_LOCK_TIMEOUT_MS;
     const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
@@ -1095,6 +803,20 @@ export class WorkbenchProcessGuard {
       throw new LifecycleGuardError("Workbench owner token must not be empty.", "STATE_INVALID");
     }
     return `${WORKBENCH_OWNER_ARG_PREFIX}${token}`;
+  }
+
+  /**
+   * Exact identity of this controller process without acquiring the lifecycle
+   * mutex. The backend inspection is cached after its first successful proof.
+   */
+  async currentMcpOwnerIdentity(): Promise<McpOwnerIdentity> {
+    const identity = await this.currentIdentity();
+    return Object.freeze({
+      ...identity,
+      instanceId: this.mcpInstanceId,
+      leaseId: this.leaseId,
+      claimedAtMs: Date.now(),
+    });
   }
 
   async withLifecycleLock<T>(
@@ -1125,39 +847,263 @@ export class WorkbenchProcessGuard {
     });
   }
 
+  async assertLifecycleAuthority(expected: WorkbenchLifecycleStateV3): Promise<void> {
+    // This is a cooperative fence, not a mutation: helper-mediated phase CAS
+    // already takes the machine mutex. A bounded atomic snapshot here keeps
+    // spawn/inspection outside the mutex while refusing stale generations at
+    // each state-machine boundary.
+    const read = await this.readLifecycleState();
+    const current = read.kind === "valid" ? read.state : null;
+    const sameOwner = current?.mcpOwner && expected.mcpOwner &&
+      processMatches(current.mcpOwner, expected.mcpOwner) &&
+      current.mcpOwner.instanceId === expected.mcpOwner.instanceId &&
+      current.mcpOwner.leaseId === expected.mcpOwner.leaseId &&
+      current.mcpOwner.userSid === expected.mcpOwner.userSid;
+    const sameWorkbench = (!current?.workbench && !expected.workbench) ||
+      (current?.workbench && expected.workbench &&
+        processMatches(current.workbench, expected.workbench) &&
+        current.workbench.ownerTokenArgument === expected.workbench.ownerTokenArgument &&
+        current.workbench.launchedAtMs === expected.workbench.launchedAtMs);
+    if (!current || current.generation !== expected.generation || !sameOwner ||
+        !sameWorkbench || current.target?.comparisonKey !== expected.target?.comparisonKey) {
+      throw new LifecycleGuardError(
+        "Workbench lifecycle generation or exact owner changed during recoverable spawn.",
+        "GENERATION_MISMATCH"
+      );
+    }
+  }
+
+  private casBackend(): HelperMediatedJsonCasBackend {
+    this.helperCasBackend ??= new HelperMediatedJsonCasBackend({
+      compareAndSwap: async ({ path, expectedGeneration, nextJson }) => {
+        const next = parseJsonText(nextJson) as WorkbenchLifecycleStateV3;
+        await this.backend.replaceState({ path, expectedGeneration, next });
+      },
+      archive: ({ path, archivePath, expectedSha256 }) =>
+        this.backend.archiveState({ path, archivePath, expectedSha256 }),
+      isConflict: (error) => error instanceof LifecycleGuardError
+        ? error.code === "GENERATION_MISMATCH"
+        : error instanceof Error && /generation mismatch/i.test(error.message),
+    });
+    return this.helperCasBackend;
+  }
+
+  private lifecycleStore(): JsonCasStore<WorkbenchLifecycleStateV3> {
+    mkdirSync(this.stateDir, { recursive: true });
+    this.lifecycleCasStore ??= new JsonCasStore({
+      root: this.stateDir,
+      path: this.statePath,
+      minRecordBytes: 1,
+      maxRecordBytes: MAX_LIFECYCLE_STATE_BYTES,
+      maxTotalBytes: MAX_LIFECYCLE_STATE_BYTES * 4,
+      maxRecords: 16,
+      durable: true,
+      parse: (value) => {
+        const parsed = parseLifecycleState(value);
+        if (!parsed) {
+          throw new TypeError("Lifecycle state does not satisfy the strict version-3 schema.");
+        }
+        return parsed;
+      },
+      generationOf: (state) => state.generation,
+      backend: this.casBackend(),
+    });
+    return this.lifecycleCasStore;
+  }
+
+  private spawnStore(): JsonCasStore<WorkbenchSpawnJournalStateV3> {
+    mkdirSync(this.stateDir, { recursive: true });
+    this.spawnCasStore ??= new JsonCasStore({
+      root: this.stateDir,
+      path: this.spawnJournalPath,
+      minRecordBytes: 1,
+      maxRecordBytes: MAX_SPAWN_JOURNAL_BYTES,
+      maxTotalBytes: MAX_SPAWN_JOURNAL_BYTES * 8,
+      maxRecords: 16,
+      durable: true,
+      parse: parseWorkbenchSpawnJournalState,
+      generationOf: (state) => state.generation,
+      backend: this.casBackend(),
+    });
+    return this.spawnCasStore;
+  }
+
   async readLifecycleState(): Promise<LifecycleStateRead> {
-    const activePath = existsSync(this.statePath) ? this.statePath : null;
-    if (!activePath) return { kind: "missing" };
-    let raw: Buffer;
+    if (!existsSync(this.statePath)) return { kind: "missing" };
+    let inspected: JsonCasInspection<WorkbenchLifecycleStateV3>;
     try {
-      raw = readFileSync(activePath);
+      inspected = await this.lifecycleStore().inspect();
     } catch (error) {
       return {
         kind: "malformed",
-        path: activePath,
+        path: this.statePath,
         rawSha256: "unreadable",
         message: `Lifecycle state cannot be read: ${error instanceof Error ? error.message : String(error)}`,
       };
     }
-    const rawSha256 = sha256(raw);
-    let parsed: unknown;
+    if (inspected.kind === "missing") return inspected;
+    if (inspected.kind === "versioned") return { kind: "valid", state: inspected.value };
+    return {
+      kind: "malformed",
+      path: inspected.path,
+      rawSha256: inspected.rawSha256,
+      message: inspected.message,
+    };
+  }
+
+  async readSpawnJournal(): Promise<WorkbenchSpawnJournalRead> {
+    if (!existsSync(this.spawnJournalPath)) return { kind: "missing" };
+    let inspected: JsonCasInspection<WorkbenchSpawnJournalStateV3>;
     try {
-      parsed = parseJsonText(raw.toString("utf8"));
+      inspected = await this.spawnStore().inspect();
     } catch (error) {
       return {
         kind: "malformed",
-        path: activePath,
-        rawSha256,
-        message: `Lifecycle state is not valid JSON: ${error instanceof Error ? error.message : String(error)}`,
+        path: this.spawnJournalPath,
+        rawSha256: "unreadable",
+        message: `Workbench spawn journal cannot be read: ${error instanceof Error
+          ? error.message
+          : String(error)}`,
       };
     }
-    const state = parseLifecycleState(parsed);
-    if (state) return { kind: "valid", state };
+    if (inspected.kind === "missing") return inspected;
+    if (inspected.kind === "versioned") {
+      return {
+        kind: "valid",
+        generation: inspected.generation,
+        record: inspected.value.record,
+      };
+    }
     return {
       kind: "malformed",
-      path: activePath,
-      rawSha256,
-      message: "Lifecycle state does not satisfy the strict version-3 schema.",
+      path: inspected.path,
+      rawSha256: inspected.rawSha256,
+      message: inspected.message,
+    };
+  }
+
+  async assertSpawnJournalReplaceable(): Promise<void> {
+    const read = await this.readSpawnJournal();
+    return this.assertSpawnJournalReadReplaceable(read);
+  }
+
+  private async assertSpawnJournalReadReplaceable(
+    read: WorkbenchSpawnJournalRead
+  ): Promise<void> {
+    if (read.kind === "missing") return;
+    if (read.kind === "malformed") {
+      throw new LifecycleGuardError(
+        `Workbench spawn journal is malformed and requires manual recovery: ${read.message}`,
+        "RECOVERY_REQUIRED"
+      );
+    }
+    const record = read.record;
+    if (record.phase === "spawned_unverified") {
+      throw new LifecycleGuardError(
+        `Workbench spawn transaction ${record.transactionId} durably recorded only PID ` +
+          `${record.pid}; exact identity was never established. Preserve it for attended/manual recovery.`,
+        "RECOVERY_REQUIRED"
+      );
+    }
+    if (record.phase === "pre_spawn") {
+      const processes = await this.scanStrict();
+      if (processes.length > 0) {
+        throw new LifecycleGuardError(
+          `Workbench spawn transaction ${record.transactionId} stopped at pre_spawn while ` +
+            `Workbench PID(s) ${processes.map((entry) => entry.pid).join(", ")} exist. ` +
+            "The post-spawn publication boundary is uncertain and requires attended/manual recovery.",
+          "RECOVERY_REQUIRED"
+        );
+      }
+      return;
+    }
+    const identity = record.identity!;
+    const status = await this.inspectOwnedWorkbench(identity);
+    if (status !== "absent") {
+      throw new LifecycleGuardError(
+        `Workbench spawn transaction ${record.transactionId} still owns exact live PID ` +
+          `${identity.pid}; recover that transaction before another spawn.`,
+        "RECOVERY_REQUIRED"
+      );
+    }
+  }
+
+  createSpawnJournal(
+    lifecycleAuthority: WorkbenchLifecycleStateV3
+  ): RecoverableSpawnJournal<WorkbenchIdentity, WorkbenchSpawnMetadata> {
+    let expectedGeneration: string | null | undefined;
+    return {
+      persist: async (previous, next) => {
+        let initialGeneration: string | null | undefined;
+        if (previous === null) {
+          const current = await this.readSpawnJournal();
+          await this.assertSpawnJournalReadReplaceable(current);
+          initialGeneration = current.kind === "valid" ? current.generation : null;
+        } else if (expectedGeneration === undefined) {
+          throw new LifecycleGuardError(
+            "Workbench spawn journal continuation has no committed prior generation.",
+            "STATE_INVALID"
+          );
+        }
+        return this.backend.withMachineMutex({
+          name: this.mutexName,
+          timeoutMs: this.lockTimeoutMs,
+          action: async () => {
+            mkdirSync(this.stateDir, { recursive: true });
+            const lifecycle = await this.readLifecycleState();
+            const current = lifecycle.kind === "valid" ? lifecycle.state : null;
+            const sameOwner = current?.mcpOwner && lifecycleAuthority.mcpOwner &&
+              processMatches(current.mcpOwner, lifecycleAuthority.mcpOwner) &&
+              current.mcpOwner.instanceId === lifecycleAuthority.mcpOwner.instanceId &&
+              current.mcpOwner.leaseId === lifecycleAuthority.mcpOwner.leaseId &&
+              current.mcpOwner.userSid === lifecycleAuthority.mcpOwner.userSid;
+            const sameTarget = current?.target?.comparisonKey === next.metadata.targetKey &&
+              lifecycleAuthority.target?.comparisonKey === next.metadata.targetKey;
+            const publishedIdentityMatches = next.phase === "published" && current?.workbench &&
+              next.identity && processMatches(current.workbench, next.identity) &&
+              current.workbench.ownerTokenArgument === next.identity.ownerTokenArgument &&
+              current.workbench.launchedAtMs === next.identity.launchedAtMs;
+            const reservedGenerationMatches = next.phase !== "published" &&
+              current?.generation === lifecycleAuthority.generation &&
+              next.metadata.lifecycleGeneration === lifecycleAuthority.generation;
+            if (next.metadata.lifecycleGeneration !== lifecycleAuthority.generation ||
+                !sameOwner || !sameTarget ||
+                (!reservedGenerationMatches && !publishedIdentityMatches)) {
+              throw new LifecycleGuardError(
+                "Workbench spawn journal phase lacks the exact reserved lifecycle authority.",
+                "GENERATION_MISMATCH"
+              );
+            }
+            if (previous === null) {
+              const locked = await this.readSpawnJournal();
+              const lockedGeneration = locked.kind === "valid" ? locked.generation
+                : locked.kind === "missing" ? null
+                  : undefined;
+              if (lockedGeneration !== initialGeneration) {
+                throw new LifecycleGuardError(
+                  "Workbench spawn journal changed after recovery preflight; stale publication was refused.",
+                  "GENERATION_MISMATCH"
+                );
+              }
+              expectedGeneration = initialGeneration!;
+            }
+            const envelope: WorkbenchSpawnJournalStateV3 = {
+              version: 3,
+              generation: randomUUID(),
+              record: next,
+            };
+            const result = await this.spawnStore().compareAndSwap(expectedGeneration!, envelope);
+            if (result.kind === "conflict") {
+              throw new LifecycleGuardError(
+                "Workbench spawn journal generation changed; stale phase publication was refused.",
+                "GENERATION_MISMATCH"
+              );
+            }
+            expectedGeneration = result.current.generation;
+            return result.current.value.record;
+          },
+        });
+      },
     };
   }
 
@@ -1303,7 +1249,6 @@ export class WorkbenchProcessGuard {
     args: {
       endpoint: LifecycleEndpoint;
       target?: CanonicalProjectIdentity | null;
-      operation?: { kind: LifecycleOperationKind; operationId: string } | null;
     }
   ): Promise<LifecycleClaimResult> {
     const endpoint = normalizedEndpoint(args.endpoint);
@@ -1320,7 +1265,7 @@ export class WorkbenchProcessGuard {
     if (read.kind === "missing") {
       const processes = await this.scanStrict();
       if (processes.length > 0) return this.unownedRefusal(processes);
-      const state = await this.createClaimedState(null, endpoint, target, session.mcp, args.operation ?? null);
+      const state = await this.createClaimedState(null, endpoint, target, session.mcp);
       return { kind: "claimed", state, source: "missing" };
     }
 
@@ -1337,12 +1282,15 @@ export class WorkbenchProcessGuard {
         dirname(read.path),
         `malformed-${Date.now()}-${randomUUID()}.json`
       );
-      await this.backend.archiveState({
-        path: read.path,
-        archivePath,
-        expectedSha256: read.rawSha256,
-      });
-      const state = await this.createClaimedState(null, endpoint, target, session.mcp, args.operation ?? null);
+      const malformed = await this.lifecycleStore().inspect();
+      if (malformed.kind !== "corrupt" || malformed.rawSha256 !== read.rawSha256) {
+        throw new LifecycleGuardError(
+          "Lifecycle state changed before malformed-state archival.",
+          "GENERATION_MISMATCH"
+        );
+      }
+      await this.lifecycleStore().archiveCorrupt(malformed, archivePath);
+      const state = await this.createClaimedState(null, endpoint, target, session.mcp);
       return { kind: "claimed", state, source: "malformed" };
     }
 
@@ -1385,7 +1333,7 @@ export class WorkbenchProcessGuard {
           state,
         };
       }
-      if ((target && state.target?.comparisonKey !== target.comparisonKey) || args.operation !== undefined) {
+      if (target && state.target?.comparisonKey !== target.comparisonKey) {
         const changed = await this.transitionLocked(session, {
           generation: state.generation,
           leaseId: state.mcpOwner!.leaseId,
@@ -1396,7 +1344,7 @@ export class WorkbenchProcessGuard {
           mcpOwner: state.mcpOwner,
           workbench: state.workbench,
           companion: state.companion,
-          operation: args.operation === undefined ? state.operation : args.operation,
+          operation: state.operation,
         });
         return { kind: "owned_by_current_mcp", state: changed };
       }
@@ -1436,7 +1384,7 @@ export class WorkbenchProcessGuard {
       mcpOwner: claimedOwner,
       workbench: state.workbench,
       companion: state.companion,
-      operation: args.operation === undefined ? state.operation : args.operation,
+      operation: state.operation,
     });
     return {
       kind: "claimed",
@@ -1485,8 +1433,7 @@ export class WorkbenchProcessGuard {
     expectedGeneration: string | null,
     endpoint: LifecycleEndpoint,
     target: CanonicalProjectIdentity | null,
-    owner: McpOwnerIdentity,
-    operation: { kind: LifecycleOperationKind; operationId: string } | null
+    owner: McpOwnerIdentity
   ): Promise<WorkbenchLifecycleStateV3> {
     const next: WorkbenchLifecycleStateV3 = {
       version: 3,
@@ -1502,7 +1449,13 @@ export class WorkbenchProcessGuard {
     if (!parseLifecycleState(next)) {
       throw new LifecycleGuardError("Initial lifecycle state is invalid.", "STATE_INVALID");
     }
-    await this.backend.replaceState({ path: this.statePath, expectedGeneration, next });
+    const replacement = await this.lifecycleStore().compareAndSwap(expectedGeneration, next);
+    if (replacement.kind === "conflict") {
+      throw new LifecycleGuardError(
+        "Lifecycle state generation changed; stale initial claim was refused.",
+        "GENERATION_MISMATCH"
+      );
+    }
     return next;
   }
 
@@ -1521,11 +1474,13 @@ export class WorkbenchProcessGuard {
     if (!parseLifecycleState(next)) {
       throw new LifecycleGuardError("Refusing to write an invalid lifecycle state transition.", "STATE_INVALID");
     }
-    await this.backend.replaceState({
-      path: this.statePath,
-      expectedGeneration: current.generation,
-      next,
-    });
+    const replacement = await this.lifecycleStore().compareAndSwap(current.generation, next);
+    if (replacement.kind === "conflict") {
+      throw new LifecycleGuardError(
+        "Lifecycle state generation changed; stale mutation was refused.",
+        "GENERATION_MISMATCH"
+      );
+    }
     return next;
   }
 

@@ -1,4 +1,10 @@
 import { randomUUID } from "node:crypto";
+import {
+  AbortableLeaseController,
+  type AbortableLease,
+  type AbortableLeaseTiming,
+  type CancellationReason,
+} from "../foundation/reservation-gate.js";
 
 export type WorkbenchActivityErrorCode =
   | "ACTIVE_CAPTURE"
@@ -26,9 +32,9 @@ export interface CaptureActivityBinding {
   };
 }
 
-export interface CaptureCancellationReason {
-  readonly code: "LIFECYCLE_REQUESTED" | "WORKBENCH_EXITED" | "IDENTITY_CHANGED";
-  readonly message: string;
+export interface CaptureCancellationReason extends CancellationReason<
+  "LIFECYCLE_REQUESTED" | "WORKBENCH_EXITED" | "IDENTITY_CHANGED"
+> {
 }
 
 /**
@@ -36,31 +42,36 @@ export interface CaptureCancellationReason {
  * Lifecycle cancellation is delivered through `signal`; it does not itself
  * claim that restoration completed.
  */
-export interface CaptureActivityLease {
-  readonly id: string;
-  readonly binding: CaptureActivityBinding;
-  readonly signal: AbortSignal;
-}
+export interface CaptureActivityLease extends AbortableLease<
+  CaptureActivityBinding,
+  CaptureCancellationReason
+> {}
 
-export interface WorkbenchActivityGateTiming {
-  setTimeout(callback: () => void, delayMs: number): unknown;
-  clearTimeout(handle: unknown): void;
-}
+export interface WorkbenchActivityGateTiming extends AbortableLeaseTiming {}
 
 export interface WorkbenchActivityGateOptions {
-  /** Maximum time lifecycle work waits for capture restoration and release. */
+  /** Maximum default time lifecycle work waits for local admission. */
   restoreTimeoutMs?: number;
   timing?: WorkbenchActivityGateTiming;
   createLeaseId?: () => string;
 }
 
-interface CaptureRecord {
-  readonly lease: CaptureActivityLease;
-  readonly abortController: AbortController;
-  readonly releasedPromise: Promise<void>;
-  resolveReleased(): void;
-  released: boolean;
-  invalidated: boolean;
+export interface WorkbenchLifecycleAdmissionOptions {
+  /** Override the default bound for queueing, reader drain, and capture restoration. */
+  timeoutMs?: number;
+  /** Cancel admission without interrupting lifecycle work after it has been admitted. */
+  signal?: AbortSignal;
+}
+
+interface LifecycleWaiter {
+  readonly kind: string;
+  readonly options: WorkbenchLifecycleAdmissionOptions;
+  readonly admitted: Promise<void>;
+  resolveAdmitted(): void;
+  rejectAdmitted(error: WorkbenchActivityError): void;
+  timer: unknown;
+  abortListener: (() => void) | null;
+  status: "pending" | "admitted" | "cancelled";
 }
 
 const DEFAULT_RESTORE_TIMEOUT_MS = 5_000;
@@ -104,10 +115,15 @@ export class WorkbenchActivityGate {
   private readonly restoreTimeoutMs: number;
   private readonly timing: WorkbenchActivityGateTiming;
   private readonly createLeaseId: () => string;
-  private readonly records = new WeakMap<CaptureActivityLease, CaptureRecord>();
-  private activeCapture: CaptureRecord | null = null;
+  private readonly captureLeases = new AbortableLeaseController<
+    CaptureActivityBinding,
+    CaptureCancellationReason
+  >();
   private managedActivities = 0;
   private lifecycleRequests = 0;
+  private lifecycleActive = false;
+  private advancingLifecycleQueue = false;
+  private readonly lifecycleQueue: LifecycleWaiter[] = [];
 
   constructor(options: WorkbenchActivityGateOptions = {}) {
     const restoreTimeoutMs = options.restoreTimeoutMs ?? DEFAULT_RESTORE_TIMEOUT_MS;
@@ -126,40 +142,22 @@ export class WorkbenchActivityGate {
         "LIFECYCLE_BUSY"
       );
     }
-    if (this.activeCapture) {
+    const activeCapture = this.captureLeases.activeLease;
+    if (activeCapture) {
       throw new WorkbenchActivityError(
-        `Workbench capture ${this.activeCapture.lease.id} already owns the camera activity lease.`,
+        `Workbench capture ${activeCapture.id} already owns the camera activity lease.`,
         "ACTIVE_CAPTURE"
       );
     }
-
-    const abortController = new AbortController();
-    let resolveReleased!: () => void;
-    const releasedPromise = new Promise<void>((resolve) => { resolveReleased = resolve; });
-    const lease = Object.freeze({
-      id: this.createLeaseId(),
-      binding: copyBinding(binding),
-      signal: abortController.signal,
-    });
-    const record: CaptureRecord = {
-      lease,
-      abortController,
-      releasedPromise,
-      resolveReleased,
-      released: false,
-      invalidated: false,
-    };
-    this.records.set(lease, record);
-    this.activeCapture = record;
-    return lease;
+    return this.captureLeases.issue(
+      this.createLeaseId(),
+      copyBinding(binding)
+    );
   }
 
   releaseCapture(lease: CaptureActivityLease): void {
-    const record = this.recordFor(lease);
-    if (record.released) return;
-    record.released = true;
-    if (this.activeCapture === record) this.activeCapture = null;
-    record.resolveReleased();
+    this.captureLeases.release(lease);
+    this.advanceLifecycleQueue();
   }
 
   /** Assert that the lease remains active and bound to the current identity. */
@@ -167,20 +165,19 @@ export class WorkbenchActivityGate {
     lease: CaptureActivityLease,
     currentBinding: CaptureActivityBinding
   ): void {
-    const record = this.recordFor(lease);
-    if (record.released || record.invalidated || this.activeCapture !== record) {
+    if (!this.captureLeases.isActive(lease)) {
       throw new WorkbenchActivityError(
         `Workbench capture lease ${lease.id} is no longer active.`,
         "CAPTURE_INVALIDATED"
       );
     }
-    if (!sameBinding(record.lease.binding, currentBinding)) {
-      this.invalidateRecord(record, {
+    if (!sameBinding(lease.binding, currentBinding)) {
+      this.captureLeases.cancel(lease, {
         code: "IDENTITY_CHANGED",
         message:
           `Workbench capture lease ${lease.id} no longer matches its lifecycle generation, ` +
-          "canonical target, or exact process identity.",
-      }, false);
+            "canonical target, or exact process identity.",
+      });
       throw new WorkbenchActivityError(
         `Workbench capture lease ${lease.id} is stale for the current Workbench identity.`,
         "CAPTURE_INVALIDATED"
@@ -189,9 +186,8 @@ export class WorkbenchActivityGate {
   }
 
   invalidateCapture(lease: CaptureActivityLease, message: string): void {
-    const record = this.recordFor(lease);
-    if (record.released) return;
-    this.invalidateRecord(record, { code: "IDENTITY_CHANGED", message }, false);
+    if (this.captureLeases.isReleased(lease)) return;
+    this.captureLeases.cancel(lease, { code: "IDENTITY_CHANGED", message });
   }
 
   /**
@@ -199,14 +195,15 @@ export class WorkbenchActivityGate {
    * and lifecycle identity captured by that lease.
    */
   invalidateForUnexpectedExit(binding: CaptureActivityBinding): boolean {
-    const record = this.activeCapture;
-    if (!record || !sameBinding(record.lease.binding, binding)) return false;
-    this.invalidateRecord(record, {
+    const lease = this.captureLeases.activeLease;
+    if (!lease || !sameBinding(lease.binding, binding)) return false;
+    this.captureLeases.cancel(lease, {
       code: "WORKBENCH_EXITED",
       message:
         `Exact owned Workbench PID ${binding.process.pid} exited while capture ` +
-        `${record.lease.id} was active.`,
-    }, true);
+        `${lease.id} was active.`,
+    }, { release: true });
+    this.advanceLifecycleQueue();
     return true;
   }
 
@@ -227,81 +224,170 @@ export class WorkbenchActivityGate {
       return await action();
     } finally {
       this.managedActivities -= 1;
+      if (this.managedActivities === 0) this.advanceLifecycleQueue();
     }
   }
 
-  async runLifecycle<T>(kind: string, action: () => Promise<T>): Promise<T> {
-    this.lifecycleRequests += 1;
+  async runLifecycle<T>(
+    kind: string,
+    action: () => Promise<T>,
+    options: WorkbenchLifecycleAdmissionOptions = {}
+  ): Promise<T> {
+    const waiter = this.enqueueLifecycle(kind, options);
+    await waiter.admitted;
     try {
-      if (this.managedActivities > 0) {
-        throw new WorkbenchActivityError(
-          `Workbench lifecycle ${kind} cannot race ${this.managedActivities} active managed request(s).`,
-          "LIFECYCLE_BUSY"
-        );
-      }
-      const capture = this.activeCapture;
-      if (capture) {
-        if (!capture.abortController.signal.aborted) {
-          capture.abortController.abort({
-            code: "LIFECYCLE_REQUESTED",
-            message:
-              `Workbench lifecycle ${kind} requested cancellation and exact camera restoration ` +
-              `for capture ${capture.lease.id}.`,
-          } satisfies CaptureCancellationReason);
-        }
-        const restored = await this.waitForRelease(capture);
-        if (!restored) {
-          throw new WorkbenchActivityError(
-            `ACTIVE_CAPTURE: lifecycle ${kind} refused because capture ${capture.lease.id} ` +
-              `did not restore and release within ${this.restoreTimeoutMs}ms.`,
-            "ACTIVE_CAPTURE"
-          );
-        }
-      }
       return await action();
     } finally {
+      this.lifecycleActive = false;
       this.lifecycleRequests -= 1;
+      this.advanceLifecycleQueue();
     }
   }
 
-  private recordFor(lease: CaptureActivityLease): CaptureRecord {
-    const record = this.records.get(lease);
-    if (!record) {
-      throw new WorkbenchActivityError(
-        "Capture activity lease was not issued by this Workbench activity gate.",
-        "CAPTURE_INVALIDATED"
+  private enqueueLifecycle(
+    kind: string,
+    options: WorkbenchLifecycleAdmissionOptions
+  ): LifecycleWaiter {
+    const timeoutMs = options.timeoutMs ?? this.restoreTimeoutMs;
+    if (!Number.isFinite(timeoutMs) || timeoutMs < 0) {
+      throw new TypeError("Workbench lifecycle admission timeout must be a finite non-negative number.");
+    }
+
+    let resolveAdmitted!: () => void;
+    let rejectAdmitted!: (error: WorkbenchActivityError) => void;
+    const admitted = new Promise<void>((resolve, reject) => {
+      resolveAdmitted = resolve;
+      rejectAdmitted = reject;
+    });
+    const waiter: LifecycleWaiter = {
+      kind,
+      options,
+      admitted,
+      resolveAdmitted,
+      rejectAdmitted,
+      timer: undefined,
+      abortListener: null,
+      status: "pending",
+    };
+
+    this.lifecycleRequests += 1;
+    this.lifecycleQueue.push(waiter);
+    waiter.timer = this.timing.setTimeout(
+      () => this.cancelLifecycleWaiter(waiter, this.admissionTimeoutError(waiter, timeoutMs)),
+      timeoutMs
+    );
+    if (options.signal) {
+      waiter.abortListener = () => this.cancelLifecycleWaiter(
+        waiter,
+        new WorkbenchActivityError(
+          `Workbench lifecycle ${kind} admission was cancelled.`,
+          "LIFECYCLE_BUSY"
+        )
+      );
+      options.signal.addEventListener("abort", waiter.abortListener, { once: true });
+    }
+
+    if (options.signal?.aborted) {
+      waiter.abortListener?.();
+    } else {
+      this.advanceLifecycleQueue();
+    }
+    return waiter;
+  }
+
+  private advanceLifecycleQueue(): void {
+    if (this.advancingLifecycleQueue || this.lifecycleActive) return;
+    this.advancingLifecycleQueue = true;
+    try {
+      for (;;) {
+        const waiter = this.lifecycleQueue[0];
+        if (!waiter || this.lifecycleActive) return;
+        if (waiter.status !== "pending") {
+          this.lifecycleQueue.shift();
+          continue;
+        }
+        if (waiter.options.signal?.aborted) {
+          this.cancelLifecycleWaiter(
+            waiter,
+            new WorkbenchActivityError(
+              `Workbench lifecycle ${waiter.kind} admission was cancelled.`,
+              "LIFECYCLE_BUSY"
+            ),
+            false
+          );
+          continue;
+        }
+        if (this.managedActivities > 0) return;
+
+        const capture = this.captureLeases.activeLease;
+        if (capture) {
+          if (!capture.signal.aborted) {
+            this.captureLeases.cancel(capture, {
+              code: "LIFECYCLE_REQUESTED",
+              message:
+                `Workbench lifecycle ${waiter.kind} requested cancellation and exact camera ` +
+                `restoration for capture ${capture.id}.`,
+            }, { invalidate: false });
+          }
+          // Abort handlers may synchronously restore and release the capture.
+          if (this.captureLeases.activeLease) return;
+        }
+
+        this.lifecycleQueue.shift();
+        waiter.status = "admitted";
+        this.clearLifecycleWaiterResources(waiter);
+        this.lifecycleActive = true;
+        waiter.resolveAdmitted();
+        return;
+      }
+    } finally {
+      this.advancingLifecycleQueue = false;
+    }
+  }
+
+  private cancelLifecycleWaiter(
+    waiter: LifecycleWaiter,
+    error: WorkbenchActivityError,
+    advance = true
+  ): void {
+    if (waiter.status !== "pending") return;
+    waiter.status = "cancelled";
+    const index = this.lifecycleQueue.indexOf(waiter);
+    if (index >= 0) this.lifecycleQueue.splice(index, 1);
+    this.clearLifecycleWaiterResources(waiter);
+    this.lifecycleRequests -= 1;
+    waiter.rejectAdmitted(error);
+    if (advance) this.advanceLifecycleQueue();
+  }
+
+  private clearLifecycleWaiterResources(waiter: LifecycleWaiter): void {
+    if (waiter.timer !== undefined) {
+      this.timing.clearTimeout(waiter.timer);
+      waiter.timer = undefined;
+    }
+    if (waiter.abortListener && waiter.options.signal) {
+      waiter.options.signal.removeEventListener("abort", waiter.abortListener);
+      waiter.abortListener = null;
+    }
+  }
+
+  private admissionTimeoutError(
+    waiter: LifecycleWaiter,
+    timeoutMs: number
+  ): WorkbenchActivityError {
+    const capture = this.captureLeases.activeLease;
+    if (capture) {
+      return new WorkbenchActivityError(
+        `ACTIVE_CAPTURE: lifecycle ${waiter.kind} refused because capture ${capture.id} ` +
+          `did not restore and release within ${timeoutMs}ms.`,
+        "ACTIVE_CAPTURE"
       );
     }
-    return record;
+    return new WorkbenchActivityError(
+      `Workbench lifecycle ${waiter.kind} could not acquire its local write lease within ` +
+        `${timeoutMs}ms.`,
+      "LIFECYCLE_BUSY"
+    );
   }
 
-  private invalidateRecord(
-    record: CaptureRecord,
-    reason: CaptureCancellationReason,
-    releaseForExactProcessExit: boolean
-  ): void {
-    if (!record.abortController.signal.aborted) record.abortController.abort(reason);
-    record.invalidated = true;
-    // Identity/generation drift can still leave camera state installed in a
-    // live editor. Keep lifecycle admission blocked until the adapter proves
-    // restoration and explicitly releases. Exact process exit is different:
-    // the camera/world no longer exists, so that exact lease can be released.
-    if (releaseForExactProcessExit) this.releaseCapture(record.lease);
-  }
-
-  private waitForRelease(record: CaptureRecord): Promise<boolean> {
-    if (record.released) return Promise.resolve(true);
-    return new Promise<boolean>((resolve) => {
-      let settled = false;
-      let timer: unknown;
-      const finish = (released: boolean): void => {
-        if (settled) return;
-        settled = true;
-        if (released) this.timing.clearTimeout(timer);
-        resolve(released);
-      };
-      timer = this.timing.setTimeout(() => finish(false), this.restoreTimeoutMs);
-      void record.releasedPromise.then(() => finish(true));
-    });
-  }
 }

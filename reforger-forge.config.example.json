@@ -4,7 +4,6 @@
   "projectPath": "",
   "workbenchAddonDirs": [],
   "workbenchScriptAuthorizeAll": false,
-  "workbenchNoThrow": true,
   "workbenchHost": "127.0.0.1",
   "workbenchPort": 5775,
   "observer": {

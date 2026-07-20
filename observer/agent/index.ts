@@ -1,37 +1,14 @@
-import { randomUUID } from "node:crypto";
 import { pathToFileURL } from "node:url";
 import { AGENT_VERSION } from "../protocol/index.js";
-import { ArtifactStore } from "./artifacts.js";
-import { ObserverControlApi, type ObserverControlOptions } from "./control-api.js";
-import { JobStore, type JobStoreOptions } from "./jobs.js";
-import { InstanceRegistry, type RegistryOptions } from "./registry.js";
-import { ObserverRunStore, type RunStoreOptions } from "./runs.js";
-import { ObserverAgentServer, type ObserverAgentServerOptions } from "./server.js";
-
-export interface CreateObserverAgentOptions extends ObserverControlOptions, ObserverAgentServerOptions, RunStoreOptions {
-  registry?: RegistryOptions;
-  jobs?: JobStoreOptions;
-}
-
-export function createObserverAgent(options: CreateObserverAgentOptions = {}) {
-  const agentInstanceId = randomUUID();
-  const control = new ObserverControlApi({ ...options, agentInstanceId });
-  const registry = new InstanceRegistry(control.sessions, { clock: options.clock, ...options.registry });
-  const jobs = new JobStore(control.sessions, registry, options.clock, options.jobs);
-  const artifacts = new ArtifactStore(control.paths.artifacts, control.sessions, jobs);
-  const runs = new ObserverRunStore(control.paths.runs, control.paths.exportWork, artifacts, jobs, {
-    evidenceRoots: options.evidenceRoots,
-    supportingLogRoots: [control.paths.logs, ...(options.supportingLogRoots ?? [])],
-  });
-  const server = new ObserverAgentServer(agentInstanceId, control, registry, jobs, artifacts, runs, options);
-  return { control, registry, jobs, artifacts, runs, server };
-}
 
 export { AGENT_VERSION };
 export * from "./artifacts.js";
+export * from "./application.js";
 export * from "./bmp.js";
 export * from "./control-api.js";
 export * from "./control-client.js";
+export * from "./evidence-bundle-service.js";
+export * from "./application-operations.js";
 export * from "./errors.js";
 export * from "./jobs.js";
 export * from "./launch-arguments.js";

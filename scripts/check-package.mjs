@@ -131,26 +131,51 @@ const requiredFiles = [
   "RELEASE_NOTES_v1.1.0.md",
   "dist/index.js",
   "dist/observer/agent/artifacts.js",
+  "dist/observer/agent/application.js",
+  "dist/observer/agent/application-operations.js",
+  "dist/observer/agent/evidence-bundle-service.js",
   "dist/observer/agent/index.js",
   "dist/observer/agent/jobs.js",
   "dist/observer/agent/mailbox-coordinator.js",
   "dist/observer/agent/private-child.js",
   "dist/observer/agent/registry.js",
   "dist/observer/agent/sessions.js",
+  "dist/observer/application.js",
+  "dist/observer/agent-client.js",
+  "dist/observer/capture-contract.js",
+  "dist/observer/capture-job-store.js",
+  "dist/observer/capture-request.js",
+  "dist/observer/capture-service.js",
   "dist/observer/coordinator.js",
+  "dist/observer/evidence-run-service.js",
+  "dist/observer/host-diagnostics.js",
   "dist/observer/launch.js",
   "dist/observer/owned-runtime-manager.js",
   "dist/observer/setup.js",
   "dist/observer/tools.js",
+  "dist/observer/runtime-capture-backend.js",
+  "dist/observer/workbench-capture-backend.js",
+  "dist/observer/world-revision.js",
   "dist/observer/protocol/index.js",
   "dist/tools/observer-runtime.js",
   "dist/tools/wb-shutdown.js",
+  "dist/foundation/child-supervisor.js",
+  "dist/workbench/activity-gate.js",
+  "dist/workbench/client.js",
+  "dist/workbench/diagnostics.js",
   "dist/workbench/helper-addon.js",
+  "dist/workbench/launch-plan.js",
+  "dist/workbench/lifecycle-execution.js",
+  "dist/workbench/managed-build-profile.js",
+  "dist/workbench/net-api-client.js",
   "dist/workbench/observer-adapter.js",
   "dist/workbench/process-guard.js",
   "dist/workbench/project-identity.js",
+  "dist/workbench/readiness.js",
   "dist/workbench/runner-cli.js",
   "dist/workbench/runner.js",
+  "dist/workbench/session-controller.js",
+  "dist/workbench/session-state.js",
   "configs/claude-desktop.json",
   "configs/cursor-global.json",
   "docs/AGENTS.md",
@@ -254,10 +279,14 @@ const legacyPackagedHandlers = [...files].filter((path) =>
 const repositoryOnlyAcceptanceSources = [
   "scripts/observer-live-acceptance-support.ts",
   "scripts/run-runtime-observer-acceptance.ts",
+  "scripts/run-workbench-build-acceptance.ts",
   "scripts/run-workbench-observer-acceptance.ts",
 ];
 const packagedRepositoryOnlySources = repositoryOnlyAcceptanceSources.filter((path) =>
   files.has(path)
+);
+const duplicateSharedBuildFiles = [...files].filter((path) =>
+  path.startsWith("dist/src/foundation/") || path.startsWith("dist/src/companions/")
 );
 const forbiddenObserverFiles = [...files].filter((path) =>
   path.startsWith("tests/observer/") ||
@@ -270,7 +299,7 @@ const forbiddenObserverFiles = [...files].filter((path) =>
   (path.startsWith("observer/") && /\.(bmp|png)$/i.test(path))
 );
 
-if (missingFiles.length || missingPrefixes.length || missingHandlers.length || unexpectedHandlers.length || missingObserverScripts.length || legacyPackagedHandlers.length || packagedRepositoryOnlySources.length || forbiddenObserverFiles.length) {
+if (missingFiles.length || missingPrefixes.length || missingHandlers.length || unexpectedHandlers.length || missingObserverScripts.length || legacyPackagedHandlers.length || packagedRepositoryOnlySources.length || duplicateSharedBuildFiles.length || forbiddenObserverFiles.length) {
   const details = [
     ...missingFiles.map((path) => `missing file: ${path}`),
     ...missingPrefixes.map((prefix) => `missing package content under: ${prefix}`),
@@ -280,6 +309,9 @@ if (missingFiles.length || missingPrefixes.length || missingHandlers.length || u
     ...legacyPackagedHandlers.map((path) => `legacy project-injection handler must not be packaged: ${path}`),
     ...packagedRepositoryOnlySources.map((path) =>
       `repository-only TypeScript acceptance harness must not be packaged: ${path}`
+    ),
+    ...duplicateSharedBuildFiles.map((path) =>
+      `duplicate shared TypeScript build output must not be packaged: ${path}`
     ),
     ...forbiddenObserverFiles.map((path) => `forbidden observer runtime artifact: ${path}`),
   ];
@@ -465,6 +497,29 @@ if (missingFiles.length || missingPrefixes.length || missingHandlers.length || u
       "Installed observer agent non-network --version check",
       versionCheck
     );
+  }
+
+  const missingDoctorRoot = join(temporaryRoot, "installed-doctor", "missing-root");
+  const missingDoctorProfile = join(temporaryRoot, "installed-doctor", "missing-profile");
+  const doctorCheck = spawnSync(process.execPath, [
+    installedAgentPath,
+    "doctor",
+    "--root",
+    missingDoctorRoot,
+    "--profile-root",
+    missingDoctorProfile,
+  ], {
+    cwd: installRoot,
+    encoding: "utf8",
+    env: probeEnvironment,
+    timeout: 30_000,
+    maxBuffer: 8 * 1024 * 1024,
+  });
+  let doctorResult;
+  try { doctorResult = JSON.parse(doctorCheck.stdout); } catch { doctorResult = null; }
+  if (doctorCheck.error || doctorCheck.status !== 0 || doctorResult?.readOnly !== true ||
+      existsSync(missingDoctorRoot) || existsSync(missingDoctorProfile)) {
+    throw commandFailure("Installed observer agent read-only doctor check", doctorCheck);
   }
 
   console.log(

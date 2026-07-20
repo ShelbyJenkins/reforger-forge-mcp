@@ -1,4 +1,5 @@
 import { PROTOCOL_VERSION, publicErrorMessage, type ObserverErrorCode } from "../protocol/index.js";
+import type { BoundedOptionErrorFactory } from "#foundation/bounded-option";
 
 export class ObserverError extends Error {
   constructor(
@@ -26,3 +27,7 @@ export function errorBody(error: unknown): {
     error: { code: observerError.code, message: publicErrorMessage(observerError.code, observerError.message) },
   };
 }
+
+/** Preserve the observer protocol error surface while sharing bound logic. */
+export const observerOptionError: BoundedOptionErrorFactory = ({ message }) =>
+  new ObserverError("INVALID_REQUEST", message);

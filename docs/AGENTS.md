@@ -110,13 +110,20 @@ Workbench from loading or saving resources.
 `ReforgerForgeWorkbenchHelper` beneath the external observer managed root. It
 loads that add-on alongside the exact target `.gproj` and gives Workbench a
 dedicated external profile. It does not place MCP helper files in the target
-project. Readiness requires `EMCP_WB_Ping` to return the exact helper add-on ID,
-GUID, version, protocol, and build identity expected by the running MCP.
+project. Editor readiness requires `EMCP_WB_Ping` to return the exact helper
+add-on ID, GUID, version, protocol, and build identity expected by the running
+MCP. The target-build plan has no helper activation or NET-readiness capability.
 
-Automated lifecycle control is supported on Windows and serialized with the
-version-3 global named mutex and lifecycle record. A second live MCP cannot
-adopt the first MCP's Workbench. A replacement MCP may claim the lease only
-after the prior MCP PID and exact creation identity are proven dead.
+Automated lifecycle control is supported on Windows through one shared
+`WorkbenchSessionController` behind the stable `WorkbenchClient` facade. The
+version-3 global named mutex and lifecycle record serialize cross-process state
+transitions. A controller-local, writer-preferring reader/writer gate permits
+concurrent managed NET calls, blocks new readers once a writer is pending, and
+drains active reads and capture restoration before lifecycle or companion
+administration changes. Ordinary NET calls do not hold the machine mutex. A
+second live MCP cannot adopt the first MCP's Workbench. A replacement MCP may
+claim the lease only after the prior MCP PID and exact creation identity are
+proven dead.
 `wb_restart` preflights the complete replacement before it stops anything,
 retains the same canonical `.gproj`, terminates through the verified OS process
 handle, waits for the NET API port to release, launches with `-noThrow`, and
@@ -150,13 +157,16 @@ reforger-forge-workbench editor --gproj <path> --foreground
 reforger-forge-workbench build --gproj <path> --platform PC --output <path> --timeout-ms <n>
 ```
 
-Editor ownership is foreground-only. Build execution is deadline-bounded and
-uses a companion-qualification preflight followed by a distinct target-only
-child under the same machine lock. The version-3 JSON receipt keeps their exact
-PIDs, lifecycle generations, and attributed log directories separate, records
-preflight endpoint/Ping ownership, and requires fresh nonempty output containing
-one hashed `resourceDatabase.rdb` after a zero build exit. Supply a unique empty
-output directory for every run.
+Editor ownership is foreground-only. The canonical target-build plan is
+helper-free, uses a dedicated profile, and has no NET-readiness step. Until the
+controlled target-only live acceptance gate passes, the public build command
+continues to run a companion-qualification editor preflight followed by that
+distinct target-only child under the same machine lock. Its version-3 JSON
+receipt keeps their exact PIDs, lifecycle generations, and attributed log
+directories separate, records preflight endpoint/Ping ownership, and requires
+fresh nonempty output containing one hashed `resourceDatabase.rdb` after a zero
+build exit. Do not describe or expect a public version-4 receipt yet. Supply a
+caller-exclusive unique empty output directory for every run.
 
 Installed Workbench 1.7.0.54 requires the exact target sequence
 `-wbModule=ResourceManager -builddata PC <fresh-output> <AddonName>`, with the
@@ -164,6 +174,46 @@ Installed Workbench 1.7.0.54 requires the exact target sequence
 qualified fresh output on 2026-07-18. Keep the lifecycle and receipt checks
 intact: child launch and zero exit alone remain insufficient, and any missing or
 stale output proof must fail closed.
+
+### Workbench implementation cohesion
+
+`session-controller.ts`, `runner.ts`, and `launch-plan.ts` may each remain over
+800 lines when reviewing Stage 3. Their size is not itself a reason to split a
+transaction. Socket framing, process execution, state projection, readiness,
+diagnostics, supervision, and managed-profile creation have separate modules.
+The session controller keeps lifecycle/gate ordering local because reservation,
+spawn publication, exact cleanup, and vacancy form one fail-closed transaction.
+The runner keeps CLI/build evidence policy local because log attribution, output
+reservation, output proof, exit mapping, and V3 receipt shaping must agree. The
+launch-plan module keeps the three-plan validation and final argument ordering
+together so no caller can assemble a partial policy. Extract another module only
+when it owns an independently testable invariant, not merely to reduce line
+count.
+
+`scripts/run-workbench-build-acceptance.ts` is also an intentional cohesion
+exception. It is a repository-only, one-shot evidence evaluator rather than a
+production orchestration owner: production lifecycle, process execution,
+launch-plan, state, and readiness logic remain in the modules above. Keeping its
+dual live-run gate, two-run protocol, normalized evidence schema, sanitizer, and
+schema validator in one auditable source prevents the recorded evaluator policy
+from drifting across loosely versioned helpers. Its exported seams are covered
+hermetically, and its complete runtime source closure is hash-bound in every
+artifact. Split it only if the extracted evaluator component gains its own
+versioned schema and independently enforced source-closure contract.
+
+The repository-only target-build acceptance harness exercises the helper-free
+controller path without changing the public build command:
+
+```powershell
+$env:RFO_RUN_LIVE_WORKBENCH_BUILD_ACCEPTANCE = '1'
+npm run dev:workbench:acceptance:build -- --confirm-live-run --gproj <ABSOLUTE_TARGET_GPROJ> --output-root <EXTERNAL_OUTPUT_PARENT>
+```
+
+It creates two distinct exclusive output directories and writes sanitized
+pre-removal evidence beneath `docs/validation`. Merely adding or running the
+harness does not satisfy the removal gate: retain two successful controlled
+runs, keep all hermetic contracts green, and remember that the public command
+still uses the helper preflight and V3 receipt until that evidence is reviewed.
 
 ## Observer Runtime Lifecycle (Windows)
 
@@ -305,19 +355,20 @@ For live editor work:
    changing it.
 5. Make the smallest scoped change and inspect the result.
 6. Save intentional editor changes manually while a person is attending the
-   editor; `wb_save`/Save As are disabled because they may open modal UI.
+   editor; no automated Save/Save As tool is advertised because the operation
+   may open modal UI.
 7. After script changes, use verified owner-scoped `wb_restart` for a clean
    compile. Never use `wb_reload` or a generic menu action for scripts.
 8. Prefer a bounded standalone diagnostic/autotest launcher for gameplay
    acceptance. When attended in-editor testing is required, ask the user to
-   enter Play manually because `wb_play` is disabled, pause until they confirm,
+   enter Play manually because no automated Play tool exists, pause until they confirm,
    verify Play mode with `wb_state`, and use `wb_stop` to return to edit mode.
 9. When live automation is finished, restore or cancel active captures, wait
    for terminal state, and call `wb_shutdown`.
 
 After changing `.c` files in a session that has loaded a world, save intentional
 editor changes manually and use `wb_restart`. Do not route a script compile
-through `wb_reload` or `wb_execute_action`; generic menu execution is disabled
+through `wb_reload` or a generic menu action; generic menu execution is disabled
 entirely, including in the direct NET API handler.
 
 Most scene mutations only work in edit mode. Do not assume an operation failed
@@ -335,16 +386,25 @@ archives, probe logs, or raw capture work. Configure its absolute path in
 `observer.evidenceRoots`; the observer keeps all working artifacts under its
 external managed root.
 
+Runtime and Workbench captures intentionally share one public capture service:
+do not bypass its job ID, exact revision, absolute deadline, promotion, or
+release receipt. Durable run ownership remains available for cleanup, but new
+begin/reserve/finalize operations are refused when no evidence exporter root is
+configured. `observer_setup action="doctor"` and the installed CLI `doctor`
+are inspection-only and must not create missing roots, load stores, stage
+companions, or start the private child.
+
 1. Call `observer_run action="begin"` and retain the generated `runId`.
 2. Prepare a runtime with `observer_prepare_launch`. Either use its structured
    arguments in an external launcher or explicitly start its `preparedLaunchId`
    with `observer_runtime`; call `wb_launch` separately for an editor.
 3. Call `observer_instances`, choose one exact renderer, and record its
-   `instanceId`, `worldId`, and `worldEpoch`.
+   `instanceId` and opaque `worldRevision`. The legacy `worldId` and
+   `worldEpoch` fields remain available for compatibility.
 4. Call `observer_capture` with the `runId`, a meaningful unique
-   `captureLabel`, and the inventory's expected-world values. These fields are
-   required for evidence captures. Prefer `view.kind="current"` first and
-   synchronous mode while reviewing interactively.
+   `captureLabel`, and `expectedWorldRevision` copied from inventory. These
+   fields are required for evidence captures. Prefer `view.kind="current"`
+   first and synchronous mode while reviewing interactively.
 5. Inspect the image itself. A successful capture transaction proves image
    integrity and camera restoration, not the gameplay claim shown in the image.
 6. For asynchronous work, poll `observer_job action="status"`, then call

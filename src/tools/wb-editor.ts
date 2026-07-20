@@ -4,37 +4,6 @@ import type { WorkbenchClient } from "../workbench/client.js";
 import { formatConnectionStatus, requirePlayMode } from "../workbench/status.js";
 
 export function registerWbEditorTools(server: McpServer, client: WorkbenchClient): void {
-  // wb_play — Switch to game mode (Play in Editor)
-  server.registerTool(
-    "wb_play",
-    {
-      description:
-        "Report that in-editor Play is disabled for unattended automation because it can compile scripts in a live editor process.",
-      inputSchema: {
-        debugMode: z
-          .boolean()
-          .optional()
-          .describe("Enable debug mode (script breakpoints, extra logging)"),
-        fullScreen: z
-          .boolean()
-          .optional()
-          .describe("Launch in full-screen mode instead of windowed"),
-      },
-    },
-    async () => {
-      return {
-        content: [{
-          type: "text" as const,
-          text:
-            "**Play Refused** — in-editor Play can compile scripts in a live Workbench process. " +
-            "Use a standalone diagnostic/autotest runtime launcher instead." +
-            formatConnectionStatus(client),
-        }],
-        isError: true,
-      };
-    }
-  );
-
   // wb_stop — Switch to edit mode
   server.registerTool(
     "wb_stop",
@@ -94,33 +63,6 @@ export function registerWbEditorTools(server: McpServer, client: WorkbenchClient
         isError: true,
         };
       }
-    }
-  );
-
-  // wb_save — Save the current world
-  server.registerTool(
-    "wb_save",
-    {
-      description:
-        "Report that unattended save is disabled because Workbench may open a modal dialog. Save manually before restart.",
-      inputSchema: {
-        path: z
-          .string()
-          .optional()
-          .describe("File path for Save As. Omit to save to the current file."),
-      },
-    },
-    async ({ path }) => {
-      return {
-        content: [{
-          type: "text" as const,
-          text:
-            `**Save Refused** — unattended save${path ? "-as" : ""} is disabled because Workbench may open a modal dialog. ` +
-            `Save intentional editor changes manually before owner-scoped restart.` +
-            formatConnectionStatus(client),
-        }],
-        isError: true,
-      };
     }
   );
 

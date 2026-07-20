@@ -17,10 +17,17 @@ import { registerPatternResource } from "./resources/pattern-resource.js";
 import { registerGroupResource } from "./resources/group-resource.js";
 import { SearchEngine } from "./index/search-engine.js";
 import { PatternLibrary } from "./patterns/loader.js";
-import { WorkbenchClient } from "./workbench/client.js";
+import { ChildSupervisor } from "./foundation/child-supervisor.js";
+import { WorkbenchActivityGate } from "./workbench/activity-gate.js";
+import { WorkbenchNetApiClient } from "./workbench/net-api-client.js";
+import { WorkbenchProcessGuard } from "./workbench/process-guard.js";
+import { WorkbenchSessionController } from "./workbench/session-controller.js";
+import type { WorkbenchLifecycleExecutionPort } from "./workbench/lifecycle-execution.js";
+import { diagnoseWorkbench } from "./workbench/diagnostics.js";
 import {
   WorkbenchHelperStager,
   defaultWorkbenchHelperManagedRoot,
+  type WorkbenchCompanionProvider,
 } from "./workbench/helper-addon.js";
 import { WorkbenchObserverAdapter } from "./workbench/observer-adapter.js";
 import { registerWbLaunch } from "./tools/wb-launch.js";
@@ -30,7 +37,6 @@ import { registerWbReload } from "./tools/wb-reload.js";
 import { registerWbRestart } from "./tools/wb-restart.js";
 import { registerWbShutdown } from "./tools/wb-shutdown.js";
 import { registerWbEditorTools } from "./tools/wb-editor.js";
-import { registerWbExecuteAction } from "./tools/wb-execute-action.js";
 import { registerWbEntityTools } from "./tools/wb-entities.js";
 import { registerWbComponent } from "./tools/wb-components.js";
 import { registerWbTerrain } from "./tools/wb-terrain.js";
@@ -55,11 +61,73 @@ import { registerAnimationGraph } from "./tools/animation-graph.js";
 import { registerWbKnowledge } from "./tools/wb-knowledge.js";
 import { registerBuildingSetup } from "./tools/building-setup.js";
 import type { Config } from "./config.js";
-import { ObserverCoordinator } from "./observer/coordinator.js";
+import { createObserverApplication } from "./observer/application.js";
 import { registerObserverTools } from "./observer/tools.js";
-import { closeObserverRuntimeLifecycle, OwnedRuntimeManager } from "./observer/owned-runtime-manager.js";
 
+/**
+ * Explicit application shutdown contract returned by {@link registerTools}.
+ * Embedders must await this disposer before closing their MCP server so owned
+ * observer runtime lifecycle state can be sealed through supported APIs.
+ */
 export type RegisteredToolsDisposer = () => Promise<Record<string, unknown>>;
+
+/**
+ * The process-wide Workbench lifecycle object graph owned by the MCP server.
+ * Keeping construction here makes it impossible for tool registrars or the
+ * observer adapter to accidentally create a second coordinator.
+ */
+export interface WorkbenchServerComposition {
+  readonly processGuard: WorkbenchProcessGuard;
+  readonly netApi: WorkbenchNetApiClient;
+  readonly activityGate: WorkbenchActivityGate;
+  readonly childSupervisor: ChildSupervisor;
+  readonly companionProvider: WorkbenchCompanionProvider;
+  readonly lifecycleExecution: WorkbenchLifecycleExecutionPort;
+  readonly diagnostics: typeof diagnoseWorkbench;
+  readonly client: WorkbenchSessionController;
+}
+
+export function createWorkbenchServerComposition(config: Config): WorkbenchServerComposition {
+  const observerConfig = config.observer;
+  const processGuard = new WorkbenchProcessGuard();
+  const netApi = new WorkbenchNetApiClient(config.workbenchHost, config.workbenchPort);
+  const activityGate = new WorkbenchActivityGate();
+  const childSupervisor = new ChildSupervisor();
+  const companionProvider = new WorkbenchHelperStager({
+    managedRoot: observerConfig?.managedRoot ?? defaultWorkbenchHelperManagedRoot(),
+  });
+  const lifecycleExecution = WorkbenchSessionController.composeLifecycleExecution({
+    processGuard,
+    childSupervisor,
+  });
+  const diagnostics = diagnoseWorkbench;
+  const client = new WorkbenchSessionController(
+    config.workbenchHost,
+    config.workbenchPort,
+    config,
+    undefined,
+    processGuard,
+    {
+      companionProvider,
+      netApi,
+      activityGate,
+      childSupervisor,
+      lifecycleExecution,
+      diagnostics,
+    }
+  );
+
+  return Object.freeze({
+    processGuard,
+    netApi,
+    activityGate,
+    childSupervisor,
+    companionProvider,
+    lifecycleExecution,
+    diagnostics,
+    client,
+  });
+}
 
 export function registerTools(server: McpServer, config: Config): RegisteredToolsDisposer {
   const searchEngine = new SearchEngine(config.dataDir);
@@ -84,28 +152,19 @@ export function registerTools(server: McpServer, config: Config): RegisteredTool
 
   // Workbench Live Control tools (Phase 4)
   const observerConfig = config.observer;
-  const workbenchCompanion = new WorkbenchHelperStager({
-    managedRoot: observerConfig?.managedRoot ?? defaultWorkbenchHelperManagedRoot(),
-  });
-  const wbClient = new WorkbenchClient(
-    config.workbenchHost,
-    config.workbenchPort,
-    config,
-    undefined,
-    undefined,
-    { companionProvider: workbenchCompanion }
-  );
+  const { client: wbClient } = createWorkbenchServerComposition(config);
   // The observer adapter deliberately shares the one Workbench client and its
   // lifecycle/activity gate with every other Workbench tool. It never owns an
   // independent connection or auto-launch path.
   const workbenchObserver = new WorkbenchObserverAdapter(wbClient, {
     handlerTimeoutMs: observerConfig?.requestTimeoutMs,
   });
-  const observerCoordinator = new ObserverCoordinator({
+  const observerApplication = createObserverApplication({
     agentPath: observerConfig?.agentPath,
     managedRoot: observerConfig?.managedRoot,
     profileRoot: observerConfig?.profileRoot,
     projectPath: config.projectPath,
+    gamePath: config.gamePath,
     startupTimeoutMs: observerConfig?.startupTimeoutMs,
     requestTimeoutMs: observerConfig?.requestTimeoutMs,
     defaultCaptureTimeoutMs: observerConfig?.defaultCaptureTimeoutMs,
@@ -117,13 +176,8 @@ export function registerTools(server: McpServer, config: Config): RegisteredTool
     supportingLogRoots: observerConfig?.supportingLogRoots,
     workbenchAdapter: workbenchObserver,
   });
-  const ownedRuntimeManager = new OwnedRuntimeManager({
-    managedRoot: observerConfig?.managedRoot ?? defaultWorkbenchHelperManagedRoot(),
-    gamePath: config.gamePath,
-    projectPath: config.projectPath,
-    observerGate: observerCoordinator,
-  });
-  registerObserverTools(server, observerCoordinator, {
+  const ownedRuntimeManager = observerApplication.ownedRuntimeManager!;
+  registerObserverTools(server, observerApplication, {
     sessionTtlMs: observerConfig?.sessionTtlMs,
     defaultCaptureTimeoutMs: observerConfig?.defaultCaptureTimeoutMs,
     workbenchClient: wbClient,
@@ -132,31 +186,9 @@ export function registerTools(server: McpServer, config: Config): RegisteredTool
   });
   let observerShutdown: Promise<Record<string, unknown>> | null = null;
   const disposeObserverLifecycle = (): Promise<Record<string, unknown>> => {
-    observerShutdown ??= closeObserverRuntimeLifecycle(ownedRuntimeManager, observerCoordinator);
+    observerShutdown ??= observerApplication.closeRuntimeLifecycle();
     return observerShutdown;
   };
-  const protocolServer = (server as unknown as { server?: { onclose?: () => void } }).server;
-  if (protocolServer) {
-    const previousOnClose = protocolServer.onclose;
-    protocolServer.onclose = () => {
-      try {
-        previousOnClose?.();
-      } finally {
-        const fallbackShutdown = observerShutdown === null;
-        void disposeObserverLifecycle().then((result) => {
-          if (!fallbackShutdown) return;
-          const errors = Array.isArray(result.errorRuntimes) ? result.errorRuntimes.length : 0;
-          const busy = Array.isArray(result.busyRuntimeIds) ? result.busyRuntimeIds.length : 0;
-          if (errors > 0 || busy > 0) {
-            console.error(`[reforger-forge-observer] shutdown left ${busy} busy and ${errors} unverifiable runtime lifecycle(s) unsealed`);
-          }
-        }).catch((error) => {
-          if (!fallbackShutdown) return;
-          console.error(`[reforger-forge-observer] lifecycle shutdown sealing failed: ${error instanceof Error ? error.message : String(error)}`);
-        });
-      }
-    };
-  }
   registerWbLaunch(server, config, wbClient);
   registerWbConnect(server, wbClient);
   registerWbDiagnose(server, wbClient);
@@ -164,7 +196,6 @@ export function registerTools(server: McpServer, config: Config): RegisteredTool
   registerWbRestart(server, wbClient);
   registerWbShutdown(server, wbClient);
   registerWbEditorTools(server, wbClient);
-  registerWbExecuteAction(server, wbClient);
   registerWbEntityTools(server, wbClient);
   registerWbComponent(server, wbClient);
   registerWbTerrain(server, wbClient);

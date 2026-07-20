@@ -23,7 +23,7 @@ import {
   type RuntimeStopPreflight,
 } from "../../src/observer/owned-runtime-manager.js";
 import type { ObserverLaunchInput, ObserverPreparedLaunch } from "../../src/observer/launch.js";
-import type { SupervisedChildExit } from "../../src/workbench/child-supervisor.js";
+import type { SupervisedChildExit } from "../../src/foundation/child-supervisor.js";
 
 interface FixtureProcess {
   identity: OwnedRuntimeExactIdentity;
@@ -55,7 +55,7 @@ class ExitBackend implements OwnedRuntimeProcessBackend {
     return {
       pid,
       executablePath: process.execPath,
-      creationTimeFileTime: "910001",
+      creationTime: "910001",
       userSid: "S-1-5-21-exit-reconciliation-fixture",
     };
   }
@@ -198,7 +198,7 @@ function makeHarness(): ExitHarness {
       identity: {
         pid: child.pid,
         executablePath: file,
-        creationTimeFileTime: String(800_000 + child.pid),
+        creationTime: String(800_000 + child.pid),
       },
       ownerArgument,
     });
@@ -394,7 +394,7 @@ describe("OwnedRuntimeManager child-exit retry", () => {
       identity: {
         pid: newReceipt.pid,
         executablePath: newReceipt.executablePath,
-        creationTimeFileTime: newReceipt.creationTimeFileTime,
+        creationTime: newReceipt.creationTimeFileTime,
       },
       ownerArgument: newReceipt.ownerTokenArgument,
     });

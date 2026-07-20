@@ -1,7 +1,9 @@
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
-import { existsSync, lstatSync, readFileSync, renameSync, unlinkSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, renameSync, unlinkSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { z } from "zod";
+import { boundedOption } from "#foundation/bounded-option";
+import { BoundedJsonMap, BoundedJsonStore } from "#foundation/json-store";
 import {
   ADDON_VERSION,
   DEFAULT_LIMITS,
@@ -15,8 +17,8 @@ import {
   type InstanceRegistration,
   type SessionContract,
 } from "../protocol/index.js";
-import { ObserverError } from "./errors.js";
-import { assertManagedPath, atomicWriteJson, ensureCanonicalDirectory, resolveEngineProfileDirectory } from "./paths.js";
+import { ObserverError, observerOptionError } from "./errors.js";
+import { assertManagedPath, ensureCanonicalDirectory, resolveEngineProfileDirectory } from "./paths.js";
 
 export interface Clock {
   now(): number;
@@ -112,6 +114,8 @@ const durableSessionRecordSchema = z.object({
   revokedAt: z.number().int().nonnegative().nullable(),
 });
 
+const MAX_SESSION_CONTRACT_BYTES = 1024 * 1024;
+
 export type AgentLeaseProbeResult = "same" | "different" | "absent" | "unverifiable";
 
 export interface ContractRecoveryResult {
@@ -134,11 +138,15 @@ function equalDigest(left: string, right: string): boolean {
 }
 
 function parseExistingContract(contractPath: string): SessionContract {
-  if (lstatSync(contractPath).isSymbolicLink()) {
-    throw new ObserverError("PROFILE_CONFLICT", "Observer profile contract is a symbolic link");
-  }
   try {
-    return sessionContractSchema.parse(JSON.parse(readFileSync(contractPath, "utf8")));
+    const contract = new BoundedJsonStore({
+      root: dirname(contractPath),
+      minRecordBytes: 2,
+      maxRecordBytes: MAX_SESSION_CONTRACT_BYTES,
+      parse: (value) => sessionContractSchema.parse(value),
+    }).read(contractPath);
+    if (!contract) throw new Error("session contract is missing");
+    return contract;
   } catch (error) {
     if (error instanceof ObserverError) throw error;
     throw new ObserverError("PROFILE_CONFLICT", "Observer profile contains an unrecognized session contract");
@@ -146,7 +154,7 @@ function parseExistingContract(contractPath: string): SessionContract {
 }
 
 export class SessionStore {
-  private readonly sessions = new Map<string, SessionRecord>();
+  private readonly sessions: BoundedJsonMap<string, SessionRecord>;
   private readonly retentionPins = new Map<string, Set<string>>();
   private readonly lifecycleLeases = new Map<string, Set<string>>();
   readonly terminalRetentionMs: number;
@@ -154,27 +162,40 @@ export class SessionStore {
   readonly maxEstimatedBytes: number;
 
   constructor(private readonly clock: Clock = systemClock, options: SessionStoreOptions = {}) {
-    this.terminalRetentionMs = this.boundedOption(
+    this.terminalRetentionMs = boundedOption(
       options.terminalRetentionMs,
       SESSION_TOMBSTONE_RETENTION_MS,
       0,
       24 * 60 * 60_000,
-      "Session terminal retention"
+      "Session terminal retention",
+      observerOptionError
     );
-    this.maxRecords = this.boundedOption(
+    this.maxRecords = boundedOption(
       options.maxRecords,
       DEFAULT_SESSION_MAX_RECORDS,
       1,
       100_000,
-      "Session record limit"
+      "Session record limit",
+      observerOptionError
     );
-    this.maxEstimatedBytes = this.boundedOption(
+    this.maxEstimatedBytes = boundedOption(
       options.maxEstimatedBytes,
       DEFAULT_SESSION_MAX_BYTES,
       1_024,
       1024 * 1024 * 1024,
-      "Session store byte limit"
+      "Session store byte limit",
+      observerOptionError
     );
+    this.sessions = new BoundedJsonMap({
+      maxRecords: this.maxRecords,
+      maxEstimatedBytes: this.maxEstimatedBytes,
+      estimateBytes: (_sessionId, record) => this.budgetedRecordBytes(record),
+      capacityError: () => new ObserverError(
+        "TRANSPORT_UNAVAILABLE",
+        "Observer session store retention budget is exhausted",
+        503
+      ),
+    });
   }
 
   async recoverProfileContract(
@@ -283,7 +304,12 @@ export class SessionStore {
       revokedAt: null,
     };
     this.assertCapacity(record);
-    atomicWriteJson(profilePath, contractPath, contract);
+    new BoundedJsonStore({
+      root: observerDirectory,
+      minRecordBytes: 2,
+      maxRecordBytes: MAX_SESSION_CONTRACT_BYTES,
+      parse: (value) => sessionContractSchema.parse(value),
+    }).write(contractPath, contract);
     this.sessions.set(sessionId, record);
     return { contract, record, contractPath };
   }
@@ -546,7 +572,7 @@ export class SessionStore {
       terminal: records.length - active,
       pinned: [...this.retentionPins.values()].filter((owners) => owners.size > 0).length,
       lifecycleLeased: [...this.lifecycleLeases.values()].filter((owners) => owners.size > 0).length,
-      estimatedBytes: records.reduce((total, record) => total + this.budgetedRecordBytes(record), 0),
+      estimatedBytes: this.sessions.estimatedBytes(),
       actualBytes: records.reduce((total, record) => total + this.recordBytes(record), 0),
       maxRecords: this.maxRecords,
       maxEstimatedBytes: this.maxEstimatedBytes,
@@ -559,13 +585,7 @@ export class SessionStore {
     // to the coordinated sweep. Never perform an unpinned retention mutation
     // from this local capacity check.
     void sweep;
-    const replacing = this.sessions.get(record.sessionId);
-    const nextRecords = this.sessions.size + (replacing ? 0 : 1);
-    const currentBytes = [...this.sessions.values()].reduce((total, existing) => total + this.budgetedRecordBytes(existing), 0);
-    const nextBytes = currentBytes - (replacing ? this.budgetedRecordBytes(replacing) : 0) + this.budgetedRecordBytes(record);
-    if (nextRecords > this.maxRecords || nextBytes > this.maxEstimatedBytes) {
-      throw new ObserverError("TRANSPORT_UNAVAILABLE", "Observer session store retention budget is exhausted", 503);
-    }
+    this.sessions.assertCanSet(record.sessionId, record);
   }
 
   private recordBytes(record: SessionRecord): number {
@@ -583,11 +603,4 @@ export class SessionStore {
     });
   }
 
-  private boundedOption(value: number | undefined, fallback: number, minimum: number, maximum: number, label: string): number {
-    const selected = value ?? fallback;
-    if (!Number.isSafeInteger(selected) || selected < minimum || selected > maximum) {
-      throw new ObserverError("INVALID_REQUEST", `${label} must be an integer from ${minimum} through ${maximum}`);
-    }
-    return selected;
-  }
 }

@@ -1,11 +1,10 @@
-import { randomUUID } from "node:crypto";
 import { once } from "node:events";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Config } from "../../../src/config.js";
 import { WorkbenchClient, WorkbenchError } from "../../../src/workbench/client.js";
 import { canonicalizeGproj } from "../../../src/workbench/project-identity.js";
-import { WorkbenchProcessGuard, type LifecycleOperationKind } from "../../../src/workbench/process-guard.js";
+import { WorkbenchProcessGuard } from "../../../src/workbench/process-guard.js";
 
 const stateDir = process.env.RR_STATE_DIR;
 const helperPath = process.env.RR_HELPER_PATH;
@@ -37,12 +36,8 @@ const config: Config = {
   workbenchPort: endpoint.port,
 };
 
-async function claim(kind: LifecycleOperationKind): Promise<unknown> {
-  return guard.withLifecycleLock((session) => session.validateAndClaim({
-    endpoint,
-    target,
-    operation: { kind, operationId: randomUUID() },
-  }));
+async function claim(): Promise<unknown> {
+  return guard.withLifecycleLock((session) => session.validateAndClaim({ endpoint, target }));
 }
 
 async function refused(action: () => Promise<unknown>): Promise<unknown> {
@@ -60,7 +55,7 @@ async function refused(action: () => Promise<unknown>): Promise<unknown> {
 
 try {
   if (role === "owner") {
-    const result = await claim("launch");
+    const result = await claim();
     process.stdout.write(`${JSON.stringify({ role, result })}\n`);
   } else if (role === "contender") {
     const client = new WorkbenchClient(

@@ -148,9 +148,9 @@ describe("requirePlayMode", () => {
     const result = requirePlayMode(client, "stop play mode");
     expect(result).not.toBeNull();
     expect(result).toContain("edit mode");
-    expect(result).toContain("Enter Play mode manually");
-    expect(result).toContain("automated `wb_play` is disabled");
+    expect(result).toContain("No automated Play tool exists");
+    expect(result).toContain("enter Play mode manually");
     expect(result).toContain("wb_state");
-    expect(result).not.toContain("Call `wb_play`");
+    expect(result).not.toContain("wb_play");
   });
 });

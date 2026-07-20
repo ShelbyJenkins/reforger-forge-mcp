@@ -2,7 +2,7 @@ import { mkdirSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { createObserverAgent } from "../../observer/agent/index.js";
+import { createObserverApplication } from "../../observer/agent/application.js";
 import { MailboxCoordinator } from "../../observer/agent/mailbox-coordinator.js";
 import { OBSERVER_BUILD_IDENTITY } from "../../observer/protocol/index.js";
 import {
@@ -82,10 +82,13 @@ describe("observer in-memory retention", () => {
     const clock = new FakeClock();
     const profileRoot = join(root, "profiles");
     mkdirSync(profileRoot, { recursive: true });
-    const agent = createObserverAgent({
+    const evidenceRoot = join(root, "evidence");
+    mkdirSync(evidenceRoot, { recursive: true });
+    const agent = createObserverApplication({
       root: join(root, "managed"),
       profileRoot,
       sourceDirectory: observerAddonSource,
+      evidenceRoots: [evidenceRoot],
       clock,
       sessionStore: { terminalRetentionMs: 0 },
       registry: { staleAfterMs: 1_000, staleRetentionMs: 0 },
@@ -192,10 +195,13 @@ describe("observer in-memory retention", () => {
     const clock = new FakeClock();
     const profileRoot = join(root, "profiles");
     mkdirSync(profileRoot, { recursive: true });
-    const agent = createObserverAgent({
+    const evidenceRoot = join(root, "evidence");
+    mkdirSync(evidenceRoot, { recursive: true });
+    const agent = createObserverApplication({
       root: join(root, "managed"),
       profileRoot,
       sourceDirectory: observerAddonSource,
+      evidenceRoots: [evidenceRoot],
       clock,
       sessionStore: {
         terminalRetentionMs: 0,
@@ -279,7 +285,7 @@ describe("observer in-memory retention", () => {
     const clock = new FakeClock();
     const profileRoot = join(root, "profiles");
     mkdirSync(profileRoot, { recursive: true });
-    const agent = createObserverAgent({
+    const agent = createObserverApplication({
       root: join(root, "managed"),
       profileRoot,
       sourceDirectory: observerAddonSource,
@@ -344,10 +350,13 @@ describe("observer in-memory retention", () => {
     const clock = new FakeClock();
     const profileRoot = join(root, "profiles");
     mkdirSync(profileRoot, { recursive: true });
-    const agent = createObserverAgent({
+    const evidenceRoot = join(root, "evidence");
+    mkdirSync(evidenceRoot, { recursive: true });
+    const agent = createObserverApplication({
       root: join(root, "managed"),
       profileRoot,
       sourceDirectory: observerAddonSource,
+      evidenceRoots: [evidenceRoot],
       clock,
       sessionStore: { terminalRetentionMs: 0, maxRecords: 8 },
       jobs: {

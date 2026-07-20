@@ -1,7 +1,7 @@
 import { mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { createObserverAgent } from "../../observer/agent/index.js";
+import { createObserverApplication } from "../../observer/agent/application.js";
 import { probeAgentLease } from "../../observer/agent/control-api.js";
 import { requestObserverControl } from "../../observer/agent/control-client.js";
 import { cleanup, observerAddonSource, temporaryDirectory } from "./helpers.js";
@@ -27,7 +27,7 @@ describe("observer runtime HTTP API", () => {
     roots.push(root);
     const profileRoot = join(root, "profiles");
     mkdirSync(profileRoot, { recursive: true });
-    const agent = createObserverAgent({ root: join(root, "managed"), profileRoot, sourceDirectory: observerAddonSource, enableControlHttp: true });
+    const agent = createObserverApplication({ root: join(root, "managed"), profileRoot, sourceDirectory: observerAddonSource, enableControlHttp: true });
     const descriptor = await agent.server.start();
     closers.push(() => agent.server.close());
     expect(descriptor.host).toBe("127.0.0.1");
@@ -101,7 +101,7 @@ describe("observer runtime HTTP API", () => {
   it("enforces the body limit before JSON parsing", async () => {
     const root = temporaryDirectory();
     roots.push(root);
-    const agent = createObserverAgent({ root: join(root, "managed"), sourceDirectory: observerAddonSource, maxBodyBytes: 64 });
+    const agent = createObserverApplication({ root: join(root, "managed"), sourceDirectory: observerAddonSource, maxBodyBytes: 64 });
     const descriptor = await agent.server.start();
     closers.push(() => agent.server.close());
     const response = await post(`http://${descriptor.host}:${descriptor.port}/v1/runtime/register`, { padding: "x".repeat(200) });

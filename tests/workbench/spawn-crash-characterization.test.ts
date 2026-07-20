@@ -16,6 +16,7 @@ import {
   WorkbenchProcessGuard,
   type ExactProcessIdentity,
   type WorkbenchLifecycleStateV3,
+  type WorkbenchSpawnRecord,
 } from "../../src/workbench/process-guard.js";
 import {
   runWorkbenchIntent,
@@ -26,7 +27,10 @@ import {
   fakeCompanionProvider,
   WORKBENCH_HELPER_PING_RESPONSE,
 } from "./fake-companion.js";
-import { FakeLifecycleBackend } from "./fake-lifecycle-backend.js";
+import {
+  createFakeLifecycleBackend,
+  type FakeLifecycleBackend,
+} from "./fake-lifecycle-backend.js";
 
 type SpawnCrashCut =
   | "before_spawn"
@@ -38,36 +42,42 @@ type SpawnCrashCut =
 const CRASH_CUTS: ReadonlyArray<{
   cut: SpawnCrashCut;
   processCreated: boolean;
+  journalPhase: WorkbenchSpawnRecord["phase"];
   exactIdentityDurable: boolean;
   clientRecovery: "retry_launch" | "preserve_manual" | "cleanup_then_retry";
 }> = [
   {
     cut: "before_spawn",
     processCreated: false,
+    journalPhase: "pre_spawn",
     exactIdentityDurable: false,
     clientRecovery: "retry_launch",
   },
   {
     cut: "after_spawn",
     processCreated: true,
+    journalPhase: "pre_spawn",
     exactIdentityDurable: false,
     clientRecovery: "preserve_manual",
   },
   {
     cut: "after_exact_inspection",
     processCreated: true,
+    journalPhase: "spawned_unverified",
     exactIdentityDurable: false,
     clientRecovery: "preserve_manual",
   },
   {
     cut: "before_durable_publication",
     processCreated: true,
-    exactIdentityDurable: false,
-    clientRecovery: "preserve_manual",
+    journalPhase: "identity_verified",
+    exactIdentityDurable: true,
+    clientRecovery: "cleanup_then_retry",
   },
   {
     cut: "after_durable_publication",
     processCreated: true,
+    journalPhase: "identity_verified",
     exactIdentityDurable: true,
     clientRecovery: "cleanup_then_retry",
   },
@@ -104,6 +114,7 @@ interface WorkbenchCrashHarness {
 interface CapturedWorkbenchCut {
   cut: SpawnCrashCut;
   state: WorkbenchLifecycleStateV3;
+  journal: { version: 3; generation: string; record: WorkbenchSpawnRecord };
   process: {
     identity: ExactProcessIdentity;
     ownerArgument: string;
@@ -140,9 +151,8 @@ function createHarness(label: string): WorkbenchCrashHarness {
     patternsDir: join(root, "patterns"),
     workbenchHost: "127.0.0.1",
     workbenchPort: 5775,
-    workbenchNoThrow: true,
   };
-  const backend = new FakeLifecycleBackend();
+  const backend = createFakeLifecycleBackend();
   const guard = new WorkbenchProcessGuard({
     backend,
     stateDir,
@@ -165,6 +175,16 @@ function readDurableState(harness: WorkbenchCrashHarness): WorkbenchLifecycleSta
   return JSON.parse(readFileSync(harness.guard.statePath, "utf8")) as WorkbenchLifecycleStateV3;
 }
 
+function readDurableJournal(
+  harness: WorkbenchCrashHarness
+): { version: 3; generation: string; record: WorkbenchSpawnRecord } {
+  return JSON.parse(readFileSync(harness.guard.spawnJournalPath, "utf8")) as {
+    version: 3;
+    generation: string;
+    record: WorkbenchSpawnRecord;
+  };
+}
+
 function installPhaseHooks(args: {
   harness: WorkbenchCrashHarness;
   cut: SpawnCrashCut;
@@ -182,6 +202,7 @@ function installPhaseHooks(args: {
     captured = {
       cut,
       state: readDurableState(harness),
+      journal: readDurableJournal(harness),
       process: processIdentity
         ? { identity: { ...processIdentity }, ownerArgument }
         : null,
@@ -256,9 +277,6 @@ async function captureClientCut(cut: SpawnCrashCut): Promise<CapturedWorkbenchCu
       launchPollIntervalMs: 1,
     }
   );
-  (client as unknown as {
-    waitForCompanionReady: () => Promise<void>;
-  }).waitForCompanionReady = vi.fn().mockResolvedValue(undefined);
   await expect(client.ensureRunning(harness.projectPath)).rejects.toBeDefined();
   return hooks.captured();
 }
@@ -273,6 +291,7 @@ async function captureRunnerCut(cut: SpawnCrashCut): Promise<CapturedWorkbenchCu
   }, {
     processGuard: harness.guard,
     companionProvider: fakeCompanionProvider(harness.companion),
+    managedRoot: join(harness.root, "managed-helper"),
     spawnProcess: hooks.spawnProcess,
     logRoot: harness.logRoot,
     endpointProbeTimeoutMs: 10,
@@ -294,7 +313,11 @@ function createReplacement(captured: CapturedWorkbenchCut, label: string): {
   const stateDir = join(captured.harness.root, `replacement-${label}`);
   mkdirSync(stateDir, { recursive: true });
   writeFileSync(join(stateDir, "lifecycle.json"), `${JSON.stringify(captured.state, null, 2)}\n`);
-  const backend = new FakeLifecycleBackend({
+  writeFileSync(
+    join(stateDir, "spawn-journal.json"),
+    `${JSON.stringify(captured.journal, null, 2)}\n`
+  );
+  const backend = createFakeLifecycleBackend({
     pid: 2_001,
     executablePath: process.execPath,
     creationTime: "133900000000002001",
@@ -322,32 +345,36 @@ afterEach(() => {
 describe("F8 Workbench spawn crash characterization", () => {
   it.each(CRASH_CUTS)(
     "client cut $cut leaves only the authority published before the crash",
-    async ({ cut, processCreated, exactIdentityDurable }) => {
+    async ({ cut, processCreated, journalPhase, exactIdentityDurable }) => {
       const captured = await captureClientCut(cut);
       expect(captured.state).toMatchObject({
         phase: "starting",
         operation: { kind: "launch" },
       });
       expect(captured.process !== null).toBe(processCreated);
-      expect(captured.state.workbench !== null).toBe(exactIdentityDurable);
+      expect(captured.journal.record.phase).toBe(journalPhase);
+      expect(captured.journal.record.identity !== null).toBe(exactIdentityDurable);
+      expect(captured.state.workbench !== null).toBe(cut === "after_durable_publication");
       if (exactIdentityDurable) {
-        expect(captured.state.workbench).toMatchObject(captured.process!.identity);
+        expect(captured.journal.record.identity).toMatchObject(captured.process!.identity);
       }
     }
   );
 
   it.each(CRASH_CUTS)(
     "runner cut $cut leaves only the authority published before the crash",
-    async ({ cut, processCreated, exactIdentityDurable }) => {
+    async ({ cut, processCreated, journalPhase, exactIdentityDurable }) => {
       const captured = await captureRunnerCut(cut);
       expect(captured.state).toMatchObject({
         phase: "starting",
         operation: { kind: "launch" },
       });
       expect(captured.process !== null).toBe(processCreated);
-      expect(captured.state.workbench !== null).toBe(exactIdentityDurable);
+      expect(captured.journal.record.phase).toBe(journalPhase);
+      expect(captured.journal.record.identity !== null).toBe(exactIdentityDurable);
+      expect(captured.state.workbench !== null).toBe(cut === "after_durable_publication");
       if (exactIdentityDurable) {
-        expect(captured.state.workbench).toMatchObject(captured.process!.identity);
+        expect(captured.journal.record.identity).toMatchObject(captured.process!.identity);
       }
     }
   );

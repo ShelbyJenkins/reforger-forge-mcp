@@ -11,27 +11,48 @@ import {
   readFileSync,
   readSync,
   readdirSync,
-  realpathSync,
-  renameSync,
-  fsyncSync,
   unlinkSync,
-  writeFileSync,
 } from "node:fs";
-import { dirname, isAbsolute, join, parse, relative, resolve, sep } from "node:path";
+import { dirname, join, parse, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
+import type {
+  ExactProcessBackend,
+  ExactProcessInspection,
+  ExactProcessTerminationResult,
+} from "../foundation/exact-process-backend.js";
+import type { ExactProcessIdentity } from "../foundation/identity.js";
+import type {
+  MachineMutex,
+  MachineMutexLeaseLoss,
+} from "../foundation/machine-mutex.js";
 import {
-  WindowsLifecycleBackend,
-  type ExactProcessIdentity,
-  type LifecycleGuardError,
-  type VerifyTerminateResult,
-  type WorkbenchIdentity,
-} from "../workbench/process-guard.js";
+  DurableReservationGate,
+  ReservationCancelledError,
+} from "../foundation/reservation-gate.js";
+import {
+  runRecoverableSpawn,
+  type RecoverableSpawnRecord,
+} from "../foundation/recoverable-spawn.js";
+import {
+  atomicWriteFile as foundationAtomicWriteFile,
+  BoundedJsonStore,
+  JsonStoreError,
+} from "../foundation/json-store.js";
+import {
+  assertRegularManagedFile,
+  canonicalizeExistingDirectory,
+  canonicalizePotentialPath,
+  isPathContained,
+  pathComparisonKey,
+  resolveManagedPath,
+} from "../foundation/managed-path.js";
+import { createWindowsExactProcessBackend } from "../platform/windows/exact-process-backend.js";
 import {
   ChildSupervisor,
   type SupervisedChildCounts,
   type SupervisedChildExit,
-} from "../workbench/child-supervisor.js";
+} from "../foundation/child-supervisor.js";
 import type {
   ObserverLaunchInput,
   ObserverPreparedLaunch,
@@ -104,94 +125,27 @@ export type OwnedRuntimeState =
   | "unverifiable"
   | "stale";
 
-export interface OwnedRuntimeExactIdentity {
-  pid: number;
-  executablePath: string;
-  creationTimeFileTime: string;
+/** @deprecated Use ExactProcessIdentity from foundation/identity. */
+export type OwnedRuntimeExactIdentity = ExactProcessIdentity;
+
+/** @deprecated Use ExactProcessInspection from foundation/exact-process-backend. */
+export type OwnedRuntimeInspection = ExactProcessInspection;
+
+/** @deprecated Use ExactProcessTerminationResult from foundation/exact-process-backend. */
+export type OwnedRuntimeTerminateResult = ExactProcessTerminationResult;
+
+/** Compatibility composition for callers that still provide one combined adapter. */
+export interface OwnedRuntimeProcessBackend extends ExactProcessBackend, MachineMutex {}
+
+function defaultOwnedRuntimeBackend(): OwnedRuntimeProcessBackend {
+  const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
+  return createWindowsExactProcessBackend(
+    join(packageRoot, "scripts", "windows", "workbench-lifecycle.ps1")
+  );
 }
 
-export interface OwnedRuntimeInspection {
-  identity: OwnedRuntimeExactIdentity;
-  ownerArgumentMatched: boolean | null;
-}
-
-export type OwnedRuntimeTerminateResult = VerifyTerminateResult;
-
-/** Generic exact-process surface used by the runtime manager. */
-export interface OwnedRuntimeProcessBackend {
-  readonly platform: "win32" | "test";
-  withMachineMutex<T>(args: {
-    name: string;
-    timeoutMs: number;
-    action: () => Promise<T>;
-    onLeaseLost?: (error: LifecycleGuardError) => void;
-  }): Promise<T>;
-  inspectCurrentProcess(pid: number): Promise<OwnedRuntimeExactIdentity & { userSid: string }>;
-  inspectProcess(pid: number, expectedOwnerTokenArgument?: string): Promise<OwnedRuntimeInspection | null>;
-  verifyAndTerminate(
-    expected: OwnedRuntimeExactIdentity & { ownerTokenArgument: string; launchedAtMs: number },
-    timeoutMs: number
-  ): Promise<OwnedRuntimeTerminateResult>;
-}
-
-/**
- * Reuses the native Windows handle implementation without exposing its
- * Workbench lifecycle state, endpoint, or name-enumeration operations.
- */
-export class WindowsOwnedRuntimeProcessBackend implements OwnedRuntimeProcessBackend {
-  readonly platform = "win32" as const;
-  private readonly backend: WindowsLifecycleBackend;
-
-  constructor(backend?: WindowsLifecycleBackend) {
-    const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
-    this.backend = backend ?? new WindowsLifecycleBackend(
-      join(packageRoot, "scripts", "windows", "workbench-lifecycle.ps1")
-    );
-  }
-
-  withMachineMutex<T>(args: {
-    name: string;
-    timeoutMs: number;
-    action: () => Promise<T>;
-    onLeaseLost?: (error: LifecycleGuardError) => void;
-  }): Promise<T> {
-    return this.backend.withMachineMutex(args);
-  }
-
-  async inspectCurrentProcess(pid: number): Promise<OwnedRuntimeExactIdentity & { userSid: string }> {
-    const identity = await this.backend.inspectCurrentProcess(pid);
-    return {
-      pid: identity.pid,
-      executablePath: identity.executablePath,
-      creationTimeFileTime: identity.creationTime,
-      userSid: identity.userSid,
-    };
-  }
-
-  async inspectProcess(
-    pid: number,
-    expectedOwnerTokenArgument?: string
-  ): Promise<OwnedRuntimeInspection | null> {
-    const inspection = await this.backend.inspectProcess(pid, expectedOwnerTokenArgument);
-    return inspection ? {
-      identity: runtimeIdentity(inspection.identity),
-      ownerArgumentMatched: inspection.ownerArgumentMatched,
-    } : null;
-  }
-
-  verifyAndTerminate(
-    expected: OwnedRuntimeExactIdentity & { ownerTokenArgument: string; launchedAtMs: number },
-    timeoutMs: number
-  ): Promise<OwnedRuntimeTerminateResult> {
-    const workbenchShape: WorkbenchIdentity = {
-      pid: expected.pid,
-      executablePath: expected.executablePath,
-      creationTime: expected.creationTimeFileTime,
-      ownerTokenArgument: expected.ownerTokenArgument,
-      launchedAtMs: expected.launchedAtMs,
-    };
-    return this.backend.verifyAndTerminate(workbenchShape, timeoutMs);
-  }
+function providesMachineMutex(value: ExactProcessBackend): value is ExactProcessBackend & MachineMutex {
+  return "withMachineMutex" in value && typeof value.withMachineMutex === "function";
 }
 
 export interface RuntimeStopPreflight {
@@ -263,7 +217,9 @@ export interface OwnedRuntimeManagerOptions {
   gamePath: string;
   observerGate: OwnedRuntimeObserverGate;
   projectPath?: string;
-  backend?: OwnedRuntimeProcessBackend;
+  backend?: ExactProcessBackend;
+  /** Required when backend does not also implement the legacy combined adapter. */
+  machineMutex?: MachineMutex;
   spawnProcess?: typeof nodeSpawn;
   executableResolver?: () => string;
   clock?: () => number;
@@ -559,14 +515,6 @@ const pendingStartSchema = z.object({
 });
 type PendingStart = z.infer<typeof pendingStartSchema>;
 
-function runtimeIdentity(identity: ExactProcessIdentity): OwnedRuntimeExactIdentity {
-  return {
-    pid: identity.pid,
-    executablePath: identity.executablePath,
-    creationTimeFileTime: identity.creationTime,
-  };
-}
-
 function sha256(value: string | Buffer): string {
   return createHash("sha256").update(value).digest("hex");
 }
@@ -674,13 +622,11 @@ function assertWindowsCommandLineFits(executablePath: string, argumentsArray: re
 }
 
 function pathKey(value: string): string {
-  const absolute = resolve(value);
-  return process.platform === "win32" ? absolute.toLowerCase() : absolute;
+  return pathComparisonKey(value);
 }
 
 function isContained(root: string, candidate: string): boolean {
-  const rel = relative(pathKey(root), pathKey(candidate));
-  return rel === "" || (!isAbsolute(rel) && rel !== ".." && !rel.startsWith(`..${sep}`));
+  return isPathContained(root, candidate);
 }
 
 function pathsOverlap(left: string, right: string): boolean {
@@ -689,18 +635,14 @@ function pathsOverlap(left: string, right: string): boolean {
 
 function assertNoLinkedDirectorySegments(directoryPath: string): void {
   const absolute = resolve(directoryPath);
-  const root = parse(absolute).root;
-  let current = root;
-  for (const segment of relative(root, absolute).split(sep).filter(Boolean)) {
-    current = join(current, segment);
-    if (!existsSync(current)) break;
-    const entry = lstatSync(current);
-    if (entry.isSymbolicLink() || !entry.isDirectory()) {
-      throw new OwnedRuntimeError(
-        "STORAGE_UNVERIFIABLE",
-        `Owned-runtime storage traverses a link or non-directory: ${current}`
-      );
-    }
+  try {
+    resolveManagedPath(parse(absolute).root, absolute, "no-links");
+  } catch (error) {
+    throw new OwnedRuntimeError(
+      "STORAGE_UNVERIFIABLE",
+      `Owned-runtime storage traverses a link or non-directory: ${absolute}`,
+      { cause: error instanceof Error ? error.message : String(error) }
+    );
   }
 }
 
@@ -713,37 +655,41 @@ function canonicalDirectory(directoryPath: string, create: boolean, rejectLinked
   if (supplied.isSymbolicLink() || !supplied.isDirectory()) {
     throw new OwnedRuntimeError("STORAGE_UNVERIFIABLE", `Owned-runtime storage is not a regular directory: ${absolute}`);
   }
-  const canonical = realpathSync.native(absolute);
-  return canonical;
+  try {
+    return canonicalizeExistingDirectory(absolute, "Owned-runtime storage");
+  } catch (error) {
+    throw new OwnedRuntimeError(
+      "STORAGE_UNVERIFIABLE",
+      error instanceof Error ? error.message : `Owned-runtime storage cannot be resolved: ${absolute}`
+    );
+  }
 }
 
 function canonicalDirectoryTarget(directoryPath: string, rejectLinkedSegments: boolean): string {
-  const absolute = resolve(directoryPath);
-  if (rejectLinkedSegments) assertNoLinkedDirectorySegments(absolute);
-  let existing = absolute;
-  while (!existsSync(existing)) {
-    const parent = dirname(existing);
-    if (parent === existing) {
-      throw new OwnedRuntimeError("STORAGE_UNVERIFIABLE", `Owned-runtime storage has no resolvable ancestor: ${absolute}`);
-    }
-    existing = parent;
+  try {
+    return canonicalizePotentialPath(directoryPath, {
+      linkPolicy: rejectLinkedSegments ? "no-links" : "follow-existing",
+      existingAncestor: "directory",
+      label: "Owned-runtime storage",
+    });
+  } catch (error) {
+    throw new OwnedRuntimeError(
+      "STORAGE_UNVERIFIABLE",
+      error instanceof Error
+        ? error.message
+        : `Owned-runtime storage cannot be resolved: ${resolve(directoryPath)}`,
+      { cause: error instanceof Error ? error.message : String(error) }
+    );
   }
-  const canonicalAncestor = rejectLinkedSegments
-    ? canonicalDirectory(existing, false, true)
-    : realpathSync.native(existing);
-  if (!lstatSync(canonicalAncestor).isDirectory()) {
-    throw new OwnedRuntimeError("STORAGE_UNVERIFIABLE", `Configured path has a non-directory ancestor: ${existing}`);
-  }
-  return resolve(canonicalAncestor, relative(existing, absolute));
 }
 
 function canonicalFile(filePath: string, label: string): string {
   const absolute = resolve(filePath);
-  const entry = lstatSync(absolute);
-  if (entry.isSymbolicLink() || !entry.isFile()) {
+  try {
+    return assertRegularManagedFile(dirname(absolute), absolute);
+  } catch {
     throw new OwnedRuntimeError("IDENTITY_UNVERIFIABLE", `${label} is not a regular non-link file`);
   }
-  return realpathSync.native(absolute);
 }
 
 function assertNoOwnerArgument(argumentsArray: readonly string[]): void {
@@ -816,7 +762,9 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
   readonly managerInstanceId: string;
   readonly installationId: string;
   readonly storageRoot: string;
-  private readonly backend: OwnedRuntimeProcessBackend;
+  private readonly backend: ExactProcessBackend;
+  private readonly machineMutex: MachineMutex;
+  private readonly durableReservations = new DurableReservationGate();
   private readonly spawnProcess: typeof nodeSpawn;
   private readonly clock: () => number;
   private readonly createOwnerToken: () => string;
@@ -836,7 +784,16 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
 
   constructor(private readonly options: OwnedRuntimeManagerOptions) {
     this.managerInstanceId = randomUUID();
-    this.backend = options.backend ?? new WindowsOwnedRuntimeProcessBackend();
+    this.backend = options.backend ?? defaultOwnedRuntimeBackend();
+    const machineMutex = options.machineMutex ??
+      (providesMachineMutex(this.backend) ? this.backend : null);
+    if (!machineMutex) {
+      throw new OwnedRuntimeError(
+        "INVALID_REQUEST",
+        "Owned runtime process backend requires a machine mutex adapter"
+      );
+    }
+    this.machineMutex = machineMutex;
     this.spawnProcess = options.spawnProcess ?? nodeSpawn;
     this.clock = options.clock ?? Date.now;
     this.createOwnerToken = options.ownerToken ?? (() => randomBytes(32).toString("base64url"));
@@ -894,21 +851,21 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
     action: (fence: OwnedRuntimeLeaseFence) => Promise<T>,
     deadline?: OwnedRuntimeWallDeadline
   ): Promise<T> {
-    let leaseLoss: LifecycleGuardError | null = null;
+    let leaseLoss: MachineMutexLeaseLoss | null = null;
     const fence: OwnedRuntimeLeaseFence = {
       assertActive: () => {
         if (leaseLoss) {
           throw new OwnedRuntimeError(
             "RECOVERY_REQUIRED",
             "Owned-runtime lifecycle mutex lease was lost; durable state was preserved for recovery",
-            { reason: leaseLoss.code }
+            { reason: leaseLoss.code ?? "MUTEX_LEASE_LOST" }
           );
         }
         if (deadline) this.remainingWallBudget(deadline);
       },
     };
     const acquire = async (remainingMs = this.lockTimeoutMs): Promise<T> =>
-      this.backend.withMachineMutex({
+      this.machineMutex.withMachineMutex({
         name: OWNED_RUNTIME_LIFECYCLE_MUTEX,
         timeoutMs: Math.min(this.lockTimeoutMs, remainingMs),
         onLeaseLost: (error) => { leaseLoss = error; },
@@ -1077,7 +1034,7 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
       identity: {
         pid: pending.pid,
         executablePath: pending.executablePath,
-        creationTimeFileTime: pending.creationTimeFileTime,
+        creationTime: pending.creationTimeFileTime,
         ownerTokenArgument: pending.ownerTokenArgument,
         launchedAtMs: pending.launchedAtMs,
       },
@@ -1091,7 +1048,7 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
     if (!inspection) return "absent";
     if (inspection.identity.pid !== authority.identity.pid ||
         pathKey(inspection.identity.executablePath) !== pathKey(authority.identity.executablePath) ||
-        inspection.identity.creationTimeFileTime !== authority.identity.creationTimeFileTime ||
+        inspection.identity.creationTime !== authority.identity.creationTime ||
         inspection.ownerArgumentMatched === false) {
       return "absent";
     }
@@ -1343,7 +1300,7 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
       bundleDigest: prepared.bundleDigest,
     });
     try {
-      return await this.backend.withMachineMutex({
+      return await this.machineMutex.withMachineMutex({
         name: OWNED_RUNTIME_LIFECYCLE_MUTEX,
         timeoutMs: this.lockTimeoutMs,
         action: async () => {
@@ -1477,7 +1434,7 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
   /** Explicit bounded retention hook for controlled shutdown and diagnostics. */
   async sweep(now = this.clock()): Promise<OwnedRuntimeSweepResult> {
     try {
-      return await this.backend.withMachineMutex({
+      return await this.machineMutex.withMachineMutex({
         name: OWNED_RUNTIME_LIFECYCLE_MUTEX,
         timeoutMs: this.lockTimeoutMs,
         action: async () => {
@@ -2047,75 +2004,131 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
       createdAt: pendingCreatedAt,
       updatedAt: pendingCreatedAt,
     });
-    this.atomicWrite(root, this.pendingStartPath(runtimeId), pending, true);
 
     let child: ChildProcess | null = null;
     let receiptPublished = false;
     let pinnedReceipt: OwnedRuntimeReceipt | null = null;
     try {
-      leaseFence.assertActive();
-      child = this.spawnProcess(executablePath, argumentsArray, {
-        cwd: dirname(executablePath),
-        detached: false,
-        shell: false,
-        stdio: "ignore",
-        windowsHide: false,
+      const transaction = await runRecoverableSpawn({
+        transactionId: runtimeId,
+        metadata: pending,
+        backend: this.backend,
+        fence: leaseFence,
+        now: this.clock,
+        journal: {
+          persist: async (
+            _previous: RecoverableSpawnRecord<OwnedRuntimeExactIdentity, PendingStart> | null,
+            next: RecoverableSpawnRecord<OwnedRuntimeExactIdentity, PendingStart>
+          ) => {
+            if (next.phase === "pre_spawn") {
+              pending = next.metadata;
+              this.atomicWrite(root, this.pendingStartPath(runtimeId), pending, true);
+            } else if (next.phase === "spawned_unverified") {
+              pending = this.updatePendingStart(root, pending, {
+                state: "spawned_unverified",
+                pid: next.pid,
+              });
+            } else if (next.phase === "identity_verified") {
+              const receipt = pinnedReceipt;
+              if (!receipt || !next.identity) {
+                throw new OwnedRuntimeError(
+                  "IDENTITY_UNVERIFIABLE",
+                  "Recoverable spawn journal received no exact runtime identity"
+                );
+              }
+              pending = this.updatePendingStart(root, pending, {
+                state: "identity_verified",
+                pid: next.identity.pid,
+                creationTimeFileTime: next.identity.creationTime,
+                lifecycleGeneration: runtimeLifecycleGeneration(receipt),
+              });
+            } else {
+              // The immutable runtime receipt is authoritative. Pending-start
+              // completion is best-effort and remains replayable by sweep.
+              try {
+                pending = this.updatePendingStart(root, pending, { state: "succeeded" });
+              } catch {
+                // Preserve the successful publication.
+              }
+            }
+            return next;
+          },
+        },
+        spawn: () => {
+          child = this.spawnProcess(executablePath, argumentsArray, {
+            cwd: dirname(executablePath),
+            detached: false,
+            shell: false,
+            stdio: "ignore",
+            windowsHide: false,
+          });
+          return child;
+        },
+        childPid: (spawned) => spawned.pid,
+        awaitSpawn: (spawned) => this.awaitSpawn(spawned),
+        inspect: async (spawned) => {
+          const identity = await this.inspectSpawned(
+            spawned,
+            executablePath,
+            ownerTokenArgument
+          );
+          const executableFileAfterSpawn = inspectExecutableFile(executablePath);
+          if (!executableFilesMatch(executableFile, executableFileAfterSpawn)) {
+            throw new OwnedRuntimeError(
+              "IDENTITY_MISMATCH",
+              "Graphical runtime executable was replaced during start"
+            );
+          }
+          pinnedReceipt = runtimeReceiptSchema.parse({
+            version: STORAGE_VERSION,
+            runtimeId,
+            sessionId: descriptor.sessionId,
+            preparedLaunchId,
+            pid: identity.pid,
+            executablePath: identity.executablePath,
+            executableFile: executableFileAfterSpawn,
+            creationTimeFileTime: identity.creationTime,
+            ownerTokenArgument,
+            argvSha256,
+            profilePath: descriptor.profilePath,
+            runtimeKind: descriptor.runtimeKind,
+            startedAt: new Date(launchedAtMs).toISOString(),
+            launchedAtMs,
+            preparedExpiresAt: descriptor.expiresAt,
+            mcpOwner,
+          });
+          return identity;
+        },
+        beforePublish: async () => {
+          const receipt = pinnedReceipt;
+          if (!receipt) {
+            throw new OwnedRuntimeError(
+              "IDENTITY_UNVERIFIABLE",
+              "Exact runtime receipt was not prepared before lifecycle retention"
+            );
+          }
+          // The retained generation is acquired before successful ownership
+          // publication; exact vacancy is the only later release authority.
+          await this.retainRuntimeLifecycle(receipt);
+        },
+        publish: async () => {
+          const receipt = pinnedReceipt;
+          if (!receipt) {
+            throw new OwnedRuntimeError(
+              "IDENTITY_UNVERIFIABLE",
+              "Exact runtime receipt was not prepared before publication"
+            );
+          }
+          this.atomicWrite(root, this.runtimePath(runtimeId), receipt, true);
+          receiptPublished = true;
+          return receipt;
+        },
       });
-      pending = this.updatePendingStart(root, pending, {
-        state: "spawned_unverified",
-        pid: Number.isSafeInteger(child.pid) && (child.pid ?? 0) > 0 ? child.pid! : null,
-      });
-      await this.awaitSpawn(child);
-      leaseFence.assertActive();
-      const identity = await this.inspectSpawned(child, executablePath, ownerTokenArgument);
-      leaseFence.assertActive();
-      const executableFileAfterSpawn = inspectExecutableFile(executablePath);
-      if (!executableFilesMatch(executableFile, executableFileAfterSpawn)) {
-        throw new OwnedRuntimeError("IDENTITY_MISMATCH", "Graphical runtime executable was replaced during start");
-      }
-      const receipt = runtimeReceiptSchema.parse({
-        version: STORAGE_VERSION,
-        runtimeId,
-        sessionId: descriptor.sessionId,
-        preparedLaunchId,
-        pid: identity.pid,
-        executablePath: identity.executablePath,
-        executableFile: executableFileAfterSpawn,
-        creationTimeFileTime: identity.creationTimeFileTime,
-        ownerTokenArgument,
-        argvSha256,
-        profilePath: descriptor.profilePath,
-        runtimeKind: descriptor.runtimeKind,
-        startedAt: new Date(launchedAtMs).toISOString(),
-        launchedAtMs,
-        preparedExpiresAt: descriptor.expiresAt,
-        mcpOwner,
-      });
-      const lifecycleGeneration = runtimeLifecycleGeneration(receipt);
-      // Persist the exact process identity and generation before asking the
-      // agent to retain it. A lost retain response or publication failure can
-      // then be reconciled without guessing which child owns the lease.
-      pending = this.updatePendingStart(root, pending, {
-        state: "identity_verified",
-        pid: identity.pid,
-        creationTimeFileTime: identity.creationTimeFileTime,
-        lifecycleGeneration,
-      });
-      // Acquire the agent-side lifecycle lease before publishing ownership.
-      // If publication fails, only exact child vacancy may release it; once
-      // the immutable receipt exists, retries can reassert this generation.
-      pinnedReceipt = receipt;
-      await this.retainRuntimeLifecycle(receipt);
-      leaseFence.assertActive();
-      // This is the first successful ownership publication. Everything above
-      // may fail without leaving a successful runtime receipt.
-      leaseFence.assertActive();
-      this.atomicWrite(root, this.runtimePath(runtimeId), receipt, true);
-      receiptPublished = true;
+      const receipt = transaction.publication;
+      child = transaction.child;
       this.children.supervise(runtimeId, child, {
         onExit: (exit) => this.reconcileChildExit(receipt, exit),
       });
-      try { pending = this.updatePendingStart(root, pending, { state: "succeeded" }); } catch { /* runtime receipt is authoritative */ }
       try {
         this.atomicWrite(root, idempotencyPath, idempotencySchema.parse({
           version: STORAGE_VERSION,
@@ -2399,7 +2412,7 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
         this.backend.verifyAndTerminate({
           pid: receipt.pid,
           executablePath: receipt.executablePath,
-          creationTimeFileTime: receipt.creationTimeFileTime,
+          creationTime: receipt.creationTimeFileTime,
           ownerTokenArgument: receipt.ownerTokenArgument,
           launchedAtMs: receipt.launchedAtMs,
         }, Math.min(this.terminationTimeoutMs, remainingMs)));
@@ -2549,7 +2562,7 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
       }
       if (priorOwner && priorOwner.identity.pid === receipt.mcpOwner.pid &&
           pathKey(priorOwner.identity.executablePath) === pathKey(receipt.mcpOwner.executablePath) &&
-          priorOwner.identity.creationTimeFileTime === receipt.mcpOwner.creationTimeFileTime) {
+          priorOwner.identity.creationTime === receipt.mcpOwner.creationTimeFileTime) {
         return this.publicStatus(
           receipt,
           "unverifiable",
@@ -2600,7 +2613,7 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
     receipt: OwnedRuntimeReceipt,
     exit: SupervisedChildExit
   ): Promise<void> {
-    await this.backend.withMachineMutex({
+    await this.machineMutex.withMachineMutex({
       name: OWNED_RUNTIME_LIFECYCLE_MUTEX,
       timeoutMs: this.lockTimeoutMs,
       action: async () => {
@@ -2680,117 +2693,130 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
     const restorationDeadline = Date.now() + waitForRestorationMs;
     let exactRuntimeVacant = allowUnknownVacantSession;
     z.string().uuid().parse(proposedReservationId);
-    for (;;) {
-      if (signal?.aborted) throw new OwnedRuntimeError("CANCELLED", "Owned runtime stop was cancelled");
-      const durableProof = wallDeadline
-        ? await this.withFencedMachineMutex(
-          async () => this.readValidatedRestorationProofLocked(receipt),
-          wallDeadline
-        )
-        : await this.withFencedMachineMutex(
-          async () => this.readValidatedRestorationProofLocked(receipt)
-        );
-      if (durableProof) {
-        if (durableProof.kind === "live_stop_reservation" &&
-            durableProof.stopIdempotencyHash !== keyHash) {
-          throw new OwnedRuntimeError(
-            "RECOVERY_REQUIRED",
-            "A different idempotent stop owns the durable restoration lease",
-            { runtimeId: receipt.runtimeId, state: "stopping" }
-          );
-        }
-        return { proof: durableProof };
-      }
-
-      let preflight: RuntimeStopPreflight;
-      try {
-        const request = () => this.options.observerGate.reserveRuntimeStop(
-          receipt.sessionId,
-          proposedReservationId,
-          exactRuntimeVacant,
-          {
-            runtimeId: receipt.runtimeId,
-            generation: runtimeLifecycleGeneration(receipt),
+    try {
+      return await this.durableReservations.acquire<
+        StopReservation | null,
+        RuntimeStopPreflight,
+        { code: "CANCELLED"; message: string }
+      >({
+        deadlineMs: restorationDeadline,
+        retryIntervalMs: PROCESS_POLL_MS,
+        signal,
+        cancellationReason: {
+          code: "CANCELLED",
+          message: "Owned runtime stop was cancelled",
+        },
+        attempt: async ({ remainingMs }) => {
+          const durableProof = wallDeadline
+            ? await this.withFencedMachineMutex(
+              async () => this.readValidatedRestorationProofLocked(receipt),
+              wallDeadline
+            )
+            : await this.withFencedMachineMutex(
+              async () => this.readValidatedRestorationProofLocked(receipt)
+            );
+          if (durableProof) {
+            if (durableProof.kind === "live_stop_reservation" &&
+                durableProof.stopIdempotencyHash !== keyHash) {
+              throw new OwnedRuntimeError(
+                "RECOVERY_REQUIRED",
+                "A different idempotent stop owns the durable restoration lease",
+                { runtimeId: receipt.runtimeId, state: "stopping" }
+              );
+            }
+            return { kind: "acquired" as const, value: { proof: durableProof } };
           }
-        );
-        preflight = wallDeadline
-          ? await this.beforeWallDeadline(wallDeadline, () => request())
-          : await request();
-      } catch (error) {
-        // The request may have reached the serialized child before IPC failed.
-        // Do not guess at release: a concurrent same-key recovery may already
-        // be publishing proof. The deterministic proposal is recoverable by
-        // the next exact idempotent retry.
-        throw error;
-      }
-      if (signal?.aborted) {
-        throw new OwnedRuntimeError("CANCELLED", "Owned runtime stop was cancelled");
-      }
-      if (!preflight.sessionKnown) {
-        if (exactRuntimeVacant) return null;
-        throw new OwnedRuntimeError(
-          "SESSION_UNVERIFIABLE",
-          "Observer session state is unavailable, so camera restoration cannot be proven"
-        );
-      }
-      if (preflight.ready && preflight.reserved) {
-        const reservationId = this.requireReservationId(preflight);
-        if (reservationId !== proposedReservationId) {
-          throw new OwnedRuntimeError(
-            "SESSION_UNVERIFIABLE",
-            "Observer runtime stop lease did not echo the caller-proposed generation"
-          );
-        }
-        try {
-          const persist = async () => this.persistStopReservationLocked(
-            receipt,
-            keyHash,
-            reservationId,
-            exactRuntimeVacant
-          );
-          return wallDeadline
-            ? await this.withFencedMachineMutex(persist, wallDeadline)
-            : await this.withFencedMachineMutex(persist);
-        } catch (error) {
-          // Whether proof publication ran is deliberately irrelevant to
-          // adoption: the next same-key retry proposes this exact token and
-          // either republishes or reuses the durable proof.
-          throw error;
-        }
-      }
-      if (!exactRuntimeVacant) {
-        const current = await this.inspectReceipt(receipt, wallDeadline);
-        if (current.state === "identity_mismatch" || current.state === "unverifiable") {
-          throw new OwnedRuntimeError(
-            "IDENTITY_UNVERIFIABLE",
-            `Owned runtime changed while restoration was pending: ${current.state}`,
-            { reason: current.reason }
-          );
-        }
-        if (current.state === "exited") {
-          exactRuntimeVacant = true;
-          continue;
-        }
-      }
-      if (waitForRestorationMs === 0 || Date.now() >= restorationDeadline) {
-        throw new OwnedRuntimeError(
+
+          let preflight: RuntimeStopPreflight;
+          try {
+            const request = () => this.options.observerGate.reserveRuntimeStop(
+              receipt.sessionId,
+              proposedReservationId,
+              exactRuntimeVacant,
+              {
+                runtimeId: receipt.runtimeId,
+                generation: runtimeLifecycleGeneration(receipt),
+              }
+            );
+            preflight = wallDeadline
+              ? await this.beforeWallDeadline(wallDeadline, () => request())
+              : await request();
+          } catch (error) {
+            // The request may have reached the serialized child before IPC
+            // failed. The deterministic proposal is recoverable by the next
+            // exact idempotent API retry; never guess at release here.
+            throw error;
+          }
+          if (!preflight.sessionKnown) {
+            if (exactRuntimeVacant) {
+              return { kind: "acquired" as const, value: null };
+            }
+            throw new OwnedRuntimeError(
+              "SESSION_UNVERIFIABLE",
+              "Observer session state is unavailable, so camera restoration cannot be proven"
+            );
+          }
+          if (preflight.ready && preflight.reserved) {
+            const reservationId = this.requireReservationId(preflight);
+            if (reservationId !== proposedReservationId) {
+              throw new OwnedRuntimeError(
+                "SESSION_UNVERIFIABLE",
+                "Observer runtime stop lease did not echo the caller-proposed generation"
+              );
+            }
+            const persist = async () => this.persistStopReservationLocked(
+              receipt,
+              keyHash,
+              reservationId,
+              exactRuntimeVacant
+            );
+            const reservation = wallDeadline
+              ? await this.withFencedMachineMutex(persist, wallDeadline)
+              : await this.withFencedMachineMutex(persist);
+            return { kind: "acquired" as const, value: reservation };
+          }
+          if (!exactRuntimeVacant) {
+            const current = await this.inspectReceipt(receipt, wallDeadline);
+            if (current.state === "identity_mismatch" || current.state === "unverifiable") {
+              throw new OwnedRuntimeError(
+                "IDENTITY_UNVERIFIABLE",
+                `Owned runtime changed while restoration was pending: ${current.state}`,
+                { reason: current.reason }
+              );
+            }
+            if (current.state === "exited") {
+              exactRuntimeVacant = true;
+              return { kind: "retry" as const, pending: preflight, delayMs: 1 };
+            }
+          }
+          const wallRemaining = wallDeadline
+            ? this.remainingWallBudget(wallDeadline)
+            : Number.MAX_SAFE_INTEGER;
+          return {
+            kind: "retry" as const,
+            pending: preflight,
+            delayMs: Math.min(
+              PROCESS_POLL_MS,
+              Math.max(1, remainingMs),
+              wallRemaining
+            ),
+          };
+        },
+        onDeadline: (preflight) => new OwnedRuntimeError(
           "CAMERA_BUSY",
           "Observer runtime still has active capture or camera-restoration work",
           {
-            activeJobIds: preflight.activeJobIds,
-            cameraLeaseJobIds: preflight.cameraLeaseJobIds,
-            restorationPendingJobIds: preflight.restorationPendingJobIds,
+            activeJobIds: preflight?.activeJobIds ?? [],
+            cameraLeaseJobIds: preflight?.cameraLeaseJobIds ?? [],
+            restorationPendingJobIds: preflight?.restorationPendingJobIds ?? [],
           }
-        );
+        ),
+      });
+    } catch (error) {
+      if (error instanceof ReservationCancelledError) {
+        throw new OwnedRuntimeError(error.reason.code, error.reason.message);
       }
-      const wallRemaining = wallDeadline
-        ? this.remainingWallBudget(wallDeadline)
-        : Number.MAX_SAFE_INTEGER;
-      await wait(Math.min(
-        PROCESS_POLL_MS,
-        Math.max(1, restorationDeadline - Date.now()),
-        wallRemaining
-      ), signal);
+      throw error;
     }
   }
 
@@ -2958,7 +2984,7 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
   private inspectionMatches(receipt: OwnedRuntimeReceipt, inspection: OwnedRuntimeInspection): boolean {
     return inspection.identity.pid === receipt.pid &&
       pathKey(inspection.identity.executablePath) === pathKey(receipt.executablePath) &&
-      inspection.identity.creationTimeFileTime === receipt.creationTimeFileTime &&
+      inspection.identity.creationTime === receipt.creationTimeFileTime &&
       inspection.ownerArgumentMatched === true;
   }
 
@@ -2994,7 +3020,7 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
       managerInstanceId: this.managerInstanceId,
       pid: identity.pid,
       executablePath: identity.executablePath,
-      creationTimeFileTime: identity.creationTimeFileTime,
+      creationTimeFileTime: identity.creationTime,
       userSid: identity.userSid,
     });
   }
@@ -4026,18 +4052,25 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
     label: string,
     maxBytes = Math.min(DEFAULT_LIFECYCLE_RECORD_MAX_BYTES, this.maxRecordBytes)
   ): T {
-    try {
-      const entry = lstatSync(path);
-      if (entry.isSymbolicLink() || !entry.isFile() || entry.size < 2 || entry.size > maxBytes) {
-        throw new Error("not a bounded regular file");
-      }
-      return schema.parse(JSON.parse(readFileSync(path, "utf8")));
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-        throw new OwnedRuntimeError("RUNTIME_NOT_FOUND", `${label} was not found`);
-      }
-      throw new OwnedRuntimeError("STORAGE_UNVERIFIABLE", `${label} is invalid: ${this.message(error)}`);
+    const store = new BoundedJsonStore<T>({
+      root: this.storageRoot,
+      minRecordBytes: 2,
+      maxRecordBytes: maxBytes,
+      maxRecords: this.maxStoreRecords,
+      maxTotalBytes: this.maxStoreBytes,
+      parse: (value) => schema.parse(value),
+    });
+    const inspected = store.inspect(path);
+    if (inspected.kind === "missing") {
+      throw new OwnedRuntimeError("RUNTIME_NOT_FOUND", `${label} was not found`);
     }
+    if (inspected.kind === "corrupt") {
+      throw new OwnedRuntimeError(
+        "STORAGE_UNVERIFIABLE",
+        `${label} is invalid: ${inspected.message}`
+      );
+    }
+    return inspected.value;
   }
 
   private readOptionalParsed<T>(path: string, schema: z.ZodType<T>, label: string): T | null {
@@ -4062,23 +4095,23 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
     }
     if (!capacityPreflighted) this.assertBatchCapacity(root, [{ target, value, exclusive }]);
     const serialized = this.serializeRecord(value);
-    const temporary = join(dirname(target), `.${randomUUID()}.tmp`);
-    let descriptor: number | null = null;
     try {
-      descriptor = openSync(temporary, "wx", 0o600);
-      writeFileSync(descriptor, serialized);
-      fsyncSync(descriptor);
-      closeSync(descriptor);
-      descriptor = null;
-      if (exclusive && existsSync(target)) {
-        throw new OwnedRuntimeError("STORAGE_CONFLICT", "Lifecycle receipt appeared concurrently");
-      }
-      renameSync(temporary, target);
+      foundationAtomicWriteFile({
+        root,
+        targetPath: target,
+        data: serialized,
+        maxBytes: this.maxRecordBytes,
+        mode: 0o600,
+        durable: true,
+        exclusive,
+      });
     } catch (error) {
-      if (descriptor !== null) {
-        try { closeSync(descriptor); } catch { /* best effort for a failed unpublished write */ }
+      if (error instanceof JsonStoreError && error.code === "CAS_CONFLICT") {
+        throw new OwnedRuntimeError(
+          "STORAGE_CONFLICT",
+          "Lifecycle receipt appeared concurrently"
+        );
       }
-      try { unlinkSync(temporary); } catch { /* best effort for an unpublished temp file */ }
       throw error;
     }
   }

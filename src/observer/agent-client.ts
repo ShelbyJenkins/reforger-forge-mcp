@@ -1,0 +1,315 @@
+import { fork, type ChildProcess } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { logger } from "../utils/logger.js";
+import { canonicalPublicObserverErrorCode } from "./public-contract.js";
+import { ObserverCoordinatorError } from "./errors.js";
+
+const CHILD_PROTOCOL = "rfo-observer-child-v1" as const;
+
+export interface ObserverChildDescriptor {
+  protocolVersion: string;
+  agentVersion: string;
+  agentInstanceId: string;
+  host: "127.0.0.1" | "::1";
+  port: number;
+  controlHttpEnabled?: boolean;
+  controlToken?: string;
+}
+
+export interface ObserverAgentClientRequestOptions {
+  /** Absolute wall-clock deadline. */
+  deadlineAtMs?: number;
+  signal?: AbortSignal;
+  /** Compatibility shortcut for callers that still provide a relative bound. */
+  timeoutMs?: number;
+  allowClosing?: boolean;
+}
+
+export interface ObserverAgentClientOptions {
+  agentPath: string;
+  arguments?: readonly string[];
+  startupTimeoutMs?: number;
+  requestTimeoutMs?: number;
+  forkChild?: typeof fork;
+}
+
+interface PendingRequest {
+  resolve: (value: unknown) => void;
+  reject: (error: Error) => void;
+  timer: NodeJS.Timeout;
+  abort?: () => void;
+  signal?: AbortSignal;
+}
+
+function bounded(value: number | undefined, fallback: number, minimum: number, maximum: number, label: string): number {
+  const result = value ?? fallback;
+  if (!Number.isSafeInteger(result) || result < minimum || result > maximum) throw new TypeError(`${label} is invalid`);
+  return result;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+const CONTRACT_BODY = /((?:"?[A-Za-z0-9]*contract(?:body|payload)?"?)\s*[:=]\s*).*/i;
+
+export function redactChildLine(value: string): string {
+  return value
+    .replace(/Bearer\s+[A-Za-z0-9._~-]+/gi, "Bearer [REDACTED]")
+    .replace(/((?:[A-Za-z0-9_-]*nonce|(?:session|control)?token|authorization|credential|secret)(?:"?\s*[:=]\s*"?))[^\s",}]+/gi, "$1[REDACTED]")
+    .replace(CONTRACT_BODY, "$1[REDACTED]")
+    .slice(0, 1_024);
+}
+
+function abortError(): ObserverCoordinatorError {
+  return new ObserverCoordinatorError("CANCELLED", "Observer request was cancelled");
+}
+
+/** Fork/request lifecycle only. No observer domain policy belongs here. */
+export class ObserverAgentClient {
+  private readonly startupTimeoutMs: number;
+  private readonly requestTimeoutMs: number;
+  private readonly spawnChild: typeof fork;
+  private readonly argumentsArray: string[];
+  private readonly liveChildren = new Set<ChildProcess>();
+  private readonly pending = new Map<string, PendingRequest>();
+  private child: ChildProcess | null = null;
+  private descriptor: ObserverChildDescriptor | null = null;
+  private startPromise: Promise<ObserverChildDescriptor> | null = null;
+  private rejectStartup: ((error: Error) => void) | null = null;
+  private closed = false;
+  private closing = false;
+  private closePromise: Promise<void> | null = null;
+
+  constructor(private readonly options: ObserverAgentClientOptions) {
+    this.startupTimeoutMs = bounded(options.startupTimeoutMs, 10_000, 1_000, 60_000, "Observer startup timeout");
+    this.requestTimeoutMs = bounded(options.requestTimeoutMs, 30_000, 1_000, 5 * 60_000, "Observer request timeout");
+    this.spawnChild = options.forkChild ?? fork;
+    this.argumentsArray = [...(options.arguments ?? [])];
+  }
+
+  diagnosticPrivateChildCount(): number { return this.liveChildren.size; }
+  /** Narrow compatibility hook for host recovery tests; transport still owns the child. */
+  get childProcess(): ChildProcess | null { return this.child; }
+  get descriptorValue(): ObserverChildDescriptor | null { return this.descriptor; }
+  get state(): "closed" | "closing" | "starting" | "ready" | "idle" { return this.closed ? "closed" : this.closing ? "closing" : this.startPromise ? "starting" : this.descriptor ? "ready" : "idle"; }
+
+  async ensureStarted(): Promise<ObserverChildDescriptor> {
+    if (this.closed || this.closing) throw new ObserverCoordinatorError("TRANSPORT_UNAVAILABLE", "Observer agent is shutting down");
+    if (this.child?.connected && this.descriptor) return this.descriptor;
+    if (this.startPromise) return this.startPromise;
+    const child = this.spawnChild(this.options.agentPath, this.argumentsArray, {
+      stdio: ["ignore", "ignore", "pipe", "ipc"],
+      execArgv: [],
+      env: { ...process.env },
+      serialization: "advanced",
+    });
+    this.liveChildren.add(child);
+    this.child = child;
+    this.descriptor = null;
+    this.attachChild(child);
+    this.startPromise = new Promise<ObserverChildDescriptor>((resolve, reject) => {
+      this.rejectStartup = reject;
+      const timer = setTimeout(() => {
+        if (this.child === child && !this.descriptor) {
+          reject(new ObserverCoordinatorError("TRANSPORT_UNAVAILABLE", "Private observer agent did not become ready before the startup deadline"));
+          // Do not decrement live-child accounting here. The exit event is the
+          // only authoritative proof that the child is gone.
+          child.kill();
+        }
+      }, this.startupTimeoutMs);
+      timer.unref();
+      const ready = (message: unknown): void => {
+        if (!isRecord(message) || message.protocol !== CHILD_PROTOCOL || message.type !== "ready") return;
+        try {
+          const descriptor = this.parseDescriptor(message.descriptor);
+          clearTimeout(timer);
+          child.off("message", ready);
+          this.descriptor = descriptor;
+          this.rejectStartup = null;
+          resolve(descriptor);
+        } catch (error) {
+          clearTimeout(timer);
+          child.off("message", ready);
+          reject(error instanceof Error ? error : new Error(String(error)));
+          child.kill();
+        }
+      };
+      child.on("message", ready);
+    }).finally(() => { this.startPromise = null; });
+    return this.startPromise;
+  }
+
+  /** Send only to the currently ready child; never starts or replaces one. */
+  async requestIfReady(
+    operation: string,
+    payload: Record<string, unknown> = {},
+    options: ObserverAgentClientRequestOptions = {}
+  ): Promise<unknown> {
+    if (this.closed || this.closing) throw new ObserverCoordinatorError("TRANSPORT_UNAVAILABLE", "Observer agent is unavailable");
+    const child = this.child;
+    if (!child?.connected || !this.descriptor) throw new ObserverCoordinatorError("TRANSPORT_UNAVAILABLE", "Private observer agent is not ready");
+    return this.sendRequest(child, operation, payload, options);
+  }
+
+  async request(
+    operation: string,
+    payload: Record<string, unknown> = {},
+    options: ObserverAgentClientRequestOptions = {}
+  ): Promise<unknown> {
+    if (!options.allowClosing && (this.closed || this.closing)) throw new ObserverCoordinatorError("TRANSPORT_UNAVAILABLE", "Observer agent is unavailable");
+    if (!options.allowClosing) await this.ensureStarted();
+    const child = this.child;
+    if (!child?.connected) throw new ObserverCoordinatorError("TRANSPORT_UNAVAILABLE", "Private observer agent is unavailable");
+    return this.sendRequest(child, operation, payload, options);
+  }
+
+  async close(): Promise<void> {
+    if (this.closed) return;
+    if (this.closePromise) return this.closePromise;
+    this.closing = true;
+    this.closePromise = (async () => {
+      const child = this.child;
+      if (!child) return;
+      try {
+        if (child.connected && this.descriptor) {
+          await this.request("shutdown", {}, { timeoutMs: 2_000, allowClosing: true }).catch(() => undefined);
+        } else if (child.connected) child.disconnect();
+        await new Promise<void>((resolve) => {
+          if (child.exitCode !== null || child.signalCode !== null) return resolve();
+          const timer = setTimeout(() => {
+            child.removeListener("exit", exited);
+            if (child.connected) child.disconnect();
+            child.kill();
+            resolve();
+          }, 2_000);
+          timer.unref();
+          const exited = (): void => { clearTimeout(timer); resolve(); };
+          child.once("exit", exited);
+        });
+      } finally {
+        this.child = null;
+        this.descriptor = null;
+        this.rejectAll(new ObserverCoordinatorError("TRANSPORT_UNAVAILABLE", "Observer agent stopped"));
+      }
+    })().finally(() => { this.closed = true; this.closing = false; });
+    return this.closePromise;
+  }
+
+  private attachChild(child: ChildProcess): void {
+    let stderrBuffer = "";
+    child.stderr?.setEncoding("utf8");
+    child.stderr?.on("data", (chunk: string) => {
+      stderrBuffer = `${stderrBuffer}${chunk}`.slice(-8_192);
+      for (;;) {
+        const newline = stderrBuffer.indexOf("\n");
+        if (newline < 0) break;
+        const line = stderrBuffer.slice(0, newline).trim();
+        stderrBuffer = stderrBuffer.slice(newline + 1);
+        if (line) logger.warn(`observer child: ${redactChildLine(line)}`);
+      }
+    });
+    child.on("message", (message: unknown) => this.onMessage(message));
+    child.once("error", (error) => {
+      if (child.pid === undefined) this.liveChildren.delete(child);
+      if (this.child !== child) return;
+      this.rejectStartup?.(new ObserverCoordinatorError("TRANSPORT_UNAVAILABLE", `Private observer agent failed: ${error.message}`));
+      this.descriptor = null;
+      this.rejectAll(new ObserverCoordinatorError("TRANSPORT_UNAVAILABLE", "Private observer agent became unavailable"));
+      child.kill();
+    });
+    child.once("exit", (code, signal) => {
+      this.liveChildren.delete(child);
+      if (this.child !== child) return;
+      if (stderrBuffer.trim()) logger.warn(`observer child: ${redactChildLine(stderrBuffer.trim())}`);
+      this.child = null;
+      this.descriptor = null;
+      const detail = code === 0 || this.closing ? "Private observer agent stopped" : `Private observer agent exited (${code ?? signal ?? "unknown"})`;
+      const error = new ObserverCoordinatorError("TRANSPORT_UNAVAILABLE", detail);
+      this.rejectStartup?.(error);
+      this.rejectStartup = null;
+      this.rejectAll(error);
+    });
+  }
+
+  private onMessage(message: unknown): void {
+    if (!isRecord(message) || message.protocol !== CHILD_PROTOCOL) return;
+    if (message.type === "fatal") {
+      const error = isRecord(message.error) ? message.error : {};
+      this.rejectStartup?.(new ObserverCoordinatorError(
+        canonicalPublicObserverErrorCode(error.code, "TRANSPORT_UNAVAILABLE"),
+        typeof error.message === "string" ? error.message : "Private observer agent failed during startup"
+      ));
+      this.rejectStartup = null;
+      this.child?.kill();
+      return;
+    }
+    if (message.type !== "response" || typeof message.requestId !== "string") return;
+    const pending = this.pending.get(message.requestId);
+    if (!pending) return;
+    this.pending.delete(message.requestId);
+    clearTimeout(pending.timer);
+    if (pending.abort && pending.signal) pending.signal.removeEventListener("abort", pending.abort);
+    if (message.ok === true) pending.resolve(message.result);
+    else {
+      const error = isRecord(message.error) ? message.error : {};
+      pending.reject(new ObserverCoordinatorError(
+        canonicalPublicObserverErrorCode(error.code),
+        typeof error.message === "string" ? error.message : "Observer operation failed"
+      ));
+    }
+  }
+
+  private sendRequest(child: ChildProcess, operation: string, payload: Record<string, unknown>, options: ObserverAgentClientRequestOptions): Promise<unknown> {
+    if (!child.connected) return Promise.reject(new ObserverCoordinatorError("TRANSPORT_UNAVAILABLE", "Private observer agent is unavailable"));
+    const deadlineAtMs = options.deadlineAtMs ?? Date.now() + (options.timeoutMs ?? this.requestTimeoutMs);
+    const remaining = deadlineAtMs - Date.now();
+    if (remaining <= 0) return Promise.reject(new ObserverCoordinatorError("TRANSPORT_UNAVAILABLE", `Observer ${operation} request deadline expired`));
+    const requestId = randomUUID();
+    return new Promise((resolve, reject) => {
+      let abort: (() => void) | undefined;
+      const finish = (error?: Error, result?: unknown): void => {
+        const pending = this.pending.get(requestId);
+        if (!pending) return;
+        this.pending.delete(requestId);
+        clearTimeout(pending.timer);
+        if (pending.abort && pending.signal) pending.signal.removeEventListener("abort", pending.abort);
+        if (error) reject(error); else resolve(result);
+      };
+      const timer = setTimeout(() => finish(new ObserverCoordinatorError("TRANSPORT_UNAVAILABLE", `Observer ${operation} request timed out`)), remaining);
+      timer.unref();
+      abort = () => finish(abortError());
+      const pending: PendingRequest = { resolve, reject, timer, abort, signal: options.signal };
+      this.pending.set(requestId, pending);
+      if (options.signal) {
+        if (options.signal.aborted) return finish(abortError());
+        options.signal.addEventListener("abort", abort, { once: true });
+      }
+      child.send({ protocol: CHILD_PROTOCOL, type: "request", requestId, operation, payload }, (error) => {
+        if (error) finish(new ObserverCoordinatorError("TRANSPORT_UNAVAILABLE", "Could not send a private observer request"));
+      });
+    });
+  }
+
+  private parseDescriptor(value: unknown): ObserverChildDescriptor {
+    if (!isRecord(value) || typeof value.protocolVersion !== "string" || !/^1\.\d+$/.test(value.protocolVersion) ||
+        typeof value.agentVersion !== "string" || !/^\d+\.\d+\.\d+$/.test(value.agentVersion) ||
+        typeof value.agentInstanceId !== "string" || value.agentInstanceId.length < 1 || value.agentInstanceId.length > 96 ||
+        (value.host !== "127.0.0.1" && value.host !== "::1") ||
+        !Number.isInteger(value.port) || (value.port as number) < 1 || (value.port as number) > 65_535) {
+      throw new ObserverCoordinatorError("TRANSPORT_UNAVAILABLE", "Private observer agent returned an invalid startup descriptor");
+    }
+    return value as unknown as ObserverChildDescriptor;
+  }
+
+  private rejectAll(error: Error): void {
+    for (const [requestId, pending] of this.pending) {
+      clearTimeout(pending.timer);
+      if (pending.abort && pending.signal) pending.signal.removeEventListener("abort", pending.abort);
+      pending.reject(error);
+      this.pending.delete(requestId);
+    }
+  }
+}
+
+export { ObserverCoordinatorError } from "./errors.js";

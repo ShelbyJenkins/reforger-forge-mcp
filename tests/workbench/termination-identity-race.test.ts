@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { WorkbenchProcessGuard } from "../../src/workbench/process-guard.js";
-import { FakeLifecycleBackend } from "./fake-lifecycle-backend.js";
+import { createFakeLifecycleBackend } from "./fake-lifecycle-backend.js";
 
 const roots: string[] = [];
 
@@ -15,7 +15,7 @@ describe("exact termination identity races", () => {
   it("does not terminate a replacement when PID identity changes after inspection", async () => {
     const stateDir = mkdtempSync(join(tmpdir(), "reforger-forge-identity-race-"));
     roots.push(stateDir);
-    const backend = new FakeLifecycleBackend();
+    const backend = createFakeLifecycleBackend();
     const guard = new WorkbenchProcessGuard({ stateDir, backend });
     const pid = 7300;
     const executablePath = "C:\\Tools\\ArmaReforgerWorkbenchSteamDiag.exe";

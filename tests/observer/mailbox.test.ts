@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { MailboxTransport } from "../../observer/agent/mailbox.js";
 import { MailboxCoordinator } from "../../observer/agent/mailbox-coordinator.js";
 import { ArtifactStore } from "../../observer/agent/artifacts.js";
@@ -205,6 +205,31 @@ describe("observer mailbox", () => {
     expect(coordinator.stats().estimatedBytes).toBeLessThanOrEqual(1_024);
   });
 
+  it("rolls back transport admission when the command-usage index fails during commit", async () => {
+    const root = temporaryDirectory();
+    roots.push(root);
+    const fixture = createSessionFixture(root);
+    const registry = new InstanceRegistry(fixture.store, { clock: fixture.clock });
+    const jobs = new JobStore(fixture.store, registry, fixture.clock);
+    const artifacts = new ArtifactStore(join(root, "artifacts"), fixture.store, jobs);
+    const coordinator = new MailboxCoordinator(fixture.store, registry, jobs, artifacts, { clock: fixture.clock });
+    const commandUsage = (coordinator as unknown as {
+      commandUsageBySession: Map<string, { files: number; bytes: number }>;
+    }).commandUsageBySession;
+    vi.spyOn(commandUsage, "set").mockImplementationOnce(() => {
+      throw new Error("injected command usage admission failure");
+    });
+
+    await coordinator.pollOnce();
+
+    expect(coordinator.sessionIds()).toEqual(new Set());
+    expect(coordinator.stats()).toMatchObject({ transports: 0, commandFiles: 0, commandBytes: 0 });
+
+    await coordinator.pollOnce();
+    expect(coordinator.sessionIds()).toEqual(new Set([fixture.created.contract.sessionId]));
+    expect(coordinator.stats().transports).toBe(1);
+  });
+
   it("consumes restored ownership-loss status and the following heartbeat without quarantine", async () => {
     const root = temporaryDirectory();
     roots.push(root);
@@ -338,6 +363,36 @@ describe("observer mailbox", () => {
     await coordinator.pollOnce();
     expect(existsSync(join(mailbox.statusDirectory, `${name}.complete`))).toBe(false);
     expect(coordinator.stats()).toMatchObject({ transientRetries: 3, quarantined: 1, trackedRetries: 0 });
+  });
+
+  it("admits the newest retry through the shared bounded map before applying mailbox eviction policy", async () => {
+    const root = temporaryDirectory();
+    roots.push(root);
+    const fixture = createSessionFixture(root);
+    const registry = new InstanceRegistry(fixture.store, { clock: fixture.clock });
+    const jobs = new JobStore(fixture.store, registry, fixture.clock);
+    const artifacts = new ArtifactStore(join(root, "artifacts"), fixture.store, jobs);
+    const mailbox = new MailboxTransport(fixture.profilePath);
+    const first = "000000000001-status-missing-first.json";
+    const second = "000000000002-status-missing-second.json";
+    writeFileSync(join(mailbox.statusDirectory, `${first}.complete`), "ready");
+    writeFileSync(join(mailbox.statusDirectory, `${second}.complete`), "ready");
+    const coordinator = new MailboxCoordinator(fixture.store, registry, jobs, artifacts, {
+      clock: fixture.clock,
+      maxRetryAttempts: 100,
+      maxTrackedRetries: 1,
+    });
+
+    await coordinator.pollOnce();
+
+    expect(existsSync(join(mailbox.statusDirectory, `${first}.complete`))).toBe(false);
+    expect(existsSync(join(mailbox.statusDirectory, `${second}.complete`))).toBe(true);
+    expect(coordinator.stats()).toMatchObject({
+      trackedRetries: 1,
+      maxTrackedRetries: 1,
+      transientRetries: 2,
+      quarantined: 1,
+    });
   });
 
   it("stores a bounded summary when rejected ingress exceeds the quarantine byte budget", async () => {

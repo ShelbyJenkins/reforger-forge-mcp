@@ -20,6 +20,7 @@ export const WORKBENCH_HELPER_PING_RESPONSE = Object.freeze({
   helperAddonGuid: WORKBENCH_HELPER_ADDON_GUID,
   helperAddonVersion: WORKBENCH_HELPER_ADDON_VERSION,
   helperProtocolVersion: WORKBENCH_HELPER_PROTOCOL_VERSION,
+  workbenchProtocol: WORKBENCH_HELPER_PROTOCOL_VERSION,
   helperBuildIdentity: WORKBENCH_HELPER_BUILD_IDENTITY,
 });
 

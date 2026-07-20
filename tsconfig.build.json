@@ -2,8 +2,19 @@
   "extends": "./tsconfig.json",
   "compilerOptions": {
     "rootDir": "./src",
-    "outDir": "./dist"
+    "outDir": "./dist",
+    "composite": true,
+    "tsBuildInfoFile": "./dist/.tsbuildinfo/mcp.tsbuildinfo"
   },
   "include": ["src/**/*"],
-  "exclude": ["tests/**/*", "scripts/**/*"]
+  "exclude": [
+    "src/foundation/**/*",
+    "src/companions/**/*",
+    "tests/**/*",
+    "scripts/**/*"
+  ],
+  "references": [
+    { "path": "./tsconfig.shared.build.json" },
+    { "path": "./observer/protocol/tsconfig.build.json" }
+  ]
 }

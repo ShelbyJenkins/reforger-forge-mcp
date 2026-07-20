@@ -27,7 +27,7 @@ export function registerModifyModPrompt(server: McpServer): void {
 
 I want to: ${task}
 
-YOU ARE AUTONOMOUS FOR EVERY SAFE, AUTOMATABLE STEP. The one required attended exception is Play mode: automated \`wb_play\` is disabled, so when runtime testing is needed you must ask the user to enter Play mode manually, pause until they confirm, and then verify the mode with **wb_state**. Do not ask the user to perform builds, edit files, or handle any other step that the available tools can complete safely.
+YOU ARE AUTONOMOUS FOR EVERY SAFE, AUTOMATABLE STEP. The one required attended exception is Play mode: no automated Play tool exists, so when runtime testing is needed you must ask the user to enter Play mode manually, pause until they confirm, and then verify the mode with **wb_state**. Do not ask the user to perform builds, edit files, or handle any other step that the available tools can complete safely.
 
 Follow this workflow — every step is mandatory:
 
@@ -57,7 +57,7 @@ Follow this workflow — every step is mandatory:
 
 7. **Workbench Setup** (MANDATORY — automate every safe step; attended Play is the one manual exception):
    a. **wb_launch** with \`gprojPath\` set to the addon's .gproj file — this stages the private helper outside the mod and opens the project in the World Editor with verified NET API access
-   b. Ask the user to enter Play mode manually in Workbench because automated \`wb_play\` is disabled. Pause and wait for the user to confirm that Play has started.
+   b. Ask the user to enter Play mode manually in Workbench because no automated Play tool exists. Pause and wait for the user to confirm that Play has started.
    c. After confirmation, call **wb_state** and proceed only after it reports Play mode. Verify that the world launches successfully.
    d. Use **wb_stop** to return to the World Editor. Calling it in edit mode is an idempotent success.
    e. If compilation failed, fix with **project** and \`action: "write"\`, then use **wb_restart** to recompile from a clean owner-scoped session. Ask the user to enter Play manually again, wait for confirmation, and verify the result with **wb_state**. Do not hot-reload scripts while a world is loaded.

@@ -12,6 +12,7 @@ import {
 } from "node:fs";
 import { extname, join } from "node:path";
 import { isDeepStrictEqual } from "node:util";
+import { BoundedJsonStore, JsonStoreError } from "#foundation/json-store";
 import {
   SESSION_DIRECTORY_NAME,
   artifactManifestSchema,
@@ -27,7 +28,6 @@ import {
   assertManagedPath,
   assertRegularManagedFile,
   atomicWriteFile,
-  atomicWriteJson,
   canonicalizeExistingDirectory,
   ensureCanonicalDirectory,
   resolveEngineProfileDirectory,
@@ -85,6 +85,15 @@ interface RetainedArtifactMetadata {
   sourceByteCount?: number;
   sourceContentSha256?: string;
   sourceManifest?: ArtifactManifest;
+}
+
+const MAX_ARTIFACT_METADATA_BYTES = 4 * 1024 * 1024;
+
+function parseMetadataObject(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("artifact metadata must be a JSON object");
+  }
+  return value as Record<string, unknown>;
 }
 
 async function wait(delay: number): Promise<void> {
@@ -168,8 +177,8 @@ export class ArtifactStore {
       let retainedSha256: string | null = null;
       try {
         const retainedImage = assertRegularManagedFile(jobRoot, imagePath);
-        const retainedMetadata = assertRegularManagedFile(jobRoot, metadataPath);
-        existing = JSON.parse(readFileSync(retainedMetadata, "utf8")) as RetainedArtifactMetadata;
+        assertRegularManagedFile(jobRoot, metadataPath);
+        existing = this.readMetadata(jobRoot, metadataPath) as unknown as RetainedArtifactMetadata;
         retainedSha256 = createHash("sha256").update(readFileSync(retainedImage)).digest("hex");
       } catch { /* conflict is reported below */ }
       if (!existing || retainedSha256 === null || existing.version !== 1 || existing.artifactId !== manifest.artifactId ||
@@ -233,7 +242,7 @@ export class ArtifactStore {
         bundleDigest: session.bundleDigest,
         protocolVersion: manifest.protocolVersion,
       };
-      atomicWriteJson(temporary, join(temporary, "metadata.json"), metadata);
+      this.writeMetadata(temporary, join(temporary, "metadata.json"), metadata);
       // Re-read the exact managed source immediately before promotion. A file
       // replacement after the stability check must not be retained under the
       // original completion manifest.
@@ -292,7 +301,7 @@ export class ArtifactStore {
     const metadataPath = assertRegularManagedFile(this.artifactsRoot, join(root, "metadata.json"));
     this.inUse.add(root);
     try {
-      return { image: readFileSync(imagePath), metadata: JSON.parse(readFileSync(metadataPath, "utf8")) };
+      return { image: readFileSync(imagePath), metadata: this.readMetadata(root, metadataPath) };
     } finally {
       this.inUse.delete(root);
     }
@@ -313,7 +322,7 @@ export class ArtifactStore {
       `workbench/${jobId}`,
       jobId,
       readFileSync(imagePath),
-      JSON.parse(readFileSync(metadataPath, "utf8"))
+      this.readMetadata(root, metadataPath)
     );
   }
 
@@ -366,7 +375,7 @@ export class ArtifactStore {
     mkdirSync(temporary, { mode: 0o700 });
     try {
       atomicWriteFile(temporary, join(temporary, "image.png"), validated.png);
-      atomicWriteJson(temporary, join(temporary, "metadata.json"), retainedMetadata);
+      this.writeMetadata(temporary, join(temporary, "metadata.json"), retainedMetadata);
       renameSync(temporary, root);
     } catch (error) {
       rmSync(temporary, { recursive: true, force: true });
@@ -391,11 +400,7 @@ export class ArtifactStore {
     this.inUse.add(root);
     try {
       const image = readFileSync(imagePath);
-      const metadata = JSON.parse(readFileSync(metadataPath, "utf8")) as unknown;
-      if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) {
-        throw new ObserverError("ARTIFACT_INVALID", "Retained artifact metadata is invalid", 409);
-      }
-      const metadataRecord = metadata as Record<string, unknown>;
+      const metadataRecord = this.readMetadata(root, metadataPath);
       const actualSha256 = createHash("sha256").update(image).digest("hex");
       if (actualSha256 !== ref.sha256 || image.length !== ref.bytes ||
           metadataRecord.width !== ref.width || metadataRecord.height !== ref.height ||
@@ -490,6 +495,46 @@ export class ArtifactStore {
       removed.push(item.root);
     }
     return { removed, retainedBytes: total };
+  }
+
+  private metadataStore(root: string): BoundedJsonStore<Record<string, unknown>> {
+    return new BoundedJsonStore({
+      root,
+      minRecordBytes: 2,
+      maxRecordBytes: MAX_ARTIFACT_METADATA_BYTES,
+      parse: parseMetadataObject,
+    });
+  }
+
+  private readMetadata(root: string, path: string): Record<string, unknown> {
+    try {
+      const metadata = this.metadataStore(root).read(path);
+      if (!metadata) throw new Error("artifact metadata is missing");
+      return metadata;
+    } catch (error) {
+      if (error instanceof ObserverError) throw error;
+      throw new ObserverError(
+        "ARTIFACT_INVALID",
+        error instanceof JsonStoreError
+          ? `Retained artifact metadata is invalid: ${error.message}`
+          : "Retained artifact metadata is invalid",
+        409
+      );
+    }
+  }
+
+  private writeMetadata(root: string, path: string, value: Record<string, unknown>): void {
+    try {
+      this.metadataStore(root).write(path, value);
+    } catch (error) {
+      throw new ObserverError(
+        "ARTIFACT_INVALID",
+        error instanceof Error
+          ? `Artifact metadata could not be retained: ${error.message}`
+          : "Artifact metadata could not be retained",
+        409
+      );
+    }
   }
 
   private refFromRead(

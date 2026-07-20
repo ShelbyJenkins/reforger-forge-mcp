@@ -330,7 +330,10 @@ auto-launch it.
 
 ### Observer Platform (Private Local Agent)
 
-The observer coordinator starts its disposable child only when an operation
+One host observer application owns the transport client, runtime and Workbench
+capture backends, shared capture job service, durable evidence-run port,
+owned-runtime lifecycle, and ordered shutdown. The historical coordinator is a
+thin compatibility facade. The disposable child starts only when an operation
 needs private agent state; idle status and doctor checks stay non-mutating.
 Launch preparation returns argument tokens, session data, and an opaque
 `preparedLaunchId`; it does not start the game. Starting or stopping is always
@@ -346,17 +349,31 @@ a distinct, explicit `observer_runtime` action.
 | `observer_job` | Inspect, read, cancel, or release a capture. Inline reads return a completed validated PNG; oversized captures remain available to run finalization. |
 | `observer_run` | Begin, inspect, finalize, or discard a bounded managed evidence run. Finalize exports a standardized reviewed bundle beneath an allowlisted evidence root. |
 
+Both renderers use the same public capture IDs, idempotency receipts, absolute
+deadline, cancellation, artifact promotion, and release rules. Inventory also
+publishes an opaque `worldRevision`; prefer binding that exact value on new
+requests while the legacy `worldId`/`worldEpoch` fields remain compatible.
+Evidence-run durability is always owned by the agent, but beginning or
+finalizing a new run is disabled unless at least one evidence root is
+configured. Bundle hashing, redaction, manifest-last publication, and recovery
+are isolated in the optional evidence exporter.
+
 ### Workbench Lifecycle, Connection & Diagnostics (Windows)
 
-Automated launch/restart/shutdown lifecycle control is release-supported
-on Windows. A global named mutex serializes every mutation. A second live MCP
-cannot adopt the first MCP's Workbench; a replacement may claim the lease only
-after the prior MCP process identity is proven dead. The target is always one
-canonical `.gproj`, and a different requested target is refused rather than
-reported as success. User-launched or otherwise unverifiable Workbench processes
-are never terminated. If `gprojPath` is omitted, launch succeeds only when a
-prior verified target or exactly one configured project can be resolved;
-ambiguity is refused with the candidate paths.
+Automated launch/restart/shutdown lifecycle control is release-supported on
+Windows. One composed `WorkbenchSessionController` backs the stable
+`WorkbenchClient` compatibility facade used by the `wb_*` tools and Workbench
+observer adapter. The global named mutex serializes cross-process lifecycle
+transitions; a controller-local, writer-preferring reader/writer gate allows
+concurrent managed NET calls while draining them before lifecycle or companion
+administration changes. Ordinary NET calls do not hold the machine mutex. A
+second live MCP cannot adopt the first MCP's Workbench; a replacement may claim
+the lease only after the prior MCP process identity is proven dead. The target
+is always one canonical `.gproj`, and a different requested target is refused
+rather than reported as success. User-launched or otherwise unverifiable
+Workbench processes are never terminated. If `gprojPath` is omitted, launch
+succeeds only when a prior verified target or exactly one configured project can
+be resolved; ambiguity is refused with the candidate paths.
 
 Automated lifecycle control requires a numeric loopback NET API endpoint. The
 version-3 lifecycle records the immutable companion identity and its external
@@ -375,13 +392,14 @@ unexpected-child-exit reconciliation use the stored target identity, so exact
 shutdown remains available if the recorded `.gproj` has been deleted or
 disconnected. Launch and restart still require current project revalidation.
 
-Before spawn, ReforgerForge digest-verifies and stages
+Before an editor spawn, ReforgerForge digest-verifies and stages
 `ReforgerForgeWorkbenchHelper` from `observer/workbench-addon` beneath the
 external observer managed root. Workbench receives the helper search root,
-add-on GUID, and a dedicated external `-profile`. Readiness requires
+add-on GUID, and a dedicated external `-profile`. Editor readiness requires
 `EMCP_WB_Ping` to return the exact add-on ID, GUID, version, protocol, and build
 identity expected by the running MCP. No Workbench helper source is written to
-the target project.
+the target project. The canonical `target_build` plan has no helper activation
+or NET-readiness capability.
 
 | Tool | What it does |
 |------|-------------|
@@ -397,10 +415,11 @@ the target project.
 
 The Workbench companion provides five dedicated observer endpoints (`ping`,
 `submit`, `status`, `cancel`, and `release`) plus their shared transaction
-implementation. They are consumed only through the same long-lived
-`WorkbenchClient` and exact lifecycle lease used by the `wb_*` tools. Observer
-capture never launches Workbench, creates another process guard, enters Play,
-executes a menu action, saves, or reloads scripts.
+implementation. They are consumed through the same long-lived compatibility
+facade, session controller, local reader/writer gate, and exact lifecycle lease
+used by the `wb_*` tools. Observer capture never launches Workbench, creates
+another process guard, enters Play, executes a menu action, saves, or reloads
+scripts.
 
 Workbench capture is bound to the lifecycle generation, canonical target
 `.gproj`, exact process identity, native `BaseWorld` camera slot, and
@@ -424,11 +443,11 @@ and canonicalizes that regular file, validates stable length and the PNG
 signature/structure/dimensions, computes SHA-256, and returns those exact bytes
 from `observer_capture`; there is no BMP conversion step.
 
-Before owner-scoped restart or shutdown, active captures receive a
-bounded restoration request through the shared activity gate. If restoration
-does not finish in time, the lifecycle mutation is refused before the global
-mutex or process termination. The normal order is: restore or cancel captures,
-wait for terminal state, then call `wb_shutdown`.
+Before owner-scoped restart or shutdown, the controller's local writer gate
+stops admitting new managed reads and gives active captures a bounded restoration
+window. If reads or restoration do not drain in time, the lifecycle mutation is
+refused before process termination. The normal order is: restore or cancel
+captures, wait for terminal state, then call `wb_shutdown`.
 
 For project-owned scripts and CI, the packaged `reforger-forge-workbench`
 runner shares the same version-3 lifecycle and companion staging:
@@ -439,17 +458,36 @@ reforger-forge-workbench build --gproj <path> --platform PC --output <path> --ti
 ```
 
 Editor mode is intentionally foreground-only and returns its version-2 receipt
-only after exact helper endpoint and Ping qualification. Build mode provides a
+only after exact helper endpoint and Ping qualification. The target-build plan
+itself is helper-free, uses a dedicated build profile, and performs no NET call.
+At this pre-removal boundary, however, the public build command still provides a
 guarded two-phase lifecycle under one machine lock and one absolute deadline.
-Its managed-companion preflight proves endpoint ownership and immutable Ping
-identity, then is exact-terminated and followed by an endpoint-vacancy proof
-before the distinct target-only child starts. The version-3 build receipt keeps
-the two PIDs, lifecycle generations, and attributed log directories separate;
-binds the target add-on ID/GUID, project-file SHA-256, and companion bundle; and
-requires fresh nonempty output containing exactly one hashed
-`resourceDatabase.rdb` before reporting success. Timeout and nonzero exits have
-`output: null`; an exit-zero output-proof failure carries `validationFailure`
-and makes the CLI fail while preserving both attributed log directories.
+Its separate managed-companion editor preflight proves endpoint ownership and
+immutable Ping identity, then is exact-terminated and followed by an
+endpoint-vacancy proof before the distinct target-only child starts. The public
+command therefore still emits the version-3 build receipt, which keeps the two
+PIDs, lifecycle generations, and attributed log directories separate; binds the
+target add-on ID/GUID, project-file SHA-256, and companion bundle; and requires
+fresh nonempty output containing exactly one hashed `resourceDatabase.rdb`
+before reporting success. Timeout and nonzero exits have `output: null`; an
+exit-zero output-proof failure carries `validationFailure` and makes the CLI
+fail while preserving both attributed log directories. Removing the preflight
+and emitting a helper-free version-4 receipt remain gated on two consecutive
+controlled target-only Workbench acceptance runs plus green hermetic contracts.
+
+Maintainers can collect that pre-removal evidence through the repository-only
+controller harness. It requires both an environment gate and explicit command
+confirmation, an exact real target, and an external output parent:
+
+```powershell
+$env:RFO_RUN_LIVE_WORKBENCH_BUILD_ACCEPTANCE = '1'
+npm run dev:workbench:acceptance:build -- --confirm-live-run --gproj <ABSOLUTE_TARGET_GPROJ> --output-root <EXTERNAL_OUTPUT_PARENT>
+```
+
+The harness runs the helper-free `target_build` controller path twice with
+distinct exclusive outputs and records a path/PID/token-sanitized artifact under
+`docs/validation`. Its existence is not acceptance evidence, and it neither
+removes the public helper preflight nor emits a version-4 receipt.
 
 Guarded data build is supported on installed Workbench 1.7.0.54 with the exact
 Resource Manager sequence
@@ -462,14 +500,19 @@ spawned child or zero exit without fresh output proof is not build evidence.
 
 ### Workbench Editor Control (Live)
 
+Embedders that call `registerTools()` directly must await its returned disposer
+before closing their `McpServer`. The disposer seals owned observer runtime
+lifecycle state; `src/index.ts` already follows this explicit shutdown contract.
+
 | Tool | What it does |
 |------|-------------|
-| `wb_play` | Refused for unattended automation. Enter Play manually while attended, confirm the action, verify mode with `wb_state`, and use `wb_stop` to return to edit mode. |
 | `wb_stop` | Exit play mode and return to World Editor; already-edit mode is an idempotent success. |
-| `wb_save` | Refused for unattended automation because Save/Save As can open modal UI. Save intentional editor changes manually while attended. |
 | `wb_undo_redo` | Undo or redo the last World Editor action. |
 | `wb_open_resource` | Open a resource in its editor (.et → Prefab Editor, .c → Script Editor, etc.). |
-| `wb_execute_action` | Generic menu execution is disabled in both the MCP tool and direct handler; use a purpose-built, reviewed tool instead. |
+
+Enter Play and save intentional editor changes manually while a person is
+attending Workbench. No automated Play, Save/Save As, or generic menu-action
+tool is advertised because those operations cannot be made reliably modal-free.
 
 ### Workbench Entities (Live)
 

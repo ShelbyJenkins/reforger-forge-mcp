@@ -1,18 +1,15 @@
 import { createHash } from "node:crypto";
 import {
-  existsSync,
-  lstatSync,
-  readFileSync,
   readdirSync,
-  statSync,
   unlinkSync,
 } from "node:fs";
 import { join } from "node:path";
 import { z } from "zod";
-import { ObserverError } from "./errors.js";
+import { boundedOption } from "#foundation/bounded-option";
+import { BoundedJsonStore, JsonStoreError } from "#foundation/json-store";
+import { ObserverError, observerOptionError } from "./errors.js";
 import {
   assertManagedPath,
-  atomicWriteJson,
   ensureCanonicalDirectory,
 } from "./paths.js";
 
@@ -124,6 +121,7 @@ export class OwnedRuntimeAuthorityStore {
   readonly maxBytes: number;
   readonly maxRecordBytes: number;
   readonly releaseRetentionMs: number;
+  private readonly recordsStore: BoundedJsonStore<OwnedRuntimeAuthorityRecord>;
 
   constructor(
     stateRoot: string,
@@ -137,22 +135,32 @@ export class OwnedRuntimeAuthorityStore {
   ) {
     this.root = ensureCanonicalDirectory(join(stateRoot, "owned-runtime-authorities-v1"));
     assertManagedPath(stateRoot, this.root);
-    this.maxRecords = this.option(options.maxRecords, DEFAULT_MAX_RECORDS, 1, 100_000, "record limit");
-    this.maxBytes = this.option(options.maxBytes, DEFAULT_MAX_BYTES, 4_096, 1024 * 1024 * 1024, "byte limit");
-    this.maxRecordBytes = this.option(
+    this.maxRecords = boundedOption(options.maxRecords, DEFAULT_MAX_RECORDS, 1, 100_000, "Owned runtime authority record limit", observerOptionError);
+    this.maxBytes = boundedOption(options.maxBytes, DEFAULT_MAX_BYTES, 4_096, 1024 * 1024 * 1024, "Owned runtime authority byte limit", observerOptionError);
+    this.maxRecordBytes = boundedOption(
       options.maxRecordBytes,
       Math.min(DEFAULT_MAX_RECORD_BYTES, this.maxBytes),
       1_024,
       this.maxBytes,
-      "record byte limit"
+      "Owned runtime authority record byte limit",
+      observerOptionError
     );
-    this.releaseRetentionMs = this.option(
+    this.releaseRetentionMs = boundedOption(
       options.releaseRetentionMs,
       DEFAULT_RELEASE_RETENTION_MS,
       0,
       24 * 60 * 60_000,
-      "release retention"
+      "Owned runtime authority release retention",
+      observerOptionError
     );
+    this.recordsStore = new BoundedJsonStore({
+      root: this.root,
+      minRecordBytes: 2,
+      maxRecordBytes: this.maxRecordBytes,
+      maxRecords: this.maxRecords,
+      maxTotalBytes: this.maxBytes,
+      parse: (value) => authorityRecordSchema.parse(value),
+    });
   }
 
   validateAuthority(input: unknown): OwnedRuntimeRecoveryAuthority {
@@ -170,13 +178,9 @@ export class OwnedRuntimeAuthorityStore {
   read(runtimeId: string): OwnedRuntimeAuthorityRecord | null {
     runtimeIdSchema.parse(runtimeId);
     const path = this.path(runtimeId);
-    if (!existsSync(path)) return null;
     try {
-      const info = lstatSync(path);
-      if (info.isSymbolicLink() || !info.isFile() || info.size < 2 || info.size > this.maxRecordBytes) {
-        throw new Error("not a bounded regular file");
-      }
-      const record = authorityRecordSchema.parse(JSON.parse(readFileSync(path, "utf8")));
+      const record = this.recordsStore.read(path);
+      if (!record) return null;
       if (record.authority.runtimeId !== runtimeId ||
           ("preparedLaunchId" in record.authority &&
             lifecycleGeneration(record.authority) !== record.authority.generation) ||
@@ -381,9 +385,10 @@ export class OwnedRuntimeAuthorityStore {
 
   stats(): OwnedRuntimeAuthorityStats {
     const records = this.records();
+    const usage = this.recordsStore.usage();
     return {
       records: records.length,
-      bytes: records.reduce((total, record) => total + statSync(this.path(record.authority.runtimeId)).size, 0),
+      bytes: usage.bytes,
       retained: records.filter((record) => record.state === "retained").length,
       releaseAcknowledged: records.filter((record) => record.state === "release_acknowledged").length,
       maxRecords: this.maxRecords,
@@ -424,31 +429,27 @@ export class OwnedRuntimeAuthorityStore {
   }
 
   private write(record: OwnedRuntimeAuthorityRecord, exclusive: boolean): void {
-    const serialized = `${JSON.stringify(record, null, 2)}\n`;
-    const bytes = Buffer.byteLength(serialized, "utf8");
-    if (bytes > this.maxRecordBytes) {
-      throw new ObserverError(
-        "TRANSPORT_UNAVAILABLE",
-        "Owned runtime recovery authority exceeds its record budget",
-        503
-      );
-    }
     const path = this.path(record.authority.runtimeId);
-    const usage = this.usage();
-    const priorBytes = existsSync(path) ? statSync(path).size : 0;
-    const nextRecords = usage.records + (existsSync(path) ? 0 : 1);
-    const nextBytes = usage.bytes - priorBytes + bytes;
-    if (nextRecords > this.maxRecords || nextBytes > this.maxBytes) {
-      throw new ObserverError(
-        "TRANSPORT_UNAVAILABLE",
-        "Owned runtime recovery authority store is full",
-        503
-      );
+    try {
+      this.recordsStore.write(path, record, { exclusive });
+    } catch (error) {
+      if (error instanceof JsonStoreError && error.code === "CAS_CONFLICT") {
+        throw new ObserverError("SESSION_MISMATCH", "Owned runtime recovery authority already exists", 409);
+      }
+      if (error instanceof JsonStoreError && [
+        "RECORD_TOO_LARGE",
+        "CAPACITY_EXCEEDED",
+      ].includes(error.code)) {
+        throw new ObserverError(
+          "TRANSPORT_UNAVAILABLE",
+          error.code === "RECORD_TOO_LARGE"
+            ? "Owned runtime recovery authority exceeds its record budget"
+            : "Owned runtime recovery authority store is full",
+          503
+        );
+      }
+      throw error;
     }
-    if (exclusive && existsSync(path)) {
-      throw new ObserverError("SESSION_MISMATCH", "Owned runtime recovery authority already exists", 409);
-    }
-    atomicWriteJson(this.root, path, record);
   }
 
   private records(): OwnedRuntimeAuthorityRecord[] {
@@ -468,39 +469,10 @@ export class OwnedRuntimeAuthorityStore {
     return records;
   }
 
-  private usage(): { records: number; bytes: number } {
-    let records = 0;
-    let bytes = 0;
-    for (const name of readdirSync(this.root)) {
-      const path = join(this.root, name);
-      const info = lstatSync(path);
-      if (info.isSymbolicLink() || !info.isFile()) continue;
-      records += 1;
-      bytes += info.size;
-    }
-    return { records, bytes };
-  }
-
   private path(runtimeId: string): string {
     const path = join(this.root, `${runtimeIdSchema.parse(runtimeId)}.json`);
     assertManagedPath(this.root, path);
     return path;
   }
 
-  private option(
-    value: number | undefined,
-    fallback: number,
-    minimum: number,
-    maximum: number,
-    label: string
-  ): number {
-    const selected = value ?? fallback;
-    if (!Number.isSafeInteger(selected) || selected < minimum || selected > maximum) {
-      throw new ObserverError(
-        "INVALID_REQUEST",
-        `Owned runtime authority ${label} must be from ${minimum} through ${maximum}`
-      );
-    }
-    return selected;
-  }
 }

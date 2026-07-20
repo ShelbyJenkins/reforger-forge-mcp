@@ -101,7 +101,7 @@ class CrashBackend implements OwnedRuntimeProcessBackend {
     return {
       pid,
       executablePath: process.execPath,
-      creationTimeFileTime: "900001",
+      creationTime: "900001",
       userSid: "S-1-5-21-f8-owner",
     };
   }
@@ -134,7 +134,7 @@ class CrashBackend implements OwnedRuntimeProcessBackend {
         message: "fixture path mismatch",
       };
     }
-    if (processRecord.identity.creationTimeFileTime !== expected.creationTimeFileTime) {
+    if (processRecord.identity.creationTime !== expected.creationTime) {
       return {
         kind: "refused" as const,
         reason: "creation_time_mismatch" as const,
@@ -287,7 +287,7 @@ async function captureOwnedCut(cut: OwnedSpawnCrashCut): Promise<OwnedCrashSnaps
       identity: {
         pid,
         executablePath: file,
-        creationTimeFileTime: String(800_000 + pid),
+        creationTime: String(800_000 + pid),
       },
       ownerArgument,
     });

@@ -1,4 +1,5 @@
-import { resolve, sep } from "node:path";
+import { resolve } from "node:path";
+import { resolveManagedPath } from "../foundation/managed-path.js";
 
 /**
  * Validate that a user-supplied name is safe for use as a filename.
@@ -42,16 +43,10 @@ export function validateEnforceIdentifier(name: string): void {
 }
 
 /**
- * Check that resolved is equal to or contained within normalizedBase.
- * Uses trailing separator to prevent prefix collisions (e.g., C:\Proj vs C:\ProjEvil).
- */
-function isContained(normalizedBase: string, resolved: string): boolean {
-  return resolved === normalizedBase || resolved.startsWith(normalizedBase + sep);
-}
-
-/**
  * Validate that a resolved path stays within the base directory.
- * Combines validateFilename + traversal check.
+ * Combines validateFilename + lexical traversal checking. Project directories
+ * are user-owned rather than an adversarial private store, so links inside a
+ * project remain intentionally supported here.
  */
 export function safePath(basePath: string, ...segments: string[]): string {
   for (const seg of segments) {
@@ -61,11 +56,11 @@ export function safePath(basePath: string, ...segments: string[]): string {
   const normalizedBase = resolve(basePath);
   const resolved = resolve(normalizedBase, ...segments);
 
-  if (!isContained(normalizedBase, resolved)) {
+  try {
+    return resolveManagedPath(normalizedBase, resolved, "lexical");
+  } catch {
     throw new Error("Path traversal not allowed: resolved path is outside project");
   }
-
-  return resolved;
 }
 
 /**
@@ -80,9 +75,9 @@ export function validateProjectPath(basePath: string, subPath: string): string {
   const normalizedBase = resolve(basePath);
   const resolved = resolve(normalizedBase, subPath);
 
-  if (!isContained(normalizedBase, resolved)) {
+  try {
+    return resolveManagedPath(normalizedBase, resolved, "lexical");
+  } catch {
     throw new Error("Path traversal not allowed: resolved path is outside project");
   }
-
-  return resolved;
 }

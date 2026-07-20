@@ -10,7 +10,9 @@ import {
   type ObserverCapability,
 } from "../protocol/index.js";
 import { z } from "zod";
-import { ObserverError } from "./errors.js";
+import { boundedOption } from "#foundation/bounded-option";
+import { BoundedJsonMap } from "#foundation/json-store";
+import { ObserverError, observerOptionError } from "./errors.js";
 import { type Clock, SessionStore, systemClock } from "./sessions.js";
 
 const RUNTIME_CAPABILITIES = new Set<string>(
@@ -77,7 +79,7 @@ export interface InstanceRegistryStats {
 }
 
 export class InstanceRegistry {
-  private readonly instances = new Map<string, InstanceRecord>();
+  private readonly instances: BoundedJsonMap<string, InstanceRecord>;
   private readonly clock: Clock;
   readonly staleAfterMs: number;
   readonly staleRetentionMs: number;
@@ -87,16 +89,27 @@ export class InstanceRegistry {
 
   constructor(private readonly sessions: SessionStore, options: RegistryOptions = {}) {
     this.clock = options.clock ?? systemClock;
-    this.staleAfterMs = this.boundedOption(options.staleAfterMs, 15_000, 1_000, 24 * 60 * 60_000, "Instance stale threshold");
-    this.staleRetentionMs = this.boundedOption(options.staleRetentionMs, 5 * 60_000, 0, 24 * 60 * 60_000, "Stale instance retention");
-    this.maxRecords = this.boundedOption(options.maxRecords, 4_096, 1, 100_000, "Instance record limit");
-    this.maxEstimatedBytes = this.boundedOption(
+    this.staleAfterMs = boundedOption(options.staleAfterMs, 15_000, 1_000, 24 * 60 * 60_000, "Instance stale threshold", observerOptionError);
+    this.staleRetentionMs = boundedOption(options.staleRetentionMs, 5 * 60_000, 0, 24 * 60 * 60_000, "Stale instance retention", observerOptionError);
+    this.maxRecords = boundedOption(options.maxRecords, 4_096, 1, 100_000, "Instance record limit", observerOptionError);
+    this.maxEstimatedBytes = boundedOption(
       options.maxEstimatedBytes,
       16 * 1024 * 1024,
       1_024,
       1024 * 1024 * 1024,
-      "Instance registry byte limit"
+      "Instance registry byte limit",
+      observerOptionError
     );
+    this.instances = new BoundedJsonMap({
+      maxRecords: this.maxRecords,
+      maxEstimatedBytes: this.maxEstimatedBytes,
+      estimateBytes: (_key, record) => this.recordBytes(record),
+      capacityError: () => new ObserverError(
+        "TRANSPORT_UNAVAILABLE",
+        "Observer instance registry retention budget is exhausted",
+        503
+      ),
+    });
   }
 
   setDurableMutationHook(hook: ((mutation: RegistryDurableMutation) => void) | null): void {
@@ -387,7 +400,7 @@ export class InstanceRegistry {
       records: records.length,
       stale: records.filter((record) => now - record.lastHeartbeatAtMs > this.staleAfterMs).length,
       restorationObligations: records.filter((record) => record.activeJobId !== null || record.cameraLeaseJobId !== null).length,
-      estimatedBytes: records.reduce((total, record) => total + this.recordBytes(record), 0),
+      estimatedBytes: this.instances.estimatedBytes(),
       maxRecords: this.maxRecords,
       maxEstimatedBytes: this.maxEstimatedBytes,
       staleAfterMs: this.staleAfterMs,
@@ -409,24 +422,11 @@ export class InstanceRegistry {
 
   private assertCapacity(key: string, record: InstanceRecord, now: number, sweep = true): void {
     if (sweep) this.sweep(now);
-    const replacing = this.instances.get(key);
-    const nextRecords = this.instances.size + (replacing ? 0 : 1);
-    const currentBytes = [...this.instances.values()].reduce((total, existing) => total + this.recordBytes(existing), 0);
-    const nextBytes = currentBytes - (replacing ? this.recordBytes(replacing) : 0) + this.recordBytes(record);
-    if (nextRecords > this.maxRecords || nextBytes > this.maxEstimatedBytes) {
-      throw new ObserverError("TRANSPORT_UNAVAILABLE", "Observer instance registry retention budget is exhausted", 503);
-    }
+    this.instances.assertCanSet(key, record);
   }
 
   private recordBytes(record: InstanceRecord): number {
     return Buffer.byteLength(JSON.stringify(record), "utf8");
   }
 
-  private boundedOption(value: number | undefined, fallback: number, minimum: number, maximum: number, label: string): number {
-    const selected = value ?? fallback;
-    if (!Number.isSafeInteger(selected) || selected < minimum || selected > maximum) {
-      throw new ObserverError("INVALID_REQUEST", `${label} must be an integer from ${minimum} through ${maximum}`);
-    }
-    return selected;
-  }
 }

@@ -4,16 +4,18 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { join, resolve, sep } from "node:path";
 import { isIP } from "node:net";
 import { ZodError } from "zod";
+import { boundedOption } from "#foundation/bounded-option";
 import { AGENT_VERSION, DEFAULT_LIMITS, MAX_PROTOCOL_MESSAGE_BYTES, PROTOCOL_VERSION } from "../protocol/index.js";
 import { ArtifactStore } from "./artifacts.js";
 import { ObserverControlApi } from "./control-api.js";
-import { asObserverError, errorBody, ObserverError } from "./errors.js";
+import { asObserverError, errorBody, ObserverError, observerOptionError } from "./errors.js";
 import { JobStore, type JobStoreDurableMutation } from "./jobs.js";
 import { observerLogger } from "./logger.js";
 import { MailboxCoordinator, type MailboxCoordinatorOptions, type MailboxSweepResult } from "./mailbox-coordinator.js";
 import { InstanceRegistry, type RegistryDurableMutation } from "./registry.js";
 import { ObserverRuntimeApi } from "./runtime-api.js";
 import { ObserverRunStore } from "./runs.js";
+import type { ObserverApplicationOperations, ObserverApplicationOperationName } from "./application-operations.js";
 import {
   OwnedRuntimeAuthorityStore,
   type OwnedRuntimeRecoveryAuthority,
@@ -132,6 +134,7 @@ export class ObserverAgentServer {
   private lastSweep: ObserverApplicationSweepResult | null = null;
   private readonly ownedRuntimeLifecyclePins = new Map<string, OwnedRuntimeLifecyclePin>();
   private readonly ownedRuntimeAuthorities: OwnedRuntimeAuthorityStore;
+  private controlOperations: Pick<ObserverApplicationOperations, "execute"> | null = null;
 
   constructor(
     readonly agentInstanceId: string,
@@ -158,6 +161,11 @@ export class ObserverAgentServer {
     this.registry.setDurableMutationHook((mutation) => {
       this.persistOwnedRuntimeLifecycleSnapshot(mutation.sessionId, undefined, mutation);
     });
+  }
+
+  setControlOperations(operations: Pick<ObserverApplicationOperations, "execute">): void {
+    if (this.controlOperations) throw new ObserverError("INVALID_REQUEST", "Observer control operations are already configured", 409);
+    this.controlOperations = operations;
   }
 
   async start(): Promise<StartupDescriptor> {
@@ -204,7 +212,7 @@ export class ObserverAgentServer {
       controlHttpEnabled: this.options.enableControlHttp ?? false,
       ...(this.options.enableControlHttp ? { controlToken: this.control.controlToken } : {}),
     };
-    const sweepIntervalMs = this.boundedOption(this.options.sweepIntervalMs, 1_000, 100, 60_000, "Observer sweep interval");
+    const sweepIntervalMs = boundedOption(this.options.sweepIntervalMs, 1_000, 100, 60_000, "Observer sweep interval", observerOptionError);
     this.sweepTimer = setInterval(() => {
       try {
         this.sweep(Date.now());
@@ -248,12 +256,13 @@ export class ObserverAgentServer {
     const removedPreparedReceiptKeys = this.control.sweepPrepared(now, finalPins);
     this.ownedRuntimeAuthorities.sweep(now);
 
-    const retentionIntervalMs = this.boundedOption(
+    const retentionIntervalMs = boundedOption(
       this.options.retentionIntervalMs,
       60_000,
       1_000,
       24 * 60 * 60_000,
-      "Observer retention interval"
+      "Observer retention interval",
+      observerOptionError
     );
     const retentionApplied = forceRetention || now - this.lastRetentionAt >= retentionIntervalMs;
     if (retentionApplied) {
@@ -685,14 +694,6 @@ export class ObserverAgentServer {
     await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
   }
 
-  private boundedOption(value: number | undefined, fallback: number, minimum: number, maximum: number, label: string): number {
-    const selected = value ?? fallback;
-    if (!Number.isSafeInteger(selected) || selected < minimum || selected > maximum) {
-      throw new ObserverError("INVALID_REQUEST", `${label} must be an integer from ${minimum} through ${maximum}`);
-    }
-    return selected;
-  }
-
   private assertOwnedRuntimeLifecycleIdentity(
     sessionId: string,
     runtimeId: string,
@@ -773,33 +774,27 @@ export class ObserverAgentServer {
     if (!this.options.enableControlHttp) throw new ObserverError("UNAUTHORIZED", "Loopback control HTTP is disabled", 403);
     const token = bearer(request);
     if (!token || !constantTimeToken(token, this.control.controlToken)) throw new ObserverError("UNAUTHORIZED", "Control credential is invalid", 401);
+    const operations = this.controlOperations;
+    if (!operations) throw new ObserverError("TRANSPORT_UNAVAILABLE", "Observer control operations are unavailable", 503);
     if (request.method === "GET" && url.pathname === "/v1/control/status") {
-      json(response, 200, {
-        ...this.control.diagnostics(),
-        instances: this.registry.diagnostics(),
-        jobs: this.jobs.diagnostics(),
-        stores: this.storeDiagnostics(),
-      });
+      json(response, 200, await operations.execute("status", {}));
       return;
     }
     if (request.method === "GET" && url.pathname === "/v1/control/instances") {
-      json(response, 200, { instances: this.registry.diagnostics() });
+      json(response, 200, await operations.execute("instances", {}));
       return;
     }
     if (request.method !== "POST") throw new ObserverError("INVALID_REQUEST", "Unexpected control method", 405);
     const body = await readJson(request, maxBodyBytes);
-    if (url.pathname === "/v1/control/stage") {
-      json(response, 200, this.control.ensureStaged());
-    } else if (url.pathname === "/v1/control/prepare-launch") {
-      json(response, 200, await this.control.prepareLaunch(body as never));
-    } else if (url.pathname === "/v1/control/revoke") {
-      json(response, 200, { revoked: this.control.revokeSession(String(body.sessionId ?? "")) });
-    } else if (url.pathname === "/v1/control/jobs") {
-      json(response, 200, this.jobs.submit(body as never));
-    } else if (url.pathname === "/v1/control/cancel") {
-      json(response, 200, this.jobs.cancel(String(body.sessionId ?? ""), String(body.jobId ?? "")));
-    } else {
-      throw new ObserverError("INVALID_REQUEST", "Observer control endpoint was not found", 404);
-    }
+    const routes: Readonly<Record<string, ObserverApplicationOperationName>> = {
+      "/v1/control/stage": "stage",
+      "/v1/control/prepare-launch": "prepareLaunch",
+      "/v1/control/revoke": "revoke",
+      "/v1/control/jobs": "submitJob",
+      "/v1/control/cancel": "cancelJob",
+    };
+    const operation = routes[url.pathname];
+    if (!operation) throw new ObserverError("INVALID_REQUEST", "Observer control endpoint was not found", 404);
+    json(response, 200, await operations.execute(operation, body));
   }
 }

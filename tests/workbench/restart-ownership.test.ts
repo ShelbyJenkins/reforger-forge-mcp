@@ -6,10 +6,12 @@ import {
   expect,
   it,
   vi,
+  type Mock,
 } from "vitest";
 import {
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   rmSync,
   unlinkSync,
   writeFileSync,
@@ -20,12 +22,25 @@ import type { Config } from "../../src/config.js";
 import {
   WorkbenchClient,
   WorkbenchError,
+  type WorkbenchClientDependencies,
 } from "../../src/workbench/client.js";
+import type {
+  WorkbenchNetApiCallOptions,
+  WorkbenchNetApiPort,
+} from "../../src/workbench/net-api-client.js";
+import {
+  waitForVacancy,
+  type CompanionReadinessOptions,
+  type WorkbenchCompanionIdentity,
+} from "../../src/workbench/readiness.js";
 import {
   LifecycleGuardError,
   WorkbenchProcessGuard,
 } from "../../src/workbench/process-guard.js";
-import { FakeLifecycleBackend } from "./fake-lifecycle-backend.js";
+import {
+  createFakeLifecycleBackend,
+  type FakeLifecycleBackend,
+} from "./fake-lifecycle-backend.js";
 import {
   createFakeCompanionLaunch,
   fakeCompanionProvider,
@@ -61,12 +76,24 @@ interface Harness {
   client: WorkbenchClient;
   companionProvider: ReturnType<typeof fakeCompanionProvider>;
   verifyStaged: ReturnType<typeof vi.fn>;
+  netApiCall: Mock<TestNetApiCall>;
   children: FakeChild[];
   spawnOptions: SpawnOptions[];
   spawnArgs: string[][];
 }
 
-function createHarness(): Harness {
+type TestNetApiCall = (
+  apiFunc: string,
+  params?: Record<string, unknown>,
+  options?: WorkbenchNetApiCallOptions
+) => Promise<Record<string, unknown>>;
+
+interface HarnessOptions {
+  companionReadiness?: NonNullable<WorkbenchClientDependencies["companionReadiness"]>;
+  vacancyWait?: NonNullable<WorkbenchClientDependencies["vacancyWait"]>;
+}
+
+function createHarness(options: HarnessOptions = {}): Harness {
   const root = mkdtempSync(join(tmpdir(), "reforger-forge-restart-"));
   roots.push(root);
   const projectRoot = join(root, "projects");
@@ -94,9 +121,8 @@ function createHarness(): Harness {
     patternsDir: join(root, "patterns"),
     workbenchHost: "127.0.0.1",
     workbenchPort: 5775,
-    workbenchNoThrow: true,
   };
-  const backend = new FakeLifecycleBackend();
+  const backend = createFakeLifecycleBackend();
   const mutexName = `Global\\ReforgerForge.Test.${root}`;
   const guard = new WorkbenchProcessGuard({
     backend,
@@ -111,6 +137,12 @@ function createHarness(): Harness {
   const spawnOptions: SpawnOptions[] = [];
   const spawnArgs: string[][] = [];
   let nextPid = 12_000;
+  const netApiCall = vi.fn<TestNetApiCall>(async (apiFunc) => apiFunc === "EMCP_WB_Ping"
+    ? WORKBENCH_HELPER_PING_RESPONSE
+    : { status: "ok" });
+  const netApi: WorkbenchNetApiPort = {
+    call: netApiCall as WorkbenchNetApiPort["call"],
+  };
   const client = new WorkbenchClient(
     config.workbenchHost,
     config.workbenchPort,
@@ -119,6 +151,9 @@ function createHarness(): Harness {
     guard,
     {
       companionProvider,
+      netApi,
+      companionReadiness: options.companionReadiness,
+      vacancyWait: options.vacancyWait,
       spawnProcess: (command, args, options) => {
         spawnOptions.push(options);
         spawnArgs.push([...args]);
@@ -140,15 +175,6 @@ function createHarness(): Harness {
     }
   );
 
-  // Process ownership and state transitions remain real; only external TCP
-  // readiness timing is removed from these hermetic lifecycle tests.
-  (client as unknown as {
-    waitForCompanionReady: (
-      child: ChildProcess,
-      error: () => Error | null,
-      companion: unknown
-    ) => Promise<void>;
-  }).waitForCompanionReady = vi.fn().mockResolvedValue(undefined);
   return {
     root,
     modDirectory,
@@ -161,6 +187,7 @@ function createHarness(): Harness {
     client,
     companionProvider,
     verifyStaged,
+    netApiCall,
     children,
     spawnOptions,
     spawnArgs,
@@ -175,6 +202,20 @@ function addProject(harness: Harness, name: string): string {
   return projectPath;
 }
 
+function readinessIdentity(
+  options: CompanionReadinessOptions
+): WorkbenchCompanionIdentity {
+  return {
+    addonId: options.companion.addonId,
+    addonGuid: options.companion.addonGuid,
+    addonVersion: options.companion.addonVersion,
+    protocolVersion: options.companion.protocolVersion,
+    workbenchProtocol: options.companion.protocolVersion,
+    buildIdentity: options.companion.buildIdentity,
+    bundleDigest: options.companion.bundleDigest,
+  };
+}
+
 afterEach(() => {
   for (const root of roots.splice(0)) {
     rmSync(root, { recursive: true, force: true });
@@ -184,47 +225,41 @@ afterEach(() => {
 describe("exact owner-scoped Workbench restart", () => {
   it("refuses configured NET API calls before touching an unmanaged endpoint", async () => {
     const harness = createHarness();
-    const rawCall = vi.spyOn(
-      harness.client as unknown as { rawCall: (api: string) => Promise<Record<string, unknown>> },
-      "rawCall"
-    );
 
     await expect(harness.client.call("EMCP_WB_ListEntities", {}, { skipAutoLaunch: true }))
       .rejects.toMatchObject({ code: "CONNECTION_REFUSED" });
-    expect(rawCall).not.toHaveBeenCalled();
+    expect(harness.netApiCall).not.toHaveBeenCalled();
   });
 
   it("permits calls only after exact lifecycle, process, endpoint, and companion attestation", async () => {
     const harness = createHarness();
     await harness.client.ensureRunning(harness.projectPath);
-    const rawCall = vi.spyOn(
-      harness.client as unknown as { rawCall: (api: string) => Promise<Record<string, unknown>> },
-      "rawCall"
-    ).mockImplementation(async (api) => api === "EMCP_WB_Ping"
+    harness.netApiCall.mockClear();
+    harness.netApiCall.mockImplementation(async (api) => api === "EMCP_WB_Ping"
       ? WORKBENCH_HELPER_PING_RESPONSE
       : { status: "ok", count: 0 });
 
     await expect(harness.client.call("EMCP_WB_ListEntities", {}, { skipAutoLaunch: true }))
       .resolves.toMatchObject({ status: "ok", count: 0 });
-    expect(rawCall.mock.calls.map(([api]) => api)).toEqual([
+    expect(harness.netApiCall.mock.calls.map(([api]) => api)).toEqual([
       "EMCP_WB_Ping",
       "EMCP_WB_ListEntities",
     ]);
   });
 
-  it("caches immutable companion attestation by lifecycle generation and digest", async () => {
+  it("shares immutable companion attestation across two consumers of one facade/controller", async () => {
     const harness = createHarness();
     await harness.client.ensureRunning(harness.projectPath);
     const launchAttestations = harness.verifyStaged.mock.calls.length;
-    vi.spyOn(
-      harness.client as unknown as { rawCall: (api: string) => Promise<Record<string, unknown>> },
-      "rawCall"
-    ).mockImplementation(async (api) => api === "EMCP_WB_Ping"
+    const toolConsumer = harness.client;
+    const observerConsumer = harness.client;
+    expect(toolConsumer).toBe(observerConsumer);
+    harness.netApiCall.mockImplementation(async (api) => api === "EMCP_WB_Ping"
       ? WORKBENCH_HELPER_PING_RESPONSE
       : { status: "ok" });
 
-    await harness.client.call("EMCP_WB_GetState", {}, { skipAutoLaunch: true });
-    await harness.client.call("EMCP_WB_ListEntities", {}, { skipAutoLaunch: true });
+    await toolConsumer.call("EMCP_WB_GetState", {}, { skipAutoLaunch: true });
+    await observerConsumer.call("EMCP_WB_ListEntities", {}, { skipAutoLaunch: true });
     expect(harness.verifyStaged.mock.calls.length - launchAttestations).toBe(1);
 
     await harness.guard.withLifecycleLock(async (session) => {
@@ -244,6 +279,65 @@ describe("exact owner-scoped Workbench restart", () => {
       );
     });
     await harness.client.call("EMCP_WB_GetState", {}, { skipAutoLaunch: true });
+    expect(harness.verifyStaged.mock.calls.length - launchAttestations).toBe(2);
+  });
+
+  it("invalidates immutable attestation when the recorded bundle digest changes", async () => {
+    const harness = createHarness();
+    await harness.client.ensureRunning(harness.projectPath);
+    const launchAttestations = harness.verifyStaged.mock.calls.length;
+    harness.netApiCall.mockImplementation(async (api) => api === "EMCP_WB_Ping"
+      ? WORKBENCH_HELPER_PING_RESPONSE
+      : { status: "ok" });
+
+    await harness.client.call("EMCP_WB_GetState", {}, { skipAutoLaunch: true });
+    expect(harness.verifyStaged.mock.calls.length - launchAttestations).toBe(1);
+
+    await harness.guard.withLifecycleLock(async (session) => {
+      const read = await session.readState();
+      if (read.kind !== "valid" || !read.state.mcpOwner || !read.state.companion) {
+        throw new Error("missing running companion state");
+      }
+      await session.transition(
+        { generation: read.state.generation, leaseId: read.state.mcpOwner.leaseId },
+        {
+          phase: read.state.phase,
+          endpoint: read.state.endpoint,
+          target: read.state.target,
+          mcpOwner: read.state.mcpOwner,
+          workbench: read.state.workbench,
+          companion: {
+            ...read.state.companion,
+            bundleDigest: "b".repeat(64),
+          },
+          operation: read.state.operation,
+        }
+      );
+    });
+
+    await harness.client.call("EMCP_WB_GetState", {}, { skipAutoLaunch: true });
+    expect(harness.verifyStaged.mock.calls.length - launchAttestations).toBe(2);
+    expect(harness.verifyStaged.mock.calls.at(-1)?.[0]).toMatchObject({
+      bundleDigest: "b".repeat(64),
+    });
+  });
+
+  it("does not cache a failed process or endpoint qualification", async () => {
+    const harness = createHarness();
+    await harness.client.ensureRunning(harness.projectPath);
+    const launchAttestations = harness.verifyStaged.mock.calls.length;
+    harness.backend.endpointOwnershipResult = {
+      kind: "refused",
+      reason: "listener_pid_mismatch",
+      message: "listener temporarily belongs to another process",
+    };
+
+    await expect(harness.client.call("EMCP_WB_GetState", {}, { skipAutoLaunch: true }))
+      .rejects.toMatchObject({ code: "IDENTITY_UNVERIFIABLE" });
+    harness.backend.endpointOwnershipResult = null;
+    await expect(harness.client.call("EMCP_WB_GetState", {}, { skipAutoLaunch: true }))
+      .resolves.toMatchObject({ status: "ok" });
+
     expect(harness.verifyStaged.mock.calls.length - launchAttestations).toBe(2);
   });
 
@@ -303,6 +397,49 @@ describe("exact owner-scoped Workbench restart", () => {
     expect(mutexDepth).toBe(0);
   });
 
+  it("publishes a durable reservation before uninstalling from a missing lifecycle", async () => {
+    const harness = createHarness();
+    const contenderGuard = new WorkbenchProcessGuard({
+      backend: harness.backend,
+      stateDir: harness.guard.stateDir,
+      mutexName: harness.mutexName,
+    });
+    let contenderAttempt: ReturnType<typeof contenderGuard.withLifecycleLock> | null = null;
+    harness.companionProvider.uninstall = vi.fn(() => {
+      const reserved = JSON.parse(
+        readFileSync(harness.guard.statePath, "utf8")
+      ) as { phase: string; workbench: unknown; operation: { kind: string } | null };
+      expect(reserved).toMatchObject({
+        phase: "starting",
+        workbench: null,
+        operation: { kind: "recovery" },
+      });
+      contenderAttempt = contenderGuard.withLifecycleLock((session) =>
+        session.validateAndClaim({
+          endpoint: {
+            host: harness.config.workbenchHost,
+            port: harness.config.workbenchPort,
+          },
+          target: null,
+        })
+      );
+      return { removed: true, roleRoot: join(harness.root, "managed-helper") };
+    });
+
+    await expect(harness.client.uninstallManagedCompanion()).resolves.toMatchObject({
+      removed: true,
+    });
+    await expect(contenderAttempt).resolves.toMatchObject({
+      kind: "refused",
+      code: "OWNED_BY_OTHER_MCP",
+    });
+    const read = await harness.guard.readLifecycleState();
+    expect(read).toMatchObject({
+      kind: "valid",
+      state: { phase: "vacant", workbench: null, companion: null, operation: null },
+    });
+  });
+
   it("releases the machine mutex while an ordinary managed NET request is blocked", async () => {
     const harness = createHarness();
     await harness.client.ensureRunning(harness.projectPath);
@@ -310,10 +447,7 @@ describe("exact owner-scoped Workbench restart", () => {
     let releaseCall!: () => void;
     const entered = new Promise<void>((resolvePromise) => { enteredCall = resolvePromise; });
     const blocked = new Promise<void>((resolvePromise) => { releaseCall = resolvePromise; });
-    vi.spyOn(
-      harness.client as unknown as { rawCall: (api: string) => Promise<Record<string, unknown>> },
-      "rawCall"
-    ).mockImplementation(async (api) => {
+    harness.netApiCall.mockImplementation(async (api) => {
       if (api === "EMCP_WB_Ping") return WORKBENCH_HELPER_PING_RESPONSE;
       enteredCall();
       await blocked;
@@ -324,26 +458,25 @@ describe("exact owner-scoped Workbench restart", () => {
     await entered;
     const contenderRead = await harness.guard.withLifecycleLock((session) => session.readState());
     expect(contenderRead).toMatchObject({ kind: "valid", state: { phase: "running" } });
-    await expect(harness.client.restartOwnedWorkbench()).rejects.toMatchObject({
-      code: "LIFECYCLE_BUSY",
-    });
+    const previousPid = harness.children[0].pid;
+    const restarting = harness.client.restartOwnedWorkbench();
+    await new Promise<void>((resolvePromise) => setImmediate(resolvePromise));
+    expect(harness.backend.terminationCalls).toHaveLength(0);
 
     releaseCall();
     await expect(request).resolves.toMatchObject({ status: "ok", count: 1 });
+    await expect(restarting).resolves.toMatchObject({ previousPid });
+    expect(harness.children).toHaveLength(2);
   });
 
   it("refuses stale local state publication when generation changes during an unlocked NET call", async () => {
     const harness = createHarness();
     await harness.client.ensureRunning(harness.projectPath);
-    const baselineState = harness.client.state;
     let enteredCall!: () => void;
     let releaseCall!: () => void;
     const entered = new Promise<void>((resolvePromise) => { enteredCall = resolvePromise; });
     const blocked = new Promise<void>((resolvePromise) => { releaseCall = resolvePromise; });
-    vi.spyOn(
-      harness.client as unknown as { rawCall: (api: string) => Promise<Record<string, unknown>> },
-      "rawCall"
-    ).mockImplementation(async (api) => {
+    harness.netApiCall.mockImplementation(async (api) => {
       if (api === "EMCP_WB_Ping") return WORKBENCH_HELPER_PING_RESPONSE;
       enteredCall();
       await blocked;
@@ -378,15 +511,16 @@ describe("exact owner-scoped Workbench restart", () => {
     });
     await mutexHeld;
     releaseCall();
+    const requestError = request.catch((error: unknown) => error);
 
-    // The NET response is provisional while its final exact-generation check
-    // is queued. It must never become visible through the local cache.
+    // The NET response is provisional until its lock-free exact-generation
+    // check completes. A stale response invalidates the local cache immediately.
     await new Promise((resolve) => setTimeout(resolve, 5));
-    expect(harness.client.state).toEqual(baselineState);
+    expect(harness.client.state).toMatchObject({ connected: false, mode: "unknown" });
     releaseFinalMutex();
     await holder;
 
-    await expect(request).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    await expect(requestError).resolves.toMatchObject({ code: "RECOVERY_REQUIRED" });
     expect(harness.client.state).toMatchObject({ connected: false, mode: "unknown" });
   });
 
@@ -481,19 +615,22 @@ describe("exact owner-scoped Workbench restart", () => {
   });
 
   it("terminates the exact failed launch before returning to vacant", async () => {
-    const harness = createHarness();
-    (harness.client as unknown as {
-      waitForCompanionReady: () => Promise<void>;
-    }).waitForCompanionReady = vi.fn().mockRejectedValue(new WorkbenchError(
-      "injected readiness failure",
-      "LAUNCH_FAILED"
-    ));
+    const harness = createHarness({
+      companionReadiness: async () => {
+        throw new WorkbenchError("injected readiness failure", "LAUNCH_FAILED");
+      },
+    });
 
     await expect(harness.client.ensureRunning(harness.projectPath)).rejects.toMatchObject({
       code: "LAUNCH_FAILED",
     });
     expect(harness.backend.terminationCalls).toHaveLength(1);
     expect(harness.backend.workbenchPids.size).toBe(0);
+    expect(harness.client.diagnosticSupervisedChildCounts()).toEqual({
+      active: 0,
+      reconciling: 0,
+      total: 0,
+    });
     const read = await harness.guard.readLifecycleState();
     expect(read.kind).toBe("valid");
     if (read.kind === "valid") {
@@ -501,6 +638,56 @@ describe("exact owner-scoped Workbench restart", () => {
       expect(read.state.workbench).toBeNull();
       expect(read.state.companion).not.toBeNull();
     }
+  });
+
+  it("drains old and failed replacement supervision before a later operation", async () => {
+    let readinessAttempt = 0;
+    const harness = createHarness({
+      companionReadiness: async (options) => {
+        readinessAttempt += 1;
+        if (readinessAttempt === 2) {
+          throw new WorkbenchError("injected replacement readiness failure", "LAUNCH_FAILED");
+        }
+        return readinessIdentity(options);
+      },
+    });
+    const launched = await harness.client.ensureRunning(harness.projectPath);
+    expect(harness.client.diagnosticSupervisedChildCounts()).toEqual({
+      active: 1,
+      reconciling: 0,
+      total: 1,
+    });
+
+    await expect(harness.client.restartOwnedWorkbench()).rejects.toMatchObject({
+      code: "LAUNCH_FAILED",
+    });
+    expect(harness.backend.terminationCalls.map((call) => call.pid)).toEqual([
+      launched.pid,
+      harness.children[1].pid,
+    ]);
+    expect(harness.backend.workbenchPids.size).toBe(0);
+    expect(harness.client.diagnosticSupervisedChildCounts()).toEqual({
+      active: 0,
+      reconciling: 0,
+      total: 0,
+    });
+
+    const relaunched = await harness.client.ensureRunning(harness.projectPath);
+    expect(relaunched).toMatchObject({
+      action: "launched",
+      pid: harness.children[2].pid,
+    });
+    expect(harness.client.diagnosticSupervisedChildCounts()).toEqual({
+      active: 1,
+      reconciling: 0,
+      total: 1,
+    });
+    await harness.client.shutdownOwnedWorkbench();
+    expect(harness.client.diagnosticSupervisedChildCounts()).toEqual({
+      active: 0,
+      reconciling: 0,
+      total: 0,
+    });
   });
 
   it("rolls back when a foreign endpoint answers ping while the spawned child stays alive", async () => {
@@ -529,13 +716,11 @@ describe("exact owner-scoped Workbench restart", () => {
   });
 
   it("preserves the live failed-launch transaction when exact stop is refused", async () => {
-    const harness = createHarness();
-    (harness.client as unknown as {
-      waitForCompanionReady: () => Promise<void>;
-    }).waitForCompanionReady = vi.fn().mockRejectedValue(new WorkbenchError(
-      "injected readiness failure",
-      "LAUNCH_FAILED"
-    ));
+    const harness = createHarness({
+      companionReadiness: async () => {
+        throw new WorkbenchError("injected readiness failure", "LAUNCH_FAILED");
+      },
+    });
     harness.backend.terminationResult = {
       kind: "refused",
       reason: "access_denied",
@@ -671,7 +856,7 @@ describe("exact owner-scoped Workbench restart", () => {
     const harness = createHarness();
     const launched = await harness.client.ensureRunning(harness.projectPath);
     expect(harness.backend.endpointOwnershipCalls).toHaveLength(1);
-    vi.spyOn(harness.client, "ping").mockResolvedValue(true);
+    const ping = vi.spyOn(harness.client, "ping").mockResolvedValue(true);
     harness.backend.endpointOwnershipResult = {
       kind: "refused",
       reason: "listener_pid_mismatch",
@@ -683,6 +868,7 @@ describe("exact owner-scoped Workbench restart", () => {
     });
     expect(harness.backend.endpointOwnershipCalls).toHaveLength(2);
     expect(harness.backend.endpointOwnershipCalls[1].expected.pid).toBe(launched.pid);
+    expect(ping).not.toHaveBeenCalled();
     expect(harness.backend.terminationCalls).toHaveLength(0);
     expect(harness.backend.workbenchPids.has(launched.pid)).toBe(true);
   });
@@ -709,7 +895,7 @@ describe("exact owner-scoped Workbench restart", () => {
         }
       );
     });
-    vi.spyOn(harness.client, "ping").mockResolvedValue(true);
+    const ping = vi.spyOn(harness.client, "ping").mockResolvedValue(true);
     harness.backend.endpointOwnershipResult = {
       kind: "refused",
       reason: "listener_pid_mismatch",
@@ -721,6 +907,7 @@ describe("exact owner-scoped Workbench restart", () => {
     });
     expect(harness.backend.endpointOwnershipCalls).toHaveLength(2);
     expect(harness.backend.endpointOwnershipCalls[1].expected.pid).toBe(launched.pid);
+    expect(ping).not.toHaveBeenCalled();
     expect(harness.backend.terminationCalls).toHaveLength(0);
     expect(harness.backend.workbenchPids.has(launched.pid)).toBe(true);
   });
@@ -760,16 +947,16 @@ describe("exact owner-scoped Workbench restart", () => {
   });
 
   it("deduplicates concurrent launches of the same canonical target", async () => {
-    const harness = createHarness();
     let releaseReady!: () => void;
     let enteredReady!: () => void;
     const entered = new Promise<void>((resolvePromise) => { enteredReady = resolvePromise; });
     const blocked = new Promise<void>((resolvePromise) => { releaseReady = resolvePromise; });
-    (harness.client as unknown as {
-      waitForCompanionReady: () => Promise<void>;
-    }).waitForCompanionReady = vi.fn(async () => {
-      enteredReady();
-      await blocked;
+    const harness = createHarness({
+      companionReadiness: async (options) => {
+        enteredReady();
+        await blocked;
+        return readinessIdentity(options);
+      },
     });
 
     const first = harness.client.ensureRunning(harness.projectPath);
@@ -788,18 +975,18 @@ describe("exact owner-scoped Workbench restart", () => {
   });
 
   it("refuses a different target while a launch is active", async () => {
-    const harness = createHarness();
-    const otherProject = addProject(harness, "OtherMod");
     let releaseReady!: () => void;
     let enteredReady!: () => void;
     const entered = new Promise<void>((resolvePromise) => { enteredReady = resolvePromise; });
     const blocked = new Promise<void>((resolvePromise) => { releaseReady = resolvePromise; });
-    (harness.client as unknown as {
-      waitForCompanionReady: () => Promise<void>;
-    }).waitForCompanionReady = vi.fn(async () => {
-      enteredReady();
-      await blocked;
+    const harness = createHarness({
+      companionReadiness: async (options) => {
+        enteredReady();
+        await blocked;
+        return readinessIdentity(options);
+      },
     });
+    const otherProject = addProject(harness, "OtherMod");
 
     const launching = harness.client.ensureRunning(harness.projectPath);
     await entered;
@@ -813,16 +1000,16 @@ describe("exact owner-scoped Workbench restart", () => {
   });
 
   it("releases the machine mutex while companion readiness is pending", async () => {
-    const harness = createHarness();
     let releaseReady!: () => void;
     let enteredReady!: () => void;
     const entered = new Promise<void>((resolvePromise) => { enteredReady = resolvePromise; });
     const blocked = new Promise<void>((resolvePromise) => { releaseReady = resolvePromise; });
-    (harness.client as unknown as {
-      waitForCompanionReady: () => Promise<void>;
-    }).waitForCompanionReady = vi.fn(async () => {
-      enteredReady();
-      await blocked;
+    const harness = createHarness({
+      companionReadiness: async (options) => {
+        enteredReady();
+        await blocked;
+        return readinessIdentity(options);
+      },
     });
 
     const launching = harness.client.ensureRunning(harness.projectPath);
@@ -841,16 +1028,16 @@ describe("exact owner-scoped Workbench restart", () => {
   });
 
   it("refuses a stale running commit after readiness loses its exact reservation", async () => {
-    const harness = createHarness();
     let releaseReady!: () => void;
     let enteredReady!: () => void;
     const entered = new Promise<void>((resolvePromise) => { enteredReady = resolvePromise; });
     const blocked = new Promise<void>((resolvePromise) => { releaseReady = resolvePromise; });
-    (harness.client as unknown as {
-      waitForCompanionReady: () => Promise<void>;
-    }).waitForCompanionReady = vi.fn(async () => {
-      enteredReady();
-      await blocked;
+    const harness = createHarness({
+      companionReadiness: async (options) => {
+        enteredReady();
+        await blocked;
+        return readinessIdentity(options);
+      },
     });
 
     const launching = harness.client.ensureRunning(harness.projectPath);
@@ -958,19 +1145,18 @@ describe("exact owner-scoped Workbench restart", () => {
   });
 
   it("refuses target B while restart A is paused after exact old-process exit", async () => {
-    const harness = createHarness();
-    const otherProject = addProject(harness, "OtherMod");
-    await harness.client.ensureRunning(harness.projectPath);
     let releasePort!: () => void;
     let enteredPort!: () => void;
     const entered = new Promise<void>((resolvePromise) => { enteredPort = resolvePromise; });
     const blocked = new Promise<void>((resolvePromise) => { releasePort = resolvePromise; });
-    (harness.client as unknown as {
-      waitForPortRelease: () => Promise<void>;
-    }).waitForPortRelease = vi.fn(async () => {
-      enteredPort();
-      await blocked;
+    const harness = createHarness({
+      vacancyWait: async () => {
+        enteredPort();
+        await blocked;
+      },
     });
+    const otherProject = addProject(harness, "OtherMod");
+    await harness.client.ensureRunning(harness.projectPath);
 
     const restarting = harness.client.restartOwnedWorkbench();
     await entered;
@@ -995,18 +1181,17 @@ describe("exact owner-scoped Workbench restart", () => {
   });
 
   it("refuses a stale post-vacancy restart commit after generation interference", async () => {
-    const harness = createHarness();
-    const launched = await harness.client.ensureRunning(harness.projectPath);
     let releasePort!: () => void;
     let enteredPort!: () => void;
     const entered = new Promise<void>((resolvePromise) => { enteredPort = resolvePromise; });
     const blocked = new Promise<void>((resolvePromise) => { releasePort = resolvePromise; });
-    (harness.client as unknown as {
-      waitForPortRelease: () => Promise<void>;
-    }).waitForPortRelease = vi.fn(async () => {
-      enteredPort();
-      await blocked;
+    const harness = createHarness({
+      vacancyWait: async () => {
+        enteredPort();
+        await blocked;
+      },
     });
+    const launched = await harness.client.ensureRunning(harness.projectPath);
 
     const restarting = harness.client.restartOwnedWorkbench();
     await entered;
@@ -1039,18 +1224,17 @@ describe("exact owner-scoped Workbench restart", () => {
   });
 
   it("deduplicates concurrent restarts of the same canonical target", async () => {
-    const harness = createHarness();
-    await harness.client.ensureRunning(harness.projectPath);
     let releasePort!: () => void;
     let enteredPort!: () => void;
     const entered = new Promise<void>((resolvePromise) => { enteredPort = resolvePromise; });
     const blocked = new Promise<void>((resolvePromise) => { releasePort = resolvePromise; });
-    (harness.client as unknown as {
-      waitForPortRelease: () => Promise<void>;
-    }).waitForPortRelease = vi.fn(async () => {
-      enteredPort();
-      await blocked;
+    const harness = createHarness({
+      vacancyWait: async () => {
+        enteredPort();
+        await blocked;
+      },
     });
+    await harness.client.ensureRunning(harness.projectPath);
 
     const first = harness.client.restartOwnedWorkbench();
     await entered;
@@ -1186,16 +1370,20 @@ describe("exact owner-scoped Workbench restart", () => {
   });
 
   it("waits for native endpoint vacancy proof and fails closed on unverifiable probes", async () => {
-    const harness = createHarness();
     const verifyEndpointVacant = vi.fn()
       .mockResolvedValueOnce({ kind: "occupied", listenerPid: 9001, message: "still bound" })
       .mockResolvedValueOnce({ kind: "vacant" });
-    const client = harness.client as unknown as {
-      waitForPortRelease(session: {
-        verifyEndpointVacant: typeof verifyEndpointVacant;
-      }): Promise<void>;
-    };
-    await expect(client.waitForPortRelease({ verifyEndpointVacant })).resolves.toBeUndefined();
+    const harness = createHarness({
+      vacancyWait: (options) => waitForVacancy({
+        ...options,
+        verify: verifyEndpointVacant,
+        pollIntervalMs: 0,
+      }),
+    });
+    await harness.client.ensureRunning(harness.projectPath);
+    await expect(harness.client.restartOwnedWorkbench()).resolves.toMatchObject({
+      previousPid: harness.children[0].pid,
+    });
     expect(verifyEndpointVacant).toHaveBeenCalledTimes(2);
 
     const unverifiable = vi.fn().mockResolvedValue({
@@ -1203,7 +1391,14 @@ describe("exact owner-scoped Workbench restart", () => {
       reason: "access_denied",
       message: "TCP owner table access denied",
     });
-    await expect(client.waitForPortRelease({ verifyEndpointVacant: unverifiable }))
+    const unverifiableHarness = createHarness({
+      vacancyWait: (options) => waitForVacancy({
+        ...options,
+        verify: unverifiable,
+      }),
+    });
+    await unverifiableHarness.client.ensureRunning(unverifiableHarness.projectPath);
+    await expect(unverifiableHarness.client.shutdownOwnedWorkbench())
       .rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
     expect(unverifiable).toHaveBeenCalledTimes(1);
   });

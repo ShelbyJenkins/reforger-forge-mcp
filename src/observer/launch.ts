@@ -1,4 +1,4 @@
-import { ObserverCoordinatorError, type ObserverCoordinator } from "./coordinator.js";
+import { ObserverCoordinatorError } from "./coordinator.js";
 
 export interface ObserverLaunchInput {
   runtimeKind: "client" | "listenServer" | "dedicated" | "testRunner";
@@ -28,6 +28,11 @@ export interface ObserverPreparedLaunchRecorder {
   ): Promise<string>;
 }
 
+export interface ObserverLaunchPort {
+  prepareLaunch(input: Record<string, unknown>): Promise<Record<string, unknown>>;
+  revokeSession(sessionId: string): Promise<Record<string, unknown>>;
+}
+
 function record(value: unknown): Record<string, unknown> | null {
   return value && typeof value === "object" && !Array.isArray(value)
     ? value as Record<string, unknown>
@@ -39,7 +44,7 @@ function record(value: unknown): Record<string, unknown> | null {
  * only its public session descriptor. This function never starts Enfusion.
  */
 export async function prepareObserverLaunch(
-  coordinator: ObserverCoordinator,
+  coordinator: ObserverLaunchPort,
   input: ObserverLaunchInput,
   recorder?: ObserverPreparedLaunchRecorder
 ): Promise<ObserverPreparedLaunch> {

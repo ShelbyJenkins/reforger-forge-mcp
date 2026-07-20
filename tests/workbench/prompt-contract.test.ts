@@ -40,7 +40,6 @@ function collectRuntimeRegistry(): RuntimeRegistry {
     patternsDir: join(packageRoot, "data", "patterns"),
     workbenchHost: "127.0.0.1",
     workbenchPort: 5775,
-    workbenchNoThrow: true,
   };
   registerTools(server, config);
   return { tools, prompts };
@@ -52,7 +51,8 @@ function promptText(result: PromptResult): string {
 
 function assertExecutableContract(text: string, registeredTools: Map<string, unknown>): void {
   expect(text).not.toMatch(OBSOLETE_TOOL_NAMES);
-  expect(text).not.toContain("**wb_play**");
+  expect(text).not.toContain("wb_play");
+  expect(text).toContain("no automated Play tool exists");
   expect(text).toContain("enter Play mode manually");
   expect(text).toContain("wait for the user to confirm");
   expect(text).toContain("**wb_state**");
@@ -84,6 +84,9 @@ describe("prompt/tool contracts", () => {
     expect(registry.tools.has("project")).toBe(true);
     expect(registry.tools.has("prefab")).toBe(true);
     expect(registry.tools.has("wb_state")).toBe(true);
+    expect(registry.tools.has("wb_play")).toBe(false);
+    expect(registry.tools.has("wb_save")).toBe(false);
+    expect(registry.tools.has("wb_execute_action")).toBe(false);
     expect(registry.prompts.has("create-mod")).toBe(true);
     expect(registry.prompts.has("modify-mod")).toBe(true);
   });

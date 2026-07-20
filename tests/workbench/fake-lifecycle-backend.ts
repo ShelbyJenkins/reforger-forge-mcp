@@ -8,118 +8,81 @@ import {
 } from "node:fs";
 import type {
   ExactProcessIdentity,
-  ProcessInspection,
   LifecycleEndpoint,
   VerifyEndpointOwnerResult,
   VerifyEndpointVacantResult,
-  VerifyTerminateResult,
   WorkbenchIdentity,
   WorkbenchLifecycleBackend,
   WorkbenchLifecycleStateV3,
   WorkbenchProcessScan,
 } from "../../src/workbench/process-guard.js";
+import {
+  createFakeExactProcessBackend,
+  type FakeExactProcessBackend,
+} from "../foundation/fake-exact-process-backend.js";
 
-export class FakeLifecycleBackend implements WorkbenchLifecycleBackend {
-  readonly platform = "test" as const;
-  readonly processes = new Map<number, ExactProcessIdentity>();
-  readonly ownerArguments = new Map<number, string>();
-  readonly workbenchPids = new Set<number>();
-  readonly terminationCalls: WorkbenchIdentity[] = [];
+interface FakeLifecycleControls {
+  readonly workbenchPids: Set<number>;
   readonly endpointOwnershipCalls: Array<{
     endpoint: LifecycleEndpoint;
     expected: WorkbenchIdentity;
-  }> = [];
-  readonly endpointVacancyCalls: LifecycleEndpoint[] = [];
-  unverifiable: WorkbenchProcessScan["unverifiable"] = [];
-  terminationResult: VerifyTerminateResult | null = null;
-  endpointOwnershipResult: VerifyEndpointOwnerResult | null = null;
-  endpointVacancyResult: VerifyEndpointVacantResult | null = null;
+  }>;
+  readonly endpointVacancyCalls: LifecycleEndpoint[];
+  unverifiable: WorkbenchProcessScan["unverifiable"];
+  endpointOwnershipResult: VerifyEndpointOwnerResult | null;
+  endpointVacancyResult: VerifyEndpointVacantResult | null;
   replaceFailure: ((args: {
     path: string;
     expectedGeneration: string | null;
     next: WorkbenchLifecycleStateV3;
-  }) => Error | null) | null = null;
-  maxConcurrent = 0;
-  private concurrent = 0;
-  private mutexTail: Promise<void> = Promise.resolve();
+  }) => Error | null) | null;
+  addWorkbench(identity: ExactProcessIdentity, ownerArgument?: string): void;
+}
 
-  constructor(
-    readonly current: ExactProcessIdentity & { userSid: string } = {
-      pid: 1001,
-      executablePath: "C:\\Program Files\\nodejs\\node.exe",
-      creationTime: "133900000000000001",
-      userSid: "S-1-5-21-test-user",
-    }
-  ) {
-    this.processes.set(current.pid, current);
+/** Workbench-specific capabilities adapted onto the one shared exact-process fake. */
+export type FakeLifecycleBackend = FakeExactProcessBackend &
+  WorkbenchLifecycleBackend &
+  FakeLifecycleControls;
+
+export function createFakeLifecycleBackend(
+  current: ExactProcessIdentity & { userSid: string } = {
+    pid: 1001,
+    executablePath: "C:\\Program Files\\nodejs\\node.exe",
+    creationTime: "133900000000000001",
+    userSid: "S-1-5-21-test-user",
   }
+): FakeLifecycleBackend {
+  const backend = createFakeExactProcessBackend(current) as FakeLifecycleBackend;
+  backend.processes.set(current.pid, current);
+  backend.workbenchPids = new Set<number>();
+  backend.endpointOwnershipCalls = [];
+  backend.endpointVacancyCalls = [];
+  backend.unverifiable = [];
+  backend.endpointOwnershipResult = null;
+  backend.endpointVacancyResult = null;
+  backend.replaceFailure = null;
 
-  async withMachineMutex<T>(args: {
-    name: string;
-    timeoutMs: number;
-    action: () => Promise<T>;
-  }): Promise<T> {
-    void args.name;
-    void args.timeoutMs;
-    let release!: () => void;
-    const turn = new Promise<void>((resolve) => { release = resolve; });
-    const previous = this.mutexTail;
-    this.mutexTail = previous.then(() => turn);
-    await previous;
-    this.concurrent += 1;
-    this.maxConcurrent = Math.max(this.maxConcurrent, this.concurrent);
-    try {
-      return await args.action();
-    } finally {
-      this.concurrent -= 1;
-      release();
-    }
-  }
+  backend.scanWorkbenchProcesses = async () => ({
+    processes: [...backend.workbenchPids]
+      .map((pid) => backend.processes.get(pid))
+      .filter((entry): entry is ExactProcessIdentity => entry !== undefined),
+    unverifiable: [...backend.unverifiable],
+  });
 
-  async inspectCurrentProcess(): Promise<ExactProcessIdentity & { userSid: string }> {
-    return this.current;
-  }
-
-  async inspectProcess(
-    pid: number,
-    expectedOwnerTokenArgument?: string
-  ): Promise<ProcessInspection | null> {
-    const identity = this.processes.get(pid);
-    if (!identity) return null;
-    return {
-      identity,
-      ownerArgumentMatched: expectedOwnerTokenArgument
-        ? this.ownerArguments.get(pid) === expectedOwnerTokenArgument
-        : null,
-    };
-  }
-
-  async scanWorkbenchProcesses(): Promise<WorkbenchProcessScan> {
-    return {
-      processes: [...this.workbenchPids]
-        .map((pid) => this.processes.get(pid))
-        .filter((entry): entry is ExactProcessIdentity => entry !== undefined),
-      unverifiable: [...this.unverifiable],
-    };
-  }
-
-  async verifyEndpointOwner(
-    endpoint: LifecycleEndpoint,
-    expected: WorkbenchIdentity
-  ): Promise<VerifyEndpointOwnerResult> {
-    this.endpointOwnershipCalls.push({ endpoint, expected });
-    if (this.endpointOwnershipResult) return this.endpointOwnershipResult;
-    const actual = this.processes.get(expected.pid);
+  backend.verifyEndpointOwner = async (endpoint, expected) => {
+    backend.endpointOwnershipCalls.push({ endpoint, expected });
+    if (backend.endpointOwnershipResult) return backend.endpointOwnershipResult;
+    const actual = backend.processes.get(expected.pid);
     if (!actual || actual.creationTime !== expected.creationTime ||
         actual.executablePath.toLowerCase() !== expected.executablePath.toLowerCase() ||
-        this.ownerArguments.get(expected.pid) !== expected.ownerTokenArgument) {
+        backend.ownerArguments.get(expected.pid) !== expected.ownerTokenArgument) {
       return {
         kind: "refused",
         reason: "workbench_process_mismatch",
         message: "The expected fake Workbench identity is not live and exact.",
       };
     }
-    if (this.workbenchPids.size !== 1 || !this.workbenchPids.has(expected.pid)) {
+    if (backend.workbenchPids.size !== 1 || !backend.workbenchPids.has(expected.pid)) {
       return {
         kind: "refused",
         reason: "workbench_process_mismatch",
@@ -127,77 +90,55 @@ export class FakeLifecycleBackend implements WorkbenchLifecycleBackend {
       };
     }
     return { kind: "owned", listenerPid: expected.pid };
-  }
+  };
 
-  async verifyEndpointVacant(_endpoint: LifecycleEndpoint): Promise<VerifyEndpointVacantResult> {
-    this.endpointVacancyCalls.push(_endpoint);
-    if (this.endpointVacancyResult) return this.endpointVacancyResult;
-    if (this.workbenchPids.size === 0) return { kind: "vacant" };
-    const listenerPid = [...this.workbenchPids][0];
+  backend.verifyEndpointVacant = async (endpoint) => {
+    backend.endpointVacancyCalls.push(endpoint);
+    if (backend.endpointVacancyResult) return backend.endpointVacancyResult;
+    if (backend.workbenchPids.size === 0) return { kind: "vacant" };
+    const listenerPid = [...backend.workbenchPids][0];
     return {
       kind: "occupied",
       listenerPid,
       message: `Fake endpoint is still owned by PID ${listenerPid}.`,
     };
-  }
+  };
 
-  async verifyAndTerminate(expected: WorkbenchIdentity): Promise<VerifyTerminateResult> {
-    this.terminationCalls.push(expected);
-    if (this.terminationResult) return this.terminationResult;
-    const actual = this.processes.get(expected.pid);
-    if (!actual) return { kind: "already_exited" };
-    if (actual.creationTime !== expected.creationTime) {
-      return { kind: "refused", reason: "creation_time_mismatch", message: "PID was reused." };
-    }
-    if (actual.executablePath.toLowerCase() !== expected.executablePath.toLowerCase()) {
-      return {
-        kind: "refused",
-        reason: "executable_mismatch",
-        message: "Executable path no longer matches.",
-      };
-    }
-    if (this.ownerArguments.get(expected.pid) !== expected.ownerTokenArgument) {
-      return { kind: "refused", reason: "token_mismatch", message: "Owner argument is absent." };
-    }
-    this.processes.delete(expected.pid);
-    this.workbenchPids.delete(expected.pid);
-    return { kind: "terminated" };
-  }
+  const verifyExactAndTerminate = backend.verifyAndTerminate.bind(backend);
+  backend.verifyAndTerminate = async (expected, timeoutMs) => {
+    const result = await verifyExactAndTerminate(expected, timeoutMs);
+    if (result.kind === "terminated") backend.workbenchPids.delete(expected.pid);
+    return result;
+  };
 
-  async replaceState(args: {
-    path: string;
-    expectedGeneration: string | null;
-    next: WorkbenchLifecycleStateV3;
-  }): Promise<void> {
-    const failure = this.replaceFailure?.(args);
+  backend.replaceState = async (args) => {
+    const failure = backend.replaceFailure?.(args);
     if (failure) throw failure;
     if (args.expectedGeneration === null) {
       if (existsSync(args.path)) throw new Error("generation mismatch: expected missing");
     } else {
       if (!existsSync(args.path)) throw new Error("generation mismatch: missing state");
-      const current = JSON.parse(readFileSync(args.path, "utf8")) as { generation?: string };
-      if (current.generation !== args.expectedGeneration) throw new Error("generation mismatch");
+      const currentState = JSON.parse(readFileSync(args.path, "utf8")) as { generation?: string };
+      if (currentState.generation !== args.expectedGeneration) throw new Error("generation mismatch");
     }
     const temp = `${args.path}.fake.tmp`;
     writeFileSync(temp, `${JSON.stringify(args.next, null, 2)}\n`, "utf8");
     if (existsSync(args.path)) unlinkSync(args.path);
     renameSync(temp, args.path);
-  }
+  };
 
-  async archiveState(args: {
-    path: string;
-    archivePath: string;
-    expectedSha256: string;
-  }): Promise<void> {
+  backend.archiveState = async (args) => {
     const bytes = readFileSync(args.path);
     const actual = createHash("sha256").update(bytes).digest("hex");
     if (actual !== args.expectedSha256) throw new Error("hash mismatch");
     renameSync(args.path, args.archivePath);
-  }
+  };
 
-  addWorkbench(identity: ExactProcessIdentity, ownerArgument?: string): void {
-    this.processes.set(identity.pid, identity);
-    this.workbenchPids.add(identity.pid);
-    if (ownerArgument) this.ownerArguments.set(identity.pid, ownerArgument);
-  }
+  backend.addWorkbench = (identity, ownerArgument) => {
+    backend.processes.set(identity.pid, identity);
+    backend.workbenchPids.add(identity.pid);
+    if (ownerArgument) backend.ownerArguments.set(identity.pid, ownerArgument);
+  };
+
+  return backend;
 }

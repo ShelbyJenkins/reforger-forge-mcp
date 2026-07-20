@@ -49,14 +49,16 @@ describe("protocol artifact generator", () => {
 
     writeProtocolArtifacts(root);
     unlinkSync(absoluteArtifactPath(root, "observer/protocol/generated/error-codes.json"));
+    unlinkSync(absoluteArtifactPath(root, "observer/protocol/schemas/instance-registration.schema.json"));
     writeFileSync(
-      absoluteArtifactPath(root, "observer/protocol/errors.md"),
+      absoluteArtifactPath(root, "observer/protocol/schemas/capture-request.schema.json"),
       "stale\n",
       "utf8"
     );
     expect(findProtocolArtifactDrift(root)).toEqual([
       "observer/protocol/generated/error-codes.json",
-      "observer/protocol/errors.md",
+      "observer/protocol/schemas/capture-request.schema.json",
+      "observer/protocol/schemas/instance-registration.schema.json",
     ]);
 
     writeProtocolArtifacts(root);
@@ -107,10 +109,16 @@ describe("protocol artifact generator", () => {
     const errorSchema = JSON.parse(artifact(rendered, "observer/protocol/schemas/error.schema.json"));
     const heartbeatSchema = JSON.parse(artifact(rendered, "observer/protocol/schemas/heartbeat.schema.json"));
     const jobStatusSchema = JSON.parse(artifact(rendered, "observer/protocol/schemas/job-status.schema.json"));
+    const instanceRegistrationSchema = JSON.parse(artifact(
+      rendered,
+      "observer/protocol/schemas/instance-registration.schema.json"
+    ));
     expect(errorSchema.properties.error.properties.code.enum)
       .toEqual(["SECOND_ERROR", "FIRST_ERROR"]);
     expect(heartbeatSchema.properties.lastErrorCode.oneOf[0].enum).toEqual(["FIRST_ERROR"]);
     expect(jobStatusSchema.properties.errorCode.enum).toEqual(["FIRST_ERROR"]);
+    expect(instanceRegistrationSchema.$defs.knownCapability.enum)
+      .toEqual(["z.capability", "a.capability"]);
     expect(artifact(rendered, "observer/protocol/errors.md"))
       .toContain("| SECOND_ERROR | bounded-diagnostic | no | host | Second error. |");
     expect(artifact(rendered, "observer/protocol/capabilities.md"))

@@ -1,8 +1,10 @@
-import { existsSync, lstatSync, readFileSync, readdirSync, renameSync, unlinkSync } from "node:fs";
+import { existsSync, lstatSync, readdirSync, renameSync, unlinkSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
+import { boundedOption } from "#foundation/bounded-option";
+import { BoundedJsonMap, BoundedJsonStore } from "#foundation/json-store";
 import { DEFAULT_LIMITS } from "../protocol/index.js";
 import { ArtifactStore } from "./artifacts.js";
-import { ObserverError } from "./errors.js";
+import { ObserverError, observerOptionError } from "./errors.js";
 import { JobStore } from "./jobs.js";
 import { observerLogger } from "./logger.js";
 import { MailboxTransport, type MailboxCleanupFailure } from "./mailbox.js";
@@ -33,6 +35,13 @@ interface AggregateCleanupSweep extends CleanupSweep {
 interface QuarantineInventory {
   files: Array<{ path: string; bytes: number; mtimeMs: number }>;
   reliable: boolean;
+}
+
+function parseIngressObject(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("mailbox ingress must be a JSON object");
+  }
+  return value as Record<string, unknown>;
 }
 
 export interface MailboxCoordinatorOptions {
@@ -83,10 +92,10 @@ export interface MailboxCoordinatorStats {
 }
 
 export class MailboxCoordinator {
-  private readonly transports = new Map<string, MailboxTransport>();
-  private readonly rejectionAttempts = new Map<string, RetryRecord>();
-  private readonly pollCursors = new Map<string, string>();
-  private readonly commandUsageBySession = new Map<string, { files: number; bytes: number }>();
+  private readonly transports: BoundedJsonMap<string, MailboxTransport>;
+  private readonly rejectionAttempts: BoundedJsonMap<string, RetryRecord>;
+  private readonly pollCursors: BoundedJsonMap<string, string>;
+  private readonly commandUsageBySession: BoundedJsonMap<string, { files: number; bytes: number }>;
   private quarantineInventoryScope: Map<string, QuarantineInventory> | null = null;
   private readonly clock: Clock;
   private readonly maxIngressPerPoll: number;
@@ -120,23 +129,56 @@ export class MailboxCoordinator {
     options: MailboxCoordinatorOptions = {}
   ) {
     this.clock = options.clock ?? systemClock;
-    this.maxIngressPerPoll = this.boundedOption(options.maxIngressPerPoll, 256, 1, 4_096, "Mailbox ingress batch limit");
-    this.maxRetryAttempts = this.boundedOption(options.maxRetryAttempts, 8, 1, 1_000, "Mailbox retry attempt limit");
-    this.maxRetryAgeMs = this.boundedOption(options.maxRetryAgeMs, 30_000, 0, 24 * 60 * 60_000, "Mailbox retry age limit");
-    this.maxTrackedRetries = this.boundedOption(options.maxTrackedRetries, 512, 1, 100_000, "Mailbox retry tracking limit");
-    this.maxTransports = this.boundedOption(options.maxTransports, 1_024, 1, 100_000, "Mailbox transport limit");
-    this.maxEstimatedBytes = this.boundedOption(
+    this.maxIngressPerPoll = boundedOption(options.maxIngressPerPoll, 256, 1, 4_096, "Mailbox ingress batch limit", observerOptionError);
+    this.maxRetryAttempts = boundedOption(options.maxRetryAttempts, 8, 1, 1_000, "Mailbox retry attempt limit", observerOptionError);
+    this.maxRetryAgeMs = boundedOption(options.maxRetryAgeMs, 30_000, 0, 24 * 60 * 60_000, "Mailbox retry age limit", observerOptionError);
+    this.maxTrackedRetries = boundedOption(options.maxTrackedRetries, 512, 1, 100_000, "Mailbox retry tracking limit", observerOptionError);
+    this.maxTransports = boundedOption(options.maxTransports, 1_024, 1, 100_000, "Mailbox transport limit", observerOptionError);
+    this.maxEstimatedBytes = boundedOption(
       options.maxEstimatedBytes,
       64 * 1024 * 1024,
       1_024,
       1024 * 1024 * 1024,
-      "Mailbox aggregate store byte limit"
+      "Mailbox aggregate store byte limit",
+      observerOptionError
     );
-    this.quarantineMaxRecords = this.boundedOption(options.quarantineMaxRecords, 128, 1, 100_000, "Mailbox quarantine record limit");
-    this.quarantineMaxBytes = this.boundedOption(options.quarantineMaxBytes, 4 * 1024 * 1024, 1_024, 1024 * 1024 * 1024, "Mailbox quarantine byte limit");
-    this.quarantineMaxAgeMs = this.boundedOption(options.quarantineMaxAgeMs, 24 * 60 * 60_000, 0, 30 * 24 * 60 * 60_000, "Mailbox quarantine age limit");
-    this.orphanIngressMaxAgeMs = this.boundedOption(options.orphanIngressMaxAgeMs, 30_000, 0, 24 * 60 * 60_000, "Mailbox orphan ingress age limit");
+    this.quarantineMaxRecords = boundedOption(options.quarantineMaxRecords, 128, 1, 100_000, "Mailbox quarantine record limit", observerOptionError);
+    this.quarantineMaxBytes = boundedOption(options.quarantineMaxBytes, 4 * 1024 * 1024, 1_024, 1024 * 1024 * 1024, "Mailbox quarantine byte limit", observerOptionError);
+    this.quarantineMaxAgeMs = boundedOption(options.quarantineMaxAgeMs, 24 * 60 * 60_000, 0, 30 * 24 * 60 * 60_000, "Mailbox quarantine age limit", observerOptionError);
+    this.orphanIngressMaxAgeMs = boundedOption(options.orphanIngressMaxAgeMs, 30_000, 0, 24 * 60 * 60_000, "Mailbox orphan ingress age limit", observerOptionError);
     this.removeFile = options.removeFile ?? unlinkSync;
+    const capacityError = () => new ObserverError(
+      "TRANSPORT_UNAVAILABLE",
+      "Mailbox in-memory retention budget is exhausted",
+      503
+    );
+    this.transports = new BoundedJsonMap({
+      maxRecords: this.maxTransports,
+      maxEstimatedBytes: this.maxEstimatedBytes,
+      estimateBytes: (sessionId, transport) => Buffer.byteLength(JSON.stringify({
+        sessionId,
+        profilePath: transport.profilePath,
+      }), "utf8"),
+      capacityError,
+    });
+    this.rejectionAttempts = new BoundedJsonMap({
+      maxRecords: this.maxTrackedRetries,
+      maxEstimatedBytes: this.maxEstimatedBytes,
+      estimateBytes: (path, retry) => Buffer.byteLength(JSON.stringify([path, retry]), "utf8"),
+      capacityError,
+    });
+    this.pollCursors = new BoundedJsonMap({
+      maxRecords: this.maxTransports,
+      maxEstimatedBytes: this.maxEstimatedBytes,
+      estimateBytes: (sessionId, cursor) => Buffer.byteLength(JSON.stringify([sessionId, cursor]), "utf8"),
+      capacityError,
+    });
+    this.commandUsageBySession = new BoundedJsonMap({
+      maxRecords: this.maxTransports,
+      maxEstimatedBytes: this.maxEstimatedBytes,
+      estimateBytes: (sessionId, usage) => Buffer.byteLength(JSON.stringify([sessionId, usage]), "utf8"),
+      capacityError,
+    });
   }
 
   async pollOnce(): Promise<void> {
@@ -328,15 +370,15 @@ export class MailboxCoordinator {
         if (entry.isSymbolicLink() || markerInfo.isSymbolicLink() || !markerInfo.isFile() || markerInfo.size > 64) {
           throw new ObserverError("INVALID_REQUEST", "Mailbox completion marker is invalid");
         }
-        if (!existsSync(path)) throw new ObserverError("ARTIFACT_INCOMPLETE", "Mailbox data file is missing");
-        const info = lstatSync(path);
-        if (info.isSymbolicLink() || !info.isFile()) throw new ObserverError("INVALID_REQUEST", "Mailbox ingress entry is not a regular file");
-        if (info.size < 2 || info.size > DEFAULT_LIMITS.maxRequestBodyBytes) {
-          throw new ObserverError("INVALID_REQUEST", "Mailbox ingress entry exceeds message bounds");
-        }
         const kind = this.kind(entry.name);
         if (!kind) throw new ObserverError("INVALID_REQUEST", "Mailbox ingress filename is invalid");
-        const body = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+        const body = new BoundedJsonStore({
+          root: statusDirectory,
+          minRecordBytes: 2,
+          maxRecordBytes: DEFAULT_LIMITS.maxRequestBodyBytes,
+          parse: parseIngressObject,
+        }).read(path);
+        if (!body) throw new ObserverError("ARTIFACT_INCOMPLETE", "Mailbox data file is missing");
         if (body.sessionId !== sessionId || typeof body.sessionToken !== "string") {
           throw new ObserverError("UNAUTHORIZED", "Mailbox message session identity is invalid", 401);
         }
@@ -378,7 +420,6 @@ export class MailboxCoordinator {
           dataName,
         };
         this.rejectionAttempts.delete(markerPath);
-        this.rejectionAttempts.set(markerPath, retry);
         this.dispositionCounts.transientRetries += 1;
         observerLogger.warn("mailbox ingress retry scheduled", {
           sessionId,
@@ -390,7 +431,9 @@ export class MailboxCoordinator {
         if (retry.attempts >= this.maxRetryAttempts || now - retry.firstSeenAt >= this.maxRetryAgeMs) {
           this.quarantine(statusDirectory, dataName, path, markerPath, normalized.code, now);
           this.rejectionAttempts.delete(markerPath);
+          continue;
         }
+        if (!this.retainRetry(markerPath, retry, now)) continue;
         this.enforceRetryTrackingBound(now);
       }
     }
@@ -429,6 +472,39 @@ export class MailboxCoordinator {
       const path = join(retry.statusDirectory, retry.dataName);
       this.quarantine(retry.statusDirectory, retry.dataName, path, markerPath, "RETRY_TRACKING_LIMIT", now);
       this.rejectionAttempts.delete(markerPath);
+    }
+  }
+
+  private retainRetry(markerPath: string, retry: RetryRecord, now: number): boolean {
+    for (;;) {
+      try {
+        this.rejectionAttempts.set(markerPath, retry);
+        return true;
+      } catch (error) {
+        if (!(error instanceof ObserverError) || error.code !== "TRANSPORT_UNAVAILABLE") throw error;
+        const oldest = this.rejectionAttempts.entries().next().value as [string, RetryRecord] | undefined;
+        if (!oldest) {
+          this.quarantine(
+            retry.statusDirectory,
+            retry.dataName,
+            join(retry.statusDirectory, retry.dataName),
+            markerPath,
+            "RETRY_TRACKING_LIMIT",
+            now
+          );
+          return false;
+        }
+        const [oldestMarkerPath, oldestRetry] = oldest;
+        this.quarantine(
+          oldestRetry.statusDirectory,
+          oldestRetry.dataName,
+          join(oldestRetry.statusDirectory, oldestRetry.dataName),
+          oldestMarkerPath,
+          "RETRY_TRACKING_LIMIT",
+          now
+        );
+        this.rejectionAttempts.delete(oldestMarkerPath);
+      }
     }
   }
 
@@ -791,9 +867,15 @@ export class MailboxCoordinator {
     transport: MailboxTransport,
     importedCommandUsage: { files: number; bytes: number }
   ): void {
-    this.transports.set(sessionId, transport);
-    this.commandUsageBySession.set(sessionId, importedCommandUsage);
     try {
+      // Preflight both independently bounded indexes before publishing either
+      // side of the admission. Keep the mutations inside the same rollback
+      // boundary as defense against injected failures or future estimators
+      // whose result can change between preflight and commit.
+      this.transports.assertCanSet(sessionId, transport);
+      this.commandUsageBySession.assertCanSet(sessionId, importedCommandUsage);
+      this.transports.set(sessionId, transport);
+      this.commandUsageBySession.set(sessionId, importedCommandUsage);
       if (this.estimatedStoreBytes() > this.maxEstimatedBytes) {
         throw new ObserverError("TRANSPORT_UNAVAILABLE", "Mailbox aggregate retention byte budget is exhausted", 503);
       }
@@ -808,11 +890,4 @@ export class MailboxCoordinator {
     }
   }
 
-  private boundedOption(value: number | undefined, fallback: number, minimum: number, maximum: number, label: string): number {
-    const selected = value ?? fallback;
-    if (!Number.isSafeInteger(selected) || selected < minimum || selected > maximum) {
-      throw new ObserverError("INVALID_REQUEST", `${label} must be an integer from ${minimum} through ${maximum}`);
-    }
-    return selected;
-  }
 }

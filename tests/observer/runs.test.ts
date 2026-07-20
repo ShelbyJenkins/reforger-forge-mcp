@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { ArtifactStore } from "../../observer/agent/artifacts.js";
 import { convertBmpToPng } from "../../observer/agent/bmp.js";
 import { ObserverRunStore } from "../../observer/agent/runs.js";
+import { FileEvidenceBundleService } from "../../observer/agent/evidence-bundle-service.js";
 import { cleanup, temporaryDirectory } from "./helpers.js";
 
 const roots: string[] = [];
@@ -43,11 +44,8 @@ function setup() {
     {} as never,
     {} as never
   );
-  const jobs = { require: () => { throw new Error("not a runtime job"); } } as never;
-  const runs = new ObserverRunStore(join(root, "runs"), join(root, "export-work"), artifacts, jobs, {
-    evidenceRoots: [evidence],
-    supportingLogRoots: [logs],
-  });
+  const exporter = new FileEvidenceBundleService(join(root, "export-work"), [evidence], [logs]);
+  const runs = new ObserverRunStore(join(root, "runs"), artifacts, exporter);
   return { root, evidence, logs, artifacts, runs };
 }
 
@@ -125,6 +123,33 @@ function regularFiles(root: string): string[] {
   };
   visit(root);
   return result.sort((left, right) => left.localeCompare(right));
+}
+
+function reattestBundleMember(
+  value: ReturnType<typeof setup>,
+  runId: string,
+  relativePath: string,
+  bytes: Buffer
+): void {
+  const output = join(value.evidence, runId);
+  writeFileSync(join(output, ...relativePath.split("/")), bytes);
+  const manifestPath = join(output, "manifest.json");
+  const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as {
+    files: Array<{ path: string; bytes: number; sha256: string }>;
+  };
+  const member = manifest.files.find((item) => item.path === relativePath);
+  if (!member) throw new Error(`Missing evidence member ${relativePath}`);
+  member.bytes = bytes.length;
+  member.sha256 = createHash("sha256").update(bytes).digest("hex");
+  const manifestBytes = Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`);
+  writeFileSync(manifestPath, manifestBytes);
+
+  const recordPath = join(value.root, "runs", runId, "run.json");
+  const record = JSON.parse(readFileSync(recordPath, "utf8")) as {
+    exportReceipt: { manifestSha256: string };
+  };
+  record.exportReceipt.manifestSha256 = createHash("sha256").update(manifestBytes).digest("hex");
+  writeFileSync(recordPath, `${JSON.stringify(record, null, 2)}\n`, "utf8");
 }
 
 describe("managed observer runs", () => {
@@ -224,6 +249,54 @@ describe("managed observer runs", () => {
     writeFileSync(join(output, "unmanifested.txt"), "must not be ignored", "utf8");
     expect(() => value.runs.finalize(input)).toThrowError(expect.objectContaining({ code: "ARTIFACT_INVALID" }));
     expect(value.artifacts.hasRef(ref)).toBe(true);
+  });
+
+  it("rejects an oversized evidence manifest through the bounded descriptor reader", () => {
+    const value = setup();
+    const { runId } = completedCapture(value);
+    const input = reviewedFinalizeInput(value, runId);
+    value.runs.finalize(input);
+    writeFileSync(
+      join(value.evidence, runId, "manifest.json"),
+      `${" ".repeat(2 * 1024 * 1024)}{}`,
+      "utf8"
+    );
+
+    expect(() => value.runs.finalize(input)).toThrowError(expect.objectContaining({
+      code: "ARTIFACT_INVALID",
+      message: "Evidence manifest size is invalid",
+    }));
+  });
+
+  it("rejects re-attested capture metadata whose JSON representation exceeds its descriptor bound", () => {
+    const value = setup();
+    const { runId } = completedCapture(value);
+    const input = reviewedFinalizeInput(value, runId);
+    value.runs.finalize(input);
+    const metadataPath = join(value.evidence, runId, "captures", "feature-proof.json");
+    const canonicalJson = readFileSync(metadataPath, "utf8");
+    const oversizedButEquivalent = Buffer.from(`${" ".repeat(2 * 1024 * 1024)}${canonicalJson}`);
+    reattestBundleMember(value, runId, "captures/feature-proof.json", oversizedButEquivalent);
+
+    expect(() => value.runs.finalize(input)).toThrowError(expect.objectContaining({
+      code: "ARTIFACT_INVALID",
+      message: "Evidence capture 'feature-proof' metadata does not match its manifest",
+    }));
+  });
+
+  it("rejects re-attested runtime JSON whose representation exceeds the runtime-config bound", () => {
+    const value = setup();
+    const { runId } = completedCapture(value);
+    const runtimeConfig = { configurationId: "rr-test", values: { warmupDurationSeconds: 60 } };
+    const input = { ...reviewedFinalizeInput(value, runId), runtimeConfig };
+    value.runs.finalize(input);
+    const oversizedButEquivalent = Buffer.from(`${" ".repeat(64 * 1024)}${JSON.stringify(runtimeConfig)}`);
+    reattestBundleMember(value, runId, "runtime-config.json", oversizedButEquivalent);
+
+    expect(() => value.runs.finalize(input)).toThrowError(expect.objectContaining({
+      code: "ARTIFACT_INVALID",
+      message: "Recovered runtime configuration does not match the finalize request",
+    }));
   });
 
   it("refuses a manifest-only forged recovery without releasing its managed artifact", () => {

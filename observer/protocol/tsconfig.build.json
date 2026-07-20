@@ -1,0 +1,10 @@
+{
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "rootDir": ".",
+    "outDir": "../../dist/observer/protocol",
+    "composite": true,
+    "tsBuildInfoFile": "../../dist/.tsbuildinfo/observer-protocol.tsbuildinfo"
+  },
+  "include": ["*.ts"]
+}

@@ -1,13 +1,16 @@
-import { existsSync, lstatSync, readFileSync, readdirSync, unlinkSync } from "node:fs";
+import { existsSync, lstatSync, readdirSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
+import { boundedOption } from "#foundation/bounded-option";
+import { BoundedJsonStore } from "#foundation/json-store";
 import {
+  DEFAULT_LIMITS,
   SESSION_DIRECTORY_NAME,
   jobStatusSchema,
   parseProtocolMessage,
   type JobStatus,
   type RuntimeCommandEnvelope,
 } from "../protocol/index.js";
-import { ObserverError } from "./errors.js";
+import { ObserverError, observerOptionError } from "./errors.js";
 import {
   assertIdentifier,
   assertManagedPath,
@@ -17,6 +20,15 @@ import {
 } from "./paths.js";
 
 const MAX_COMMAND_SEQUENCE = 999_999_999_999;
+
+function readBoundedJson(root: string, path: string, maxRecordBytes: number): unknown | null {
+  return new BoundedJsonStore<unknown>({
+    root,
+    minRecordBytes: 1,
+    maxRecordBytes,
+    parse: (value) => value,
+  }).read(path);
+}
 
 export interface MailboxCleanupFailure {
   operation: string;
@@ -53,8 +65,8 @@ export class MailboxTransport {
     readonly profilePath: string,
     options: MailboxTransportOptions = {}
   ) {
-    this.maxCommandFiles = this.boundedOption(options.maxCommandFiles, 256, 1, 4_096, "Mailbox command file limit");
-    this.maxCommandBytes = this.boundedOption(options.maxCommandBytes, 8 * 1024 * 1024, 1_024, 256 * 1024 * 1024, "Mailbox command byte limit");
+    this.maxCommandFiles = boundedOption(options.maxCommandFiles, 256, 1, 4_096, "Mailbox command file limit", observerOptionError);
+    this.maxCommandBytes = boundedOption(options.maxCommandBytes, 8 * 1024 * 1024, 1_024, 256 * 1024 * 1024, "Mailbox command byte limit", observerOptionError);
     this.removeFile = options.removeFile ?? unlinkSync;
     this.onCleanupFailure = options.onCleanupFailure;
     const engineProfileDirectory = resolveEngineProfileDirectory(profilePath, { requireExisting: true });
@@ -109,8 +121,14 @@ export class MailboxTransport {
     for (const item of before.files) {
       let expired = false;
       try {
-        const value = JSON.parse(readFileSync(item.path, "utf8")) as Record<string, unknown>;
-        const lease = typeof value.deliveryLeaseExpiresAt === "string" ? Date.parse(value.deliveryLeaseExpiresAt) : Number.NaN;
+        const value = readBoundedJson(
+          this.commandsDirectory,
+          item.path,
+          this.maxCommandBytes
+        ) as Record<string, unknown> | null;
+        const lease = value && typeof value.deliveryLeaseExpiresAt === "string"
+          ? Date.parse(value.deliveryLeaseExpiresAt)
+          : Number.NaN;
         expired = !Number.isFinite(lease) || lease <= now;
       } catch {
         // The agent is the sole command writer. A malformed retained command
@@ -168,7 +186,7 @@ export class MailboxTransport {
       assertManagedPath(this.statusDirectory, path);
       let value: unknown;
       try {
-        value = JSON.parse(readFileSync(path, "utf8"));
+        value = readBoundedJson(this.statusDirectory, path, DEFAULT_LIMITS.maxRequestBodyBytes);
       } catch {
         continue;
       }
@@ -187,7 +205,10 @@ export class MailboxTransport {
       const path = join(this.statusDirectory, entry.name);
       assertManagedPath(this.statusDirectory, path);
       try {
-        const parsed = parseProtocolMessage(jobStatusSchema, JSON.parse(readFileSync(path, "utf8")));
+        const parsed = parseProtocolMessage(
+          jobStatusSchema,
+          readBoundedJson(this.statusDirectory, path, DEFAULT_LIMITS.maxRequestBodyBytes)
+        );
         if (parsed.success && parsed.data.jobId === jobId && parsed.data.sequence === sequence) {
           unlinkSync(path);
           return true;
@@ -305,11 +326,4 @@ export class MailboxTransport {
     throw new ObserverError("TRANSPORT_UNAVAILABLE", "Mailbox command sequence namespace is exhausted", 503);
   }
 
-  private boundedOption(value: number | undefined, fallback: number, minimum: number, maximum: number, label: string): number {
-    const selected = value ?? fallback;
-    if (!Number.isSafeInteger(selected) || selected < minimum || selected > maximum) {
-      throw new ObserverError("INVALID_REQUEST", `${label} must be an integer from ${minimum} through ${maximum}`);
-    }
-    return selected;
-  }
 }

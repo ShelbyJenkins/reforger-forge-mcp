@@ -1,19 +1,27 @@
-import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { AGENT_VERSION } from "../protocol/index.js";
-import { ArtifactStore } from "./artifacts.js";
 import { requestObserverControl } from "./control-client.js";
-import { ObserverControlApi } from "./control-api.js";
 import { errorBody } from "./errors.js";
-import { JobStore } from "./jobs.js";
 import { observerLogger } from "./logger.js";
-import { InstanceRegistry } from "./registry.js";
-import { ObserverRunStore } from "./runs.js";
-import { ObserverAgentServer } from "./server.js";
+import { inspectPaths } from "./paths.js";
+import { createObserverApplication } from "./application.js";
 
 function option(argumentsArray: string[], name: string): string | undefined {
   const index = argumentsArray.indexOf(name);
   return index >= 0 ? argumentsArray[index + 1] : undefined;
+}
+
+function optionValues(argumentsArray: string[], name: string): string[] {
+  const values: string[] = [];
+  for (let index = 0; index < argumentsArray.length; index += 1) {
+    if (argumentsArray[index] === name && argumentsArray[index + 1] !== undefined) values.push(argumentsArray[index + 1]);
+  }
+  return values;
+}
+
+function numberOption(argumentsArray: string[], name: string): number | undefined {
+  const value = option(argumentsArray, name);
+  return value === undefined ? undefined : Number(value);
 }
 
 function print(value: unknown): void {
@@ -31,20 +39,20 @@ function baseOptions(argumentsArray: string[]) {
     root: option(argumentsArray, "--root"),
     profileRoot: option(argumentsArray, "--profile-root"),
     sourceDirectory: option(argumentsArray, "--source-addon"),
+    evidenceRoots: optionValues(argumentsArray, "--evidence-root"),
+    supportingLogRoots: optionValues(argumentsArray, "--supporting-log-root"),
+    retentionIntervalMs: numberOption(argumentsArray, "--retention-interval-ms"),
+    retentionMaxAgeMs: numberOption(argumentsArray, "--retention-max-age-ms"),
+    retentionMaxBytes: numberOption(argumentsArray, "--retention-max-bytes"),
+    sweepIntervalMs: numberOption(argumentsArray, "--sweep-interval-ms"),
+    sessionStore: {
+      terminalRetentionMs: numberOption(argumentsArray, "--session-terminal-retention-ms"),
+    },
   };
 }
 
-function createCliAgent(options: ReturnType<typeof baseOptions> & { port?: number; host?: "127.0.0.1" | "::1"; enableControlHttp?: boolean }) {
-  const agentInstanceId = randomUUID();
-  const control = new ObserverControlApi({ ...options, agentInstanceId });
-  const registry = new InstanceRegistry(control.sessions);
-  const jobs = new JobStore(control.sessions, registry);
-  const artifacts = new ArtifactStore(control.paths.artifacts, control.sessions, jobs);
-  const runs = new ObserverRunStore(control.paths.runs, control.paths.exportWork, artifacts, jobs, {
-    supportingLogRoots: [control.paths.logs],
-  });
-  const server = new ObserverAgentServer(agentInstanceId, control, registry, jobs, artifacts, runs, options);
-  return { control, registry, jobs, artifacts, runs, server };
+function createCliApplication(options: ReturnType<typeof baseOptions> & { port?: number; host?: "127.0.0.1" | "::1"; enableControlHttp?: boolean }) {
+  return createObserverApplication(options);
 }
 
 export async function runCli(argumentsArray: string[]): Promise<void> {
@@ -55,17 +63,29 @@ export async function runCli(argumentsArray: string[]): Promise<void> {
       return;
     }
     if (command === "stage") {
-      const agent = createCliAgent(baseOptions(argumentsArray));
+      const agent = createCliApplication(baseOptions(argumentsArray));
       print(agent.control.ensureStaged());
       return;
     }
     if (command === "doctor") {
-      const agent = createCliAgent(baseOptions(argumentsArray));
+      const options = baseOptions(argumentsArray);
+      const inspection = inspectPaths(options.root, options.profileRoot);
       print({
-        ...agent.control.diagnostics(),
-        instances: agent.registry.diagnostics(),
-        jobs: agent.jobs.diagnostics(),
-        stores: agent.server.storeDiagnostics(),
+        readOnly: true,
+        mutationPerformed: false,
+        diagnostic: "doctor",
+        observerRoot: inspection.paths.root,
+        profileRoot: inspection.paths.profiles,
+        managedStorage: inspection.entries,
+        stateLoaded: false,
+        sessions: [],
+        instances: [],
+        jobs: [],
+        promises: {
+          launchesProcesses: false,
+          signalsProcesses: false,
+          mutatesWorkbenchHandlers: false,
+        },
       });
       return;
     }
@@ -86,7 +106,7 @@ export async function runCli(argumentsArray: string[]): Promise<void> {
     }
     if (command !== "serve") throw new Error(`Unknown observer agent command: ${command}`);
     const portValue = option(argumentsArray, "--port");
-    const agent = createCliAgent({
+    const agent = createCliApplication({
       ...baseOptions(argumentsArray),
       port: portValue === undefined ? 0 : Number(portValue),
       host: argumentsArray.includes("--ipv6") ? "::1" : "127.0.0.1",

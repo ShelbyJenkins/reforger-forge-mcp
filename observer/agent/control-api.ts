@@ -2,8 +2,9 @@ import { createHash, randomBytes } from "node:crypto";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
+import { boundedOption } from "#foundation/bounded-option";
 import { DEFAULT_LIMITS, TRANSPORTS, type ObserverTransport, type SessionContract } from "../protocol/index.js";
-import { ObserverError } from "./errors.js";
+import { ObserverError, observerOptionError } from "./errors.js";
 import { mergeLaunchArguments } from "./launch-arguments.js";
 import {
   assertManagedPath,
@@ -151,20 +152,22 @@ export class ObserverControlApi {
   constructor(options: ObserverControlOptions = {}) {
     this.paths = createObserverPaths(options.root);
     this.clock = options.clock ?? systemClock;
-    this.preparedReceiptRetentionMs = this.boundedStoreOption(
+    this.preparedReceiptRetentionMs = boundedOption(
       options.preparedReceiptRetentionMs,
       SESSION_TOMBSTONE_RETENTION_MS,
       0,
       24 * 60 * 60_000,
-      "Prepared launch receipt retention"
+      "Prepared launch receipt retention",
+      observerOptionError
     );
-    this.preparedMaxRecords = this.boundedStoreOption(options.preparedMaxRecords, 1_024, 1, 100_000, "Prepared launch record limit");
-    this.preparedMaxEstimatedBytes = this.boundedStoreOption(
+    this.preparedMaxRecords = boundedOption(options.preparedMaxRecords, 1_024, 1, 100_000, "Prepared launch record limit", observerOptionError);
+    this.preparedMaxEstimatedBytes = boundedOption(
       options.preparedMaxEstimatedBytes,
       32 * 1024 * 1024,
       1_024,
       1024 * 1024 * 1024,
-      "Prepared launch store byte limit"
+      "Prepared launch store byte limit",
+      observerOptionError
     );
     this.agentInstanceId = options.agentInstanceId ?? `agent-${randomBytes(16).toString("hex")}`;
     this.recoveryProbe = options.recoveryProbe ?? probeAgentLease;
@@ -340,11 +343,4 @@ export class ObserverControlApi {
     return Buffer.byteLength(JSON.stringify(entry), "utf8");
   }
 
-  private boundedStoreOption(value: number | undefined, fallback: number, minimum: number, maximum: number, label: string): number {
-    const selected = value ?? fallback;
-    if (!Number.isSafeInteger(selected) || selected < minimum || selected > maximum) {
-      throw new ObserverError("INVALID_REQUEST", `${label} must be an integer from ${minimum} through ${maximum}`);
-    }
-    return selected;
-  }
 }
