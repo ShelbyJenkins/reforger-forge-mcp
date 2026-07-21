@@ -285,6 +285,22 @@ class EMCP_WB_ObserverService
 		return Workbench.GetCurrentGameProjectFile();
 	}
 
+	// Fault-matrix acceptance hook boundary. Advance() is the only point this
+	// handler is re-entered while a job is settling (Submit and Cancel are
+	// single synchronous NET API calls and cannot be held open), so this is
+	// the sole phase currently wired: it pauses the local job state machine
+	// at lease_acquired while the host's ordinary Status poll keeps calling
+	// Advance normally. The default implementation always returns true, so
+	// production behavior is unchanged when no fixture add-on overrides it.
+	// A disposable acceptance fixture may override this through a modded
+	// class to prove fault-injection behavior against a real Workbench
+	// process. It is not part of the public observer protocol or the
+	// production helper's five NET API handlers.
+	protected event bool OnLeaseAcquiredBarrier(EMCP_WB_ObserverJob job)
+	{
+		return true;
+	}
+
 	string CurrentWorldIdentity()
 	{
 		WorldEditor worldEditor = Workbench.GetModule(WorldEditor);
@@ -503,6 +519,11 @@ class EMCP_WB_ObserverService
 		if (!BindingStillCurrent(m_Job))
 		{
 			FailAndRestore("CAPTURE_INVALIDATED", "Workbench lifecycle, target, world, or camera ownership changed during capture");
+			message = m_Job.message;
+			return true;
+		}
+		if (!OnLeaseAcquiredBarrier(m_Job))
+		{
 			message = m_Job.message;
 			return true;
 		}

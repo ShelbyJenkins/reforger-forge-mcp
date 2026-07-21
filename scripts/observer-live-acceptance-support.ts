@@ -22,10 +22,21 @@ import { performance } from "node:perf_hooks";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { inflateSync } from "node:zlib";
-import { redactArguments } from "#foundation/redact";
+import { redactArguments, redactText } from "#foundation/redact";
+import {
+  caseForId,
+  isCanonicalFaultMatrixTerminal,
+  type FaultMatrix,
+  type FaultMatrixBackend,
+  type MatrixEvidenceField,
+} from "../observer/protocol/fault-matrix.js";
 
 const PNG_SIGNATURE = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
 const MAX_PNG_BYTES = 64 * 1024 * 1024;
+// The shared matrix identity adds five explicit source members to the
+// backend-specific baseline lists; keep the manifest bounded without making
+// Workbench's 36-member closure impossible to publish.
+const MAX_MEASURED_SOURCE_IDENTITIES = 64;
 const MAX_PNG_PIXELS = 32_000_000;
 
 const BLOCKING_PROCESS_NAMES = new Set([
@@ -673,7 +684,7 @@ export function buildOperationalBaselineArtifact(input: Omit<
   validateSourceIdentity(input.source.harness);
   validateSourceIdentity(input.source.recorder);
   if (!Array.isArray(input.source.measured) || input.source.measured.length < 1 ||
-      input.source.measured.length > 32) {
+      input.source.measured.length > MAX_MEASURED_SOURCE_IDENTITIES) {
     throw new Error("Operational baseline measured-source identity list is invalid");
   }
   const measuredPathKeys = new Set<string>();
@@ -982,7 +993,7 @@ export function operationalBaselineSource(
     identity(join(repositoryRoot, ...repositoryRelativePath.replace(/\\/g, "/").split("/")), repositoryRelativePath)
   ).concat(measuredClosures.map(closureIdentity)).sort(compareSourcePath);
   const measuredKeys = new Set(measured.map((source) => source.path.toLocaleLowerCase("en-US")));
-  if (measured.length < 1 || measured.length > 32 || measuredKeys.size !== measured.length) {
+  if (measured.length < 1 || measured.length > MAX_MEASURED_SOURCE_IDENTITIES || measuredKeys.size !== measured.length) {
     throw new Error("Operational baseline measured-source identity list is invalid");
   }
   return {
@@ -1023,6 +1034,470 @@ export function writeOperationalBaselineArtifact(
     throw error;
   }
   return finalPath;
+}
+
+export type MatrixArtifactBackend = FaultMatrixBackend;
+
+export interface MatrixRetainedDiagnostic {
+  readonly sha256: string;
+  readonly byteCount: number;
+  readonly tail: string;
+}
+
+export interface MatrixCaseEntry {
+  readonly caseId: string;
+  readonly schedule: {
+    readonly backend: MatrixArtifactBackend;
+    readonly view: "current" | "pose" | "lookAt" | null;
+    readonly phase: string;
+    readonly action: string;
+  };
+  readonly result: "passed" | "failed";
+  readonly publicTerminal: { readonly state: string; readonly errorCode: string | null };
+  readonly deadline: {
+    readonly outcome: "completed" | "expired" | "cancelled";
+    readonly elapsedMs: number;
+    readonly budgetMs: number;
+  };
+  readonly worldRevision: "unchanged" | "changed" | "not_acquired" | "unavailable";
+  readonly camera: "restored" | "exact_process_exit" | "not_acquired" | "unproven";
+  readonly artifact: "validated" | "not_created" | "rejected" | "unproven";
+  readonly cleanup: {
+    readonly lifecycleVacant: boolean;
+    readonly endpointVacant: boolean;
+    readonly childVacant: boolean;
+    readonly exactOwnerVacant: boolean;
+  };
+  readonly retainedDiagnostics: readonly MatrixRetainedDiagnostic[];
+}
+
+export interface ObserverFailureMatrixArtifact {
+  readonly schemaVersion: 2;
+  readonly kind:
+    | "reforger_forge_runtime_observer_failure_matrix"
+    | "reforger_forge_workbench_observer_failure_matrix";
+  readonly backend: MatrixArtifactBackend;
+  readonly result: "passed" | "failed";
+  readonly evaluator: { readonly kind: "local_maintainer"; readonly stableId: null };
+  readonly startedAt: string;
+  readonly finishedAt: string;
+  readonly durationMs: number;
+  readonly environment: OperationalBaselineEnvironment;
+  readonly workload: OperationalBaselineWorkload;
+  readonly source: OperationalBaselineArtifact["source"];
+  readonly matrix: {
+    readonly schemaVersion: 1;
+    readonly declaredCaseIds: readonly string[];
+    readonly sourceClosureSha256: string;
+  };
+  readonly cases: readonly MatrixCaseEntry[];
+  readonly measurements: readonly OperationalBaselineMeasurement[];
+  readonly processCounts: readonly OperationalBaselineProcessSample[];
+  readonly limitations: readonly string[];
+  readonly failure: { readonly name: string } | null;
+}
+
+export interface FailureMatrixArtifactInput extends Omit<ObserverFailureMatrixArtifact,
+  "schemaVersion" | "kind" | "evaluator" | "matrix"> {
+  readonly matrix: FaultMatrix;
+  readonly knownSecretValues?: readonly string[];
+}
+
+export interface FailureMatrixPublication {
+  readonly jsonPath: string;
+  readonly markdownPath: string;
+  readonly artifact: ObserverFailureMatrixArtifact;
+}
+
+const MATRIX_DIAGNOSTIC_MAXIMUM = 4 * 1024;
+const MATRIX_HASH = /^[a-f0-9]{64}$/;
+const FAILURE_MATRIX_REQUIRED_SOURCE_PATHS = Object.freeze([
+  "observer/protocol/fault-matrix.ts",
+  "scripts/observer-fault-matrix-support.ts",
+  "scripts/observer-live-acceptance-support.ts",
+  "src/foundation/redact.ts",
+  "src/foundation/time.ts",
+  "src/observer/public-contract.ts",
+] as const);
+const MATRIX_PORTABLE_IDENTIFIER_ASSIGNMENT = /((?:pid|process[_ -]?id|hostname|host|username|user|lifecycle(?:id|generation|[_ -]id|[_ -]generation)|handler(?:id|lease|[_ -]id|[_ -]lease))\s*[:=]\s*)([^\s,;}\]]+)/gi;
+const MATRIX_CHECK_FIELD: Readonly<Record<string, keyof MatrixCaseEntry["cleanup"]>> = Object.freeze({
+  lifecycle_vacant: "lifecycleVacant",
+  endpoint_vacant: "endpointVacant",
+  child_vacant: "childVacant",
+  exact_owner_vacant: "exactOwnerVacant",
+});
+const MATRIX_LOCAL_IDENTIFIER_ASSIGNMENT = /(\b(?:pid|process(?:[_ -]?id)?|host(?:name)?|user(?:name)?|lifecycle(?:[_ -]?(?:id|generation))?|handler(?:[_ -]?(?:id|lease))?)\s*[:=]\s*)(?:"(?:\\.|[^"\\])*"|[^\s,;}\]]+)/gi;
+
+function exactKeys(value: unknown, expected: readonly string[], _label: string): value is Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const actual = Object.keys(value).sort();
+  const sortedExpected = [...expected].sort();
+  return actual.length === sortedExpected.length && actual.every((key, index) => key === sortedExpected[index]);
+}
+
+const MATRIX_LOCAL_IDENTIFIER_KEYS = new Set([
+  "pid", "processid", "hostname", "host", "username", "user",
+  "lifecycleid", "lifecyclegeneration", "handlerid", "handlerlease",
+]);
+
+function redactMatrixLocalIdentifiers(value: string): string {
+  return value.split(";").map((part) => {
+    const equals = part.indexOf("=");
+    const colon = part.indexOf(":");
+    const boundary = equals < 0 ? colon : colon < 0 ? equals : Math.min(equals, colon);
+    if (boundary < 0) return part;
+    const key = part.slice(0, boundary).trim().replace(/[_ -]/g, "").toLowerCase();
+    return MATRIX_LOCAL_IDENTIFIER_KEYS.has(key)
+      ? part.slice(0, boundary + 1) + "[REDACTED]"
+      : part;
+  }).join(";");
+}
+
+function safeMatrixText(value: string, knownSecretValues: readonly string[]): string {
+  const centrallyRedacted = redactText(value, {
+    profile: "evidence_portability",
+    knownSecretValues,
+    maxLength: MATRIX_DIAGNOSTIC_MAXIMUM,
+  })
+    // The central portability profile recognizes whole POSIX arguments. A
+    // diagnostic may embed one after ordinary prose, so retain no such span.
+    .replace(/(^|[\s;])\/(?:[^\s,;}\]]+)/g, "$1<absolute-path>")
+    .replace(MATRIX_LOCAL_IDENTIFIER_ASSIGNMENT, "$1[REDACTED]")
+    .replace(MATRIX_PORTABLE_IDENTIFIER_ASSIGNMENT, "$1[REDACTED]");
+  const redacted = redactMatrixLocalIdentifiers(centrallyRedacted);
+  // Redaction is intentionally followed by a portability gate. A new diagnostic
+  // shape must fail publication until the central redactor learns how to handle it.
+  const unsafe = [
+    /(?:[A-Za-z]:[\\/]|\\\\[^\\/\s]+[\\/]|(?:^|\s)\/[A-Za-z0-9._-]+)/,
+    /-reforgerForgeOwnerToken=(?!\[REDACTED\])/i,
+    /\bBearer\s+(?!\[REDACTED\])/i,
+    /\b(?:capability|lifecycle|handler|owner)\s*[:=]\s*[A-Za-z0-9._-]{8,}/i,
+  ];
+  if (knownSecretValues.some((secret) => secret && redacted.includes(secret)) || unsafe.some((pattern) => pattern.test(redacted))) {
+    throw new Error("Failure-matrix diagnostic remains unsafe after redaction");
+  }
+  return redacted;
+}
+
+/** Redact a retained diagnostic at its only matrix-evidence presentation boundary. */
+export function matrixRetainedDiagnostic(
+  tail: string,
+  knownSecretValues: readonly string[] = []
+): MatrixRetainedDiagnostic {
+  if (typeof tail !== "string") throw new Error("Failure-matrix diagnostic tail must be a string");
+  const redacted = safeMatrixText(tail, knownSecretValues);
+  return Object.freeze({
+    sha256: createHash("sha256").update(redacted).digest("hex"),
+    byteCount: Buffer.byteLength(redacted, "utf8"),
+    tail: redacted,
+  });
+}
+
+/** Stable digest of the actual sorted harness/source closure, never a runner literal. */
+export function failureMatrixSourceClosureSha256(source: OperationalBaselineArtifact["source"]): string {
+  const members = [source.harness, source.recorder, ...source.measured]
+    .map((member) => ({ path: member.path, sha256: member.sha256 }))
+    .sort(compareSourcePath);
+  if (members.length < 3 || new Set(members.map((member) => member.path.toLowerCase())).size !== members.length) {
+    throw new Error("Failure-matrix source closure is invalid");
+  }
+  const memberPaths = new Set(members.map((member) => member.path.toLowerCase()));
+  for (const requiredPath of FAILURE_MATRIX_REQUIRED_SOURCE_PATHS) {
+    if (!memberPaths.has(requiredPath.toLowerCase())) {
+      throw new Error(`Failure-matrix source closure omits required ${requiredPath}`);
+    }
+  }
+  return aggregateContentMembers(members, "rfo-observer-failure-matrix-source-closure-v1");
+}
+
+function validateMatrixDiagnostic(value: unknown, knownSecretValues: readonly string[]): asserts value is MatrixRetainedDiagnostic {
+  if (!exactKeys(value, ["sha256", "byteCount", "tail"], "Failure-matrix retained diagnostic") ||
+      typeof value.sha256 !== "string" || !MATRIX_HASH.test(value.sha256) ||
+      typeof value.byteCount !== "number" || !Number.isSafeInteger(value.byteCount) || value.byteCount < 0 || value.byteCount > MATRIX_DIAGNOSTIC_MAXIMUM ||
+      typeof value.tail !== "string" || Buffer.byteLength(value.tail, "utf8") !== value.byteCount ||
+      value.tail.length > MATRIX_DIAGNOSTIC_MAXIMUM ||
+      safeMatrixText(value.tail, knownSecretValues) !== value.tail ||
+      createHash("sha256").update(value.tail).digest("hex") !== value.sha256) {
+    throw new Error("Failure-matrix retained diagnostic is invalid or unsafe");
+  }
+}
+
+function validateMatrixCleanup(value: unknown): asserts value is MatrixCaseEntry["cleanup"] {
+  if (!exactKeys(value, ["lifecycleVacant", "endpointVacant", "childVacant", "exactOwnerVacant"], "Failure-matrix cleanup") ||
+      Object.values(value).some((member) => typeof member !== "boolean")) {
+    throw new Error("Failure-matrix cleanup is invalid");
+  }
+}
+
+function hasEvidence(entry: MatrixCaseEntry, field: MatrixEvidenceField): boolean {
+  switch (field) {
+    case "public_terminal": return Boolean(entry.publicTerminal.state);
+    case "deadline": return entry.deadline.outcome === "completed";
+    case "world_revision": return entry.worldRevision !== "unavailable";
+    case "camera": return entry.camera !== "unproven";
+    case "artifact": return entry.artifact !== "unproven";
+    case "cleanup": return true;
+    case "retained_diagnostics": return entry.retainedDiagnostics.length > 0;
+  }
+}
+
+function validateMatrixCaseEntry(
+  value: unknown,
+  matrix: FaultMatrix,
+  artifactResult: "passed" | "failed",
+  knownSecretValues: readonly string[]
+): asserts value is MatrixCaseEntry {
+  if (!exactKeys(value, [
+    "caseId", "schedule", "result", "publicTerminal", "deadline", "worldRevision", "camera", "artifact", "cleanup", "retainedDiagnostics",
+  ], "Failure-matrix case entry") || typeof value.caseId !== "string" ||
+      (value.result !== "passed" && value.result !== "failed")) {
+    throw new Error("Failure-matrix case entry is invalid");
+  }
+  const declared = caseForId(matrix, value.caseId);
+  if (!exactKeys(value.schedule, ["backend", "view", "phase", "action"], "Failure-matrix case schedule") ||
+      value.schedule.backend !== declared.backend || value.schedule.view !== declared.view ||
+      value.schedule.phase !== declared.injection.phase || value.schedule.action !== declared.injection.action) {
+    throw new Error("Failure-matrix case schedule disagrees with its declaration");
+  }
+  // Failed rows retain their observed public terminal, but still cannot turn
+  // evidence into an unbounded transport for arbitrary state/error strings.
+  if (!isCanonicalFaultMatrixTerminal(value.publicTerminal)) {
+    throw new Error("Failure-matrix public terminal is invalid");
+  }
+  const deadline = value.deadline;
+  if (!exactKeys(deadline, ["outcome", "elapsedMs", "budgetMs"], "Failure-matrix deadline") ||
+      (deadline.outcome !== "completed" && deadline.outcome !== "expired" && deadline.outcome !== "cancelled") ||
+      typeof deadline.elapsedMs !== "number" || !Number.isSafeInteger(deadline.elapsedMs) || deadline.elapsedMs < 0 ||
+      typeof deadline.budgetMs !== "number" || !Number.isSafeInteger(deadline.budgetMs) || deadline.budgetMs < 1 ||
+      deadline.elapsedMs > deadline.budgetMs) {
+    throw new Error("Failure-matrix deadline is invalid");
+  }
+  if (typeof value.worldRevision !== "string" || !["unchanged", "changed", "not_acquired", "unavailable"].includes(value.worldRevision) ||
+      typeof value.camera !== "string" || !["restored", "exact_process_exit", "not_acquired", "unproven"].includes(value.camera) ||
+      typeof value.artifact !== "string" || !["validated", "not_created", "rejected", "unproven"].includes(value.artifact) ||
+      !Array.isArray(value.retainedDiagnostics) || value.retainedDiagnostics.length > 16) {
+    throw new Error("Failure-matrix case dispositions are invalid");
+  }
+  validateMatrixCleanup(value.cleanup);
+  for (const diagnostic of value.retainedDiagnostics) validateMatrixDiagnostic(diagnostic, knownSecretValues);
+  if (value.result === "passed") {
+    if (value.publicTerminal.state !== declared.expectedTerminal.state ||
+        value.publicTerminal.errorCode !== declared.expectedTerminal.errorCode ||
+        value.camera !== declared.cameraDisposition) {
+      throw new Error("A passed failure-matrix case contradicts its declaration");
+    }
+    for (const field of declared.requiredEvidence) {
+      if (!hasEvidence(value as unknown as MatrixCaseEntry, field)) throw new Error(`A passed failure-matrix case lacks required ${field} evidence`);
+    }
+    for (const check of declared.requiredChecks) {
+      if (!value.cleanup[MATRIX_CHECK_FIELD[check]]) {
+        throw new Error(`A passed failure-matrix case lacks required ${check} proof`);
+      }
+    }
+  }
+  if (artifactResult === "passed" && value.result !== "passed") {
+    throw new Error("A passed failure-matrix artifact cannot contain a failed case");
+  }
+}
+
+function validateFailureMatrixArtifact(
+  artifact: ObserverFailureMatrixArtifact,
+  matrix: FaultMatrix,
+  knownSecretValues: readonly string[]
+): void {
+  if (!exactKeys(artifact, [
+    "schemaVersion", "kind", "backend", "result", "evaluator", "startedAt", "finishedAt", "durationMs", "environment", "workload",
+    "source", "matrix", "cases", "measurements", "processCounts", "limitations", "failure",
+  ], "Failure-matrix artifact") || artifact.schemaVersion !== 2 ||
+      artifact.kind !== `reforger_forge_${artifact.backend}_observer_failure_matrix` ||
+      (artifact.backend !== "runtime" && artifact.backend !== "workbench") ||
+      (artifact.result !== "passed" && artifact.result !== "failed") ||
+      !exactKeys(artifact.evaluator, ["kind", "stableId"], "Failure-matrix evaluator") ||
+      artifact.evaluator.kind !== "local_maintainer" || artifact.evaluator.stableId !== null) {
+    throw new Error("Failure-matrix artifact identity is invalid");
+  }
+  const started = isoTimestamp(artifact.startedAt, "Failure-matrix start");
+  const finished = isoTimestamp(artifact.finishedAt, "Failure-matrix finish");
+  if (finished < started || !Number.isFinite(artifact.durationMs) || artifact.durationMs < 0) {
+    throw new Error("Failure-matrix timing is invalid");
+  }
+  // Reuse the established baseline validator for all retained operational evidence.
+  buildOperationalBaselineArtifact({
+    backend: artifact.backend,
+    result: artifact.result,
+    startedAt: artifact.startedAt,
+    finishedAt: artifact.finishedAt,
+    durationMs: artifact.durationMs,
+    environment: artifact.environment,
+    workload: artifact.workload,
+    source: artifact.source,
+    measurements: artifact.measurements,
+    processCounts: artifact.processCounts,
+    limitations: [...artifact.limitations],
+    failure: artifact.failure,
+  } as Omit<OperationalBaselineArtifact, "schemaVersion" | "kind" | "thresholds">);
+  const declaredBackendCases = matrix.cases.filter((item) => item.backend === artifact.backend);
+  if (!exactKeys(artifact.matrix, ["schemaVersion", "declaredCaseIds", "sourceClosureSha256"], "Failure-matrix catalog") ||
+      artifact.matrix.schemaVersion !== 1 || !MATRIX_HASH.test(artifact.matrix.sourceClosureSha256) ||
+      !Array.isArray(artifact.matrix.declaredCaseIds) ||
+      artifact.matrix.declaredCaseIds.length !== declaredBackendCases.length ||
+      artifact.matrix.declaredCaseIds.some((id, index) => id !== declaredBackendCases[index]!.id) ||
+      artifact.matrix.sourceClosureSha256 !== failureMatrixSourceClosureSha256(artifact.source)) {
+    throw new Error("Failure-matrix catalog identity is invalid");
+  }
+  if (!Array.isArray(artifact.cases) || artifact.cases.length !== declaredBackendCases.length ||
+      artifact.cases.some((entry, index) => entry.caseId !== declaredBackendCases[index]!.id)) {
+    throw new Error("Failure-matrix entries must occur once in sorted declared order");
+  }
+  for (const entry of artifact.cases) validateMatrixCaseEntry(entry, matrix, artifact.result, knownSecretValues);
+  if ((artifact.result === "passed" && artifact.failure !== null) ||
+      (artifact.result === "failed" && !artifact.failure?.name) ||
+      (artifact.failure !== null && (!exactKeys(artifact.failure, ["name"], "Failure-matrix failure") ||
+        !boundedVersion(artifact.failure.name)))) {
+    throw new Error("Failure-matrix failure classification is invalid");
+  }
+  if (!Array.isArray(artifact.limitations) || artifact.limitations.some((item) =>
+    typeof item !== "string" || item.length > 512 || safeMatrixText(item, knownSecretValues) !== item)) {
+    throw new Error("Failure-matrix limitations are unsafe");
+  }
+}
+
+/** Build a v2 matrix artifact while preserving the v1 baseline's environment/source evidence shape. */
+export function buildObserverFailureMatrixArtifact(input: FailureMatrixArtifactInput): ObserverFailureMatrixArtifact {
+  const knownSecretValues = [...new Set(input.knownSecretValues ?? [])];
+  if (knownSecretValues.some((value) => typeof value !== "string" || !value)) {
+    throw new Error("Failure-matrix known secret values are invalid");
+  }
+  const artifact: ObserverFailureMatrixArtifact = {
+    schemaVersion: 2,
+    kind: `reforger_forge_${input.backend}_observer_failure_matrix`,
+    backend: input.backend,
+    result: input.result,
+    evaluator: { kind: "local_maintainer", stableId: null },
+    startedAt: input.startedAt,
+    finishedAt: input.finishedAt,
+    durationMs: input.durationMs,
+    environment: input.environment,
+    workload: input.workload,
+    source: input.source,
+    matrix: {
+      schemaVersion: 1,
+      declaredCaseIds: input.matrix.cases.filter((item) => item.backend === input.backend).map((item) => item.id),
+      sourceClosureSha256: failureMatrixSourceClosureSha256(input.source),
+    },
+    cases: input.cases.map((entry) => ({
+      ...entry,
+      retainedDiagnostics: entry.retainedDiagnostics.map((diagnostic) => matrixRetainedDiagnostic(diagnostic.tail, knownSecretValues)),
+    })),
+    measurements: input.measurements,
+    processCounts: input.processCounts,
+    limitations: input.limitations.map((item) => safeMatrixText(item, knownSecretValues)),
+    failure: input.failure,
+  };
+  validateFailureMatrixArtifact(artifact, input.matrix, knownSecretValues);
+  return Object.freeze(artifact);
+}
+
+function failureMatrixMarkdown(artifact: ObserverFailureMatrixArtifact): string {
+  const product = artifact.backend === "runtime" ? artifact.environment.game : artifact.environment.workbench;
+  const productVersion = product?.version ?? product?.fileVersion ?? "unavailable";
+  const lines = [
+    "# Observer failure matrix",
+    "",
+    `Result: ${artifact.result}`,
+    `Backend: ${artifact.backend}`,
+    `Product version: ${productVersion}`,
+    `Evaluator: ${artifact.evaluator.kind}`,
+    `Source closure SHA-256: ${artifact.matrix.sourceClosureSha256}`,
+    "",
+    "| Case | Result | Terminal | Deadline | Camera |",
+    "| --- | --- | --- | --- | --- |",
+    ...artifact.cases.map((entry) => `| ${entry.caseId} | ${entry.result} | ${entry.publicTerminal.state}/${entry.publicTerminal.errorCode ?? "none"} | ${entry.deadline.outcome} | ${entry.camera} |`),
+    "",
+    "## Retained diagnostic hashes",
+    "",
+    ...artifact.cases.flatMap((entry) => entry.retainedDiagnostics.map((diagnostic) =>
+      `- ${entry.caseId}: ${diagnostic.sha256} (${diagnostic.byteCount} bytes)`)),
+    "",
+    "## Limitations",
+    "",
+    ...artifact.limitations.map((item) => `- ${item}`),
+    "",
+  ];
+  return lines.join("\n");
+}
+
+export function validateObserverFailureMatrixSummary(
+  summary: unknown,
+  markdown: string,
+): asserts summary is { readonly basename: string; readonly sha256: string } {
+  if (!exactKeys(summary, ["basename", "sha256"], "Failure-matrix summary") ||
+      typeof summary.basename !== "string" || !/^[0-9TZ-]+-(runtime|workbench)-observer-failure-matrix-[0-9a-f-]+\.md$/i.test(summary.basename) ||
+      typeof summary.sha256 !== "string" || !MATRIX_HASH.test(summary.sha256) ||
+      createHash("sha256").update(markdown).digest("hex") !== summary.sha256) {
+    throw new Error("Failure-matrix summary hash is invalid");
+  }
+}
+
+/**
+ * Publish the redacted summary first and JSON manifest last. Any schema,
+ * redaction, or closeout failure removes only this attempt's temporary siblings.
+ */
+export function writeObserverFailureMatrixArtifact(
+  outputDirectory: string,
+  artifact: ObserverFailureMatrixArtifact,
+  matrix: FaultMatrix,
+  knownSecretValues: readonly string[] = []
+): FailureMatrixPublication {
+  validateFailureMatrixArtifact(artifact, matrix, knownSecretValues);
+  const directory = resolve(outputDirectory);
+  mkdirSync(directory, { recursive: true });
+  const stat = lstatSync(directory);
+  if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("Failure-matrix output must be a non-symlink directory");
+  const timestamp = artifact.startedAt.replace(/[:.]/g, "-");
+  const nonce = randomUUID();
+  const stem = `${timestamp}-${artifact.backend}-observer-failure-matrix-${nonce}`;
+  const markdownName = `${stem}.md`;
+  const jsonName = `${stem}.json`;
+  const markdownPath = join(directory, markdownName);
+  const jsonPath = join(directory, jsonName);
+  const markdownTemporary = join(directory, `.${markdownName}.${process.pid}.tmp`);
+  const jsonTemporary = join(directory, `.${jsonName}.${process.pid}.tmp`);
+  if ([markdownPath, jsonPath, markdownTemporary, jsonTemporary].some(existsSync)) {
+    throw new Error("Failure-matrix artifact name unexpectedly collided");
+  }
+  try {
+    const markdown = failureMatrixMarkdown(artifact);
+    if (safeMatrixText(markdown, knownSecretValues) !== markdown) throw new Error("Failure-matrix summary is unsafe");
+    writeFileSync(markdownTemporary, markdown, { encoding: "utf8", flag: "wx", mode: 0o600 });
+    renameSync(markdownTemporary, markdownPath);
+    const markdownBytes = readFileSync(markdownPath, "utf8");
+    const manifest = {
+      ...artifact,
+      summary: {
+        basename: markdownName,
+        sha256: createHash("sha256").update(markdownBytes).digest("hex"),
+      },
+    };
+    validateObserverFailureMatrixSummary(manifest.summary, markdownBytes);
+    const serialized = `${JSON.stringify(manifest, null, 2)}\n`;
+    // Every free-text field was redacted and validated above. Do not run the
+    // JSON envelope through text redaction: repository-relative source names
+    // are structured identity fields, not diagnostics.
+    if (knownSecretValues.some((secret) => secret && serialized.includes(secret))) {
+      throw new Error("Failure-matrix manifest is unsafe");
+    }
+    writeFileSync(jsonTemporary, serialized, { encoding: "utf8", flag: "wx", mode: 0o600 });
+    renameSync(jsonTemporary, jsonPath);
+    return Object.freeze({ jsonPath, markdownPath, artifact });
+  } catch (error) {
+    for (const path of [markdownTemporary, jsonTemporary]) {
+      try { if (existsSync(path)) unlinkSync(path); } catch { /* preserve root failure */ }
+    }
+    // A final summary without a final manifest is not a valid publication closure.
+    try { if (existsSync(markdownPath) && !existsSync(jsonPath)) unlinkSync(markdownPath); } catch { /* preserve root failure */ }
+    throw error;
+  }
 }
 
 export interface PngMaterialEvidence {

@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { ArtifactStore } from "../../observer/agent/artifacts.js";
@@ -55,7 +55,7 @@ function setup(
     stableTimeoutMs: timing.stableTimeoutMs ?? 2_000,
     ...(timing.sleeper ? { clock, sleeper: timing.sleeper } : {}),
   });
-  return { root, ...fixture, registry, registration, jobs, artifacts };
+  return { root, ...fixture, clock, registry, registration, jobs, artifacts };
 }
 
 function scopedIt(

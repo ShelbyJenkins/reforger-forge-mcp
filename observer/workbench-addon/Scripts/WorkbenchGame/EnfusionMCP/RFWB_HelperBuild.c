@@ -7,5 +7,5 @@ class RFWB_HelperBuild
 	static const string ADDON_GUID = "4D74249D90703F46";
 	static const string ADDON_VERSION = "0.1.0";
 	static const string PROTOCOL_VERSION = "2.0";
-	static const string IDENTITY = "8a187406f40702829a2f967e7aa24ef6ba609e50c228ecb8d8c22b8623267238";
+	static const string IDENTITY = "276840804c0d4c33dc6d836c8542489fdd975a856f48e5023bcd2274dcb168a8";
 }

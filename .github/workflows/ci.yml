@@ -35,6 +35,8 @@ jobs:
 
       - run: npm run build
 
+      - run: npm run typecheck
+
       - run: npm test
 
       # Run the installed-tarball smoke once rather than packing and installing

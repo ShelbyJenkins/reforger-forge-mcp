@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, afterEach } from "vitest";
 import { createServer, type Server, type Socket } from "node:net";
 import { WorkbenchClient } from "../../src/workbench/client.js";
 import { formatConnectionStatus, requireEditMode, requirePlayMode } from "../../src/workbench/status.js";

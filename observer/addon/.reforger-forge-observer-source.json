@@ -5,7 +5,7 @@
   "addonId": "ReforgerForgeObserver",
   "addonGuid": "7F3A91C2E40B6D58",
   "buildIdentity": "000cec19226673ce911c68dca027dca7449ff58a604fe0cef6509afbc4d7ec22",
-  "bundleDigest": "c519bf76261b2657463f97f1f16ecb7082130edeac0931f54769b045327c4458",
+  "bundleDigest": "9dcf005290e335f06f0fc43da4055ead637522e9fdca64d4444a7af82873a529",
   "files": [
     {
       "path": "addon.gproj",
@@ -61,7 +61,7 @@
     },
     {
       "path": "Scripts/Game/ReforgerForgeObserver/RFO_ObserverService.c",
-      "sha256": "81c62ddd5178c8a8c207e1e1f956bcb3b983cfd1ce2be24430db025f66330923"
+      "sha256": "140a3e7549d3922e8a35acd299ecf1e136ca3618d020f21d9ac3a9bb7a72fbd6"
     },
     {
       "path": "Scripts/Game/ReforgerForgeObserver/RFO_ObserverSession.c",

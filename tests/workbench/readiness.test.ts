@@ -1,4 +1,6 @@
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi, type Mock } from "vitest";
+import { type WorkbenchNetApiPort } from "../../src/workbench/net-api-client.js";
+import { type VerifyEndpointOwnerResult } from "../../src/workbench/process-guard.js";
 import {
   waitForCompanionReady,
   WorkbenchReadinessError,
@@ -36,6 +38,10 @@ const ping = {
   helperBuildIdentity: WORKBENCH_HELPER_BUILD_IDENTITY,
 };
 
+// A vi.fn cannot express the port's generic `call<T>()`; keep the mock for
+// `.mock` introspection while presenting the exact port surface to production.
+type MockNetApiCall = WorkbenchNetApiPort["call"] & Mock;
+
 function baseOptions() {
   return {
     endpoint: { host: "127.0.0.1", port: 5775 },
@@ -47,8 +53,8 @@ function baseOptions() {
       launchedAtMs: 1,
     },
     companion,
-    netApi: { call: vi.fn(async () => ping) },
-    verifyEndpointOwner: vi.fn(async () => ({ kind: "owned" as const, listenerPid: 42 })),
+    netApi: { call: vi.fn(async () => ping) as unknown as MockNetApiCall },
+    verifyEndpointOwner: vi.fn(async (): Promise<VerifyEndpointOwnerResult> => ({ kind: "owned", listenerPid: 42 })),
     attestCompanion: vi.fn(() => companion),
     deadlineMs: Date.now() + 1_000,
     pollIntervalMs: 1,
@@ -60,11 +66,11 @@ describe("Workbench companion readiness", () => {
     const trace: string[] = [];
     const options = baseOptions();
     options.attestCompanion = vi.fn(() => { trace.push("attest"); return companion; });
-    options.verifyEndpointOwner = vi.fn(async () => {
+    options.verifyEndpointOwner = vi.fn(async (): Promise<VerifyEndpointOwnerResult> => {
       trace.push("endpoint");
-      return { kind: "owned" as const, listenerPid: 42 };
+      return { kind: "owned", listenerPid: 42 };
     });
-    options.netApi.call = vi.fn(async () => { trace.push("ping"); return ping; });
+    options.netApi.call = vi.fn(async () => { trace.push("ping"); return ping; }) as unknown as MockNetApiCall;
     await expect(waitForCompanionReady(options)).resolves.toMatchObject({
       addonId: WORKBENCH_HELPER_ADDON_ID,
       workbenchProtocol: WORKBENCH_HELPER_PROTOCOL_VERSION,
@@ -75,7 +81,7 @@ describe("Workbench companion readiness", () => {
 
   it("rejects a mismatched Workbench protocol", async () => {
     const options = baseOptions();
-    options.netApi.call = vi.fn(async () => ({ ...ping, workbenchProtocol: "stale" }));
+    options.netApi.call = vi.fn(async () => ({ ...ping, workbenchProtocol: "stale" })) as unknown as MockNetApiCall;
     await expect(waitForCompanionReady(options)).rejects.toMatchObject({
       code: "IDENTITY_UNVERIFIABLE",
     });
@@ -113,9 +119,9 @@ describe("Workbench companion readiness", () => {
   it("fails immediately when the supervised child errors during polling", async () => {
     const options = baseOptions();
     options.pollIntervalMs = 100;
-    options.verifyEndpointOwner = vi.fn(async () => ({
-      kind: "refused" as const,
-      reason: "listener_not_found" as const,
+    options.verifyEndpointOwner = vi.fn(async (): Promise<VerifyEndpointOwnerResult> => ({
+      kind: "refused",
+      reason: "listener_not_found",
       message: "not listening yet",
     }));
     let terminalState: WorkbenchReadinessChild["terminalState"] = null;

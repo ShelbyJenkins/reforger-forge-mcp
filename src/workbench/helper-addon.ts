@@ -41,7 +41,7 @@ export const WORKBENCH_HELPER_ADDON_VERSION = "0.1.0" as const;
 export const WORKBENCH_HELPER_PROTOCOL_VERSION = "2.0" as const;
 /** Content identity of the helper payload, excluding only its generated identity source. */
 export const WORKBENCH_HELPER_BUILD_IDENTITY =
-  "8a187406f40702829a2f967e7aa24ef6ba609e50c228ecb8d8c22b8623267238" as const;
+  "276840804c0d4c33dc6d836c8542489fdd975a856f48e5023bcd2274dcb168a8" as const;
 export const WORKBENCH_HELPER_HANDLER_FILES = generatedWorkbenchHelperHandlerFiles;
 /** Workbench creates this cache beside addon.gproj after loading a staged add-on. */
 const WORKBENCH_GENERATED_STAGED_FILES = new Set(["resourceDatabase.rdb"]);

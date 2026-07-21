@@ -187,20 +187,21 @@ describe("live graphical runtime observer acceptance contract", () => {
     expect(source).toContain("stoppedRuntime.identityVacant !== true");
     expect(source).toContain("vacantRuntime.identityVacant !== true");
     expect(source).toContain('runtimeKind: "listenServer"');
-    expect(source).toContain('"-server", worldResource');
     expect(source).toContain("await application.beginRun(");
     expect(source).toContain("application.instances({");
     expect(source).toContain("await application.capture(");
     expect(source).toContain("await application.finalizeRun(");
     const stopIndex = source.indexOf("await runtimeManager.stop({");
-    const revokeIndex = source.indexOf("application.revokeSession(sessionId)");
+    const revokeIndex = Math.max(
+      source.indexOf("application.revokeSession(sessionId)"),
+      source.indexOf("application.revokeSession(confirmedSessionId)")
+    );
     expect(stopIndex).toBeGreaterThan(-1);
     expect(revokeIndex).toBeGreaterThan(stopIndex);
     expect(source).toContain("preserved because exact-process vacancy was not proven");
     expect(source).toContain('imagesReviewed: false');
     expect(source).toContain('outcome: "Unreviewed"');
     expect(source).toContain("resolveRuntimeAcceptanceArtifactRoot(options.artifactRoot)");
-    expect(source).toContain("assertExternalRoot(root, label)");
     expect(source).toContain("verifyEvidenceBundle(");
     expect(source).toContain("retainDiagnosticCapture(diagnosticsRoot");
     expect(source).toContain("recordRestorationImageSimilarity(\n      poseRestorationSimilarity");
@@ -252,5 +253,40 @@ describe("live graphical runtime observer acceptance contract", () => {
       "src/observer/tools.ts",
     ].map((path) => readFileSync(resolve(path), "utf8")).join("\n");
     expect(production).not.toMatch(/ArmaReforgerSteamDiag|spawnOwnedRuntime|runRuntimeObserverAcceptance/);
+  });
+
+  it("builds launch arguments and validates external roots in the shared launch-support module", () => {
+    const source = readFileSync(resolve("scripts/observer-runtime-launch-support.ts"), "utf8");
+    expect(source).toContain('"-server", worldResource');
+    expect(source).toContain("assertExternalRoot(root, label)");
+    expect(source).not.toMatch(/taskkill|Stop-Process|KillProcess|execSync|shell:\s*true|\.kill\(/i);
+  });
+
+  it("delegates fault-matrix mode to the runtime failure-matrix runner behind the --only/--keep-profile gate", () => {
+    const source = readFileSync(resolve("scripts/run-runtime-observer-acceptance.ts"), "utf8");
+    expect(source).toContain('import { runRuntimeFailureMatrix } from "./observer-runtime-failure-matrix.js"');
+    expect(source).toContain("await runRuntimeFailureMatrix({");
+    expect(source).toContain('if (keepProfile && !only)');
+    expect(source).toContain('"--keep-profile is valid only together with --only"');
+    expect(source).toContain('"--only (fault-matrix mode) rejects a user-selected --addon-dir');
+    expect(source).toContain('process.argv.includes("--list-cases")');
+    const listCasesIndex = source.indexOf('process.argv.includes("--list-cases")');
+    const helpIndex = source.indexOf('process.argv.includes("--help")');
+    const onlyIndex = source.indexOf('const only = readOption("--only")');
+    expect(helpIndex).toBeGreaterThan(-1);
+    // --help and --list-cases both return early, before --only is even read,
+    // so neither reaches live-run authorization or filesystem preparation.
+    expect(listCasesIndex).toBeGreaterThan(helpIndex);
+    expect(onlyIndex).toBeGreaterThan(listCasesIndex);
+  });
+
+  it("keeps the runtime failure-matrix runner on exact owned-lifecycle shutdown with no direct process-kill path", () => {
+    const source = readFileSync(resolve("scripts/observer-runtime-failure-matrix.ts"), "utf8");
+    expect(source).toContain("await runtimeManager.stop({");
+    expect(source).toContain("scheduler.finishCase()");
+    expect(source).toContain("scheduler.arm(matrixCase.id)");
+    expect(source).toContain("scheduler.releaseBarrier(");
+    expect(source).not.toMatch(/taskkill|Stop-Process|KillProcess|execSync|shell:\s*true|\.kill\(/i);
+    expect(source).not.toMatch(/ChildProcess/);
   });
 });

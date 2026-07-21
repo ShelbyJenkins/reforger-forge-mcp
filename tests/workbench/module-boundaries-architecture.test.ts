@@ -33,7 +33,7 @@ function importedNames(node: ts.ImportDeclaration): string[] {
   return names.sort();
 }
 
-describe("Stage 3 Workbench architecture boundaries", () => {
+describe("Workbench architecture boundaries", () => {
   it("hash-binds the converged Workbench runtime in controlled evidence", () => {
     const acceptance = readFileSync(
       join(repositoryRoot, "scripts", "run-workbench-observer-acceptance.ts"),

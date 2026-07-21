@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { repositoryRoot } from "../support/observer-fixtures.js";
 
-describe("Stage 4 observer architecture", () => {
+describe("Observer application composition architecture", () => {
   it("keeps the host application as the sole host composition root", () => {
     const application = readFileSync(join(repositoryRoot, "src", "observer", "application.ts"), "utf8");
     const server = readFileSync(join(repositoryRoot, "src", "server.ts"), "utf8");
@@ -23,7 +23,7 @@ describe("Stage 4 observer architecture", () => {
     expect(server).toContain("operations.execute");
   });
 
-  it("constructs the host graph once and publishes every Stage 4 runtime module", () => {
+  it("constructs the host graph once and publishes every runtime module", () => {
     const server = readFileSync(join(repositoryRoot, "src", "server.ts"), "utf8");
     expect(server.match(/createObserverApplication\(/g)).toHaveLength(1);
     expect(server).not.toMatch(/ObserverCoordinator|new OwnedRuntimeManager/);

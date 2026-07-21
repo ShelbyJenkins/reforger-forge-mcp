@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { CaptureError, type BackendJob, type CaptureBackend, type CaptureInstance } from "../../src/observer/capture-contract.js";
+import { type BackendJob, type CaptureBackend, type CaptureInstance } from "../../src/observer/capture-contract.js";
 import { CaptureService } from "../../src/observer/capture-service.js";
 import { runtimeWorldRevision } from "../../src/observer/world-revision.js";
 import { captureServiceContract } from "./capture-service-contract.js";
@@ -31,8 +31,8 @@ function backend(): { backend: CaptureBackend; calls: string[] } {
       return completed;
     },
     async cancel(ref) { calls.push("cancel"); return { ...(jobs.get(ref.jobId)!), ref, state: "cancelled", restorationConfirmed: true, cameraLeaseHeld: false }; },
-    async read(ref) { calls.push("read"); return { image: Buffer.from("png"), metadata: { contentSha256: "a".repeat(64) } }; },
-    async release(ref) { calls.push("release"); return { restorationConfirmed: true, artifactRemoved: true }; },
+    async read(_ref) { calls.push("read"); return { image: Buffer.from("png"), metadata: { contentSha256: "a".repeat(64) } }; },
+    async release(_ref) { calls.push("release"); return { restorationConfirmed: true, artifactRemoved: true }; },
   };
   return { backend, calls };
 }

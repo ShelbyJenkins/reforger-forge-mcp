@@ -328,7 +328,7 @@ describe("controlled target-only Workbench build acceptance", () => {
       "scripts/run-workbench-build-acceptance.ts"
     );
     expect(packageJson.scripts["test:stage3"]).toContain(
-      "tests/workbench/stage3-architecture.test.ts"
+      "tests/workbench/module-boundaries-architecture.test.ts"
     );
     expect(packageJson.scripts["test:stage3"]).toContain(
       "tests/workbench/server-composition.test.ts"

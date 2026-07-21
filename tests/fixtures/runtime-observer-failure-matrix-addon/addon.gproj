@@ -1,0 +1,14 @@
+GameProject {
+ ID RFORuntimeFailureMatrix
+ GUID "1155E9DCA4074C7A"
+ TITLE "RFO Runtime Failure Matrix"
+ Dependencies {
+  "7F3A91C2E40B6D58"
+ }
+ Configurations {
+  GameProjectConfig PC {
+  }
+  GameProjectConfig HEADLESS {
+  }
+ }
+}

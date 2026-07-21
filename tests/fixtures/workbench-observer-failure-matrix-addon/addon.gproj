@@ -1,0 +1,14 @@
+GameProject {
+ ID RFOWorkbenchObserverMatrix
+ GUID "2C6B8D14F9A0473E"
+ TITLE "RFO Workbench Observer Failure Matrix"
+ Dependencies {
+  "4D74249D90703F46"
+ }
+ Configurations {
+  GameProjectConfig PC {
+  }
+  GameProjectConfig HEADLESS {
+  }
+ }
+}

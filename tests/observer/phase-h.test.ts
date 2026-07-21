@@ -287,7 +287,7 @@ function fakeWorkbenchAdapter(options: { unavailable?: boolean } = {}) {
       jobId = input.jobId ?? jobId;
       return { ...workbenchJob(state), jobId } as never;
     }),
-    recover: vi.fn(async () => ({ ...workbenchJob(state, 2), jobId }) as never),
+    recover: vi.fn(async (_input: { jobId: string; expectedInstanceId?: string }) => ({ ...workbenchJob(state, 2), jobId }) as never),
     status: vi.fn(async () => ({ ...workbenchJob(state, 2), jobId }) as never),
     cancel: vi.fn(async () => {
       state = "cancelled";

@@ -52,7 +52,7 @@ afterEach(async () => {
   for (const fixture of fixtures.splice(0)) fixture.cleanup();
 });
 
-describe("Stage 3 hermetic target-build acceptance", () => {
+describe("hermetic target-build acceptance", () => {
   it("executes the target policy without helper activation, -run, NET calls, or child leaks", async () => {
     const fixture = createFixture();
     const plan = fixture.targetPlan(300_000);
@@ -227,7 +227,7 @@ describe("Stage 3 hermetic target-build acceptance", () => {
   });
 });
 
-describe("Stage 3 shared session-controller adapter trace", () => {
+describe("shared session-controller adapter trace", () => {
   it("preserves the shared durable spawn and cleanup transaction across all three policies", async () => {
     type Kind = "mcp_editor" | "cli_editor" | "target_build";
     const runAdapter = async (kind: Kind) => {
@@ -462,7 +462,7 @@ describe("Stage 3 shared session-controller adapter trace", () => {
   });
 });
 
-describe("Stage 3 hermetic arbitration acceptance", () => {
+describe("hermetic arbitration acceptance", () => {
   it("preserves writer priority and remains reusable after reader drain and writer failure", async () => {
     const gate = new WorkbenchActivityGate({ restoreTimeoutMs: 1_000 });
     const releaseFirstReader = deferred();
@@ -522,7 +522,7 @@ describe("Stage 3 hermetic arbitration acceptance", () => {
   });
 });
 
-describe("Stage 3 hermetic child-supervision acceptance", () => {
+describe("hermetic child-supervision acceptance", () => {
   it("drains listeners and bounded reconciliation after terminal failure", async () => {
     const supervisor = new ChildSupervisor({
       reconciliationAttempts: 2,

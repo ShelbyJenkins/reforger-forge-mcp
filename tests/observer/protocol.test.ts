@@ -223,7 +223,7 @@ describe("observer protocol", () => {
     // derived so a spelling change cannot be hidden by a second copied list.
     const workbenchResponseStateIndexes = new Set([2, 7, 8, 9, 10]);
     const workbenchResponseStates = JOB_STATES.filter((state, index) =>
-      workbenchResponseStateIndexes.has(index) || TERMINAL_JOB_STATES.includes(state)
+      workbenchResponseStateIndexes.has(index) || TERMINAL_JOB_STATES.includes(state as never)
     );
 
     expect(targetValues("game", "STATE_")).toEqual(JOB_STATES);

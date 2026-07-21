@@ -112,7 +112,7 @@ function deterministicTiming(now: { value: number }, waits: number[]): Workbench
   };
 }
 
-describe("cross-cutting Task 0 characterization baseline", () => {
+describe("cross-cutting coordinator baseline characterization", () => {
   it("keeps known secret sentinels out of diagnostic and evidence sinks", async () => {
     const diagnostic = JSON.stringify(redactForDiagnostics({
       token: "token-sentinel",

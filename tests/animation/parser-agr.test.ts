@@ -1,6 +1,5 @@
 import { describe, it, expect } from "vitest";
 import { parseAgrToStruct } from "../../src/animation/parser.js";
-import type { ParsedAgr } from "../../src/animation/types.js";
 
 const SAMPLE_AGR = `AnimSrcGraph {
  AnimSetTemplate "{ABC123}path/to/file.ast"

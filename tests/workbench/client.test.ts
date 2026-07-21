@@ -69,7 +69,7 @@ describe("WorkbenchClient", () => {
   let client: WorkbenchClient;
 
   beforeEach(() => {
-    mockServer = createMockWorkbench((apiFunc, params) => {
+    mockServer = createMockWorkbench((apiFunc, _params) => {
       if (apiFunc === "EMCP_WB_Ping") {
         return WORKBENCH_HELPER_PING_RESPONSE;
       }

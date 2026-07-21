@@ -21,12 +21,12 @@ import {
 } from "../foundation/fake-exact-process-backend.js";
 
 interface FakeLifecycleControls {
-  readonly workbenchPids: Set<number>;
-  readonly endpointOwnershipCalls: Array<{
+  workbenchPids: Set<number>;
+  endpointOwnershipCalls: Array<{
     endpoint: LifecycleEndpoint;
     expected: WorkbenchIdentity;
   }>;
-  readonly endpointVacancyCalls: LifecycleEndpoint[];
+  endpointVacancyCalls: LifecycleEndpoint[];
   unverifiable: WorkbenchProcessScan["unverifiable"];
   endpointOwnershipResult: VerifyEndpointOwnerResult | null;
   endpointVacancyResult: VerifyEndpointVacantResult | null;

@@ -79,7 +79,8 @@ export class FakeExactProcessBackend<
   }
 
   async verifyAndTerminate(
-    expected: ExactOwnedProcessIdentity
+    expected: ExactOwnedProcessIdentity,
+    _timeoutMs?: number
   ): Promise<ExactProcessTerminationResult> {
     this.beforeTerminate?.();
     this.terminationCalls.push({ ...expected });

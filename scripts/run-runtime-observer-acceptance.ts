@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import {
   existsSync,
   lstatSync,
@@ -7,17 +7,16 @@ import {
   mkdtempSync,
   readFileSync,
   readdirSync,
-  realpathSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
-import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, join, relative, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 import { OBSERVER_TERMINAL_STATES } from "../observer/protocol/enforce-contract.js";
-import { loadConfig } from "../src/config.js";
+import { OBSERVER_FAULT_MATRIX } from "../observer/protocol/fault-matrix.js";
+import { systemClock, systemSleeper } from "../src/foundation/time.js";
 import {
   createObserverApplication,
   type ObserverApplication,
@@ -31,7 +30,6 @@ import {
   analyzePngMaterial,
   comparePngImages,
   detectPngColorMarker,
-  inspectBlockingProcesses,
   operationalBaselineDirectoryIdentity,
   operationalBaselineEnvironment,
   operationalBaselineLaunchArgumentIdentity,
@@ -44,62 +42,85 @@ import {
   type PngComparisonEvidence,
   type PngMaterialEvidence,
 } from "./observer-live-acceptance-support.js";
+import {
+  createFaultMatrixRunScaffolding,
+  removeOwnedFaultControlRoot,
+  resolveFaultMatrixCases,
+} from "./observer-fault-matrix-support.js";
+import { runRuntimeFailureMatrix } from "./observer-runtime-failure-matrix.js";
+import {
+  assertArmaVacant,
+  assertCurrentViewReleasedFromDisplaced,
+  assertLiveRuntimeObserverAuthorized,
+  assertRequestedPoseRendered,
+  boundedText,
+  canonicalDirectory,
+  canonicalFile,
+  captureMatrix,
+  comparisonPath,
+  DEFAULT_RUNTIME_OBSERVER_LOOK_AT_FOV,
+  DEFAULT_RUNTIME_OBSERVER_LOOK_AT_POSITION,
+  DEFAULT_RUNTIME_OBSERVER_LOOK_AT_TARGET,
+  DEFAULT_RUNTIME_OBSERVER_POSE_FOV,
+  DEFAULT_RUNTIME_OBSERVER_POSE_ORIENTATION,
+  DEFAULT_RUNTIME_OBSERVER_POSE_POSITION,
+  DEFAULT_RUNTIME_OBSERVER_WORLD,
+  findRuntimeExecutable,
+  inspectAddonFixture,
+  launchArguments,
+  LIVE_RUNTIME_OBSERVER_ENVIRONMENT,
+  OBSERVER_OPERATIONAL_BASELINE_SOURCE_CLOSURES,
+  OBSERVER_SOURCE_PATH,
+  PRIVATE_CHILD_PATH,
+  record,
+  recordRestorationImageSimilarity,
+  REPOSITORY_ROOT,
+  resolveRuntimeAcceptanceArtifactRoot,
+  RUNTIME_FIXTURE_SOURCE_EXTENSIONS,
+  RUNTIME_OPERATIONAL_BASELINE_SOURCES,
+  sha256,
+  type Quaternion,
+  type Vector3,
+} from "./observer-runtime-launch-support.js";
 
-export const LIVE_RUNTIME_OBSERVER_ENVIRONMENT =
-  "RFO_RUN_LIVE_RUNTIME_OBSERVER_ACCEPTANCE";
-export const LIVE_RUNTIME_OBSERVER_TEST_CONFIRMATION =
-  "RFO_CONFIRM_LIVE_RUNTIME_OBSERVER_ACCEPTANCE";
-export const DEFAULT_RUNTIME_OBSERVER_WORLD =
-  "{96A8AF57260A7392}worlds/MP/MpTest/MpTest.ent";
-export const DEFAULT_RUNTIME_OBSERVER_POSE_POSITION: Vector3 = [96, 90, -5];
-export const DEFAULT_RUNTIME_OBSERVER_POSE_ORIENTATION: Quaternion = [
-  0.3063401817273692,
-  -0.14012450476798344,
-  0.0456440842650991,
-  0.9404453380151182,
-];
-export const DEFAULT_RUNTIME_OBSERVER_POSE_FOV = 58;
-export const DEFAULT_RUNTIME_OBSERVER_LOOK_AT_POSITION: Vector3 = [64, 121, -40];
-export const DEFAULT_RUNTIME_OBSERVER_LOOK_AT_TARGET: Vector3 = [64, 10, 100];
-export const DEFAULT_RUNTIME_OBSERVER_LOOK_AT_FOV = 70;
+export {
+  LIVE_RUNTIME_OBSERVER_ENVIRONMENT,
+  LIVE_RUNTIME_OBSERVER_TEST_CONFIRMATION,
+  DEFAULT_RUNTIME_OBSERVER_WORLD,
+  DEFAULT_RUNTIME_OBSERVER_POSE_POSITION,
+  DEFAULT_RUNTIME_OBSERVER_POSE_ORIENTATION,
+  DEFAULT_RUNTIME_OBSERVER_POSE_FOV,
+  DEFAULT_RUNTIME_OBSERVER_LOOK_AT_POSITION,
+  DEFAULT_RUNTIME_OBSERVER_LOOK_AT_TARGET,
+  DEFAULT_RUNTIME_OBSERVER_LOOK_AT_FOV,
+  REPOSITORY_ROOT,
+  RUNTIME_OPERATIONAL_BASELINE_SOURCES,
+  OBSERVER_OPERATIONAL_BASELINE_SOURCE_CLOSURES,
+  PRIVATE_CHILD_PATH,
+  OBSERVER_SOURCE_PATH,
+  RUNTIME_FIXTURE_SOURCE_EXTENSIONS,
+  record,
+  canonicalDirectory,
+  canonicalFile,
+  resolveRuntimeAcceptanceArtifactRoot,
+  boundedText,
+  assertLiveRuntimeObserverAuthorized,
+  assertArmaVacant,
+  inspectAddonFixture,
+  findRuntimeExecutable,
+  launchArguments,
+  captureMatrix,
+  assertMatrixClose,
+  runtimePoseMatrix,
+  assertRequestedPoseRendered,
+  assertCurrentViewReleasedFromDisplaced,
+  recordRestorationImageSimilarity,
+  type AddonFixture,
+  type RuntimeCameraMatrix,
+  type RuntimeRestorationImageDiagnostic,
+} from "./observer-runtime-launch-support.js";
 
 const SCRIPT_PATH = fileURLToPath(import.meta.url);
-const REPOSITORY_ROOT = resolve(dirname(SCRIPT_PATH), "..");
-const RUNTIME_OPERATIONAL_BASELINE_SOURCES = [
-  "dist/observer/agent/private-child.js",
-  "observer/addon/.reforger-forge-observer-source.json",
-  "observer/addon/addon.gproj",
-  "observer/agent/private-child.ts",
-  "observer/agent/application.ts",
-  "observer/agent/application-operations.ts",
-  "observer/agent/evidence-bundle-service.ts",
-  "package-lock.json",
-  "package.json",
-  "scripts/windows/workbench-lifecycle.ps1",
-  "src/observer/application.ts",
-  "src/observer/capture-service.ts",
-  "src/observer/evidence-run-service.ts",
-  "src/observer/launch.ts",
-  "src/observer/owned-runtime-manager.ts",
-  "src/workbench/child-supervisor.ts",
-  "src/workbench/process-guard.ts",
-] as const;
-const OBSERVER_OPERATIONAL_BASELINE_SOURCE_CLOSURES = [
-  { path: "dist/observer/agent/**/*.js", directory: "dist/observer/agent", extension: ".js" },
-  { path: "dist/observer/protocol/**/*.js", directory: "dist/observer/protocol", extension: ".js" },
-  { path: "observer/addon/**/*.c", directory: "observer/addon", extension: ".c" },
-  { path: "observer/agent/**/*.ts", directory: "observer/agent", extension: ".ts" },
-  { path: "observer/protocol/**/*.ts", directory: "observer/protocol", extension: ".ts" },
-  { path: "src/**/*.ts", directory: "src", extension: ".ts" },
-] as const;
-const PRIVATE_CHILD_PATH = join(
-  REPOSITORY_ROOT,
-  "dist",
-  "observer",
-  "agent",
-  "private-child.js"
-);
-const OBSERVER_SOURCE_PATH = join(REPOSITORY_ROOT, "observer", "addon");
 const TERMINAL_STATES = new Set<string>(OBSERVER_TERMINAL_STATES);
 const ACCEPTANCE_CASE_ID = "RFO-LIVE-RUNTIME-SCREENSHOT";
 const CAPTURE_LABELS = [
@@ -109,18 +130,6 @@ const CAPTURE_LABELS = [
   "explicit-look-at",
   "post-look-at-restoration-current",
 ] as const;
-const RUNTIME_FIXTURE_SOURCE_EXTENSIONS = [
-  ".c", ".conf", ".ent", ".gproj", ".json", ".layer", ".layout", ".meta",
-] as const;
-
-type Vector3 = [number, number, number];
-type Quaternion = [number, number, number, number];
-type RuntimeCameraMatrix = [
-  number, number, number, number,
-  number, number, number, number,
-  number, number, number, number,
-  number, number, number, number,
-];
 
 export interface RuntimeObserverMarkerExpectation {
   color: [number, number, number];
@@ -148,6 +157,10 @@ export interface RuntimeObserverAcceptanceOptions {
   lookAtTarget?: Vector3;
   lookAtFov?: number;
   marker?: RuntimeObserverMarkerExpectation;
+  /** Only the legacy positive-path flow is reachable through this option; a
+   *  declared matrix ID is always rejected here and must be run through the
+   *  --only CLI flag (scripts/observer-runtime-failure-matrix.ts). */
+  only?: string;
 }
 
 export interface RuntimeObserverAcceptanceResult {
@@ -158,171 +171,12 @@ export interface RuntimeObserverAcceptanceResult {
   summary: Record<string, unknown>;
 }
 
-export interface RuntimeRestorationImageDiagnostic {
-  acceptanceRole: "diagnostic-only";
-  reason: string;
-  comparison: PngComparisonEvidence;
-}
-
-interface AddonFixture {
-  addonDirectory: string;
-  addonSearchRoot: string;
-  addonId: string;
-  addonGuid: string;
-  gprojPath: string;
-}
-
 interface RetainedCapture {
   label: typeof CAPTURE_LABELS[number];
   job: Record<string, unknown>;
   metadata: Record<string, unknown>;
   image: Buffer;
   png: PngMaterialEvidence;
-}
-
-function record(value: unknown, label: string): Record<string, unknown> {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new Error(`${label} is not an object`);
-  }
-  return value as Record<string, unknown>;
-}
-
-function sha256(value: Buffer): string {
-  return createHash("sha256").update(value).digest("hex");
-}
-
-function comparisonPath(path: string): string {
-  const resolved = resolve(path);
-  return resolved.toLowerCase();
-}
-
-function contained(root: string, candidate: string): boolean {
-  const rel = relative(comparisonPath(root), comparisonPath(candidate));
-  return rel === "" || (!isAbsolute(rel) && rel !== ".." && !rel.startsWith(`..${sep}`));
-}
-
-function canonicalDirectory(path: string, label: string): string {
-  const absolute = resolve(path);
-  if (!existsSync(absolute)) throw new Error(`${label} is missing: ${absolute}`);
-  const entry = lstatSync(absolute);
-  if (!entry.isDirectory() || entry.isSymbolicLink()) {
-    throw new Error(`${label} must be a non-symlink directory: ${absolute}`);
-  }
-  return realpathSync.native(absolute);
-}
-
-function canonicalFile(path: string, label: string): string {
-  const absolute = resolve(path);
-  if (!existsSync(absolute)) throw new Error(`${label} is missing: ${absolute}`);
-  const entry = lstatSync(absolute);
-  if (!entry.isFile() || entry.isSymbolicLink()) {
-    throw new Error(`${label} must be a non-symlink file: ${absolute}`);
-  }
-  return realpathSync.native(absolute);
-}
-
-function assertExternalRoot(path: string, label: string): void {
-  const repository = realpathSync.native(REPOSITORY_ROOT);
-  if (contained(repository, path) || contained(path, repository)) {
-    throw new Error(`${label} must not overlap the repository`);
-  }
-}
-
-export function resolveRuntimeAcceptanceArtifactRoot(explicit?: string): string {
-  const label = "Runtime observer acceptance artifact root";
-  if (explicit) {
-    // Explicit roots must already exist. Do not create an unchecked path and
-    // only then discover that it overlaps a worktree.
-    const root = canonicalDirectory(explicit, label);
-    assertExternalRoot(root, label);
-    return root;
-  }
-  const defaultRoot = join(tmpdir(), "reforger-forge-runtime-observer-acceptance");
-  mkdirSync(defaultRoot, { recursive: true });
-  const root = canonicalDirectory(defaultRoot, label);
-  assertExternalRoot(root, label);
-  return root;
-}
-
-function boundedText(value: string, label: string, maximum = 32_768): string {
-  const result = value.trim();
-  if (!result || result.length > maximum || /[\0\r\n]/.test(result)) {
-    throw new Error(`${label} is empty, too long, or contains a control character`);
-  }
-  return result;
-}
-
-export function assertLiveRuntimeObserverAuthorized(
-  confirmed: boolean,
-  environment: NodeJS.ProcessEnv = process.env
-): void {
-  if (!confirmed) {
-    throw new Error("Live runtime observer acceptance requires --confirm-live-run");
-  }
-  if (environment[LIVE_RUNTIME_OBSERVER_ENVIRONMENT] !== "1") {
-    throw new Error(
-      `Live runtime observer acceptance requires ${LIVE_RUNTIME_OBSERVER_ENVIRONMENT}=1`
-    );
-  }
-}
-
-function assertArmaVacant(stage: string): void {
-  const blockers = inspectBlockingProcesses();
-  if (blockers.length > 0) {
-    throw new Error(
-      `${stage} requires all Arma Reforger and Workbench processes to be absent: ` +
-      blockers.map((entry) => `${entry.processName} (${entry.id})`).join(", ")
-    );
-  }
-}
-
-function parseGprojValue(source: string, name: "ID" | "GUID"): string | null {
-  const quoted = new RegExp(`(?:^|\\s)${name}\\s+\"([^\"]+)\"`, "m").exec(source)?.[1];
-  if (quoted) return quoted;
-  return new RegExp(`(?:^|\\s)${name}\\s+([^\\s{}]+)`, "m").exec(source)?.[1] ?? null;
-}
-
-function inspectAddonFixture(input: string | undefined): AddonFixture | null {
-  if (!input) return null;
-  const addonDirectory = canonicalDirectory(input, "Runtime acceptance addon directory");
-  const projects = readdirSync(addonDirectory, { withFileTypes: true })
-    .filter((entry) => entry.isFile() && entry.name.toLowerCase().endsWith(".gproj"));
-  if (projects.length !== 1) {
-    throw new Error("Runtime acceptance addon directory must contain exactly one .gproj file");
-  }
-  const gprojPath = canonicalFile(join(addonDirectory, projects[0].name), "Runtime acceptance .gproj");
-  const source = readFileSync(gprojPath, "utf8");
-  const addonId = parseGprojValue(source, "ID");
-  const addonGuid = parseGprojValue(source, "GUID");
-  if (!addonId || !/^[A-Za-z0-9._-]{1,128}$/.test(addonId)) {
-    throw new Error("Runtime acceptance .gproj has no bounded addon ID");
-  }
-  if (!addonGuid || !/^[A-Fa-f0-9]{16}$/.test(addonGuid)) {
-    throw new Error("Runtime acceptance .gproj has no 16-hex addon GUID");
-  }
-  return {
-    addonDirectory,
-    addonSearchRoot: canonicalDirectory(dirname(addonDirectory), "Runtime acceptance addon search root"),
-    addonId,
-    addonGuid: addonGuid.toUpperCase(),
-    gprojPath,
-  };
-}
-
-function findRuntimeExecutable(explicit: string | undefined): string {
-  if (explicit) return canonicalFile(explicit, "Arma Reforger graphical runtime executable");
-  const gameRoot = canonicalDirectory(loadConfig().gamePath, "Arma Reforger game directory");
-  const candidates = [
-    join(gameRoot, "ArmaReforgerSteamDiag.exe"),
-    join(gameRoot, "ArmaReforgerDiag.exe"),
-  ];
-  const candidate = candidates.find((path) => existsSync(path));
-  if (!candidate) {
-    throw new Error(
-      "No graphical Diag runtime executable was found; provide --executable explicitly"
-    );
-  }
-  return canonicalFile(candidate, "Arma Reforger graphical Diag executable");
 }
 
 function validatePosition(position: Vector3, label: string): void {
@@ -376,132 +230,6 @@ function validateLookAt(
     throw new Error("Runtime acceptance look-at FOV must be from 10 through 120 degrees");
   }
   return { kind: "lookAt", position: [...position], target: [...target], fov };
-}
-
-function launchArguments(
-  worldResource: string,
-  fixture: AddonFixture | null,
-  additional: string[] | undefined
-): string[] {
-  const result = [
-    "-window",
-    "-screenWidth", "1280",
-    "-screenHeight", "720",
-    "-noSplash",
-    "-noThrow",
-    "-disableCrashReporter",
-    "-server", worldResource,
-  ];
-  if (fixture) {
-    result.push("-addonsDir", fixture.addonSearchRoot, "-addons", fixture.addonGuid);
-  }
-  for (const token of additional ?? []) {
-    if (typeof token !== "string" || token.length < 1 || token.length > 8_192 || /[\0\r\n]/.test(token)) {
-      throw new Error("Additional runtime launch arguments must be bounded argument tokens");
-    }
-    result.push(token);
-  }
-  return result;
-}
-
-export function captureMatrix(
-  metadata: Record<string, unknown>,
-  label: string
-): RuntimeCameraMatrix {
-  const actualCamera = record(metadata.actualCamera, `${label} actual camera`);
-  const matrix = actualCamera.matrix;
-  if (!Array.isArray(matrix) || matrix.length !== 16 || matrix.some((value) =>
-    typeof value !== "number" || !Number.isFinite(value))) {
-    throw new Error(`${label} has no finite flat row-major 4x4 actual camera matrix`);
-  }
-  return matrix as RuntimeCameraMatrix;
-}
-
-export function assertMatrixClose(
-  expected: RuntimeCameraMatrix,
-  actual: RuntimeCameraMatrix,
-  tolerance: number,
-  label: string
-): void {
-  for (let index = 0; index < 16; index += 1) {
-    if (Math.abs(expected[index] - actual[index]) > tolerance) {
-      throw new Error(
-        `${label} differs at matrix[${index}]: ` +
-        `${expected[index]} != ${actual[index]}`
-      );
-    }
-  }
-}
-
-export function runtimePoseMatrix(
-  view: Extract<ObserverCaptureView, { kind: "pose" }>
-): RuntimeCameraMatrix {
-  let [x, y, z, w] = view.orientation;
-  const length = Math.hypot(x, y, z, w);
-  if (!Number.isFinite(length) || length < 0.000001) {
-    throw new Error("Runtime pose orientation is not a finite non-zero quaternion");
-  }
-  x /= length;
-  y /= length;
-  z /= length;
-  w /= length;
-  // Math3D.QuatToMatrix exposes Enfusion transform basis vectors as rows.
-  // That is the transpose of the conventional row-major quaternion matrix.
-  return [
-    1 - 2 * (y * y + z * z), 2 * (x * y + z * w), 2 * (x * z - y * w), 0,
-    2 * (x * y - z * w), 1 - 2 * (x * x + z * z), 2 * (y * z + x * w), 0,
-    2 * (x * z + y * w), 2 * (y * z - x * w), 1 - 2 * (x * x + y * y), 0,
-    view.position[0], view.position[1], view.position[2], 1,
-  ];
-}
-
-export function assertRequestedPoseRendered(
-  metadata: Record<string, unknown>,
-  view: Extract<ObserverCaptureView, { kind: "pose" }>,
-  matrixTolerance = 0.05,
-  fovTolerance = 0.05
-): RuntimeCameraMatrix {
-  if (!isDeepStrictEqual(metadata.requestedView, view)) {
-    throw new Error("Explicit pose metadata does not preserve the exact requested view");
-  }
-  const actual = captureMatrix(metadata, "Explicit pose capture");
-  assertMatrixClose(runtimePoseMatrix(view), actual, matrixTolerance, "Explicit pose rendered matrix");
-  if (typeof metadata.actualFov !== "number" ||
-      Math.abs(metadata.actualFov - view.fov) > fovTolerance) {
-    throw new Error("Explicit pose rendered FOV differs from the requested FOV");
-  }
-  return actual;
-}
-
-export function assertCurrentViewReleasedFromDisplaced(
-  displaced: RuntimeCameraMatrix,
-  current: RuntimeCameraMatrix,
-  minimumPositionDistance = 5
-): number {
-  const positionDistance = Math.hypot(
-    displaced[12] - current[12],
-    displaced[13] - current[13],
-    displaced[14] - current[14]
-  );
-  if (!Number.isFinite(positionDistance) || positionDistance < minimumPositionDistance) {
-    throw new Error(
-      `Post-restoration current camera remains at the displaced position ` +
-      `(distance ${positionDistance.toFixed(3)}m)`
-    );
-  }
-  return positionDistance;
-}
-
-export function recordRestorationImageSimilarity(
-  comparison: PngComparisonEvidence
-): RuntimeRestorationImageDiagnostic {
-  return {
-    acceptanceRole: "diagnostic-only",
-    reason:
-      "A live current camera may move or rotate naturally between captures; " +
-      "acceptance relies on lease restoration and release from the displaced pose.",
-    comparison,
-  };
 }
 
 function validateCapture(
@@ -805,6 +533,10 @@ export async function runRuntimeObserverAcceptance(
   options: RuntimeObserverAcceptanceOptions
 ): Promise<RuntimeObserverAcceptanceResult> {
   assertLiveRuntimeObserverAuthorized(options.confirmed, options.environment);
+  const phaseOneFaultCases = resolveFaultMatrixCases(OBSERVER_FAULT_MATRIX, options.only);
+  if (phaseOneFaultCases.length > 0) {
+    throw new Error("Runtime fault-matrix execution is not enabled until the Phase 2 fixture bridge is installed");
+  }
   const timeoutMs = options.timeoutMs ?? 300_000;
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 60_000 || timeoutMs > 900_000) {
     throw new Error("Live runtime observer timeout must be 60000..900000 ms");
@@ -921,6 +653,7 @@ export async function runRuntimeObserverAcceptance(
   let runtimeId: string | null = null;
   let sessionId: string | null = null;
   let managedRunId: string | null = null;
+  let faultScaffolding: ReturnType<typeof createFaultMatrixRunScaffolding> | null = null;
   let finalized = false;
   let evidenceDirectory = "";
   let baselinePath = "";
@@ -950,12 +683,13 @@ export async function runRuntimeObserverAcceptance(
     if (!prepared.preparedLaunchId) {
       throw new Error("Observer launch preparation returned no owned-runtime handle");
     }
+    const preparedLaunchId = prepared.preparedLaunchId;
     baselineLaunchArguments = operationalBaselineLaunchArgumentIdentity([
       ...prepared.arguments,
       "-reforgerForgeOwnerToken=<redacted>",
     ]);
     summary.preparedLaunch = {
-      preparedLaunchId: prepared.preparedLaunchId,
+      preparedLaunchId,
       sessionId,
       expiresAt: prepared.expiresAt,
       bundleDigest: prepared.bundleDigest,
@@ -970,7 +704,7 @@ export async function runRuntimeObserverAcceptance(
       "OwnedRuntimeManager.start/status(running)",
       async () => {
         const startedRuntime = await runtimeManager.start({
-          preparedLaunchId: prepared.preparedLaunchId,
+          preparedLaunchId,
           idempotencyKey: `runtime-start-${randomUUID()}`,
         });
         runtimeId = startedRuntime.runtimeId;
@@ -996,12 +730,46 @@ export async function runRuntimeObserverAcceptance(
     summary.runtimeStart = startedRuntime;
     summary.ownedRuntimePid = startedRuntime.pid;
     summary.runtimeStatus = runningRuntime;
+    const runtimeLifecycle = await runtimeManager.lifecycleIdentity(startedRuntime.runtimeId);
+    const fixtureContentIdentity = baselineFixtureContent?.sha256 ?? operationalBaselineProcedureSha256({ fixture: "no-generated-addon" });
+    const generatedProjectIdentity = operationalBaselineProcedureSha256({
+      preparedLaunchId,
+      bundleDigest: prepared.bundleDigest,
+    });
+    const generatedAddonIdentity = fixture?.addonGuid ?? operationalBaselineProcedureSha256({ addon: "no-generated-addon" });
+    const faultBinding = Object.freeze({
+      fixtureId: fixture?.addonGuid ?? fixture?.addonId ?? "runtime-generated-fixture",
+      lifecycleId: runtimeLifecycle.runtimeId,
+      lifecycleGeneration: runtimeLifecycle.generation,
+    });
+    faultScaffolding = createFaultMatrixRunScaffolding({
+      runRoot: runDirectory,
+      controlRoot: join(runDirectory, "fault-control"),
+      matrix: OBSERVER_FAULT_MATRIX,
+      bootstrap: {
+        schemaVersion: 1,
+        runId: managedRunId!,
+        backend: "runtime",
+        capability: randomUUID(),
+        fixtureContentIdentity,
+        generatedProjectIdentity,
+        generatedAddonIdentity,
+        binding: faultBinding,
+      },
+      clock: systemClock,
+      sleeper: systemSleeper,
+      readLifecycleBinding: () => faultBinding,
+      onCleanup: () => {
+        if (faultScaffolding) removeOwnedFaultControlRoot(faultScaffolding.controlRoot);
+      },
+    });
+    summary.faultMatrixControl = { configured: true, declaredCaseCount: phaseOneFaultCases.length };
     const remainingForInventory = Math.max(1_000, deadline - Date.now());
     const inventory = await baseline.measure(
       "managed_call",
       "ObserverApplication.instances(renderersOnly)",
       () => application.instances({
-        sessionId,
+        sessionId: sessionId ?? undefined,
         requiredCapabilities: ["render.capture", "camera.runtime"],
         renderersOnly: true,
         waitMs: remainingForInventory,
@@ -1248,6 +1016,15 @@ export async function runRuntimeObserverAcceptance(
       ? { name: error.name, message: error.message }
       : String(error);
   } finally {
+    if (faultScaffolding) {
+      try {
+        await faultScaffolding.scheduler.finishCase();
+      } catch (error) {
+        failure ??= error;
+        summary.status = "failed";
+        summary.faultMatrixControl = error instanceof Error ? error.message : String(error);
+      }
+    }
     if (!finalized && managedRunId) {
       let safeToDiscard = sessionId === null;
       if (sessionId) {
@@ -1275,6 +1052,7 @@ export async function runRuntimeObserverAcceptance(
     }
     let exactRuntimeVacancy = runtimeId === null;
     if (runtimeId) {
+      const ownedRuntimeId = runtimeId;
       const terminationSpan = baseline.start(
         "shutdown",
         "OwnedRuntimeManager.stop",
@@ -1323,7 +1101,7 @@ export async function runRuntimeObserverAcceptance(
         const vacantRuntime = await baseline.measure(
           "managed_call",
           "OwnedRuntimeManager.status(after stop)",
-          () => runtimeManager.status(runtimeId),
+          () => runtimeManager.status(ownedRuntimeId),
           "shutdown_status_confirmation"
         );
         summary.runtimeVacancy = vacantRuntime;
@@ -1356,12 +1134,13 @@ export async function runRuntimeObserverAcceptance(
       }
     }
     if (sessionId) {
+      const confirmedSessionId = sessionId;
       if (exactRuntimeVacancy) {
         try {
           summary.sessionRevoke = await baseline.measure(
             "shutdown",
             "ObserverApplication.revokeSession",
-            () => application.revokeSession(sessionId),
+            () => application.revokeSession(confirmedSessionId),
             "observer_cleanup_confirmation"
           );
         } catch (error) {
@@ -1576,6 +1355,13 @@ function usage(): string {
     "       [--look-at-position <x,y,z>] [--look-at-target <x,y,z>] [--look-at-fov <degrees>]",
     "       [--marker-rgb <r,g,b>] [--marker-roi <x,y,width,height>]",
     "",
+    "Fault-matrix mode:",
+    "  npm run dev:observer:acceptance:runtime -- --only <case-id> --confirm-live-run",
+    "       [--keep-profile] [--executable <file>] [--artifact-root <directory>] [--validation-root <directory>]",
+    "  npm run dev:observer:acceptance:runtime -- --list-cases",
+    "Matrix mode always creates and validates its own disposable fixture; it rejects --addon-dir.",
+    "--keep-profile is valid only together with --only, and only preserves scratch on a failed case.",
+    "",
     `Required environment: ${LIVE_RUNTIME_OBSERVER_ENVIRONMENT}=1`,
     `Default world: ${DEFAULT_RUNTIME_OBSERVER_WORLD}`,
     "The default is an installed stock fixture; all harness roots are external to the current project.",
@@ -1583,49 +1369,87 @@ function usage(): string {
   ].join("\n");
 }
 
-if (process.argv[1] && resolve(process.argv[1]) === resolve(SCRIPT_PATH)) {
+async function runCli(): Promise<void> {
   if (process.argv.includes("--help") || process.argv.includes("-h")) {
     process.stdout.write(usage());
-  } else {
-    try {
-      const environment = process.env;
-      const worldResource = readOption("--world") ?? environment.RFO_RUNTIME_OBSERVER_WORLD;
-      const posePosition = readOption("--pose-position") ?? environment.RFO_RUNTIME_OBSERVER_POSE_POSITION;
-      const poseOrientation = readOption("--pose-orientation") ?? environment.RFO_RUNTIME_OBSERVER_POSE_ORIENTATION;
-      const poseFov = readOption("--pose-fov") ?? environment.RFO_RUNTIME_OBSERVER_POSE_FOV;
-      const lookAtPosition = readOption("--look-at-position") ?? environment.RFO_RUNTIME_OBSERVER_LOOK_AT_POSITION;
-      const lookAtTarget = readOption("--look-at-target") ?? environment.RFO_RUNTIME_OBSERVER_LOOK_AT_TARGET;
-      const lookAtFov = readOption("--look-at-fov") ?? environment.RFO_RUNTIME_OBSERVER_LOOK_AT_FOV;
-      const timeout = readOption("--timeout-ms") ?? environment.RFO_RUNTIME_OBSERVER_TIMEOUT_MS;
-      const result = await runRuntimeObserverAcceptance({
-        confirmed: process.argv.includes("--confirm-live-run"),
-        environment,
-        worldResource,
-        addonDirectory: readOption("--addon-dir") ?? environment.RFO_RUNTIME_OBSERVER_ADDON_DIR,
-        executablePath: readOption("--executable") ?? environment.RFO_RUNTIME_OBSERVER_EXECUTABLE,
-        artifactRoot: readOption("--artifact-root") ?? environment.RFO_RUNTIME_OBSERVER_ARTIFACT_ROOT,
-        validationRoot: readOption("--validation-root"),
-        timeoutMs: timeout ? Number(timeout) : undefined,
-        launchArguments: readOptions("--launch-arg"),
-        posePosition: posePosition ? parseVector3(posePosition, "Pose position") : undefined,
-        poseOrientation: poseOrientation
-          ? parseQuaternion(poseOrientation, "Pose orientation")
-          : undefined,
-        poseFov: poseFov ? Number(poseFov) : undefined,
-        lookAtPosition: lookAtPosition ? parseVector3(lookAtPosition, "Look-at position") : undefined,
-        lookAtTarget: lookAtTarget ? parseVector3(lookAtTarget, "Look-at target") : undefined,
-        lookAtFov: lookAtFov ? Number(lookAtFov) : undefined,
-        marker: parseMarker(environment),
-      });
-      process.stdout.write(
-        `Runtime observer acceptance passed.\n` +
-        `RFO_RUNTIME_OBSERVER_ACCEPTANCE_RESULT=${result.summaryPath}\n` +
-        `RFO_RUNTIME_OBSERVER_EVIDENCE=${result.evidenceDirectory}\n` +
-        `RFO_RUNTIME_OPERATIONAL_BASELINE=${result.baselinePath}\n`
-      );
-    } catch (error) {
-      process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
-      process.exitCode = 1;
+    return;
+  }
+  if (process.argv.includes("--list-cases")) {
+    for (const item of OBSERVER_FAULT_MATRIX.cases) {
+      if (item.backend === "runtime") process.stdout.write(`${item.id}\n`);
     }
+    return;
+  }
+  const environment = process.env;
+  const only = readOption("--only");
+  const keepProfile = process.argv.includes("--keep-profile");
+  if (keepProfile && !only) {
+    throw new Error("--keep-profile is valid only together with --only");
+  }
+  if (only !== undefined) {
+    const addonDir = readOption("--addon-dir") ?? environment.RFO_RUNTIME_OBSERVER_ADDON_DIR;
+    if (addonDir) {
+      throw new Error("--only (fault-matrix mode) rejects a user-selected --addon-dir; it always creates its own fixture");
+    }
+    const result = await runRuntimeFailureMatrix({
+      confirmed: process.argv.includes("--confirm-live-run"),
+      environment,
+      worldResource: readOption("--world") ?? environment.RFO_RUNTIME_OBSERVER_WORLD,
+      executablePath: readOption("--executable") ?? environment.RFO_RUNTIME_OBSERVER_EXECUTABLE,
+      artifactRoot: readOption("--artifact-root") ?? environment.RFO_RUNTIME_OBSERVER_ARTIFACT_ROOT,
+      validationRoot: readOption("--validation-root"),
+      launchArguments: readOptions("--launch-arg"),
+      only,
+      keepProfile,
+    });
+    process.stdout.write(
+      `Runtime failure-matrix case passed.\n` +
+      `RFO_RUNTIME_FAILURE_MATRIX_JSON=${result.jsonPath}\n` +
+      `RFO_RUNTIME_FAILURE_MATRIX_MARKDOWN=${result.markdownPath}\n`
+    );
+    return;
+  }
+  const worldResource = readOption("--world") ?? environment.RFO_RUNTIME_OBSERVER_WORLD;
+  const posePosition = readOption("--pose-position") ?? environment.RFO_RUNTIME_OBSERVER_POSE_POSITION;
+  const poseOrientation = readOption("--pose-orientation") ?? environment.RFO_RUNTIME_OBSERVER_POSE_ORIENTATION;
+  const poseFov = readOption("--pose-fov") ?? environment.RFO_RUNTIME_OBSERVER_POSE_FOV;
+  const lookAtPosition = readOption("--look-at-position") ?? environment.RFO_RUNTIME_OBSERVER_LOOK_AT_POSITION;
+  const lookAtTarget = readOption("--look-at-target") ?? environment.RFO_RUNTIME_OBSERVER_LOOK_AT_TARGET;
+  const lookAtFov = readOption("--look-at-fov") ?? environment.RFO_RUNTIME_OBSERVER_LOOK_AT_FOV;
+  const timeout = readOption("--timeout-ms") ?? environment.RFO_RUNTIME_OBSERVER_TIMEOUT_MS;
+  const result = await runRuntimeObserverAcceptance({
+    confirmed: process.argv.includes("--confirm-live-run"),
+    environment,
+    worldResource,
+    addonDirectory: readOption("--addon-dir") ?? environment.RFO_RUNTIME_OBSERVER_ADDON_DIR,
+    executablePath: readOption("--executable") ?? environment.RFO_RUNTIME_OBSERVER_EXECUTABLE,
+    artifactRoot: readOption("--artifact-root") ?? environment.RFO_RUNTIME_OBSERVER_ARTIFACT_ROOT,
+    validationRoot: readOption("--validation-root"),
+    timeoutMs: timeout ? Number(timeout) : undefined,
+    launchArguments: readOptions("--launch-arg"),
+    posePosition: posePosition ? parseVector3(posePosition, "Pose position") : undefined,
+    poseOrientation: poseOrientation
+      ? parseQuaternion(poseOrientation, "Pose orientation")
+      : undefined,
+    poseFov: poseFov ? Number(poseFov) : undefined,
+    lookAtPosition: lookAtPosition ? parseVector3(lookAtPosition, "Look-at position") : undefined,
+    lookAtTarget: lookAtTarget ? parseVector3(lookAtTarget, "Look-at target") : undefined,
+    lookAtFov: lookAtFov ? Number(lookAtFov) : undefined,
+    marker: parseMarker(environment),
+  });
+  process.stdout.write(
+    `Runtime observer acceptance passed.\n` +
+    `RFO_RUNTIME_OBSERVER_ACCEPTANCE_RESULT=${result.summaryPath}\n` +
+    `RFO_RUNTIME_OBSERVER_EVIDENCE=${result.evidenceDirectory}\n` +
+    `RFO_RUNTIME_OPERATIONAL_BASELINE=${result.baselinePath}\n`
+  );
+}
+
+if (process.argv[1] && resolve(process.argv[1]) === resolve(SCRIPT_PATH)) {
+  try {
+    await runCli();
+  } catch (error) {
+    process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
+    process.exitCode = 1;
   }
 }

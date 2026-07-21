@@ -786,7 +786,7 @@ describe("standalone Workbench lifecycle runner", () => {
       validationFailure: null,
       exitStatus: { reason: "exited", exitCode: 0, timedOut: false },
     });
-    expect(receipt.output?.freshBytes).toBeGreaterThan(0);
+    expect(receipt.intent === "build" && receipt.output?.freshBytes).toBeGreaterThan(0);
     expect(journalPhases).toEqual([
       "runner_companion_preflight:pre_spawn",
       "runner_companion_preflight:spawned_unverified",
@@ -1275,7 +1275,7 @@ describe("standalone Workbench lifecycle runner", () => {
       timeoutMs: 1_000,
     }, runnerDependencies(harness, spawner.spawnProcess));
 
-    expect(receipt.output).toBeNull();
+    expect(receipt.intent === "build" && receipt.output).toBeNull();
     expect(receipt.intent === "build" && receipt.validationFailure).toMatchObject({
       code: "OUTPUT_ATTESTATION_FAILED",
     });
@@ -1302,7 +1302,7 @@ describe("standalone Workbench lifecycle runner", () => {
       timeoutMs: 1_000,
     }, runnerDependencies(harness, spawner.spawnProcess));
 
-    expect(receipt.output).toBeNull();
+    expect(receipt.intent === "build" && receipt.output).toBeNull();
     expect(receipt.intent === "build" && receipt.validationFailure?.message)
       .toMatch(/exactly one regular resourceDatabase\.rdb; found 2/i);
   });
@@ -1333,7 +1333,7 @@ describe("standalone Workbench lifecycle runner", () => {
       timeoutMs: 1_000,
     }, runnerDependencies(harness, spawner.spawnProcess));
 
-    expect(receipt.output).toBeNull();
+    expect(receipt.intent === "build" && receipt.output).toBeNull();
     expect(receipt.intent === "build" && receipt.validationFailure).toMatchObject({
       code: "OUTPUT_ATTESTATION_FAILED",
     });

@@ -645,7 +645,7 @@ describe("live observer acceptance support", () => {
     };
     expect(() => buildOperationalBaselineArtifact({
       ...base,
-      workload: { ...base.workload, privatePath: "C:\\Users\\private-user" },
+      workload: { ...base.workload, privatePath: "C:\\Users\\private-user" } as typeof base.workload,
     })).toThrow(/unexpected or missing fields/);
     expect(() => buildOperationalBaselineArtifact({
       ...base,

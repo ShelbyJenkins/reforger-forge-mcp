@@ -1390,6 +1390,21 @@ export class WorkbenchSessionController {
     return this.childSupervisor.counts();
   }
 
+  /** Return the exact lifecycle lease and generation for the running target. */
+  async lifecycleIdentity(): Promise<{ readonly lifecycleId: string; readonly generation: string }> {
+    const read = await this.processGuard.readLifecycleState();
+    if (read.kind !== "valid" || read.state.phase !== "running" || !read.state.mcpOwner || !read.state.workbench) {
+      throw new WorkbenchError(
+        "Workbench lifecycle is not currently running with an exact owner.",
+        "STATE_INVALID"
+      );
+    }
+    return Object.freeze({
+      lifecycleId: read.state.mcpOwner.leaseId,
+      generation: read.state.generation,
+    });
+  }
+
   async ensureRunning(gprojPath?: string): Promise<WorkbenchLaunchResult> {
     this.requireConfig("auto-launch");
     const project = await this.resolveLifecycleProject(gprojPath);

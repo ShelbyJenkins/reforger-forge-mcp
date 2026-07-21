@@ -17,7 +17,6 @@ import {
   closeObserverRuntimeLifecycle,
   OwnedRuntimeManager,
   type OwnedRuntimeLifecycleAuthority,
-  type OwnedRuntimeExactIdentity,
   type OwnedRuntimeInspection,
   type OwnedRuntimeObserverGate,
   type OwnedRuntimeProcessBackend,
@@ -44,7 +43,7 @@ import { ManualTime } from "../support/manual-time.js";
 interface FakeProcess extends FakeExactProcessRecord {}
 
 type FakeBackend = FakeExactProcessBackend<FakeProcess> & OwnedRuntimeProcessBackend & {
-  readonly terminateCalls: FakeExactProcessBackend<FakeProcess>["terminationCalls"];
+  terminateCalls: FakeExactProcessBackend<FakeProcess>["terminationCalls"];
   currentCreation: string;
   currentUserSid: string;
   refuseTermination: boolean;
@@ -63,7 +62,7 @@ function createFakeBackend(): FakeBackend {
     userSid: backend.currentUserSid,
   });
   const verifyExactAndTerminate = backend.verifyAndTerminate.bind(backend);
-  backend.verifyAndTerminate = async (expected, timeoutMs) => {
+  backend.verifyAndTerminate = async (expected, timeoutMs?: number) => {
     const previous = backend.terminationResult;
     if (backend.refuseTermination) {
       backend.terminationResult = {
@@ -82,7 +81,7 @@ function createFakeBackend(): FakeBackend {
 }
 
 type QueuedBackend = FakeBackend & {
-  readonly firstEntryBlocked: Promise<void>;
+  firstEntryBlocked: Promise<void>;
   allowFirstEntry(): void;
 };
 
@@ -92,7 +91,7 @@ function createQueuedBackend(): QueuedBackend {
   let entryCount = 0;
   let markFirstEntryBlocked!: () => void;
   let releaseFirstEntry!: () => void;
-  backend.firstEntryBlocked = new Promise((resolve) => { markFirstEntryBlocked = resolve; });
+  backend.firstEntryBlocked = new Promise<void>((resolve) => { markFirstEntryBlocked = resolve; });
   const firstEntryRelease = new Promise<void>((resolve) => { releaseFirstEntry = resolve; });
   backend.allowFirstEntry = () => releaseFirstEntry();
   backend.withMachineMutex = async (args) => {
@@ -221,7 +220,7 @@ function createLeaseLosingBackend(): LeaseLosingBackend {
     return result;
   };
   const verifyExactAndTerminate = backend.verifyAndTerminate.bind(backend);
-  backend.verifyAndTerminate = async (expected, timeoutMs) => {
+  backend.verifyAndTerminate = async (expected, timeoutMs?: number) => {
     const result = await verifyExactAndTerminate(expected, timeoutMs);
     if (backend.loseAfterTermination && activeLeaseLoss) {
       backend.loseAfterTermination = false;
@@ -1766,7 +1765,7 @@ describe("OwnedRuntimeManager", () => {
     await didCallPreflight;
     let contenderEntered = false;
     await expect(Promise.race([
-      backend.withMachineMutex({ action: async () => { contenderEntered = true; } })
+      backend.withMachineMutex({ name: "contender", timeoutMs: 1_000, action: async () => { contenderEntered = true; } })
         .then(() => "entered" as const),
       new Promise<"timed_out">((resolve) => setTimeout(() => resolve("timed_out"), 100)),
     ])).resolves.toBe("entered");
@@ -1803,7 +1802,7 @@ describe("OwnedRuntimeManager", () => {
     expect(recordExists(value.manager, "stops", started.runtimeId)).toBe(true);
     expect(recordExists(value.manager, "stop-completions", started.runtimeId)).toBe(false);
     await expect(Promise.race([
-      backend.withMachineMutex({ action: async () => "entered" as const }),
+      backend.withMachineMutex({ name: "contender", timeoutMs: 1_000, action: async () => "entered" as const }),
       new Promise<"timed_out">((resolve) => setTimeout(() => resolve("timed_out"), 100)),
     ])).resolves.toBe("entered");
 

@@ -1412,6 +1412,21 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
     }
   }
 
+  /** Return the exact durable lifecycle identity for a currently owned runtime. */
+  async lifecycleIdentity(runtimeId: string): Promise<OwnedRuntimeLifecycleIdentity> {
+    runtimeIdSchema.parse(runtimeId);
+    const receipt = this.readRuntimeReceipt(runtimeId);
+    await this.reconcileRuntimeLifecycleLease(receipt);
+    const status = await this.inspectReceipt(receipt);
+    if (status.state !== "running" || status.exactOwned !== true) {
+      throw new OwnedRuntimeError("LIFECYCLE_UNAVAILABLE", "Owned runtime lifecycle is not currently running and exact-owned");
+    }
+    return Object.freeze({
+      runtimeId: receipt.runtimeId,
+      generation: runtimeLifecycleGeneration(receipt),
+    });
+  }
+
   /** Bounded diagnostic used by lifecycle reconciliation tests and health output. */
   diagnosticSupervisedChildCount(): number {
     return this.children.counts().active;

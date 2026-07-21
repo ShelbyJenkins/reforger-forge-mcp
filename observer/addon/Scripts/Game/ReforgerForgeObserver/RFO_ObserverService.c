@@ -412,6 +412,39 @@ class RFO_ObserverService
 		return "client";
 	}
 
+	// Fault-matrix acceptance hook boundary. Each pauses only the local job
+	// state machine at one canonical lease phase; the frame loop, transport,
+	// cancellation handling, and any fixture control inbox continue normally.
+	// The default implementation always returns true, so production behavior
+	// is unchanged when no fixture add-on overrides it. A disposable
+	// acceptance fixture may override these through a modded class to prove
+	// fault-injection behavior against a real runtime. They are not part of
+	// the public observer protocol or any production add-on capability.
+	protected event bool OnBeforeLeaseBarrier(RFO_ObserverJob job)
+	{
+		return true;
+	}
+
+	protected event bool OnLeaseAcquiredBarrier(RFO_ObserverJob job)
+	{
+		return true;
+	}
+
+	protected event bool OnCaptureInProgressBarrier(RFO_ObserverJob job)
+	{
+		return true;
+	}
+
+	protected event bool OnRestorationInProgressBarrier(RFO_ObserverJob job)
+	{
+		return true;
+	}
+
+	protected event bool OnTerminalReleaseBarrier(RFO_ObserverJob job)
+	{
+		return true;
+	}
+
 	protected void ProcessActiveJob(BaseWorld world)
 	{
 		RFO_ObserverJob job = m_RFO_ActiveJob;
@@ -489,6 +522,8 @@ class RFO_ObserverService
 				}
 				break;
 			case RFO_ObserverJobState.ACQUIRING_CAMERA:
+				if (!OnLeaseAcquiredBarrier(job))
+					break;
 				job.state = RFO_ObserverJobState.POSITIONING;
 				PublishStatus();
 				break;
@@ -543,6 +578,8 @@ class RFO_ObserverService
 
 	protected void AcquireCamera(BaseWorld world)
 	{
+		if (!OnBeforeLeaseBarrier(m_RFO_ActiveJob))
+			return;
 		vector matrix[4];
 		bool built;
 		if (m_RFO_ActiveJob.viewKind == "pose")
@@ -611,6 +648,8 @@ class RFO_ObserverService
 	protected void AdvanceCapture(BaseWorld world)
 	{
 		RFO_ObserverJob job = m_RFO_ActiveJob;
+		if (!OnCaptureInProgressBarrier(job))
+			return;
 		if (job.IsCameraView() && !m_RFO_CameraLease.MaintainRequestedView(job.jobId))
 		{
 			RecordFailure(RFO_ObserverProtocol.ERROR_CAMERA_OWNERSHIP_LOST, "Observer camera ownership changed before screenshot issuance", false);
@@ -654,6 +693,8 @@ class RFO_ObserverService
 	protected void AdvanceRestoration(BaseWorld world)
 	{
 		RFO_ObserverJob job = m_RFO_ActiveJob;
+		if (!OnRestorationInProgressBarrier(job))
+			return;
 		if (!job.restorationConfirmed && m_RFO_CameraLease.HasOutstandingLease())
 		{
 			job.restorationAttempted = true;
@@ -689,6 +730,8 @@ class RFO_ObserverService
 			PublishStatus();
 			return;
 		}
+		if (!OnTerminalReleaseBarrier(job))
+			return;
 		if (!job.terminalErrorCode.IsEmpty())
 		{
 			if (job.terminalErrorCode == RFO_ObserverProtocol.ERROR_CANCELLED)
