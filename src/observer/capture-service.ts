@@ -468,7 +468,13 @@ export class CaptureService {
         const job = await this.refresh(record, this.operationDeadline());
         if (job.state === "completed") {
           const current = this.store.getById(jobId)!;
-          if (current.runCompleted || current.lastBackendJob.managedArtifactAvailable === true) {
+          // Workbench has already imported a separate managed copy, so its
+          // external handler may be released during convergence. Runtime run
+          // artifacts are the managed copy: finalize/discard retain exclusive
+          // release ownership until the durable run snapshot says it is gone.
+          const mayReleaseBackend = backend === "workbench" || runReleasedArtifact;
+          if (mayReleaseBackend &&
+              (current.runCompleted || current.lastBackendJob.managedArtifactAvailable === true)) {
             const released = await this.backends.get(backend)!.release(current.ref, this.context(this.operationDeadline()));
             this.store.update(jobId, (stored) => {
               stored.runCompleted = true;

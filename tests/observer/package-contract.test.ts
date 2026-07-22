@@ -315,7 +315,7 @@ describe("observer package and source contracts", () => {
     ]) expect(ping).toContain(field);
   });
 
-  it("packages and centrally registers the completed Phase H integration", () => {
+  it("packages and centrally registers the observer integration", () => {
     const observerSource = join(repositoryRoot, "src", "observer");
     for (const name of ["application.ts", "agent-client.ts", "capture-service.ts", "evidence-run-service.ts", "setup.ts", "launch.ts", "owned-runtime-manager.ts", "tools.ts"]) {
       expect(existsSync(join(observerSource, name))).toBe(true);

@@ -24,7 +24,10 @@ import {
   type ObserverCaptureView,
 } from "../src/observer/application.js";
 import { prepareObserverLaunch } from "../src/observer/launch.js";
-import { OwnedRuntimeManager } from "../src/observer/owned-runtime-manager.js";
+import {
+  closeObserverRuntimeLifecycle,
+  OwnedRuntimeManager,
+} from "../src/observer/owned-runtime-manager.js";
 import {
   OperationalBaselineRecorder,
   analyzePngMaterial,
@@ -359,7 +362,16 @@ function removeOwnedScratch(runDirectory: string, path: string, label: string): 
   // Refuse recursive cleanup when the owned tree contains a link or a special
   // filesystem entry. A failed acceptance then preserves it for inspection.
   listBundleFiles(canonical);
-  rmSync(canonical, { recursive: true, force: false });
+  // LMDB has closed before this point, but Windows can briefly report EPERM
+  // while releasing its memory-mapped files. Keep the cleanup exact and
+  // fail-closed, while allowing Node's bounded recursive-rm retry to bridge
+  // that post-close filesystem race.
+  rmSync(canonical, {
+    recursive: true,
+    force: false,
+    maxRetries: 10,
+    retryDelay: 100,
+  });
   if (existsSync(canonical)) throw new Error(`${label} remained after exact cleanup`);
   return { removed: true, path: canonical };
 }
@@ -1153,10 +1165,10 @@ export async function runRuntimeObserverAcceptance(
       }
     }
     try {
-      await baseline.measure(
+      summary.runtimeLifecycleShutdown = await baseline.measure(
         "shutdown",
         "ObserverApplication.close",
-        () => application.close(),
+        () => closeObserverRuntimeLifecycle(runtimeManager, application),
         "observer_process_cleanup"
       );
       summary.applicationShutdown = "complete";

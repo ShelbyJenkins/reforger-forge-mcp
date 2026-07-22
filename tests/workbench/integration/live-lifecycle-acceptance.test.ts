@@ -252,6 +252,7 @@ describe.runIf(runLive)("live exact-owner Workbench lifecycle acceptance", () =>
         console.warn("[live-lifecycle-acceptance] exact-owner cleanup refused", error);
       }
       const remaining = await guard.listWorkbenchProcesses();
+      await guard.close();
       if (remaining.length === 0) {
         rmSync(root, { recursive: true, force: true });
         rmSync(managedRoot, { recursive: true, force: true });

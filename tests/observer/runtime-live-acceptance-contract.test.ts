@@ -205,6 +205,7 @@ describe("live graphical runtime observer acceptance contract", () => {
     expect(source).toContain("await runtimeManager.start({");
     expect(source.match(/runtimeManager\.status\(/g)).toHaveLength(2);
     expect(source).toContain("await runtimeManager.stop({");
+    expect(source).toContain("closeObserverRuntimeLifecycle(runtimeManager, application)");
     expect(source).toContain("stoppedRuntime.identityVacant !== true");
     expect(source).toContain("vacantRuntime.identityVacant !== true");
     expect(source).toContain('runtimeKind: "listenServer"');
@@ -219,6 +220,10 @@ describe("live graphical runtime observer acceptance contract", () => {
     );
     expect(stopIndex).toBeGreaterThan(-1);
     expect(revokeIndex).toBeGreaterThan(stopIndex);
+    const lifecycleCloseIndex = source.indexOf(
+      "closeObserverRuntimeLifecycle(runtimeManager, application)"
+    );
+    expect(lifecycleCloseIndex).toBeGreaterThan(revokeIndex);
     expect(source).toContain("preserved because exact-process vacancy was not proven");
     expect(source).toContain('imagesReviewed: false');
     expect(source).toContain('outcome: "Unreviewed"');
@@ -240,6 +245,8 @@ describe("live graphical runtime observer acceptance contract", () => {
     expect(source).toContain("postLookAtDistanceMeters");
     expect(source).toContain('writeFileSync(imagePath, capture.image, { flag: "wx" })');
     expect(source).toContain('diagnostics: removeOwnedScratch(runDirectory, diagnosticsRoot');
+    expect(source).toContain('maxRetries: 10');
+    expect(source).toContain('retryDelay: 100');
     expect(source).toContain('"OwnedRuntimeManager.start/status(running)"');
     expect(source).toContain("stoppedRuntime.terminationComplete !== true");
     expect(source).toContain("stoppedRuntime.observerCleanupPending !== false");
@@ -304,6 +311,7 @@ describe("live graphical runtime observer acceptance contract", () => {
   it("keeps the runtime failure-matrix runner on exact owned-lifecycle shutdown with no direct process-kill path", () => {
     const source = readFileSync(resolve("scripts/observer-runtime-failure-matrix.ts"), "utf8");
     expect(source).toContain("await runtimeManager.stop({");
+    expect(source).toContain("closeObserverRuntimeLifecycle(runtimeManager, application)");
     expect(source).toContain("scheduler.finishCase()");
     expect(source).toContain("scheduler.finishCase(publicTerminal)");
     expect(source).toContain("scheduler.arm(matrixCase.id)");

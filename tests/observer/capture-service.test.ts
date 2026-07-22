@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { type BackendJob, type CaptureBackend, type CaptureInstance } from "../../src/observer/capture-contract.js";
+import {
+  type BackendJob,
+  type CaptureBackend,
+  type CaptureInstance,
+  type CaptureRunPort,
+} from "../../src/observer/capture-contract.js";
 import { CaptureService } from "../../src/observer/capture-service.js";
 import { WorkbenchCaptureBackend } from "../../src/observer/workbench-capture-backend.js";
 import { runtimeWorldRevision } from "../../src/observer/world-revision.js";
@@ -128,5 +133,62 @@ describe("CaptureService", () => {
     await service.capture({ sessionId: "session-1", idempotencyKey: "conflict", view: { kind: "current" }, asynchronous: true, timeoutMs: 1_000 });
     await expect(service.capture({ sessionId: "session-1", idempotencyKey: "conflict", view: { kind: "lookAt", position: [0, 0, 0], target: [1, 0, 0], fov: 60 }, asynchronous: true, timeoutMs: 1_000 }))
       .rejects.toMatchObject({ code: "IDEMPOTENCY_CONFLICT" });
+  });
+
+  it("defers runtime run-artifact release until the durable run records its release", async () => {
+    const fake = backend();
+    const runPort: CaptureRunPort = {
+      async reserve(input) {
+        return {
+          runId: input.runId,
+          captureLabel: input.captureLabel,
+          jobId: input.jobId,
+        };
+      },
+      async bind() {},
+      async complete() {},
+      async fail() {},
+      async assertReleaseAllowed() {},
+    };
+    const service = new CaptureService({
+      backends: [fake.backend],
+      runPort,
+      pollIntervalMs: 1,
+      sleep: async () => undefined,
+      createJobId: () => "job-run-owned",
+    });
+    const capture = {
+      captureLabel: "proof",
+      backend: "runtime",
+      sessionId: "session-1",
+      jobId: "job-run-owned",
+      instanceId: "runtime-1",
+      state: "completed",
+      artifactAvailable: true,
+    };
+
+    try {
+      await service.capture({
+        sessionId: "session-1",
+        runId: "run-1",
+        captureLabel: "proof",
+        idempotencyKey: "run-owned",
+        view: { kind: "current" },
+        timeoutMs: 1_000,
+      });
+
+      await service.convergeRun({ runId: "run-1", state: "open", captures: [capture] });
+      await service.convergeRun({ runId: "run-1", state: "finalized", captures: [capture] });
+      expect(fake.calls.filter((call) => call === "release")).toHaveLength(0);
+
+      await service.convergeRun({
+        runId: "run-1",
+        state: "finalized",
+        captures: [{ ...capture, state: "released", artifactAvailable: false }],
+      });
+      expect(fake.calls.filter((call) => call === "release")).toHaveLength(1);
+    } finally {
+      await service.close();
+    }
   });
 });

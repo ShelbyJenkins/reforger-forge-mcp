@@ -367,7 +367,18 @@ function assertNoArmaOrWorkbench(deadlineAtMs?: number): void {
   }
 }
 
-async function waitForCaptureCapability(
+export function workbenchCaptureCapabilityProbeWaitMs(
+  deadline: number,
+  now = Date.now()
+): number | null {
+  // A normal Workbench Net API inventory can take several seconds. Leave the
+  // outer poll responsive without imposing a timeout shorter than the
+  // handler's own 10-second budget.
+  if (deadline - now < 1_000) return null;
+  return Math.min(15_000, remainingWorkbenchMatrixCaptureTimeout(deadline, now));
+}
+
+export async function waitForCaptureCapability(
   application: ObserverApplication,
   deadline: number
 ): Promise<Record<string, unknown>> {
@@ -378,12 +389,16 @@ async function waitForCaptureCapability(
     deadline: deadlineAt(deadline),
     intervalMs: 1_000,
     probe: async (): Promise<Record<string, unknown> | undefined> => {
+      const waitMs = workbenchCaptureCapabilityProbeWaitMs(deadline);
+      // Preserve the last actionable inventory warning when the outer
+      // deadline has too little room for one more meaningful backend probe.
+      if (waitMs === null) return undefined;
       try {
         const inventory = await application.instances({
           renderersOnly: true,
           // Bound the backend probe itself; pollUntil cannot pre-empt an
           // outstanding probe when the outer deadline expires.
-          waitMs: Math.min(1_000, remainingWorkbenchMatrixCaptureTimeout(deadline)),
+          waitMs,
         });
         const eligible = inventory.instances.filter((instance) =>
           instance.backend === "workbench" &&

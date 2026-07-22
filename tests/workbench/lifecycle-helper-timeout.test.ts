@@ -23,7 +23,20 @@ const failStopWorkerPath = fileURLToPath(
 );
 
 afterEach(() => {
-  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+  for (const root of roots.splice(0)) {
+    // Deadline cases intentionally return as soon as the helper is killed;
+    // Windows can retain the script handle briefly while that process exits.
+    rmSync(root, {
+      recursive: true,
+      force: true,
+      // Under the full suite PowerShell shutdown can be delayed by other
+      // process-heavy tests for longer than the focused-test 500 ms window.
+      // Keep cleanup strict, but give the exact killed helper up to five
+      // seconds to release its script handle.
+      maxRetries: 100,
+      retryDelay: 50,
+    });
+  }
 });
 
 function helper(body: string): string {

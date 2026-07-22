@@ -653,11 +653,11 @@ function exactIdentityProof(
 }
 
 async function executeControllerTargetBuild(
-  context: TargetBuildRunContext
+  context: TargetBuildRunContext,
+  processGuard: WorkbenchProcessGuard
 ): Promise<TargetBuildAcceptanceRunEvidence> {
   const startedMs = Date.now();
   const deadlineMs = startedMs + context.timeoutMs;
-  const processGuard = new WorkbenchProcessGuard();
   const childSupervisor = new ChildSupervisor();
   const supervisedAtStart = childSupervisor.counts();
   let spawnCount = 0;
@@ -1002,27 +1002,38 @@ export async function runWorkbenchBuildAcceptance(
   const repositoryBefore = (dependencies.repositoryEvidence ?? repositoryAcceptanceEvidence)();
   validateRepositoryEvidence(repositoryBefore);
   const startedMs = now();
-  const executeRun = dependencies.executeRun ?? executeControllerTargetBuild;
-  const first = await executeRun({
-    sequence: 1,
-    config,
-    project,
-    target,
-    profile,
-    outputRoot: bundle.outputs[0],
-    timeoutMs,
-  });
-  validateRunEvidence(first, 1, timeoutMs);
-  const second = await executeRun({
-    sequence: 2,
-    config,
-    project,
-    target,
-    profile,
-    outputRoot: bundle.outputs[1],
-    timeoutMs,
-  });
-  validateRunEvidence(second, 2, timeoutMs);
+  // Both native builds belong to one acceptance process and therefore must
+  // reuse its lifecycle identity. A fresh guard for run two looks like a
+  // competing live MCP while run one's process-scoped lease is still valid.
+  const sharedProcessGuard = dependencies.executeRun ? null : new WorkbenchProcessGuard();
+  const executeRun = dependencies.executeRun ?? ((context: TargetBuildRunContext) =>
+    executeControllerTargetBuild(context, sharedProcessGuard!));
+  let first: TargetBuildAcceptanceRunEvidence;
+  let second: TargetBuildAcceptanceRunEvidence;
+  try {
+    first = await executeRun({
+      sequence: 1,
+      config,
+      project,
+      target,
+      profile,
+      outputRoot: bundle.outputs[0],
+      timeoutMs,
+    });
+    validateRunEvidence(first, 1, timeoutMs);
+    second = await executeRun({
+      sequence: 2,
+      config,
+      project,
+      target,
+      profile,
+      outputRoot: bundle.outputs[1],
+      timeoutMs,
+    });
+    validateRunEvidence(second, 2, timeoutMs);
+  } finally {
+    await sharedProcessGuard?.close();
+  }
   const repositoryAfter = (dependencies.repositoryEvidence ?? repositoryAcceptanceEvidence)();
   validateRepositoryEvidence(repositoryAfter);
   if (repositoryBefore.revision !== repositoryAfter.revision ||

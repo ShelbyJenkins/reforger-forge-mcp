@@ -333,6 +333,33 @@ describe("controlled target-only Workbench build acceptance", () => {
     expect(packageJson.scripts["test:stage3"]).toContain(
       "tests/workbench/server-composition.test.ts"
     );
+    for (const runnerSuite of [
+      "tests/workbench/runner-editor-lifecycle.test.ts",
+      "tests/workbench/runner-build-lifecycle.test.ts",
+      "tests/workbench/runner-build-output-attestation.test.ts",
+      "tests/workbench/runner-recovery-fencing.test.ts",
+      "tests/workbench/runner-arguments.test.ts",
+    ]) {
+      expect(packageJson.scripts["test:stage3"]).toContain(runnerSuite);
+    }
+    expect(packageJson.scripts["test:stage3"]).not.toContain(
+      "tests/workbench/runner.test.ts"
+    );
+    for (const restartOwnershipSuite of [
+      "tests/workbench/restart-ownership-net-qualification.test.ts",
+      "tests/workbench/restart-ownership-companion-maintenance.test.ts",
+      "tests/workbench/restart-ownership-launch-transactions.test.ts",
+      "tests/workbench/restart-ownership-shutdown.test.ts",
+      "tests/workbench/restart-ownership-session-qualification.test.ts",
+      "tests/workbench/restart-ownership-lease-arbitration.test.ts",
+      "tests/workbench/restart-ownership-recovery.test.ts",
+      "tests/workbench/restart-ownership-exit-reconciliation.test.ts",
+    ]) {
+      expect(packageJson.scripts["test:stage3"]).toContain(restartOwnershipSuite);
+    }
+    expect(packageJson.scripts["test:stage3"]).not.toContain(
+      "tests/workbench/restart-ownership.test.ts"
+    );
     expect(packageJson.files).not.toContain("scripts/run-workbench-build-acceptance.ts");
     expect(packageCheck).toContain('"scripts/run-workbench-build-acceptance.ts"');
   });

@@ -7,7 +7,10 @@ import {
   assertCameraMatrixClose,
   assertLiveWorkbenchObserverAuthorized,
   quaternionFromWorkbenchMatrix,
+  waitForCaptureCapability,
+  workbenchCaptureCapabilityProbeWaitMs,
 } from "../../scripts/run-workbench-observer-acceptance.js";
+import type { ObserverApplication } from "../../src/observer/application.js";
 
 function readWorkbenchAcceptanceSources(): string {
   return [
@@ -59,6 +62,30 @@ describe("live Workbench observer acceptance contract", () => {
     expect(() => assertCameraMatrixClose(baseline, drifted, 0.002)).toThrow(
       /Camera restoration mismatch/
     );
+  });
+
+  it("gives a normal Workbench capability inventory enough time to answer", async () => {
+    expect(workbenchCaptureCapabilityProbeWaitMs(60_000, 0)).toBe(15_000);
+    expect(workbenchCaptureCapabilityProbeWaitMs(4_201, 0)).toBe(4_201);
+    expect(workbenchCaptureCapabilityProbeWaitMs(999, 0)).toBeNull();
+
+    const observedWaits: number[] = [];
+    const application = {
+      instances: async ({ waitMs }: { waitMs?: number }) => {
+        observedWaits.push(waitMs ?? 0);
+        return {
+          instances: (waitMs ?? 0) >= 4_201
+            ? [{ backend: "workbench", capabilities: ["render.capture"] }]
+            : [],
+          warnings: [],
+          timedOut: false,
+        };
+      },
+    } as unknown as ObserverApplication;
+
+    await expect(waitForCaptureCapability(application, Date.now() + 60_000))
+      .resolves.toMatchObject({ backend: "workbench" });
+    expect(observedWaits).toEqual([15_000]);
   });
 
   it("uses adapter no-auto-launch calls and exact-owner cleanup without a global kill path", () => {

@@ -198,6 +198,7 @@ describe("runPilotCancellationCase", () => {
     expect(entry.publicTerminal).toEqual({ state: "cancelled", errorCode: null });
     expect(entry.camera).toBe("restored");
     expect(entry.artifact).toBe("not_created");
+    expect(entry.control).toEqual({ arrival: "arrived", action: "executed" });
     expect(entry.deadline.outcome).toBe("completed");
     expect(entry.retainedDiagnostics.length).toBeGreaterThan(0);
   });

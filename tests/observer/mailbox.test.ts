@@ -2,19 +2,16 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, unlinkSync, utimesSyn
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { MailboxTransport } from "../../observer/agent/mailbox.js";
-import { MailboxCoordinator } from "../../observer/agent/mailbox-coordinator.js";
+import { MailboxCoordinator, type MailboxCoordinatorOptions } from "../../observer/agent/mailbox-coordinator.js";
 import { ArtifactStore } from "../../observer/agent/artifacts.js";
 import { JobStore } from "../../observer/agent/jobs.js";
 import { InstanceRegistry } from "../../observer/agent/registry.js";
 import { atomicWriteFile } from "../../observer/agent/paths.js";
+import type { InstanceRegistration, JobStatus, RuntimeCommandEnvelope } from "../../observer/protocol/index.js";
 import { withTemporaryDirectory } from "../support/temporary-directory.js";
-import { createObserverSessionFixture, graphicalRegistration, observerAddonSource } from "../support/observer-fixtures.js";
+import { createObserverSessionFixture, graphicalRegistration } from "../support/observer-fixtures.js";
 
-function scopedIt(
-  name: string,
-  run: (root: string) => Promise<void> | void,
-  timeoutMs = 5_000,
-): void {
+function scopedIt(name: string, run: (root: string) => Promise<void> | void, timeoutMs = 5_000): void {
   it(name, () => withTemporaryDirectory(run, { prefix: "rfo-mailbox-" }), timeoutMs);
 }
 
@@ -22,55 +19,122 @@ function errno(code: string): NodeJS.ErrnoException {
   return Object.assign(new Error(code), { code });
 }
 
-function enforceMethod(source: string, signature: string): string {
-  const start = source.indexOf(signature);
-  if (start < 0) throw new Error(`Missing Enforce method: ${signature}`);
-  const open = source.indexOf("{", start);
-  let depth = 0;
-  for (let index = open; index < source.length; index += 1) {
-    if (source[index] === "{") depth += 1;
-    else if (source[index] === "}") {
-      depth -= 1;
-      if (depth === 0) return source.slice(start, index + 1);
-    }
-  }
-  throw new Error(`Unclosed Enforce method: ${signature}`);
+function removeUnlessBusy(isBusy: (path: string) => boolean): (path: string) => void {
+  return (path) => {
+    if (isBusy(path)) throw errno("EBUSY");
+    unlinkSync(path);
+  };
+}
+
+function createMailboxHarness(root: string) {
+  const fixture = createObserverSessionFixture({ root });
+  const registry = new InstanceRegistry(fixture.store, { clock: fixture.clock });
+  const jobs = new JobStore(fixture.store, registry, fixture.clock);
+  const artifacts = new ArtifactStore(join(root, "artifacts"), fixture.store, jobs);
+  const mailbox = new MailboxTransport(fixture.profilePath);
+  return {
+    fixture,
+    registry,
+    jobs,
+    mailbox,
+    createCoordinator: (options: MailboxCoordinatorOptions = {}) =>
+      new MailboxCoordinator(fixture.store, registry, jobs, artifacts, {
+        clock: fixture.clock,
+        ...options,
+      }),
+  };
+}
+
+type MailboxHarness = ReturnType<typeof createMailboxHarness>;
+
+function createCoordinatorHarness(root: string, options: MailboxCoordinatorOptions = {}) {
+  const harness = createMailboxHarness(root);
+  return { ...harness, coordinator: harness.createCoordinator(options) };
+}
+
+const MAILBOX_CAPABILITIES = ["render.capture", "transport.mailbox"] as const;
+
+function mailboxRegistration(harness: MailboxHarness,
+  capabilities: readonly string[] = MAILBOX_CAPABILITIES): InstanceRegistration {
+  return graphicalRegistration(harness.fixture.created, {
+    selectedTransport: "mailbox",
+    capabilities: [...capabilities],
+  });
+}
+
+function captureCommand(
+  fixture: ReturnType<typeof createObserverSessionFixture>,
+  overrides: Partial<RuntimeCommandEnvelope> = {},
+): RuntimeCommandEnvelope {
+  return {
+    protocolVersion: "1.0",
+    jobId: "job-1",
+    idempotencyKey: "capture-1",
+    deadlineAt: new Date(fixture.clock.now() + 10_000).toISOString(),
+    view: { kind: "current" },
+    settleFrames: 0,
+    performancePolicy: "evidence",
+    commandKind: "capture",
+    deliveryAttempt: 1,
+    deliveryToken: "delivery_token_1234567890",
+    deliveryLeaseExpiresAt: new Date(fixture.clock.now() + 5_000).toISOString(),
+    wireView: { position: [], orientation: [], target: [], fov: "0" },
+    ...overrides,
+  };
+}
+
+function writeIngress(mailbox: MailboxTransport, name: string,
+  body?: string | Record<string, unknown>, publish = true): string {
+  const path = join(mailbox.statusDirectory, name);
+  if (body !== undefined) writeFileSync(path, typeof body === "string" ? body : JSON.stringify(body));
+  if (publish) writeFileSync(`${path}.complete`, "ready");
+  return path;
+}
+
+function publishRegistration(
+  harness: MailboxHarness,
+  options: {
+    sequence?: number;
+    publish?: boolean;
+    capabilities?: readonly string[];
+  } = {},
+): { registration: InstanceRegistration; name: string; path: string } {
+  const registration = mailboxRegistration(harness, options.capabilities);
+  const name = `${String(options.sequence ?? 1).padStart(12, "0")}-registration-${registration.sessionId}.json`;
+  const path = writeIngress(harness.mailbox, name, {
+    ...registration,
+    sessionToken: harness.fixture.created.contract.sessionToken,
+  }, options.publish);
+  return { registration, name, path };
+}
+
+function statusEnvelope(fixture: MailboxHarness["fixture"],
+  overrides: Partial<JobStatus> = {}): JobStatus {
+  return {
+    protocolVersion: "1.0", sessionId: fixture.created.contract.sessionId, instanceId: "instance-1",
+    instanceNonce: "instance_nonce_123456789012345678901234",
+    jobId: "job-1", sequence: 0, state: "accepted", worldId: "world-1", worldEpoch: 1,
+    timestamp: new Date(fixture.clock.now()).toISOString(),
+    cameraLease: { held: false, restorationConfirmed: false },
+    ...overrides,
+  };
+}
+
+function expectIngressRemoved(mailbox: MailboxTransport, name: string): void {
+  expect(existsSync(join(mailbox.statusDirectory, name))).toBe(false);
+  expect(existsSync(join(mailbox.statusDirectory, `${name}.complete`))).toBe(false);
 }
 
 describe("observer mailbox", () => {
   scopedIt("writes generated ordered commands and reads status in sequence order", (root) => {
     const fixture = createObserverSessionFixture({ root });
     const mailbox = new MailboxTransport(fixture.profilePath);
-    const command = {
-      protocolVersion: "1.0" as const,
-      jobId: "job-1",
-      idempotencyKey: "capture-1",
-      deadlineAt: new Date(fixture.clock.now() + 10_000).toISOString(),
-      view: { kind: "current" as const },
-      settleFrames: 0,
-      performancePolicy: "evidence" as const,
-      commandKind: "capture" as const,
-      deliveryAttempt: 1,
-      deliveryToken: "delivery_token_1234567890",
-      deliveryLeaseExpiresAt: new Date(fixture.clock.now() + 5_000).toISOString(),
-      wireView: { position: [], orientation: [], target: [], fov: "0" },
-    };
+    const command = captureCommand(fixture);
     const commandPath = mailbox.writeCommand(command);
     expect(commandPath).toMatch(/000000000001-capture-job-1-1\.json$/);
     expect(mailbox.writeCommand(command)).toBe(commandPath);
     expect(mailbox.stats()).toMatchObject({ commandFiles: 1, cachedPublications: 1 });
-    const base = {
-      protocolVersion: "1.0",
-      sessionId: fixture.created.contract.sessionId,
-      instanceId: "instance-1",
-      instanceNonce: "instance_nonce_123456789012345678901234",
-      jobId: "job-1",
-      state: "accepted",
-      worldId: "world-1",
-      worldEpoch: 1,
-      timestamp: new Date(fixture.clock.now()).toISOString(),
-      cameraLease: { held: false, restorationConfirmed: false },
-    };
+    const base = statusEnvelope(fixture);
     writeFileSync(join(mailbox.statusDirectory, "000000000003-status-job-1.json"), JSON.stringify({ ...base, sequence: 2 }));
     writeFileSync(join(mailbox.statusDirectory, "000000000002-status-job-1.json"), JSON.stringify({ ...base, sequence: 1 }));
     writeFileSync(join(mailbox.statusDirectory, "000000000004-status-job-1.json.tmp"), "incomplete");
@@ -80,22 +144,9 @@ describe("observer mailbox", () => {
   });
 
   scopedIt("connects mailbox registration and command publication to the agent stores", async (root) => {
-    const fixture = createObserverSessionFixture({ root });
-    const registry = new InstanceRegistry(fixture.store, { clock: fixture.clock });
-    const jobs = new JobStore(fixture.store, registry, fixture.clock);
-    const artifacts = new ArtifactStore(join(root, "artifacts"), fixture.store, jobs);
-    const mailbox = new MailboxTransport(fixture.profilePath);
-    const registration = graphicalRegistration(fixture.created, {
-      selectedTransport: "mailbox",
-      capabilities: ["render.capture", "transport.mailbox"],
-    });
-    const registrationName = `000000000001-registration-${registration.sessionId}.json`;
-    writeFileSync(join(mailbox.statusDirectory, registrationName), JSON.stringify({
-      ...registration,
-      sessionToken: fixture.created.contract.sessionToken,
-    }));
-    writeFileSync(join(mailbox.statusDirectory, `${registrationName}.complete`), "ready");
-    const coordinator = new MailboxCoordinator(fixture.store, registry, jobs, artifacts);
+    const harness = createCoordinatorHarness(root);
+    const { fixture, registry, jobs, mailbox, coordinator } = harness;
+    const { registration } = publishRegistration(harness);
     await coordinator.pollOnce();
     expect(registry.diagnostics()).toMatchObject([{ instanceId: registration.instanceId, selectedTransport: "mailbox" }]);
     const job = jobs.submit({
@@ -110,25 +161,20 @@ describe("observer mailbox", () => {
 
   scopedIt("accounts for exact pretty-printed command bytes before writing", (root) => {
     const fixture = createObserverSessionFixture({ root });
-    const command = {
-      protocolVersion: "1.0" as const,
+    const command = captureCommand(fixture, {
       jobId: `job-${"j".repeat(80)}`,
       idempotencyKey: "i".repeat(128),
-      deadlineAt: new Date(fixture.clock.now() + 10_000).toISOString(),
-      view: { kind: "pose" as const, position: [1, 2, 3] as [number, number, number], orientation: [0, 0, 0, 1] as [number, number, number, number], fov: 60 },
+      view: { kind: "pose", position: [1, 2, 3], orientation: [0, 0, 0, 1], fov: 60 },
       settleFrames: 30,
-      performancePolicy: "instrumented" as const,
-      commandKind: "capture" as const,
-      deliveryAttempt: 1,
+      performancePolicy: "instrumented",
       deliveryToken: "d".repeat(256),
-      deliveryLeaseExpiresAt: new Date(fixture.clock.now() + 5_000).toISOString(),
       wireView: {
         position: ["1".repeat(32), "2".repeat(32), "3".repeat(32)],
         orientation: ["4".repeat(32), "5".repeat(32), "6".repeat(32), "7".repeat(32)],
         target: [],
         fov: "8".repeat(32),
       },
-    };
+    });
     const exactBytes = Buffer.byteLength(`${JSON.stringify({ sequence: 1, ...command }, null, 2)}\n`);
     expect(exactBytes).toBeGreaterThan(1_024);
     const mailbox = new MailboxTransport(fixture.profilePath, { maxCommandBytes: exactBytes - 1 });
@@ -144,22 +190,13 @@ describe("observer mailbox", () => {
       JSON.stringify({ deliveryLeaseExpiresAt: new Date(Date.now() + 60_000).toISOString() })
     );
     const mailbox = new MailboxTransport(fixture.profilePath);
-    const command = {
-      protocolVersion: "1.0" as const,
+    const command = captureCommand(fixture, {
       jobId: "job-after-wrap",
       idempotencyKey: "capture-after-wrap",
       instanceId: "instance-1",
       worldEpoch: 1,
-      deadlineAt: new Date(fixture.clock.now() + 10_000).toISOString(),
-      view: { kind: "current" as const },
-      settleFrames: 0,
-      performancePolicy: "evidence" as const,
-      commandKind: "capture" as const,
-      deliveryAttempt: 1,
       deliveryToken: "delivery_token_after_wrap_1234",
-      deliveryLeaseExpiresAt: new Date(fixture.clock.now() + 5_000).toISOString(),
-      wireView: { position: [], orientation: [], target: [], fov: "0" },
-    };
+    });
 
     const commandPath = mailbox.writeCommand(command);
 
@@ -169,21 +206,14 @@ describe("observer mailbox", () => {
   });
 
   scopedIt("rejects imported command usage atomically when aggregate admission is over budget", async (root) => {
-    const fixture = createObserverSessionFixture({ root });
-    const registry = new InstanceRegistry(fixture.store, { clock: fixture.clock });
-    const jobs = new JobStore(fixture.store, registry, fixture.clock);
-    const artifacts = new ArtifactStore(join(root, "artifacts"), fixture.store, jobs);
-    const mailbox = new MailboxTransport(fixture.profilePath);
+    const { fixture, mailbox, coordinator } = createCoordinatorHarness(root, {
+      maxEstimatedBytes: 1_024,
+    });
     const retainedCommand = join(mailbox.commandsDirectory, "000000000001-capture-imported-job-1.json");
     writeFileSync(retainedCommand, JSON.stringify({
       deliveryLeaseExpiresAt: new Date(fixture.clock.now() + 60_000).toISOString(),
       padding: "x".repeat(2_048),
     }));
-    const coordinator = new MailboxCoordinator(fixture.store, registry, jobs, artifacts, {
-      clock: fixture.clock,
-      maxEstimatedBytes: 1_024,
-    });
-
     await coordinator.pollOnce();
 
     expect(existsSync(retainedCommand)).toBe(true);
@@ -202,11 +232,7 @@ describe("observer mailbox", () => {
   });
 
   scopedIt("rolls back transport admission when the command-usage index fails during commit", async (root) => {
-    const fixture = createObserverSessionFixture({ root });
-    const registry = new InstanceRegistry(fixture.store, { clock: fixture.clock });
-    const jobs = new JobStore(fixture.store, registry, fixture.clock);
-    const artifacts = new ArtifactStore(join(root, "artifacts"), fixture.store, jobs);
-    const coordinator = new MailboxCoordinator(fixture.store, registry, jobs, artifacts, { clock: fixture.clock });
+    const { fixture, coordinator } = createCoordinatorHarness(root);
     const commandUsage = (coordinator as unknown as {
       commandUsageBySession: Map<string, { files: number; bytes: number }>;
     }).commandUsageBySession;
@@ -225,38 +251,27 @@ describe("observer mailbox", () => {
   });
 
   scopedIt("consumes restored ownership-loss status and the following heartbeat without quarantine", async (root) => {
-    const fixture = createObserverSessionFixture({ root });
-    const registry = new InstanceRegistry(fixture.store, { clock: fixture.clock });
-    const registration = graphicalRegistration(fixture.created, {
-      selectedTransport: "mailbox",
-      capabilities: ["render.capture", "camera.runtime", "world.query", "transport.mailbox"],
-    });
+    const harness = createCoordinatorHarness(root);
+    const { fixture, registry, jobs, mailbox, coordinator } = harness;
+    const registration = mailboxRegistration(harness, [
+      "render.capture", "camera.runtime", "world.query", "transport.mailbox",
+    ]);
     registry.register(registration, fixture.created.contract.sessionToken);
-    const jobs = new JobStore(fixture.store, registry, fixture.clock);
-    const artifacts = new ArtifactStore(join(root, "artifacts"), fixture.store, jobs);
-    const mailbox = new MailboxTransport(fixture.profilePath);
-    const coordinator = new MailboxCoordinator(fixture.store, registry, jobs, artifacts);
     const job = jobs.submit({
-      sessionId: registration.sessionId,
-      idempotencyKey: "mailbox-ownership-loss",
+      sessionId: registration.sessionId, idempotencyKey: "mailbox-ownership-loss",
       deadlineAt: new Date(fixture.clock.now() + 30_000).toISOString(),
       view: { kind: "lookAt", position: [0, 1, 0], target: [1, 1, 0], fov: 60 },
     });
     const command = jobs.nextCommand(registration.sessionId, registration.instanceId, registration.instanceNonce)!;
-    const baseStatus = {
-      protocolVersion: "1.0",
-      sessionId: registration.sessionId,
-      instanceId: registration.instanceId,
-      instanceNonce: registration.instanceNonce,
-      jobId: job.request.jobId,
-      worldId: registration.worldId,
-      worldEpoch: registration.worldEpoch,
-      timestamp: new Date(fixture.clock.now()).toISOString(),
+    const baseStatus = statusEnvelope(fixture, {
+      sessionId: registration.sessionId, instanceId: registration.instanceId,
+      instanceNonce: registration.instanceNonce, jobId: job.request.jobId,
+      worldId: registration.worldId, worldEpoch: registration.worldEpoch,
       deliveryToken: command.deliveryToken,
-    };
+    });
     const heldCamera = { held: true, leaseId: `lease-${job.request.jobId}`, observerCameraId: 42 } as const;
     const restoredCamera = { held: false, restorationConfirmed: true } as const;
-    const update = (sequence: number, state: string, cameraLease: typeof heldCamera | typeof restoredCamera | { held: false; restorationConfirmed: false }) => {
+    const update = (sequence: number, state: JobStatus["state"], cameraLease: JobStatus["cameraLease"]) => {
       jobs.update({ ...baseStatus, sequence, state, cameraLease }, fixture.created.contract.sessionToken);
     };
     update(0, "accepted", { held: false, restorationConfirmed: false });
@@ -266,35 +281,26 @@ describe("observer mailbox", () => {
     update(4, "restoring", restoredCamera);
 
     const terminalName = `000000000006-status-${job.request.jobId}.json`;
-    writeFileSync(join(mailbox.statusDirectory, terminalName), JSON.stringify({
+    writeIngress(mailbox, terminalName, {
       ...baseStatus,
       sequence: 5,
       state: "failed",
       cameraLease: restoredCamera,
-      errorCode: "CAMERA_OWNERSHIP_LOST",
-      message: "Observer camera ownership changed before screenshot issuance",
+      errorCode: "CAMERA_OWNERSHIP_LOST", message: "Observer camera ownership changed before screenshot issuance",
       sessionToken: fixture.created.contract.sessionToken,
-    }));
-    writeFileSync(join(mailbox.statusDirectory, `${terminalName}.complete`), "ready");
+    });
 
     const heartbeatName = `000000000007-heartbeat-${registration.instanceId}.json`;
-    writeFileSync(join(mailbox.statusDirectory, heartbeatName), JSON.stringify({
-      protocolVersion: "1.0",
-      sessionId: registration.sessionId,
-      instanceId: registration.instanceId,
-      instanceNonce: registration.instanceNonce,
-      sequence: 48,
+    writeIngress(mailbox, heartbeatName, {
+      protocolVersion: "1.0", sessionId: registration.sessionId,
+      instanceId: registration.instanceId, instanceNonce: registration.instanceNonce, sequence: 48,
       sentAt: new Date(fixture.clock.now()).toISOString(),
-      worldId: registration.worldId,
-      worldEpoch: registration.worldEpoch,
+      worldId: registration.worldId, worldEpoch: registration.worldEpoch,
       capabilities: registration.capabilities,
-      activeJobId: null,
-      cameraLeaseJobId: null,
-      transportHealthy: true,
-      lastErrorCode: "CAMERA_OWNERSHIP_LOST",
+      activeJobId: null, cameraLeaseJobId: null,
+      transportHealthy: true, lastErrorCode: "CAMERA_OWNERSHIP_LOST",
       sessionToken: fixture.created.contract.sessionToken,
-    }));
-    writeFileSync(join(mailbox.statusDirectory, `${heartbeatName}.complete`), "ready");
+    });
 
     await coordinator.pollOnce();
 
@@ -304,47 +310,28 @@ describe("observer mailbox", () => {
       cameraLease: { held: false, restorationConfirmed: true },
     });
     expect(registry.require(registration.sessionId, registration.instanceId)).toMatchObject({
-      lastHeartbeatSequence: 48,
-      activeJobId: null,
-      cameraLeaseJobId: null,
+      lastHeartbeatSequence: 48, activeJobId: null, cameraLeaseJobId: null,
       lastErrorCode: "CAMERA_OWNERSHIP_LOST",
     });
-    expect(existsSync(join(mailbox.statusDirectory, terminalName))).toBe(false);
-    expect(existsSync(join(mailbox.statusDirectory, `${terminalName}.complete`))).toBe(false);
-    expect(existsSync(join(mailbox.statusDirectory, heartbeatName))).toBe(false);
-    expect(existsSync(join(mailbox.statusDirectory, `${heartbeatName}.complete`))).toBe(false);
+    expectIngressRemoved(mailbox, terminalName);
+    expectIngressRemoved(mailbox, heartbeatName);
     expect(existsSync(join(mailbox.statusDirectory, "quarantine"))).toBe(false);
   });
 
   scopedIt("permanently rejects malformed ingress into bounded quarantine immediately", async (root) => {
-    const fixture = createObserverSessionFixture({ root });
-    const registry = new InstanceRegistry(fixture.store, { clock: fixture.clock });
-    const jobs = new JobStore(fixture.store, registry, fixture.clock);
-    const artifacts = new ArtifactStore(join(root, "artifacts"), fixture.store, jobs);
-    const mailbox = new MailboxTransport(fixture.profilePath);
+    const { mailbox, coordinator } = createCoordinatorHarness(root);
     const name = "000000000001-status-malformed.json";
-    writeFileSync(join(mailbox.statusDirectory, name), "{not-json");
-    writeFileSync(join(mailbox.statusDirectory, `${name}.complete`), "ready");
-    const coordinator = new MailboxCoordinator(fixture.store, registry, jobs, artifacts);
+    writeIngress(mailbox, name, "{not-json");
     await coordinator.pollOnce();
-    expect(existsSync(join(mailbox.statusDirectory, name))).toBe(false);
-    expect(existsSync(join(mailbox.statusDirectory, `${name}.complete`))).toBe(false);
+    expectIngressRemoved(mailbox, name);
     expect(readdirSync(join(mailbox.statusDirectory, "quarantine"))).toHaveLength(1);
     expect(coordinator.stats()).toMatchObject({ permanentRejected: 1, quarantined: 1, trackedRetries: 0 });
   });
 
   scopedIt("bounds transient retries by attempt count before quarantining", async (root) => {
-    const fixture = createObserverSessionFixture({ root });
-    const registry = new InstanceRegistry(fixture.store, { clock: fixture.clock });
-    const jobs = new JobStore(fixture.store, registry, fixture.clock);
-    const artifacts = new ArtifactStore(join(root, "artifacts"), fixture.store, jobs);
-    const mailbox = new MailboxTransport(fixture.profilePath);
+    const { mailbox, coordinator } = createCoordinatorHarness(root, { maxRetryAttempts: 3 });
     const name = "000000000001-status-missing.json";
-    writeFileSync(join(mailbox.statusDirectory, `${name}.complete`), "ready");
-    const coordinator = new MailboxCoordinator(fixture.store, registry, jobs, artifacts, {
-      clock: fixture.clock,
-      maxRetryAttempts: 3,
-    });
+    writeIngress(mailbox, name);
     await coordinator.pollOnce();
     await coordinator.pollOnce();
     expect(existsSync(join(mailbox.statusDirectory, `${name}.complete`))).toBe(true);
@@ -354,21 +341,14 @@ describe("observer mailbox", () => {
   });
 
   scopedIt("admits the newest retry through the shared bounded map before applying mailbox eviction policy", async (root) => {
-    const fixture = createObserverSessionFixture({ root });
-    const registry = new InstanceRegistry(fixture.store, { clock: fixture.clock });
-    const jobs = new JobStore(fixture.store, registry, fixture.clock);
-    const artifacts = new ArtifactStore(join(root, "artifacts"), fixture.store, jobs);
-    const mailbox = new MailboxTransport(fixture.profilePath);
-    const first = "000000000001-status-missing-first.json";
-    const second = "000000000002-status-missing-second.json";
-    writeFileSync(join(mailbox.statusDirectory, `${first}.complete`), "ready");
-    writeFileSync(join(mailbox.statusDirectory, `${second}.complete`), "ready");
-    const coordinator = new MailboxCoordinator(fixture.store, registry, jobs, artifacts, {
-      clock: fixture.clock,
+    const { mailbox, coordinator } = createCoordinatorHarness(root, {
       maxRetryAttempts: 100,
       maxTrackedRetries: 1,
     });
-
+    const first = "000000000001-status-missing-first.json";
+    const second = "000000000002-status-missing-second.json";
+    writeIngress(mailbox, first);
+    writeIngress(mailbox, second);
     await coordinator.pollOnce();
 
     expect(existsSync(join(mailbox.statusDirectory, `${first}.complete`))).toBe(false);
@@ -382,20 +362,12 @@ describe("observer mailbox", () => {
   });
 
   scopedIt("stores a bounded summary when rejected ingress exceeds the quarantine byte budget", async (root) => {
-    const fixture = createObserverSessionFixture({ root });
-    const registry = new InstanceRegistry(fixture.store, { clock: fixture.clock });
-    const jobs = new JobStore(fixture.store, registry, fixture.clock);
-    const artifacts = new ArtifactStore(join(root, "artifacts"), fixture.store, jobs);
-    const mailbox = new MailboxTransport(fixture.profilePath);
-    const name = "000000000001-status-large-poison.json";
-    writeFileSync(join(mailbox.statusDirectory, name), "x".repeat(2_048));
-    writeFileSync(join(mailbox.statusDirectory, `${name}.complete`), "ready");
-    const coordinator = new MailboxCoordinator(fixture.store, registry, jobs, artifacts, {
-      clock: fixture.clock,
+    const { mailbox, coordinator } = createCoordinatorHarness(root, {
       quarantineMaxBytes: 1_024,
       maxEstimatedBytes: 8 * 1_024,
     });
-
+    const name = "000000000001-status-large-poison.json";
+    writeIngress(mailbox, name, "x".repeat(2_048));
     await coordinator.pollOnce();
 
     const quarantine = join(mailbox.statusDirectory, "quarantine");
@@ -410,22 +382,15 @@ describe("observer mailbox", () => {
   });
 
   scopedIt("drops forensic evidence when non-removable metadata leaves no aggregate byte budget", async (root) => {
-    const fixture = createObserverSessionFixture({ root });
-    const registry = new InstanceRegistry(fixture.store, { clock: fixture.clock });
-    const jobs = new JobStore(fixture.store, registry, fixture.clock);
-    const artifacts = new ArtifactStore(join(root, "artifacts"), fixture.store, jobs);
-    const mailbox = new MailboxTransport(fixture.profilePath);
-    for (let sequence = 1; sequence <= 20; sequence += 1) {
-      const name = `${String(sequence).padStart(12, "0")}-status-missing-${"x".repeat(40)}-${sequence}.json`;
-      writeFileSync(join(mailbox.statusDirectory, `${name}.complete`), "ready");
-    }
-    const coordinator = new MailboxCoordinator(fixture.store, registry, jobs, artifacts, {
-      clock: fixture.clock,
+    const { mailbox, coordinator } = createCoordinatorHarness(root, {
       maxRetryAttempts: 100,
       maxTrackedRetries: 100,
       maxEstimatedBytes: 2 * 1_024,
     });
-
+    for (let sequence = 1; sequence <= 20; sequence += 1) {
+      const name = `${String(sequence).padStart(12, "0")}-status-missing-${"x".repeat(40)}-${sequence}.json`;
+      writeIngress(mailbox, name);
+    }
     await coordinator.pollOnce();
 
     expect(coordinator.stats().estimatedBytes).toBeLessThanOrEqual(2 * 1_024);
@@ -434,41 +399,24 @@ describe("observer mailbox", () => {
   });
 
   scopedIt("consumes valid ingress after more than one batch of poison while bounding forensic evidence", async (root) => {
-    const fixture = createObserverSessionFixture({ root });
-    const registry = new InstanceRegistry(fixture.store, { clock: fixture.clock });
-    const jobs = new JobStore(fixture.store, registry, fixture.clock);
-    const artifacts = new ArtifactStore(join(root, "artifacts"), fixture.store, jobs);
-    const mailbox = new MailboxTransport(fixture.profilePath);
-    for (let sequence = 1; sequence <= 300; sequence += 1) {
-      const name = `${String(sequence).padStart(12, "0")}-status-poison-${sequence}.json`;
-      writeFileSync(join(mailbox.statusDirectory, name), "{not-json");
-      writeFileSync(join(mailbox.statusDirectory, `${name}.complete`), "ready");
-    }
-    const registration = graphicalRegistration(fixture.created, {
-      selectedTransport: "mailbox",
-      capabilities: ["render.capture", "transport.mailbox"],
-    });
-    const validName = `000000000301-registration-${registration.sessionId}.json`;
-    writeFileSync(join(mailbox.statusDirectory, validName), JSON.stringify({
-      ...registration,
-      sessionToken: fixture.created.contract.sessionToken,
-    }));
-    writeFileSync(join(mailbox.statusDirectory, `${validName}.complete`), "ready");
-    const coordinator = new MailboxCoordinator(fixture.store, registry, jobs, artifacts, {
-      clock: fixture.clock,
+    const harness = createCoordinatorHarness(root, {
       maxIngressPerPoll: 256,
       quarantineMaxRecords: 4,
-      quarantineMaxBytes: 64 * 1024,
+      quarantineMaxBytes: 64 * 1_024,
     });
-
+    const { fixture, registry, mailbox, coordinator } = harness;
+    for (let sequence = 1; sequence <= 300; sequence += 1) {
+      const name = `${String(sequence).padStart(12, "0")}-status-poison-${sequence}.json`;
+      writeIngress(mailbox, name, "{not-json");
+    }
+    const { registration, name: validName } = publishRegistration(harness, { sequence: 301 });
     await coordinator.pollOnce();
     expect(registry.stats().records).toBe(0);
     await coordinator.pollOnce();
 
     expect(registry.require(registration.sessionId, registration.instanceId).registration.instanceId)
       .toBe(registration.instanceId);
-    expect(existsSync(join(mailbox.statusDirectory, validName))).toBe(false);
-    expect(existsSync(join(mailbox.statusDirectory, `${validName}.complete`))).toBe(false);
+    expectIngressRemoved(mailbox, validName);
     expect(coordinator.stats()).toMatchObject({
       accepted: 1,
       permanentRejected: 300,
@@ -488,7 +436,8 @@ describe("observer mailbox", () => {
   }, 20_000);
 
   scopedIt("isolates raced and busy command cleanup so unrelated transport retention continues", async (root) => {
-    const fixture = createObserverSessionFixture({ root });
+    const harness = createMailboxHarness(root);
+    const { fixture } = harness;
     const secondProfile = join(root, "profiles", "run-2");
     mkdirSync(secondProfile, { recursive: true });
     const second = fixture.store.create({
@@ -501,9 +450,6 @@ describe("observer mailbox", () => {
       ttlMs: 20 * 60 * 1_000,
       transportPreference: ["mailbox"],
     });
-    const registry = new InstanceRegistry(fixture.store, { clock: fixture.clock });
-    const jobs = new JobStore(fixture.store, registry, fixture.clock);
-    const artifacts = new ArtifactStore(join(root, "artifacts"), fixture.store, jobs);
     const busyName = "000000000001-capture-busy-job-1.json";
     const racedName = "000000000001-capture-raced-job-1.json";
     const removeFile = (path: string) => {
@@ -514,8 +460,7 @@ describe("observer mailbox", () => {
       }
       unlinkSync(path);
     };
-    const coordinator = new MailboxCoordinator(fixture.store, registry, jobs, artifacts, {
-      clock: fixture.clock,
+    const coordinator = harness.createCoordinator({
       removeFile,
     });
     await coordinator.pollOnce();
@@ -544,26 +489,12 @@ describe("observer mailbox", () => {
   }, 10_000);
 
   scopedIt("does not reclaim a live writer paused before marker publication", async (root) => {
-    const fixture = createObserverSessionFixture({ root });
-    const registry = new InstanceRegistry(fixture.store, { clock: fixture.clock });
-    const jobs = new JobStore(fixture.store, registry, fixture.clock);
-    const artifacts = new ArtifactStore(join(root, "artifacts"), fixture.store, jobs);
-    const coordinator = new MailboxCoordinator(fixture.store, registry, jobs, artifacts, {
-      clock: fixture.clock,
+    const harness = createCoordinatorHarness(root, {
       orphanIngressMaxAgeMs: 1_000,
     });
+    const { fixture, registry, coordinator } = harness;
     await coordinator.pollOnce();
-    const mailbox = new MailboxTransport(fixture.profilePath);
-    const registration = graphicalRegistration(fixture.created, {
-      selectedTransport: "mailbox",
-      capabilities: ["render.capture", "transport.mailbox"],
-    });
-    const name = `000000000001-registration-${registration.sessionId}.json`;
-    const dataPath = join(mailbox.statusDirectory, name);
-    writeFileSync(dataPath, JSON.stringify({
-      ...registration,
-      sessionToken: fixture.created.contract.sessionToken,
-    }));
+    const { registration, path: dataPath } = publishRegistration(harness, { publish: false });
     const pausedAt = new Date(fixture.clock.now() - 60_000);
     utimesSync(dataPath, pausedAt, pausedAt);
 
@@ -587,16 +518,10 @@ describe("observer mailbox", () => {
   });
 
   scopedIt("reclaims more than the runtime egress cap only after writer authority is terminal", async (root) => {
-    const fixture = createObserverSessionFixture({ root });
-    const registry = new InstanceRegistry(fixture.store, { clock: fixture.clock });
-    const jobs = new JobStore(fixture.store, registry, fixture.clock);
-    const artifacts = new ArtifactStore(join(root, "artifacts"), fixture.store, jobs);
-    const coordinator = new MailboxCoordinator(fixture.store, registry, jobs, artifacts, {
-      clock: fixture.clock,
+    const { fixture, mailbox, coordinator } = createCoordinatorHarness(root, {
       orphanIngressMaxAgeMs: 1_000,
     });
     await coordinator.pollOnce();
-    const mailbox = new MailboxTransport(fixture.profilePath);
     const old = new Date(fixture.clock.now() - 60_000);
     for (let sequence = 1; sequence <= 513; sequence += 1) {
       const suffix = sequence % 2 === 0 ? ".json.tmp" : ".json";
@@ -622,25 +547,18 @@ describe("observer mailbox", () => {
   });
 
   scopedIt("retains a busy quarantine file and refuses new evidence instead of exceeding its bound", async (root) => {
-    const fixture = createObserverSessionFixture({ root });
-    const registry = new InstanceRegistry(fixture.store, { clock: fixture.clock });
-    const jobs = new JobStore(fixture.store, registry, fixture.clock);
-    const artifacts = new ArtifactStore(join(root, "artifacts"), fixture.store, jobs);
+    const harness = createMailboxHarness(root);
+    const { mailbox } = harness;
     let quarantineBusy = false;
-    const removeFile = (path: string) => {
-      if (quarantineBusy && path.includes(`${join("status", "quarantine")}`)) throw errno("EBUSY");
-      unlinkSync(path);
-    };
-    const coordinator = new MailboxCoordinator(fixture.store, registry, jobs, artifacts, {
-      clock: fixture.clock,
+    const removeFile = removeUnlessBusy((path) =>
+      quarantineBusy && path.includes(`${join("status", "quarantine")}`));
+    const coordinator = harness.createCoordinator({
       quarantineMaxRecords: 1,
       removeFile,
     });
-    const mailbox = new MailboxTransport(fixture.profilePath);
     const poison = (sequence: number) => {
       const name = `${String(sequence).padStart(12, "0")}-status-poison-${sequence}.json`;
-      writeFileSync(join(mailbox.statusDirectory, name), "{not-json");
-      writeFileSync(join(mailbox.statusDirectory, `${name}.complete`), "ready");
+      writeIngress(mailbox, name, "{not-json");
     };
     poison(1);
     await coordinator.pollOnce();
@@ -661,21 +579,14 @@ describe("observer mailbox", () => {
   });
 
   scopedIt("rescans quarantine disk state before reserving space for new evidence", async (root) => {
-    const fixture = createObserverSessionFixture({ root });
-    const registry = new InstanceRegistry(fixture.store, { clock: fixture.clock });
-    const jobs = new JobStore(fixture.store, registry, fixture.clock);
-    const artifacts = new ArtifactStore(join(root, "artifacts"), fixture.store, jobs);
-    const mailbox = new MailboxTransport(fixture.profilePath);
+    const harness = createMailboxHarness(root);
+    const { mailbox } = harness;
     const quarantineDirectory = join(mailbox.statusDirectory, "quarantine");
     mkdirSync(quarantineDirectory);
     const racedName = "externally-retained-evidence.json";
     const racedPath = join(quarantineDirectory, racedName);
-    const removeFile = (path: string) => {
-      if (path === racedPath) throw errno("EBUSY");
-      unlinkSync(path);
-    };
-    const coordinator = new MailboxCoordinator(fixture.store, registry, jobs, artifacts, {
-      clock: fixture.clock,
+    const removeFile = removeUnlessBusy((path) => path === racedPath);
+    const coordinator = harness.createCoordinator({
       quarantineMaxRecords: 1,
       removeFile,
     });
@@ -684,14 +595,12 @@ describe("observer mailbox", () => {
     await coordinator.pollOnce();
     writeFileSync(racedPath, "retained");
     const poisonName = "000000000001-status-raced-poison.json";
-    writeFileSync(join(mailbox.statusDirectory, poisonName), "{not-json");
-    writeFileSync(join(mailbox.statusDirectory, `${poisonName}.complete`), "ready");
+    writeIngress(mailbox, poisonName, "{not-json");
 
     await coordinator.pollOnce();
 
     expect(readdirSync(quarantineDirectory)).toEqual([racedName]);
-    expect(existsSync(join(mailbox.statusDirectory, poisonName))).toBe(false);
-    expect(existsSync(join(mailbox.statusDirectory, `${poisonName}.complete`))).toBe(false);
+    expectIngressRemoved(mailbox, poisonName);
     expect(coordinator.stats()).toMatchObject({
       quarantineFiles: 1,
       quarantineDropped: 1,
@@ -708,27 +617,15 @@ describe("observer mailbox", () => {
     writeFileSync(temporaryPath, "incomplete");
     let busy = true;
     const mailbox = new MailboxTransport(fixture.profilePath, {
-      removeFile: (path) => {
-        if (busy && path === temporaryPath) throw errno("EBUSY");
-        unlinkSync(path);
-      },
+      removeFile: removeUnlessBusy((path) => busy && path === temporaryPath),
     });
-    const command = {
-      protocolVersion: "1.0" as const,
+    const command = captureCommand(fixture, {
       jobId: "job-after-temporary",
       idempotencyKey: "capture-after-temporary",
       instanceId: "instance-1",
       worldEpoch: 1,
-      deadlineAt: new Date(fixture.clock.now() + 10_000).toISOString(),
-      view: { kind: "current" as const },
-      settleFrames: 0,
-      performancePolicy: "evidence" as const,
-      commandKind: "capture" as const,
-      deliveryAttempt: 1,
       deliveryToken: "delivery_token_after_temporary_1234",
-      deliveryLeaseExpiresAt: new Date(fixture.clock.now() + 5_000).toISOString(),
-      wireView: { position: [], orientation: [], target: [], fov: "0" },
-    };
+    });
 
     expect(mailbox.stats()).toMatchObject({ commandFiles: 1, commandUsageReliable: false });
     expect(() => mailbox.writeCommand(command)).toThrowError(expect.objectContaining({ code: "TRANSPORT_UNAVAILABLE" }));
@@ -747,103 +644,5 @@ describe("observer mailbox", () => {
     expect(() => atomicWriteFile(root, occupiedTarget, "payload")).toThrow();
 
     expect(readdirSync(root)).toEqual(["occupied.json"]);
-  });
-
-  it("models locked-file fairness beyond one 256-entry Enforce work batch", () => {
-    const source = readFileSync(join(observerAddonSource, "Scripts", "Game", "ReforgerForgeObserver", "RFO_ObserverMailboxTransport.c"), "utf8");
-    const poll = enforceMethod(source, "override bool PollCommand()");
-    const cap = Number(/MAX_COMMAND_FILES\s*=\s*(\d+)/.exec(source)?.[1]);
-    expect(cap).toBe(256);
-    expect(poll).toContain("inspected < MAX_COMMAND_FILES");
-    expect(poll).toContain("m_RFO_CommandCursor = files[index]");
-    expect(source).toContain("enum RFO_ObserverMailboxDisposition");
-    expect(source).toContain("RETAINED_FOR_RETRY");
-    expect(source).toContain("STORAGE_UNAVAILABLE");
-    expect(poll).not.toContain("m_RFO_Initialized = false");
-    expect(poll).toContain("RecordIngressDisposition");
-
-    // Behavioral model of the source-verified sorted/cursor/capped loop. The
-    // controlled V10 Workbench gate executes this case against compiled
-    // Enforce; this fast model remains supplementary architecture coverage.
-    let files = Array.from({ length: 300 }, (_, index) => `${String(index + 1).padStart(12, "0")}-capture-poison-${index + 1}.json`);
-    const locked = files[0];
-    const valid = "000000000301-capture-valid-1.json";
-    files.push(valid);
-    let cursor = "";
-    let accepted = false;
-    let lockHeld = true;
-    let heartbeatPublications = 0;
-    const quarantine: string[] = [];
-    const retainEvidence = (name: string) => {
-      if (!quarantine.includes(name)) quarantine.push(name);
-      while (quarantine.length > 128) quarantine.shift();
-    };
-    const pollModel = () => {
-      const snapshot = [...files].sort();
-      const cursorIndex = cursor ? snapshot.indexOf(cursor) : -1;
-      const start = cursorIndex >= 0 ? (cursorIndex + 1) % snapshot.length : 0;
-      for (let offset = 0; offset < snapshot.length && offset < cap; offset += 1) {
-        const name = snapshot[(start + offset) % snapshot.length];
-        cursor = name;
-        if (name === valid) {
-          accepted = true;
-          files = files.filter((candidate) => candidate !== name);
-          return;
-        }
-        retainEvidence(name);
-        if (name === locked && lockHeld) continue;
-        files = files.filter((candidate) => candidate !== name);
-      }
-    };
-    pollModel();
-    heartbeatPublications += 1;
-    expect(accepted).toBe(false);
-    pollModel();
-    heartbeatPublications += 1;
-    expect(accepted).toBe(true);
-    expect(files).toContain(locked);
-    expect(quarantine.length).toBeLessThanOrEqual(128);
-    expect(new Set(quarantine).size).toBe(quarantine.length);
-    expect(heartbeatPublications).toBe(2);
-
-    lockHeld = false;
-    pollModel();
-    heartbeatPublications += 1;
-    expect(files).not.toContain(locked);
-    expect(new Set(quarantine).size).toBe(quarantine.length);
-    expect(heartbeatPublications).toBe(3);
-  });
-
-  it("supplements behavioral coverage with Enforce writer serialization and idempotent quarantine architecture checks", () => {
-    const source = readFileSync(join(observerAddonSource, "Scripts", "Game", "ReforgerForgeObserver", "RFO_ObserverMailboxTransport.c"), "utf8");
-    const writeOwned = enforceMethod(source, "protected bool WriteOwned(string kind, string data)");
-    const reclaim = enforceMethod(source, "protected bool ReclaimOrphanStatusFiles()");
-    const quarantine = enforceMethod(source, "protected RFO_ObserverMailboxDisposition QuarantineCommand(string name, string path, string reason, int length)");
-    const trim = enforceMethod(source, "protected RFO_ObserverMailboxDisposition TrimQuarantine(int incomingBytes)");
-    const deleteOrAbsent = enforceMethod(source, "protected RFO_ObserverMailboxDisposition DeleteOrAbsent(string path, string name, string directory, string extension)");
-    const evidenceName = enforceMethod(source, "protected string NewQuarantineEvidenceName(string name)");
-    const evidenceBytes = enforceMethod(source, "protected int QuarantineEvidenceBytes(string name)");
-
-    expect(writeOwned.indexOf("ReclaimOrphanStatusFiles()")).toBeLessThan(writeOwned.indexOf("existingFiles.Count() >= MAX_STATUS_FILES"));
-    expect(writeOwned).toContain("m_RFO_EgressHealthy = false");
-    expect(reclaim).toContain("markerNames.Contains(dataName + \".complete\")");
-    expect(reclaim).toContain("temporaryName.EndsWith(\".json.tmp\")");
-    expect(quarantine).toContain("QuarantineEvidenceBytes(name)");
-    expect(quarantine).toContain("RFO_ObserverMailboxDisposition.STORAGE_UNAVAILABLE");
-    expect(trim).toContain("MAX_QUARANTINE_FILES");
-    expect(trim).toContain("MAX_QUARANTINE_BYTES");
-    expect(trim).toContain('FileIO.FindFiles(longNameFiles.Insert, QUARANTINE_DIRECTORY, ".rfoq")');
-    expect(evidenceName).toContain('name.Substring(0, name.Length() - 5) + ".rfoq"');
-    expect(evidenceBytes).toContain("candidateName.Length() == name.Length() + 13");
-    expect(evidenceBytes).toContain("candidateName.Substring(13, name.Length()) == name");
-    expect(evidenceBytes).not.toContain("EndsWith(suffix)");
-    expect(evidenceBytes).toContain("if (!evidence)");
-    expect(evidenceBytes).toContain("if (length <= 0 || length > 65536)");
-    expect(evidenceBytes).toContain("envelope.LoadFromFile(evidencePath)");
-    expect(evidenceBytes).toContain("return -3");
-    expect(evidenceBytes).toContain("DeleteOrAbsent(evidencePath, candidateName, QUARANTINE_DIRECTORY, extension)");
-    expect(evidenceBytes).toContain("envelope.sourceName != name");
-    expect(deleteOrAbsent).toContain("if (BaseName(candidatePath) == name)");
-    expect(deleteOrAbsent).toContain("RFO_ObserverMailboxDisposition.RETAINED_FOR_RETRY");
   });
 });

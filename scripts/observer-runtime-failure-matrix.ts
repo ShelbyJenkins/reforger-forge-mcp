@@ -15,7 +15,10 @@ import {
   type ObserverApplication,
 } from "../src/observer/application.js";
 import { prepareObserverLaunch } from "../src/observer/launch.js";
-import { OwnedRuntimeManager } from "../src/observer/owned-runtime-manager.js";
+import {
+  closeObserverRuntimeLifecycle,
+  OwnedRuntimeManager,
+} from "../src/observer/owned-runtime-manager.js";
 import {
   createFaultMatrixRunScaffolding,
   removeOwnedFaultControlRoot,
@@ -629,6 +632,7 @@ export async function runPilotCancellationCase(
       childVacant: false,
       exactOwnerVacant: false,
     },
+    control: { arrival: "arrived", action: "executed" },
     retainedDiagnostics: diagnostics.map((tail) => matrixRetainedDiagnostic(tail)),
   };
 }
@@ -1032,7 +1036,7 @@ export async function runRuntimeFailureMatrix(
       await baseline.measure(
         "shutdown",
         "ObserverApplication.close",
-        () => application.close(),
+        () => closeObserverRuntimeLifecycle(runtimeManager, application),
         "observer_process_cleanup"
       );
     } catch (error) {
