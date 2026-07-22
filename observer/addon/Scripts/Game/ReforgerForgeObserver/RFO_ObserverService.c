@@ -489,7 +489,17 @@ class RFO_ObserverService
 		if (job.cancellationRequested && job.terminalErrorCode.IsEmpty())
 			RecordFailure(RFO_ObserverProtocol.ERROR_CANCELLED, "Capture was cancelled", true);
 		else if (job.DeadlineExpired() && job.terminalErrorCode.IsEmpty())
-			RecordFailure(RFO_ObserverProtocol.ERROR_CAPTURE_TIMEOUT, "Capture deadline expired", false);
+		{
+			string deadlineMessage = "Capture deadline expired";
+			if (job.state == RFO_ObserverJobState.RESOLVING && job.IsCameraView())
+			{
+				string leaseabilityReason = m_RFO_CameraLease.GetLastLeaseabilityReason();
+				if (leaseabilityReason.IsEmpty())
+					leaseabilityReason = "lease_readiness_unavailable";
+				deadlineMessage += " while resolving camera reason=" + leaseabilityReason;
+			}
+			RecordFailure(RFO_ObserverProtocol.ERROR_CAPTURE_TIMEOUT, deadlineMessage, false);
+		}
 		if (!job.terminalErrorCode.IsEmpty() && job.state != RFO_ObserverJobState.RESTORING && !job.IsTerminal())
 		{
 			BeginTerminalTransition();
@@ -505,7 +515,14 @@ class RFO_ObserverService
 		{
 			case RFO_ObserverJobState.ACCEPTED:
 				if (job.IsCameraView())
-					AcquireCamera(world);
+				{
+					// Explicit views wait in a cancellable, deadline-bounded state until
+					// an exact CameraBase restoration target is observable. Capability
+					// inventory is only a heartbeat snapshot, so this local recheck
+					// closes the selection-to-acquire race without mutating the camera.
+					job.state = RFO_ObserverJobState.RESOLVING;
+					PublishStatus();
+				}
 				else
 				{
 					if (!m_RFO_Capture.BeginPreload(world))
@@ -520,6 +537,11 @@ class RFO_ObserverService
 					job.state = RFO_ObserverJobState.PRELOADING;
 					PublishStatus();
 				}
+				break;
+			case RFO_ObserverJobState.RESOLVING:
+				if (!m_RFO_CameraLease.CanAcquire(world))
+					break;
+				AcquireCamera(world);
 				break;
 			case RFO_ObserverJobState.ACQUIRING_CAMERA:
 				if (!OnLeaseAcquiredBarrier(job))
@@ -592,7 +614,12 @@ class RFO_ObserverService
 		if (!built || !acquired)
 		{
 			m_RFO_ActiveJob.cameraWasAcquired = m_RFO_CameraLease.HasOutstandingLease();
-			RecordFailure(RFO_ObserverProtocol.ERROR_CAMERA_BUSY, "Observer camera lease could not be acquired", false);
+			string leaseabilityReason = m_RFO_CameraLease.GetLastLeaseabilityReason();
+			if (!built)
+				leaseabilityReason = "view_matrix_unavailable";
+			else if (leaseabilityReason.IsEmpty())
+				leaseabilityReason = "lease_mutation_rejected";
+			RecordFailure(RFO_ObserverProtocol.ERROR_CAMERA_BUSY, "Observer camera lease could not be acquired reason=" + leaseabilityReason, false);
 			if (m_RFO_ActiveJob.cameraWasAcquired)
 			{
 				// Initial ownership evidence is valid only in acquiringCamera. Once
@@ -924,11 +951,13 @@ class RFO_ObserverService
 	{
 		bool restReady = m_RFO_Transport.GetName() == "rest";
 		bool mailboxReady = m_RFO_Transport.GetName() == "mailbox";
-		// Advertise the graphical endpoint as soon as its managed capture path is
-		// available. Per-job BeginPreload/RuntimeReady owns camera readiness; using
-		// that state here would prevent the first job from initiating its preload.
+		// Render capture remains available as soon as its managed path is ready.
+		// Runtime-camera routing additionally requires a read-only proof that the
+		// current world exposes an exact CameraBase restoration target. The job's
+		// RESOLVING state repeats this same proof to close heartbeat staleness.
 		bool captureReady = m_RFO_Capture && m_RFO_Capture.IsReady();
-		return RFO_ObserverCapabilities.Collect(m_RFO_World.Available(), restReady, mailboxReady, captureReady, captureReady && RFO_ObserverCapabilities.CAMERA_RESTORE_PROVEN && m_RFO_CameraSubsystemSafe && !m_RFO_CameraLease.HasOutstandingLease());
+		bool cameraReady = captureReady && m_RFO_World.Available() && RFO_ObserverCapabilities.CAMERA_RESTORE_PROVEN && m_RFO_CameraSubsystemSafe && m_RFO_CameraLease && m_RFO_CameraLease.CanAcquire(m_RFO_World.GetObject());
+		return RFO_ObserverCapabilities.Collect(m_RFO_World.Available(), restReady, mailboxReady, captureReady, cameraReady);
 	}
 
 	protected void SwitchToMailboxFallback()

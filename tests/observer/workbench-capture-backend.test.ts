@@ -1,6 +1,7 @@
 import { WorkbenchCaptureBackend } from "../../src/observer/workbench-capture-backend.js";
+import { describe, expect, it } from "vitest";
 import { captureBackendContract } from "./capture-backend-contract.js";
-import { contractInstance, contractPng } from "./capture-policy-fixture.js";
+import { contractInstance, contractPng, contractRequest } from "./capture-policy-fixture.js";
 
 captureBackendContract("workbench", () => {
   const instance = contractInstance("workbench");
@@ -51,4 +52,26 @@ captureBackendContract("workbench", () => {
     lowLevelCalls,
     complete(): void { state = "completed"; },
   };
+});
+
+describe("Workbench capture contention projection", () => {
+  it("maps the activity gate's ACTIVE_CAPTURE refusal to public CAMERA_BUSY", async () => {
+    const instance = contractInstance("workbench");
+    const backend = new WorkbenchCaptureBackend({
+      async submit() {
+        throw Object.assign(new Error("another capture owns the Workbench activity lease"), {
+          code: "ACTIVE_CAPTURE",
+        });
+      },
+    } as never);
+
+    await expect(backend.submit({
+      jobId: "contending-job",
+      idempotencyKey: "contending-request",
+      request: contractRequest(instance),
+      instance,
+    }, { deadlineAtMs: Date.now() + 5_000 })).rejects.toMatchObject({
+      code: "CAMERA_BUSY",
+    });
+  });
 });

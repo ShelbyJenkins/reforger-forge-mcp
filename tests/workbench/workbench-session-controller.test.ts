@@ -63,6 +63,37 @@ describe("WorkbenchSessionController public contract", () => {
     expect(controller.state).toMatchObject({ connected: true, mode: "edit" });
   });
 
+  it("re-clamps a stale relative timeout at the final NET transport boundary", async () => {
+    const netApi = new StubNetApi({ status: "ok" });
+    let now = 1_000;
+    const controller = new WorkbenchSessionController(
+      "127.0.0.1",
+      5775,
+      undefined,
+      "controller-deadline-contract",
+      undefined,
+      {
+        netApi,
+        now: () => now,
+        requestDeadlineAtMs: () => 1_300,
+      }
+    );
+
+    now = 1_175;
+    await controller.call("EMCP_WB_GetState", {}, {
+      timeout: 500,
+      skipAutoLaunch: true,
+    });
+    expect(netApi.calls.at(-1)?.options).toEqual({ timeoutMs: 125 });
+
+    now = 1_300;
+    await expect(controller.call("EMCP_WB_GetState", {}, {
+      timeout: 500,
+      skipAutoLaunch: true,
+    })).rejects.toMatchObject({ code: "TIMEOUT" });
+    expect(netApi.calls).toHaveLength(1);
+  });
+
   it("maps transport failures without leaking them into lifecycle policy", async () => {
     const netApi = new StubNetApi(new WorkbenchNetApiError(
       "injected transport refusal",

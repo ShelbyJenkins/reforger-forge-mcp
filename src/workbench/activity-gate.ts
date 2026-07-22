@@ -65,6 +65,7 @@ export interface WorkbenchLifecycleAdmissionOptions {
 
 interface LifecycleWaiter {
   readonly kind: string;
+  readonly ownedShutdown: boolean;
   readonly options: WorkbenchLifecycleAdmissionOptions;
   readonly admitted: Promise<void>;
   resolveAdmitted(): void;
@@ -122,6 +123,7 @@ export class WorkbenchActivityGate {
   private lifecycleActive = false;
   private advancingLifecycleQueue = false;
   private readonly lifecycleQueue: LifecycleWaiter[] = [];
+  private exactOwnerExitRequired: CaptureActivityBinding | null = null;
 
   constructor(options: WorkbenchActivityGateOptions = {}) {
     const restoreTimeoutMs = options.restoreTimeoutMs ?? DEFAULT_RESTORE_TIMEOUT_MS;
@@ -134,6 +136,9 @@ export class WorkbenchActivityGate {
   }
 
   acquireCapture(binding: CaptureActivityBinding): CaptureActivityLease {
+    if (this.exactOwnerExitRequired) {
+      throw this.exactOwnerExitSealError("capture");
+    }
     if (this.lifecycleRequests > 0) {
       throw new WorkbenchActivityError(
         "Workbench capture cannot start while a lifecycle mutation is pending or active.",
@@ -154,6 +159,29 @@ export class WorkbenchActivityGate {
   }
 
   releaseCapture(lease: CaptureActivityLease): void {
+    this.captureLeases.release(lease);
+    this.advanceLifecycleQueue();
+  }
+
+  /**
+   * Replace one retained capture wait with an exact-owner-exit seal.
+   *
+   * This is deliberately not ordinary release: the exact process binding is
+   * retained and every reader, capture, and lifecycle mutation remains closed
+   * except the controller's owner-scoped shutdown path.
+   */
+  requireExactOwnerExit(lease: CaptureActivityLease): void {
+    if (this.exactOwnerExitRequired && sameBinding(this.exactOwnerExitRequired, lease.binding) &&
+        this.captureLeases.isReleased(lease)) {
+      return;
+    }
+    if (this.captureLeases.activeLease !== lease) {
+      throw new WorkbenchActivityError(
+        `Workbench capture lease ${lease.id} cannot establish an exact-owner-exit seal because it is no longer retained.`,
+        "CAPTURE_INVALIDATED"
+      );
+    }
+    this.exactOwnerExitRequired = copyBinding(lease.binding);
     this.captureLeases.release(lease);
     this.advanceLifecycleQueue();
   }
@@ -211,6 +239,9 @@ export class WorkbenchActivityGate {
    * recorded synchronously and either side is admitted, never raced.
    */
   async runManaged<T>(description: string, action: () => Promise<T>): Promise<T> {
+    if (this.exactOwnerExitRequired) {
+      throw this.exactOwnerExitSealError(description);
+    }
     if (this.lifecycleRequests > 0) {
       throw new WorkbenchActivityError(
         `Workbench ${description} cannot start while a lifecycle mutation is pending or active.`,
@@ -231,10 +262,44 @@ export class WorkbenchActivityGate {
     action: () => Promise<T>,
     options: WorkbenchLifecycleAdmissionOptions = {}
   ): Promise<T> {
-    const waiter = this.enqueueLifecycle(kind, options);
+    return this.runLifecycleAdmission(kind, action, options, false);
+  }
+
+  /** The sole lifecycle admission allowed while an exact-owner-exit seal is held. */
+  async runOwnedShutdown<T>(
+    action: (requiredBinding: CaptureActivityBinding | null) => Promise<T>,
+    options: WorkbenchLifecycleAdmissionOptions = {}
+  ): Promise<T> {
+    return this.runLifecycleAdmission("shutdown", action, options, true);
+  }
+
+  private async runLifecycleAdmission<T>(
+    kind: string,
+    action: (requiredBinding: CaptureActivityBinding | null) => Promise<T>,
+    options: WorkbenchLifecycleAdmissionOptions,
+    ownedShutdown: boolean
+  ): Promise<T> {
+    if (this.exactOwnerExitRequired && !ownedShutdown) {
+      throw this.exactOwnerExitSealError(`lifecycle ${kind}`);
+    }
+    const waiter = this.enqueueLifecycle(kind, options, ownedShutdown);
     await waiter.admitted;
     try {
-      return await action();
+      const requiredBinding = ownedShutdown && this.exactOwnerExitRequired
+        ? copyBinding(this.exactOwnerExitRequired)
+        : null;
+      const result = await action(requiredBinding);
+      if (requiredBinding) {
+        if (!this.exactOwnerExitRequired ||
+            !sameBinding(this.exactOwnerExitRequired, requiredBinding)) {
+          throw new WorkbenchActivityError(
+            "Exact-owner shutdown completed against a different capture binding; the exit seal was retained.",
+            "CAPTURE_INVALIDATED"
+          );
+        }
+        this.exactOwnerExitRequired = null;
+      }
+      return result;
     } finally {
       this.lifecycleActive = false;
       this.lifecycleRequests -= 1;
@@ -244,7 +309,8 @@ export class WorkbenchActivityGate {
 
   private enqueueLifecycle(
     kind: string,
-    options: WorkbenchLifecycleAdmissionOptions
+    options: WorkbenchLifecycleAdmissionOptions,
+    ownedShutdown: boolean
   ): LifecycleWaiter {
     const timeoutMs = options.timeoutMs ?? this.restoreTimeoutMs;
     if (!Number.isFinite(timeoutMs) || timeoutMs < 0) {
@@ -259,6 +325,7 @@ export class WorkbenchActivityGate {
     });
     const waiter: LifecycleWaiter = {
       kind,
+      ownedShutdown,
       options,
       admitted,
       resolveAdmitted,
@@ -311,6 +378,14 @@ export class WorkbenchActivityGate {
               `Workbench lifecycle ${waiter.kind} admission was cancelled.`,
               "LIFECYCLE_BUSY"
             ),
+            false
+          );
+          continue;
+        }
+        if (this.exactOwnerExitRequired && !waiter.ownedShutdown) {
+          this.cancelLifecycleWaiter(
+            waiter,
+            this.exactOwnerExitSealError(`lifecycle ${waiter.kind}`),
             false
           );
           continue;
@@ -384,6 +459,14 @@ export class WorkbenchActivityGate {
     return new WorkbenchActivityError(
       `Workbench lifecycle ${waiter.kind} could not acquire its local write lease within ` +
         `${timeoutMs}ms.`,
+      "LIFECYCLE_BUSY"
+    );
+  }
+
+  private exactOwnerExitSealError(operation: string): WorkbenchActivityError {
+    return new WorkbenchActivityError(
+      `Workbench ${operation} is blocked because camera restoration is unproven; ` +
+        "only exact owned Workbench shutdown is permitted.",
       "LIFECYCLE_BUSY"
     );
   }

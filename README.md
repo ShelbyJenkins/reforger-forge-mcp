@@ -440,6 +440,24 @@ window. If reads or restoration do not drain in time, the lifecycle mutation is
 refused before process termination. The normal order is: restore or cancel
 captures, wait for terminal state, then call `wb_shutdown`.
 
+For the repository-only failure harness, the helper exposes five protected,
+default-inert phase hooks; only the generated disposable fixture overrides
+them, without adding an observer handler or MCP tool. A restoration failure may
+enter an exact-owner-exit seal that admits only owner-scoped shutdown and never
+claims the camera was restored. Only independent exact-owner vacancy proof may
+then clear the repository-only acceptance adapter's retained local record.
+Shutdown revalidates the sealed
+lifecycle, target, PID, executable path, and creation time before reservation
+and again before signaling; a mismatch refuses without a termination call.
+Default-off harness seams cover one real NET
+API request/response loss, bounded PNG mutation immediately before validation,
+identical Release replay, and exact-identity decoy comparison. None is a public
+Workbench configuration surface.
+
+The shared catalog contains 69 Workbench failure-matrix cases and the harness
+has hermetic coverage, but no gated native matrix run or matrix image review is
+recorded for the current implementation.
+
 For project-owned scripts and CI, the packaged `reforger-forge-workbench`
 runner shares the same version-3 lifecycle and companion staging:
 
@@ -636,6 +654,33 @@ npm run dev:observer:acceptance:runtime -- --confirm-live-run
 $env:RFO_RUN_LIVE_WORKBENCH_OBSERVER_ACCEPTANCE = "1"
 npm run dev:observer:acceptance:workbench -- --confirm-live-run
 ```
+
+Those no-selector commands retain the established positive-path acceptances.
+The Workbench failure harness has separate read-only, full, and selected modes:
+
+```powershell
+npm run dev:observer:acceptance:workbench -- --list-cases
+
+$env:RFO_RUN_LIVE_WORKBENCH_OBSERVER_ACCEPTANCE = "1"
+npm run dev:observer:acceptance:workbench -- --matrix --confirm-live-run
+npm run dev:observer:acceptance:workbench -- --only workbench.cancel_capture.lease_acquired.pose --confirm-live-run
+```
+
+`--matrix` runs all 69 canonical Workbench cases serially with fresh per-case
+state and writes version-3 full-coverage evidence. `--only` runs one validated
+Workbench case and writes explicit partial coverage. The selectors cannot be
+combined. `--list-cases` and `--help` are standalone and do not require the live
+gate. `--keep-profile` is accepted only with `--only` and retains the generated
+case directory only after a failure. No gated Workbench failure-matrix run or
+manual matrix review is recorded for the current implementation.
+
+Successful completed-case bundles are copied out of the disposable case roots
+and the command prints
+`RFO_WORKBENCH_OBSERVER_FAILURE_MATRIX_REVIEW_DIRECTORY=<path>`. Inspect every
+image in that exact directory at original resolution during Task 7, retain it
+until the matrix JSON/Markdown review is recorded, then delete only the printed
+directory. The runner does not mark those images reviewed or remove that review
+directory automatically.
 
 The runtime command defaults to Reforger's installed stock
 `{96A8AF57260A7392}worlds/MP/MpTest/MpTest.ent`. It uses an explicit

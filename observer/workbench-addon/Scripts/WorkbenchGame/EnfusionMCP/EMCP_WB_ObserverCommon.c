@@ -285,18 +285,32 @@ class EMCP_WB_ObserverService
 		return Workbench.GetCurrentGameProjectFile();
 	}
 
-	// Fault-matrix acceptance hook boundary. Advance() is the only point this
-	// handler is re-entered while a job is settling (Submit and Cancel are
-	// single synchronous NET API calls and cannot be held open), so this is
-	// the sole phase currently wired: it pauses the local job state machine
-	// at lease_acquired while the host's ordinary Status poll keeps calling
-	// Advance normally. The default implementation always returns true, so
-	// production behavior is unchanged when no fixture add-on overrides it.
-	// A disposable acceptance fixture may override this through a modded
-	// class to prove fault-injection behavior against a real Workbench
-	// process. It is not part of the public observer protocol or the
-	// production helper's five NET API handlers.
+	// Passive fault-matrix acceptance boundaries. Their default implementations
+	// are inert, so the production helper retains exactly the same five public
+	// observer handlers and normal state-machine behavior. A disposable,
+	// non-shipped add-on may override them to pause only the selected job while
+	// ordinary Status/Ping calls keep the private fixture mailbox moving.
+	protected event bool OnBeforeLeaseBarrier(string jobId, string lifecycleGeneration, string canonicalTarget, string viewKind)
+	{
+		return true;
+	}
+
 	protected event bool OnLeaseAcquiredBarrier(EMCP_WB_ObserverJob job)
+	{
+		return true;
+	}
+
+	protected event bool OnCaptureInProgressBarrier(EMCP_WB_ObserverJob job)
+	{
+		return true;
+	}
+
+	protected event bool OnRestorationInProgressBarrier(EMCP_WB_ObserverJob job)
+	{
+		return true;
+	}
+
+	protected event bool OnTerminalReleaseBarrier(EMCP_WB_ObserverJob job)
 	{
 		return true;
 	}
@@ -376,6 +390,11 @@ class EMCP_WB_ObserverService
 		if (viewKind != "current" && !m_RestorationProven)
 		{
 			message = "camera.editor is fail-closed until this Workbench process completes an exact current-view restoration proof";
+			return false;
+		}
+		if (!OnBeforeLeaseBarrier(jobId, lifecycleGeneration, canonicalTarget, viewKind))
+		{
+			message = "The disposable acceptance fixture is holding the capture before camera lease acquisition";
 			return false;
 		}
 
@@ -511,18 +530,69 @@ class EMCP_WB_ObserverService
 	{
 		if (!Matches(jobId, leaseId, lifecycleGeneration, canonicalTarget, message))
 			return false;
+		if (m_Job.IsTerminal() && !m_Job.cameraLeaseHeld && m_Job.restorationConfirmed && !OnTerminalReleaseBarrier(m_Job))
+		{
+			message = m_Job.message;
+			return true;
+		}
 		if (m_Job.IsTerminal())
 		{
 			message = m_Job.message;
 			return true;
 		}
-		if (!BindingStillCurrent(m_Job))
+		string bindingFailureCode = BindingFailureCode(m_Job);
+		if (!bindingFailureCode.IsEmpty())
 		{
-			FailAndRestore("CAPTURE_INVALIDATED", "Workbench lifecycle, target, world, or camera ownership changed during capture");
+			FailAndRestore(bindingFailureCode, "Workbench lifecycle, target, world, or camera ownership changed during capture");
 			message = m_Job.message;
 			return true;
 		}
 		if (!OnLeaseAcquiredBarrier(m_Job))
+		{
+			message = m_Job.message;
+			return true;
+		}
+		// A fixture-held restoration resumes here on the next ordinary Status
+		// call. Without a fixture the hook returns true in the same call that
+		// discovered a stable artifact, preserving production timing.
+		if (m_Job.state == EMCP_WB_ObserverProtocol.STATE_RESTORING)
+		{
+			if (m_Job.cameraLeaseHeld)
+			{
+				m_Job.message = "Artifact is ready; exact editor camera restoration is in progress";
+				if (!OnRestorationInProgressBarrier(m_Job))
+				{
+					message = m_Job.message;
+					return true;
+				}
+				if (!RestoreJob(m_Job))
+				{
+					m_RestorationProven = false;
+					m_Job.state = EMCP_WB_ObserverProtocol.STATE_FAILED;
+					m_Job.terminalErrorCode = EMCP_WB_ObserverProtocol.ERROR_RESTORATION_UNCONFIRMED;
+					m_Job.message = "Screenshot completed, but exact editor camera restoration could not be proven: " + m_LastRestorationDiagnostic;
+					m_Job.sequence++;
+					message = m_Job.message;
+					return true;
+				}
+				m_RestorationProven = true;
+			}
+			if (m_Job.restorationConfirmed)
+			{
+				m_Job.state = EMCP_WB_ObserverProtocol.STATE_COMPLETED;
+				m_Job.message = "Workbench PNG completed and exact editor camera state was restored";
+				m_Job.sequence++;
+				if (!OnTerminalReleaseBarrier(m_Job))
+				{
+					message = m_Job.message;
+					return true;
+				}
+				message = m_Job.message;
+				return true;
+			}
+		}
+
+		if (m_Job.screenshotIssued && !OnCaptureInProgressBarrier(m_Job))
 		{
 			message = m_Job.message;
 			return true;
@@ -588,6 +658,11 @@ class EMCP_WB_ObserverService
 			m_Job.state = EMCP_WB_ObserverProtocol.STATE_CAPTURING;
 			m_Job.message = "Screenshot issued; waiting for a stable artifact";
 			m_Job.sequence++;
+			if (!OnCaptureInProgressBarrier(m_Job))
+			{
+				message = m_Job.message;
+				return true;
+			}
 			message = m_Job.message;
 			return true;
 		}
@@ -642,7 +717,13 @@ class EMCP_WB_ObserverService
 
 		m_Job.artifactBytes = length;
 		m_Job.state = EMCP_WB_ObserverProtocol.STATE_RESTORING;
+		m_Job.message = "Artifact is ready; exact editor camera restoration is in progress";
 		m_Job.sequence++;
+		if (!OnRestorationInProgressBarrier(m_Job))
+		{
+			message = m_Job.message;
+			return true;
+		}
 		if (!RestoreJob(m_Job))
 		{
 			m_RestorationProven = false;
@@ -657,6 +738,11 @@ class EMCP_WB_ObserverService
 		m_Job.state = EMCP_WB_ObserverProtocol.STATE_COMPLETED;
 		m_Job.message = "Workbench PNG completed and exact editor camera state was restored";
 		m_Job.sequence++;
+		if (!OnTerminalReleaseBarrier(m_Job))
+		{
+			message = m_Job.message;
+			return true;
+		}
 		message = m_Job.message;
 		return true;
 	}
@@ -665,6 +751,15 @@ class EMCP_WB_ObserverService
 	{
 		if (!Matches(jobId, leaseId, lifecycleGeneration, canonicalTarget, message))
 			return false;
+		if (m_Job.state == EMCP_WB_ObserverProtocol.STATE_COMPLETED && !m_Job.cameraLeaseHeld && m_Job.restorationConfirmed)
+		{
+			m_Job.state = EMCP_WB_ObserverProtocol.STATE_CANCELLED;
+			m_Job.terminalErrorCode = string.Empty;
+			m_Job.message = "Workbench observer capture cancelled before artifact/reference release after exact camera restoration";
+			m_Job.sequence++;
+			message = m_Job.message;
+			return true;
+		}
 		if (m_Job.IsTerminal() && !m_Job.cameraLeaseHeld)
 		{
 			message = m_Job.message;
@@ -763,16 +858,29 @@ class EMCP_WB_ObserverService
 
 	protected bool BindingStillCurrent(EMCP_WB_ObserverJob job)
 	{
+		return BindingFailureCode(job).IsEmpty();
+	}
+
+	// Project/lifecycle drift and a real editor-world replacement are distinct
+	// public outcomes. Keep private activity-gate terminology out of the helper
+	// response so the host does not have to infer WORLD_CHANGED from a generic
+	// CAPTURE_INVALIDATED spelling.
+	protected string BindingFailureCode(EMCP_WB_ObserverJob job)
+	{
 		if (!job || !job.cameraLeaseHeld || !job.world)
-			return false;
+			return EMCP_WB_ObserverProtocol.ERROR_STALE_LIFECYCLE;
 		WorldEditor worldEditor = Workbench.GetModule(WorldEditor);
-		if (!worldEditor || !worldEditor.GetApi() || worldEditor.GetApi().GetWorld() != job.world)
-			return false;
+		if (!worldEditor || !worldEditor.GetApi())
+			return EMCP_WB_ObserverProtocol.ERROR_STALE_LIFECYCLE;
+		if (NormalizedPath(CurrentProjectFile()) != NormalizedPath(job.projectFile))
+			return EMCP_WB_ObserverProtocol.ERROR_STALE_LIFECYCLE;
+		if (worldEditor.GetApi().GetWorld() != job.world || CurrentWorldIdentity() != job.worldIdentity)
+			return EMCP_WB_ObserverProtocol.ERROR_WORLD_CHANGED;
 		if (worldEditor.GetApi().GetScreenWidth() != job.viewportWidth || worldEditor.GetApi().GetScreenHeight() != job.viewportHeight)
-			return false;
-		if (NormalizedPath(CurrentProjectFile()) != NormalizedPath(job.projectFile) || CurrentWorldIdentity() != job.worldIdentity)
-			return false;
-		return InstalledStateStillOwned(job);
+			return EMCP_WB_ObserverProtocol.ERROR_STALE_LIFECYCLE;
+		if (!InstalledStateStillOwned(job))
+			return EMCP_WB_ObserverProtocol.ERROR_STALE_LIFECYCLE;
+		return string.Empty;
 	}
 
 	protected void FailAndRestore(string code, string failureMessage)

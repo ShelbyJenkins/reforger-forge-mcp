@@ -125,9 +125,16 @@ describe("observer package and source contracts", () => {
     ];
     const repositoryOnlyAcceptanceSources = [
       "scripts/observer-live-acceptance-support.ts",
+      "scripts/observer-workbench-failure-support.ts",
       "scripts/run-runtime-observer-acceptance.ts",
       "scripts/run-workbench-build-acceptance.ts",
       "scripts/run-workbench-observer-acceptance.ts",
+      "scripts/workbench-observer-acceptance-adapter.ts",
+      "scripts/workbench-observer-acceptance-runtime.ts",
+      "scripts/workbench-observer-live-matrix-case.ts",
+      "scripts/workbench-observer-matrix-case.ts",
+      "tests/fixtures/workbench-observer-failure-matrix-addon",
+      "tests/fixtures/workbench-observer-failure-matrix-decoy.mjs",
     ];
     expect(packageJson.files).toEqual(expect.arrayContaining(observerReleaseAssets));
     expect(packageJson.files).toEqual(expect.not.arrayContaining(repositoryOnlyAcceptanceSources));
@@ -178,6 +185,7 @@ describe("observer package and source contracts", () => {
       "dist/workbench/managed-build-profile.js",
       "dist/workbench/net-api-client.js",
       "dist/workbench/observer-adapter.js",
+      "dist/workbench/observer-artifact-envelope.js",
       "dist/workbench/readiness.js",
       "dist/workbench/session-controller.js",
       "dist/workbench/session-state.js",

@@ -1,7 +1,7 @@
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { deflateSync } from "node:zlib";
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, expectTypeOf, it, vi } from "vitest";
 import type {
   WorkbenchCallOptions,
   WorkbenchCaptureActivityLease,
@@ -10,13 +10,56 @@ import type {
 import {
   WorkbenchObserverAdapter,
   workbenchCameraMatrix,
+  type WorkbenchObserverAdapterOptions,
   type WorkbenchObserverClient,
 } from "../../src/workbench/observer-adapter.js";
+import { WorkbenchObserverAcceptanceAdapter } from "../../scripts/workbench-observer-acceptance-adapter.js";
+import { createOneShotWorkbenchPngArtifactHook } from "../../scripts/observer-workbench-failure-support.js";
 import {
   companionLifecycleState,
   createFakeCompanionLaunch,
 } from "./fake-companion.js";
 import { withTemporaryDirectory } from "../support/temporary-directory.js";
+
+type ForbiddenProductionAdapterMethod = Extract<
+  keyof WorkbenchObserverAdapter,
+  | "armOneShotBeforeSubmitDelivery"
+  | "armOneShotBeforeRelease"
+  | "requireExactOwnerExit"
+  | "confirmExactOwnerExit"
+>;
+
+type ForbiddenProductionAdapterOption = Extract<
+  keyof WorkbenchObserverAdapterOptions,
+  "beforeArtifactValidation" | "verifyIdempotentReleaseReplay"
+>;
+
+describe("Workbench observer production adapter boundary", () => {
+  it("keeps repository acceptance controls out of the shipped public types", () => {
+    expectTypeOf<ForbiddenProductionAdapterMethod>().toEqualTypeOf<never>();
+    expectTypeOf<ForbiddenProductionAdapterOption>().toEqualTypeOf<never>();
+  });
+
+  it("keeps repository-only acceptance state out of the production implementation", () => {
+    const productionSource = readFileSync(
+      join(process.cwd(), "src", "workbench", "observer-adapter.ts"),
+      "utf8"
+    );
+    for (const acceptanceOnlyIdentifier of [
+      "armOneShotBeforeSubmitDelivery",
+      "armOneShotBeforeRelease",
+      "requireExactOwnerExit",
+      "confirmExactOwnerExit",
+      "exactOwnerExitRequired",
+      "exactOwnerExitConfirmed",
+      "artifactPreValidationInvoked",
+      "beforeArtifactValidation",
+      "verifyIdempotentReleaseReplay",
+    ]) {
+      expect(productionSource).not.toContain(acceptanceOnlyIdentifier);
+    }
+  });
+});
 
 function testCrc32(data: Buffer): number {
   let crc = 0xffffffff;
@@ -73,6 +116,11 @@ interface FakeOptions {
   loseFirstSubmitAcknowledgement?: boolean;
   loseFirstReleaseAcknowledgement?: boolean;
   corruptArtifact?: boolean;
+  completedArtifactOverrides?: Record<string, unknown>;
+  cancelResponseOverrides?: Record<string, unknown>;
+  failFirstCancel?: boolean;
+  releaseReplayOverrides?: Record<string, unknown>;
+  releaseReplayError?: Error;
 }
 
 class FakeObserverClient implements WorkbenchObserverClient {
@@ -86,6 +134,7 @@ class FakeObserverClient implements WorkbenchObserverClient {
   }> = [];
   readonly snapshot: WorkbenchObserverSnapshot;
   readonly releaseCaptureActivity = vi.fn();
+  readonly requireExactOwnerExit = vi.fn();
   readonly acquireCaptureActivity = vi.fn((snapshot: WorkbenchObserverSnapshot) => {
     const controller = new AbortController();
     this.controller = controller;
@@ -110,6 +159,8 @@ class FakeObserverClient implements WorkbenchObserverClient {
   submitMutations = 0;
   lostSubmitAcknowledgement = false;
   releaseMutations = 0;
+  releaseCalls = 0;
+  failedFirstCancel = false;
   lostReleaseAcknowledgement = false;
   releaseReceipt: Record<string, unknown> | null = null;
 
@@ -193,12 +244,21 @@ class FakeObserverClient implements WorkbenchObserverClient {
         artifactLogicalPath: `$profile:ReforgerForgeObserver/workbench/${String(params.jobId)}.png`,
         artifactPath: path,
         artifactBytes: bytes.length,
+        ...this.options.completedArtifactOverrides,
       }) as T;
     }
     if (apiFunc === "EMCP_WB_ObserverCancel") {
-      return this.jobResponse("cancelled", true, false, { terminalErrorCode: "CANCELLED" }) as T;
+      if (this.options.failFirstCancel && !this.failedFirstCancel) {
+        this.failedFirstCancel = true;
+        throw new Error("first cancel transport failed");
+      }
+      return this.jobResponse("cancelled", true, false, {
+        terminalErrorCode: "CANCELLED",
+        ...this.options.cancelResponseOverrides,
+      }) as T;
     }
     if (apiFunc === "EMCP_WB_ObserverRelease") {
+      this.releaseCalls += 1;
       if (!this.releaseReceipt) {
         this.releaseMutations += 1;
         this.releaseReceipt = {
@@ -215,7 +275,12 @@ class FakeObserverClient implements WorkbenchObserverClient {
         this.lostReleaseAcknowledgement = true;
         throw new Error("release response was lost after delivery");
       }
-      return this.releaseReceipt as T;
+      if (this.releaseCalls > 1 && this.options.releaseReplayError) {
+        throw this.options.releaseReplayError;
+      }
+      return this.releaseCalls > 1 && this.options.releaseReplayOverrides
+        ? { ...this.releaseReceipt, ...this.options.releaseReplayOverrides } as T
+        : this.releaseReceipt as T;
     }
     throw new Error(`unexpected handler ${apiFunc}`);
   }
@@ -302,6 +367,32 @@ describe("Workbench observer adapter", () => {
     expect(matrix[2]).toEqual([0, 1, 0]);
   });
 
+  scopedIt("evaluates a dynamic handler timeout at each native dispatch", async (root) => {
+    const client = fakeClient(root);
+    let timeoutMs = 4_321;
+    const adapter = new WorkbenchObserverAdapter(client, {
+      handlerTimeoutMs: () => timeoutMs,
+    });
+
+    await adapter.ping();
+    timeoutMs = 1_234;
+    await adapter.ping();
+
+    expect(client.calls.filter((call) => call.apiFunc === "EMCP_WB_ObserverPing")
+      .map((call) => call.options.timeout)).toEqual([4_321, 1_234]);
+  });
+
+  scopedIt("rejects an invalid static timeout at construction and a dynamic timeout at dispatch", async (root) => {
+    const client = fakeClient(root);
+    expect(() => new WorkbenchObserverAdapter(client, { handlerTimeoutMs: 0 }))
+      .toThrow("Workbench observer handler timeout must be a positive integer");
+
+    const dynamic = new WorkbenchObserverAdapter(client, { handlerTimeoutMs: () => 0 });
+    await expect(dynamic.ping()).rejects.toThrow(
+      "Workbench observer handler timeout must be a positive integer"
+    );
+  });
+
   scopedIt("captures current view through the exact owned client, validates the native PNG, and releases the gate", async (root) => {
     const client = fakeClient(root, { completeOnStatus: true });
     const adapter = new WorkbenchObserverAdapter(client, { createJobId: () => "job-current" });
@@ -328,6 +419,55 @@ describe("Workbench observer adapter", () => {
     expect(client.calls.some((call) => /ExecuteAction|Reload|Play|Save/.test(call.apiFunc))).toBe(false);
   });
 
+  scopedIt("cancels a restored completed job through the real handler until artifact release", async (root) => {
+    const client = fakeClient(root, { completeOnStatus: true });
+    const adapter = new WorkbenchObserverAcceptanceAdapter(client, { createJobId: () => "terminal-cancel" });
+
+    await adapter.submit({ view: { kind: "current" } });
+    await expect(adapter.status("terminal-cancel")).resolves.toMatchObject({
+      state: "completed",
+      cameraLeaseHeld: false,
+      restorationConfirmed: true,
+    });
+    await expect(adapter.cancel("terminal-cancel")).resolves.toMatchObject({
+      state: "cancelled",
+      cameraLeaseHeld: false,
+      restorationConfirmed: true,
+    });
+    expect(client.calls.filter((call) => call.apiFunc === "EMCP_WB_ObserverCancel")).toHaveLength(1);
+    expect(() => adapter.readCompletedArtifact("terminal-cancel")).toThrow(/no completed retained image/);
+  });
+
+  scopedIt("keeps production cancellation idempotent after a restored terminal", async (root) => {
+    const client = fakeClient(root, { completeOnStatus: true });
+    const adapter = new WorkbenchObserverAdapter(client, { createJobId: () => "production-terminal" });
+
+    await adapter.submit({ view: { kind: "current" } });
+    await adapter.status("production-terminal");
+    await expect(adapter.cancel("production-terminal")).resolves.toMatchObject({
+      state: "completed",
+      cameraLeaseHeld: false,
+      restorationConfirmed: true,
+    });
+    expect(client.calls.filter((call) => call.apiFunc === "EMCP_WB_ObserverCancel")).toHaveLength(0);
+  });
+
+  scopedIt("fails closed when the acceptance terminal Cancel does not prove cancelled restoration", async (root) => {
+    const client = fakeClient(root, {
+      completeOnStatus: true,
+      cancelResponseOverrides: { state: "failed", restorationConfirmed: false },
+    });
+    const adapter = new WorkbenchObserverAcceptanceAdapter(client, {
+      createJobId: () => "terminal-cancel-unproven",
+    });
+
+    await adapter.submit({ view: { kind: "current" } });
+    await adapter.status("terminal-cancel-unproven");
+    await expect(adapter.cancel("terminal-cancel-unproven")).rejects.toMatchObject({
+      code: "RESTORATION_UNCONFIRMED",
+    });
+  });
+
   scopedIt("rejects a corrupt native PNG after releasing the already-restored lifecycle gate", async (root) => {
     const client = fakeClient(root, { completeOnStatus: true, corruptArtifact: true });
     const adapter = new WorkbenchObserverAdapter(client, { createJobId: () => "corrupt-png" });
@@ -338,6 +478,94 @@ describe("Workbench observer adapter", () => {
     await expect(adapter.release("corrupt-png")).resolves.toMatchObject({
       restorationConfirmed: true,
     });
+  });
+
+  scopedIt("runs a one-shot fixture mutation after restored-terminal preflight and immediately before PNG validation", async (root) => {
+    const client = fakeClient(root, { completeOnStatus: true });
+    const mutate = createOneShotWorkbenchPngArtifactHook("crc_corruption");
+    let mutationResult: ReturnType<typeof mutate> | undefined;
+    const beforeArtifactValidation = vi.fn((context) => {
+      expect(Object.isFrozen(context)).toBe(true);
+      expect(readFileSync(context.artifactPath).subarray(0, 8)).toEqual(
+        Buffer.from([137, 80, 78, 71, 13, 10, 26, 10])
+      );
+      mutationResult = mutate(context);
+    });
+    const adapter = new WorkbenchObserverAcceptanceAdapter(client, {
+      createJobId: () => "pre-validation-crc",
+      beforeArtifactValidation,
+    });
+
+    await adapter.submit({ view: { kind: "current" } });
+    await expect(adapter.status("pre-validation-crc")).rejects.toMatchObject({
+      code: "ARTIFACT_INVALID",
+    });
+
+    expect(beforeArtifactValidation).toHaveBeenCalledTimes(1);
+    expect(beforeArtifactValidation).toHaveBeenCalledWith(expect.objectContaining({
+      jobId: "pre-validation-crc",
+      artifactBytes: expect.any(Number),
+      cameraLeaseHeld: false,
+      restorationConfirmed: true,
+    }));
+    expect(mutationResult).toMatchObject({
+      mutation: "crc_corruption",
+      byteLengthChanged: false,
+    });
+    expect(client.releaseCaptureActivity).toHaveBeenCalledTimes(1);
+
+    // The terminal status retained after validation failure does not run the
+    // mutation callback a second time.
+    await expect(adapter.status("pre-validation-crc")).resolves.toMatchObject({
+      state: "completed",
+      restorationConfirmed: true,
+    });
+    expect(beforeArtifactValidation).toHaveBeenCalledTimes(1);
+  });
+
+  scopedIt("does not expose an unbound artifact path to the pre-validation hook", async (root) => {
+    const client = fakeClient(root, {
+      completeOnStatus: true,
+      completedArtifactOverrides: { artifactPath: join(root, "unbound.png") },
+    });
+    const beforeArtifactValidation = vi.fn();
+    const adapter = new WorkbenchObserverAcceptanceAdapter(client, {
+      createJobId: () => "unbound-artifact",
+      beforeArtifactValidation,
+    });
+
+    await adapter.submit({ view: { kind: "current" } });
+    await expect(adapter.status("unbound-artifact")).rejects.toMatchObject({
+      code: "ARTIFACT_INVALID",
+    });
+    expect(beforeArtifactValidation).not.toHaveBeenCalled();
+    expect(client.releaseCaptureActivity).toHaveBeenCalledTimes(1);
+  });
+
+  scopedIt("maps a pre-validation callback failure to a bounded artifact error after restoration", async (root) => {
+    const client = fakeClient(root, { completeOnStatus: true });
+    const beforeArtifactValidation = vi.fn(() => {
+      throw new Error("C:\\private-user\\artifact-path-sentinel.png");
+    });
+    const adapter = new WorkbenchObserverAcceptanceAdapter(client, {
+      createJobId: () => "hook-failure",
+      beforeArtifactValidation,
+    });
+
+    await adapter.submit({ view: { kind: "current" } });
+    let failure: unknown;
+    try {
+      await adapter.status("hook-failure");
+    } catch (error) {
+      failure = error;
+    }
+    expect(failure).toMatchObject({
+      code: "ARTIFACT_INVALID",
+      message: "Workbench artifact pre-validation hook failed",
+    });
+    expect(String(failure)).not.toContain("private-user");
+    expect(beforeArtifactValidation).toHaveBeenCalledTimes(1);
+    expect(client.releaseCaptureActivity).toHaveBeenCalledTimes(1);
   });
 
   scopedIt("normalizes Enforce numeric boolean responses at the adapter boundary", async (root) => {
@@ -465,6 +693,223 @@ describe("Workbench observer adapter", () => {
       "EMCP_WB_ObserverRelease",
     ]));
     expect(client.releaseMutations).toBe(1);
+  });
+
+  scopedIt("retains acceptance facade state when restoreAll needs a retry", async (root) => {
+    const client = fakeClient(root, { failFirstCancel: true });
+    const adapter = new WorkbenchObserverAcceptanceAdapter(client, {
+      createJobId: () => "retry-shutdown-job",
+    });
+    await adapter.submit({ view: { kind: "current" } });
+
+    await expect(adapter.restoreAll()).rejects.toThrow(
+      "One or more Workbench observer camera leases could not be restored"
+    );
+    expect(client.calls.filter((call) => call.apiFunc === "EMCP_WB_ObserverCancel"))
+      .toHaveLength(1);
+    expect(client.calls.filter((call) => call.apiFunc === "EMCP_WB_ObserverRelease"))
+      .toHaveLength(0);
+
+    await expect(adapter.restoreAll()).resolves.toBeUndefined();
+    expect(client.calls.filter((call) => call.apiFunc === "EMCP_WB_ObserverCancel"))
+      .toHaveLength(2);
+    expect(client.calls.filter((call) => call.apiFunc === "EMCP_WB_ObserverRelease"))
+      .toHaveLength(1);
+    expect(client.releaseCaptureActivity).toHaveBeenCalledOnce();
+  });
+
+  scopedIt("keeps terminal release replay disabled by default", async (root) => {
+    const client = fakeClient(root);
+    const adapter = new WorkbenchObserverAdapter(client, { createJobId: () => "ordinary-release" });
+    await adapter.submit({ view: { kind: "current" } });
+    await adapter.cancel("ordinary-release");
+
+    await expect(adapter.release("ordinary-release")).resolves.toEqual({
+      jobId: "ordinary-release",
+      restorationConfirmed: true,
+      artifactRemoved: true,
+    });
+    expect(client.calls.filter((call) => call.apiFunc === "EMCP_WB_ObserverRelease"))
+      .toHaveLength(1);
+    expect(client.releaseMutations).toBe(1);
+  });
+
+  scopedIt("replays the identical real Release request once and reports equivalent acknowledgement evidence", async (root) => {
+    const client = fakeClient(root, {
+      releaseReplayOverrides: { message: "already released" },
+    });
+    const adapter = new WorkbenchObserverAcceptanceAdapter(client, {
+      createJobId: () => "duplicate-release",
+      createLeaseId: () => "duplicate-release-lease",
+      verifyIdempotentReleaseReplay: true,
+    });
+    await adapter.submit({ view: { kind: "current" } });
+    await adapter.cancel("duplicate-release");
+
+    await expect(adapter.release("duplicate-release")).resolves.toEqual({
+      jobId: "duplicate-release",
+      restorationConfirmed: true,
+      artifactRemoved: true,
+      idempotentReplay: {
+        attempted: true,
+        identicalRequest: true,
+        equivalentAcknowledgement: true,
+      },
+    });
+    const releases = client.calls.filter((call) => call.apiFunc === "EMCP_WB_ObserverRelease");
+    expect(releases).toHaveLength(2);
+    expect(releases[0]?.params).toBe(releases[1]?.params);
+    expect(Object.isFrozen(releases[0]?.params)).toBe(true);
+    expect(releases[0]?.params).toEqual({
+      jobId: "duplicate-release",
+      leaseId: "duplicate-release-lease",
+      lifecycleGeneration: "generation-a",
+      canonicalTarget: client.project,
+    });
+    expect(client.releaseMutations).toBe(1);
+  });
+
+  scopedIt("fails replay evidence on a non-equivalent acknowledgement but still retires the proven released job", async (root) => {
+    const client = fakeClient(root, {
+      completeOnStatus: true,
+      releaseReplayOverrides: { artifactRemoved: false },
+    });
+    const adapter = new WorkbenchObserverAcceptanceAdapter(client, {
+      createJobId: () => "mismatched-release",
+      verifyIdempotentReleaseReplay: true,
+    });
+    await adapter.submit({ view: { kind: "current" } });
+    await adapter.status("mismatched-release");
+
+    await expect(adapter.release("mismatched-release")).rejects.toMatchObject({
+      code: "HANDLER_REJECTED",
+      message: expect.stringMatching(/equivalent acknowledgement/),
+    });
+    const releases = client.calls.filter((call) => call.apiFunc === "EMCP_WB_ObserverRelease");
+    expect(releases).toHaveLength(2);
+    expect(releases[0]?.params).toBe(releases[1]?.params);
+    expect(client.releaseMutations).toBe(1);
+    await expect(adapter.release("mismatched-release")).rejects.toMatchObject({
+      code: "JOB_NOT_FOUND",
+    });
+    expect(() => adapter.readCompletedArtifact("mismatched-release")).toThrowError(
+      expect.objectContaining({ code: "JOB_NOT_FOUND" })
+    );
+  });
+
+  scopedIt("does not synthesize a replay acknowledgement when the second real call fails", async (root) => {
+    const client = fakeClient(root, {
+      releaseReplayError: new Error("real replay transport failed"),
+    });
+    const adapter = new WorkbenchObserverAcceptanceAdapter(client, {
+      createJobId: () => "failed-release-replay",
+      verifyIdempotentReleaseReplay: true,
+    });
+    await adapter.submit({ view: { kind: "current" } });
+    await adapter.cancel("failed-release-replay");
+
+    await expect(adapter.release("failed-release-replay")).rejects.toMatchObject({
+      code: "HANDLER_UNAVAILABLE",
+      message: "real replay transport failed",
+    });
+    expect(client.calls.filter((call) => call.apiFunc === "EMCP_WB_ObserverRelease"))
+      .toHaveLength(2);
+    expect(client.releaseMutations).toBe(1);
+    await expect(adapter.release("failed-release-replay")).rejects.toMatchObject({
+      code: "JOB_NOT_FOUND",
+    });
+  });
+
+  scopedIt("marks one retained job for exact owner exit without claiming ordinary gate release", async (root) => {
+    const client = fakeClient(root);
+    const adapter = new WorkbenchObserverAcceptanceAdapter(client, { createJobId: () => "exit-required-job" });
+    await adapter.submit({ view: { kind: "current" } });
+    const activityLease = client.acquireCaptureActivity.mock.results[0]!.value;
+
+    adapter.requireExactOwnerExit("exit-required-job");
+    adapter.requireExactOwnerExit("exit-required-job");
+
+    expect(client.requireExactOwnerExit).toHaveBeenCalledOnce();
+    expect(client.requireExactOwnerExit).toHaveBeenCalledWith(activityLease);
+    expect(client.releaseCaptureActivity).not.toHaveBeenCalled();
+    expect(() => adapter.requireExactOwnerExit("unknown-job")).toThrow(
+      expect.objectContaining({ code: "JOB_NOT_FOUND" })
+    );
+  });
+
+  scopedIt("runs exact owner shutdown after lease creation but before Submit delivery", async (root) => {
+    const client = fakeClient(root);
+    const adapter = new WorkbenchObserverAcceptanceAdapter(client, {
+      createJobId: () => "before-submit-exit",
+    });
+    const beforeSubmit = vi.fn(async (context: { readonly jobId: string }) => {
+      adapter.requireExactOwnerExit(context.jobId);
+      return { exactOwnerVacant: true } as const;
+    });
+    adapter.armOneShotBeforeSubmitDelivery(beforeSubmit);
+
+    await expect(adapter.submit({ view: { kind: "current" } })).rejects.toMatchObject({
+      code: "WORKBENCH_EXITED",
+    });
+    expect(beforeSubmit).toHaveBeenCalledOnce();
+    expect(client.requireExactOwnerExit).toHaveBeenCalledOnce();
+    expect(client.calls.filter((call) => call.apiFunc === "EMCP_WB_ObserverSubmit")).toHaveLength(0);
+    expect(client.releaseCaptureActivity).toHaveBeenCalledOnce();
+  });
+
+  scopedIt("does not bypass a failed before-submit hook on the bounded Submit retry", async (root) => {
+    const client = fakeClient(root);
+    const adapter = new WorkbenchObserverAcceptanceAdapter(client, {
+      createJobId: () => "failed-before-submit",
+    });
+    const beforeSubmit = vi.fn(async () => {
+      throw new Error("injected before-submit failure");
+    });
+    adapter.armOneShotBeforeSubmitDelivery(beforeSubmit);
+
+    await expect(adapter.submit({ view: { kind: "current" } })).rejects.toThrow(
+      "injected before-submit failure"
+    );
+    expect(beforeSubmit).toHaveBeenCalledOnce();
+    expect(client.calls.filter((call) => call.apiFunc === "EMCP_WB_ObserverSubmit"))
+      .toHaveLength(0);
+    expect(client.releaseCaptureActivity).toHaveBeenCalledOnce();
+  });
+
+  scopedIt("converges retained adapter state only after affirmative exact owner vacancy", async (root) => {
+    const client = fakeClient(root);
+    const adapter = new WorkbenchObserverAcceptanceAdapter(client, { createJobId: () => "confirmed-exit-job" });
+    await adapter.submit({ view: { kind: "current" } });
+
+    expect(() => adapter.confirmExactOwnerExit("confirmed-exit-job", true)).toThrow(
+      expect.objectContaining({ code: "INVALID_REQUEST" })
+    );
+
+    adapter.requireExactOwnerExit("confirmed-exit-job");
+    expect(() => adapter.confirmExactOwnerExit("confirmed-exit-job", false)).toThrow(
+      expect.objectContaining({ code: "RESTORATION_UNCONFIRMED" })
+    );
+
+    const terminal = adapter.confirmExactOwnerExit("confirmed-exit-job", true);
+    expect(terminal).toMatchObject({
+      state: "failed",
+      terminalErrorCode: "WORKBENCH_EXITED",
+      cameraLeaseHeld: false,
+      restorationConfirmed: false,
+    });
+    expect(adapter.confirmExactOwnerExit("confirmed-exit-job", true)).toEqual(terminal);
+    expect(client.calls.filter((call) => call.apiFunc === "EMCP_WB_ObserverCancel")).toHaveLength(0);
+    expect(client.calls.filter((call) => call.apiFunc === "EMCP_WB_ObserverRelease")).toHaveLength(0);
+    await expect(adapter.release("confirmed-exit-job")).resolves.toEqual({
+      jobId: "confirmed-exit-job",
+      restorationConfirmed: false,
+      artifactRemoved: false,
+    });
+    expect(client.releaseCaptureActivity).toHaveBeenCalledOnce();
+    expect(() => adapter.readCompletedArtifact("confirmed-exit-job")).toThrow(
+      expect.objectContaining({ code: "JOB_NOT_FOUND" })
+    );
+    await expect(adapter.restoreAll()).resolves.toBeUndefined();
   });
 
   scopedIt("graceful restoreAll releases a completed gate-released handler job", async (root) => {

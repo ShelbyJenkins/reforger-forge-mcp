@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
-import { lstatSync, readFileSync, realpathSync } from "node:fs";
-import { basename, dirname, isAbsolute, resolve } from "node:path";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { inflateSync } from "node:zlib";
 import { z } from "zod";
 import {
@@ -16,6 +16,7 @@ import type {
   WorkbenchCaptureActivityLease,
   WorkbenchObserverSnapshot,
 } from "./client.js";
+import { inspectWorkbenchObserverArtifactEnvelope } from "./observer-artifact-envelope.js";
 
 const TERMINAL_STATES = new Set<string>(WORKBENCH_ADAPTER_TERMINAL_STATES);
 const DEFAULT_HANDLER_TIMEOUT_MS = 5_000;
@@ -175,8 +176,15 @@ export interface WorkbenchObserverInstance {
   readinessMessage: string;
 }
 
+export interface WorkbenchObserverReleaseResult {
+  readonly jobId: string;
+  readonly restorationConfirmed: boolean;
+  readonly artifactRemoved: boolean;
+}
+
 export interface WorkbenchObserverAdapterOptions {
-  handlerTimeoutMs?: number;
+  /** A callback is evaluated at handler dispatch for absolute-deadline callers. */
+  handlerTimeoutMs?: number | (() => number);
   maxArtifactBytes?: number;
   maxPixels?: number;
   createJobId?: () => string;
@@ -341,7 +349,7 @@ function positiveInteger(value: number | undefined, fallback: number, label: str
 }
 
 export class WorkbenchObserverAdapter {
-  private readonly handlerTimeoutMs: number;
+  private readonly handlerTimeoutMs: () => number;
   private readonly maxArtifactBytes: number;
   private readonly maxPixels: number;
   private readonly createJobId: () => string;
@@ -353,7 +361,17 @@ export class WorkbenchObserverAdapter {
     private readonly client: WorkbenchObserverClient,
     options: WorkbenchObserverAdapterOptions = {}
   ) {
-    this.handlerTimeoutMs = positiveInteger(options.handlerTimeoutMs, DEFAULT_HANDLER_TIMEOUT_MS, "Workbench observer handler timeout");
+    const handlerTimeout = options.handlerTimeoutMs ?? DEFAULT_HANDLER_TIMEOUT_MS;
+    if (typeof handlerTimeout === "function") {
+      this.handlerTimeoutMs = handlerTimeout;
+    } else {
+      const validatedHandlerTimeout = positiveInteger(
+        handlerTimeout,
+        DEFAULT_HANDLER_TIMEOUT_MS,
+        "Workbench observer handler timeout"
+      );
+      this.handlerTimeoutMs = () => validatedHandlerTimeout;
+    }
     this.maxArtifactBytes = positiveInteger(options.maxArtifactBytes, DEFAULT_MAX_ARTIFACT_BYTES, "Workbench observer artifact limit");
     this.maxPixels = positiveInteger(options.maxPixels, DEFAULT_MAX_PIXELS, "Workbench observer pixel limit");
     this.createJobId = options.createJobId ?? (() => randomUUID());
@@ -464,9 +482,18 @@ export class WorkbenchObserverAdapter {
       let response: z.infer<typeof jobResponseSchema>;
       try {
         response = await this.handlerJobCall("EMCP_WB_ObserverSubmit", submitRequest);
-      } catch {
+      } catch (error) {
         deliveryUncertain = true;
         this.convergeAbort(record);
+        const exitReason = record.activityLease.signal.reason as { code?: unknown; message?: unknown } | undefined;
+        if (exitReason?.code === WORKBENCH_ADAPTER_ERROR_CODES.WORKBENCH_EXITED) {
+          throw new WorkbenchObserverAdapterError(
+            WORKBENCH_ADAPTER_ERROR_CODES.WORKBENCH_EXITED,
+            typeof exitReason.message === "string"
+              ? exitReason.message
+              : "The exact owned Workbench process exited during observer Submit"
+          );
+        }
         if (record.gateReleased) {
           throw new WorkbenchObserverAdapterError(WORKBENCH_ADAPTER_ERROR_CODES.HANDLER_UNAVAILABLE, "Workbench exited before observer submit acknowledgement");
         }
@@ -616,7 +643,7 @@ export class WorkbenchObserverAdapter {
     return this.cancelBound(record);
   }
 
-  async release(jobId: string): Promise<{ jobId: string; restorationConfirmed: boolean; artifactRemoved: boolean }> {
+  async release(jobId: string): Promise<WorkbenchObserverReleaseResult> {
     const record = this.requireJob(jobId);
     this.convergeAbort(record);
     if (record.lastStatus?.terminalErrorCode === WORKBENCH_ADAPTER_ERROR_CODES.WORKBENCH_EXITED) {
@@ -641,14 +668,14 @@ export class WorkbenchObserverAdapter {
     const parsed = releaseResponseSchema.safeParse(raw);
     if (!parsed.success) throw new WorkbenchObserverAdapterError(WORKBENCH_ADAPTER_ERROR_CODES.HANDLER_UNAVAILABLE, "Workbench observer release returned an invalid response");
     if (parsed.data.status !== "ok") throw new WorkbenchObserverAdapterError(WORKBENCH_ADAPTER_ERROR_CODES.HANDLER_REJECTED, parsed.data.message);
-    if (parsed.data.restorationConfirmed) {
-      record.released = true;
-      this.jobs.delete(jobId);
-      this.completedImages.delete(jobId);
-      this.releaseGate(record);
-    } else {
+    if (!parsed.data.restorationConfirmed) {
       throw new WorkbenchObserverAdapterError(WORKBENCH_ADAPTER_ERROR_CODES.RESTORATION_UNCONFIRMED, parsed.data.message);
     }
+
+    record.released = true;
+    this.jobs.delete(jobId);
+    this.completedImages.delete(jobId);
+    this.releaseGate(record);
     return {
       jobId,
       restorationConfirmed: parsed.data.restorationConfirmed,
@@ -755,7 +782,14 @@ export class WorkbenchObserverAdapter {
   }
 
   private callOptions(): WorkbenchCallOptions {
-    return { skipAutoLaunch: true, timeout: this.handlerTimeoutMs };
+    return {
+      skipAutoLaunch: true,
+      timeout: positiveInteger(
+        this.handlerTimeoutMs(),
+        DEFAULT_HANDLER_TIMEOUT_MS,
+        "Workbench observer handler timeout"
+      ),
+    };
   }
 
   private boundRequest(record: AdapterJobRecord): Record<string, unknown> {
@@ -814,49 +848,38 @@ export class WorkbenchObserverAdapter {
         farPlane: response.farPlane,
       },
     };
-    if (response.state === WORKBENCH_ADAPTER_STATE_VALUES.COMPLETED && validateArtifact) result.artifact = this.validateArtifact(record, response);
+    if (response.state === WORKBENCH_ADAPTER_STATE_VALUES.COMPLETED && validateArtifact) {
+      result.artifact = this.validateArtifact(record, response);
+    }
     if (response.terminalErrorCode === WORKBENCH_ADAPTER_ERROR_CODES.RESTORATION_UNCONFIRMED) {
       result.terminalErrorCode = WORKBENCH_ADAPTER_ERROR_CODES.RESTORATION_UNCONFIRMED;
     }
     return result;
   }
 
+  private inspectArtifactEnvelope(
+    record: AdapterJobRecord,
+    response: z.infer<typeof jobResponseSchema>
+  ) {
+    const inspection = inspectWorkbenchObserverArtifactEnvelope({
+      jobId: record.jobId,
+      profilePath: record.snapshot.companion.profilePath,
+      artifactLogicalPath: response.artifactLogicalPath,
+      artifactPath: response.artifactPath,
+      artifactBytes: response.artifactBytes,
+      maxArtifactBytes: this.maxArtifactBytes,
+    });
+    if (!inspection.ok) {
+      throw new WorkbenchObserverAdapterError(inspection.code, inspection.message);
+    }
+    return { canonical: inspection.canonicalPath, info: inspection.info };
+  }
+
   private validateArtifact(
     record: AdapterJobRecord,
     response: z.infer<typeof jobResponseSchema>
   ): WorkbenchObserverArtifact {
-    const expectedLogical = `$profile:ReforgerForgeObserver/workbench/${record.jobId}.png`;
-    const expectedPhysical = resolve(
-      record.snapshot.companion.profilePath,
-      "profile",
-      "ReforgerForgeObserver",
-      "workbench",
-      `${record.jobId}.png`
-    );
-    if (response.artifactLogicalPath !== expectedLogical || !isAbsolute(response.artifactPath) ||
-        basename(response.artifactPath).toLowerCase() !== `${record.jobId.toLowerCase()}.png` ||
-        !samePath(response.artifactPath, expectedPhysical)) {
-      throw new WorkbenchObserverAdapterError(WORKBENCH_ADAPTER_ERROR_CODES.ARTIFACT_INVALID, "Workbench returned an unexpected generated artifact path");
-    }
-    const captureDirectory = dirname(response.artifactPath);
-    if (basename(captureDirectory).toLowerCase() !== "workbench" ||
-        basename(dirname(captureDirectory)).toLowerCase() !== "reforgerforgeobserver") {
-      throw new WorkbenchObserverAdapterError(WORKBENCH_ADAPTER_ERROR_CODES.ARTIFACT_INVALID, "Workbench artifact escaped the generated profile capture directory");
-    }
-    const info = lstatSync(response.artifactPath);
-    if (!info.isFile() || info.isSymbolicLink()) {
-      throw new WorkbenchObserverAdapterError(WORKBENCH_ADAPTER_ERROR_CODES.ARTIFACT_INVALID, "Workbench artifact is not a regular file");
-    }
-    if (info.size <= 33 || info.size > this.maxArtifactBytes) {
-      throw new WorkbenchObserverAdapterError(WORKBENCH_ADAPTER_ERROR_CODES.ARTIFACT_TOO_LARGE, "Workbench artifact is empty or exceeds the reviewed size bound");
-    }
-    if (response.artifactBytes !== info.size) {
-      throw new WorkbenchObserverAdapterError(WORKBENCH_ADAPTER_ERROR_CODES.ARTIFACT_INVALID, "Workbench artifact length changed after stable completion");
-    }
-    const canonical = realpathSync.native(response.artifactPath);
-    if (!samePath(canonical, response.artifactPath)) {
-      throw new WorkbenchObserverAdapterError(WORKBENCH_ADAPTER_ERROR_CODES.ARTIFACT_INVALID, "Workbench artifact path changed during canonicalization");
-    }
+    const { canonical, info } = this.inspectArtifactEnvelope(record, response);
     const bytes = readFileSync(canonical);
     const dimensions = this.validatePng(bytes);
     this.completedImages.set(record.jobId, bytes);

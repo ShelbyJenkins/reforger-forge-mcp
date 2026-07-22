@@ -1,6 +1,7 @@
 # Local observer failure matrix — Phase 3: Workbench matrix and closeout
 
-**Status:** Implementation-ready plan  
+**Status:** Implemented in code and hermetic tests; gated live Workbench matrix,
+deliberate assertion-mutation review, and maintainer closeout outstanding
 **Scope:** Disposable Workbench fault coverage, exact-identity decoy safety,
 remaining behavioral-ownership work, and final maintainer acceptance.
 
@@ -13,9 +14,8 @@ and the proven execution/evidence approach from
 [Phase 2: runtime matrix](1-independent-local-observer-failure-matrix-phase-2-runtime.md).
 
 The original plan remains the authority for scope, safety constraints, and
-completion criteria. This document only turns its Workbench and closeout work
-into ordered repository changes; do not edit or replace the original plan as
-part of this phase.
+completion criteria. This document records the implemented Workbench design
+and the still-open maintainer closeout.
 
 ## Objective
 
@@ -24,7 +24,7 @@ project, that every declared Workbench fault reaches its public bounded result
 and leaves either a restored editor camera or an exactly verified owned-process
 exit. The run must also prove that an unrelated decoy process was untouched.
 
-## Phase-entry gate
+## Phase-entry gate and current qualification state
 
 Do not start a live Workbench case until Phase 1 has supplied the shared matrix
 definition, scheduler, capability-gated barrier contract, redaction policy,
@@ -46,28 +46,76 @@ Before the first case, confirm all of the following:
   `assertNoArmaOrWorkbench()`.
 - The generated fixture owns two blank worlds, `ObserverMatrixA` and
   `ObserverMatrixB`. They are the only resources a fault case may open. This
-  gives the world-loss case a headless, prompt-free target; do not use a
-  maintainer world, Save/Save As, generic menu execution, or UI automation.
+  gives the world-loss case its bounded native target; the gated run must still
+  establish that switching between them is prompt-free. Do not use a maintainer
+  world, Save/Save As, generic menu execution, or UI automation.
 - The local evidence root is outside the repository, and `docs/validation/`
   remains ignored. The runner may write a short-lived reviewed matrix artifact
   there, but it must not add a git exception for it.
 
-Begin with one vertical slice before implementing the full table:
-`WB-CANCEL-LEASE-ACQUIRED-POSE`. It must launch the disposable project, prove
-the `lease_acquired` barrier from observable job state, cancel through
-`ObserverApplication.cancelJob`, observe `cancelled`/`CANCELLED` with
-`cameraLeaseHeld=false` and `restorationConfirmed=true`, release the job, run a
-follow-up current capture, and establish Workbench/endpoint/process vacancy.
-Record the measured launch, case, and cleanup time. Do not expand the case
-inventory until this slice works without timing sleeps.
+The initial `workbench.cancel_capture.lease_acquired.pose` cancellation
+checkpoint has been completed and superseded by the full implementation. The shared catalog now
+contains all 69 Workbench declarations, the helper exposes all five passive
+barriers, and the fixture authorizer is general rather than case-hardcoded.
+That case remains useful with `--only` as a selected-case diagnostic, but it is
+not the scope of Phase 3 and is not retained live proof of the full matrix.
+
+No gated Workbench failure-matrix run has been recorded for this revision.
+The implementation and hermetic contracts described below must not be read as
+a claim that the 69 cases passed in Workbench or that retained images were
+manually reviewed.
+
+## Implemented repository state
+
+- `observer/protocol/fault-matrix.ts` declares 69 canonical Workbench cases:
+  3 completion, 12 cancellation, 15 handler-loss, 3 lease-contention,
+  15 world-loss, 3 artifact-corruption, 15 owned-shutdown, and
+  3 terminal-release replay cases.
+- `EMCP_WB_ObserverCommon.c` supplies default-inert hooks for
+  `before_lease`, `lease_acquired`, `capture_in_progress`,
+  `restoration_in_progress`, and `terminal_release`. The generated fixture
+  overrides all five and includes `RFO_WorkbenchObserverMatrixPlugin` to drain
+  its capability-gated, lifecycle-bound file control channel.
+- The Workbench matrix orchestration is serial. A full run uses fresh
+  per-case project/profile/lifecycle/control state and publishes one full
+  artifact; `--only <case-id>` runs one selected case and publishes explicit
+  partial coverage. No selector preserves the five-view positive acceptance;
+  `--matrix` is therefore required for the full failure matrix.
+- `ObserverFailureMatrixArtifact` is schema version 3. It records full versus
+  partial coverage, source commit/tree state, structured barrier, PNG/metadata,
+  manifest, exact-owner, decoy, cleanup, and per-case limitation evidence.
+  A full passing artifact requires a clean 40-hex commit and every declared
+  backend case in canonical order.
+- Repository-only acceptance composition owns one-shot real-handler transport
+  loss, pre-validation PNG mutation, idempotent release replay, exact-exit
+  confirmation, and exact-identity decoy comparison. These controls and their
+  mutable records do not live in the production `WorkbenchObserverAdapter`.
+  The shared production lifecycle seal remains a general owner-scoped shutdown
+  safety primitive: it releases an unprovable capture wait only into the
+  owned-shutdown path and does not claim camera restoration. Shutdown compares
+  the sealed lifecycle, target, PID, executable path, and creation time before
+  reservation and rechecks target and process identity immediately before
+  signaling. Any mismatch returns `IDENTITY_UNVERIFIABLE`, retains the seal,
+  and performs no termination call.
+- `WorkbenchObserverAcceptanceRuntime` owns the shared disposable-directory,
+  client, adapter, application, recovery, and process-baseline composition used
+  by both positive and matrix acceptance. `WorkbenchMatrixCaseExecution` and
+  `WorkbenchLiveMatrixCaseExecution` hold dispatcher and live-case state in
+  named fields and split setup, execution, cleanup, and closeout into bounded
+  methods; the CLI runner now coordinates those modules instead of containing
+  either state machine.
+- Hermetic catalog, authorizer, fixture-envelope, phase-hook, transport,
+  artifact, release, decoy, exact-exit, evidence, redaction, runner, and CI
+  isolation tests are present. Native Workbench execution and manual evidence
+  review remain the phase-exit gate.
 
 ## Work assigned to this phase
 
 - Add Workbench phase barriers and run every Workbench case serially, with a
   fresh preflight vacancy check for each case (original plan Task 3).
-- Start with the vertical slice above, then add the declared success,
+- Expand the completed cancellation checkpoint into the declared success,
   transport-loss, lease-contention, world-loss, artifact-failure, cancellation,
-  and exact-owned-shutdown cases.
+  owned-shutdown, and terminal-release cases.
 - Reuse the existing Workbench handler, adapter, exact-owner guard, restoration
   path, PNG validators, and evidence writer. Do not add a public fault-control
   MCP tool, a general Workbench command executor, or a PID/name kill path.
@@ -77,7 +125,7 @@ inventory until this slice works without timing sleeps.
   narrow static ownership rules (remaining original plan Task 6).
 - Run the final local runtime and Workbench acceptance commands, review the
   temporary artifacts, and complete the documented local-evidence closeout
-  (original plan Task 7).
+  (original plan Task 7). This final item remains outstanding.
 
 ## Not in this phase
 
@@ -91,22 +139,22 @@ inventory until this slice works without timing sleeps.
 
 ## Implementation sequence
 
-### 1. Add a fixture-only Workbench barrier
+### 1. Fixture-only Workbench barriers
 
-Create a non-shipped fixture under
+The non-shipped fixture lives under
 `tests/fixtures/workbench-observer-failure-matrix-addon/`. Its Workbench plugin
-should be named `RFO_WorkbenchObserverMatrixPlugin` and must be staged only
+is `RFO_WorkbenchObserverMatrixPlugin` and is staged only
 inside the generated project/profile of the live matrix harness. It must not be
 listed in `package.json` `files`, added to the production helper payload, or
 registered as an MCP tool or a `NetApiHandler`.
 
-Extend `createDisposableProject()` in
-`scripts/run-workbench-observer-acceptance.ts` to copy the fixture source and
-generate both disposable worlds. Extend that harness's existing `spawnProcess`
-override to append only the fixed fixture plugin argument for matrix runs; keep
-the current `-forceUpdate` behavior and record the redacted launch-argument
-identity. Add the fixture source to `WORKBENCH_OPERATIONAL_BASELINE_SOURCES`
-and its source closure to the matrix source hash.
+`createDisposableProject()` in
+`scripts/run-workbench-observer-acceptance.ts` copies the fixture source and
+generates both disposable worlds. The harness's `spawnProcess` override appends
+only the fixed fixture plugin argument for matrix runs, retains the current
+`-forceUpdate` behavior, and records the redacted launch-argument identity.
+The fixture source participates in `WORKBENCH_OPERATIONAL_BASELINE_SOURCES`
+and the matrix source hash.
 
 The plugin is an observer, not a command surface. It may receive a passive
 phase notification from the helper and exchange files only beneath its own
@@ -114,9 +162,8 @@ generated `$profile:RFOWorkbenchObserverMatrix/` directory. The production
 helper must retain exactly its five observer NET API handlers:
 `Ping`, `Submit`, `Status`, `Cancel`, and `Release`.
 
-Add the smallest passive phase hook needed in
-`EMCP_WB_ObserverCommon.c`. It must publish the following product-observable
-boundaries, not source-line labels:
+`EMCP_WB_ObserverCommon.c` exposes five protected passive hooks at the following
+product-observable boundaries, not source-line labels:
 
 | Matrix phase | Proof supplied by the helper |
 | --- | --- |
@@ -131,15 +178,24 @@ With no staged fixture it must be absent/inert and have no behavior change.
 It must never evaluate caller-provided Enforce, execute a Workbench action, or
 accept an unbounded filename, path, or command.
 
-Use the Phase 1 control-envelope shape. Each command and acknowledgement must
-include `schemaVersion`, `runId`, random capability, case ID, lifecycle
-generation, canonical target, job ID, phase, action, and a monotonic sequence.
-The plugin must reject a wrong capability before parsing the rest of a command,
-then reject a wrong run, target, generation, phase/action pair, sequence,
-replay, or post-terminal command. An acknowledgement records only
-`executed` or `refused`, the public phase, and a bounded redacted diagnostic.
+The implemented Phase 1 control envelope carries `schemaVersion`, `runId`,
+request and case IDs, phase/action, and the generated fixture/lifecycle
+binding. The random capability and monotonic sequence are authenticated in
+the new-file mailbox name before command parsing; the bootstrap binds the
+generated project/add-on identities, and arrival binds the retained job where
+the phase has one. The plugin rejects a wrong capability before parsing, then
+rejects a wrong run, fixture/lifecycle binding, phase/action pair, sequence,
+replay, or post-terminal command. Acknowledgements contain only the bounded
+control disposition, request/case/phase identity, and a bounded refusal reason.
 The capability, owner token, absolute profile path, PID, and raw handler
 arguments must never enter matrix evidence.
+
+At `before_lease`, authenticated Ping arrival proves the lifecycle, case, phase,
+and absence of a retained job; the declared view is instead host-bound by the
+validated capture input. The fixture retains a one-shot expected view/lifecycle
+tuple and rejects a later Submit that does not match it. Submit is intentionally
+optional because world replacement, Ping response loss, and owned shutdown may
+terminate the case before any handler Submit.
 
 The runner waits for an `arrived` acknowledgement with `pollUntil` and a
 per-case deadline, performs exactly one matrix action, then waits for an
@@ -147,15 +203,19 @@ per-case deadline, performs exactly one matrix action, then waits for an
 or cancellation invalidates the barrier, calls the existing restoration path,
 and makes the case fail; do not use `setTimeout`/sleep as phase coordination.
 
-### 2. Keep the Workbench runner serial and resettable
+### 2. Serial, resettable Workbench runner
 
-Refactor the positive-path body of
-`runWorkbenchObserverAcceptance()` into a per-case executor. Add
-`--only <case-id>` and `--keep-profile` to the existing CLI, plus matching
-typed options. `--only` validates against the shared matrix before a Workbench
-launch; `--keep-profile` is permitted only after a failed matrix run and must
-print the retained generated directory without putting it in the Markdown
-summary.
+The matrix path uses a per-case executor while preserving the separate
+positive-path behavior of `runWorkbenchObserverAcceptance()`. With no selector,
+the CLI runs that positive acceptance. `--matrix` selects all 69 Workbench cases
+in canonical order and emits full coverage; `--only <case-id>` selects one
+Workbench case and emits partial coverage. The two selectors are mutually
+exclusive and validate before process launch. `--keep-profile` is legal only
+with `--only`; it retains and prints that case's generated directory only when
+the selected case fails, without putting the path in the Markdown summary.
+`--list-cases` and `--help` are standalone read-only modes and require neither
+live confirmation. Both executing matrix modes require the existing environment
+gate and `--confirm-live-run`.
 
 For every case, in this order:
 
@@ -188,34 +248,37 @@ choose a shutdown target.
 
 ### 3. Implement the Workbench case table
 
-Define these cases in the shared `backend: "workbench"` fault matrix. Use the
-case IDs below as the stable public IDs; expand only the phase/view combinations
-that have the observable proof in the first table. A matrix entry that cannot
-reach a phase must declare it `not_applicable`; silently skipping it is invalid.
+The shared `backend: "workbench"` catalog now contains these 69 lower-case,
+dotted public IDs. `lookAt` is serialized as `lookat` in an ID. The fixture
+implements all five phase hooks, while each case schedules only the applicable
+phase/view combinations below; all other combinations are rejected.
 
-| ID pattern | Action and implementation | Required terminal/camera proof |
-| --- | --- | --- |
-| `WB-SUCCESS-{CURRENT\|POSE\|LOOK_AT}` | Reuse the existing `captureAndRetain` flows. Keep the current/pose/look-at PNG, requested-view, camera-restoration, and post-restoration-current assertions. | `completed`; valid PNG and metadata; exact restoration; release and vacancy. |
-| `WB-CANCEL-{PHASE}-{VIEW}` | At the acknowledged barrier, invoke `ObserverApplication.cancelJob`; do not call a handler directly. | `cancelled` with `CANCELLED` and exact restoration, or failed `RESTORATION_UNCONFIRMED` followed by exact owned exit. |
-| `WB-TRANSPORT-LOSS-{PHASE}-{VIEW}` | Use a fixture-only `WorkbenchNetApiPort` fault wrapper around the real NET API client. It must break the selected real handler call/response after the barrier; it must not synthesize an adapter response. | Bounded `HANDLER_UNAVAILABLE`/public transport disposition; no claim of restoration unless it was observed. If a held lease cannot be queried safely, require exact owned exit. |
-| `WB-LEASE-CONTENTION-{VIEW}` | Submit one capture and retain its activity lease. Submit the second capture through `ObserverApplication.capture` before releasing the first. | The second request returns public `CAMERA_BUSY`; the first job's camera state is unchanged; then cancel/complete and prove a follow-up capture can acquire the lease. |
-| `WB-WORLD-LOSS-{PHASE}-{VIEW}` | At the barrier, call the existing `EMCP_WB_EditorControl.openResource` only for generated `ObserverMatrixB`. Verify it changes the world identity without a modal prompt. | Before lease: `not_acquired`. After lease: public `WORLD_CHANGED` or `STALE_LIFECYCLE`; if exact restoration cannot be proven, require `RESTORATION_UNCONFIRMED` and exact owned exit. |
-| `WB-ARTIFACT-{TRUNCATED\|CRC\|MISMATCHED}` | Use a harness-only pre-promotion seam after handler terminal restoration and before `WorkbenchObserverAdapter.validateArtifact`. Truncate the generated PNG, corrupt one CRC, or change its byte length. Do not fake a completed artifact. | Public `ARTIFACT_INVALID`; helper restoration remains proven; no capture is promoted or included in an evidence-bundle manifest. |
-| `WB-OWNED-SHUTDOWN-{PHASE}-{VIEW}` | At the barrier invoke `client.shutdownOwnedWorkbench()` through its normal activity-gate/adapter bookkeeping. | Public `WORKBENCH_EXITED` or the declared cancellation result, exact owner vacancy, endpoint vacancy, no child/lease obligation, and decoy identity unchanged. |
-| `WB-TERMINAL-RELEASE-{VIEW}` | Hold at `terminal_release`, release once, then retry the identical release. | First release removes the managed artifact/reference only after restoration; second release is idempotently acknowledged; no camera mutation. |
+| ID pattern | Count | Action and required terminal/camera proof |
+| --- | ---: | --- |
+| `workbench.complete_capture.terminal_release.{current\|pose\|lookat}` | 3 | Complete a real capture; `completed`, validated PNG/metadata, exact restoration, release, and vacancy. |
+| `workbench.cancel_capture.{lease_acquired\|capture_in_progress\|restoration_in_progress\|terminal_release}.{current\|pose\|lookat}` | 12 | Cancel through `ObserverApplication.cancelJob`; `cancelled` with no asynchronous error and exact restoration. |
+| `workbench.disable_fixture_handler.{phase}.{current\|pose\|lookat}` | 15 | The one-shot transport seam breaks a selected real handler request/response; public `TRANSPORT_UNAVAILABLE`, with `not_acquired` before lease, exact owned exit during the three held/restoring phases, and already-proven restoration at `terminal_release`. |
+| `workbench.submit_competing_capture.lease_acquired.{current\|pose\|lookat}` | 3 | Overlap a second application capture; public `CAMERA_BUSY`, unchanged first lease, restoration, and a successful follow-up acquisition. |
+| `workbench.replace_fixture_world.{phase}.{current\|pose\|lookat}` | 15 | Open generated `ObserverMatrixB`; before lease reports `WORLD_CHANGED`/`not_acquired`; the three held/restoring phases report `RESTORATION_UNCONFIRMED` and require exact owned exit; `terminal_release` remains `completed`/restored. |
+| `workbench.{write_truncated_artifact\|write_crc_artifact\|write_mismatched_artifact}.capture_in_progress.pose` | 3 | Mutate the real bounded PNG immediately before validation; public `ARTIFACT_INVALID`, proven restoration, and no published managed manifest for the rejected capture. |
+| `workbench.stop_owned_workbench.{phase}.{current\|pose\|lookat}` | 15 | Call owner-scoped shutdown and verify exact owner/endpoint/child vacancy plus unchanged decoy identity. Before terminal release the public result is `WORKBENCH_EXITED` with exact exit; at `terminal_release` the capture remains `completed`/restored before shutdown. |
+| `workbench.release_twice.terminal_release.{current\|pose\|lookat}` | 3 | Replay the identical frozen release request; equivalent idempotent acknowledgements after restoration and no camera mutation. |
 
-For the transport family, use the existing `WorkbenchNetApiPort` dependency
-seam in the session controller, but route all non-faulted calls to a real
-`WorkbenchNetApiClient`. The test seam must be scoped to the per-case fixture
-and disabled by default; it is not a production configuration setting.
+The transport family uses the existing `WorkbenchNetApiPort` dependency seam
+in the session controller and routes every non-faulted call to a real
+`WorkbenchNetApiClient`. The seam is scoped to the per-case fixture and
+disabled by default; it is not a production configuration setting.
 
-For the world-loss family, update the helper's public projection so a changed
-world produces canonical `WORLD_CHANGED`, while a lifecycle/target mismatch
-produces `STALE_LIFECYCLE`. Do not retain the private
-`CAPTURE_INVALIDATED` spelling as a matrix expectation. If opening the second
-generated world causes a modal dialog or cannot be made headless, stop this
-family at the spike, record the limitation, and do not misrepresent a fake
-adapter failure as world loss.
+For the world-loss family, the helper's public projection no longer uses the
+private `CAPTURE_INVALIDATED` spelling. A pre-lease replacement declares
+canonical `WORLD_CHANGED`. At `lease_acquired`, `capture_in_progress`, or
+`restoration_in_progress`, inability to restore against the changed world
+declares `RESTORATION_UNCONFIRMED` and enters the exact-owner-exit path. At
+`terminal_release`, restoration and completion are already proven, so replacing
+the fixture world cannot retroactively turn that capture into a restoration
+failure. The gated native run must still prove that opening the second generated
+world is prompt-free; hermetic projection tests alone do not establish that
+Workbench behavior.
 
 The `restoration_in_progress` barrier needs a real yield between setting the
 state and calling `RestoreJob`; a probe that merely observes the terminal state
@@ -223,13 +286,13 @@ after synchronous restoration does not satisfy the phase. The barrier must
 continue to use the helper's normal `RestoreJob`, `Cancel`, and `Release`
 paths once released.
 
-### 4. Add exact-identity decoy protection
+### 4. Exact-identity decoy protection
 
-Create a small, fixture-only long-lived Node decoy that exits only when its
-own generated exit sentinel appears. Launch it with a unique owner argument,
-but never pass its identity to `WorkbenchProcessGuard` as a termination target.
+The fixture-only long-lived Node decoy exits only when its own generated exit
+sentinel appears. It starts with a unique owner argument, but its identity is
+never passed to `WorkbenchProcessGuard` as a termination target.
 
-For every `WB-OWNED-SHUTDOWN-*` case:
+For every `workbench.stop_owned_workbench.{phase}.{view}` case:
 
 1. Inspect the decoy through the existing Windows exact-process backend before
    triggering shutdown. Retain its `ExactProcessIdentity` and require the
@@ -251,12 +314,11 @@ inspection/result category.
 
 ### 5. Make evidence matrix-aware
 
-Keep `OperationalBaselineArtifact` v1 readable by its existing tests. Add the
-Phase 1 matrix-artifact type and writer path beside
-`writeOperationalBaselineArtifact` in
-`scripts/observer-live-acceptance-support.ts`; reuse its canonical source
-closure, redaction, atomic write, and evaluator-identity conventions instead
-of creating a second ad hoc serializer.
+`OperationalBaselineArtifact` remains version 1 and readable by its existing
+tests. The separate `ObserverFailureMatrixArtifact` writer beside
+`writeOperationalBaselineArtifact` is now version 3 and reuses the baseline's
+canonical source closure, redaction, atomic write, and evaluator-identity
+conventions.
 
 Each Workbench case entry must contain:
 
@@ -271,6 +333,12 @@ Each Workbench case entry must contain:
   diagnostic hashes; and
 - the shared source-closure hash, procedure revision, and sanitized evaluator
   identity for the run.
+
+Version 3 also records explicit `coverage`. A full artifact selects all
+declared backend IDs in canonical order; `--only` produces a partial artifact
+whose selected IDs and rows match exactly. `sourceRevision` records the commit
+and `clean`, `dirty`, or `unavailable` tree state. A full passing artifact is
+invalid unless the tree is clean and the commit is a 40-hex Git revision.
 
 Write a sibling Markdown summary after all case cleanup and before publishing
 the final JSON artifact. Its table should contain case ID, declared fault,
@@ -294,19 +362,30 @@ Use this publication rule:
    failed case, a camera/exit contradiction, a manifest before valid metadata,
    unredacted identity data, and raw Windows-style paths or capability values.
 
-Add adversarial redaction tests using real-looking Windows home paths, PIDs,
-owner tokens, profile paths, and control capabilities. Test the serialized JSON
-and Markdown rather than only the in-memory object.
+Adversarial redaction tests use real-looking Windows home paths, PIDs, owner
+tokens, profile paths, and control capabilities and inspect serialized JSON and
+Markdown rather than only the in-memory object.
 
-### 6. Replace source-text checks only when behavior owns the invariant
+### 6. Source-text checks remain until behavior owns the invariant
 
-Add a committed migration table in this document's directory before removing a
-source-text assertion. Each row must name the assertion location, protected
+The committed migration table in this document's directory governs removal of
+any source-text assertion. Each row names the assertion location, protected
 invariant, behavioral replacement, deliberate mutation, command run, observed
 failure, disposition (`replace` or `retain`), and a non-observability rationale
 when retained.
 
-Start the table with these concrete groups:
+The active table is
+[the assertion migration ledger](1-independent-local-observer-failure-matrix-assertion-migration.md).
+Rows whose native mutation is still gated by live acceptance remain explicitly marked
+`Retain`; they are not silently treated as behaviorally replaced.
+The current ledger is therefore a retention inventory, not a completed
+migration: it records 22 retained groups and zero behavioral replacements or
+deletions. Retained checks were retargeted where ownership moved, but that
+receives no migration credit. Task 6 remains open unless deliberate
+mutation evidence changes a disposition or the maintainer explicitly accepts a
+retention-only closeout.
+
+The ledger begins with these concrete groups:
 
 | Current location | First classification | Required action |
 | --- | --- | --- |
@@ -326,23 +405,32 @@ and must assert that neither live-run environment variable is set in CI.
 ### 7. Final maintainer acceptance and closeout
 
 On a controlled Windows machine, with no pre-existing Arma or Workbench
-process, run the complete matrices one at a time after all hermetic tests and
-package checks pass:
+process, run the currently declared runtime pilot and complete Workbench matrix
+one at a time after all hermetic tests and package checks pass:
 
 ```powershell
 $env:RFO_RUN_LIVE_RUNTIME_OBSERVER_ACCEPTANCE = '1'
-npm.cmd run dev:observer:acceptance:runtime -- --confirm-live-run
+npm.cmd run dev:observer:acceptance:runtime -- --only runtime.cancel_capture.lease_acquired.pose --confirm-live-run
 
 $env:RFO_RUN_LIVE_WORKBENCH_OBSERVER_ACCEPTANCE = '1'
-npm.cmd run dev:observer:acceptance:workbench -- --confirm-live-run
+npm.cmd run dev:observer:acceptance:workbench -- --matrix --confirm-live-run
 ```
 
-Review the runtime and Workbench JSON and Markdown together. They must name the
-same committed source revision and source-closure hash; if either source or
-procedure changes between runs, rerun both matrices. Inspect every retained
+Review the runtime-pilot and Workbench-matrix JSON and Markdown together. They
+must name the same committed source revision, and each must retain its own
+backend source-closure hash and procedure revision. If either source or
+procedure changes between runs, rerun both. Inspect every retained
 output image relevant to a successful capture and record the reviewer result
 truthfully. A passed review must not inherit `imagesReviewed=true` from
 automation alone.
+
+The Workbench command prints
+`RFO_WORKBENCH_OBSERVER_FAILURE_MATRIX_REVIEW_DIRECTORY=<path>` after copying
+successful completed-case bundles out of their disposable case roots. Review
+every image beneath that exact directory at original resolution. The runner
+deliberately neither marks those images reviewed nor deletes this directory;
+retain it through the review and include that exact printed directory in the
+targeted cleanup below.
 
 Before deleting local evidence, retain a short PR/review note containing the
 committed revision, both source-closure hashes, Workbench version, case-table
@@ -357,6 +445,12 @@ gone, `git status --short` contains no newly tracked validation output, and a
 fresh run does not recreate evidence unless its explicit live gate is set.
 
 ## Phase exit criteria
+
+**Current result:** not satisfied. The catalog, fixture, runner, repository-only
+acceptance instrumentation, evidence schema, and hermetic contracts are
+implemented, but the gated full Workbench matrix, retained revision-bound
+evidence, deliberate assertion-mutation review, cross-backend review, and
+manual image review have not been completed.
 
 - Every declared Workbench case has a bounded, public terminal result and
   sanitised evidence of cleanup, restoration or exact exit, and final vacancy.

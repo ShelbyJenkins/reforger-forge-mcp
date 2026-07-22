@@ -506,11 +506,16 @@ export class CaptureService {
   private async selectInstance(request: ReturnType<typeof normalizeCaptureRequest>, deadlineAtMs: number, signal?: AbortSignal): Promise<CaptureInstance> {
     const candidates: CaptureInstance[] = [];
     const errors: string[] = [];
+    const failures: CaptureError[] = [];
     for (const backend of this.backends.values()) {
       if (!request.sessionId && backend.kind === "runtime") continue;
       try {
         candidates.push(...await backend.listInstances({ sessionId: request.sessionId }, this.context(deadlineAtMs, signal)));
-      } catch (error) { errors.push(error instanceof Error ? error.message : String(error)); }
+      } catch (error) {
+        const failure = asCaptureError(error);
+        failures.push(failure);
+        errors.push(failure.message);
+      }
     }
     const eligible = candidates.filter((instance) => {
       if (request.instanceId && instance.instanceId !== request.instanceId) return false;
@@ -519,7 +524,14 @@ export class CaptureService {
       return isCompatible(instance, request);
     });
     if (eligible.length !== 1) {
-      if (request.instanceId && eligible.length === 0) throw new CaptureError("STALE_INSTANCE", "Selected observer instance is unavailable");
+      if (request.instanceId && eligible.length === 0) {
+        const selectedWasObserved = candidates.some((instance) => instance.instanceId === request.instanceId);
+        // An explicit instance can be declared stale only after the relevant
+        // inventories answered. If selection itself lost transport, absence
+        // from the partial inventory is not evidence that the instance left.
+        if (!selectedWasObserved && failures.length > 0) throw failures[0];
+        throw new CaptureError("STALE_INSTANCE", "Selected observer instance is unavailable");
+      }
       if (eligible.length > 1) throw new CaptureError("AMBIGUOUS_INSTANCE", "Multiple compatible observer instances are available", { instanceIds: eligible.map((entry) => entry.instanceId) });
       throw new CaptureError("NO_RENDER_ENDPOINT", errors[0] ?? "No compatible observer renderer is available");
     }

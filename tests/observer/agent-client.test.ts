@@ -88,4 +88,49 @@ describe("ObserverAgentClient", () => {
     expect(redactChildLine("Authorization: Bearer abc.def launchNonce=secret")).not.toMatch(/abc\.def|secret$/);
     await transport.close();
   });
+
+  it("caps both lazy startup and requests at the shared absolute deadline", async () => {
+    const stalledStartup = new TransportChild();
+    let startupDeadline: number | undefined = Date.now() + 50;
+    const startupFork = (() => stalledStartup as unknown as ChildProcess) as typeof fork;
+    const starting = new ObserverAgentClient({
+      agentPath: "private-child.js",
+      forkChild: startupFork,
+      startupTimeoutMs: 1_000,
+      requestTimeoutMs: 1_000,
+      requestDeadlineAtMs: () => startupDeadline,
+    });
+    const startupBegan = Date.now();
+    await expect(starting.ensureStarted()).rejects.toMatchObject({
+      code: "TRANSPORT_UNAVAILABLE",
+    });
+    expect(Date.now() - startupBegan).toBeLessThan(500);
+    startupDeadline = undefined;
+    await starting.close();
+
+    const child = new TransportChild();
+    let requestDeadline: number | undefined;
+    const forkChild = (() => {
+      child.ready();
+      return child as unknown as ChildProcess;
+    }) as typeof fork;
+    const transport = new ObserverAgentClient({
+      agentPath: "private-child.js",
+      forkChild,
+      startupTimeoutMs: 1_000,
+      requestTimeoutMs: 1_000,
+      requestDeadlineAtMs: () => requestDeadline,
+    });
+    await transport.ensureStarted();
+    child.hold = true;
+    requestDeadline = Date.now() + 50;
+    const requestBegan = Date.now();
+    await expect(transport.request("held")).rejects.toMatchObject({
+      code: "TRANSPORT_UNAVAILABLE",
+    });
+    expect(Date.now() - requestBegan).toBeLessThan(500);
+    requestDeadline = undefined;
+    child.hold = false;
+    await transport.close();
+  });
 });

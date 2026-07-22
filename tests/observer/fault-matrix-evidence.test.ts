@@ -1,7 +1,7 @@
-import { mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { defineFaultMatrix, type FaultMatrixCase } from "../../observer/protocol/fault-matrix.js";
 import {
   buildObserverFailureMatrixArtifact,
@@ -37,6 +37,23 @@ function workbenchCase(): FaultMatrixCase {
   const value: any = structuredClone(declaredCase());
   value.id = "workbench.cancel_capture.lease_acquired.current";
   value.backend = "workbench";
+  return value;
+}
+
+function secondRuntimeCase(): FaultMatrixCase {
+  const value: any = structuredClone(declaredCase());
+  value.id = "runtime.cancel_capture.capture_in_progress.current";
+  value.injection.phase = "capture_in_progress";
+  return value;
+}
+
+function ownedWorkbenchCase(): FaultMatrixCase {
+  const value: any = structuredClone(workbenchCase());
+  value.id = "workbench.stop_owned_workbench.lease_acquired.current";
+  value.injection.action = "stop_owned_workbench";
+  value.expectedTerminal = { state: "failed", errorCode: "WORKBENCH_EXITED" };
+  value.cameraDisposition = "exact_process_exit";
+  value.requiredChecks = [...value.requiredChecks, "exact_owner_vacant"];
   return value;
 }
 
@@ -78,6 +95,7 @@ function input(result: "passed" | "failed" = "passed"): FailureMatrixArtifactInp
         { path: "src/observer/public-contract.ts", sha256: "3".repeat(64) },
       ],
     },
+    sourceRevision: { commit: "4".repeat(40), tree: "clean" },
     cases: [{
       caseId: "runtime.cancel_capture.lease_acquired.current",
       schedule: { backend: "runtime", view: "current", phase: "lease_acquired", action: "cancel_capture" },
@@ -85,6 +103,14 @@ function input(result: "passed" | "failed" = "passed"): FailureMatrixArtifactInp
       deadline: { outcome: "completed", elapsedMs: 10, budgetMs: 1_000 },
       worldRevision: "unchanged", camera: "restored", artifact: "not_created",
       cleanup: { lifecycleVacant: true, endpointVacant: true, childVacant: true, exactOwnerVacant: false },
+      control: { arrival: "arrived", action: "executed" },
+      artifactEvidence: {
+        validation: "not_created", pngSha256: null, metadataSha256: null,
+        byteCount: null, manifestPublished: false,
+      },
+      ownerShutdown: "not_applicable",
+      decoy: { category: "not_applicable", identityUnchanged: null },
+      limitations: ["Cancellation intentionally produced no promoted artifact."],
       retainedDiagnostics: [matrixRetainedDiagnostic("captured diagnostic")],
     }],
     measurements: [
@@ -105,7 +131,61 @@ function input(result: "passed" | "failed" = "passed"): FailureMatrixArtifactInp
   };
 }
 
+function ownedWorkbenchInput(): FailureMatrixArtifactInput {
+  const value = input("failed");
+  const declared = ownedWorkbenchCase();
+  return {
+    ...value,
+    backend: "workbench",
+    matrix: defineFaultMatrix([declared]),
+    workload: {
+      ...value.workload,
+      runtimeKind: "workbench",
+      fixture: {
+        kind: "disposable_workbench_world",
+        id: "matrix-fixture",
+        guid: null,
+        sourceFileCount: 1,
+        sourceSha256: "6".repeat(64),
+      },
+    },
+    cases: [{
+      ...value.cases[0]!,
+      caseId: declared.id,
+      schedule: {
+        backend: declared.backend,
+        view: declared.view,
+        phase: declared.injection.phase,
+        action: declared.injection.action,
+      },
+      publicTerminal: declared.expectedTerminal,
+      camera: declared.cameraDisposition,
+      cleanup: {
+        lifecycleVacant: true,
+        endpointVacant: true,
+        childVacant: true,
+        exactOwnerVacant: true,
+      },
+      ownerShutdown: "exact_owner_vacant",
+      decoy: { category: "verified", identityUnchanged: true },
+    }],
+  };
+}
+
 describe("observer failure-matrix evidence", () => {
+  it("accepts the bounded aggregate timeout required by 69 serial Workbench cases", () => {
+    const candidate = input();
+    const artifact = buildObserverFailureMatrixArtifact({
+      ...candidate,
+      workload: { ...candidate.workload, overallTimeoutMs: 41_400_000 },
+    });
+    expect(artifact.workload.overallTimeoutMs).toBe(41_400_000);
+    expect(() => buildObserverFailureMatrixArtifact({
+      ...candidate,
+      workload: { ...candidate.workload, overallTimeoutMs: 41_400_001 },
+    })).toThrow(/workload identity/i);
+  });
+
   it("builds and publishes a fully closed passing manifest after its summary", () => {
     const value = input();
     const artifact = buildObserverFailureMatrixArtifact(value);
@@ -113,14 +193,141 @@ describe("observer failure-matrix evidence", () => {
     try {
       const publication = writeObserverFailureMatrixArtifact(root, artifact, value.matrix);
       const manifest = JSON.parse(readFileSync(publication.jsonPath, "utf8"));
-      expect(readFileSync(publication.markdownPath, "utf8")).toContain("Result: passed");
-      expect(readFileSync(publication.markdownPath, "utf8")).toContain("Product version: 1.7.0.54");
+      const markdown = readFileSync(publication.markdownPath, "utf8");
+      expect(markdown).toContain("Result: passed");
+      expect(markdown).toContain("Product version: 1.7.0.54");
+      expect(markdown).toContain("Workbench version: unavailable");
+      expect(markdown).toContain("Procedure revision: runtime-observer-acceptance-v2");
+      expect(markdown).toContain(`Source revision: ${"4".repeat(40)}`);
+      expect(markdown).toContain("Source tree: clean");
+      expect(markdown).toContain("Coverage: full (1 of 1 declared cases)");
+      expect(markdown).toContain("Images manually reviewed: no");
+      expect(markdown).toContain("| Case | Declared fault (phase/action) | Public result | Camera / exit | Artifact | Vacancy | Limitations |");
+      expect(markdown).toContain("lease_acquired / cancel_capture");
+      expect(statSync(publication.markdownPath).mtimeMs).toBeLessThanOrEqual(statSync(publication.jsonPath).mtimeMs);
+      expect(manifest.schemaVersion).toBe(3);
       expect(manifest.result).toBe("passed");
+      expect(manifest.review).toEqual({ imagesReviewed: false, outcome: "unreviewed" });
+      expect(manifest.coverage).toEqual({
+        kind: "full", selectedCaseIds: ["runtime.cancel_capture.lease_acquired.current"],
+      });
+      expect(manifest.sourceRevision).toEqual({ commit: "4".repeat(40), tree: "clean" });
+      expect(manifest.cases[0]).toMatchObject({
+        control: { arrival: "arrived", action: "executed" },
+        artifactEvidence: { validation: "not_created", manifestPublished: false },
+        ownerShutdown: "not_applicable",
+        decoy: { category: "not_applicable", identityUnchanged: null },
+        limitations: ["Cancellation intentionally produced no promoted artifact."],
+      });
       expect(manifest.summary.basename).toBe(publication.markdownPath.split(/[\\/]/).pop());
       expect(manifest.summary.sha256).toMatch(/^[a-f0-9]{64}$/);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
+  });
+
+  it("supports canonical full and explicit partial coverage without weakening catalog identity", () => {
+    const value = input();
+    const matrix = defineFaultMatrix([declaredCase(), secondRuntimeCase()]);
+    const entries = matrix.cases.map((declared) => ({
+      ...value.cases[0]!,
+      caseId: declared.id,
+      schedule: {
+        backend: declared.backend,
+        view: declared.view,
+        phase: declared.injection.phase,
+        action: declared.injection.action,
+      },
+      publicTerminal: declared.expectedTerminal,
+      camera: declared.cameraDisposition,
+    }));
+    const full = buildObserverFailureMatrixArtifact({ ...value, matrix, cases: entries });
+    expect(full.coverage).toEqual({ kind: "full", selectedCaseIds: matrix.caseIds });
+    expect(full.matrix.declaredCaseIds).toEqual(matrix.caseIds);
+
+    const partial = buildObserverFailureMatrixArtifact({
+      ...value,
+      matrix,
+      sourceRevision: { commit: null, tree: "unavailable" },
+      coverage: {
+        kind: "partial",
+        selectedCaseIds: ["runtime.cancel_capture.lease_acquired.current"],
+      },
+      cases: [value.cases[0]!],
+    });
+    expect(partial.coverage.kind).toBe("partial");
+    expect(partial.cases.map((entry) => entry.caseId)).toEqual(partial.coverage.selectedCaseIds);
+    expect(partial.matrix.declaredCaseIds).toEqual(matrix.caseIds);
+
+    const root = mkdtempSync(join(tmpdir(), "rfo-matrix-partial-"));
+    try {
+      const publication = writeObserverFailureMatrixArtifact(root, partial, matrix);
+      expect(readFileSync(publication.markdownPath, "utf8")).toContain("Coverage: partial (1 of 2 declared cases)");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+
+    expect(() => buildObserverFailureMatrixArtifact({
+      ...value,
+      matrix,
+      coverage: { kind: "full", selectedCaseIds: [value.cases[0]!.caseId] },
+      cases: [value.cases[0]!],
+    })).toThrow(/Full failure-matrix coverage/);
+    expect(() => buildObserverFailureMatrixArtifact({
+      ...value,
+      matrix,
+      coverage: { kind: "partial", selectedCaseIds: [...matrix.caseIds].reverse() },
+      cases: [...entries].reverse(),
+    })).toThrow(/canonical backend order/);
+  });
+
+  it("requires an exact clean source revision for full passing coverage", () => {
+    const value = input();
+    expect(() => buildObserverFailureMatrixArtifact({
+      ...value,
+      sourceRevision: { commit: "4".repeat(40), tree: "dirty" },
+    })).toThrow(/clean 40-hex source revision/);
+    expect(() => buildObserverFailureMatrixArtifact({
+      ...value,
+      sourceRevision: { commit: null, tree: "unavailable" },
+    })).toThrow(/clean 40-hex source revision/);
+    expect(() => buildObserverFailureMatrixArtifact({
+      ...value,
+      sourceRevision: { commit: "not-a-commit", tree: "clean" },
+    })).toThrow(/source revision is invalid/);
+    expect(() => buildObserverFailureMatrixArtifact({
+      ...input("failed"),
+      sourceRevision: { commit: "5".repeat(40), tree: "dirty" },
+      cases: [{ ...input("failed").cases[0]!, result: "failed", camera: "unproven" }],
+    })).not.toThrow();
+  });
+
+  it("materializes conservative v3 closeout defaults for legacy failed-row input", () => {
+    const value = input("failed");
+    const {
+      control: _control,
+      artifactEvidence: _artifactEvidence,
+      ownerShutdown: _ownerShutdown,
+      decoy: _decoy,
+      limitations: _limitations,
+      ...legacyEntry
+    } = value.cases[0]!;
+    const artifact = buildObserverFailureMatrixArtifact({
+      ...value,
+      sourceRevision: undefined,
+      cases: [{ ...legacyEntry, result: "failed", camera: "unproven" }],
+    });
+    expect(artifact.sourceRevision).toEqual({ commit: null, tree: "unavailable" });
+    expect(artifact.cases[0]).toMatchObject({
+      control: { arrival: "unproven", action: "unproven" },
+      artifactEvidence: {
+        validation: "not_created", pngSha256: null, metadataSha256: null,
+        byteCount: null, manifestPublished: false,
+      },
+      ownerShutdown: "not_applicable",
+      decoy: { category: "not_applicable", identityUnchanged: null },
+      limitations: [],
+    });
   });
 
   it("keeps runtime and Workbench entry sets independent and publishes valid failed evidence", () => {
@@ -149,6 +356,14 @@ describe("observer failure-matrix evidence", () => {
     expect(() => buildObserverFailureMatrixArtifact({
       ...failed,
       cases: [{ ...failed.cases[0]!, result: "failed", publicTerminal: { state: "completed", errorCode: "INTERNAL_ERROR" } }],
+    })).toThrow(/public terminal is invalid/);
+    expect(() => buildObserverFailureMatrixArtifact({
+      ...failed,
+      cases: [{ ...failed.cases[0]!, result: "failed", publicTerminal: { state: "cancelled", errorCode: "CANCELLED" } }],
+    })).toThrow(/public terminal is invalid/);
+    expect(() => buildObserverFailureMatrixArtifact({
+      ...failed,
+      cases: [{ ...failed.cases[0]!, result: "failed", publicTerminal: { state: "failed", errorCode: null } }],
     })).toThrow(/public terminal is invalid/);
   });
 
@@ -182,8 +397,11 @@ describe("observer failure-matrix evidence", () => {
 
   it("rejects missing, duplicate, contradictory, and absent required proof rows", () => {
     const value = input();
-    expect(() => buildObserverFailureMatrixArtifact({ ...value, cases: [] })).toThrow(/entries must occur once/);
-    expect(() => buildObserverFailureMatrixArtifact({ ...value, cases: [value.cases[0]!, value.cases[0]!] })).toThrow(/entries must occur once/);
+    const coverage = { kind: "full" as const, selectedCaseIds: [value.cases[0]!.caseId] };
+    expect(() => buildObserverFailureMatrixArtifact({ ...value, coverage, cases: [] })).toThrow(/entries must exactly match coverage/);
+    expect(() => buildObserverFailureMatrixArtifact({
+      ...value, coverage, cases: [value.cases[0]!, value.cases[0]!],
+    })).toThrow(/entries must exactly match coverage/);
     expect(() => buildObserverFailureMatrixArtifact({
       ...value,
       cases: [{ ...value.cases[0]!, publicTerminal: { state: "completed", errorCode: null } }],
@@ -194,29 +412,138 @@ describe("observer failure-matrix evidence", () => {
     })).toThrow(/required child_vacant proof/);
   });
 
+  it("rejects contradictory control, artifact, manifest, and exact-exit evidence", () => {
+    const value = input();
+    expect(() => buildObserverFailureMatrixArtifact({
+      ...value,
+      cases: [{ ...value.cases[0]!, control: { arrival: "not_arrived", action: "not_executed" } }],
+    })).toThrow(/requires arrived and executed control evidence/);
+    expect(() => buildObserverFailureMatrixArtifact({
+      ...value,
+      cases: [{
+        ...value.cases[0]!,
+        artifactEvidence: { ...value.cases[0]!.artifactEvidence!, validation: "rejected" },
+      }],
+    })).toThrow(/artifact disposition contradicts/);
+    expect(() => buildObserverFailureMatrixArtifact({
+      ...value,
+      cases: [{
+        ...value.cases[0]!,
+        artifact: "validated",
+        artifactEvidence: {
+          validation: "validated", pngSha256: null, metadataSha256: null,
+          byteCount: null, manifestPublished: false,
+        },
+      }],
+    })).toThrow(/requires both hashes, positive bytes, and a published manifest/);
+    expect(() => buildObserverFailureMatrixArtifact({
+      ...value,
+      cases: [{
+        ...value.cases[0]!,
+        artifact: "rejected",
+        artifactEvidence: {
+          validation: "rejected", pngSha256: "7".repeat(64), metadataSha256: null,
+          byteCount: 8, manifestPublished: true,
+        },
+      }],
+    })).toThrow(/cannot publish a manifest/);
+
+    const failed = input("failed");
+    expect(() => buildObserverFailureMatrixArtifact({
+      ...failed,
+      cases: [{
+        ...failed.cases[0]!, result: "failed", camera: "exact_process_exit",
+        ownerShutdown: "not_applicable",
+      }],
+    })).toThrow(/requires exact-owner vacancy and shutdown proof/);
+
+    expect(() => buildObserverFailureMatrixArtifact({
+      ...value,
+      cases: [{
+        ...value.cases[0]!,
+        artifact: "validated",
+        artifactEvidence: {
+          validation: "validated", pngSha256: "8".repeat(64), metadataSha256: "9".repeat(64),
+          byteCount: 512, manifestPublished: true,
+        },
+      }],
+    })).not.toThrow();
+  });
+
+  it("binds owned shutdown to exact-owner vacancy and an unchanged verified decoy", () => {
+    const value = ownedWorkbenchInput();
+    expect(() => buildObserverFailureMatrixArtifact(value)).not.toThrow();
+    expect(() => buildObserverFailureMatrixArtifact({
+      ...value,
+      cases: [{
+        ...value.cases[0]!,
+        decoy: { category: "verified", identityUnchanged: false },
+      }],
+    })).toThrow(/unchanged verified decoy/);
+    expect(() => buildObserverFailureMatrixArtifact({
+      ...value,
+      cases: [{ ...value.cases[0]!, ownerShutdown: "unproven" }],
+    })).toThrow(/Exact-process-exit camera evidence/);
+
+    const nonOwned = input("failed");
+    expect(() => buildObserverFailureMatrixArtifact({
+      ...nonOwned,
+      cases: [{
+        ...nonOwned.cases[0]!, result: "failed", camera: "unproven",
+        decoy: { category: "verified", identityUnchanged: true },
+      }],
+    })).toThrow(/non-owned-shutdown.*verified decoy/);
+  });
+
   it("redacts the complete portable-evidence adversarial corpus from both outputs", () => {
     const capability = "123e4567-e89b-42d3-a456-426614174000";
     const raw = [
       "C:\\Users\\shelby\\private", "\\\\server\\share\\private", "/var/private/shelby", "PID=4242",
+      "Workbench PID 5252 remains", "Workbench PID(s) 5353, 5454 remain", "process ID 5555 is still live",
       "-reforgerForgeOwnerToken=owner-token", `capability=${capability}`, "Authorization: Bearer bearer-secret",
       "hostname=private-host", "user=shelby", "lifecycleId=raw-lifecycle-id", "handlerLease=raw-handler-lease",
+      "Matrix pilot job job-private-123 did not reach terminal", "run run-secret-456", "session session-secret-789",
     ].join("; ");
     const value = input();
     const artifact = buildObserverFailureMatrixArtifact({
       ...value,
       knownSecretValues: [capability, "owner-token", "bearer-secret"],
-      cases: [{ ...value.cases[0]!, retainedDiagnostics: [matrixRetainedDiagnostic(raw, [capability, "owner-token", "bearer-secret"])] }],
+      cases: [{
+        ...value.cases[0]!,
+        limitations: [raw],
+        retainedDiagnostics: [matrixRetainedDiagnostic(raw, [capability, "owner-token", "bearer-secret"])],
+      }],
     });
     const root = mkdtempSync(join(tmpdir(), "rfo-matrix-redaction-"));
     try {
       const publication = writeObserverFailureMatrixArtifact(root, artifact, value.matrix, [capability, "owner-token", "bearer-secret"]);
       const output = `${readFileSync(publication.markdownPath, "utf8")}\n${readFileSync(publication.jsonPath, "utf8")}`;
-      for (const sentinel of ["shelby", "server\\share", "/var/private", "4242", "owner-token", capability, "bearer-secret", "private-host", "raw-lifecycle-id", "raw-handler-lease"]) {
+      for (const sentinel of ["shelby", "server\\share", "/var/private", "4242", "5252", "5353", "5454", "5555", "owner-token", capability, "bearer-secret", "private-host", "raw-lifecycle-id", "raw-handler-lease", "job-private-123", "run-secret-456", "session-secret-789"]) {
         expect(output).not.toContain(sentinel);
       }
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
+  });
+
+  it("byte-bounds multibyte diagnostics and rejects unsafe text outside diagnostic fields", () => {
+    const diagnostic = matrixRetainedDiagnostic("😀".repeat(4_096));
+    expect(diagnostic.byteCount).toBeLessThanOrEqual(4_096);
+    const value = input();
+    expect(() => buildObserverFailureMatrixArtifact({
+      ...value,
+      cases: [{ ...value.cases[0]!, retainedDiagnostics: [diagnostic] }],
+    })).not.toThrow();
+    expect(() => buildObserverFailureMatrixArtifact({
+      ...value,
+      environment: {
+        ...value.environment,
+        machineClass: {
+          ...value.environment.machineClass,
+          cpuModel: "read C:\\Users\\private-user\\secret",
+        },
+      },
+    })).toThrow(/unsafe or unbounded text/);
   });
 
   it("detects a summary-hash mismatch and leaves no final publication for unsafe input", () => {
@@ -239,6 +566,23 @@ describe("observer failure-matrix evidence", () => {
         rmSync(unsafeRoot, { recursive: true, force: true });
       }
     } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rolls back both final siblings when closeout fails after the JSON rename", () => {
+    const value = input();
+    const artifact = buildObserverFailureMatrixArtifact(value);
+    const root = mkdtempSync(join(tmpdir(), "rfo-matrix-post-json-failure-"));
+    const freeze = vi.spyOn(Object, "freeze").mockImplementationOnce(() => {
+      throw new Error("injected post-publication closeout failure");
+    });
+    try {
+      expect(() => writeObserverFailureMatrixArtifact(root, artifact, value.matrix))
+        .toThrow(/injected post-publication closeout failure/);
+      expect(readdirSync(root)).toEqual([]);
+    } finally {
+      freeze.mockRestore();
       rmSync(root, { recursive: true, force: true });
     }
   });

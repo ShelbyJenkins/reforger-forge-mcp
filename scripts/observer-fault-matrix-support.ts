@@ -1,13 +1,15 @@
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import {
   caseForId,
+  isCanonicalFaultMatrixTerminal,
   type FaultMatrix,
   type FaultMatrixAction,
   type FaultMatrixBackend,
   type FaultMatrixCase,
   type FaultMatrixPhase,
+  type FaultMatrixTerminal,
 } from "../observer/protocol/fault-matrix.js";
 import {
   deadlineAfter,
@@ -93,6 +95,8 @@ export interface FaultControlValidation {
   readonly command?: FaultControlCommand;
   readonly reason?: FaultControlRefusalCode;
   readonly replay?: FaultControlAcknowledgement;
+  /** The byte-identical request is already admitted and must not execute again. */
+  readonly pending?: boolean;
 }
 
 export interface FaultControlMailbox {
@@ -133,6 +137,12 @@ interface RecordedFaultControlAcknowledgement {
   readonly fingerprint: string;
   readonly commandKind: FaultControlCommand["kind"];
   readonly acknowledgement: FaultControlAcknowledgement;
+}
+
+interface ActiveFaultControlSchedule {
+  readonly caseId: string;
+  readonly phase: FaultMatrixPhase;
+  readonly action: FaultMatrixAction;
 }
 
 const REFUSAL_SET = new Set<string>(FAULT_CONTROL_REFUSAL_CODES);
@@ -293,6 +303,7 @@ export class FaultControlAuthorizer {
   private protocolState: FaultControlProtocolState = "awaiting_arm";
   private readonly pending = new Map<string, PendingFaultControlCommand>();
   private readonly acknowledgements = new Map<string, RecordedFaultControlAcknowledgement>();
+  private activeSchedule: ActiveFaultControlSchedule | undefined;
 
   constructor(private readonly options: {
     readonly matrix: FaultMatrix;
@@ -318,6 +329,7 @@ export class FaultControlAuthorizer {
     this.terminal = true;
     this.protocolState = "terminal";
     this.pending.clear();
+    this.activeSchedule = undefined;
   }
 
   private admit(command: FaultControlCommand, fingerprint: string): FaultControlValidation {
@@ -325,6 +337,11 @@ export class FaultControlAuthorizer {
     if (command.kind === "arm") {
       if (priorState !== "awaiting_arm") return { accepted: false, reason: "REPLAY_REFUSED" };
       this.protocolState = "arm_pending";
+      this.activeSchedule = Object.freeze({
+        caseId: command.caseId,
+        phase: command.phase,
+        action: command.action,
+      });
     } else if (command.kind === "release" || command.kind === "cancel") {
       // An action may cross the barrier only after the fixture has recorded
       // its own observable arrival acknowledgement for the arm request.
@@ -375,13 +392,31 @@ export class FaultControlAuthorizer {
       return { accepted: true, command, replay: known.acknowledgement };
     }
     if (this.terminal) return { accepted: false, reason: "CASE_TERMINAL" };
-    if (this.pending.has(command.requestId)) return { accepted: false, reason: "REPLAY_REFUSED" };
+    const pending = this.pending.get(command.requestId);
+    if (pending) {
+      if (pending.fingerprint !== fingerprint) return { accepted: false, reason: "REPLAY_REFUSED" };
+      // Admission is not execution. A resend while the fixture is still
+      // reaching the barrier is accepted as an idempotent pending duplicate,
+      // but the bridge must not execute it a second time.
+      return { accepted: true, pending: true };
+    }
     let matrixCase: FaultMatrixCase;
     try { matrixCase = caseForId(this.options.matrix, command.caseId); } catch { return { accepted: false, reason: "MATRIX_MISMATCH" }; }
     if (matrixCase.backend !== this.options.bootstrap.backend) return { accepted: false, reason: "MATRIX_MISMATCH" };
     if (matrixCase.injection.phase !== command.phase) return { accepted: false, reason: "PHASE_MISMATCH" };
     if (command.kind !== "terminal" && matrixCase.injection.action !== command.action) {
       return { accepted: false, reason: "MATRIX_MISMATCH" };
+    }
+    if (command.kind !== "arm" && this.activeSchedule) {
+      if (command.caseId !== this.activeSchedule.caseId) {
+        return { accepted: false, reason: "MATRIX_MISMATCH" };
+      }
+      if (command.phase !== this.activeSchedule.phase) {
+        return { accepted: false, reason: "PHASE_MISMATCH" };
+      }
+      if (command.kind !== "terminal" && command.action !== this.activeSchedule.action) {
+        return { accepted: false, reason: "MATRIX_MISMATCH" };
+      }
     }
     return this.admit(command, fingerprint);
   }
@@ -400,11 +435,14 @@ export class FaultControlAuthorizer {
     this.pending.delete(command.requestId);
     if (acknowledgement.kind === "refused") {
       this.protocolState = pending.priorState;
+      if (command.kind === "arm") this.activeSchedule = undefined;
     } else if (command.kind === "arm") {
       this.protocolState = "armed";
     } else if (command.kind === "terminal") {
       this.terminal = true;
       this.protocolState = "terminal";
+      this.pending.clear();
+      this.activeSchedule = undefined;
     } else {
       this.protocolState = "action_executed";
     }
@@ -451,7 +489,17 @@ export class FilesystemFaultControlMailbox implements FaultControlMailbox {
       throw new FaultControlError("MALFORMED");
     }
     if (parsedName.capability !== this.capability) throw new FaultControlError("CAPABILITY_MISMATCH");
-    writeFileSync(join(this.inboxPath, filename), body, { encoding: "utf8", flag: "wx", mode: 0o600 });
+    const finalPath = join(this.inboxPath, filename);
+    const temporaryPath = join(this.inboxPath, `.${randomUUID()}.tmp`);
+    try {
+      // Fixtures enumerate only committed .json names. A same-directory rename
+      // prevents an Enforce reader from advancing its sequence over a partial
+      // command body.
+      writeFileSync(temporaryPath, body, { encoding: "utf8", flag: "wx", mode: 0o600 });
+      renameSync(temporaryPath, finalPath);
+    } finally {
+      if (existsSync(temporaryPath)) unlinkSync(temporaryPath);
+    }
   }
 
   async takeOutbox(): Promise<FaultControlAcknowledgement | undefined> {
@@ -476,14 +524,24 @@ export class FilesystemFaultControlMailbox implements FaultControlMailbox {
       if (entry.size > FAULT_CONTROL_MAX_DOCUMENT_BYTES) {
         throw new FaultControlError("MALFORMED");
       }
+      // Enforce cannot atomically rename a freshly written file. The fixture
+      // therefore publishes a zero-byte completion marker only after its copy
+      // has closed; never open or consume the JSON before that marker exists.
+      const completionPath = `${filePath}.complete`;
+      if (!existsSync(completionPath)) return undefined;
+      const completion = lstatSync(completionPath);
+      if (!completion.isFile() || completion.isSymbolicLink() || completion.size !== 0) {
+        throw new FaultControlError("MALFORMED");
+      }
       const body = readFileSync(filePath, "utf8");
       if (Buffer.byteLength(body, "utf8") > FAULT_CONTROL_MAX_DOCUMENT_BYTES) {
         throw new FaultControlError("MALFORMED");
       }
-      unlinkSync(filePath);
       let value: unknown;
       try { value = JSON.parse(body); } catch { throw new FaultControlError("MALFORMED"); }
       if (!validateFaultControlAcknowledgement(value)) throw new FaultControlError("MALFORMED");
+      unlinkSync(filePath);
+      unlinkSync(completionPath);
       this.previousOutboxSequence = parsedName.sequence;
       return value;
     }
@@ -519,7 +577,8 @@ export interface ScheduledFaultCase {
 
 /** Host-side barrier owner. It never invents a schedule and uses only absolute deadlines. */
 export class FaultMatrixScheduler {
-  private readonly deadline: Deadline;
+  private deadline: Deadline | undefined;
+  private readonly deadlineBudgetMs: number;
   private readonly barrierAllowanceMs: number;
   private readonly controller = new AbortController();
   private sequence = 0;
@@ -527,6 +586,7 @@ export class FaultMatrixScheduler {
   private finishing = false;
   private armStarted = false;
   private actionStarted = false;
+  private actionExecuted = false;
   private scheduled: ScheduledFaultCase | undefined;
   private activeCase: FaultMatrixCase | undefined;
 
@@ -536,13 +596,27 @@ export class FaultMatrixScheduler {
     }
     const budget = options.caseDeadlineMs ?? FAULT_CONTROL_MAX_BARRIER_MS;
     if (!Number.isSafeInteger(budget) || budget < 1 || budget > 900_000) throw new FaultControlError("MALFORMED");
-    this.deadline = options.deadline ?? deadlineAfter(options.clock, budget);
+    this.deadline = options.deadline;
+    this.deadlineBudgetMs = budget;
     this.barrierAllowanceMs = options.barrierAllowanceMs ?? FAULT_CONTROL_MAX_BARRIER_MS;
     if (!Number.isSafeInteger(this.barrierAllowanceMs) || this.barrierAllowanceMs < 1 ||
         this.barrierAllowanceMs > FAULT_CONTROL_MAX_BARRIER_MS) throw new FaultControlError("MALFORMED");
   }
 
   get signal(): AbortSignal { return this.controller.signal; }
+
+  /** Bind a pre-created scaffold to the executor's exact absolute case deadline. */
+  setDeadline(deadline: Deadline): void {
+    if (this.armStarted || this.scheduled || this.finishing || this.terminal || this.deadline) {
+      throw new FaultControlError("REPLAY_REFUSED");
+    }
+    this.deadline = deadline;
+  }
+
+  private caseDeadline(): Deadline {
+    this.deadline ??= deadlineAfter(this.options.clock, this.deadlineBudgetMs);
+    return this.deadline;
+  }
 
   private assertOpen(): void {
     if (this.terminal || this.finishing) throw new FaultControlError("CASE_TERMINAL");
@@ -611,7 +685,7 @@ export class FaultMatrixScheduler {
     expected: FaultControlAcknowledgement["kind"],
     allowFinishing = false,
   ): Promise<FaultControlAcknowledgement> {
-    const fullDeadline = deriveDeadline(this.options.clock, this.deadline, this.barrierAllowanceMs);
+    const fullDeadline = deriveDeadline(this.options.clock, this.caseDeadline(), this.barrierAllowanceMs);
     const firstDeadline = deriveDeadline(
       this.options.clock,
       fullDeadline,
@@ -627,17 +701,31 @@ export class FaultMatrixScheduler {
     }
   }
 
-  /** Arm a declared case and block only until the fixture proves phase arrival. */
-  async arm(caseId: string): Promise<ScheduledFaultCase> {
+  /**
+   * Arm a declared case and block only until the fixture proves phase arrival.
+   *
+   * `afterPublished` runs synchronously after the immutable arm document has
+   * been durably placed in the mailbox, but before this method begins waiting
+   * for the fixture acknowledgement. Live runners use that boundary to start
+   * an asynchronous capture without racing Submit ahead of the arm command.
+   * The callback must only start work; the scheduler deliberately does not
+   * await a returned promise because a before-lease fixture may hold Submit
+   * until the same acknowledgement wait completes.
+   */
+  async arm(caseId: string, afterPublished?: () => void): Promise<ScheduledFaultCase> {
     this.assertOpen();
     if (this.scheduled || this.armStarted) throw new FaultControlError("REPLAY_REFUSED");
     const caseValue = caseForId(this.options.matrix, caseId);
+    // A runner may need to create the private control root before the target is
+    // ready. Start the case budget at the first arm, not at scaffolding setup.
+    this.caseDeadline();
     this.armStarted = true;
     this.activeCase = caseValue;
     const requestId = randomUUID();
     const command = this.command(caseValue, "arm", requestId);
     await this.write(command);
     try {
+      afterPublished?.();
       const arrived = await this.awaitWithOneAcknowledgementRetry(command, caseValue, "arrived");
       this.scheduled = Object.freeze({ case: caseValue, requestId, arrived });
       return this.scheduled;
@@ -648,7 +736,10 @@ export class FaultMatrixScheduler {
   }
 
   /** Release or cancel exactly the armed fault boundary; a second action is refused. */
-  async releaseBarrier(kind: "release" | "cancel" = "release"): Promise<FaultControlAcknowledgement> {
+  async releaseBarrier(
+    kind: "release" | "cancel" = "release",
+    afterPublished?: () => void
+  ): Promise<FaultControlAcknowledgement> {
     this.assertOpen();
     if (!this.scheduled) throw new FaultControlError("MATRIX_MISMATCH");
     if (this.actionStarted) throw new FaultControlError("REPLAY_REFUSED");
@@ -656,7 +747,13 @@ export class FaultMatrixScheduler {
     const command = this.command(this.scheduled.case, kind);
     await this.write(command);
     try {
-      return await this.awaitWithOneAcknowledgementRetry(command, this.scheduled.case, "executed");
+      // Some pre-lease actions must use the first real product call after this
+      // immutable command exists to both drive the fixture and surface the
+      // selected public boundary. Start that work only after publication.
+      afterPublished?.();
+      const acknowledgement = await this.awaitWithOneAcknowledgementRetry(command, this.scheduled.case, "executed");
+      this.actionExecuted = true;
+      return acknowledgement;
     } catch (error) {
       this.controller.abort(error);
       throw error;
@@ -669,17 +766,73 @@ export class FaultMatrixScheduler {
     return this.releaseBarrier(kind);
   }
 
-  /** Terminally revoke this in-memory capability before invoking owned cleanup. */
-  async finishCase(): Promise<void> {
+  /**
+   * Close a case after exact owned-process vacancy makes a fixture terminal
+   * acknowledgement impossible. The ordinary action acknowledgement must have
+   * completed while the fixture was still alive. Exact-exit camera rows and
+   * the explicit owned-Workbench shutdown action may use this path; the latter
+   * can retain a completed/restored public result while still removing the
+   * process before handler Release.
+   */
+  async finishAfterExactOwnerExit(
+    publicTerminal: FaultMatrixTerminal,
+    exactOwnerVacant: boolean
+  ): Promise<void> {
     if (this.terminal || this.finishing) return;
     const selected = this.scheduled?.case ?? this.activeCase;
+    let failure: unknown;
+    if (!selected ||
+        (selected.cameraDisposition !== "exact_process_exit" &&
+          selected.injection.action !== "stop_owned_workbench") ||
+        !this.actionStarted || !this.actionExecuted || !exactOwnerVacant) {
+      failure = new FaultControlError("MATRIX_MISMATCH");
+    } else if (!isCanonicalFaultMatrixTerminal(publicTerminal)) {
+      failure = new FaultControlError("MALFORMED");
+    } else if (publicTerminal.state !== selected.expectedTerminal.state ||
+        publicTerminal.errorCode !== selected.expectedTerminal.errorCode) {
+      failure = new FaultControlError("MATRIX_MISMATCH");
+    }
+    this.finishing = true;
+    this.controller.abort(new FaultControlError("CASE_TERMINAL"));
+    try {
+      await this.options.onCleanup?.();
+    } catch (error) {
+      failure ??= error;
+    } finally {
+      this.terminal = true;
+      this.finishing = false;
+    }
+    if (failure) throw failure;
+  }
+
+  /**
+   * Terminally revoke this in-memory capability before invoking owned cleanup.
+   *
+   * Once an action has been dispatched, a normal closeout must supply the
+   * canonical public terminal captured by the host. An invalid or missing
+   * terminal still seals the private channel and runs cleanup, but the method
+   * rejects so an emergency closeout cannot be reported as a valid sequence.
+   */
+  async finishCase(publicTerminal?: FaultMatrixTerminal): Promise<void> {
+    if (this.terminal || this.finishing) return;
+    const selected = this.scheduled?.case ?? this.activeCase;
+    let sequencingFailure: unknown;
+    if (publicTerminal !== undefined && !isCanonicalFaultMatrixTerminal(publicTerminal)) {
+      sequencingFailure = new FaultControlError("MALFORMED");
+    } else if (publicTerminal !== undefined && selected &&
+        (publicTerminal.state !== selected.expectedTerminal.state ||
+          publicTerminal.errorCode !== selected.expectedTerminal.errorCode)) {
+      sequencingFailure = new FaultControlError("MATRIX_MISMATCH");
+    } else if (this.actionStarted && (!this.actionExecuted || publicTerminal === undefined)) {
+      sequencingFailure = new FaultControlError("MATRIX_MISMATCH");
+    }
     this.finishing = true;
     // Invalidate and abort all ordinary barrier consumers before starting the
     // terminal closeout handshake. The terminal acknowledgement wait opts out
     // of this case signal and therefore cannot compete with a still-live
     // arrival/action poller for the mailbox.
     this.controller.abort(new FaultControlError("CASE_TERMINAL"));
-    let failure: unknown;
+    let failure: unknown = sequencingFailure;
     try {
       if (selected) {
         const command: FaultControlTerminalCommand = Object.freeze({
@@ -717,6 +870,9 @@ export function createFaultMatrixRunScaffolding(options: {
   readonly bootstrap: FaultControlBootstrap;
   readonly clock: Clock;
   readonly sleeper: Sleeper;
+  readonly deadline?: Deadline;
+  readonly caseDeadlineMs?: number;
+  readonly barrierAllowanceMs?: number;
   readonly readLifecycleBinding?: () => FaultControlBinding | undefined;
   readonly onCleanup?: () => Promise<void> | void;
 }): FaultMatrixRunScaffolding {
@@ -745,6 +901,9 @@ export function createFaultMatrixRunScaffolding(options: {
       binding: options.bootstrap.binding,
       clock: options.clock,
       sleeper: options.sleeper,
+      ...(options.deadline ? { deadline: options.deadline } : {}),
+      ...(options.caseDeadlineMs !== undefined ? { caseDeadlineMs: options.caseDeadlineMs } : {}),
+      ...(options.barrierAllowanceMs !== undefined ? { barrierAllowanceMs: options.barrierAllowanceMs } : {}),
       onCleanup: options.onCleanup,
     });
     return Object.freeze({ controlRoot: ownedRoot, authorizer, scheduler });

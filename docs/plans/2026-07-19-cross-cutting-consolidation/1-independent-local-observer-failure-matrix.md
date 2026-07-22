@@ -1,7 +1,9 @@
 # Local observer failure-matrix acceptance implementation
 
-**Status:** Planned maintainer-only validation work  
-**Scope:** Real local graphical-runtime and Workbench observer acceptance  
+**Status:** Workbench harness implementation and related hermetic contracts
+complete; broader runtime coverage, gated live matrix execution, and maintainer
+closeout outstanding
+**Scope:** Real local graphical-runtime and Workbench observer acceptance
 **Non-goal:** GitHub-hosted CI, contributor setup, or any always-on product fault-control surface
 **Related context:** [Cross-cutting consolidation implementation guide](README.md), independent local-acceptance follow-on
 
@@ -15,16 +17,63 @@ The observer capture system has two complementary validation layers:
    faults into a disposable runtime or Workbench fixture and retains sanitized
    evidence of safe behavior.
 
-The current scripts already prove the positive path:
+The scripts retain their independently qualified positive paths:
 
 - `scripts/run-runtime-observer-acceptance.ts`
 - `scripts/run-workbench-observer-acceptance.ts`
 
 They launch controlled fixtures, capture current/pose/look-at views, validate
 PNG material and metadata, prove restoration, export managed evidence, and
-clean up owned processes. This plan extends those scripts with controlled
-failure cases. It must not make either script part of the normal `npm test` or
-GitHub Actions workflow.
+clean up owned processes. The repository now also implements the 69-case
+Workbench failure harness and the retained runtime pilot described below. Both
+remain excluded from normal `npm test` and GitHub Actions, and implementation
+does not by itself prove a native matrix passed.
+
+## Current implementation snapshot
+
+- The version-1 shared catalog has one retained runtime pilot and 69 Workbench
+  declarations. The Workbench inventory covers 3 completion, 12 cancellation,
+  15 handler-loss, 3 lease-contention, 15 world-loss, 3 artifact-corruption,
+  15 owned-shutdown, and 3 idempotent terminal-release cases. A fault scheduled
+  at `terminal_release` preserves the already-proven restoration/completion
+  semantics; it is not treated like a fault during a held camera lease.
+- Phase 2 delivered the bounded runtime cancellation pilot and shared runner
+  contracts. The broader runtime success, world-loss, transport-loss, and
+  owned-shutdown families in Task 2 are not declared in the current catalog and
+  remain outside current failure-matrix coverage.
+- The production Workbench helper exposes five default-inert phase hooks. The
+  generated-only fixture overrides all five, drains a capability-gated
+  lifecycle-bound control channel through
+  `RFO_WorkbenchObserverMatrixPlugin`, and remains outside the shipped helper
+  and public NET API/MCP inventories.
+- The Workbench matrix runner is serial and resettable. Full execution creates
+  fresh project/profile/lifecycle/control state per case and aggregates one
+  full result behind explicit `--matrix`; selected execution validates
+  `--only <case-id>` before launch and emits explicit partial coverage. With no
+  selector, the existing five-view positive acceptance is unchanged.
+  `--keep-profile` is a failed selected-run diagnostic only.
+- Default-off harness seams exercise a one-shot failure around the real NET API
+  transport, bounded mutation of the real PNG immediately before validation,
+  an identical release replay, generated-world replacement, and full-tuple
+  decoy identity comparison.
+- When restoration becomes unprovable, the activity gate can exchange the
+  retained capture wait for an exact-owner-exit seal. Only the existing
+  owner-scoped shutdown path can cross that seal; it never converts missing
+  restoration into a passing restoration claim. The repository-only
+  acceptance adapter discards its retained local record only after independent
+  exact-owner vacancy proof.
+  Shutdown revalidates the sealed lifecycle/target/full process identity before
+  reservation and again before signaling; mismatch returns
+  `IDENTITY_UNVERIFIABLE`, retains the seal, and performs no termination call.
+- `OperationalBaselineArtifact` stays at schema version 1. The separate
+  `ObserverFailureMatrixArtifact` is version 3 with full/partial selection,
+  source commit/tree state, structured control/artifact/manifest/shutdown/decoy
+  evidence, per-case limitations, adversarial redaction, and Markdown-first,
+  JSON-last publication.
+
+The ordinary hermetic suites cover this implementation. The full gated
+Workbench matrix has not been run or reviewed for the current revision, so
+Task 7 and the completion criteria remain open.
 
 ## Prerequisites and sequencing
 
@@ -368,6 +417,12 @@ and look-at capture where it is meaningful:
 | PNG/artifact failure | Deliver an invalid, incomplete, or mismatched fixture artifact before promotion; verify validation fails before manifest export. |
 | Cancellation and shutdown | Cancel or request exact-owned shutdown at every lease phase; prove restoration or exact exit and protect the unrelated-process decoy. |
 
+**Implemented inventory:** 69 Workbench declarations expand these families in
+canonical dotted-ID order. The exact action/phase/view counts and public
+terminal contracts are retained in the
+[Phase 3 implementation record](1-independent-local-observer-failure-matrix-phase-3-workbench-and-closeout.md#3-implement-the-workbench-case-table).
+This is catalog and harness coverage, not retained live evidence.
+
 The decoy check must assert identity non-interference; it must not rely on a
 name match or attempt to terminate the decoy.
 
@@ -386,52 +441,49 @@ name match or attempt to terminate the decoy.
 - "Lease contention" is the one family that doesn't need a phase barrier at
   all — it needs two overlapping capture requests against the same fixture,
   which the existing single-lease enforcement in `capture-service.ts`
-  (`CAMERA_BUSY` on release; check the acquire path for the equivalent
-  contention error code) should already reject. This case mostly needs the
-  script to attempt the second request and assert the specific public error
-  code, not new fixture instrumentation.
-- "PNG/artifact failure" cases can likely reuse `observer-live-acceptance-support.ts`'s
-  existing PNG validators (`analyzePngMaterial`, `detectPngColorMarker`) by
-  feeding them a deliberately corrupted fixture artifact — confirm those
-  validators reject bad input with a distinguishable error rather than
-  throwing something generic, since the case needs to assert *which*
-  validation failed.
+  rejects at competing submit/acquisition with public `CAMERA_BUSY`. The matrix
+  case overlaps the second application request with the first retained lease,
+  then proves the first lease is unchanged and a follow-up can acquire it.
+- "PNG/artifact failure" uses the repository-only acceptance adapter's
+  default-off pre-validation hook to
+  mutate the bounded real PNG after restored-terminal envelope preflight and
+  immediately before validation. Truncation, CRC corruption, and byte-length
+  mismatch must project as public `ARTIFACT_INVALID`; the rejected capture is
+  never promoted into a managed manifest.
 
 **Hurdles**
 
-- **Workbench is effectively single-instance per machine.** Confirm this
-  constraint before scoping "Lease contention" and "Handler loss" cases: if
-  only one Workbench process can run at a time, every Workbench case in this
-  task must run serially against the one disposable project, and the
-  preflight vacancy check (existing safety constraint) has to be satisfied
-  fresh before *each* case, not once for the whole matrix. This multiplies
-  wall-clock cost similarly to the runtime concern in Task 2, but is worse
-  here because Workbench startup is typically slower than the runtime
-  executable.
-- **"Handler unavailable" needs a real unavailability, not a simulated one.**
-  If the acceptance handler lives inside the Workbench process itself
-  (likely, given `EMCP_WB_ObserverCommon.c` / the handler-contract test
-  naming), truly making it "unavailable" mid-phase may require either
-  unloading the add-on module or blocking its transport — both are more
-  invasive than killing an external process. Decide which mechanism is both
-  realistic (matches a real failure mode) and safe (doesn't corrupt the
-  disposable Workbench project state for the next case in the same run).
-- **World/project loss inside an editor** may prompt Workbench's own
-  "unsaved changes" or reload UI, which would hang a scripted run
-  indefinitely. Confirm the generated disposable project can be
-  unloaded/reloaded headlessly through the same control channel rather than
-  through UI automation before committing to this case family's design.
+- **Workbench is effectively single-instance per machine.** The implemented
+  runner therefore executes cases serially and creates fresh disposable
+  project, profile, lifecycle, and control state after a fresh vacancy
+  preflight. Startup cost remains a live-run budgeting concern.
+- **Handler loss uses real transport behavior.** A fixture-only one-shot
+  `WorkbenchNetApiPort` wrapper delegates every unaffected call and fails one
+  selected request or response boundary; it never synthesizes an observer
+  handler result.
+- **World/project loss inside an editor remains a native acceptance risk.**
+  The implementation opens only generated `ObserverMatrixB` and has hermetic
+  projection/cleanup coverage, but the gated run must still prove that the
+  installed Workbench does not display an unsaved-change or reload prompt.
 
 **Acceptance:** A local run emits a revision-bound Workbench matrix artifact
 covering every declared case and verifies exact-owned cleanup.
 
 ## Task 4 — Make evidence matrix-aware and reviewable
 
-Replace the positive-path-only summaries with a schema that records one entry
-per case. Each entry must include the declared case ID, redacted schedule,
-public terminal state/error, deadline outcome, world-revision disposition,
-camera disposition, artifact validation result, exact-owner cleanup result,
-and hashes for retained logs/evidence.
+Keep the positive-path version-1 artifact stable and use the separate
+version-3 failure-matrix schema, which records one entry per selected case.
+Each entry includes the declared case ID, redacted schedule, public terminal
+state/error, deadline outcome, world-revision and camera dispositions,
+structured control arrival/action, artifact validation and PNG/metadata hashes,
+managed-manifest disposition, exact-owner and decoy results, cleanup, per-case
+limitations, and hashes for retained diagnostics.
+
+The artifact declares `coverage.kind` as `full` or `partial` and binds rows to
+`selectedCaseIds` in canonical backend order. Full passing evidence requires
+all declared backend cases, a clean tree, and a 40-hex source commit. Partial
+evidence is explicit in both JSON and Markdown and cannot be presented as a
+full matrix result.
 
 Keep manifest-last behavior. On a failing case, retain only the bounded
 sanitized diagnostics needed to explain the failure and do not produce a
@@ -444,19 +496,18 @@ arguments, or image pixels in the summary.
 
 **Implementation notes**
 
-- `observer-live-acceptance-support.ts` already has
+- `observer-live-acceptance-support.ts` keeps
   `writeOperationalBaselineArtifact`, `operationalBaselineProcedureSha256`,
   and `operationalBaselineSource`/`operationalBaselineEnvironment` for the
-  positive-path artifact. Extend that schema (add a `cases: MatrixCaseEntry[]`
-  array alongside the existing fields) rather than inventing a parallel
-  artifact writer — this keeps the source-closure-hash and evaluator-identity
-  plumbing that already exists in one place.
+  version-1 positive-path artifact. The adjacent matrix writer reuses its
+  source-closure and evaluator-identity plumbing without changing the baseline
+  schema.
 - "Evaluator identity" already needs to be something other than a raw
   username per the redaction rules (machine/user identifiers must be
   redacted). Check what the current positive-path artifact records for this
   field today and keep the same convention rather than introducing a second
   identity representation.
-- Consider a `schemaVersion` field on the matrix artifact from the start.
+- The matrix artifact uses `schemaVersion: 3`.
   `docs/validation/` stays `.gitignore`d at the repo root and nothing this
   plan produces there is meant to be committed: Task 7's artifacts are
   written locally, reviewed by the maintainer, and then deleted as part of
@@ -467,17 +518,12 @@ arguments, or image pixels in the summary.
 
 **Hurdles**
 
-- **Manifest-last is harder to guarantee with N cases than with one
-  positive-path run.** The existing script can probably get away with
-  "write nothing until the whole run succeeds." A matrix run may partially
-  fail (some cases pass, one fails); Task 4 needs to decide explicitly
-  whether a partial failure still emits a JSON artifact (marked failing,
-  per "does not produce a passing matrix artifact") or emits nothing at
-  all. The task text says "do not produce a passing matrix artifact" on
-  failure, which implies a *failing* artifact may still be written — make
-  sure the schema and the manifest-last invariant test agree on which case
-  this actually is, since "manifest-last" and "always write on failure for
-  debuggability" are in tension and need a precise rule.
+- **Manifest-last with N cases is explicit.** A failed run may emit one
+  sanitized matrix pair marked `failed`; it can never be presented as passing.
+  The Markdown sibling is written and hashed first, and the JSON manifest is
+  renamed last. Per-case `manifestPublished` refers to the managed capture
+  bundle: rejected and not-created artifacts must record `false` even when the
+  failed matrix JSON itself is published for diagnosis.
 - **Redaction correctness still matters even though the artifact is
   deleted afterward.** Between being written and being deleted, the
   artifact is reviewed locally and may be pasted into a PR description, a
@@ -597,16 +643,20 @@ remaining static rule has a documented non-observability rationale.
 
 ## Task 7 — Run and retain the maintainer acceptance
 
+**Current status:** outstanding. No full 69-case Workbench matrix artifact,
+same-revision cross-backend review, or manual matrix image review has been
+recorded for the current implementation.
+
 On a controlled Windows machine with Arma Reforger Tools and the normal local
-configuration, run the final matrix commands one at a time with no pre-existing
-Arma or Workbench process:
+configuration, run the declared runtime pilot and full Workbench matrix one at
+a time with no pre-existing Arma or Workbench process:
 
 ```powershell
 $env:RFO_RUN_LIVE_RUNTIME_OBSERVER_ACCEPTANCE = '1'
-npm.cmd run dev:observer:acceptance:runtime -- --confirm-live-run
+npm.cmd run dev:observer:acceptance:runtime -- --only runtime.cancel_capture.lease_acquired.pose --confirm-live-run
 
 $env:RFO_RUN_LIVE_WORKBENCH_OBSERVER_ACCEPTANCE = '1'
-npm.cmd run dev:observer:acceptance:workbench -- --confirm-live-run
+npm.cmd run dev:observer:acceptance:workbench -- --matrix --confirm-live-run
 ```
 
 Retain the resulting sanitized runtime and Workbench matrix artifacts under
@@ -616,6 +666,16 @@ output images, then delete them as part of the same manual closeout the
 parent guide already documents for its own validation evidence. The
 artifacts are proof the run happened and passed at review time; they are not
 meant to persist in the tree or in git history afterward.
+
+For a successful full Workbench matrix, the command also prints
+`RFO_WORKBENCH_OBSERVER_FAILURE_MATRIX_REVIEW_DIRECTORY=<path>`. That exact
+external directory contains the managed completed-row bundles copied out for
+manual review. Retain it through Task 7, inspect every image at original
+resolution, and record the review against the same committed revision and
+source closure. Automation deliberately leaves the directory unreviewed and
+does not delete it. After the review is recorded, delete only the exact
+printed directory; do not use a broad cleanup against its parent, the
+repository, or `docs/validation`.
 
 **Implementation notes**
 
@@ -691,6 +751,9 @@ planned in isolation:
   configuration than assumed here.
 
 ## Completion criteria
+
+**Current result:** not complete. Implementation and hermetic qualification do
+not satisfy the retained-live-evidence requirements below.
 
 This work is complete only when:
 

@@ -10,20 +10,17 @@
 // modded ArmaReforgerScripted.OnUpdate), a Workbench helper add-on has no
 // autonomous per-frame tick: helper Enforce code runs only when the host makes
 // a NET API call. This fixture therefore drains its control inbox from a modded
-// EMCP_WB_ObserverService.Advance (which the host's Status poll calls) and from
-// its OnLeaseAcquiredBarrier override. The drain runs at the top of Advance,
-// before the terminal short-circuit, so a release/cancel acknowledgement can
-// still be produced after the host has cancelled the job. The Phase 3 runner
-// keeps polling Status for the duration of a case so these drain points keep
-// getting called.
+// EMCP_WB_ObserverService.Advance (which the host's Status poll calls), from its
+// OnLeaseAcquiredBarrier override, and from a modded ObserverPing handler. The
+// ping drain is required after cancellation because both host-side status
+// layers correctly return their cached terminal result instead of calling
+// Advance again. The Phase 3 runner pumps only these existing real handlers.
 //
-// The fixture currently knows only the single Phase 3 vertical-slice
-// declaration (workbench.cancel_capture.lease_acquired.pose). Its command/case
-// validation is intentionally hardcoded to that one case rather than a general
-// port of the host-side FaultControlAuthorizer
-// (scripts/observer-fault-matrix-support.ts): Enforce Script cannot import that
-// TypeScript module, and porting its full generality is unwarranted before the
-// slice has a retained live result.
+// The fixture validates the complete Phase 3 Workbench action/phase/view
+// vocabulary locally. It does not invent an independent schedule: accepted
+// case IDs must be the exact dotted projection of the command fields, and each
+// action is constrained to the same phase set as the host catalog. Unknown or
+// malformed schedules remain inert and receive a bounded refusal.
 
 class RFO_WBFaultControlBinding : JsonApiStruct
 {
@@ -92,10 +89,10 @@ class RFO_WBFaultControlCommand : JsonApiStruct
 /**
  * Capability-gated fixture controller. Singleton, drained on demand from the
  * modded observer service (see file header). It emits phase acknowledgements
- * and performs no native fixture action itself: the one declared vertical-slice
- * action (cancel_capture) is host-runner executed through the normal observer
- * Cancel NET API, so this controller only needs to unblock its own barrier and
- * acknowledge the control-channel handshake.
+ * and performs no native fixture action itself. Every declared action is
+ * executed by the host through the normal observer, editor-control, artifact,
+ * or exact-owner lifecycle surface; this controller only observes/unblocks its
+ * barrier and acknowledges the private control-channel handshake.
  */
 class RFO_WBObserverMatrixControl
 {
@@ -106,9 +103,12 @@ class RFO_WBObserverMatrixControl
 	protected static const string INBOX_DIRECTORY = CONTROL_DIRECTORY + "/inbox";
 	protected static const string OUTBOX_DIRECTORY = CONTROL_DIRECTORY + "/outbox";
 
-	protected static const string SLICE_CASE_ID = "workbench.cancel_capture.lease_acquired.pose";
-	protected static const string SLICE_PHASE = "lease_acquired";
-	protected static const string SLICE_ACTION = "cancel_capture";
+	protected static const string FIXTURE_ADDON_IDENTITY = "2C6B8D14F9A0473E";
+	protected static const string PHASE_BEFORE_LEASE = "before_lease";
+	protected static const string PHASE_LEASE_ACQUIRED = "lease_acquired";
+	protected static const string PHASE_CAPTURE_IN_PROGRESS = "capture_in_progress";
+	protected static const string PHASE_RESTORATION_IN_PROGRESS = "restoration_in_progress";
+	protected static const string PHASE_TERMINAL_RELEASE = "terminal_release";
 
 	protected static const string REASON_MALFORMED = "MALFORMED";
 	protected static const string REASON_RUN_MISMATCH = "RUN_MISMATCH";
@@ -123,18 +123,36 @@ class RFO_WBObserverMatrixControl
 	protected int m_NextOutboxSequence;
 	protected int m_LastProcessedInboxSequence = -1;
 	protected ref map<string, string> m_AckCache;
+	protected ref map<string, string> m_RequestFingerprints;
 
 	protected bool m_Terminal;
+	protected string m_SelectedCaseId;
+	protected string m_SelectedPhase;
+	protected string m_SelectedAction;
+	protected string m_SelectedView;
 	protected string m_ArmedCaseId;
 	protected string m_ArmedPhase;
 	protected string m_ArmedAction;
 	protected string m_ArmedRequestId;
+	protected string m_ArmedJobId;
 	protected bool m_Arrived;
 	protected bool m_Released;
+	protected bool m_ActionExecuted;
+	// before_lease is observed by Ping because no handler job exists yet. That
+	// authenticated arrival binds lifecycle/case/phase; the host's validated
+	// declared capture input binds the prospective view for faults that reject
+	// before Submit. Keep the selected tuple after releasing the probe so any
+	// subsequent real Submit must still match instead of silently consuming a
+	// different view or lifecycle. A Submit is deliberately not required for
+	// terminal closeout: WORLD_CHANGED, handler loss, and owned exit may all
+	// produce their declared public result before a handler job can exist.
+	protected bool m_BeforeLeaseSubmitPending;
+	protected bool m_BeforeLeaseSubmitBound;
 
 	void RFO_WBObserverMatrixControl()
 	{
 		m_AckCache = new map<string, string>();
+		m_RequestFingerprints = new map<string, string>();
 	}
 
 	static RFO_WBObserverMatrixControl GetInstance()
@@ -149,8 +167,6 @@ class RFO_WBObserverMatrixControl
 	// paused at the barrier or has already reached a terminal state.
 	void Drain()
 	{
-		if (m_Terminal)
-			return;
 		if (!m_BootstrapValid)
 		{
 			// Retry until the launcher has written bootstrap.json. A Workbench
@@ -175,6 +191,29 @@ class RFO_WBObserverMatrixControl
 	{
 		if (m_Terminal || m_ArmedCaseId.IsEmpty() || m_ArmedPhase != phase || !job)
 			return true;
+		// Bind the passive barrier to the real handler job and lifecycle generation,
+		// not only to values copied from the host command. A restarted Workbench or
+		// a different retained job cannot consume an old bootstrap capability.
+		if (job.lifecycleGeneration != m_Bootstrap.binding.lifecycleGeneration ||
+			(!m_ArmedJobId.IsEmpty() && m_ArmedJobId != job.jobId))
+		{
+			Refuse(m_ArmedRequestId, m_ArmedCaseId, m_ArmedPhase, REASON_LIFECYCLE_MISMATCH);
+			m_Terminal = true;
+			m_ArmedCaseId = string.Empty;
+			m_ArmedJobId = string.Empty;
+			return true;
+		}
+		if (m_ArmedJobId.IsEmpty())
+			m_ArmedJobId = job.jobId;
+		// Hook invocation alone is not phase evidence. Reject a delayed arm if
+		// the real job has already crossed the selected product boundary.
+		if (!BarrierStateMatches(phase, job))
+		{
+			Refuse(m_ArmedRequestId, m_ArmedCaseId, m_ArmedPhase, REASON_PHASE_MISMATCH);
+			m_Terminal = true;
+			ClearBarrier();
+			return true;
+		}
 		if (!m_Arrived)
 		{
 			m_Arrived = true;
@@ -182,13 +221,96 @@ class RFO_WBObserverMatrixControl
 		}
 		if (!m_Released)
 			return false;
+		ClearBarrier();
+		return true;
+	}
+
+	protected bool BarrierStateMatches(string phase, EMCP_WB_ObserverJob job)
+	{
+		if (!job)
+			return false;
+		if (phase == PHASE_LEASE_ACQUIRED)
+			return job.cameraLeaseHeld && !job.restorationConfirmed && !job.screenshotIssued &&
+				(job.state == EMCP_WB_ObserverProtocol.STATE_ACCEPTED || job.state == EMCP_WB_ObserverProtocol.STATE_SETTLING);
+		if (phase == PHASE_CAPTURE_IN_PROGRESS)
+			return job.cameraLeaseHeld && !job.restorationConfirmed && job.screenshotIssued &&
+				(job.state == EMCP_WB_ObserverProtocol.STATE_CAPTURING || job.state == EMCP_WB_ObserverProtocol.STATE_AWAITING_ARTIFACT);
+		if (phase == PHASE_RESTORATION_IN_PROGRESS)
+			return job.cameraLeaseHeld && !job.restorationConfirmed && job.screenshotIssued &&
+				job.artifactBytes > 33 && job.state == EMCP_WB_ObserverProtocol.STATE_RESTORING;
+		if (phase == PHASE_TERMINAL_RELEASE)
+			return job.IsTerminal() && !job.cameraLeaseHeld && job.restorationConfirmed;
+		return false;
+	}
+
+	// before_lease is observed through the existing Ping handler before the
+	// host dispatches Submit. The production Submit hook calls this again and is
+	// admitted only after the host has executed and released the armed action.
+	bool CheckBeforeLeaseProbe(EMCP_WB_ObserverService service)
+	{
+		if (m_Terminal || m_ArmedCaseId.IsEmpty() || m_ArmedPhase != PHASE_BEFORE_LEASE)
+			return true;
+		if (!service || service.HasJob())
+		{
+			Refuse(m_ArmedRequestId, m_ArmedCaseId, m_ArmedPhase, REASON_LIFECYCLE_MISMATCH);
+			m_Terminal = true;
+			ClearBarrier();
+			return true;
+		}
+		if (!m_Arrived)
+		{
+			m_Arrived = true;
+			SendAcknowledgement("arrived", m_ArmedRequestId, m_ArmedCaseId, m_ArmedPhase, string.Empty);
+		}
+		if (!m_Released)
+			return false;
+		ClearBarrier();
+		return true;
+	}
+
+	bool CheckBeforeLeaseSubmit(
+		EMCP_WB_ObserverService service,
+		string jobId,
+		string lifecycleGeneration,
+		string canonicalTarget,
+		string viewKind)
+	{
+		// A Submit that races the still-held probe remains blocked. Arrival is
+		// emitted only by the Ping probe, where absence of a retained job can be
+		// observed without allowing Submit to acquire camera state.
+		if (!m_ArmedCaseId.IsEmpty() && m_ArmedPhase == PHASE_BEFORE_LEASE)
+			return CheckBeforeLeaseProbe(service);
+		if (!m_BeforeLeaseSubmitPending)
+			return true;
+
+		string submittedView = viewKind;
+		if (submittedView == "lookAt")
+			submittedView = "lookat";
+		bool matches = !m_Terminal && service && !service.HasJob() && !jobId.IsEmpty() &&
+			!canonicalTarget.IsEmpty() && m_SelectedPhase == PHASE_BEFORE_LEASE &&
+			lifecycleGeneration == m_Bootstrap.binding.lifecycleGeneration && submittedView == m_SelectedView;
+		m_BeforeLeaseSubmitPending = false;
+		if (!matches)
+		{
+			// No control request is pending after the release acknowledgement, so
+			// fail the real Submit and seal the case instead of fabricating another
+			// acknowledgement for an already-completed handshake.
+			m_Terminal = true;
+			return false;
+		}
+		m_BeforeLeaseSubmitBound = true;
+		return true;
+	}
+
+	protected void ClearBarrier()
+	{
 		m_ArmedCaseId = string.Empty;
 		m_ArmedPhase = string.Empty;
 		m_ArmedAction = string.Empty;
 		m_ArmedRequestId = string.Empty;
+		m_ArmedJobId = string.Empty;
 		m_Arrived = false;
 		m_Released = false;
-		return true;
 	}
 
 	protected void TryLoadBootstrap()
@@ -202,7 +324,10 @@ class RFO_WBObserverMatrixControl
 			return;
 		if (bootstrap.schemaVersion != 1 || bootstrap.backend != "workbench" ||
 			!IsUuidLike(bootstrap.capability) || bootstrap.runId.IsEmpty() || bootstrap.runId.Length() > 160 ||
+			!IsSha256(bootstrap.fixtureContentIdentity) || !IsSha256(bootstrap.generatedProjectIdentity) ||
+			bootstrap.generatedAddonIdentity != FIXTURE_ADDON_IDENTITY ||
 			!bootstrap.binding || bootstrap.binding.fixtureId.IsEmpty() ||
+			bootstrap.binding.fixtureId != bootstrap.generatedProjectIdentity ||
 			bootstrap.binding.lifecycleId.IsEmpty() || bootstrap.binding.lifecycleGeneration.IsEmpty())
 			return;
 		m_Bootstrap = bootstrap;
@@ -229,13 +354,20 @@ class RFO_WBObserverMatrixControl
 			return;
 		if (sequence <= m_LastProcessedInboxSequence)
 			return;
-		m_LastProcessedInboxSequence = sequence;
 
 		RFO_WBFaultControlCommand command = new RFO_WBFaultControlCommand();
 		if (!command.LoadFromFile(INBOX_DIRECTORY + "/" + name))
+			// The host may still have the newly-created mailbox file open. Do not
+			// consume its sequence until one complete JSON document can be read.
 			return;
-		if (command.schemaVersion != 1 || command.runId != m_Bootstrap.runId || command.requestId.IsEmpty())
+		m_LastProcessedInboxSequence = sequence;
+		if (command.schemaVersion != 1 || command.requestId.IsEmpty())
 			return;
+		if (command.runId != m_Bootstrap.runId)
+		{
+			RefuseIfKnownRequest(command.requestId, command.caseId, command.phase, REASON_RUN_MISMATCH);
+			return;
+		}
 		if (!command.binding || command.binding.fixtureId != m_Bootstrap.binding.fixtureId ||
 			command.binding.lifecycleId != m_Bootstrap.binding.lifecycleId ||
 			command.binding.lifecycleGeneration != m_Bootstrap.binding.lifecycleGeneration)
@@ -243,36 +375,35 @@ class RFO_WBObserverMatrixControl
 			RefuseIfKnownRequest(command.requestId, command.caseId, command.phase, REASON_LIFECYCLE_MISMATCH);
 			return;
 		}
-		if (command.runId != m_Bootstrap.runId)
-		{
-			RefuseIfKnownRequest(command.requestId, command.caseId, command.phase, REASON_RUN_MISMATCH);
-			return;
-		}
-
 		if (m_AckCache.Contains(command.requestId))
 		{
-			WriteOutbox(m_AckCache.Get(command.requestId));
+			if (m_RequestFingerprints.Get(command.requestId) == CommandFingerprint(command))
+				WriteOutbox(m_AckCache.Get(command.requestId));
+			else
+				WriteOutbox(AcknowledgementJson("refused", command.requestId, command.caseId, command.phase, REASON_REPLAY_REFUSED));
 			return;
 		}
+		m_RequestFingerprints.Set(command.requestId, CommandFingerprint(command));
 
-		if (command.kind == "terminal")
-		{
-			HandleTerminal(command);
-			return;
-		}
 		if (m_Terminal)
 		{
 			Refuse(command.requestId, command.caseId, command.phase, REASON_CASE_TERMINAL);
 			return;
 		}
-		if (command.caseId != SLICE_CASE_ID)
+		if (command.kind == "terminal")
 		{
-			Refuse(command.requestId, command.caseId, command.phase, REASON_MATRIX_MISMATCH);
+			if (command.caseId != m_SelectedCaseId || command.phase != m_SelectedPhase ||
+				!IsDeclaredSchedule(command.caseId, m_SelectedAction, command.phase))
+			{
+				Refuse(command.requestId, command.caseId, command.phase, REASON_MATRIX_MISMATCH);
+				return;
+			}
+			HandleTerminal(command);
 			return;
 		}
-		if (command.phase != SLICE_PHASE)
+		if (!IsDeclaredSchedule(command.caseId, command.action, command.phase))
 		{
-			Refuse(command.requestId, command.caseId, command.phase, REASON_PHASE_MISMATCH);
+			Refuse(command.requestId, command.caseId, command.phase, REASON_MATRIX_MISMATCH);
 			return;
 		}
 		if (command.kind == "arm")
@@ -290,12 +421,7 @@ class RFO_WBObserverMatrixControl
 
 	protected void HandleArm(RFO_WBFaultControlCommand command)
 	{
-		if (command.action != SLICE_ACTION)
-		{
-			Refuse(command.requestId, command.caseId, command.phase, REASON_MATRIX_MISMATCH);
-			return;
-		}
-		if (!m_ArmedCaseId.IsEmpty())
+		if (m_ActionExecuted || !m_ArmedCaseId.IsEmpty())
 		{
 			if (m_ArmedRequestId == command.requestId)
 				// A resend of the still-pending arm while awaiting barrier arrival.
@@ -308,9 +434,16 @@ class RFO_WBObserverMatrixControl
 		m_ArmedCaseId = command.caseId;
 		m_ArmedPhase = command.phase;
 		m_ArmedAction = command.action;
+		m_SelectedCaseId = command.caseId;
+		m_SelectedPhase = command.phase;
+		m_SelectedAction = command.action;
+		m_SelectedView = DeclaredView(command.caseId, command.action, command.phase);
 		m_ArmedRequestId = command.requestId;
+		m_ArmedJobId = string.Empty;
 		m_Arrived = false;
 		m_Released = false;
+		m_BeforeLeaseSubmitPending = false;
+		m_BeforeLeaseSubmitBound = false;
 	}
 
 	protected void HandleRelease(RFO_WBFaultControlCommand command)
@@ -322,19 +455,59 @@ class RFO_WBObserverMatrixControl
 			return;
 		}
 		m_Released = true;
+		m_ActionExecuted = true;
+		if (m_ArmedPhase == PHASE_BEFORE_LEASE)
+			m_BeforeLeaseSubmitPending = true;
 		SendAcknowledgement("executed", command.requestId, command.caseId, command.phase, string.Empty);
+		ClearBarrier();
 	}
 
 	protected void HandleTerminal(RFO_WBFaultControlCommand command)
 	{
+		if (!m_ActionExecuted || !m_ArmedCaseId.IsEmpty())
+		{
+			Refuse(command.requestId, command.caseId, command.phase, REASON_REPLAY_REFUSED);
+			return;
+		}
 		m_Terminal = true;
-		m_ArmedCaseId = string.Empty;
-		m_ArmedPhase = string.Empty;
-		m_ArmedAction = string.Empty;
-		m_ArmedRequestId = string.Empty;
-		m_Arrived = false;
-		m_Released = false;
+		ClearBarrier();
 		SendAcknowledgement("terminalled", command.requestId, command.caseId, command.phase, string.Empty);
+	}
+
+	protected bool IsDeclaredSchedule(string caseId, string action, string phase)
+	{
+		if (caseId.IsEmpty() || caseId.Length() > 192 || action.IsEmpty() || phase.IsEmpty())
+			return false;
+		string view = string.Empty;
+		string prefix = "workbench." + action + "." + phase + ".";
+		if (!caseId.StartsWith(prefix))
+			return false;
+		view = caseId.Substring(prefix.Length(), caseId.Length() - prefix.Length());
+		if (view != "current" && view != "pose" && view != "lookat")
+			return false;
+
+		if (action == "complete_capture" || action == "release_twice")
+			return phase == PHASE_TERMINAL_RELEASE;
+		if (action == "cancel_capture")
+			return phase == PHASE_LEASE_ACQUIRED || phase == PHASE_CAPTURE_IN_PROGRESS ||
+				phase == PHASE_RESTORATION_IN_PROGRESS || phase == PHASE_TERMINAL_RELEASE;
+		if (action == "submit_competing_capture")
+			return phase == PHASE_LEASE_ACQUIRED;
+		if (action == "write_truncated_artifact" || action == "write_crc_artifact" || action == "write_mismatched_artifact")
+			return phase == PHASE_CAPTURE_IN_PROGRESS && view == "pose";
+		if (action == "disable_fixture_handler" || action == "replace_fixture_world" || action == "stop_owned_workbench")
+			return phase == PHASE_BEFORE_LEASE || phase == PHASE_LEASE_ACQUIRED ||
+				phase == PHASE_CAPTURE_IN_PROGRESS || phase == PHASE_RESTORATION_IN_PROGRESS ||
+				phase == PHASE_TERMINAL_RELEASE;
+		return false;
+	}
+
+	protected string DeclaredView(string caseId, string action, string phase)
+	{
+		string prefix = "workbench." + action + "." + phase + ".";
+		if (!caseId.StartsWith(prefix))
+			return string.Empty;
+		return caseId.Substring(prefix.Length(), caseId.Length() - prefix.Length());
 	}
 
 	protected void RefuseIfKnownRequest(string requestId, string caseId, string phase, string reason)
@@ -351,6 +524,14 @@ class RFO_WBObserverMatrixControl
 
 	protected void SendAcknowledgement(string kind, string requestId, string caseId, string phase, string reason)
 	{
+		string json = AcknowledgementJson(kind, requestId, caseId, phase, reason);
+		if (!requestId.IsEmpty())
+			m_AckCache.Set(requestId, json);
+		WriteOutbox(json);
+	}
+
+	protected string AcknowledgementJson(string kind, string requestId, string caseId, string phase, string reason)
+	{
 		string json = "{\"schemaVersion\":1,\"kind\":" + Quote(kind);
 		json += ",\"requestId\":" + Quote(requestId);
 		json += ",\"caseId\":" + Quote(caseId);
@@ -361,9 +542,13 @@ class RFO_WBObserverMatrixControl
 		else
 			json += ",\"reason\":" + Quote(reason);
 		json += "}";
-		if (!requestId.IsEmpty())
-			m_AckCache.Set(requestId, json);
-		WriteOutbox(json);
+		return json;
+	}
+
+	protected string CommandFingerprint(RFO_WBFaultControlCommand command)
+	{
+		return command.kind + "|" + command.runId + "|" + command.caseId + "|" + command.phase + "|" + command.action + "|" +
+			command.binding.fixtureId + "|" + command.binding.lifecycleId + "|" + command.binding.lifecycleGeneration;
 	}
 
 	protected void WriteOutbox(string json)
@@ -371,11 +556,27 @@ class RFO_WBObserverMatrixControl
 		FileIO.MakeDirectory(OUTBOX_DIRECTORY);
 		string name = Pad(m_NextOutboxSequence, 12) + "-" + m_Bootstrap.capability + ".json";
 		m_NextOutboxSequence++;
-		FileHandle file = FileIO.OpenFile(OUTBOX_DIRECTORY + "/" + name, FileMode.WRITE);
+		string complete = OUTBOX_DIRECTORY + "/" + name;
+		string temporary = complete + ".tmp";
+		FileHandle file = FileIO.OpenFile(temporary, FileMode.WRITE);
 		if (!file)
 			return;
 		file.Write(json, json.Length());
 		file.Close();
+		if (!FileIO.CopyFile(temporary, complete))
+		{
+			FileIO.DeleteFile(temporary);
+			return;
+		}
+		FileHandle marker = FileIO.OpenFile(complete + ".complete", FileMode.WRITE);
+		if (!marker)
+		{
+			FileIO.DeleteFile(complete);
+			FileIO.DeleteFile(temporary);
+			return;
+		}
+		marker.Close();
+		FileIO.DeleteFile(temporary);
 	}
 
 	// The control vocabulary (fixed acknowledgement kinds, canonical phase and
@@ -445,6 +646,21 @@ class RFO_WBObserverMatrixControl
 		return true;
 	}
 
+	protected bool IsSha256(string value)
+	{
+		if (value.Length() != 64)
+			return false;
+		for (int index = 0; index < 64; index++)
+		{
+			int character = value.ToAscii(index);
+			bool hex = (character >= 48 && character <= 57) ||
+				(character >= 97 && character <= 102) || (character >= 65 && character <= 70);
+			if (!hex)
+				return false;
+		}
+		return true;
+	}
+
 	protected string BaseName(string path)
 	{
 		int separator = path.LastIndexOf("/");
@@ -460,14 +676,21 @@ class RFO_WBObserverMatrixControl
 modded class EMCP_WB_ObserverService
 {
 	// Drain the control inbox at the top of every Advance, before the terminal
-	// short-circuit inside super.Advance, so a release/cancel acknowledgement is
-	// still produced after the host cancels the job. The Status NET API poll is
-	// what calls Advance, so as long as the host keeps polling, the inbox keeps
-	// draining regardless of job state.
+	// short-circuit inside super.Advance. Status drives the active barrier; after
+	// the host caches a terminal result, the ObserverPing hook below takes over.
 	override bool Advance(string jobId, string leaseId, string lifecycleGeneration, string canonicalTarget, out string message)
 	{
 		RFO_WBObserverMatrixControl.GetInstance().Drain();
 		return super.Advance(jobId, leaseId, lifecycleGeneration, canonicalTarget, message);
+	}
+
+	override protected event bool OnBeforeLeaseBarrier(string jobId, string lifecycleGeneration, string canonicalTarget, string viewKind)
+	{
+		if (!super.OnBeforeLeaseBarrier(jobId, lifecycleGeneration, canonicalTarget, viewKind))
+			return false;
+		RFO_WBObserverMatrixControl control = RFO_WBObserverMatrixControl.GetInstance();
+		control.Drain();
+		return control.CheckBeforeLeaseSubmit(this, jobId, lifecycleGeneration, canonicalTarget, viewKind);
 	}
 
 	override protected event bool OnLeaseAcquiredBarrier(EMCP_WB_ObserverJob job)
@@ -477,5 +700,65 @@ modded class EMCP_WB_ObserverService
 		RFO_WBObserverMatrixControl control = RFO_WBObserverMatrixControl.GetInstance();
 		control.Drain();
 		return control.CheckBarrier("lease_acquired", job);
+	}
+
+	override protected event bool OnCaptureInProgressBarrier(EMCP_WB_ObserverJob job)
+	{
+		if (!super.OnCaptureInProgressBarrier(job))
+			return false;
+		RFO_WBObserverMatrixControl control = RFO_WBObserverMatrixControl.GetInstance();
+		control.Drain();
+		return control.CheckBarrier("capture_in_progress", job);
+	}
+
+	override protected event bool OnRestorationInProgressBarrier(EMCP_WB_ObserverJob job)
+	{
+		if (!super.OnRestorationInProgressBarrier(job))
+			return false;
+		RFO_WBObserverMatrixControl control = RFO_WBObserverMatrixControl.GetInstance();
+		control.Drain();
+		return control.CheckBarrier("restoration_in_progress", job);
+	}
+
+	override protected event bool OnTerminalReleaseBarrier(EMCP_WB_ObserverJob job)
+	{
+		if (!super.OnTerminalReleaseBarrier(job))
+			return false;
+		RFO_WBObserverMatrixControl control = RFO_WBObserverMatrixControl.GetInstance();
+		control.Drain();
+		return control.CheckBarrier("terminal_release", job);
+	}
+}
+
+// Fixture-only liveness hook for control closeout after a job is terminal.
+// This does not expose a new handler or alter the production helper payload;
+// it layers one private inbox drain over the existing observer ping.
+modded class EMCP_WB_ObserverPing
+{
+	override JsonApiStruct GetResponse(JsonApiStruct request)
+	{
+		RFO_WBObserverMatrixControl control = RFO_WBObserverMatrixControl.GetInstance();
+		control.Drain();
+		control.CheckBeforeLeaseProbe(EMCP_WB_ObserverService.Get());
+		return super.GetResponse(request);
+	}
+}
+
+[WorkbenchPluginAttribute(
+	name: "RFO Workbench Observer Matrix",
+	description: "Bootstraps the disposable Workbench observer failure-matrix fixture",
+	wbModules: { "ScriptEditor" })]
+class RFO_WorkbenchObserverMatrixPlugin : WorkbenchPlugin
+{
+	override void Run()
+	{
+		RFO_WBObserverMatrixControl.GetInstance().Drain();
+	}
+
+	override void RunCommandline()
+	{
+		// Matrix Workbench must remain alive for real NET API calls; unlike a
+		// standalone autotest plugin this bootstrap deliberately does not exit.
+		RFO_WBObserverMatrixControl.GetInstance().Drain();
 	}
 }

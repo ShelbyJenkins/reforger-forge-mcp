@@ -1,6 +1,5 @@
 #!/usr/bin/env node
-import { spawn } from "node:child_process";
-import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   cpSync,
   existsSync,
@@ -15,11 +14,13 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
-import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { OBSERVER_TERMINAL_STATES } from "../observer/protocol/enforce-contract.js";
-import { caseForId, OBSERVER_FAULT_MATRIX, type FaultMatrixCase } from "../observer/protocol/fault-matrix.js";
-import { loadConfig, type Config } from "../src/config.js";
+import {
+  caseForId,
+  OBSERVER_FAULT_MATRIX,
+  type WorkbenchFaultMatrixCase,
+} from "../observer/protocol/fault-matrix.js";
 import {
   deadlineAt,
   pollUntil,
@@ -27,26 +28,21 @@ import {
   systemSleeper,
 } from "../src/foundation/time.js";
 import {
-  createObserverApplication,
   type ObserverApplication,
   type ObserverCaptureView,
 } from "../src/observer/application.js";
-import { generateGproj } from "../src/templates/gproj.js";
-import { WorkbenchClient } from "../src/workbench/client.js";
 import {
   WorkbenchObserverAdapter,
   workbenchCameraMatrix,
   type WorkbenchCameraMatrix,
   type WorkbenchObserverJobStatus,
 } from "../src/workbench/observer-adapter.js";
-import { WorkbenchProcessGuard } from "../src/workbench/process-guard.js";
 import {
   OperationalBaselineRecorder,
   analyzePngMaterial,
   buildObserverFailureMatrixArtifact,
   comparePngImages,
   inspectBlockingProcesses,
-  matrixRetainedDiagnostic,
   operationalBaselineDirectoryIdentity,
   operationalBaselineEnvironment,
   operationalBaselineLaunchArgumentIdentity,
@@ -57,6 +53,10 @@ import {
   writeOperationalBaselineArtifact,
   type FailureMatrixPublication,
   type MatrixCaseEntry,
+  type OperationalBaselineEnvironment,
+  type OperationalBaselineMeasurement,
+  type OperationalBaselineProcessSample,
+  type OperationalBaselineWorkload,
   type PngComparisonEvidence,
   type PngMaterialEvidence,
 } from "./observer-live-acceptance-support.js";
@@ -64,9 +64,53 @@ import {
   createFaultMatrixRunScaffolding,
   removeOwnedFaultControlRoot,
   resolveFaultMatrixCases,
-  type FaultMatrixRunScaffolding,
-  type FaultMatrixScheduler,
 } from "./observer-fault-matrix-support.js";
+import {
+  remainingWorkbenchMatrixCaptureTimeout,
+  remainingWorkbenchMatrixStepTimeout,
+} from "./workbench-observer-matrix-case.js";
+import {
+  BASE_EVERON_WORLD,
+  WORKBENCH_MATRIX_FIXTURE_GUID,
+  WORKBENCH_MATRIX_FIXTURE_TEMPLATE_DIR,
+  WorkbenchObserverAcceptanceRuntime,
+  acceptanceConfig,
+  workbenchEnvironmentExecutables,
+} from "./workbench-observer-acceptance-runtime.js";
+import {
+  WORKBENCH_MATRIX_FIXTURE_SOURCES,
+  captureStableWorkbenchMatrixSource,
+  failedWorkbenchMatrixEntry,
+  runLiveWorkbenchMatrixCase as executeLiveWorkbenchMatrixCase,
+  workbenchMatrixSourceRevision,
+  type WorkbenchLiveMatrixCaseOutcome,
+  type WorkbenchLiveMatrixCaseServices,
+} from "./workbench-observer-live-matrix-case.js";
+
+export {
+  remainingWorkbenchMatrixCaptureTimeout,
+  remainingWorkbenchMatrixStepTimeout,
+  runWorkbenchCancelBarrierCase,
+  runWorkbenchMatrixCase,
+  type RunWorkbenchCancelBarrierCaseInput,
+  type RunWorkbenchMatrixCaseInput,
+  type WorkbenchMatrixCaseActions,
+  type WorkbenchMatrixCaseAdapter,
+  type WorkbenchMatrixCaseApplication,
+  type WorkbenchMatrixCaseScheduler,
+  type WorkbenchMatrixShutdownEvidence,
+  type WorkbenchMatrixValidatedCapture,
+} from "./workbench-observer-matrix-case.js";
+
+export { createDisposableProject } from "./workbench-observer-acceptance-runtime.js";
+
+export {
+  captureStableWorkbenchMatrixSource,
+  launchWorkbenchMatrixDecoy,
+  requireWorkbenchReplacementWorldId,
+  workbenchFailureDeadlineEvidence,
+  type WorkbenchLiveDecoy,
+} from "./workbench-observer-live-matrix-case.js";
 
 export const LIVE_WORKBENCH_OBSERVER_ENVIRONMENT =
   "RFO_RUN_LIVE_WORKBENCH_OBSERVER_ACCEPTANCE";
@@ -75,7 +119,6 @@ export const LIVE_WORKBENCH_OBSERVER_TEST_CONFIRMATION =
 
 const SCRIPT_PATH = fileURLToPath(import.meta.url);
 const REPOSITORY_ROOT = resolve(dirname(SCRIPT_PATH), "..");
-const LOCAL_CONFIG_PATH = join(REPOSITORY_ROOT, "reforger-forge.config.json");
 const WORKBENCH_OPERATIONAL_BASELINE_SOURCES = [
   "dist/observer/agent/private-child.js",
   "observer/addon/.reforger-forge-observer-source.json",
@@ -90,6 +133,11 @@ const WORKBENCH_OPERATIONAL_BASELINE_SOURCES = [
   "package.json",
   "scripts/windows/workbench-lifecycle.ps1",
   "scripts/observer-fault-matrix-support.ts",
+  "scripts/observer-workbench-failure-support.ts",
+  "scripts/workbench-observer-acceptance-adapter.ts",
+  "scripts/workbench-observer-acceptance-runtime.ts",
+  "scripts/workbench-observer-live-matrix-case.ts",
+  "scripts/workbench-observer-matrix-case.ts",
   "observer/protocol/fault-matrix.ts",
   "src/foundation/redact.ts",
   "src/foundation/time.ts",
@@ -108,6 +156,7 @@ const WORKBENCH_OPERATIONAL_BASELINE_SOURCES = [
   "src/workbench/managed-build-profile.ts",
   "src/workbench/net-api-client.ts",
   "src/workbench/observer-adapter.ts",
+  "src/workbench/observer-artifact-envelope.ts",
   "src/workbench/process-guard.ts",
   "src/workbench/protocol.ts",
   "src/workbench/readiness.ts",
@@ -123,7 +172,6 @@ const OBSERVER_OPERATIONAL_BASELINE_SOURCE_CLOSURES = [
   { path: "observer/workbench-addon/**/*.c", directory: "observer/workbench-addon", extension: ".c" },
   { path: "src/**/*.ts", directory: "src", extension: ".ts" },
 ] as const;
-const BASE_EVERON_WORLD = "{853E92315D1D9EFE}worlds/Eden/Eden.ent";
 const WORKBENCH_CAPTURE_LABELS = [
   "initial-current",
   "explicit-pose",
@@ -289,77 +337,6 @@ function assertRestoredWorkbenchCurrent(
   }
 }
 
-function randomGuid(): string {
-  return randomBytes(8).toString("hex").toUpperCase();
-}
-
-const WORKBENCH_MATRIX_FIXTURE_TEMPLATE_DIR = join(
-  REPOSITORY_ROOT, "tests", "fixtures", "workbench-observer-failure-matrix-addon"
-);
-/** Fixed GUID of tests/fixtures/workbench-observer-failure-matrix-addon/addon.gproj. */
-const WORKBENCH_MATRIX_FIXTURE_GUID = "2C6B8D14F9A0473E";
-const WORKBENCH_MATRIX_FIXTURE_ADDON_DIR_NAME = "ObserverMatrixFixture";
-
-/**
- * Copy the disposable matrix fixture add-on into the generated project search
- * root so Workbench can resolve it, and return the dependency GUID the opened
- * project must declare so the fixture's `modded class EMCP_WB_ObserverService`
- * is loaded. Staged only for a matrix run; the positive-path acceptance never
- * calls this, so with no staged fixture the helper stays inert.
- */
-function stageWorkbenchMatrixFixture(runDirectory: string): string {
-  const fixtureDirectory = join(runDirectory, WORKBENCH_MATRIX_FIXTURE_ADDON_DIR_NAME);
-  cpSync(WORKBENCH_MATRIX_FIXTURE_TEMPLATE_DIR, fixtureDirectory, { recursive: true });
-  return WORKBENCH_MATRIX_FIXTURE_GUID;
-}
-
-function createDisposableProject(runDirectory: string, options?: {
-  stageMatrixFixture?: boolean;
-}): {
-  modDirectory: string;
-  projectPath: string;
-  worldResource: string;
-} {
-  // In matrix mode the disposable project declares a dependency on the copied
-  // fixture add-on so opening it loads the fixture's modded observer service.
-  const dependencies = options?.stageMatrixFixture
-    ? [stageWorkbenchMatrixFixture(runDirectory)]
-    : undefined;
-  const modDirectory = join(runDirectory, "ObserverAcceptance");
-  const worldsDirectory = join(modDirectory, "Worlds");
-  mkdirSync(worldsDirectory, { recursive: true });
-  const projectPath = join(modDirectory, "ObserverAcceptance.gproj");
-  writeFileSync(projectPath, generateGproj({
-    name: "ObserverAcceptance",
-    title: "ReforgerForge Workbench observer acceptance",
-    guid: randomGuid(),
-    dependencies,
-  }), { encoding: "utf8", flag: "wx" });
-  const worldGuid = randomGuid();
-  const worldPath = join(worldsDirectory, "ObserverAcceptance.ent");
-  writeFileSync(worldPath, `SubScene {\n Parent "${BASE_EVERON_WORLD}"\n}\n`, {
-    encoding: "utf8",
-    flag: "wx",
-  });
-  writeFileSync(`${worldPath}.meta`, [
-    "MetaFileClass {",
-    ` Name "{${worldGuid}}Worlds/ObserverAcceptance.ent"`,
-    " Configurations {",
-    "  ENTResourceClass PC {",
-    "  }",
-    "  ENTResourceClass HEADLESS : PC {",
-    "  }",
-    " }",
-    "}",
-    "",
-  ].join("\n"), { encoding: "utf8", flag: "wx" });
-  return {
-    modDirectory,
-    projectPath,
-    worldResource: `{${worldGuid}}Worlds/ObserverAcceptance.ent`,
-  };
-}
-
 function canonicalDirectory(path: string, label: string): string {
   const absolute = resolve(path);
   if (!existsSync(absolute)) throw new Error(`${label} is missing: ${absolute}`);
@@ -377,65 +354,11 @@ function assertEvidenceOutsideRepository(path: string): void {
   }
 }
 
-function acceptanceConfig(projectRoot: string, managedRoot: string): Config {
-  if (!existsSync(LOCAL_CONFIG_PATH)) {
-    throw new Error("Live Workbench acceptance requires the repository-local, gitignored reforger-forge.config.json");
-  }
-  // Parse independently first so a malformed local file cannot silently fall
-  // back to machine defaults in loadConfig().
-  JSON.parse(readFileSync(LOCAL_CONFIG_PATH, "utf8"));
-  const local = loadConfig();
-  const workbenchPath = canonicalDirectory(local.workbenchPath, "Workbench tools directory");
-  const gamePath = canonicalDirectory(local.gamePath, "Arma Reforger game directory");
-  const configuredRoots = (local.workbenchAddonDirs ?? []).map((path, index) =>
-    canonicalDirectory(path, `Workbench addon root ${index + 1}`));
-  const host = local.workbenchHost.trim().toLowerCase().replace(/^\[|\]$/g, "");
-  if (!["127.0.0.1", "localhost", "::1"].includes(host)) {
-    throw new Error("Live Workbench observer acceptance requires a loopback NET API endpoint");
-  }
-  return {
-    ...local,
-    workbenchPath,
-    gamePath,
-    projectPath: projectRoot,
-    workbenchAddonDirs: [...configuredRoots, projectRoot],
-    workbenchScriptAuthorizeAll: false,
-    observer: {
-      ...local.observer!,
-      managedRoot,
-      profileRoot: join(managedRoot, "profiles"),
-    },
-  };
-}
-
-function firstRegularExecutable(candidates: string[]): string | undefined {
-  return candidates.find((candidate) => {
-    if (!existsSync(candidate)) return false;
-    const entry = lstatSync(candidate);
-    return entry.isFile() && !entry.isSymbolicLink();
-  });
-}
-
-function workbenchEnvironmentExecutables(config: Config): {
-  workbenchExecutable?: string;
-  gameExecutable?: string;
-} {
-  return {
-    workbenchExecutable: firstRegularExecutable([
-      join(config.workbenchPath, "Workbench", "ArmaReforgerWorkbenchSteamDiag.exe"),
-      join(config.workbenchPath, "ArmaReforgerWorkbenchSteamDiag.exe"),
-    ]),
-    gameExecutable: firstRegularExecutable([
-      join(config.gamePath, "ArmaReforgerSteamDiag.exe"),
-      join(config.gamePath, "ArmaReforgerDiag.exe"),
-      join(config.gamePath, "ArmaReforgerSteam.exe"),
-      join(config.gamePath, "ArmaReforger.exe"),
-    ]),
-  };
-}
-
-function assertNoArmaOrWorkbench(): void {
-  const blockers = inspectBlockingProcesses();
+function assertNoArmaOrWorkbench(deadlineAtMs?: number): void {
+  const timeoutMs = deadlineAtMs === undefined
+    ? 15_000
+    : remainingWorkbenchMatrixStepTimeout(deadlineAtMs, 15_000, "process preflight");
+  const blockers = inspectBlockingProcesses(timeoutMs);
   if (blockers.length > 0) {
     throw new Error(
       "Live acceptance refuses to start while any Arma Reforger or Workbench process exists: " +
@@ -456,7 +379,12 @@ async function waitForCaptureCapability(
     intervalMs: 1_000,
     probe: async (): Promise<Record<string, unknown> | undefined> => {
       try {
-        const inventory = await application.instances({ renderersOnly: true });
+        const inventory = await application.instances({
+          renderersOnly: true,
+          // Bound the backend probe itself; pollUntil cannot pre-empt an
+          // outstanding probe when the outer deadline expires.
+          waitMs: Math.min(1_000, remainingWorkbenchMatrixCaptureTimeout(deadline)),
+        });
         const eligible = inventory.instances.filter((instance) =>
           instance.backend === "workbench" &&
           Array.isArray(instance.capabilities) &&
@@ -752,78 +680,28 @@ export async function runWorkbenchObserverAcceptance(
   );
   assertEvidenceOutsideRepository(artifactRoot);
   const runDirectory = mkdtempSync(join(artifactRoot, "run-"));
-  const projectRoot = join(runDirectory, "project");
-  const managedRoot = join(runDirectory, "observer-managed");
-  const evidenceRoot = join(runDirectory, "evidence");
-  mkdirSync(projectRoot);
-  mkdirSync(managedRoot);
-  mkdirSync(evidenceRoot);
   const summaryPath = join(runDirectory, "summary.json");
   const validationRoot = resolve(
     options.validationRoot ?? join(REPOSITORY_ROOT, "docs", "validation")
   );
-  const project = createDisposableProject(projectRoot);
-  const config = acceptanceConfig(projectRoot, managedRoot);
-  const guard = new WorkbenchProcessGuard({
-    stateDir: join(runDirectory, "lifecycle"),
-    helperPath: join(REPOSITORY_ROOT, "scripts", "windows", "workbench-lifecycle.ps1"),
-    lockTimeoutMs: 20_000,
+  const runtime = new WorkbenchObserverAcceptanceRuntime({
+    runDirectory,
+    clientIdPrefix: "live-workbench-observer",
+    launchTimeoutMs: Math.min(180_000, timeoutMs),
+    createAdapter: (client) => new WorkbenchObserverAdapter(client, {
+      handlerTimeoutMs: 10_000,
+    }),
   });
-  let baselineLaunchArguments = operationalBaselineLaunchArgumentIdentity([], false);
-  const client = new WorkbenchClient(
-    config.workbenchHost,
-    config.workbenchPort,
+  const {
+    application,
+    adapter,
+    baseline,
+    client,
     config,
-    `live-workbench-observer-${randomUUID()}`,
+    evidenceRoot,
     guard,
-    {
-      launchTimeoutMs: 180_000,
-      launchPollIntervalMs: 1_000,
-      // Acceptance projects are created immediately before launch. A fixed,
-      // argument-array-only force update indexes the world without a shell.
-      spawnProcess: (command, argumentsArray, spawnOptions) => {
-        const actualArguments = [...argumentsArray, "-forceUpdate"];
-        baselineLaunchArguments = operationalBaselineLaunchArgumentIdentity(actualArguments);
-        return spawn(command, actualArguments, spawnOptions);
-      },
-    }
-  );
-  const adapter = new WorkbenchObserverAdapter(client, { handlerTimeoutMs: 10_000 });
-  // This script is executed through tsx after `npm run build`; the source-file
-  // default would otherwise resolve beneath src/ instead of the compiled agent.
-  const observerAgentPath = join(REPOSITORY_ROOT, "dist", "observer", "agent", "private-child.js");
-  if (!existsSync(observerAgentPath)) {
-    throw new Error(`Compiled observer agent is missing: ${observerAgentPath}`);
-  }
-  const application = createObserverApplication({
-    agentPath: observerAgentPath,
-    managedRoot,
-    profileRoot: join(managedRoot, "profiles"),
-    projectPath: projectRoot,
-    sourceAddon: join(REPOSITORY_ROOT, "observer", "addon"),
-    requestTimeoutMs: 60_000,
-    defaultCaptureTimeoutMs: 5 * 60_000,
-    maxInlineImageBytes: 64 * 1024 * 1024,
-    evidenceRoots: [evidenceRoot],
-    workbenchAdapter: adapter,
-  });
-  let cleanupClient = client;
-  const readBaselineProcessCounts = () => {
-    const primary = client.diagnosticSupervisedChildCounts();
-    const recovery = cleanupClient === client
-      ? { active: 0, reconciling: 0, total: 0 }
-      : cleanupClient.diagnosticSupervisedChildCounts();
-    const observerPrivateChildren = application.diagnosticPrivateChildCount();
-    return {
-      active: primary.active + recovery.active + observerPrivateChildren,
-      reconciling: primary.reconciling + recovery.reconciling,
-      total: primary.total + recovery.total + observerPrivateChildren,
-    };
-  };
-  const baseline = new OperationalBaselineRecorder({
-    backend: "workbench",
-    readSupervisedProcessCounts: readBaselineProcessCounts,
-  });
+    project,
+  } = runtime;
   const baselineEnvironment = operationalBaselineEnvironment(
     workbenchEnvironmentExecutables(config)
   );
@@ -1177,12 +1055,8 @@ export async function runWorkbenchObserverAcceptance(
       // only this acceptance Workbench. Production adapter/lifecycle behavior
       // remains unchanged and no PID termination or foreign scan is used.
       try {
-        cleanupClient = new WorkbenchClient(
-          config.workbenchHost,
-          config.workbenchPort,
-          config,
-          `live-workbench-observer-recovery-${randomUUID()}`,
-          guard
+        const cleanupClient = runtime.createRecoveryClient(
+          "live-workbench-observer-recovery"
         );
         summary.shutdownRecovery = await baseline.measure(
           "shutdown",
@@ -1214,7 +1088,7 @@ export async function runWorkbenchObserverAcceptance(
         "waitForOperationalBaselineProcessVacancy",
         async () => {
           const evidence = await waitForOperationalBaselineProcessVacancy(
-            readBaselineProcessCounts
+            runtime.readProcessCounts
           );
           supervisedProcessVacancy = evidence;
           if (!evidence.vacant) {
@@ -1248,6 +1122,13 @@ export async function runWorkbenchObserverAcceptance(
       };
     }
     baseline.sampleProcessCounts("rest.afterShutdown");
+    try {
+      await runtime.close();
+    } catch (error) {
+      failure ??= error;
+      summary.status = "failed";
+      summary.lifecycleGuardClose = error instanceof Error ? error.message : String(error);
+    }
     try {
       const baselineFailed = Boolean(failure) || summary.status !== "passed";
       const artifact = baseline.artifact({
@@ -1289,7 +1170,7 @@ export async function runWorkbenchObserverAcceptance(
               },
             }),
           },
-          launchArguments: baselineLaunchArguments,
+          launchArguments: runtime.launchArguments,
         },
         source: baselineSource,
         limitations: [
@@ -1331,266 +1212,117 @@ export async function runWorkbenchObserverAcceptance(
   };
 }
 
-// --- Phase 3 Workbench fault-matrix vertical slice ---------------------------
-//
-// The Workbench helper has no autonomous per-frame tick, so the fixture's
-// control inbox is only drained when the host makes a NET API Status call
-// (which reaches the modded EMCP_WB_ObserverService.Advance/OnLeaseAcquiredBarrier
-// in tests/fixtures/workbench-observer-failure-matrix-addon). This pump keeps
-// polling jobStatus so the scheduler's mailbox handshake (arm/release/terminal)
-// is driven forward while it blocks on the outbox. The adapter's activity gate
-// is released only by adapter.release()/WORKBENCH_EXITED, not by cancel, so a
-// still-unreleased job keeps status() hitting the handler through cancellation
-// and the terminal handshake.
-class WorkbenchStatusPump {
-  private running = false;
-  private loop: Promise<void> = Promise.resolve();
-
-  constructor(
-    private readonly application: Pick<ObserverApplication, "jobStatus">,
-    private readonly jobId: string,
-    private readonly intervalMs = 150
-  ) {}
-
-  start(): void {
-    if (this.running) return;
-    this.running = true;
-    this.loop = (async () => {
-      while (this.running) {
-        // A transient status error must not stop the pump; the scheduler owns
-        // the bounded deadline that fails the case if arrival never happens.
-        try { await this.application.jobStatus(undefined, this.jobId); } catch { /* keep driving */ }
-        if (!this.running) break;
-        await delay(this.intervalMs);
-      }
-    })();
-  }
-
-  async stop(): Promise<void> {
-    this.running = false;
-    await this.loop;
-  }
-}
-
-async function pollMatrixTerminal(
-  application: Pick<ObserverApplication, "jobStatus">,
-  jobId: string,
-  deadline: number
-): Promise<Record<string, unknown>> {
-  let status: Record<string, unknown> | null = null;
-  const result = await pollUntil<Record<string, unknown>>({
-    clock: systemClock,
-    sleeper: systemSleeper,
-    deadline: deadlineAt(deadline),
-    intervalMs: 250,
-    probe: async (): Promise<Record<string, unknown> | undefined> => {
-      status = await application.jobStatus(undefined, jobId);
-      if (typeof status.state !== "string") throw new Error(`Workbench matrix job ${jobId} returned no state`);
-      return TERMINAL_STATES.has(status.state) ? status : undefined;
-    },
-  });
-  if (result.kind === "expired") {
-    throw new Error(`Workbench matrix job ${jobId} did not reach a terminal state before the case deadline`);
-  }
-  return result.value;
-}
-
 export interface WorkbenchFailureMatrixOptions {
   readonly confirmed: boolean;
   readonly environment?: NodeJS.ProcessEnv;
   readonly artifactRoot?: string;
   readonly validationRoot?: string;
+  /** Per-case budget. A full run has 69 independent budgets. */
   readonly timeoutMs?: number;
-  /** The Workbench matrix currently supports exactly one selected case per run. */
-  readonly only: string;
+  /** Omitted for full canonical Workbench coverage. */
+  readonly only?: string;
+  /** Valid only with --only; retained only when that selected case fails. */
   readonly keepProfile?: boolean;
 }
 
 export interface WorkbenchFailureMatrixResult extends FailureMatrixPublication {
+  /** External image-review bundle directory for successful completed rows. */
   readonly runDirectory: string | null;
 }
 
-/** The narrow application surface the per-case executor needs, for hermetic fakes. */
-export type WorkbenchMatrixCaseApplication = Pick<
-  ObserverApplication, "capture" | "cancelJob" | "jobStatus"
->;
-export type WorkbenchMatrixCaseAdapter = Pick<WorkbenchObserverAdapter, "release">;
-export type WorkbenchMatrixCaseScheduler = Pick<
-  FaultMatrixScheduler, "arm" | "releaseBarrier" | "finishCase"
->;
-
-export interface RunWorkbenchCancelBarrierCaseInput {
-  readonly application: WorkbenchMatrixCaseApplication;
-  readonly adapter: WorkbenchMatrixCaseAdapter;
-  readonly scheduler: WorkbenchMatrixCaseScheduler;
-  readonly matrixCase: FaultMatrixCase;
-  readonly runId: string;
-  readonly instanceId: string;
-  readonly expectedWorldId: string;
-  readonly poseView: ObserverCaptureView;
-  readonly caseStartedAt: number;
-  readonly caseDeadline: number;
-  readonly caseBudgetMs: number;
+export function workbenchCaseRequiresRecovery(
+  entry: Pick<MatrixCaseEntry, "cleanup" | "decoy">,
+  retainForDecoyRecovery = false
+): boolean {
+  return retainForDecoyRecovery ||
+    !entry.cleanup.lifecycleVacant ||
+    !entry.cleanup.endpointVacant ||
+    !entry.cleanup.childVacant ||
+    !entry.cleanup.exactOwnerVacant ||
+    entry.decoy?.category === "unproven";
 }
 
-/**
- * The declared vertical-slice interaction: submit an asynchronous pose capture,
- * prove the lease_acquired barrier from the fixture's own acknowledgement,
- * cancel through ObserverApplication.cancelJob, observe the cancelled/CANCELLED
- * terminal with exact restoration, run a mandatory follow-up current capture
- * proving no stale lease survived, and seal the control channel. Isolated from
- * live launch/teardown so it can run against fakes in a hermetic test.
- */
-export async function runWorkbenchCancelBarrierCase(
-  input: RunWorkbenchCancelBarrierCaseInput
-): Promise<MatrixCaseEntry> {
-  const {
-    application, adapter, scheduler, matrixCase, runId, instanceId,
-    expectedWorldId, poseView, caseStartedAt, caseDeadline, caseBudgetMs,
-  } = input;
-  const diagnostics: string[] = [];
-  const captureTimeoutMs = Math.max(1_000, Math.min(60_000, caseDeadline - Date.now()));
-
-  const submitted = await application.capture({
-    runId,
-    captureLabel: "matrix-slice-pose",
-    purpose: `Fault-matrix slice ${matrixCase.id}`,
-    instanceId,
-    expectedWorldId,
-    expectedWorldEpoch: 0,
-    idempotencyKey: `${runId}-${matrixCase.id}`,
-    view: poseView,
-    settleFrames: 3,
-    performancePolicy: "evidence",
-    asynchronous: true,
-    timeoutMs: captureTimeoutMs,
-  });
-  if (!submitted.asynchronous) {
-    throw new Error("Workbench matrix pose capture unexpectedly returned a synchronous result");
-  }
-  const jobId = requiredString(submitted.job.jobId, "Workbench matrix slice job ID");
-
-  // Prove the barrier arrival while driving the fixture inbox through status.
-  const armPump = new WorkbenchStatusPump(application, jobId);
-  armPump.start();
-  let arrived;
+export function removeWorkbenchCaseDirectoryIfSafe(input: {
+  readonly caseDirectory: string;
+  readonly entry: Pick<MatrixCaseEntry, "cleanup" | "decoy">;
+  readonly retainForDecoyRecovery?: boolean;
+  readonly retainExplicitly?: boolean;
+  readonly remove?: (path: string) => void;
+  readonly onRemovalError?: (error: unknown) => void;
+}): boolean {
+  if (input.retainExplicitly || workbenchCaseRequiresRecovery(
+    input.entry,
+    input.retainForDecoyRecovery
+  )) return false;
   try {
-    arrived = await scheduler.arm(matrixCase.id);
-  } finally {
-    await armPump.stop();
-  }
-  diagnostics.push(`barrier arrived: phase=${arrived.arrived.phase} disposition=${arrived.arrived.disposition}`);
-
-  await application.cancelJob(undefined, jobId);
-
-  const releasePump = new WorkbenchStatusPump(application, jobId);
-  releasePump.start();
-  let finalJob: Record<string, unknown>;
-  try {
-    const executed = await scheduler.releaseBarrier("cancel");
-    diagnostics.push(`barrier released: disposition=${executed.disposition}`);
-    finalJob = await pollMatrixTerminal(application, jobId, caseDeadline);
-  } finally {
-    await releasePump.stop();
-  }
-  const finalErrorCode = typeof finalJob.terminalErrorCode === "string" ? finalJob.terminalErrorCode : null;
-  if (finalJob.state !== matrixCase.expectedTerminal.state || finalErrorCode !== matrixCase.expectedTerminal.errorCode) {
-    throw new Error(
-      `Workbench matrix job reached state=${String(finalJob.state)} errorCode=${String(finalErrorCode)}, ` +
-      `expected state=${matrixCase.expectedTerminal.state} errorCode=${String(matrixCase.expectedTerminal.errorCode)}`
+    (input.remove ?? ((path) => rmSync(path, { recursive: true, force: true })))(
+      input.caseDirectory
     );
+    return true;
+  } catch (error) {
+    input.onRemovalError?.(error);
+    return false;
   }
-  if (finalJob.cameraLeaseHeld === true || finalJob.restorationConfirmed !== true) {
-    throw new Error("Workbench matrix cancellation did not prove exact editor camera restoration");
-  }
-  // Release the cancelled job's handler lease so the follow-up current capture
-  // can acquire a fresh lease and the terminal handshake has an active job.
-  await adapter.release(jobId);
-
-  // Mandatory follow-up: a fresh current capture must complete, proving no stale
-  // lease or held camera survived the cancellation. Keep the job unreleased and
-  // pumped so the terminal control handshake is driven, then release it.
-  const followUp = await application.capture({
-    runId,
-    captureLabel: "matrix-slice-followup-current",
-    purpose: "Prove no stale editor camera lease survives the cancelled Workbench slice",
-    instanceId,
-    expectedWorldId,
-    expectedWorldEpoch: 0,
-    idempotencyKey: `${runId}-${matrixCase.id}-followup`,
-    view: { kind: "current" },
-    settleFrames: 3,
-    performancePolicy: "evidence",
-    asynchronous: true,
-    timeoutMs: captureTimeoutMs,
-  });
-  if (!followUp.asynchronous) throw new Error("Workbench matrix follow-up capture unexpectedly returned synchronously");
-  const followUpJobId = requiredString(followUp.job.jobId, "Workbench matrix follow-up job ID");
-  const followUpPump = new WorkbenchStatusPump(application, followUpJobId);
-  followUpPump.start();
-  let followUpJob: Record<string, unknown>;
-  try {
-    // Seal the control channel while the follow-up job keeps status() reaching
-    // the handler, so the fixture reads the terminal command and acknowledges.
-    await scheduler.finishCase();
-    followUpJob = await pollMatrixTerminal(application, followUpJobId, caseDeadline);
-  } finally {
-    await followUpPump.stop();
-  }
-  if (followUpJob.state !== "completed" || followUpJob.cameraLeaseHeld === true || followUpJob.restorationConfirmed !== true) {
-    throw new Error("Workbench matrix follow-up current capture did not complete with proven restoration after cancellation");
-  }
-  await adapter.release(followUpJobId);
-  diagnostics.push("follow-up current capture completed after cancellation with no retained lease");
-
-  const elapsedMs = Date.now() - caseStartedAt;
-  return {
-    caseId: matrixCase.id,
-    schedule: {
-      backend: "workbench",
-      view: matrixCase.view,
-      phase: matrixCase.injection.phase,
-      action: matrixCase.injection.action,
-    },
-    result: "passed",
-    publicTerminal: { state: finalJob.state as string, errorCode: finalErrorCode },
-    deadline: { outcome: "completed", elapsedMs, budgetMs: caseBudgetMs },
-    worldRevision: "unchanged",
-    camera: "restored",
-    artifact: "not_created",
-    cleanup: { lifecycleVacant: false, endpointVacant: false, childVacant: false, exactOwnerVacant: false },
-    retainedDiagnostics: diagnostics.map((tail) => matrixRetainedDiagnostic(tail)),
-  };
 }
 
-const WORKBENCH_MATRIX_FIXTURE_SOURCES = [
-  "tests/fixtures/workbench-observer-failure-matrix-addon/addon.gproj",
-  "tests/fixtures/workbench-observer-failure-matrix-addon/Scripts/WorkbenchGame/EnfusionMCP/EMCP_WB_ObserverMatrixControl.c",
-] as const;
+const WORKBENCH_LIVE_MATRIX_CASE_SERVICES: WorkbenchLiveMatrixCaseServices = {
+  assertNoArmaOrWorkbench,
+  waitForCaptureCapability,
+  captureAndRetainUnmeasured,
+  validateFinalizedBundle,
+  quaternionFromWorkbenchMatrix,
+  readSource: () => operationalBaselineSource(
+    SCRIPT_PATH,
+    "scripts/run-workbench-observer-acceptance.ts",
+    REPOSITORY_ROOT,
+    [...WORKBENCH_OPERATIONAL_BASELINE_SOURCES, ...WORKBENCH_MATRIX_FIXTURE_SOURCES],
+    OBSERVER_OPERATIONAL_BASELINE_SOURCE_CLOSURES
+  ),
+};
+
+async function runLiveWorkbenchMatrixCase(input: {
+  readonly matrixCase: WorkbenchFaultMatrixCase;
+  readonly caseDirectory: string;
+  readonly timeoutMs: number;
+  readonly caseStartedAt: number;
+}): Promise<WorkbenchLiveMatrixCaseOutcome> {
+  return executeLiveWorkbenchMatrixCase(input, WORKBENCH_LIVE_MATRIX_CASE_SERVICES);
+}
 
 /**
- * Workbench-only orchestration for the Phase 3 fault-matrix vertical slice:
- * disposable project + staged fixture, gated launch, control root under the
- * Workbench profile, barrier-driven cancellation, and the shared v2 evidence
- * artifact. CLI/live-run authorization is delegated here once a matrix case has
- * been selected by run-workbench-observer-acceptance.ts's argument parser.
+ * Run either all 69 Workbench declarations in canonical order or one selected
+ * diagnostic row. Every row receives a new project, profile, lifecycle guard,
+ * control capability, adapter and observer application. Publication happens
+ * exactly once, after every selected row has completed cleanup.
  */
 export async function runWorkbenchFailureMatrix(
   options: WorkbenchFailureMatrixOptions
 ): Promise<WorkbenchFailureMatrixResult> {
-  assertLiveWorkbenchObserverAuthorized(options.confirmed, options.environment);
-  const matrixCase = caseForId(OBSERVER_FAULT_MATRIX, options.only);
-  if (matrixCase.backend !== "workbench") {
-    throw new Error(`Fault-matrix case ${options.only} is not a Workbench case`);
+  if (options.keepProfile && !options.only) {
+    throw new Error("--keep-profile is valid only with a single --only matrix case");
   }
-  if (matrixCase.injection.action !== "cancel_capture") {
-    throw new Error(`Workbench matrix runner currently supports only the cancellation slice, not ${matrixCase.injection.action}`);
+  assertLiveWorkbenchObserverAuthorized(options.confirmed, options.environment);
+  let selectedCases: readonly WorkbenchFaultMatrixCase[];
+  if (options.only) {
+    const selected = caseForId(OBSERVER_FAULT_MATRIX, options.only);
+    if (selected.backend !== "workbench") {
+      throw new Error(`Fault-matrix case ${options.only} is not a Workbench case`);
+    }
+    selectedCases = [selected];
+  } else {
+    selectedCases = OBSERVER_FAULT_MATRIX.cases.filter(
+      (matrixCase): matrixCase is WorkbenchFaultMatrixCase => matrixCase.backend === "workbench"
+    );
   }
   const timeoutMs = options.timeoutMs ?? 240_000;
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 60_000 || timeoutMs > 600_000) {
-    throw new Error("Live Workbench matrix timeout must be 60000..600000 ms");
+    throw new Error("Live Workbench matrix per-case timeout must be 60000..600000 ms");
   }
-  assertNoArmaOrWorkbench();
+  const initialSourceRevision = workbenchMatrixSourceRevision();
+  if (!options.only &&
+      (initialSourceRevision.tree !== "clean" || initialSourceRevision.commit === null)) {
+    throw new Error("A full Workbench matrix requires a clean committed source revision before launch");
+  }
   const artifactRoot = canonicalDirectory(
     options.artifactRoot ?? (() => {
       const path = join(tmpdir(), "reforger-forge-workbench-observer-acceptance");
@@ -1600,405 +1332,379 @@ export async function runWorkbenchFailureMatrix(
     "Workbench matrix evidence root"
   );
   assertEvidenceOutsideRepository(artifactRoot);
-  const runDirectory = mkdtempSync(join(artifactRoot, "matrix-run-"));
-  const projectRoot = join(runDirectory, "project");
-  const managedRoot = join(runDirectory, "observer-managed");
-  const evidenceRoot = join(runDirectory, "evidence");
-  mkdirSync(projectRoot);
-  mkdirSync(managedRoot);
-  mkdirSync(evidenceRoot);
-  const validationRoot = resolve(
-    options.validationRoot ?? join(REPOSITORY_ROOT, "docs", "validation")
-  );
-  const project = createDisposableProject(projectRoot, { stageMatrixFixture: true });
-  const fixtureTemplateIdentity = operationalBaselineDirectoryIdentity(
-    WORKBENCH_MATRIX_FIXTURE_TEMPLATE_DIR, [".c", ".gproj"]
-  );
-  const config = acceptanceConfig(projectRoot, managedRoot);
-  const guard = new WorkbenchProcessGuard({
-    stateDir: join(runDirectory, "lifecycle"),
-    helperPath: join(REPOSITORY_ROOT, "scripts", "windows", "workbench-lifecycle.ps1"),
-    lockTimeoutMs: 20_000,
-  });
-  let baselineLaunchArguments = operationalBaselineLaunchArgumentIdentity([], false);
-  const client = new WorkbenchClient(
-    config.workbenchHost,
-    config.workbenchPort,
-    config,
-    `live-workbench-matrix-${randomUUID()}`,
-    guard,
-    {
-      launchTimeoutMs: 180_000,
-      launchPollIntervalMs: 1_000,
-      spawnProcess: (command, argumentsArray, spawnOptions) => {
-        const actualArguments = [...argumentsArray, "-forceUpdate"];
-        baselineLaunchArguments = operationalBaselineLaunchArgumentIdentity(actualArguments);
-        return spawn(command, actualArguments, spawnOptions);
-      },
-    }
-  );
-  const adapter = new WorkbenchObserverAdapter(client, { handlerTimeoutMs: 10_000 });
-  const observerAgentPath = join(REPOSITORY_ROOT, "dist", "observer", "agent", "private-child.js");
-  if (!existsSync(observerAgentPath)) {
-    throw new Error(`Compiled observer agent is missing: ${observerAgentPath}`);
-  }
-  const application = createObserverApplication({
-    agentPath: observerAgentPath,
-    managedRoot,
-    profileRoot: join(managedRoot, "profiles"),
-    projectPath: projectRoot,
-    sourceAddon: join(REPOSITORY_ROOT, "observer", "addon"),
-    requestTimeoutMs: 60_000,
-    defaultCaptureTimeoutMs: 5 * 60_000,
-    maxInlineImageBytes: 64 * 1024 * 1024,
-    evidenceRoots: [evidenceRoot],
-    workbenchAdapter: adapter,
-  });
-  let cleanupClient = client;
-  const readProcessCounts = () => {
-    const primary = client.diagnosticSupervisedChildCounts();
-    const recovery = cleanupClient === client
-      ? { active: 0, reconciling: 0, total: 0 }
-      : cleanupClient.diagnosticSupervisedChildCounts();
-    const observerPrivateChildren = application.diagnosticPrivateChildCount();
-    return {
-      active: primary.active + recovery.active + observerPrivateChildren,
-      reconciling: primary.reconciling + recovery.reconciling,
-      total: primary.total + recovery.total + observerPrivateChildren,
-    };
-  };
+  const validationRoot = resolve(options.validationRoot ?? join(REPOSITORY_ROOT, "docs", "validation"));
+  const aggregateRunDirectory = mkdtempSync(join(artifactRoot, "matrix-run-"));
+  const startedAtMs = Date.now();
+  const startedAt = new Date(startedAtMs).toISOString();
+  const entries: MatrixCaseEntry[] = [];
+  const measurements: OperationalBaselineMeasurement[] = [];
+  const processCounts: OperationalBaselineProcessSample[] = [];
+  const knownSecretValues: string[] = [aggregateRunDirectory];
+  const failures: unknown[] = [];
+  let environment: OperationalBaselineEnvironment | null = null;
+  let launchArguments = operationalBaselineLaunchArgumentIdentity([], false);
+  let retainedRunDirectory: string | null = null;
+  let reviewDirectory: string | null = null;
+  let reviewBundleCount = 0;
 
-  const caseStartedAt = Date.now();
-  const caseDeadline = caseStartedAt + timeoutMs;
-  let observerRunId: string | null = null;
-  let faultScaffolding: FaultMatrixRunScaffolding | null = null;
-  let caseEntry: MatrixCaseEntry | null = null;
-  let failure: unknown = null;
-  let controlCapability: string | null = null;
-
-  try {
-    assertNoArmaOrWorkbench();
-    const begun = await application.beginRun({
-      title: `Workbench observer failure-matrix slice: ${matrixCase.id}`,
-      caseIds: [matrixCase.id],
-      procedureRevision: "workbench-failure-matrix-v1",
-      idempotencyKey: `workbench-matrix-${randomUUID()}`,
-    });
-    observerRunId = requiredString(begun.runId, "Managed observer run ID");
-
-    await client.ensureRunning(project.projectPath);
-    const workbenchLifecycle = await client.lifecycleIdentity();
-    const companionStatus = client.managedCompanionStatus();
-    // Workbench launches with -profile <roleRoot/profile>; the Enfusion
-    // "$profile:" keyword resolves one directory deeper, so the fixture's
-    // "$profile:RFOWorkbenchObserverMatrix" control root lives beneath
-    // <roleRoot>/profile/profile. Create it defensively before staging.
-    const fixtureProfileRoot = join(companionStatus.roleRoot, "profile", "profile");
-    mkdirSync(fixtureProfileRoot, { recursive: true });
-    const controlRoot = join(fixtureProfileRoot, "RFOWorkbenchObserverMatrix");
-
-    const fixtureContentIdentity = operationalBaselineProcedureSha256({
-      fixture: "workbench-observer-failure-matrix-addon",
-      sourceSha256: fixtureTemplateIdentity.sha256,
-    });
-    const generatedProjectIdentity = operationalBaselineProcedureSha256({
-      projectPath: project.projectPath,
-      worldResource: project.worldResource,
-    });
-    const faultBinding = Object.freeze({
-      fixtureId: generatedProjectIdentity,
-      lifecycleId: workbenchLifecycle.lifecycleId,
-      lifecycleGeneration: workbenchLifecycle.generation,
-    });
-    controlCapability = randomUUID();
-    faultScaffolding = createFaultMatrixRunScaffolding({
-      runRoot: fixtureProfileRoot,
-      controlRoot,
-      matrix: OBSERVER_FAULT_MATRIX,
-      bootstrap: {
-        schemaVersion: 1,
-        runId: observerRunId,
-        backend: "workbench",
-        capability: controlCapability,
-        fixtureContentIdentity,
-        generatedProjectIdentity,
-        generatedAddonIdentity: WORKBENCH_MATRIX_FIXTURE_GUID,
-        binding: faultBinding,
-      },
-      clock: systemClock,
-      sleeper: systemSleeper,
-      readLifecycleBinding: () => faultBinding,
-    });
-
-    const open = await client.call<Record<string, unknown>>("EMCP_WB_EditorControl", {
-      action: "openResource",
-      path: project.worldResource,
-    }, { skipAutoLaunch: true, timeout: 30_000 });
-    if (open.status !== "ok" || !String(open.message ?? "").startsWith("Opened resource:")) {
-      throw new Error(`Disposable matrix world did not open: ${String(open.message ?? "no response")}`);
-    }
-    const selected = await waitForCaptureCapability(application, caseDeadline);
-    const instanceId = requiredString(selected.instanceId, "Selected Workbench observer instance ID");
-    const expectedWorldId = requiredString(selected.worldId, "Selected Workbench observer world ID");
-
-    // Derive a materially displaced pose from the current editor camera.
-    const baseline = await captureAndRetainUnmeasured(
-      application, { kind: "current" }, "matrix-slice-baseline", observerRunId,
-      instanceId, expectedWorldId, caseDeadline
-    );
-    await adapter.release(requiredString(baseline.completed.jobId, "matrix baseline job ID"));
-    const baselineCamera = baseline.completed.actualCamera;
-    const baselineFov = baselineCamera.verticalFov;
-    if (!Number.isFinite(baselineFov) || baselineFov < 1 || baselineFov > 179) {
-      throw new Error(`Baseline editor FOV is outside pose bounds: ${baselineFov}`);
-    }
-    const poseView: ObserverCaptureView = {
-      kind: "pose",
-      position: [
-        baselineCamera.position[0] + 75,
-        baselineCamera.position[1] + 25,
-        baselineCamera.position[2] + 50,
-      ],
-      orientation: quaternionFromWorkbenchMatrix(baselineCamera.matrix),
-      fov: baselineFov <= 169 ? baselineFov + 10 : baselineFov - 10,
-    };
-
-    caseEntry = await runWorkbenchCancelBarrierCase({
-      application,
-      adapter,
-      scheduler: faultScaffolding.scheduler,
-      matrixCase,
-      runId: observerRunId,
-      instanceId,
-      expectedWorldId,
-      poseView,
-      caseStartedAt,
-      caseDeadline,
-      caseBudgetMs: timeoutMs,
-    });
-  } catch (error) {
-    failure = error;
-  } finally {
-    if (faultScaffolding) {
-      try {
-        await faultScaffolding.scheduler.finishCase();
-      } catch (error) {
-        failure ??= error;
-      }
-      try {
-        removeOwnedFaultControlRoot(faultScaffolding.controlRoot);
-      } catch { /* best-effort; run directory retained/removed wholesale below */ }
-    }
+  for (const [index, matrixCase] of selectedCases.entries()) {
+    const caseStartedAt = Date.now();
+    const caseDirectory = join(aggregateRunDirectory, `case-${String(index + 1).padStart(3, "0")}`);
+    mkdirSync(caseDirectory, { recursive: true });
+    let outcome: WorkbenchLiveMatrixCaseOutcome;
     try {
-      await adapter.restoreAll();
+      outcome = await runLiveWorkbenchMatrixCase({
+        matrixCase,
+        caseDirectory,
+        timeoutMs,
+        caseStartedAt,
+      });
     } catch (error) {
-      failure ??= error;
-    }
-    try {
-      await application.close();
-    } catch (error) {
-      failure ??= error;
-    }
-    let exactWorkbenchVacancy = false;
-    try {
-      const shutdown = await client.shutdownOwnedWorkbench();
-      exactWorkbenchVacancy = shutdown.stopped;
-      if (!shutdown.stopped) failure ??= new Error("Owned Workbench shutdown did not terminate the launched lifecycle child");
-    } catch (error) {
-      failure ??= error;
-      try {
-        cleanupClient = new WorkbenchClient(
-          config.workbenchHost, config.workbenchPort, config,
-          `live-workbench-matrix-recovery-${randomUUID()}`, guard
-        );
-        const recovery = await cleanupClient.shutdownOwnedWorkbench();
-        exactWorkbenchVacancy = recovery.stopped;
-      } catch { /* preserve the primary failure */ }
-    }
-    let endpointVacant = false;
-    try {
-      const remaining = await guard.listWorkbenchProcesses();
-      endpointVacant = remaining.length === 0;
-      if (!endpointVacant) failure ??= new Error("Exact-owner shutdown did not establish Workbench vacancy");
-    } catch (error) {
-      failure ??= error;
-    }
-    let supervisedVacant = false;
-    try {
-      const evidence = await waitForOperationalBaselineProcessVacancy(readProcessCounts);
-      supervisedVacant = evidence.vacant;
-      if (!evidence.vacant) {
-        failure ??= new Error(`Supervised process vacancy was not observed (active=${evidence.counts.active})`);
-      }
-    } catch (error) {
-      failure ??= error;
-    }
-    if (caseEntry) {
-      caseEntry = {
-        ...caseEntry,
-        cleanup: {
-          lifecycleVacant: exactWorkbenchVacancy,
-          endpointVacant,
-          childVacant: supervisedVacant,
-          exactOwnerVacant: exactWorkbenchVacancy,
-        },
+      // Composition/source-recording failures occur outside the native case's
+      // guarded launch body. Preserve a bounded failed row and continue so one
+      // aggregate diagnostic artifact still covers the complete selection.
+      const fallbackConfig = acceptanceConfig(
+        join(caseDirectory, "fallback-project"),
+        join(caseDirectory, "fallback-managed")
+      );
+      const fallbackCleanup = {
+        lifecycleVacant: false,
+        endpointVacant: false,
+        childVacant: false,
+        exactOwnerVacant: false,
       };
-      if (!exactWorkbenchVacancy || !endpointVacant || !supervisedVacant) {
-        caseEntry = { ...caseEntry, result: "failed" };
-        failure ??= new Error("Workbench matrix slice cleanup did not prove full vacancy");
+      const fallbackSecrets = [caseDirectory];
+      outcome = {
+        entry: failedWorkbenchMatrixEntry({
+          matrixCase,
+          publicTerminal: null,
+          startedAt: caseStartedAt,
+          failureObservedAt: Date.now(),
+          budgetMs: timeoutMs,
+          failure: error,
+          knownSecretValues: fallbackSecrets,
+          cleanup: fallbackCleanup,
+          exactOwnerShutdown: false,
+          decoy: matrixCase.injection.action === "stop_owned_workbench"
+            ? { category: "unproven", identityUnchanged: null }
+            : { category: "not_applicable", identityUnchanged: null },
+        }),
+        failure: error,
+        knownSecretValues: fallbackSecrets,
+        measurements: [],
+        processCounts: [],
+        launchArguments: operationalBaselineLaunchArgumentIdentity([], false),
+        environment: operationalBaselineEnvironment(workbenchEnvironmentExecutables(fallbackConfig)),
+        retainForDecoyRecovery: false,
+      };
+    }
+    entries.push(outcome.entry);
+    measurements.push(...outcome.measurements);
+    processCounts.push(...outcome.processCounts);
+    environment ??= outcome.environment;
+    if (outcome.launchArguments.observed) launchArguments = outcome.launchArguments;
+    for (const value of outcome.knownSecretValues) {
+      if (!knownSecretValues.includes(value)) knownSecretValues.push(value);
+    }
+    if (outcome.failure) failures.push(outcome.failure);
+    let reviewExportFailed = false;
+    if (!outcome.failure && outcome.entry.artifactEvidence?.manifestPublished === true) {
+      try {
+        const sourceEvidence = join(caseDirectory, "evidence");
+        if (!existsSync(sourceEvidence)) {
+          throw new Error(`Completed matrix row ${matrixCase.id} has no reviewable evidence directory`);
+        }
+        reviewDirectory ??= mkdtempSync(join(artifactRoot, "matrix-image-review-"));
+        cpSync(
+          sourceEvidence,
+          join(reviewDirectory, `case-${String(index + 1).padStart(3, "0")}`),
+          { recursive: true, errorOnExist: true, force: false }
+        );
+        reviewBundleCount += 1;
+      } catch (error) {
+        reviewExportFailed = true;
+        failures.push(error);
       }
+    }
+    const retainSelectedFailure = Boolean(options.only && options.keepProfile && outcome.failure);
+    let removed = false;
+    try {
+      removed = removeWorkbenchCaseDirectoryIfSafe({
+        caseDirectory,
+        entry: outcome.entry,
+        retainForDecoyRecovery: outcome.retainForDecoyRecovery,
+        retainExplicitly: retainSelectedFailure || reviewExportFailed,
+        onRemovalError: (error) => failures.push(error),
+      });
+    } catch (error) {
+      failures.push(error);
+      removed = false;
+    }
+    if (!removed) {
+      // Retain the common external root so every unresolved lifecycle/profile
+      // remains discoverable even when more than one full-run row fails.
+      retainedRunDirectory = aggregateRunDirectory;
     }
   }
 
-  const baselineEnvironment = operationalBaselineEnvironment(
-    workbenchEnvironmentExecutables(config)
-  );
-  const baselineSource = operationalBaselineSource(
-    SCRIPT_PATH,
-    "scripts/run-workbench-observer-acceptance.ts",
-    REPOSITORY_ROOT,
-    [...WORKBENCH_OPERATIONAL_BASELINE_SOURCES, ...WORKBENCH_MATRIX_FIXTURE_SOURCES],
-    OBSERVER_OPERATIONAL_BASELINE_SOURCE_CLOSURES
-  );
-  const overallResult: "passed" | "failed" = failure || !caseEntry || caseEntry.result !== "passed" ? "failed" : "passed";
-  const finalCaseEntry: MatrixCaseEntry = caseEntry ?? {
-    caseId: matrixCase.id,
-    schedule: {
-      backend: "workbench",
-      view: matrixCase.view,
-      phase: matrixCase.injection.phase,
-      action: matrixCase.injection.action,
-    },
-    result: "failed",
-    publicTerminal: { state: "failed", errorCode: null },
-    deadline: { outcome: "expired", elapsedMs: Date.now() - caseStartedAt, budgetMs: timeoutMs },
-    worldRevision: "unavailable",
-    camera: "unproven",
-    artifact: "unproven",
-    cleanup: { lifecycleVacant: false, endpointVacant: false, childVacant: false, exactOwnerVacant: false },
-    retainedDiagnostics: failure
-      ? [matrixRetainedDiagnostic(failure instanceof Error ? `${failure.name}: ${failure.message}` : String(failure))]
-      : [],
-  };
+  if (!options.only && failures.length === 0 && reviewBundleCount === 0) {
+    failures.push(new Error("A full passing Workbench matrix produced no external image-review bundles"));
+  }
 
+  const coverage = {
+    kind: options.only ? "partial" as const : "full" as const,
+    selectedCaseIds: selectedCases.map((matrixCase) => matrixCase.id),
+  };
+  const aggregateConfig = acceptanceConfig(
+    join(aggregateRunDirectory, "aggregate-project"),
+    join(aggregateRunDirectory, "aggregate-managed")
+  );
+  environment ??= operationalBaselineEnvironment(workbenchEnvironmentExecutables(aggregateConfig));
+  const fixtureTemplateIdentity = operationalBaselineDirectoryIdentity(
+    WORKBENCH_MATRIX_FIXTURE_TEMPLATE_DIR,
+    [".c", ".gproj"]
+  );
+  const workload: OperationalBaselineWorkload = {
+    procedureRevision: "workbench-failure-matrix-v3",
+    runtimeKind: "workbench",
+    overallTimeoutMs: timeoutMs * selectedCases.length,
+    worldResource: "Worlds/ObserverMatrixA.ent",
+    fixture: {
+      kind: "disposable_workbench_world",
+      id: "ObserverMatrixA_B",
+      guid: null,
+      sourceFileCount: 5 + fixtureTemplateIdentity.fileCount,
+      sourceSha256: operationalBaselineProcedureSha256({
+        parentWorld: BASE_EVERON_WORLD,
+        worlds: ["ObserverMatrixA", "ObserverMatrixB"],
+        fixtureAddonGuid: WORKBENCH_MATRIX_FIXTURE_GUID,
+        fixtureAddonSourceSha256: fixtureTemplateIdentity.sha256,
+      }),
+    },
+    capture: {
+      labels: ["matrix-baseline-current", "matrix-primary", "matrix-followup-current", "matrix-competing"],
+      settleFrames: 3,
+      performancePolicy: "evidence",
+      asynchronous: true,
+      configurationSha256: operationalBaselineProcedureSha256({
+        selectedCaseIds: coverage.selectedCaseIds,
+        settleFrames: 3,
+        performancePolicy: "evidence",
+      }),
+    },
+    launchArguments,
+  };
+  const limitations = [
+    "Every selected case uses a fresh disposable project, profile, lifecycle and fixture capability.",
+    "Automation validates PNG structure and metadata but records image review as unreviewed.",
+    "The matrix records observations and absolute deadlines without applying performance thresholds.",
+  ];
+  // Bracket the final Git check with two complete source-closure reads. A full
+  // artifact cannot combine a clean commit claim with bytes changed during
+  // hashing/publication preparation.
+  const finalSource = captureStableWorkbenchMatrixSource({
+    readSource: () => operationalBaselineSource(
+      SCRIPT_PATH,
+      "scripts/run-workbench-observer-acceptance.ts",
+      REPOSITORY_ROOT,
+      [...WORKBENCH_OPERATIONAL_BASELINE_SOURCES, ...WORKBENCH_MATRIX_FIXTURE_SOURCES],
+      OBSERVER_OPERATIONAL_BASELINE_SOURCE_CLOSURES
+    ),
+    readRevision: workbenchMatrixSourceRevision,
+  });
+  const { source, sourceRevision } = finalSource;
+  if (!finalSource.stable) {
+    failures.push(new Error("The Workbench matrix source bytes or revision changed during final identity capture"));
+  }
+  if (!options.only &&
+      (sourceRevision.tree !== "clean" || sourceRevision.commit === null ||
+        sourceRevision.commit !== initialSourceRevision.commit)) {
+    failures.push(new Error("The Workbench matrix source revision changed or became dirty during execution"));
+  }
+  const finishedAtMs = Date.now();
+  const overallResult = failures.length === 0 ? "passed" as const : "failed" as const;
+  const failureName = overallResult === "failed"
+    ? failures[0] instanceof Error ? failures[0].name : "WorkbenchFailureMatrixError"
+    : undefined;
   const artifact = buildObserverFailureMatrixArtifact({
     backend: "workbench",
     result: overallResult,
-    startedAt: new Date(caseStartedAt).toISOString(),
-    finishedAt: new Date().toISOString(),
-    durationMs: Date.now() - caseStartedAt,
-    environment: baselineEnvironment,
-    workload: {
-      procedureRevision: "workbench-failure-matrix-v1",
-      runtimeKind: "workbench",
-      overallTimeoutMs: timeoutMs,
-      worldResource: BASE_EVERON_WORLD,
-      fixture: {
-        kind: "addon",
-        id: "RFOWorkbenchObserverMatrix",
-        guid: WORKBENCH_MATRIX_FIXTURE_GUID,
-        sourceFileCount: fixtureTemplateIdentity.fileCount,
-        sourceSha256: fixtureTemplateIdentity.sha256,
-      },
-      capture: {
-        labels: ["matrix-slice-baseline", "matrix-slice-pose", "matrix-slice-followup-current"],
-        settleFrames: 3,
-        performancePolicy: "evidence",
-        asynchronous: true,
-        configurationSha256: fixtureTemplateIdentity.sha256,
-      },
-      launchArguments: baselineLaunchArguments,
-    },
-    source: baselineSource,
+    startedAt,
+    finishedAt: new Date(finishedAtMs).toISOString(),
+    durationMs: Math.max(0, finishedAtMs - startedAtMs),
+    environment,
+    workload,
+    source,
     matrix: OBSERVER_FAULT_MATRIX,
-    cases: [finalCaseEntry],
-    measurements: [],
-    processCounts: [],
-    limitations: [
-      "Phase 3 vertical slice: exactly one declared Workbench case (cancellation at lease_acquired, explicit pose).",
-      "The remaining canonical cancellation phases and fault families are deferred until this slice has a retained live result.",
-      "The fixture control-channel authorizer is hardcoded to this one declared case rather than a general port of FaultControlAuthorizer.",
-    ],
-    failure: failure ? { name: failure instanceof Error ? failure.name : "WorkbenchFailureMatrixError" } : null,
-    knownSecretValues: controlCapability ? [WORKBENCH_MATRIX_FIXTURE_GUID, controlCapability] : [WORKBENCH_MATRIX_FIXTURE_GUID],
+    coverage,
+    sourceRevision,
+    cases: entries,
+    measurements,
+    processCounts,
+    limitations,
+    failure: failureName ? { name: failureName } : null,
+    knownSecretValues,
   });
-
   const publication = writeObserverFailureMatrixArtifact(
     validationRoot,
     artifact,
     OBSERVER_FAULT_MATRIX,
-    controlCapability ? [WORKBENCH_MATRIX_FIXTURE_GUID, controlCapability] : [WORKBENCH_MATRIX_FIXTURE_GUID]
+    knownSecretValues
   );
 
-  const preserveRunDirectory = Boolean(failure) && Boolean(options.keepProfile);
-  if (!preserveRunDirectory) {
-    try { rmSync(runDirectory, { recursive: true, force: true }); } catch { /* best-effort scratch cleanup */ }
+  if (!retainedRunDirectory) {
+    try { rmSync(aggregateRunDirectory, { recursive: true, force: true }); } catch { /* evidence is already published */ }
   }
-  if (failure) {
-    const error = failure instanceof Error ? failure : new Error(String(failure));
-    error.message = `${error.message}. Workbench failure-matrix artifact: ${publication.jsonPath}` +
-      (preserveRunDirectory ? ` (run directory retained: ${runDirectory})` : "");
-    throw error;
+  if (failures.length > 0) {
+    const first = failures[0] instanceof Error ? failures[0] : new Error(String(failures[0]));
+    first.message = `${first.message}. Workbench failure-matrix artifact: ${publication.jsonPath}` +
+      (retainedRunDirectory ? ` (recovery directory retained: ${retainedRunDirectory})` : "") +
+      (reviewDirectory ? ` (image-review directory retained: ${reviewDirectory})` : "");
+    throw first;
   }
-  return { ...publication, runDirectory: null };
+  return { ...publication, runDirectory: reviewDirectory };
 }
-
 function usage(): string {
-  return `Usage: npm run dev:observer:acceptance:workbench -- --confirm-live-run [--artifact-root <directory>] [--validation-root <directory>] [--timeout-ms <60000..600000>] [--only <workbench-case-id> [--keep-profile]]\n\n` +
+  return `Usage: npm run dev:observer:acceptance:workbench -- [--confirm-live-run] [--artifact-root <directory>] [--validation-root <directory>] [--timeout-ms <60000..600000>]\n` +
+    `       npm run dev:observer:acceptance:workbench -- --matrix --confirm-live-run [matrix options]\n` +
+    `       npm run dev:observer:acceptance:workbench -- --only <workbench-case-id> --confirm-live-run [--keep-profile] [matrix options]\n` +
+    `       npm run dev:observer:acceptance:workbench -- --list-cases\n\n` +
+    `No matrix selector runs the existing positive-path acceptance. --matrix selects all 69 Workbench cases; --only selects one partial-coverage case.\n` +
     `Required environment: ${LIVE_WORKBENCH_OBSERVER_ENVIRONMENT}=1\n`;
 }
 
-function readOption(name: string): string | undefined {
-  const index = process.argv.indexOf(name);
-  if (index < 0) return undefined;
-  const value = process.argv[index + 1];
+/** Declared Workbench cases, exposed without invoking authorization or live setup. */
+export function workbenchFailureMatrixCaseIds(): readonly string[] {
+  return OBSERVER_FAULT_MATRIX.cases
+    .filter((matrixCase) => matrixCase.backend === "workbench")
+    .map((matrixCase) => matrixCase.id);
+}
+
+/** Read one value option and reject ambiguous duplicate singleton options. */
+export function readWorkbenchCliOption(args: readonly string[], name: string): string | undefined {
+  const indices = args.flatMap((arg, index) => arg === name ? [index] : []);
+  if (indices.length > 1) throw new Error(`${name} may be specified only once`);
+  if (indices.length === 0) return undefined;
+  const value = args[indices[0]! + 1];
   if (!value || value.startsWith("--")) throw new Error(`${name} requires a value`);
   return value;
 }
 
-if (process.argv[1] && resolve(process.argv[1]) === resolve(SCRIPT_PATH)) {
-  if (process.argv.includes("--help") || process.argv.includes("-h")) {
-    process.stdout.write(usage());
-  } else {
-    try {
-      const only = readOption("--only");
-      const keepProfile = process.argv.includes("--keep-profile");
-      if (keepProfile && !only) {
-        throw new Error("--keep-profile is valid only together with --only");
-      }
-      if (only) {
-        // A selected fault-matrix case dispatches to the Workbench matrix
-        // runner. The positive-path acceptance never accepts --only.
-        const result = await runWorkbenchFailureMatrix({
-          confirmed: process.argv.includes("--confirm-live-run"),
-          artifactRoot: readOption("--artifact-root"),
-          validationRoot: readOption("--validation-root"),
-          only,
-          keepProfile,
-          timeoutMs: readOption("--timeout-ms") ? Number(readOption("--timeout-ms")) : undefined,
-        });
-        process.stdout.write(
-          `Workbench observer failure-matrix slice passed.\n` +
-          `RFO_WORKBENCH_OBSERVER_FAILURE_MATRIX_JSON=${result.jsonPath}\n` +
-          `RFO_WORKBENCH_OBSERVER_FAILURE_MATRIX_MARKDOWN=${result.markdownPath}\n`
-        );
-      } else {
-        const result = await runWorkbenchObserverAcceptance({
-          confirmed: process.argv.includes("--confirm-live-run"),
-          artifactRoot: readOption("--artifact-root"),
-          validationRoot: readOption("--validation-root"),
-          timeoutMs: readOption("--timeout-ms") ? Number(readOption("--timeout-ms")) : undefined,
-        });
-        process.stdout.write(
-          `Workbench observer acceptance passed.\n` +
-          `RFO_WORKBENCH_OBSERVER_ACCEPTANCE_RESULT=${result.summaryPath}\n` +
-          `RFO_WORKBENCH_OBSERVER_ACCEPTANCE_MANIFEST=${result.manifestPath}\n` +
-          `RFO_WORKBENCH_OPERATIONAL_BASELINE=${result.baselinePath}\n`
-        );
-      }
-    } catch (error) {
-      process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
-      process.exitCode = 1;
+/** Read one boolean flag and reject ambiguous duplicate singleton flags. */
+export function readWorkbenchCliFlag(args: readonly string[], name: string): boolean {
+  const count = args.filter((arg) => arg === name).length;
+  if (count > 1) throw new Error(`${name} may be specified only once`);
+  return count === 1;
+}
+
+interface WorkbenchCliLiveOptions {
+  readonly confirmed: boolean;
+  readonly artifactRoot?: string;
+  readonly validationRoot?: string;
+  readonly timeoutMs?: number;
+}
+
+export type WorkbenchObserverCliCommand =
+  | { readonly mode: "help" }
+  | { readonly mode: "list" }
+  | ({ readonly mode: "positive" } & WorkbenchCliLiveOptions)
+  | ({ readonly mode: "matrix"; readonly only?: string; readonly keepProfile: boolean } & WorkbenchCliLiveOptions);
+
+/** Strict, consuming parser: every token is recognized exactly once or rejected. */
+export function parseWorkbenchObserverCliArgs(args: readonly string[]): WorkbenchObserverCliCommand {
+  const seen = new Set<string>();
+  const values: Record<string, string> = {};
+  const flags = new Set<string>();
+  const valueOptions = new Set(["--artifact-root", "--validation-root", "--timeout-ms", "--only"]);
+  const flagOptions = new Set([
+    "--help", "--list-cases", "--confirm-live-run", "--matrix", "--keep-profile",
+  ]);
+  for (let index = 0; index < args.length; index += 1) {
+    const raw = args[index]!;
+    const option = raw === "-h" ? "--help" : raw;
+    if (valueOptions.has(option)) {
+      if (seen.has(option)) throw new Error(`${option} may be specified only once`);
+      const value = args[index + 1];
+      if (!value || value.startsWith("--")) throw new Error(`${option} requires a value`);
+      seen.add(option);
+      values[option] = value;
+      index += 1;
+      continue;
     }
+    if (flagOptions.has(option)) {
+      if (seen.has(option)) throw new Error(`${option} may be specified only once`);
+      seen.add(option);
+      flags.add(option);
+      continue;
+    }
+    throw new Error(`Unknown or stray Workbench acceptance argument: ${raw}`);
+  }
+
+  if (flags.has("--help") || flags.has("--list-cases")) {
+    const selected = flags.has("--help") ? "--help" : "--list-cases";
+    if (seen.size !== 1) throw new Error(`${selected} must be used by itself`);
+    return { mode: selected === "--help" ? "help" : "list" };
+  }
+  if (flags.has("--matrix") && values["--only"]) {
+    throw new Error("--matrix and --only are mutually exclusive selectors");
+  }
+  if (flags.has("--keep-profile") && !values["--only"]) {
+    throw new Error("--keep-profile is valid only together with --only");
+  }
+  const timeoutValue = values["--timeout-ms"];
+  const timeoutMs = timeoutValue === undefined ? undefined : Number(timeoutValue);
+  if (timeoutMs !== undefined &&
+      (!Number.isSafeInteger(timeoutMs) || timeoutMs < 60_000 || timeoutMs > 600_000)) {
+    throw new Error("--timeout-ms must be a safe integer from 60000 through 600000");
+  }
+  const common: WorkbenchCliLiveOptions = {
+    confirmed: flags.has("--confirm-live-run"),
+    ...(values["--artifact-root"] ? { artifactRoot: values["--artifact-root"] } : {}),
+    ...(values["--validation-root"] ? { validationRoot: values["--validation-root"] } : {}),
+    ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+  };
+  const only = values["--only"];
+  if (only) {
+    const selected = caseForId(OBSERVER_FAULT_MATRIX, only);
+    if (selected.backend !== "workbench") {
+      throw new Error(`Fault-matrix case ${only} is not a Workbench case`);
+    }
+    return { mode: "matrix", ...common, only, keepProfile: flags.has("--keep-profile") };
+  }
+  if (flags.has("--matrix")) {
+    return { mode: "matrix", ...common, keepProfile: false };
+  }
+  return { mode: "positive", ...common };
+}
+
+if (process.argv[1] && resolve(process.argv[1]) === resolve(SCRIPT_PATH)) {
+  try {
+    const command = parseWorkbenchObserverCliArgs(process.argv.slice(2));
+    if (command.mode === "help") {
+      process.stdout.write(usage());
+    } else if (command.mode === "list") {
+      process.stdout.write(`${workbenchFailureMatrixCaseIds().join("\n")}\n`);
+    } else if (command.mode === "matrix") {
+      const result = await runWorkbenchFailureMatrix(command);
+      process.stdout.write(
+        `Workbench observer failure matrix passed (${command.only ? "partial" : "full"} coverage).\n` +
+        `RFO_WORKBENCH_OBSERVER_FAILURE_MATRIX_JSON=${result.jsonPath}\n` +
+        `RFO_WORKBENCH_OBSERVER_FAILURE_MATRIX_MARKDOWN=${result.markdownPath}\n` +
+        (result.runDirectory
+          ? `RFO_WORKBENCH_OBSERVER_FAILURE_MATRIX_REVIEW_DIRECTORY=${result.runDirectory}\n`
+          : "")
+      );
+    } else {
+      const result = await runWorkbenchObserverAcceptance(command);
+      process.stdout.write(
+        `Workbench observer acceptance passed.\n` +
+        `RFO_WORKBENCH_OBSERVER_ACCEPTANCE_RESULT=${result.summaryPath}\n` +
+        `RFO_WORKBENCH_OBSERVER_ACCEPTANCE_MANIFEST=${result.manifestPath}\n` +
+        `RFO_WORKBENCH_OPERATIONAL_BASELINE=${result.baselinePath}\n`
+      );
+    }
+  } catch (error) {
+    process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
+    process.exitCode = 1;
   }
 }

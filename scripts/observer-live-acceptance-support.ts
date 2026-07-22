@@ -485,7 +485,10 @@ function validateWorkload(
   ], "Operational baseline workload");
   if (!/^[a-z0-9][a-z0-9._-]{0,95}$/.test(workload.procedureRevision) ||
       !Number.isSafeInteger(workload.overallTimeoutMs) ||
-      workload.overallTimeoutMs < 60_000 || workload.overallTimeoutMs > 900_000 ||
+      // A full Workbench fault matrix is deliberately serial and may launch
+      // 69 fresh editor lifecycles. Preserve one bounded aggregate duration
+      // while allowing the reviewed maximum of 69 x 600,000 ms.
+      workload.overallTimeoutMs < 60_000 || workload.overallTimeoutMs > 41_400_000 ||
       !workload.worldResource || workload.worldResource.length > 1_024 ||
       /[\0\r\n]/.test(workload.worldResource) || portableIsAbsolute(workload.worldResource) ||
       workload.worldResource.replace(/\\/g, "/").split("/").includes("..")) {
@@ -1044,7 +1047,7 @@ export interface MatrixRetainedDiagnostic {
   readonly tail: string;
 }
 
-export interface MatrixCaseEntry {
+interface MatrixCaseEntryBase {
   readonly caseId: string;
   readonly schedule: {
     readonly backend: MatrixArtifactBackend;
@@ -1071,14 +1074,68 @@ export interface MatrixCaseEntry {
   readonly retainedDiagnostics: readonly MatrixRetainedDiagnostic[];
 }
 
+export interface MatrixCaseControlEvidence {
+  readonly arrival: "arrived" | "not_arrived" | "unproven";
+  readonly action: "executed" | "rejected" | "not_executed" | "unproven";
+}
+
+export interface MatrixCaseArtifactEvidence {
+  readonly validation: "validated" | "not_created" | "rejected" | "unproven";
+  readonly pngSha256: string | null;
+  readonly metadataSha256: string | null;
+  readonly byteCount: number | null;
+  readonly manifestPublished: boolean;
+}
+
+export type MatrixOwnerShutdownCategory =
+  | "not_applicable"
+  | "exact_owner_vacant"
+  | "owner_still_present"
+  | "unproven";
+
+export interface MatrixCaseDecoyEvidence {
+  readonly category: "not_applicable" | "verified" | "unproven";
+  readonly identityUnchanged: boolean | null;
+}
+
+interface MatrixCaseCloseoutEvidence {
+  readonly control: MatrixCaseControlEvidence;
+  readonly artifactEvidence: MatrixCaseArtifactEvidence;
+  readonly ownerShutdown: MatrixOwnerShutdownCategory;
+  readonly decoy: MatrixCaseDecoyEvidence;
+  readonly limitations: readonly string[];
+}
+
+/**
+ * Existing runners may construct the pre-v3 portion while they migrate. The
+ * failure-matrix artifact itself always uses `MatrixCaseEntry<true>`, so every
+ * serialized v3 row contains the complete closeout evidence shape.
+ */
+export type MatrixCaseEntry<Complete extends boolean = false> = MatrixCaseEntryBase &
+  (Complete extends true ? MatrixCaseCloseoutEvidence : Partial<MatrixCaseCloseoutEvidence>);
+
+export interface FailureMatrixCoverage {
+  readonly kind: "full" | "partial";
+  readonly selectedCaseIds: readonly string[];
+}
+
+export interface FailureMatrixSourceRevision {
+  readonly commit: string | null;
+  readonly tree: "clean" | "dirty" | "unavailable";
+}
+
 export interface ObserverFailureMatrixArtifact {
-  readonly schemaVersion: 2;
+  readonly schemaVersion: 3;
   readonly kind:
     | "reforger_forge_runtime_observer_failure_matrix"
     | "reforger_forge_workbench_observer_failure_matrix";
   readonly backend: MatrixArtifactBackend;
   readonly result: "passed" | "failed";
   readonly evaluator: { readonly kind: "local_maintainer"; readonly stableId: null };
+  /** Automation never claims that a maintainer reviewed retained image content. */
+  readonly review: { readonly imagesReviewed: false; readonly outcome: "unreviewed" };
+  readonly coverage: FailureMatrixCoverage;
+  readonly sourceRevision: FailureMatrixSourceRevision;
   readonly startedAt: string;
   readonly finishedAt: string;
   readonly durationMs: number;
@@ -1090,7 +1147,7 @@ export interface ObserverFailureMatrixArtifact {
     readonly declaredCaseIds: readonly string[];
     readonly sourceClosureSha256: string;
   };
-  readonly cases: readonly MatrixCaseEntry[];
+  readonly cases: readonly MatrixCaseEntry<true>[];
   readonly measurements: readonly OperationalBaselineMeasurement[];
   readonly processCounts: readonly OperationalBaselineProcessSample[];
   readonly limitations: readonly string[];
@@ -1098,8 +1155,13 @@ export interface ObserverFailureMatrixArtifact {
 }
 
 export interface FailureMatrixArtifactInput extends Omit<ObserverFailureMatrixArtifact,
-  "schemaVersion" | "kind" | "evaluator" | "matrix"> {
+  "schemaVersion" | "kind" | "evaluator" | "review" | "coverage" | "sourceRevision" | "matrix" | "cases"> {
   readonly matrix: FaultMatrix;
+  /** Omitted coverage is derived from the supplied case IDs. */
+  readonly coverage?: FailureMatrixCoverage;
+  /** Omitted revision is serialized as unavailable; it can never prove a full passing run. */
+  readonly sourceRevision?: FailureMatrixSourceRevision;
+  readonly cases: readonly MatrixCaseEntry[];
   readonly knownSecretValues?: readonly string[];
 }
 
@@ -1110,7 +1172,9 @@ export interface FailureMatrixPublication {
 }
 
 const MATRIX_DIAGNOSTIC_MAXIMUM = 4 * 1024;
+const MATRIX_SUMMARY_MAXIMUM = 256 * 1024;
 const MATRIX_HASH = /^[a-f0-9]{64}$/;
+const MATRIX_COMMIT = /^[a-f0-9]{40}$/;
 const FAILURE_MATRIX_REQUIRED_SOURCE_PATHS = Object.freeze([
   "observer/protocol/fault-matrix.ts",
   "scripts/observer-fault-matrix-support.ts",
@@ -1119,14 +1183,16 @@ const FAILURE_MATRIX_REQUIRED_SOURCE_PATHS = Object.freeze([
   "src/foundation/time.ts",
   "src/observer/public-contract.ts",
 ] as const);
-const MATRIX_PORTABLE_IDENTIFIER_ASSIGNMENT = /((?:pid|process[_ -]?id|hostname|host|username|user|lifecycle(?:id|generation|[_ -]id|[_ -]generation)|handler(?:id|lease|[_ -]id|[_ -]lease))\s*[:=]\s*)([^\s,;}\]]+)/gi;
+const MATRIX_PORTABLE_IDENTIFIER_ASSIGNMENT = /((?:pid|process[_ -]?id|hostname|host|username|user|lifecycle(?:id|generation|[_ -]id|[_ -]generation)|handler(?:id|lease|[_ -]id|[_ -]lease)|(?:job|run|session|instance|runtime|request|reservation)(?:id|[_ -]id)?)\s*[:=]\s*)([^\s,;}\]]+)/gi;
 const MATRIX_CHECK_FIELD: Readonly<Record<string, keyof MatrixCaseEntry["cleanup"]>> = Object.freeze({
   lifecycle_vacant: "lifecycleVacant",
   endpoint_vacant: "endpointVacant",
   child_vacant: "childVacant",
   exact_owner_vacant: "exactOwnerVacant",
 });
-const MATRIX_LOCAL_IDENTIFIER_ASSIGNMENT = /(\b(?:pid|process(?:[_ -]?id)?|host(?:name)?|user(?:name)?|lifecycle(?:[_ -]?(?:id|generation))?|handler(?:[_ -]?(?:id|lease))?)\s*[:=]\s*)(?:"(?:\\.|[^"\\])*"|[^\s,;}\]]+)/gi;
+const MATRIX_LOCAL_IDENTIFIER_ASSIGNMENT = /(\b(?:pid|process(?:[_ -]?id)?|host(?:name)?|user(?:name)?|lifecycle(?:[_ -]?(?:id|generation))?|handler(?:[_ -]?(?:id|lease))?|(?:job|run|session|instance|runtime|request|reservation)(?:[_ -]?id)?)\s*[:=]\s*)(?:"(?:\\.|[^"\\])*"|[^\s,;}\]]+)/gi;
+const MATRIX_LOCAL_IDENTIFIER_PROSE = /(\b(?:job|run|session|instance|runtime|request|reservation)(?:[_ -]?id)?\s+)((?=[A-Za-z0-9._:-]{8,}(?:\b|$))(?=[A-Za-z0-9._:-]*[0-9._:-])[A-Za-z0-9._:-]+)/gi;
+const MATRIX_PID_PROSE = /(\b(?:pid(?:\(s\)|s)?|process(?:[_ -]?id)(?:\(s\)|s)?)\s*(?::|=|#|\s)\s*)(\d{1,10}(?:\s*,\s*\d{1,10})*)/gi;
 
 function exactKeys(value: unknown, expected: readonly string[], _label: string): value is Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
@@ -1138,6 +1204,9 @@ function exactKeys(value: unknown, expected: readonly string[], _label: string):
 const MATRIX_LOCAL_IDENTIFIER_KEYS = new Set([
   "pid", "processid", "hostname", "host", "username", "user",
   "lifecycleid", "lifecyclegeneration", "handlerid", "handlerlease",
+  "job", "jobid", "run", "runid", "session", "sessionid",
+  "instance", "instanceid", "runtime", "runtimeid", "request", "requestid",
+  "reservation", "reservationid",
 ]);
 
 function redactMatrixLocalIdentifiers(value: string): string {
@@ -1153,18 +1222,39 @@ function redactMatrixLocalIdentifiers(value: string): string {
   }).join(";");
 }
 
-function safeMatrixText(value: string, knownSecretValues: readonly string[]): string {
+function safeMatrixText(
+  value: string,
+  knownSecretValues: readonly string[],
+  maximumBytes = MATRIX_DIAGNOSTIC_MAXIMUM,
+): string {
   const centrallyRedacted = redactText(value, {
     profile: "evidence_portability",
     knownSecretValues,
-    maxLength: MATRIX_DIAGNOSTIC_MAXIMUM,
+    maxLength: maximumBytes,
   })
     // The central portability profile recognizes whole POSIX arguments. A
     // diagnostic may embed one after ordinary prose, so retain no such span.
     .replace(/(^|[\s;])\/(?:[^\s,;}\]]+)/g, "$1<absolute-path>")
     .replace(MATRIX_LOCAL_IDENTIFIER_ASSIGNMENT, "$1[REDACTED]")
-    .replace(MATRIX_PORTABLE_IDENTIFIER_ASSIGNMENT, "$1[REDACTED]");
-  const redacted = redactMatrixLocalIdentifiers(centrallyRedacted);
+    .replace(MATRIX_PORTABLE_IDENTIFIER_ASSIGNMENT, "$1[REDACTED]")
+    .replace(MATRIX_LOCAL_IDENTIFIER_PROSE, "$1[REDACTED]")
+    // Lifecycle failures commonly use prose such as `Workbench PID 1234` or
+    // `PID(s) 1234, 5678`, rather than an assignment. Process identifiers are
+    // local evidence even when no field delimiter is present.
+    .replace(MATRIX_PID_PROSE, "$1[REDACTED]");
+  const locallyRedacted = redactMatrixLocalIdentifiers(centrallyRedacted);
+  let redacted = locallyRedacted;
+  if (Buffer.byteLength(redacted, "utf8") > maximumBytes) {
+    let bounded = "";
+    let byteCount = 0;
+    for (const character of redacted) {
+      const characterBytes = Buffer.byteLength(character, "utf8");
+      if (byteCount + characterBytes > maximumBytes) break;
+      bounded += character;
+      byteCount += characterBytes;
+    }
+    redacted = bounded;
+  }
   // Redaction is intentionally followed by a portability gate. A new diagnostic
   // shape must fail publication until the central redactor learns how to handle it.
   const unsafe = [
@@ -1172,11 +1262,28 @@ function safeMatrixText(value: string, knownSecretValues: readonly string[]): st
     /-reforgerForgeOwnerToken=(?!\[REDACTED\])/i,
     /\bBearer\s+(?!\[REDACTED\])/i,
     /\b(?:capability|lifecycle|handler|owner)\s*[:=]\s*[A-Za-z0-9._-]{8,}/i,
+    /\b(?:pid(?:\(s\)|s)?|process(?:[_ -]?id)(?:\(s\)|s)?)\s*(?::|=|#|\s)\s*\d{1,10}/i,
   ];
   if (knownSecretValues.some((secret) => secret && redacted.includes(secret)) || unsafe.some((pattern) => pattern.test(redacted))) {
     throw new Error("Failure-matrix diagnostic remains unsafe after redaction");
   }
   return redacted;
+}
+
+function validatePortableMatrixStrings(value: unknown, knownSecretValues: readonly string[]): void {
+  if (typeof value === "string") {
+    if (safeMatrixText(value, knownSecretValues) !== value) {
+      throw new Error("Failure-matrix artifact contains unsafe or unbounded text");
+    }
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) validatePortableMatrixStrings(item, knownSecretValues);
+    return;
+  }
+  if (value && typeof value === "object") {
+    for (const item of Object.values(value)) validatePortableMatrixStrings(item, knownSecretValues);
+  }
 }
 
 /** Redact a retained diagnostic at its only matrix-evidence presentation boundary. */
@@ -1229,7 +1336,57 @@ function validateMatrixCleanup(value: unknown): asserts value is MatrixCaseEntry
   }
 }
 
-function hasEvidence(entry: MatrixCaseEntry, field: MatrixEvidenceField): boolean {
+function validateMatrixControl(value: unknown): asserts value is MatrixCaseControlEvidence {
+  if (!exactKeys(value, ["arrival", "action"], "Failure-matrix control evidence") ||
+      typeof value.arrival !== "string" || !["arrived", "not_arrived", "unproven"].includes(value.arrival) ||
+      typeof value.action !== "string" || !["executed", "rejected", "not_executed", "unproven"].includes(value.action) ||
+      (value.arrival !== "arrived" && value.action === "executed")) {
+    throw new Error("Failure-matrix control evidence is invalid or contradictory");
+  }
+}
+
+function validateMatrixArtifactEvidence(value: unknown): asserts value is MatrixCaseArtifactEvidence {
+  if (!exactKeys(value, ["validation", "pngSha256", "metadataSha256", "byteCount", "manifestPublished"], "Failure-matrix artifact evidence") ||
+      typeof value.validation !== "string" || !["validated", "not_created", "rejected", "unproven"].includes(value.validation) ||
+      (value.pngSha256 !== null && (typeof value.pngSha256 !== "string" || !MATRIX_HASH.test(value.pngSha256))) ||
+      (value.metadataSha256 !== null && (typeof value.metadataSha256 !== "string" || !MATRIX_HASH.test(value.metadataSha256))) ||
+      (value.byteCount !== null && (typeof value.byteCount !== "number" || !Number.isSafeInteger(value.byteCount) || value.byteCount < 1)) ||
+      typeof value.manifestPublished !== "boolean") {
+    throw new Error("Failure-matrix artifact evidence is invalid");
+  }
+  if (value.validation === "validated" &&
+      (value.pngSha256 === null || value.metadataSha256 === null || value.byteCount === null || !value.manifestPublished)) {
+    throw new Error("Validated failure-matrix artifact evidence requires both hashes, positive bytes, and a published manifest");
+  }
+  if ((value.validation === "rejected" || value.validation === "not_created" || value.validation === "unproven") &&
+      value.manifestPublished) {
+    throw new Error(`A ${value.validation} failure-matrix artifact cannot publish a manifest`);
+  }
+  if (value.validation === "not_created" &&
+      (value.pngSha256 !== null || value.metadataSha256 !== null || value.byteCount !== null)) {
+    throw new Error("A not-created failure-matrix artifact cannot claim file evidence");
+  }
+}
+
+function validateMatrixDecoy(value: unknown): asserts value is MatrixCaseDecoyEvidence {
+  if (!exactKeys(value, ["category", "identityUnchanged"], "Failure-matrix decoy evidence") ||
+      typeof value.category !== "string" || !["not_applicable", "verified", "unproven"].includes(value.category) ||
+      (value.category === "verified"
+        ? typeof value.identityUnchanged !== "boolean"
+        : value.identityUnchanged !== null)) {
+    throw new Error("Failure-matrix decoy evidence is invalid");
+  }
+}
+
+function validateMatrixCaseLimitations(value: unknown, knownSecretValues: readonly string[]): asserts value is readonly string[] {
+  if (!Array.isArray(value) || value.length > 16 || value.some((item) =>
+    typeof item !== "string" || !item || item.length > 512 || /[\0\r\n]/.test(item) ||
+    safeMatrixText(item, knownSecretValues) !== item)) {
+    throw new Error("Failure-matrix case limitations are unsafe");
+  }
+}
+
+function hasEvidence(entry: MatrixCaseEntry<true>, field: MatrixEvidenceField): boolean {
   switch (field) {
     case "public_terminal": return Boolean(entry.publicTerminal.state);
     case "deadline": return entry.deadline.outcome === "completed";
@@ -1246,9 +1403,10 @@ function validateMatrixCaseEntry(
   matrix: FaultMatrix,
   artifactResult: "passed" | "failed",
   knownSecretValues: readonly string[]
-): asserts value is MatrixCaseEntry {
+): asserts value is MatrixCaseEntry<true> {
   if (!exactKeys(value, [
     "caseId", "schedule", "result", "publicTerminal", "deadline", "worldRevision", "camera", "artifact", "cleanup", "retainedDiagnostics",
+    "control", "artifactEvidence", "ownerShutdown", "decoy", "limitations",
   ], "Failure-matrix case entry") || typeof value.caseId !== "string" ||
       (value.result !== "passed" && value.result !== "failed")) {
     throw new Error("Failure-matrix case entry is invalid");
@@ -1279,7 +1437,29 @@ function validateMatrixCaseEntry(
     throw new Error("Failure-matrix case dispositions are invalid");
   }
   validateMatrixCleanup(value.cleanup);
+  validateMatrixControl(value.control);
+  validateMatrixArtifactEvidence(value.artifactEvidence);
+  validateMatrixDecoy(value.decoy);
+  validateMatrixCaseLimitations(value.limitations, knownSecretValues);
   for (const diagnostic of value.retainedDiagnostics) validateMatrixDiagnostic(diagnostic, knownSecretValues);
+  if (value.artifact !== value.artifactEvidence.validation) {
+    throw new Error("Failure-matrix artifact disposition contradicts its structured evidence");
+  }
+  if (value.ownerShutdown !== "not_applicable" && value.ownerShutdown !== "exact_owner_vacant" &&
+      value.ownerShutdown !== "owner_still_present" && value.ownerShutdown !== "unproven") {
+    throw new Error("Failure-matrix owner-shutdown category is invalid");
+  }
+  if (value.ownerShutdown === "exact_owner_vacant" && !value.cleanup.exactOwnerVacant) {
+    throw new Error("Failure-matrix owner-shutdown evidence contradicts exact-owner vacancy");
+  }
+  if (value.camera === "exact_process_exit" &&
+      (!value.cleanup.exactOwnerVacant || value.ownerShutdown !== "exact_owner_vacant")) {
+    throw new Error("Exact-process-exit camera evidence requires exact-owner vacancy and shutdown proof");
+  }
+  const ownedShutdownDeclaration = value.schedule.action === "stop_owned_workbench" || value.schedule.action === "stop_owned_runtime";
+  if (!ownedShutdownDeclaration && value.decoy.category === "verified") {
+    throw new Error("A non-owned-shutdown failure-matrix case cannot claim a verified decoy");
+  }
   if (value.result === "passed") {
     if (value.publicTerminal.state !== declared.expectedTerminal.state ||
         value.publicTerminal.errorCode !== declared.expectedTerminal.errorCode ||
@@ -1287,16 +1467,58 @@ function validateMatrixCaseEntry(
       throw new Error("A passed failure-matrix case contradicts its declaration");
     }
     for (const field of declared.requiredEvidence) {
-      if (!hasEvidence(value as unknown as MatrixCaseEntry, field)) throw new Error(`A passed failure-matrix case lacks required ${field} evidence`);
+      if (!hasEvidence(value as unknown as MatrixCaseEntry<true>, field)) throw new Error(`A passed failure-matrix case lacks required ${field} evidence`);
     }
     for (const check of declared.requiredChecks) {
       if (!value.cleanup[MATRIX_CHECK_FIELD[check]]) {
         throw new Error(`A passed failure-matrix case lacks required ${check} proof`);
       }
     }
+    if (value.control.arrival !== "arrived" || value.control.action !== "executed") {
+      throw new Error("A passed failure-matrix case requires arrived and executed control evidence");
+    }
+    if (ownedShutdownDeclaration &&
+        (value.ownerShutdown !== "exact_owner_vacant" || !value.cleanup.exactOwnerVacant ||
+          value.decoy.category !== "verified" || value.decoy.identityUnchanged !== true)) {
+      throw new Error("A passed owned-shutdown case requires exact-owner vacancy and an unchanged verified decoy");
+    }
   }
   if (artifactResult === "passed" && value.result !== "passed") {
     throw new Error("A passed failure-matrix artifact cannot contain a failed case");
+  }
+}
+
+function validateFailureMatrixCoverage(
+  value: unknown,
+  declaredCaseIds: readonly string[],
+): asserts value is FailureMatrixCoverage {
+  if (!exactKeys(value, ["kind", "selectedCaseIds"], "Failure-matrix coverage") ||
+      (value.kind !== "full" && value.kind !== "partial") ||
+      !Array.isArray(value.selectedCaseIds) || value.selectedCaseIds.length < 1 ||
+      value.selectedCaseIds.some((id) => typeof id !== "string")) {
+    throw new Error("Failure-matrix coverage is invalid");
+  }
+  const selected = value.selectedCaseIds as string[];
+  const selectedSet = new Set(selected);
+  const canonicalSelection = declaredCaseIds.filter((id) => selectedSet.has(id));
+  if (selectedSet.size !== selected.length || canonicalSelection.length !== selected.length ||
+      selected.some((id, index) => id !== canonicalSelection[index])) {
+    throw new Error("Failure-matrix coverage must select declared cases in canonical backend order");
+  }
+  if (value.kind === "full" &&
+      (selected.length !== declaredCaseIds.length || selected.some((id, index) => id !== declaredCaseIds[index]))) {
+    throw new Error("Full failure-matrix coverage must select every declared backend case");
+  }
+  if (value.kind === "partial" && selected.length >= declaredCaseIds.length) {
+    throw new Error("Partial failure-matrix coverage must select a proper non-empty subset");
+  }
+}
+
+function validateFailureMatrixSourceRevision(value: unknown): asserts value is FailureMatrixSourceRevision {
+  if (!exactKeys(value, ["commit", "tree"], "Failure-matrix source revision") ||
+      (value.commit !== null && (typeof value.commit !== "string" || !MATRIX_COMMIT.test(value.commit))) ||
+      (value.tree !== "clean" && value.tree !== "dirty" && value.tree !== "unavailable")) {
+    throw new Error("Failure-matrix source revision is invalid");
   }
 }
 
@@ -1306,14 +1528,16 @@ function validateFailureMatrixArtifact(
   knownSecretValues: readonly string[]
 ): void {
   if (!exactKeys(artifact, [
-    "schemaVersion", "kind", "backend", "result", "evaluator", "startedAt", "finishedAt", "durationMs", "environment", "workload",
+    "schemaVersion", "kind", "backend", "result", "evaluator", "review", "coverage", "sourceRevision", "startedAt", "finishedAt", "durationMs", "environment", "workload",
     "source", "matrix", "cases", "measurements", "processCounts", "limitations", "failure",
-  ], "Failure-matrix artifact") || artifact.schemaVersion !== 2 ||
+  ], "Failure-matrix artifact") || artifact.schemaVersion !== 3 ||
       artifact.kind !== `reforger_forge_${artifact.backend}_observer_failure_matrix` ||
       (artifact.backend !== "runtime" && artifact.backend !== "workbench") ||
       (artifact.result !== "passed" && artifact.result !== "failed") ||
       !exactKeys(artifact.evaluator, ["kind", "stableId"], "Failure-matrix evaluator") ||
-      artifact.evaluator.kind !== "local_maintainer" || artifact.evaluator.stableId !== null) {
+      artifact.evaluator.kind !== "local_maintainer" || artifact.evaluator.stableId !== null ||
+      !exactKeys(artifact.review, ["imagesReviewed", "outcome"], "Failure-matrix review") ||
+      artifact.review.imagesReviewed !== false || artifact.review.outcome !== "unreviewed") {
     throw new Error("Failure-matrix artifact identity is invalid");
   }
   const started = isoTimestamp(artifact.startedAt, "Failure-matrix start");
@@ -1321,6 +1545,7 @@ function validateFailureMatrixArtifact(
   if (finished < started || !Number.isFinite(artifact.durationMs) || artifact.durationMs < 0) {
     throw new Error("Failure-matrix timing is invalid");
   }
+  validateFailureMatrixSourceRevision(artifact.sourceRevision);
   // Reuse the established baseline validator for all retained operational evidence.
   buildOperationalBaselineArtifact({
     backend: artifact.backend,
@@ -1337,6 +1562,7 @@ function validateFailureMatrixArtifact(
     failure: artifact.failure,
   } as Omit<OperationalBaselineArtifact, "schemaVersion" | "kind" | "thresholds">);
   const declaredBackendCases = matrix.cases.filter((item) => item.backend === artifact.backend);
+  const declaredBackendCaseIds = declaredBackendCases.map((item) => item.id);
   if (!exactKeys(artifact.matrix, ["schemaVersion", "declaredCaseIds", "sourceClosureSha256"], "Failure-matrix catalog") ||
       artifact.matrix.schemaVersion !== 1 || !MATRIX_HASH.test(artifact.matrix.sourceClosureSha256) ||
       !Array.isArray(artifact.matrix.declaredCaseIds) ||
@@ -1345,11 +1571,17 @@ function validateFailureMatrixArtifact(
       artifact.matrix.sourceClosureSha256 !== failureMatrixSourceClosureSha256(artifact.source)) {
     throw new Error("Failure-matrix catalog identity is invalid");
   }
-  if (!Array.isArray(artifact.cases) || artifact.cases.length !== declaredBackendCases.length ||
-      artifact.cases.some((entry, index) => entry.caseId !== declaredBackendCases[index]!.id)) {
-    throw new Error("Failure-matrix entries must occur once in sorted declared order");
+  validateFailureMatrixCoverage(artifact.coverage, declaredBackendCaseIds);
+  if (!Array.isArray(artifact.cases) || artifact.cases.length !== artifact.coverage.selectedCaseIds.length ||
+      artifact.cases.some((entry, index) => entry.caseId !== artifact.coverage.selectedCaseIds[index])) {
+    throw new Error("Failure-matrix entries must exactly match coverage in canonical backend order");
   }
   for (const entry of artifact.cases) validateMatrixCaseEntry(entry, matrix, artifact.result, knownSecretValues);
+  if (artifact.result === "passed" && artifact.coverage.kind === "full" &&
+      (artifact.sourceRevision.tree !== "clean" || artifact.sourceRevision.commit === null ||
+        !MATRIX_COMMIT.test(artifact.sourceRevision.commit))) {
+    throw new Error("A full passing failure-matrix artifact requires a clean 40-hex source revision");
+  }
   if ((artifact.result === "passed" && artifact.failure !== null) ||
       (artifact.result === "failed" && !artifact.failure?.name) ||
       (artifact.failure !== null && (!exactKeys(artifact.failure, ["name"], "Failure-matrix failure") ||
@@ -1360,20 +1592,41 @@ function validateFailureMatrixArtifact(
     typeof item !== "string" || item.length > 512 || safeMatrixText(item, knownSecretValues) !== item)) {
     throw new Error("Failure-matrix limitations are unsafe");
   }
+  // Structured validators constrain shape and vocabulary; this final recursive
+  // gate makes the portability rule exhaustive for every remaining free-text
+  // leaf rather than relying on a hand-maintained field list.
+  validatePortableMatrixStrings(artifact, knownSecretValues);
 }
 
-/** Build a v2 matrix artifact while preserving the v1 baseline's environment/source evidence shape. */
+/** Build a v3 matrix artifact while preserving the v1 baseline's environment/source evidence shape. */
 export function buildObserverFailureMatrixArtifact(input: FailureMatrixArtifactInput): ObserverFailureMatrixArtifact {
   const knownSecretValues = [...new Set(input.knownSecretValues ?? [])];
   if (knownSecretValues.some((value) => typeof value !== "string" || !value)) {
     throw new Error("Failure-matrix known secret values are invalid");
   }
+  const declaredCaseIds = input.matrix.cases
+    .filter((item) => item.backend === input.backend)
+    .map((item) => item.id);
+  const suppliedCaseIds = input.cases.map((entry) => entry.caseId);
+  const coverage: FailureMatrixCoverage = input.coverage
+    ? { kind: input.coverage.kind, selectedCaseIds: [...input.coverage.selectedCaseIds] }
+    : {
+        kind: suppliedCaseIds.length === declaredCaseIds.length &&
+          suppliedCaseIds.every((id, index) => id === declaredCaseIds[index]) ? "full" : "partial",
+        selectedCaseIds: suppliedCaseIds,
+      };
+  const sourceRevision: FailureMatrixSourceRevision = input.sourceRevision
+    ? { commit: input.sourceRevision.commit, tree: input.sourceRevision.tree }
+    : { commit: null, tree: "unavailable" };
   const artifact: ObserverFailureMatrixArtifact = {
-    schemaVersion: 2,
+    schemaVersion: 3,
     kind: `reforger_forge_${input.backend}_observer_failure_matrix`,
     backend: input.backend,
     result: input.result,
     evaluator: { kind: "local_maintainer", stableId: null },
+    review: { imagesReviewed: false, outcome: "unreviewed" },
+    coverage,
+    sourceRevision,
     startedAt: input.startedAt,
     finishedAt: input.finishedAt,
     durationMs: input.durationMs,
@@ -1382,11 +1635,22 @@ export function buildObserverFailureMatrixArtifact(input: FailureMatrixArtifactI
     source: input.source,
     matrix: {
       schemaVersion: 1,
-      declaredCaseIds: input.matrix.cases.filter((item) => item.backend === input.backend).map((item) => item.id),
+      declaredCaseIds,
       sourceClosureSha256: failureMatrixSourceClosureSha256(input.source),
     },
     cases: input.cases.map((entry) => ({
       ...entry,
+      control: entry.control ?? { arrival: "unproven", action: "unproven" },
+      artifactEvidence: entry.artifactEvidence ?? {
+        validation: entry.artifact,
+        pngSha256: null,
+        metadataSha256: null,
+        byteCount: null,
+        manifestPublished: false,
+      },
+      ownerShutdown: entry.ownerShutdown ?? "not_applicable",
+      decoy: entry.decoy ?? { category: "not_applicable", identityUnchanged: null },
+      limitations: (entry.limitations ?? []).map((item) => safeMatrixText(item, knownSecretValues)),
       retainedDiagnostics: entry.retainedDiagnostics.map((diagnostic) => matrixRetainedDiagnostic(diagnostic.tail, knownSecretValues)),
     })),
     measurements: input.measurements,
@@ -1398,21 +1662,47 @@ export function buildObserverFailureMatrixArtifact(input: FailureMatrixArtifactI
   return Object.freeze(artifact);
 }
 
+function failureMatrixMarkdownCell(value: string): string {
+  return value.replace(/\|/g, "\\|").replace(/[\r\n]+/g, " ");
+}
+
 function failureMatrixMarkdown(artifact: ObserverFailureMatrixArtifact): string {
   const product = artifact.backend === "runtime" ? artifact.environment.game : artifact.environment.workbench;
   const productVersion = product?.version ?? product?.fileVersion ?? "unavailable";
+  const workbenchVersion = artifact.environment.workbench?.version ??
+    artifact.environment.workbench?.fileVersion ?? "unavailable";
+  const coverage = `${artifact.coverage.kind} (${artifact.coverage.selectedCaseIds.length} of ${artifact.matrix.declaredCaseIds.length} declared cases)`;
   const lines = [
     "# Observer failure matrix",
     "",
     `Result: ${artifact.result}`,
     `Backend: ${artifact.backend}`,
     `Product version: ${productVersion}`,
+    `Workbench version: ${workbenchVersion}`,
+    `Procedure revision: ${artifact.workload.procedureRevision}`,
+    `Source revision: ${artifact.sourceRevision.commit ?? "unavailable"}`,
+    `Source tree: ${artifact.sourceRevision.tree}`,
+    `Coverage: ${coverage}`,
+    `Selected cases: ${artifact.coverage.selectedCaseIds.join(", ")}`,
     `Evaluator: ${artifact.evaluator.kind}`,
+    "Images manually reviewed: no (unreviewed automation output)",
     `Source closure SHA-256: ${artifact.matrix.sourceClosureSha256}`,
     "",
-    "| Case | Result | Terminal | Deadline | Camera |",
-    "| --- | --- | --- | --- | --- |",
-    ...artifact.cases.map((entry) => `| ${entry.caseId} | ${entry.result} | ${entry.publicTerminal.state}/${entry.publicTerminal.errorCode ?? "none"} | ${entry.deadline.outcome} | ${entry.camera} |`),
+    "| Case | Declared fault (phase/action) | Public result | Camera / exit | Artifact | Vacancy | Limitations |",
+    "| --- | --- | --- | --- | --- | --- | --- |",
+    ...artifact.cases.map((entry) => {
+      const vacancy = [
+        `lifecycle-${entry.cleanup.lifecycleVacant ? "vacant" : "occupied"}`,
+        `endpoint-${entry.cleanup.endpointVacant ? "vacant" : "occupied"}`,
+        `child-${entry.cleanup.childVacant ? "vacant" : "occupied"}`,
+        `exact-owner-${entry.cleanup.exactOwnerVacant ? "vacant" : "occupied"}`,
+      ].join(", ");
+      const limitations = entry.limitations.length > 0 ? entry.limitations.join("; ") : "none";
+      return `| ${failureMatrixMarkdownCell(entry.caseId)} | ${entry.schedule.phase} / ${entry.schedule.action} | ` +
+        `${entry.result}: ${entry.publicTerminal.state}/${entry.publicTerminal.errorCode ?? "none"} | ` +
+        `${entry.camera} / ${entry.ownerShutdown} | ${entry.artifact} | ${vacancy} | ` +
+        `${failureMatrixMarkdownCell(limitations)} |`;
+    }),
     "",
     "## Retained diagnostic hashes",
     "",
@@ -1468,7 +1758,9 @@ export function writeObserverFailureMatrixArtifact(
   }
   try {
     const markdown = failureMatrixMarkdown(artifact);
-    if (safeMatrixText(markdown, knownSecretValues) !== markdown) throw new Error("Failure-matrix summary is unsafe");
+    if (safeMatrixText(markdown, knownSecretValues, MATRIX_SUMMARY_MAXIMUM) !== markdown) {
+      throw new Error("Failure-matrix summary is unsafe");
+    }
     writeFileSync(markdownTemporary, markdown, { encoding: "utf8", flag: "wx", mode: 0o600 });
     renameSync(markdownTemporary, markdownPath);
     const markdownBytes = readFileSync(markdownPath, "utf8");
@@ -1491,11 +1783,12 @@ export function writeObserverFailureMatrixArtifact(
     renameSync(jsonTemporary, jsonPath);
     return Object.freeze({ jsonPath, markdownPath, artifact });
   } catch (error) {
-    for (const path of [markdownTemporary, jsonTemporary]) {
+    // All four names were proved absent before this attempt. Roll back both
+    // temporary siblings and any final sibling this attempt managed to rename,
+    // including a future failure after the JSON manifest rename.
+    for (const path of [markdownTemporary, jsonTemporary, markdownPath, jsonPath]) {
       try { if (existsSync(path)) unlinkSync(path); } catch { /* preserve root failure */ }
     }
-    // A final summary without a final manifest is not a valid publication closure.
-    try { if (existsSync(markdownPath) && !existsSync(jsonPath)) unlinkSync(markdownPath); } catch { /* preserve root failure */ }
     throw error;
   }
 }
@@ -1608,7 +1901,10 @@ export function findBlockingProcesses(rows: ProcessRow[]): BlockingProcess[] {
   }).sort((left, right) => left.id - right.id);
 }
 
-export function inspectBlockingProcesses(): BlockingProcess[] {
+export function inspectBlockingProcesses(timeoutMs = 15_000): BlockingProcess[] {
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) {
+    throw new TypeError("Blocking-process inspection timeout must be a positive integer.");
+  }
   const command = [
     "$ErrorActionPreference = 'Stop'",
     "$items = @(Get-Process -ErrorAction Stop | Select-Object -Property Id,ProcessName)",
@@ -1620,7 +1916,7 @@ export function inspectBlockingProcesses(): BlockingProcess[] {
     {
       encoding: "utf8",
       windowsHide: true,
-      timeout: 15_000,
+      timeout: timeoutMs,
       maxBuffer: 4 * 1024 * 1024,
     }
   );

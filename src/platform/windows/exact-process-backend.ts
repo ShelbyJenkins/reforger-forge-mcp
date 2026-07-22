@@ -40,7 +40,10 @@ type WindowsExactProcessFailure = Error & {
 };
 
 export interface WindowsExactProcessBackendOptions {
-  helperTimeoutMs?: number;
+  /** A callback is evaluated immediately before each helper invocation. */
+  helperTimeoutMs?: number | (() => number);
+  /** Optional absolute deadline shared by every nested helper phase. */
+  operationDeadlineAtMs?: () => number | undefined;
   /**
    * Process-level fail-stop invoked if an acquired OS mutex disappears before
    * the protected action finishes. It must not return.
@@ -51,6 +54,81 @@ export interface WindowsExactProcessBackendOptions {
     message: string,
     code: WindowsExactProcessBackendFailureCode
   ) => WindowsExactProcessFailure;
+}
+
+export interface WindowsMutexDeadlineBudget {
+  /** Maximum time passed to the OS mutex wait itself. */
+  readonly mutexWaitTimeoutMs: number;
+  /** Maximum time allowed for one helper response/exit phase. */
+  readonly helperTimeoutMs: number;
+  /** Parent-side bound for wait plus acquisition acknowledgement. */
+  readonly acquisitionTimeoutMs: number;
+}
+
+/**
+ * Divide one remaining absolute operation budget between mutex acquisition,
+ * its helper acknowledgement, and a final helper release/kill allowance.
+ */
+export function allocateWindowsMutexDeadlineBudget(input: {
+  readonly remainingMs: number;
+  readonly requestedMutexWaitMs: number;
+  readonly configuredHelperTimeoutMs: number;
+}): WindowsMutexDeadlineBudget {
+  const { remainingMs, requestedMutexWaitMs, configuredHelperTimeoutMs } = input;
+  if (!Number.isSafeInteger(remainingMs) || remainingMs <= 0 ||
+      !Number.isSafeInteger(requestedMutexWaitMs) || requestedMutexWaitMs <= 0 ||
+      !Number.isSafeInteger(configuredHelperTimeoutMs) || configuredHelperTimeoutMs <= 0) {
+    throw new TypeError("Windows mutex deadline budget inputs must be positive integers.");
+  }
+
+  // At most one third is assigned to either helper boundary. The middle share
+  // remains available to the OS wait, while a smaller configured helper bound
+  // naturally gives the mutex wait more of the common deadline.
+  const helperTimeoutMs = Math.min(
+    configuredHelperTimeoutMs,
+    Math.max(1, Math.floor(remainingMs / 3))
+  );
+  const mutexWaitTimeoutMs = Math.min(
+    requestedMutexWaitMs,
+    Math.max(1, remainingMs - (2 * helperTimeoutMs))
+  );
+  return Object.freeze({
+    mutexWaitTimeoutMs,
+    helperTimeoutMs,
+    acquisitionTimeoutMs: Math.min(remainingMs, mutexWaitTimeoutMs + helperTimeoutMs),
+  });
+}
+
+export interface WindowsTerminationDeadlineBudget {
+  /** Timeout sent to the exact-process termination helper. */
+  readonly terminationTimeoutMs: number;
+  /** Parent-side allowance reserved for receiving the helper response. */
+  readonly responseAllowanceMs: number;
+}
+
+/** Reserve a response allowance inside the already-clamped termination budget. */
+export function allocateWindowsTerminationDeadlineBudget(input: {
+  readonly operationBudgetMs: number;
+  readonly requestedTerminationTimeoutMs: number;
+  readonly configuredHelperTimeoutMs: number;
+}): WindowsTerminationDeadlineBudget {
+  const { operationBudgetMs, requestedTerminationTimeoutMs, configuredHelperTimeoutMs } = input;
+  if (!Number.isSafeInteger(operationBudgetMs) || operationBudgetMs <= 0 ||
+      !Number.isSafeInteger(requestedTerminationTimeoutMs) || requestedTerminationTimeoutMs <= 0 ||
+      !Number.isSafeInteger(configuredHelperTimeoutMs) || configuredHelperTimeoutMs <= 0) {
+    throw new TypeError("Windows termination deadline budget inputs must be positive integers.");
+  }
+  const responseAllowanceMs = Math.min(
+    configuredHelperTimeoutMs,
+    Math.max(1, Math.floor(operationBudgetMs / 2))
+  );
+  return Object.freeze({
+    terminationTimeoutMs: Math.min(
+      requestedTerminationTimeoutMs,
+      Math.max(1, operationBudgetMs - responseAllowanceMs)
+    ),
+    responseAllowanceMs,
+  });
 }
 
 export interface WindowsHelperResponse {
@@ -105,7 +183,8 @@ function isString(value: unknown): value is string {
  */
 export class WindowsExactProcessBackend implements ExactProcessBackend, MachineMutex {
   readonly platform = "win32" as const;
-  protected readonly helperTimeoutMs: number;
+  private readonly helperTimeoutMs: () => number;
+  private readonly operationDeadlineAtMs: (() => number | undefined) | undefined;
   private readonly leaseLossFailStop: (error: WindowsExactProcessFailure) => never;
   private readonly errorFactory: NonNullable<WindowsExactProcessBackendOptions["errorFactory"]>;
 
@@ -113,13 +192,15 @@ export class WindowsExactProcessBackend implements ExactProcessBackend, MachineM
     private readonly helperPath: string,
     options: WindowsExactProcessBackendOptions = {}
   ) {
-    this.helperTimeoutMs = options.helperTimeoutMs ?? DEFAULT_HELPER_TIMEOUT_MS;
+    const helperTimeout = options.helperTimeoutMs ?? DEFAULT_HELPER_TIMEOUT_MS;
+    this.helperTimeoutMs = typeof helperTimeout === "function"
+      ? helperTimeout
+      : () => helperTimeout;
+    this.operationDeadlineAtMs = options.operationDeadlineAtMs;
     this.errorFactory = options.errorFactory ??
       ((message, code) => new WindowsExactProcessBackendError(message, code));
     this.leaseLossFailStop = options.leaseLossFailStop ?? (() => process.abort());
-    if (!Number.isInteger(this.helperTimeoutMs) || this.helperTimeoutMs <= 0) {
-      throw this.failure("Windows lifecycle helper timeout must be positive.", "STATE_INVALID");
-    }
+    this.currentHelperTimeoutMs();
   }
 
   protected failure(
@@ -164,9 +245,11 @@ export class WindowsExactProcessBackend implements ExactProcessBackend, MachineM
     closePromise: Promise<number | null>,
     context: string,
     killImmediately: boolean,
-    outcomeUncertain = false
+    outcomeUncertain = false,
+    timeoutMs?: number
   ): Promise<void> {
     if (killImmediately) child.kill();
+    const helperTimeoutMs = timeoutMs ?? this.currentHelperTimeoutMs();
     let timer: NodeJS.Timeout | undefined;
     await Promise.race([
       closePromise.then(() => undefined),
@@ -174,11 +257,11 @@ export class WindowsExactProcessBackend implements ExactProcessBackend, MachineM
         timer = setTimeout(() => {
           child.kill();
           reject(this.failure(
-            `${context}; the mutex helper did not exit within ${this.helperTimeoutMs}ms. ` +
+            `${context}; the mutex helper did not exit within ${helperTimeoutMs}ms. ` +
               "Durable lifecycle state was preserved for recovery.",
             outcomeUncertain ? "RECOVERY_REQUIRED" : "HELPER_FAILURE"
           ));
-        }, this.helperTimeoutMs);
+        }, helperTimeoutMs);
         timer.unref();
       }),
     ]).finally(() => {
@@ -189,13 +272,15 @@ export class WindowsExactProcessBackend implements ExactProcessBackend, MachineM
   protected async invoke(
     mode: string,
     request: unknown,
-    timeoutMs = this.helperTimeoutMs,
+    timeoutMs?: number,
     mutationOutcomeUncertainOnTimeout = false
   ): Promise<WindowsHelperResponse> {
     this.assertSupported();
+    timeoutMs ??= this.currentHelperTimeoutMs();
     if (!Number.isInteger(timeoutMs) || timeoutMs <= 0) {
       throw this.failure("Windows lifecycle helper timeout must be positive.", "STATE_INVALID");
     }
+    timeoutMs = this.clampToOperationDeadline(timeoutMs, `Windows lifecycle helper mode ${mode}`);
     const deadlineUnixMs = Date.now() + timeoutMs;
     return new Promise<WindowsHelperResponse>((resolvePromise, reject) => {
       const child = spawn("powershell.exe", this.powershellArgs(mode, deadlineUnixMs), {
@@ -269,7 +354,25 @@ export class WindowsExactProcessBackend implements ExactProcessBackend, MachineM
 
   async withMachineMutex<T>(args: MachineMutexRequest<T>): Promise<T> {
     this.assertSupported();
-    const acquisitionBudgetMs = args.timeoutMs + this.helperTimeoutMs;
+    const configuredHelperTimeoutMs = this.currentHelperTimeoutMs();
+    const operationDeadlineAtMs = this.currentOperationDeadlineAtMs();
+    let mutexWaitTimeoutMs = args.timeoutMs;
+    let helperTimeoutMs = configuredHelperTimeoutMs;
+    let acquisitionBudgetMs = mutexWaitTimeoutMs + helperTimeoutMs;
+    if (operationDeadlineAtMs !== undefined) {
+      const remainingMs = this.remainingOperationMs(
+        operationDeadlineAtMs,
+        "Lifecycle mutex acquisition"
+      );
+      const budget = allocateWindowsMutexDeadlineBudget({
+        remainingMs,
+        requestedMutexWaitMs: args.timeoutMs,
+        configuredHelperTimeoutMs,
+      });
+      helperTimeoutMs = budget.helperTimeoutMs;
+      mutexWaitTimeoutMs = budget.mutexWaitTimeoutMs;
+      acquisitionBudgetMs = budget.acquisitionTimeoutMs;
+    }
     const child = spawn(
       "powershell.exe",
       this.powershellArgs("HoldMutex", Date.now() + acquisitionBudgetMs),
@@ -301,7 +404,9 @@ export class WindowsExactProcessBackend implements ExactProcessBackend, MachineM
           child,
           closePromise,
           "Lifecycle mutex acquisition timed out",
-          true
+          true,
+          false,
+          helperTimeoutMs
         ).then(() => reject(error), reject);
       }, acquisitionBudgetMs);
       timer.unref();
@@ -347,14 +452,16 @@ export class WindowsExactProcessBackend implements ExactProcessBackend, MachineM
             child,
             closePromise,
             "Lifecycle mutex holder returned invalid JSON",
-            true
+            true,
+            false,
+            helperTimeoutMs
           ).then(() => reject(invalidResponse), reject);
         }
       };
       child.once("error", onError);
       child.once("close", onClose);
       child.stdout.on("data", onData);
-      child.stdin.write(`${JSON.stringify({ mutexName: args.name, timeoutMs: args.timeoutMs })}\n`);
+      child.stdin.write(`${JSON.stringify({ mutexName: args.name, timeoutMs: mutexWaitTimeoutMs })}\n`);
     });
     if (acquired.ok !== true || acquired.status !== "acquired") {
       child.stdin.end();
@@ -362,7 +469,9 @@ export class WindowsExactProcessBackend implements ExactProcessBackend, MachineM
         child,
         closePromise,
         "Lifecycle mutex holder did not exit after refusing acquisition",
-        false
+        false,
+        false,
+        helperTimeoutMs
       );
       throw this.failure(
         acquired.status === "timeout"
@@ -393,12 +502,23 @@ export class WindowsExactProcessBackend implements ExactProcessBackend, MachineM
     } finally {
       released = true;
       child.stdin.end("release\n");
+      const releaseRemainingMs = operationDeadlineAtMs === undefined
+        ? helperTimeoutMs
+        : Math.floor(operationDeadlineAtMs - Date.now());
+      // If the protected action consumed the final millisecond, terminate the
+      // holder immediately so the OS releases the mutex; do not grant a fresh
+      // helper window after the shared deadline.
+      const releaseExpired = releaseRemainingMs <= 0;
+      const releaseTimeoutMs = releaseExpired
+        ? 1
+        : Math.min(helperTimeoutMs, releaseRemainingMs);
       await this.waitForMutexHelperExit(
         child,
         closePromise,
         "Lifecycle mutex holder did not release",
-        false,
-        true
+        releaseExpired,
+        true,
+        releaseTimeoutMs
       );
     }
   }
@@ -446,10 +566,20 @@ export class WindowsExactProcessBackend implements ExactProcessBackend, MachineM
     expected: ExactOwnedProcessIdentity,
     timeoutMs: number
   ): Promise<ExactProcessTerminationResult> {
+    const helperTimeoutMs = this.currentHelperTimeoutMs();
+    const outerTimeoutMs = this.clampToOperationDeadline(
+      timeoutMs + helperTimeoutMs,
+      "Exact process termination"
+    );
+    const { terminationTimeoutMs } = allocateWindowsTerminationDeadlineBudget({
+      operationBudgetMs: outerTimeoutMs,
+      requestedTerminationTimeoutMs: timeoutMs,
+      configuredHelperTimeoutMs: helperTimeoutMs,
+    });
     const response = await this.invoke(
       "VerifyTerminate",
-      { expected, timeoutMs },
-      timeoutMs + this.helperTimeoutMs,
+      { expected, timeoutMs: terminationTimeoutMs },
+      outerTimeoutMs,
       true
     );
     if (response.ok === true &&
@@ -478,6 +608,40 @@ export class WindowsExactProcessBackend implements ExactProcessBackend, MachineM
       reason,
       message: response.message ?? "The exact process helper refused termination.",
     };
+  }
+
+  private currentHelperTimeoutMs(): number {
+    const timeoutMs = this.helperTimeoutMs();
+    if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) {
+      throw this.failure("Windows lifecycle helper timeout must be positive.", "STATE_INVALID");
+    }
+    return timeoutMs;
+  }
+
+  private currentOperationDeadlineAtMs(): number | undefined {
+    const deadlineAtMs = this.operationDeadlineAtMs?.();
+    if (deadlineAtMs === undefined) return undefined;
+    if (!Number.isSafeInteger(deadlineAtMs) || deadlineAtMs <= 0) {
+      throw this.failure("Windows lifecycle absolute deadline is invalid.", "STATE_INVALID");
+    }
+    return deadlineAtMs;
+  }
+
+  private remainingOperationMs(deadlineAtMs: number, context: string): number {
+    const remainingMs = Math.floor(deadlineAtMs - Date.now());
+    if (remainingMs <= 0) {
+      throw this.failure(`${context} exceeded its absolute deadline.`, "HELPER_FAILURE");
+    }
+    return remainingMs;
+  }
+
+  private clampToOperationDeadline(
+    requestedMs: number,
+    context: string,
+    deadlineAtMs = this.currentOperationDeadlineAtMs()
+  ): number {
+    if (deadlineAtMs === undefined) return requestedMs;
+    return Math.min(requestedMs, this.remainingOperationMs(deadlineAtMs, context));
   }
 }
 

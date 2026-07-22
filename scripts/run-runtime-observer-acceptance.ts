@@ -1287,12 +1287,44 @@ export async function runRuntimeObserverAcceptance(
   return { runDirectory, summaryPath, evidenceDirectory, baselinePath, summary };
 }
 
-function readOption(name: string): string | undefined {
-  const index = process.argv.indexOf(name);
-  if (index < 0) return undefined;
-  const value = process.argv[index + 1];
+export function readSingletonCliOption(argv: readonly string[], name: string): string | undefined {
+  const indexes = argv.flatMap((value, index) => value === name ? [index] : []);
+  if (indexes.length > 1) throw new Error(`${name} may be specified only once`);
+  const index = indexes[0];
+  if (index === undefined) return undefined;
+  const value = argv[index + 1];
   if (!value || value.startsWith("--")) throw new Error(`${name} requires a value`);
   return value;
+}
+
+export function readSingletonCliFlag(argv: readonly string[], name: string): boolean {
+  const count = argv.filter((value) => value === name).length;
+  if (count > 1) throw new Error(`${name} may be specified only once`);
+  return count === 1;
+}
+
+const RUNTIME_SINGLETON_CLI_OPTIONS = Object.freeze([
+  "--help", "-h", "--list-cases", "--confirm-live-run", "--keep-profile",
+  "--only", "--world", "--addon-dir", "--executable", "--artifact-root",
+  "--validation-root", "--timeout-ms", "--pose-position", "--pose-orientation",
+  "--pose-fov", "--look-at-position", "--look-at-target", "--look-at-fov",
+  "--marker-rgb", "--marker-roi",
+] as const);
+
+export function assertRuntimeCliSingletonOptions(argv: readonly string[]): void {
+  for (const name of RUNTIME_SINGLETON_CLI_OPTIONS) {
+    if (argv.filter((value) => value === name).length > 1) {
+      throw new Error(`${name} may be specified only once`);
+    }
+  }
+}
+
+function readOption(name: string): string | undefined {
+  return readSingletonCliOption(process.argv, name);
+}
+
+function readFlag(name: string): boolean {
+  return readSingletonCliFlag(process.argv, name);
 }
 
 function readOptions(name: string): string[] {
@@ -1370,11 +1402,12 @@ function usage(): string {
 }
 
 async function runCli(): Promise<void> {
-  if (process.argv.includes("--help") || process.argv.includes("-h")) {
+  assertRuntimeCliSingletonOptions(process.argv);
+  if (readFlag("--help") || readFlag("-h")) {
     process.stdout.write(usage());
     return;
   }
-  if (process.argv.includes("--list-cases")) {
+  if (readFlag("--list-cases")) {
     for (const item of OBSERVER_FAULT_MATRIX.cases) {
       if (item.backend === "runtime") process.stdout.write(`${item.id}\n`);
     }
@@ -1382,7 +1415,7 @@ async function runCli(): Promise<void> {
   }
   const environment = process.env;
   const only = readOption("--only");
-  const keepProfile = process.argv.includes("--keep-profile");
+  const keepProfile = readFlag("--keep-profile");
   if (keepProfile && !only) {
     throw new Error("--keep-profile is valid only together with --only");
   }
@@ -1392,7 +1425,7 @@ async function runCli(): Promise<void> {
       throw new Error("--only (fault-matrix mode) rejects a user-selected --addon-dir; it always creates its own fixture");
     }
     const result = await runRuntimeFailureMatrix({
-      confirmed: process.argv.includes("--confirm-live-run"),
+      confirmed: readFlag("--confirm-live-run"),
       environment,
       worldResource: readOption("--world") ?? environment.RFO_RUNTIME_OBSERVER_WORLD,
       executablePath: readOption("--executable") ?? environment.RFO_RUNTIME_OBSERVER_EXECUTABLE,
@@ -1418,7 +1451,7 @@ async function runCli(): Promise<void> {
   const lookAtFov = readOption("--look-at-fov") ?? environment.RFO_RUNTIME_OBSERVER_LOOK_AT_FOV;
   const timeout = readOption("--timeout-ms") ?? environment.RFO_RUNTIME_OBSERVER_TIMEOUT_MS;
   const result = await runRuntimeObserverAcceptance({
-    confirmed: process.argv.includes("--confirm-live-run"),
+    confirmed: readFlag("--confirm-live-run"),
     environment,
     worldResource,
     addonDirectory: readOption("--addon-dir") ?? environment.RFO_RUNTIME_OBSERVER_ADDON_DIR,

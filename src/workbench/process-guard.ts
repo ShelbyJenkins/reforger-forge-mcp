@@ -21,6 +21,7 @@ import {
 } from "../foundation/lmdb-cas-store.js";
 import { LmdbEnvironment } from "../foundation/lmdb-store.js";
 import {
+  deadlineAt,
   deadlineAfter,
   pollUntil,
   systemClock,
@@ -240,7 +241,10 @@ export interface WorkbenchLifecycleBackend extends ExactProcessBackend, MachineM
 export interface WorkbenchProcessGuardOptions {
   stateDir?: string;
   mutexName?: string;
-  lockTimeoutMs?: number;
+  /** A callback is evaluated at mutex acquisition for absolute-deadline callers. */
+  lockTimeoutMs?: number | (() => number);
+  /** Absolute cap shared by lock, helper, and spawned-identity polling phases. */
+  operationDeadlineAtMs?: () => number | undefined;
   backend?: WorkbenchLifecycleBackend;
   helperPath?: string;
   /**
@@ -500,7 +504,8 @@ function defaultStateDir(): string {
 }
 
 export interface WindowsLifecycleBackendOptions {
-  helperTimeoutMs?: number;
+  helperTimeoutMs?: number | (() => number);
+  operationDeadlineAtMs?: () => number | undefined;
   /**
    * Process-level fail-stop invoked if an acquired OS mutex disappears before
    * the protected action finishes. It must not return. Injection exists only
@@ -517,6 +522,7 @@ export class WindowsLifecycleBackend extends WindowsExactProcessBackend
   ) {
     super(helperPath, {
       helperTimeoutMs: options.helperTimeoutMs,
+      operationDeadlineAtMs: options.operationDeadlineAtMs,
       errorFactory: (message, code) => new LifecycleGuardError(
         message,
         code as WindowsExactProcessBackendFailureCode
@@ -758,7 +764,8 @@ export class WorkbenchProcessGuard {
   readonly leaseId = randomUUID();
   readonly backend: WorkbenchLifecycleBackend;
   private readonly mutexName: string;
-  private readonly lockTimeoutMs: number;
+  private readonly lockTimeoutMs: () => number;
+  private readonly operationDeadlineAtMs: (() => number | undefined) | undefined;
   private readonly corruptDir: string;
   private readonly beforeLifecycleReplace: WorkbenchProcessGuardOptions["beforeLifecycleReplace"];
   private readonly afterLifecycleReplace: WorkbenchProcessGuardOptions["afterLifecycleReplace"];
@@ -773,7 +780,9 @@ export class WorkbenchProcessGuard {
     this.stateDir = resolve(options.stateDir ?? defaultStateDir());
     this.corruptDir = join(this.stateDir, "corrupt");
     this.mutexName = options.mutexName ?? DEFAULT_LIFECYCLE_MUTEX;
-    this.lockTimeoutMs = options.lockTimeoutMs ?? DEFAULT_LOCK_TIMEOUT_MS;
+    const lockTimeout = options.lockTimeoutMs ?? DEFAULT_LOCK_TIMEOUT_MS;
+    this.lockTimeoutMs = typeof lockTimeout === "function" ? lockTimeout : () => lockTimeout;
+    this.operationDeadlineAtMs = options.operationDeadlineAtMs;
     this.beforeLifecycleReplace = options.beforeLifecycleReplace;
     this.afterLifecycleReplace = options.afterLifecycleReplace;
     this.beforeSpawnJournalReplace = options.beforeSpawnJournalReplace;
@@ -782,7 +791,9 @@ export class WorkbenchProcessGuard {
     const helperPath = resolve(
       options.helperPath ?? join(packageRoot, "scripts", "windows", "workbench-lifecycle.ps1")
     );
-    this.backend = options.backend ?? new WindowsLifecycleBackend(helperPath);
+    this.backend = options.backend ?? new WindowsLifecycleBackend(helperPath, {
+      operationDeadlineAtMs: options.operationDeadlineAtMs,
+    });
   }
 
   createOwnerToken(): string {
@@ -822,7 +833,7 @@ export class WorkbenchProcessGuard {
     let activeSession: LifecycleSession | null = null;
     return this.backend.withMachineMutex({
       name: this.mutexName,
-      timeoutMs: this.lockTimeoutMs,
+      timeoutMs: this.currentLockTimeoutMs(),
       onLeaseLost: (error) => activeSession?.close(error),
       action: async () => {
         mkdirSync(this.stateDir, { recursive: true });
@@ -1038,7 +1049,7 @@ export class WorkbenchProcessGuard {
         }
         return this.backend.withMachineMutex({
           name: this.mutexName,
-          timeoutMs: this.lockTimeoutMs,
+          timeoutMs: this.currentLockTimeoutMs(),
           action: async () => {
             mkdirSync(this.stateDir, { recursive: true });
             const lifecycle = await this.readLifecycleState();
@@ -1098,6 +1109,31 @@ export class WorkbenchProcessGuard {
     };
   }
 
+  private currentLockTimeoutMs(): number {
+    let timeoutMs = this.lockTimeoutMs();
+    if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) {
+      throw new LifecycleGuardError("Lifecycle lock deadline expired.", "LIFECYCLE_BUSY");
+    }
+    const operationDeadlineAtMs = this.currentOperationDeadlineAtMs();
+    if (operationDeadlineAtMs !== undefined) {
+      const remainingMs = Math.floor(operationDeadlineAtMs - Date.now());
+      if (remainingMs <= 0) {
+        throw new LifecycleGuardError("Lifecycle lock deadline expired.", "LIFECYCLE_BUSY");
+      }
+      timeoutMs = Math.min(timeoutMs, remainingMs);
+    }
+    return timeoutMs;
+  }
+
+  private currentOperationDeadlineAtMs(): number | undefined {
+    const deadlineAtMs = this.operationDeadlineAtMs?.();
+    if (deadlineAtMs === undefined) return undefined;
+    if (!Number.isSafeInteger(deadlineAtMs) || deadlineAtMs <= 0) {
+      throw new LifecycleGuardError("Lifecycle absolute deadline is invalid.", "STATE_INVALID");
+    }
+    return deadlineAtMs;
+  }
+
   async listWorkbenchProcesses(): Promise<ExactProcessIdentity[]> {
     return this.scanStrict();
   }
@@ -1114,10 +1150,15 @@ export class WorkbenchProcessGuard {
     launchedAtMs: number;
   }): Promise<WorkbenchIdentity> {
     let lastError: unknown;
+    const localDeadlineAtMs = Date.now() + PROCESS_CAPTURE_TIMEOUT_MS;
+    const operationDeadlineAtMs = this.currentOperationDeadlineAtMs();
+    const inspectionDeadline = operationDeadlineAtMs === undefined
+      ? deadlineAfter(systemClock, PROCESS_CAPTURE_TIMEOUT_MS)
+      : deadlineAt(Math.min(localDeadlineAtMs, operationDeadlineAtMs));
     const result = await pollUntil<WorkbenchIdentity>({
       clock: systemClock,
       sleeper: systemSleeper,
-      deadline: deadlineAfter(systemClock, PROCESS_CAPTURE_TIMEOUT_MS),
+      deadline: inspectionDeadline,
       intervalMs: PROCESS_POLL_MS,
       probe: async (): Promise<WorkbenchIdentity | undefined> => {
         let inspection: ProcessInspection | null = null;

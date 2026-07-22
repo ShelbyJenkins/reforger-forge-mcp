@@ -58,6 +58,8 @@ export interface CreateObserverApplicationOptions {
   sourceAddon?: string;
   startupTimeoutMs?: number;
   requestTimeoutMs?: number;
+  /** Optional absolute cap applied to observer-agent startup and requests. */
+  requestDeadlineAtMs?: () => number | undefined;
   defaultCaptureTimeoutMs?: number;
   maxInlineImageBytes?: number;
   retentionIntervalMs?: number;
@@ -191,6 +193,7 @@ class DefaultObserverApplication implements ObserverApplication {
       arguments: argumentsArray,
       startupTimeoutMs: options.startupTimeoutMs,
       requestTimeoutMs: options.requestTimeoutMs,
+      requestDeadlineAtMs: options.requestDeadlineAtMs,
       forkChild: options.forkChild,
     });
     this.diagnostics = new ObserverHostDiagnostics(this.agentClient, managedRoot, profileRoot, sourceAddon, this.requestTimeoutMs);

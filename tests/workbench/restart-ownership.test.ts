@@ -91,6 +91,9 @@ type TestNetApiCall = (
 interface HarnessOptions {
   companionReadiness?: NonNullable<WorkbenchClientDependencies["companionReadiness"]>;
   vacancyWait?: NonNullable<WorkbenchClientDependencies["vacancyWait"]>;
+  lifecycleDeadlineAtMs?: NonNullable<WorkbenchClientDependencies["lifecycleDeadlineAtMs"]>;
+  requestDeadlineAtMs?: NonNullable<WorkbenchClientDependencies["requestDeadlineAtMs"]>;
+  now?: NonNullable<WorkbenchClientDependencies["now"]>;
 }
 
 function createHarness(options: HarnessOptions = {}): Harness {
@@ -156,6 +159,9 @@ function createHarness(options: HarnessOptions = {}): Harness {
       netApi,
       companionReadiness: options.companionReadiness,
       vacancyWait: options.vacancyWait,
+      lifecycleDeadlineAtMs: options.lifecycleDeadlineAtMs,
+      requestDeadlineAtMs: options.requestDeadlineAtMs,
+      now: options.now,
       spawnProcess: (command, args, options) => {
         spawnOptions.push(options);
         spawnArgs.push([...args]);
@@ -248,6 +254,35 @@ describe("exact owner-scoped Workbench restart", () => {
       "EMCP_WB_Ping",
       "EMCP_WB_ListEntities",
     ]);
+  });
+
+  it("recomputes the NET timeout after managed-authority prechecks consume budget", async () => {
+    let now = 1_000;
+    let requestDeadlineAtMs: number | undefined;
+    const harness = createHarness({
+      now: () => now,
+      requestDeadlineAtMs: () => requestDeadlineAtMs,
+    });
+    await harness.client.ensureRunning(harness.projectPath);
+    harness.netApiCall.mockClear();
+    requestDeadlineAtMs = 1_100;
+    harness.netApiCall.mockImplementation(async (api) => {
+      if (api === "EMCP_WB_Ping") {
+        now = 1_080;
+        return WORKBENCH_HELPER_PING_RESPONSE;
+      }
+      return { status: "ok", count: 0 };
+    });
+
+    await expect(harness.client.call("EMCP_WB_ListEntities", {}, {
+      timeout: 500,
+      skipAutoLaunch: true,
+    })).resolves.toMatchObject({ status: "ok", count: 0 });
+
+    const targetCall = harness.netApiCall.mock.calls.find(
+      ([api]) => api === "EMCP_WB_ListEntities"
+    );
+    expect(targetCall?.[2]).toEqual({ timeoutMs: 20 });
   });
 
   it("shares immutable companion attestation across two consumers of one facade/controller", async () => {
@@ -1156,6 +1191,28 @@ describe("exact owner-scoped Workbench restart", () => {
       expect(read.state.operation?.kind).toBe("shutdown");
       expect(read.state.workbench?.pid).toBe(launched.pid);
     }
+  });
+
+  it("derives exact termination and endpoint release from one lifecycle deadline", async () => {
+    let lifecycleDeadline: number | undefined;
+    let endpointDeadline = Number.POSITIVE_INFINITY;
+    const harness = createHarness({
+      lifecycleDeadlineAtMs: () => lifecycleDeadline,
+      vacancyWait: async (options) => {
+        endpointDeadline = options.deadlineMs;
+      },
+    });
+    await harness.client.ensureRunning(harness.projectPath);
+    const termination = vi.spyOn(harness.backend, "verifyAndTerminate");
+    lifecycleDeadline = Date.now() + 2_000;
+
+    await expect(harness.client.shutdownOwnedWorkbench()).resolves.toMatchObject({
+      stopped: true,
+    });
+    const terminationTimeout = termination.mock.calls[0]?.[1];
+    expect(terminationTimeout).toBeGreaterThan(0);
+    expect(terminationTimeout).toBeLessThanOrEqual(2_000);
+    expect(endpointDeadline).toBeLessThanOrEqual(lifecycleDeadline);
   });
 
   it("refuses target B while restart A is paused after exact old-process exit", async () => {

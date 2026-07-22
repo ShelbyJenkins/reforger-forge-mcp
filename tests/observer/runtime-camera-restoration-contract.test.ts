@@ -20,6 +20,86 @@ function between(source: string, start: string, end: string): string {
 }
 
 describe("runtime observer camera restoration contract", () => {
+  it("waits on a read-only leaseability proof before one mutating acquisition", () => {
+    const lease = runtimeSource("RFO_ObserverCameraLease.c");
+    const service = runtimeSource("RFO_ObserverService.c");
+    const resolver = between(
+      lease,
+      "protected bool ResolveLeaseableCamera(",
+      "protected RFO_ObserverCamera SpawnObserverCamera("
+    );
+    const acquire = between(lease, "bool Acquire(", "bool CommitPostFrame(");
+    const process = between(service, "protected void ProcessActiveJob(", "protected void AcquireCamera(");
+    const resolving = between(
+      process,
+      "case RFO_ObserverJobState.RESOLVING:",
+      "case RFO_ObserverJobState.ACQUIRING_CAMERA:"
+    );
+    const capabilities = between(
+      service,
+      "protected array<string> CurrentCapabilities()",
+      "protected void SwitchToMailboxFallback()"
+    );
+
+    expect(lease).toContain("bool CanAcquire(BaseWorld world)");
+    expect(lease).toContain("string GetLastLeaseabilityReason()");
+    expect(resolver).toContain("game.GetWorld() != world");
+    expect(resolver).toContain("original = FindPlayerCamera()");
+    expect(resolver).toContain("world.GetCurrentCameraId() != cameraId");
+    expect(resolver).toContain("CameraRegistered(manager, original)");
+    expect(resolver).not.toContain("SpawnObserverCamera(");
+    expect(resolver).not.toContain("SetCamera(");
+    expect(resolver).not.toContain("DestroyObserverCamera(");
+    expect(resolver).not.toContain("Initialize(");
+
+    expect(acquire.match(/ResolveLeaseableCamera\(/g)).toHaveLength(1);
+    expect(acquire.match(/SpawnObserverCamera\(/g)).toHaveLength(1);
+    expect(process.indexOf("job.cancellationRequested")).toBeLessThan(
+      process.indexOf("switch (job.state)")
+    );
+    expect(process.indexOf("job.DeadlineExpired()")).toBeLessThan(
+      process.indexOf("switch (job.state)")
+    );
+    expect(process).toContain('deadlineMessage += " while resolving camera reason=" + leaseabilityReason');
+    expect(process).toContain("job.state = RFO_ObserverJobState.RESOLVING");
+    expect(resolving.indexOf("m_RFO_CameraLease.CanAcquire(world)")).toBeLessThan(
+      resolving.indexOf("AcquireCamera(world)")
+    );
+    expect(resolving).not.toContain("m_RFO_CameraLease.Acquire(");
+    expect(capabilities).toContain("m_RFO_CameraLease.CanAcquire(m_RFO_World.GetObject())");
+  });
+
+  it("retains all five canonical matrix barriers around the resolving change", () => {
+    const service = runtimeSource("RFO_ObserverService.c");
+    const acquire = between(service, "protected void AcquireCamera(", "protected bool AdvanceSettleFrame(");
+    const process = between(service, "protected void ProcessActiveJob(", "protected void AcquireCamera(");
+    const acquired = between(
+      process,
+      "case RFO_ObserverJobState.ACQUIRING_CAMERA:",
+      "case RFO_ObserverJobState.POSITIONING:"
+    );
+    const barrierNames = [
+      "OnBeforeLeaseBarrier",
+      "OnLeaseAcquiredBarrier",
+      "OnCaptureInProgressBarrier",
+      "OnRestorationInProgressBarrier",
+      "OnTerminalReleaseBarrier",
+    ];
+
+    for (const name of barrierNames) {
+      expect(service.match(new RegExp(`protected event bool ${name}\\(`, "g"))).toHaveLength(1);
+    }
+    expect(acquire.indexOf("OnBeforeLeaseBarrier(m_RFO_ActiveJob)")).toBeLessThan(
+      acquire.indexOf("m_RFO_CameraLease.Acquire(")
+    );
+    expect(acquire.indexOf("m_RFO_CameraLease.Acquire(")).toBeLessThan(
+      acquire.indexOf("m_RFO_ActiveJob.state = RFO_ObserverJobState.ACQUIRING_CAMERA")
+    );
+    expect(acquired.indexOf("OnLeaseAcquiredBarrier(job)")).toBeLessThan(
+      acquired.indexOf("job.state = RFO_ObserverJobState.POSITIONING")
+    );
+  });
+
   it("proves CameraBase restoration in POSTFRAME and defers observer destruction", () => {
     const lease = runtimeSource("RFO_ObserverCameraLease.c");
     const restore = between(

@@ -9,6 +9,13 @@ import {
   quaternionFromWorkbenchMatrix,
 } from "../../scripts/run-workbench-observer-acceptance.js";
 
+function readWorkbenchAcceptanceSources(): string {
+  return [
+    "scripts/run-workbench-observer-acceptance.ts",
+    "scripts/workbench-observer-acceptance-runtime.ts",
+  ].map((path) => readFileSync(resolve(path), "utf8")).join("\n");
+}
+
 describe("live Workbench observer acceptance contract", () => {
   it("requires independent environment and explicit-run confirmations", () => {
     expect(() => assertLiveWorkbenchObserverAuthorized(false, {
@@ -55,10 +62,7 @@ describe("live Workbench observer acceptance contract", () => {
   });
 
   it("uses adapter no-auto-launch calls and exact-owner cleanup without a global kill path", () => {
-    const source = readFileSync(
-      resolve("scripts/run-workbench-observer-acceptance.ts"),
-      "utf8"
-    );
+    const source = readWorkbenchAcceptanceSources();
     expect(source).toContain("skipAutoLaunch: true");
     expect(source).toContain("() => adapter.restoreAll()");
     expect(source).toContain("const result = await client.shutdownOwnedWorkbench()");
@@ -91,12 +95,9 @@ describe("live Workbench observer acceptance contract", () => {
   });
 
   it("routes live screenshots through managed runs and exports only a standardized unreviewed bundle", () => {
-    const source = readFileSync(
-      resolve("scripts/run-workbench-observer-acceptance.ts"),
-      "utf8"
-    );
+    const source = readWorkbenchAcceptanceSources();
     expect(source).toContain("createObserverApplication({");
-    expect(source).toContain('"dist", "observer", "agent", "private-child.js"');
+    expect(source).toMatch(/"dist",\s*"observer",\s*"agent",\s*"private-child\.js"/);
     expect(source).toContain("await application.beginRun({");
     expect(source).toContain("await application.capture({");
     expect(source).toContain("await application.jobStatus(undefined, jobId)");

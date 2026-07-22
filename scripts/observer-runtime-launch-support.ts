@@ -54,6 +54,7 @@ export const RUNTIME_OPERATIONAL_BASELINE_SOURCES = [
   "package-lock.json",
   "package.json",
   "scripts/windows/workbench-lifecycle.ps1",
+  "scripts/observer-runtime-launch-support.ts",
   "scripts/observer-fault-matrix-support.ts",
   "observer/protocol/fault-matrix.ts",
   "src/foundation/redact.ts",

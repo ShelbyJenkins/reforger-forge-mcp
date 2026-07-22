@@ -1,7 +1,10 @@
 import { describe, expect, it } from "vitest";
 import { type BackendJob, type CaptureBackend, type CaptureInstance } from "../../src/observer/capture-contract.js";
 import { CaptureService } from "../../src/observer/capture-service.js";
+import { WorkbenchCaptureBackend } from "../../src/observer/workbench-capture-backend.js";
 import { runtimeWorldRevision } from "../../src/observer/world-revision.js";
+import { WorkbenchError } from "../../src/workbench/client.js";
+import { WorkbenchObserverAdapter } from "../../src/workbench/observer-adapter.js";
 import { captureServiceContract } from "./capture-service-contract.js";
 
 captureServiceContract("runtime");
@@ -38,6 +41,67 @@ function backend(): { backend: CaptureBackend; calls: string[] } {
 }
 
 describe("CaptureService", () => {
+  it("preserves a selected Workbench Ping transport failure during instance selection", async () => {
+    const calls: string[] = [];
+    const adapter = new WorkbenchObserverAdapter({
+      async getRunningObserverSnapshot() {
+        return {
+          generation: "generation-transport-loss",
+          target: { path: "C:/fixture/addon.gproj", comparisonKey: "c:/fixture/addon.gproj" },
+          endpoint: { host: "127.0.0.1", port: 17777 },
+          process: {
+            pid: 4242,
+            executablePath: "C:/Workbench/ArmaReforgerWorkbenchSteamDiag.exe",
+            creationTime: "123456",
+            launchedAtMs: 1_000,
+          },
+        };
+      },
+      async call(apiFunc: string) {
+        calls.push(apiFunc);
+        throw new WorkbenchError("fixture lost the observer Ping response", "TIMEOUT");
+      },
+    } as never);
+    const service = new CaptureService({
+      backends: [new WorkbenchCaptureBackend(adapter)],
+      createJobId: () => "job-workbench-transport-loss",
+    });
+
+    try {
+      await expect(service.capture({
+        instanceId: "generation-transport-loss:c:/fixture/addon.gproj",
+        idempotencyKey: "workbench-transport-loss",
+        view: { kind: "current" },
+        asynchronous: true,
+        timeoutMs: 1_000,
+      })).rejects.toMatchObject({ code: "TRANSPORT_UNAVAILABLE" });
+      expect(calls).toEqual(["EMCP_WB_ObserverPing"]);
+    } finally {
+      await service.close();
+    }
+  });
+
+  it("reports a selected Workbench instance as stale after a successful empty inventory", async () => {
+    const service = new CaptureService({
+      backends: [new WorkbenchCaptureBackend({
+        async instances() { return []; },
+      } as never)],
+      createJobId: () => "job-workbench-stale-instance",
+    });
+
+    try {
+      await expect(service.capture({
+        instanceId: "missing-workbench-instance",
+        idempotencyKey: "workbench-stale-instance",
+        view: { kind: "current" },
+        asynchronous: true,
+        timeoutMs: 1_000,
+      })).rejects.toMatchObject({ code: "STALE_INSTANCE" });
+    } finally {
+      await service.close();
+    }
+  });
+
   it("deduplicates concurrent identical admissions and replays the retained job", async () => {
     const fake = backend();
     const service = new CaptureService({ backends: [fake.backend], pollIntervalMs: 1, sleep: async () => undefined, createJobId: () => "job-1" });

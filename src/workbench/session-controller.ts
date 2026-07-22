@@ -428,7 +428,12 @@ export interface WorkbenchClientDependencies {
   lifecycleExecution?: WorkbenchLifecycleExecutionPort;
   /** Explicit read-only diagnostics service for server composition and tests. */
   diagnostics?: typeof diagnoseWorkbench;
-  launchTimeoutMs?: number;
+  /** A callback is evaluated at the actual launch boundary for absolute-deadline callers. */
+  launchTimeoutMs?: number | (() => number);
+  /** Optional absolute cap for exact termination and endpoint-release waits. */
+  lifecycleDeadlineAtMs?: () => number | undefined;
+  /** Optional absolute cap re-evaluated at the final NET transport boundary. */
+  requestDeadlineAtMs?: () => number | undefined;
   launchPollIntervalMs?: number;
   activityGate?: WorkbenchActivityGate;
   captureRestoreTimeoutMs?: number;
@@ -454,6 +459,20 @@ function observerBinding(snapshot: WorkbenchObserverSnapshot): CaptureActivityBi
   };
 }
 
+function captureBindingMatchesLifecycle(
+  binding: CaptureActivityBinding,
+  state: WorkbenchLifecycleStateV3,
+  requireGeneration = true
+): boolean {
+  const workbench = state.workbench;
+  return (!requireGeneration || state.generation === binding.generation) &&
+    state.target?.comparisonKey === binding.targetKey &&
+    workbench !== null &&
+    workbench.pid === binding.process.pid &&
+    workbench.creationTime === binding.process.creationTime &&
+    pathKey(workbench.executablePath) === pathKey(binding.process.executablePath);
+}
+
 export class WorkbenchSessionController {
   private activeLifecycle: ActiveLifecycleOperation | null = null;
   private ownedChild: OwnedChildObservation | null = null;
@@ -462,7 +481,9 @@ export class WorkbenchSessionController {
   private _state: WorkbenchState = { connected: false, mode: "unknown", lastUpdated: 0 };
   private readonly spawnProcess: WorkbenchClientDependencies["spawnProcess"];
   private readonly companionProvider: WorkbenchCompanionProvider | undefined;
-  private readonly launchTimeoutMs: number;
+  private readonly launchTimeoutMs: () => number;
+  private readonly lifecycleDeadlineAtMs: (() => number | undefined) | undefined;
+  private readonly requestDeadlineAtMs: (() => number | undefined) | undefined;
   private readonly launchPollIntervalMs: number;
   private readonly activityGate: WorkbenchActivityGate;
   private readonly netApi: WorkbenchNetApiPort;
@@ -542,7 +563,12 @@ export class WorkbenchSessionController {
         spawnProcess: (command, args, options) =>
           this.spawnProcess!(command, [...args], options),
       });
-    this.launchTimeoutMs = dependencies.launchTimeoutMs ?? LAUNCH_TIMEOUT_MS;
+    const launchTimeout = dependencies.launchTimeoutMs ?? LAUNCH_TIMEOUT_MS;
+    this.launchTimeoutMs = typeof launchTimeout === "function"
+      ? launchTimeout
+      : () => launchTimeout;
+    this.lifecycleDeadlineAtMs = dependencies.lifecycleDeadlineAtMs;
+    this.requestDeadlineAtMs = dependencies.requestDeadlineAtMs;
     this.launchPollIntervalMs = dependencies.launchPollIntervalMs ?? LAUNCH_POLL_INTERVAL_MS;
     this.activityGate = dependencies.activityGate ?? new WorkbenchActivityGate({
       restoreTimeoutMs: dependencies.captureRestoreTimeoutMs,
@@ -1385,6 +1411,18 @@ export class WorkbenchSessionController {
     }
   }
 
+  /**
+   * Convert an unprovable capture restoration into an exact-owner-exit seal.
+   * Only `shutdownOwnedWorkbench` can cross the local activity gate afterward.
+   */
+  requireExactOwnerExit(lease: WorkbenchCaptureActivityLease): void {
+    try {
+      this.activityGate.requireExactOwnerExit(lease);
+    } catch (error) {
+      throw this.mapLifecycleError(error);
+    }
+  }
+
   /** Count-only lifecycle evidence; no PID, owner token, or process handle is exposed. */
   diagnosticSupervisedChildCounts(): SupervisedChildCounts {
     return this.childSupervisor.counts();
@@ -1439,8 +1477,8 @@ export class WorkbenchSessionController {
       const read = await this.processGuard.readLifecycleState();
       const targetKey = read.kind === "valid" ? read.state.target?.comparisonKey ?? null : null;
       return await this.coordinateLifecycle("shutdown", targetKey, (operationId) =>
-        this.activityGate.runLifecycle("shutdown", async () =>
-          this.shutdownCoordinated(operationId)
+        this.activityGate.runOwnedShutdown(async (requiredBinding) =>
+          this.shutdownCoordinated(operationId, requiredBinding)
         )
       );
     } catch (error) {
@@ -2522,13 +2560,15 @@ export class WorkbenchSessionController {
   }
 
   private async shutdownCoordinated(
-    operationId: string
+    operationId: string,
+    requiredBinding: CaptureActivityBinding | null
   ): Promise<WorkbenchShutdownResult> {
     // Shutdown is identity-driven. Preserve the durable target spelling/key but
     // do not touch the .gproj: it may have been deleted or disconnected while
     // the exact recorded Workbench is still safely terminable.
     let state = await this.processGuard.withLifecycleLock((session) =>
       this.claimState(session, null));
+    this.assertExactOwnerExitBinding(state, requiredBinding);
     const target = state.target;
     await this.recoverUnpublishedSpawn(state);
     const status = await this.inspectRecordedWorkbench(state);
@@ -2547,6 +2587,11 @@ export class WorkbenchSessionController {
       phase: "stopping",
       operation: { kind: "shutdown", operationId },
     });
+    // The stopping reservation advances the durable state generation. Its CAS
+    // was derived from the fully matched sealed state above, so this final
+    // pre-signal check retains the exact target/process comparison while
+    // intentionally accepting only that reservation's new generation.
+    this.assertExactOwnerExitBinding(state, requiredBinding, false);
     try {
       await this.terminateExact(expected);
     } catch (error) {
@@ -2583,6 +2628,19 @@ export class WorkbenchSessionController {
       gprojPath: target?.path ?? state.target?.path ?? null,
       generation: vacant.generation,
     };
+  }
+
+  private assertExactOwnerExitBinding(
+    state: WorkbenchLifecycleStateV3,
+    requiredBinding: CaptureActivityBinding | null,
+    requireGeneration = true
+  ): void {
+    if (!requiredBinding || captureBindingMatchesLifecycle(requiredBinding, state, requireGeneration)) return;
+    throw new WorkbenchError(
+      "IDENTITY_UNVERIFIABLE: exact-owner shutdown no longer matches the sealed lifecycle " +
+        "generation, canonical target, or process identity; no process was signalled.",
+      "IDENTITY_UNVERIFIABLE"
+    );
   }
 
   private preflightLaunch(project: CanonicalProjectIdentity): LaunchPreflight {
@@ -2769,6 +2827,13 @@ export class WorkbenchSessionController {
         "IDENTITY_UNVERIFIABLE"
       );
     }
+    const launchTimeoutMs = this.launchTimeoutMs();
+    if (!Number.isFinite(launchTimeoutMs) || launchTimeoutMs <= 0) {
+      throw new WorkbenchError(
+        "Workbench launch deadline expired before readiness qualification.",
+        "LAUNCH_FAILED"
+      );
+    }
     await this.companionReadiness({
         endpoint: { host: this.host, port: this.port },
         process: identity,
@@ -2793,7 +2858,7 @@ export class WorkbenchSessionController {
             projectPath
           );
         },
-        deadlineMs: Date.now() + this.launchTimeoutMs,
+        deadlineMs: Date.now() + launchTimeoutMs,
         pollIntervalMs: this.launchPollIntervalMs,
         child: observation.handle,
       });
@@ -2838,7 +2903,7 @@ export class WorkbenchSessionController {
     try {
       result = await this.processGuard.verifyAndTerminate(
         expected,
-        OWNED_PROCESS_EXIT_TIMEOUT_MS
+        this.remainingLifecycleTimeout(OWNED_PROCESS_EXIT_TIMEOUT_MS, "exact Workbench termination")
       );
     } catch (error) {
       const mapped = this.mapLifecycleError(error);
@@ -2927,7 +2992,10 @@ export class WorkbenchSessionController {
       await this.vacancyWait({
         verify: (endpoint) => probe.verifyEndpointVacant(endpoint),
         endpoint: { host: this.host, port: this.port },
-        deadlineMs: Date.now() + PORT_RELEASE_TIMEOUT_MS,
+        deadlineMs: Date.now() + this.remainingLifecycleTimeout(
+          PORT_RELEASE_TIMEOUT_MS,
+          "Workbench endpoint release"
+        ),
         pollIntervalMs: PORT_RELEASE_POLL_MS,
       });
     } catch (error) {
@@ -2938,6 +3006,19 @@ export class WorkbenchSessionController {
         "RECOVERY_REQUIRED"
       );
     }
+  }
+
+  private remainingLifecycleTimeout(defaultMs: number, operation: string): number {
+    const deadlineAtMs = this.lifecycleDeadlineAtMs?.();
+    if (deadlineAtMs === undefined) return defaultMs;
+    const remainingMs = Math.floor(deadlineAtMs - Date.now());
+    if (remainingMs <= 0) {
+      throw new WorkbenchError(
+        `${operation} exceeded its absolute lifecycle deadline.`,
+        "TIMEOUT"
+      );
+    }
+    return Math.min(defaultMs, remainingMs);
   }
 
   private mapLifecycleError(error: unknown): WorkbenchError {
@@ -2991,8 +3072,23 @@ export class WorkbenchSessionController {
     params: Record<string, unknown> = {},
     options: WorkbenchCallOptions = {}
   ): Promise<T> {
+    const deadlineAtMs = this.requestDeadlineAtMs?.();
+    let timeoutMs = options.timeout;
+    if (deadlineAtMs !== undefined) {
+      if (!Number.isSafeInteger(deadlineAtMs) || deadlineAtMs <= 0) {
+        throw new WorkbenchError("Workbench request absolute deadline is invalid.", "TIMEOUT");
+      }
+      const remainingMs = Math.floor(deadlineAtMs - this.now());
+      if (remainingMs <= 0) {
+        throw new WorkbenchError(
+          `Workbench call "${apiFunc}" exceeded its absolute request deadline.`,
+          "TIMEOUT"
+        );
+      }
+      timeoutMs = timeoutMs === undefined ? remainingMs : Math.min(timeoutMs, remainingMs);
+    }
     return this.netApi.call<T>(apiFunc, params, {
-      timeoutMs: options.timeout,
+      timeoutMs,
     }).then((result) => {
       logger.debug(`Workbench response for "${apiFunc}":`, result);
       return result;

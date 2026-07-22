@@ -287,6 +287,50 @@ describe("WorkbenchActivityGate", () => {
     expect(action).not.toHaveBeenCalled();
   });
 
+  it("releases an unprovable capture into a seal that admits only exact owned shutdown", async () => {
+    const gate = new WorkbenchActivityGate();
+    const lease = gate.acquireCapture(binding);
+    const restartAction = vi.fn(async () => "restarted");
+    const queuedRestart = gate.runLifecycle("restart", restartAction);
+
+    expect(lease.signal.reason).toMatchObject({ code: "LIFECYCLE_REQUESTED" });
+    gate.requireExactOwnerExit(lease);
+
+    await expect(queuedRestart).rejects.toMatchObject({ code: "LIFECYCLE_BUSY" });
+    await expect(gate.runLifecycle("launch", async () => "launched")).rejects.toMatchObject({
+      code: "LIFECYCLE_BUSY",
+    });
+    await expect(gate.runManaged("ordinary NET call", async () => "called")).rejects.toMatchObject({
+      code: "LIFECYCLE_BUSY",
+    });
+    expectActivityCode(() => gate.acquireCapture(binding), "LIFECYCLE_BUSY");
+    expect(restartAction).not.toHaveBeenCalled();
+
+    await expect(gate.runOwnedShutdown(async (requiredBinding) => {
+      expect(requiredBinding).toEqual(binding);
+      expect(requiredBinding).not.toBe(binding);
+      return "stopped";
+    })).resolves.toBe("stopped");
+    await expect(gate.runManaged("post-shutdown work", async () => "admitted")).resolves.toBe("admitted");
+    const later = gate.acquireCapture(binding);
+    gate.releaseCapture(later);
+  });
+
+  it("retains the exact-owner-exit seal when owned shutdown fails", async () => {
+    const gate = new WorkbenchActivityGate();
+    const lease = gate.acquireCapture(binding);
+    gate.requireExactOwnerExit(lease);
+
+    await expect(gate.runOwnedShutdown(async () => {
+      throw new Error("termination refused");
+    })).rejects.toThrow("termination refused");
+    await expect(gate.runLifecycle("restart", async () => undefined)).rejects.toMatchObject({
+      code: "LIFECYCLE_BUSY",
+    });
+    await expect(gate.runOwnedShutdown(async () => "stopped")).resolves.toBe("stopped");
+    await expect(gate.runLifecycle("recovery", async () => "recovered")).resolves.toBe("recovered");
+  });
+
   it.each([
     ["generation", { ...binding, generation: "generation-b" }],
     ["canonical target", { ...binding, targetKey: "target-b" }],
@@ -557,6 +601,66 @@ describe("WorkbenchClient observer activity integration", () => {
       previousPid: harness.workbench.pid,
     });
     expect(harness.backend.terminationCalls).toHaveLength(1);
+  });
+
+  it("exposes an exact-owner-exit seal that blocks restart but admits owned shutdown", async () => {
+    const harness = await createRunningHarness();
+    const snapshot = await harness.client.getRunningObserverSnapshot();
+    const lease = harness.client.acquireCaptureActivity(snapshot);
+    const mutex = vi.spyOn(harness.backend, "withMachineMutex");
+    mutex.mockClear();
+
+    harness.client.requireExactOwnerExit(lease);
+    // Ordinary release is idempotent but cannot erase the stronger exit seal.
+    harness.client.releaseCaptureActivity(lease);
+    await expect(harness.client.restartOwnedWorkbench()).rejects.toMatchObject({
+      code: "LIFECYCLE_BUSY",
+    });
+    expect(mutex).not.toHaveBeenCalled();
+    expect(harness.backend.terminationCalls).toHaveLength(0);
+
+    await expect(harness.client.shutdownOwnedWorkbench()).resolves.toMatchObject({
+      stopped: true,
+      previousPid: harness.workbench.pid,
+    });
+    expect(harness.backend.terminationCalls).toHaveLength(1);
+  });
+
+  it.each([
+    ["generation", (value: CaptureActivityBinding): CaptureActivityBinding => ({
+      ...value,
+      generation: "sealed-stale-generation",
+    })],
+    ["process", (value: CaptureActivityBinding): CaptureActivityBinding => ({
+      ...value,
+      process: { ...value.process, creationTime: "133900000000099999" },
+    })],
+  ])("refuses exact-owner shutdown when the sealed %s does not match durable ownership", async (
+    _label,
+    change
+  ) => {
+    const gate = new WorkbenchActivityGate();
+    const harness = await createRunningHarness(gate);
+    const snapshot = await harness.client.getRunningObserverSnapshot();
+    const sealed = change({
+      generation: snapshot.generation,
+      targetKey: snapshot.target.comparisonKey,
+      process: {
+        pid: snapshot.process.pid,
+        executablePath: snapshot.process.executablePath,
+        creationTime: snapshot.process.creationTime,
+      },
+    });
+    const lease = gate.acquireCapture(sealed);
+    harness.client.requireExactOwnerExit(lease);
+
+    await expect(harness.client.shutdownOwnedWorkbench()).rejects.toMatchObject({
+      code: "IDENTITY_UNVERIFIABLE",
+    });
+    expect(harness.backend.terminationCalls).toHaveLength(0);
+    await expect(harness.client.restartOwnedWorkbench()).rejects.toMatchObject({
+      code: "LIFECYCLE_BUSY",
+    });
   });
 
   it("invalidates a matching capture immediately when the exact child exits", async () => {

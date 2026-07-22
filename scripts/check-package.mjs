@@ -342,6 +342,7 @@ const requiredFiles = [
   "dist/workbench/managed-build-profile.js",
   "dist/workbench/net-api-client.js",
   "dist/workbench/observer-adapter.js",
+  "dist/workbench/observer-artifact-envelope.js",
   "dist/workbench/process-guard.js",
   "dist/workbench/project-identity.js",
   "dist/workbench/readiness.js",
@@ -393,12 +394,19 @@ const legacyPackagedHandlers = [...files].filter((path) =>
 );
 const repositoryOnlyAcceptanceSources = [
   "scripts/observer-live-acceptance-support.ts",
+  "scripts/observer-workbench-failure-support.ts",
   "scripts/run-runtime-observer-acceptance.ts",
   "scripts/run-workbench-build-acceptance.ts",
   "scripts/run-workbench-observer-acceptance.ts",
+  "scripts/workbench-observer-acceptance-adapter.ts",
+  "scripts/workbench-observer-acceptance-runtime.ts",
+  "scripts/workbench-observer-live-matrix-case.ts",
+  "scripts/workbench-observer-matrix-case.ts",
+  "tests/fixtures/workbench-observer-failure-matrix-addon",
+  "tests/fixtures/workbench-observer-failure-matrix-decoy.mjs",
 ];
-const packagedRepositoryOnlySources = repositoryOnlyAcceptanceSources.filter((path) =>
-  files.has(path)
+const packagedRepositoryOnlySources = [...files].filter((file) =>
+  repositoryOnlyAcceptanceSources.some((path) => file === path || file.startsWith(`${path}/`))
 );
 const duplicateSharedBuildFiles = [...files].filter((path) =>
   path.startsWith("dist/src/foundation/") || path.startsWith("dist/src/companions/")
@@ -426,7 +434,7 @@ if (missingFiles.length || missingPrefixes.length || legacyPackagedHandlers.leng
     ...missingPrefixes.map((prefix) => `missing package content under: ${prefix}`),
     ...legacyPackagedHandlers.map((path) => `legacy project-injection handler must not be packaged: ${path}`),
     ...packagedRepositoryOnlySources.map((path) =>
-      `repository-only TypeScript acceptance harness must not be packaged: ${path}`
+      `repository-only acceptance material must not be packaged: ${path}`
     ),
     ...duplicateSharedBuildFiles.map((path) =>
       `duplicate shared TypeScript build output must not be packaged: ${path}`

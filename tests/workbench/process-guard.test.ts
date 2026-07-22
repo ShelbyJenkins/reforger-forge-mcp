@@ -355,6 +355,30 @@ describe("WorkbenchProcessGuard v3 lifecycle state", () => {
     }))).rejects.toMatchObject({ code: "IDENTITY_UNVERIFIABLE" });
   });
 
+  it("does not keep polling spawned identity after the shared absolute deadline", async () => {
+    const stateDir = root();
+    const backend = createFakeLifecycleBackend();
+    backend.inspectProcess = async () => {
+      throw new Error("injected helper deadline");
+    };
+    const deadlineAtMs = Date.now() + 40;
+    const guard = new WorkbenchProcessGuard({
+      stateDir,
+      backend,
+      operationDeadlineAtMs: () => deadlineAtMs,
+    });
+    const startedAt = Date.now();
+
+    await expect(guard.withLifecycleLock((session) => session.inspectSpawnedWorkbench({
+      pid: 5150,
+      executablePath: "C:\\Tools\\Workbench.exe",
+      ownerTokenArgument: guard.ownerArgument("absolute-deadline-token"),
+      launchedAtMs: 123,
+    }))).rejects.toMatchObject({ code: "IDENTITY_UNVERIFIABLE" });
+
+    expect(Date.now() - startedAt).toBeLessThan(500);
+  });
+
   it("binds a loopback listener to the exact sole owned Workbench", async () => {
     const stateDir = root();
     const backend = createFakeLifecycleBackend();
@@ -475,5 +499,28 @@ describe("WorkbenchProcessGuard v3 lifecycle state", () => {
     await Promise.all([first, second]);
     expect(secondRan).toBe(true);
     expect(backend.maxConcurrent).toBe(1);
+  });
+
+  it("evaluates a dynamic lifecycle-lock budget at each acquisition", async () => {
+    const stateDir = root();
+    const backend = createFakeLifecycleBackend();
+    const timeouts: number[] = [];
+    const withMachineMutex = backend.withMachineMutex.bind(backend);
+    backend.withMachineMutex = async (request) => {
+      timeouts.push(request.timeoutMs);
+      return withMachineMutex(request);
+    };
+    let timeoutMs = 4_000;
+    const guard = new WorkbenchProcessGuard({
+      stateDir,
+      backend,
+      lockTimeoutMs: () => timeoutMs,
+    });
+
+    await guard.withLifecycleLock(async () => undefined);
+    timeoutMs = 750;
+    await guard.withLifecycleLock(async () => undefined);
+
+    expect(timeouts).toEqual([4_000, 750]);
   });
 });

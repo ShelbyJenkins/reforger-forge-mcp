@@ -96,7 +96,9 @@ families:
 - view: the existing explicit pose view;
 - barrier: lease_acquired;
 - action: application.cancelJob for the selected public job;
-- expected public result: state cancelled with error code CANCELLED;
+- expected asynchronous public job result: state `cancelled` with no
+  `errorCode` (the backend and host job projection publish an error code only
+  for `failed`);
 - required camera result: the lease reports everHeld true, held false, and
   restorationConfirmed true; and
 - final result: the normal exact-owned shutdown and supervised-process
@@ -232,7 +234,7 @@ family retains all three existing views.
 | IDs | View | Phase/action | Expected public disposition | Required camera disposition |
 | --- | --- | --- | --- | --- |
 | RFO-RUNTIME-SUCCESS-CURRENT, RFO-RUNTIME-SUCCESS-POSE, RFO-RUNTIME-SUCCESS-LOOK-AT | current, pose, look-at respectively | normal flow | completed | restored for pose/look-at; not_acquired for current if no lease was obtained |
-| RFO-RUNTIME-CANCEL-BEFORE-LEASE through RFO-RUNTIME-CANCEL-TERMINAL-RELEASE | pose | each canonical phase / cancel_capture | cancelled, CANCELLED | not_acquired before_lease; restored for every later phase |
+| RFO-RUNTIME-CANCEL-BEFORE-LEASE through RFO-RUNTIME-CANCEL-TERMINAL-RELEASE | pose | each canonical phase / cancel_capture | cancelled, no error code | not_acquired before_lease; restored for every later phase |
 | RFO-RUNTIME-WORLD-LOSS-BEFORE-LEASE through RFO-RUNTIME-WORLD-LOSS-TERMINAL-RELEASE | pose | each canonical phase / change_world | failed, WORLD_CHANGED | not_acquired before_lease; exact_process_exit thereafter unless ordinary restoration is independently proven |
 | RFO-RUNTIME-TRANSPORT-LOSS-BEFORE-LEASE through RFO-RUNTIME-TRANSPORT-LOSS-TERMINAL-RELEASE | pose | each canonical phase / drop_transport | failed or rejected with TRANSPORT_UNAVAILABLE | not_acquired before_lease; exact_process_exit thereafter |
 | RFO-RUNTIME-OWNED-SHUTDOWN-BEFORE-LEASE through RFO-RUNTIME-OWNED-SHUTDOWN-TERMINAL-RELEASE | pose | each canonical phase / stop_owned_runtime | exact owned-runtime stop reports exited | exact_process_exit |

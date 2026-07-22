@@ -1,9 +1,10 @@
 import { randomUUID } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { describe, expect, it } from "vitest";
 import { defineFaultMatrix, type FaultMatrixCase } from "../../observer/protocol/fault-matrix.js";
+import { deadlineAt } from "../../src/foundation/time.js";
 import {
   FaultControlAuthorizer,
   FaultControlError,
@@ -95,6 +96,72 @@ describe("local observer fault-control channel", () => {
       .toBe("MALFORMED");
   });
 
+  it("treats an exact pending resend as idempotent without authorizing re-execution", () => {
+    const capability = randomUUID();
+    const binding = { fixtureId: "fixture", lifecycleId: "life", lifecycleGeneration: "generation" };
+    const authorizer = new FaultControlAuthorizer({
+      matrix: defineFaultMatrix([matrixCase()]),
+      bootstrap: {
+        schemaVersion: 1, runId: "run", backend: "runtime", capability,
+        fixtureContentIdentity: "fixture-content", generatedProjectIdentity: "project", generatedAddonIdentity: "addon", binding,
+      },
+      readLifecycleBinding: () => binding,
+    });
+    const arm = {
+      schemaVersion: 1, kind: "arm", runId: "run", requestId: randomUUID(),
+      caseId: "runtime.cancel_capture.lease_acquired.current", phase: "lease_acquired", action: "cancel_capture", binding,
+    };
+    const raw = JSON.stringify(arm);
+    const admitted = authorizer.authorize(faultControlFilename(1, capability), raw);
+    expect(admitted).toMatchObject({ accepted: true });
+    const pending = authorizer.authorize(faultControlFilename(2, capability), raw);
+    expect(pending).toMatchObject({
+      accepted: true,
+      pending: true,
+    });
+    expect(pending.command).toBeUndefined();
+    expect(authorizer.authorize(faultControlFilename(3, capability), JSON.stringify({ ...arm, action: "stop_owned_runtime" })).reason)
+      .toBe("REPLAY_REFUSED");
+    const arrived = acknowledgement(arm, "arrived");
+    authorizer.remember(admitted.command!, raw, arrived);
+    expect(authorizer.authorize(faultControlFilename(4, capability), raw).replay).toEqual(arrived);
+  });
+
+  it("pins release and terminal commands to the case that was armed", () => {
+    const capability = randomUUID();
+    const binding = { fixtureId: "fixture", lifecycleId: "life", lifecycleGeneration: "generation" };
+    const alternate: any = structuredClone(matrixCase());
+    alternate.id = "runtime.cancel_capture.capture_in_progress.current";
+    alternate.injection.phase = "capture_in_progress";
+    const authorizer = new FaultControlAuthorizer({
+      matrix: defineFaultMatrix([matrixCase(), alternate]),
+      bootstrap: {
+        schemaVersion: 1, runId: "run", backend: "runtime", capability,
+        fixtureContentIdentity: "fixture-content", generatedProjectIdentity: "project", generatedAddonIdentity: "addon", binding,
+      },
+      readLifecycleBinding: () => binding,
+    });
+    const arm = {
+      schemaVersion: 1, kind: "arm", runId: "run", requestId: randomUUID(),
+      caseId: "runtime.cancel_capture.lease_acquired.current", phase: "lease_acquired", action: "cancel_capture", binding,
+    };
+    const rawArm = JSON.stringify(arm);
+    const admitted = authorizer.authorize(faultControlFilename(1, capability), rawArm);
+    authorizer.remember(admitted.command!, rawArm, acknowledgement(arm, "arrived"));
+    const otherRelease = {
+      ...arm, kind: "cancel", requestId: randomUUID(),
+      caseId: alternate.id, phase: alternate.injection.phase,
+    };
+    expect(authorizer.authorize(faultControlFilename(2, capability), JSON.stringify(otherRelease)).reason)
+      .toBe("MATRIX_MISMATCH");
+    const otherTerminal = {
+      schemaVersion: 1, kind: "terminal", runId: "run", requestId: randomUUID(),
+      caseId: alternate.id, phase: alternate.injection.phase, binding,
+    };
+    expect(authorizer.authorize(faultControlFilename(3, capability), JSON.stringify(otherTerminal)).reason)
+      .toBe("MATRIX_MISMATCH");
+  });
+
   it("validates all generated bootstrap identities before creating the owned root", () => {
     const runRoot = mkdtempSync(join(tmpdir(), "rfo-fault-root-"));
     const controlRoot = join(runRoot, "fault-control");
@@ -136,6 +203,46 @@ describe("local observer fault-control channel", () => {
         { encoding: "utf8", mode: 0o600 },
       );
       await expect(mailbox.takeOutbox()).rejects.toMatchObject({ code: "CAPABILITY_MISMATCH" } satisfies Partial<FaultControlError>);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("publishes inbox commands atomically and waits for an outbox completion marker", async () => {
+    const root = mkdtempSync(join(tmpdir(), "rfo-fault-mailbox-"));
+    const inboxPath = join(root, "inbox");
+    const outboxPath = join(root, "outbox");
+    mkdirSync(inboxPath);
+    mkdirSync(outboxPath);
+    const capability = randomUUID();
+    const mailbox = new FilesystemFaultControlMailbox(inboxPath, outboxPath, capability);
+    const inboxName = faultControlFilename(1, capability);
+    const inboxBody = JSON.stringify({ command: true });
+    const outboxName = faultControlFilename(2, capability);
+    const outboxFile = join(outboxPath, outboxName);
+    const response: FaultControlAcknowledgement = {
+      schemaVersion: 1,
+      kind: "arrived",
+      requestId: randomUUID(),
+      caseId: "runtime.cancel_capture.lease_acquired.current",
+      phase: "lease_acquired",
+      disposition: "arrived",
+      reason: null,
+    };
+    try {
+      await mailbox.writeInbox(inboxName, inboxBody);
+      expect(readFileSync(join(inboxPath, inboxName), "utf8")).toBe(inboxBody);
+      expect(readdirSync(inboxPath)).toEqual([inboxName]);
+
+      // A visible JSON body is not committed until the Enforce writer closes
+      // its copy and publishes the companion completion marker.
+      writeFileSync(outboxFile, "{\"schemaVersion\":1", { encoding: "utf8", mode: 0o600 });
+      await expect(mailbox.takeOutbox()).resolves.toBeUndefined();
+      writeFileSync(outboxFile, JSON.stringify(response), { encoding: "utf8", mode: 0o600 });
+      await expect(mailbox.takeOutbox()).resolves.toBeUndefined();
+      writeFileSync(`${outboxFile}.complete`, "", { encoding: "utf8", mode: 0o600 });
+      await expect(mailbox.takeOutbox()).resolves.toEqual(response);
+      expect(readdirSync(outboxPath)).toEqual([]);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -260,7 +367,7 @@ describe("local observer fault-control channel", () => {
     mailbox.acknowledge(acknowledgement(releaseCommand, "executed"));
     await expect(release).resolves.toMatchObject({ kind: "executed" });
     let finished = false;
-    const finishing = scheduler.finishCase().then(() => { finished = true; });
+    const finishing = scheduler.finishCase({ state: "cancelled", errorCode: null }).then(() => { finished = true; });
     await Promise.resolve();
     expect(finished).toBe(false);
     const terminalCommand = JSON.parse(mailbox.inbox[2]!.body);
@@ -271,6 +378,51 @@ describe("local observer fault-control channel", () => {
     await expect(scheduler.releaseBarrier()).rejects.toMatchObject({ code: "CASE_TERMINAL" } satisfies Partial<FaultControlError>);
     await expect(scheduler.schedule("runtime.cancel_capture.lease_acquired.current", "cancel"))
       .rejects.toMatchObject({ code: "CASE_TERMINAL" } satisfies Partial<FaultControlError>);
+  });
+
+  it("publishes the arm document before starting capture-side work", async () => {
+    const time = new ManualTime();
+    const mailbox = new InMemoryFaultControlMailbox();
+    const scheduler = new FaultMatrixScheduler({
+      matrix: defineFaultMatrix([matrixCase()]), mailbox, capability: randomUUID(),
+      binding: { fixtureId: "fixture", lifecycleId: "life", lifecycleGeneration: "generation" },
+      runId: "run", clock: time, sleeper: time, caseDeadlineMs: 1_000,
+    });
+    const observations: string[] = [];
+    const arming = scheduler.arm("runtime.cancel_capture.lease_acquired.current", () => {
+      const arm = JSON.parse(mailbox.inbox[0]!.body);
+      observations.push(`capture-started-after-${arm.kind}`);
+      mailbox.acknowledge(acknowledgement(arm, "arrived"));
+    });
+    await expect(arming).resolves.toMatchObject({
+      case: { id: "runtime.cancel_capture.lease_acquired.current" },
+    });
+    expect(observations).toEqual(["capture-started-after-arm"]);
+  });
+
+  it("publishes the action document before starting its selected public boundary", async () => {
+    const time = new ManualTime();
+    const mailbox = new InMemoryFaultControlMailbox();
+    const scheduler = new FaultMatrixScheduler({
+      matrix: defineFaultMatrix([matrixCase()]), mailbox, capability: randomUUID(),
+      binding: { fixtureId: "fixture", lifecycleId: "life", lifecycleGeneration: "generation" },
+      runId: "run", clock: time, sleeper: time, caseDeadlineMs: 1_000,
+    });
+    const arming = scheduler.arm("runtime.cancel_capture.lease_acquired.current");
+    await Promise.resolve();
+    const arm = JSON.parse(mailbox.inbox[0]!.body);
+    mailbox.acknowledge(acknowledgement(arm, "arrived"));
+    await arming;
+
+    const observations: string[] = [];
+    const release = scheduler.releaseBarrier("release", () => {
+      const command = JSON.parse(mailbox.inbox[1]!.body);
+      observations.push(`public-boundary-started-after-${command.kind}`);
+      mailbox.acknowledge(acknowledgement(command, "executed"));
+    });
+
+    await expect(release).resolves.toMatchObject({ kind: "executed" });
+    expect(observations).toEqual(["public-boundary-started-after-release"]);
   });
 
   it("executes cancellation once after arrival and bounds a missing action acknowledgement", async () => {
@@ -295,6 +447,85 @@ describe("local observer fault-control channel", () => {
     await expect(cancelling).rejects.toMatchObject({ code: "DEADLINE_EXPIRED" } satisfies Partial<FaultControlError>);
   });
 
+  it("closes an exact-process-exit case locally only after action and owner vacancy proof", async () => {
+    const time = new ManualTime();
+    const mailbox = new InMemoryFaultControlMailbox();
+    const exactExitCase = structuredClone(matrixCase()) as any;
+    exactExitCase.id = "runtime.stop_owned_runtime.lease_acquired.current";
+    exactExitCase.injection.action = "stop_owned_runtime";
+    exactExitCase.expectedTerminal = { state: "failed", errorCode: "WORKBENCH_EXITED" };
+    exactExitCase.cameraDisposition = "exact_process_exit";
+    exactExitCase.requiredChecks = ["exact_owner_vacant"];
+    const scheduler = new FaultMatrixScheduler({
+      matrix: defineFaultMatrix([exactExitCase]), mailbox, capability: randomUUID(),
+      binding: { fixtureId: "fixture", lifecycleId: "life", lifecycleGeneration: "generation" },
+      runId: "run", clock: time, sleeper: time, caseDeadlineMs: 1_000,
+    });
+    const arming = scheduler.arm(exactExitCase.id);
+    await Promise.resolve();
+    const arm = JSON.parse(mailbox.inbox[0]!.body);
+    mailbox.acknowledge(acknowledgement(arm, "arrived"));
+    await arming;
+    const releasing = scheduler.releaseBarrier();
+    await Promise.resolve();
+    const release = JSON.parse(mailbox.inbox[1]!.body);
+    mailbox.acknowledge(acknowledgement(release, "executed"));
+    await releasing;
+
+    await expect(scheduler.finishAfterExactOwnerExit(
+      { state: "failed", errorCode: "WORKBENCH_EXITED" },
+      true
+    )).resolves.toBeUndefined();
+    expect(mailbox.inbox).toHaveLength(2);
+    await expect(scheduler.releaseBarrier()).rejects.toMatchObject({ code: "CASE_TERMINAL" });
+  });
+
+  it("closes a restored terminal-release shutdown only with its completed public result and exact vacancy", async () => {
+    const armedScheduler = async () => {
+      const time = new ManualTime();
+      const mailbox = new InMemoryFaultControlMailbox();
+      const restoredStopCase = structuredClone(matrixCase()) as any;
+      restoredStopCase.id = "workbench.stop_owned_workbench.terminal_release.current";
+      restoredStopCase.backend = "workbench";
+      restoredStopCase.injection = {
+        phase: "terminal_release",
+        action: "stop_owned_workbench",
+      };
+      restoredStopCase.expectedTerminal = { state: "completed", errorCode: null };
+      restoredStopCase.cameraDisposition = "restored";
+      restoredStopCase.requiredChecks = [
+        "lifecycle_vacant", "endpoint_vacant", "child_vacant", "exact_owner_vacant",
+      ];
+      const scheduler = new FaultMatrixScheduler({
+        matrix: defineFaultMatrix([restoredStopCase]), mailbox, capability: randomUUID(),
+        binding: { fixtureId: "fixture", lifecycleId: "life", lifecycleGeneration: "generation" },
+        runId: "run", clock: time, sleeper: time, caseDeadlineMs: 1_000,
+      });
+      const arming = scheduler.arm(restoredStopCase.id);
+      await Promise.resolve();
+      mailbox.acknowledge(acknowledgement(JSON.parse(mailbox.inbox[0]!.body), "arrived"));
+      await arming;
+      const releasing = scheduler.releaseBarrier();
+      await Promise.resolve();
+      mailbox.acknowledge(acknowledgement(JSON.parse(mailbox.inbox[1]!.body), "executed"));
+      await releasing;
+      return scheduler;
+    };
+
+    await expect((await armedScheduler()).finishAfterExactOwnerExit(
+      { state: "completed", errorCode: null },
+      true
+    )).resolves.toBeUndefined();
+    await expect((await armedScheduler()).finishAfterExactOwnerExit(
+      { state: "failed", errorCode: "WORKBENCH_EXITED" },
+      true
+    )).rejects.toMatchObject({ code: "MATRIX_MISMATCH" } satisfies Partial<FaultControlError>);
+    await expect((await armedScheduler()).finishAfterExactOwnerExit(
+      { state: "completed", errorCode: null },
+      false
+    )).rejects.toMatchObject({ code: "MATRIX_MISMATCH" } satisfies Partial<FaultControlError>);
+  });
+
   it("aborts an outstanding action wait before consuming the terminal closeout acknowledgement", async () => {
     const time = new ManualTime();
     const mailbox = new InMemoryFaultControlMailbox();
@@ -315,7 +546,7 @@ describe("local observer fault-control channel", () => {
     const terminal = JSON.parse(mailbox.inbox[2]!.body);
     expect(terminal.kind).toBe("terminal");
     mailbox.acknowledge(acknowledgement(terminal, "terminalled"));
-    await expect(finishing).resolves.toBeUndefined();
+    await expect(finishing).rejects.toMatchObject({ code: "MATRIX_MISMATCH" } satisfies Partial<FaultControlError>);
     await expect(action).rejects.toMatchObject({ code: "CASE_TERMINAL" } satisfies Partial<FaultControlError>);
   });
 
@@ -377,6 +608,38 @@ describe("local observer fault-control channel", () => {
       capability: randomUUID(), binding: { fixtureId: "fixture", lifecycleId: "life", lifecycleGeneration: "gen" },
       runId: "run", clock: time, sleeper: time, caseDeadlineMs: 25, barrierAllowanceMs: 25,
     });
+    const pending = scheduler.arm("runtime.cancel_capture.lease_acquired.current");
+    await Promise.resolve();
+    await time.advanceBy(25);
+    await expect(pending).rejects.toMatchObject({ code: "DEADLINE_EXPIRED" });
+  });
+
+  it("starts its default case deadline when the first case is armed", async () => {
+    const time = new ManualTime();
+    const mailbox = new InMemoryFaultControlMailbox();
+    const scheduler = new FaultMatrixScheduler({
+      matrix: defineFaultMatrix([matrixCase()]), mailbox,
+      capability: randomUUID(), binding: { fixtureId: "fixture", lifecycleId: "life", lifecycleGeneration: "gen" },
+      runId: "run", clock: time, sleeper: time, caseDeadlineMs: 50, barrierAllowanceMs: 50,
+    });
+    time.advance(5_000);
+    const pending = scheduler.arm("runtime.cancel_capture.lease_acquired.current");
+    await Promise.resolve();
+    const arm = JSON.parse(mailbox.inbox[0]!.body);
+    mailbox.acknowledge(acknowledgement(arm, "arrived"));
+    await expect(pending).resolves.toMatchObject({ requestId: arm.requestId });
+  });
+
+  it("accepts one executor-owned absolute deadline before arming", async () => {
+    const time = new ManualTime();
+    const scheduler = new FaultMatrixScheduler({
+      matrix: defineFaultMatrix([matrixCase()]), mailbox: new InMemoryFaultControlMailbox(),
+      capability: randomUUID(), binding: { fixtureId: "fixture", lifecycleId: "life", lifecycleGeneration: "gen" },
+      runId: "run", clock: time, sleeper: time, caseDeadlineMs: 5_000, barrierAllowanceMs: 5_000,
+    });
+    scheduler.setDeadline(deadlineAt(time.now() + 25));
+    expect(() => scheduler.setDeadline(deadlineAt(time.now() + 50)))
+      .toThrowError(FaultControlError);
     const pending = scheduler.arm("runtime.cancel_capture.lease_acquired.current");
     await Promise.resolve();
     await time.advanceBy(25);

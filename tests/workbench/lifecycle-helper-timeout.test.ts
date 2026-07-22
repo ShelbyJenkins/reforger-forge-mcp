@@ -5,6 +5,10 @@ import { platform, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  allocateWindowsMutexDeadlineBudget,
+  allocateWindowsTerminationDeadlineBudget,
+} from "../../src/platform/windows/exact-process-backend.js";
+import {
   LifecycleGuardError,
   WindowsLifecycleBackend,
   type WorkbenchIdentity,
@@ -43,6 +47,58 @@ const expectedWorkbench: WorkbenchIdentity = {
   launchedAtMs: 1,
 };
 
+describe("Windows lifecycle deadline budget allocation", () => {
+  it.each([
+    {
+      name: "divides a short shared deadline into acquisition and release thirds",
+      input: { remainingMs: 900, requestedMutexWaitMs: 5_000, configuredHelperTimeoutMs: 1_000 },
+      expected: { mutexWaitTimeoutMs: 300, helperTimeoutMs: 300, acquisitionTimeoutMs: 600 },
+    },
+    {
+      name: "gives unused helper allowance back to the mutex wait",
+      input: { remainingMs: 900, requestedMutexWaitMs: 5_000, configuredHelperTimeoutMs: 100 },
+      expected: { mutexWaitTimeoutMs: 700, helperTimeoutMs: 100, acquisitionTimeoutMs: 800 },
+    },
+    {
+      name: "does not inflate a caller's shorter mutex wait",
+      input: { remainingMs: 900, requestedMutexWaitMs: 20, configuredHelperTimeoutMs: 1_000 },
+      expected: { mutexWaitTimeoutMs: 20, helperTimeoutMs: 300, acquisitionTimeoutMs: 320 },
+    },
+    {
+      name: "stays inside a two millisecond boundary budget",
+      input: { remainingMs: 2, requestedMutexWaitMs: 5_000, configuredHelperTimeoutMs: 1_000 },
+      expected: { mutexWaitTimeoutMs: 1, helperTimeoutMs: 1, acquisitionTimeoutMs: 2 },
+    },
+  ])("$name", ({ input, expected }) => {
+    expect(allocateWindowsMutexDeadlineBudget(input)).toEqual(expected);
+  });
+
+  it("rejects invalid mutex budget inputs before process control", () => {
+    expect(() => allocateWindowsMutexDeadlineBudget({
+      remainingMs: 0,
+      requestedMutexWaitMs: 1,
+      configuredHelperTimeoutMs: 1,
+    })).toThrow(/positive integers/);
+  });
+
+  it.each([
+    {
+      input: { operationBudgetMs: 1_000, requestedTerminationTimeoutMs: 5_000, configuredHelperTimeoutMs: 2_000 },
+      expected: { terminationTimeoutMs: 500, responseAllowanceMs: 500 },
+    },
+    {
+      input: { operationBudgetMs: 1_000, requestedTerminationTimeoutMs: 50, configuredHelperTimeoutMs: 100 },
+      expected: { terminationTimeoutMs: 50, responseAllowanceMs: 100 },
+    },
+    {
+      input: { operationBudgetMs: 1, requestedTerminationTimeoutMs: 5_000, configuredHelperTimeoutMs: 2_000 },
+      expected: { terminationTimeoutMs: 1, responseAllowanceMs: 1 },
+    },
+  ])("reserves a bounded helper response allowance for $input.operationBudgetMs ms", ({ input, expected }) => {
+    expect(allocateWindowsTerminationDeadlineBudget(input)).toEqual(expected);
+  });
+});
+
 describe.runIf(platform() === "win32")("Windows lifecycle helper parent deadlines", () => {
   it("rejects a mutex helper that exits silently before its acquisition response", async () => {
     const backend = new WindowsLifecycleBackend(helper("exit 0"), {
@@ -68,6 +124,23 @@ describe.runIf(platform() === "win32")("Windows lifecycle helper parent deadline
       action: async () => { actionRan = true; },
     })).rejects.toMatchObject({ code: "HELPER_FAILURE" });
     expect(actionRan).toBe(false);
+  }, 10_000);
+
+  it("shares one absolute deadline across mutex wait, helper response, and release", async () => {
+    const deadlineAtMs = Date.now() + 250;
+    const backend = new WindowsLifecycleBackend(helper("Start-Sleep -Seconds 30"), {
+      helperTimeoutMs: 1_000,
+      operationDeadlineAtMs: () => deadlineAtMs,
+    });
+    const startedAt = Date.now();
+
+    await expect(backend.withMachineMutex({
+      name: `Global\\ReforgerForge.Timeout.Absolute.${process.pid}.${Date.now()}`,
+      timeoutMs: 5_000,
+      action: async () => undefined,
+    })).rejects.toMatchObject({ code: "HELPER_FAILURE" });
+
+    expect(Date.now() - startedAt).toBeLessThan(1_500);
   }, 10_000);
 
   it("kills an alive mutex helper after an invalid first line", async () => {
@@ -183,6 +256,20 @@ describe.runIf(platform() === "win32")("Windows lifecycle helper parent deadline
 
     await expect(backend.verifyAndTerminate(expectedWorkbench, 50))
       .rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+  }, 10_000);
+
+  it("does not add a fresh helper allowance after an absolute termination deadline", async () => {
+    const deadlineAtMs = Date.now() + 250;
+    const backend = new WindowsLifecycleBackend(helper("Start-Sleep -Seconds 30"), {
+      helperTimeoutMs: 1_000,
+      operationDeadlineAtMs: () => deadlineAtMs,
+    });
+    const startedAt = Date.now();
+
+    await expect(backend.verifyAndTerminate(expectedWorkbench, 5_000))
+      .rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+
+    expect(Date.now() - startedAt).toBeLessThan(1_500);
   }, 10_000);
 });
 

@@ -95,6 +95,7 @@ class RFO_RuntimeMatrixControl
 	protected static const string PILOT_CASE_ID = "runtime.cancel_capture.lease_acquired.pose";
 	protected static const string PILOT_PHASE = "lease_acquired";
 	protected static const string PILOT_ACTION = "cancel_capture";
+	protected static const string FIXTURE_ADDON_GUID = "1155E9DCA4074C7A";
 
 	protected static const string REASON_MALFORMED = "MALFORMED";
 	protected static const string REASON_RUN_MISMATCH = "RUN_MISMATCH";
@@ -104,7 +105,6 @@ class RFO_RuntimeMatrixControl
 	protected static const string REASON_REPLAY_REFUSED = "REPLAY_REFUSED";
 	protected static const string REASON_CASE_TERMINAL = "CASE_TERMINAL";
 
-	protected bool m_BootstrapLoadAttempted;
 	protected bool m_BootstrapValid;
 	protected ref RFO_FaultControlBootstrap m_Bootstrap;
 	protected int m_NextOutboxSequence;
@@ -135,16 +135,16 @@ class RFO_RuntimeMatrixControl
 	// keeps draining even while a job's local state machine is paused.
 	void Poll()
 	{
-		if (m_Terminal)
-			return;
-		if (!m_BootstrapLoadAttempted)
+		if (!m_BootstrapValid)
 		{
+			// OwnedRuntimeManager must start the exact process before the host can
+			// derive its lifecycle generation and write bootstrap.json. Retry until
+			// that bounded host setup has completed; one early frame must not
+			// permanently disable the disposable fixture.
 			TryLoadBootstrap();
 			if (!m_BootstrapValid)
 				return;
 		}
-		else if (!m_BootstrapValid)
-			return;
 		PollInbox();
 	}
 
@@ -178,7 +178,6 @@ class RFO_RuntimeMatrixControl
 
 	protected void TryLoadBootstrap()
 	{
-		m_BootstrapLoadAttempted = true;
 		if (!FileIO.FileExists(BOOTSTRAP_PATH))
 			return;
 		RFO_FaultControlBootstrap bootstrap = new RFO_FaultControlBootstrap();
@@ -186,8 +185,12 @@ class RFO_RuntimeMatrixControl
 			return;
 		if (bootstrap.schemaVersion != 1 || bootstrap.backend != "runtime" ||
 			!IsUuidLike(bootstrap.capability) || bootstrap.runId.IsEmpty() || bootstrap.runId.Length() > 160 ||
-			!bootstrap.binding || bootstrap.binding.fixtureId.IsEmpty() ||
-			bootstrap.binding.lifecycleId.IsEmpty() || bootstrap.binding.lifecycleGeneration.IsEmpty())
+			!IsSha256(bootstrap.fixtureContentIdentity) ||
+			bootstrap.generatedProjectIdentity != FIXTURE_ADDON_GUID ||
+			bootstrap.generatedAddonIdentity != FIXTURE_ADDON_GUID ||
+			!bootstrap.binding || bootstrap.binding.fixtureId != FIXTURE_ADDON_GUID ||
+			bootstrap.binding.lifecycleId.IsEmpty() || bootstrap.binding.lifecycleId.Length() > 160 ||
+			bootstrap.binding.lifecycleGeneration.IsEmpty() || bootstrap.binding.lifecycleGeneration.Length() > 160)
 			return;
 		m_Bootstrap = bootstrap;
 		m_BootstrapValid = true;
@@ -213,13 +216,20 @@ class RFO_RuntimeMatrixControl
 			return;
 		if (sequence <= m_LastProcessedInboxSequence)
 			return;
-		m_LastProcessedInboxSequence = sequence;
 
 		RFO_FaultControlCommand command = new RFO_FaultControlCommand();
 		if (!command.LoadFromFile(INBOX_DIRECTORY + "/" + name))
 			return;
-		if (command.schemaVersion != 1 || command.runId != m_Bootstrap.runId || command.requestId.IsEmpty())
+		// Do not permanently discard a command if a non-atomic external writer
+		// was observed before its JSON body was complete.
+		m_LastProcessedInboxSequence = sequence;
+		if (command.schemaVersion != 1 || command.requestId.IsEmpty())
 			return;
+		if (command.runId != m_Bootstrap.runId)
+		{
+			RefuseIfKnownRequest(command.requestId, command.caseId, command.phase, REASON_RUN_MISMATCH);
+			return;
+		}
 		if (!command.binding || command.binding.fixtureId != m_Bootstrap.binding.fixtureId ||
 			command.binding.lifecycleId != m_Bootstrap.binding.lifecycleId ||
 			command.binding.lifecycleGeneration != m_Bootstrap.binding.lifecycleGeneration)
@@ -227,23 +237,12 @@ class RFO_RuntimeMatrixControl
 			RefuseIfKnownRequest(command.requestId, command.caseId, command.phase, REASON_LIFECYCLE_MISMATCH);
 			return;
 		}
-		if (command.runId != m_Bootstrap.runId)
-		{
-			RefuseIfKnownRequest(command.requestId, command.caseId, command.phase, REASON_RUN_MISMATCH);
-			return;
-		}
-
 		if (m_AckCache.Contains(command.requestId))
 		{
 			WriteOutbox(m_AckCache.Get(command.requestId));
 			return;
 		}
 
-		if (command.kind == "terminal")
-		{
-			HandleTerminal(command);
-			return;
-		}
 		if (m_Terminal)
 		{
 			Refuse(command.requestId, command.caseId, command.phase, REASON_CASE_TERMINAL);
@@ -257,6 +256,11 @@ class RFO_RuntimeMatrixControl
 		if (command.phase != PILOT_PHASE)
 		{
 			Refuse(command.requestId, command.caseId, command.phase, REASON_PHASE_MISMATCH);
+			return;
+		}
+		if (command.kind == "terminal")
+		{
+			HandleTerminal(command);
 			return;
 		}
 		if (command.kind == "arm")
@@ -355,11 +359,27 @@ class RFO_RuntimeMatrixControl
 		FileIO.MakeDirectory(OUTBOX_DIRECTORY);
 		string name = RFO_ObserverTime.Pad(m_NextOutboxSequence, 12) + "-" + m_Bootstrap.capability + ".json";
 		m_NextOutboxSequence++;
-		FileHandle file = FileIO.OpenFile(OUTBOX_DIRECTORY + "/" + name, FileMode.WRITE);
+		string complete = OUTBOX_DIRECTORY + "/" + name;
+		string temporary = complete + ".tmp";
+		FileHandle file = FileIO.OpenFile(temporary, FileMode.WRITE);
 		if (!file)
 			return;
 		file.Write(json, json.Length());
 		file.Close();
+		if (!FileIO.CopyFile(temporary, complete))
+		{
+			FileIO.DeleteFile(temporary);
+			return;
+		}
+		FileHandle marker = FileIO.OpenFile(complete + ".complete", FileMode.WRITE);
+		if (!marker)
+		{
+			FileIO.DeleteFile(complete);
+			FileIO.DeleteFile(temporary);
+			return;
+		}
+		marker.Close();
+		FileIO.DeleteFile(temporary);
 	}
 
 	protected bool ParseControlFilename(string name, out int sequence, out string capability)
@@ -398,6 +418,20 @@ class RFO_RuntimeMatrixControl
 			}
 			int character = value.ToAscii(index);
 			bool hex = (character >= 48 && character <= 57) || (character >= 97 && character <= 102) || (character >= 65 && character <= 70);
+			if (!hex)
+				return false;
+		}
+		return true;
+	}
+
+	protected bool IsSha256(string value)
+	{
+		if (value.Length() != 64)
+			return false;
+		for (int index = 0; index < 64; index++)
+		{
+			int character = value.ToAscii(index);
+			bool hex = (character >= 48 && character <= 57) || (character >= 97 && character <= 102);
 			if (!hex)
 				return false;
 		}

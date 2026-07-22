@@ -556,6 +556,31 @@ changes unexpectedly, the adapter returns `RESTORATION_UNCONFIRMED`. The shared
 controller's local writer gate blocks new managed reads and requires active
 reads and capture restoration to drain before a lifecycle mutation proceeds.
 
+The helper also contains five protected, default-inert acceptance hooks for
+`before_lease`, `lease_acquired`, `capture_in_progress`,
+`restoration_in_progress`, and `terminal_release`. Only the generated
+`workbench-observer-failure-matrix-addon` overrides them. Its
+`RFO_WorkbenchObserverMatrixPlugin` drains a capability-gated,
+lifecycle-bound file channel and adds no sixth observer handler, public MCP
+tool, or general editor-command surface.
+
+If a fault makes camera restoration unprovable, the repository-only acceptance
+adapter may request conversion of the retained capture activity into an
+exact-owner-exit seal. That seal blocks new
+reads, captures, restart, and ordinary lifecycle work; only the existing
+exact-owner `shutdownOwnedWorkbench()` path may cross it. Exact exit is
+recorded separately and never presented as camera restoration. The acceptance
+adapter clears its retained local record only after independent exact-owner vacancy
+proof; it does not retry a now-unavailable Cancel or Release handler. The
+shutdown path compares the sealed lifecycle generation, canonical target, PID,
+executable path, and creation time before reservation, then rechecks target and
+process identity immediately before signaling. A mismatch returns
+`IDENTITY_UNVERIFIABLE`, retains the seal, and makes no termination call. Default-off
+acceptance seams additionally support one real-transport request/response
+loss, bounded pre-validation PNG mutation, identical release replay, and
+full-tuple decoy comparison. They are not runtime configuration or public
+observer capabilities.
+
 A freshly started Workbench may advertise `render.capture` for current-view
 captures, but it does not advertise `camera.editor` immediately. The exact
 process must first finish a current-view transaction and prove restoration;
@@ -619,6 +644,34 @@ shutdown, and final process vacancy.
 The Vitest live entry is additionally skipped unless
 `RFO_CONFIRM_LIVE_WORKBENCH_OBSERVER_ACCEPTANCE=1` is set.
 
+The command above has no selector and remains the five-view positive-path
+acceptance. Failure-matrix modes are explicit:
+
+```powershell
+npm run dev:observer:acceptance:workbench -- --list-cases
+
+$env:RFO_RUN_LIVE_WORKBENCH_OBSERVER_ACCEPTANCE = '1'
+npm run dev:observer:acceptance:workbench -- --matrix --confirm-live-run
+npm run dev:observer:acceptance:workbench -- --only workbench.cancel_capture.lease_acquired.pose --confirm-live-run
+```
+
+`--matrix` executes all 69 Workbench cases serially with fresh per-case state
+and writes an `ObserverFailureMatrixArtifact` version 3 with full coverage.
+`--only` validates one Workbench ID before launch and writes explicit partial
+coverage. The selectors cannot be combined. `--list-cases` and `--help` are
+standalone read-only modes; matrix execution still requires both live gates.
+`--keep-profile` is valid only with `--only` and retains the selected case
+directory only if that case fails. A passing full artifact also requires a clean
+tree and a lower-case 40-hex source commit. These modes have hermetic coverage,
+but no gated Workbench failure-matrix run or manual matrix review is recorded.
+
+For completed rows, the runner copies the managed bundles outside the
+disposable case roots and prints
+`RFO_WORKBENCH_OBSERVER_FAILURE_MATRIX_REVIEW_DIRECTORY=<path>`. Task 7 requires
+reviewing every image in that exact directory at original resolution before
+deleting it. Automation leaves both `imagesReviewed=false` and the review
+directory intact; delete only the printed directory after recording the review.
+
 Five-capture v3 automation passed on July 17, 2026 local (July 18 UTC) with
 Workbench engine 1.7.0.54. Harness run `run-wzuGy6` finalized managed run
 `20260718T015947Z-6ec8429d` from
@@ -650,16 +703,17 @@ implemented paths; it is not a substitute for recording a successful live run.
 | Graphical runtime client/listen host | REST and mailbox delivery, current/pose/look-at PNG capture, camera lease and exact transform/FOV restoration | `render.capture` and `camera.runtime` only after graphical renderer/camera initialization | Five-capture v2 automation passed against Reforger 1.7.0.54 stock `MpTest`; formal bundle review remains pending |
 | Dedicated/headless server | Registration, health, authority facts, coordination, and diagnostics without camera/render claims | Never advertises `render.capture` or a camera capability | Pending non-render qualification |
 | Minimized/out-of-focus client | Same transaction path; `-forceUpdate` remains an explicit launch-preparation option | Same initialized graphical gates | Pending |
-| World unload or agent loss during a lease | World epochs invalidate stale work; cancellation/watchdog restoration must reach a terminal state | Renderer is withheld when restoration or world identity is uncertain | Pending failure-injection qualification |
-| Workbench editor | Externally staged helper, exact Ping identity, dedicated profile, version-3 lifecycle, confined native-PNG validation, activity gating, and exact `BaseWorld` slot/matrix/FOV restoration | `render.capture` when current capture is initialized; `camera.editor` only after a current-view restoration proof in that exact process | Five-capture v3 automation and hash-bound formal image review passed in a disposable stock-Everon-derived world on Workbench 1.7.0.54, with clean-target and exact-owner-shutdown proof |
+| World unload or agent loss during a lease | World epochs invalidate stale work; cancellation/watchdog restoration must reach a terminal state; the Workbench harness has generated-world and handler-loss cases | Renderer is withheld when restoration or world identity is uncertain | Runtime failure injection remains pending; Workbench cases are implemented and hermetically covered but have no retained native matrix result |
+| Workbench editor | Externally staged helper, exact Ping identity, dedicated profile, version-3 lifecycle, confined native-PNG validation, activity gating, exact `BaseWorld` slot/matrix/FOV restoration, and a repository-only 69-case failure harness | `render.capture` when current capture is initialized; `camera.editor` only after a current-view restoration proof in that exact process | Five-capture v3 positive-path automation and hash-bound formal image review passed on Workbench 1.7.0.54; the 69-case failure matrix and its manual review remain outstanding |
 
 **Live validation status:** fresh five-capture automation passed for both the
 graphical stock-`MpTest` listen host and the companion-based Workbench editor as
-recorded above. The Workbench export now has a hash-bound formal `Passed` image
-review; the graphical runtime export remains pending formal review. Both source
-manifests retain their finalized `Unreviewed` metadata. Dedicated and headless
-non-render behavior, minimized/out-of-focus rendering, world-unload or
-agent-loss failure injection, and remote/delegated rendering remain outside
-current live proof.
+recorded above. The Workbench positive-path export has a hash-bound formal
+`Passed` image review; the graphical runtime export remains pending formal
+review. Both source manifests retain their finalized `Unreviewed` metadata.
+No Workbench failure-matrix run or matrix image review is recorded for the
+current 69-case implementation. Dedicated/headless non-render behavior,
+minimized/out-of-focus rendering, native fault injection, and remote/delegated
+rendering therefore remain outside current live proof.
 
 Real-engine tests belong under `tests/observer/integration` and run only through `npm run test:observer:integration` with disposable profiles and target projects.

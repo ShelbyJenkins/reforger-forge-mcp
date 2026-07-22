@@ -65,7 +65,7 @@ only implementations Phase 1 may use:
 | --- | --- | --- |
 | Redaction | `src/foundation/redact.ts` | Redact every exported diagnostic and every launch/control-derived string with the `evidence_portability` profile. Pass the per-run capability and lifecycle owner token as `knownSecretValues`. |
 | Deadlines and polling | `src/foundation/time.ts` | Construct one case deadline with `deadlineAfter`, derive all barrier and acknowledgement deadlines with `deriveDeadline`, and use `pollUntil` with an abort signal. |
-| Public terminal projection | `src/observer/public-contract.ts` and `observer/protocol/enforce-contract.ts` | Store only a canonical public terminal state and `canonicalPublicObserverErrorCode` result. Import `OBSERVER_TERMINAL_STATES`; do not reproduce terminal state literals in the matrix. |
+| Public terminal projection | `src/observer/public-contract.ts` and `observer/protocol/enforce-contract.ts` | Store only a canonical public terminal state; validate a canonical public error code when the asynchronous job result supplies one, and retain `null` for completed/cancelled job status. Import `OBSERVER_TERMINAL_STATES`; do not reproduce terminal state literals in the matrix. |
 
 There is no temporary redaction, polling, or public-error compatibility
 adapter. Do not add one to either acceptance script. If any of the three APIs
@@ -189,8 +189,9 @@ launched:
   phase;
 - a missing `phaseSupport` member, a source-line-oriented proof, or an
   injection phase declared not applicable;
-- an invalid expected terminal state/error-code combination, including a
-  `completed` or `cancelled` state paired with a non-null error code;
+- an invalid expected terminal state/error-code combination: `completed` and
+  `cancelled` require `null` because asynchronous job status only publishes an
+  error code for `failed`; `failed` requires a non-null canonical error code;
 - `not_acquired` after `lease_acquired`, or an `exact_process_exit`
   disposition without `exact_owner_vacant` evidence; and
 - missing, duplicate, or unknown required evidence/check names.

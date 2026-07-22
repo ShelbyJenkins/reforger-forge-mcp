@@ -20,12 +20,16 @@ export type RuntimeFaultAction =
   | "disconnect_private_agent"
   | "stop_owned_runtime";
 export type WorkbenchFaultAction =
+  | "complete_capture"
   | "cancel_capture"
   | "disable_fixture_handler"
   | "submit_competing_capture"
   | "replace_fixture_world"
-  | "write_invalid_artifact"
-  | "stop_owned_workbench";
+  | "write_truncated_artifact"
+  | "write_crc_artifact"
+  | "write_mismatched_artifact"
+  | "stop_owned_workbench"
+  | "release_twice";
 export type FaultMatrixAction = RuntimeFaultAction | WorkbenchFaultAction;
 /** Kept in the protocol project so the matrix does not create a reverse build dependency. */
 export type ObserverErrorCode = keyof typeof ERROR_REGISTRY;
@@ -114,12 +118,18 @@ export const FAULT_ACTION_PHASES: Readonly<Record<FaultMatrixBackend, Readonly<R
     stop_owned_runtime: Object.freeze(["lease_acquired", "capture_in_progress", "restoration_in_progress"] as const),
   }),
   workbench: Object.freeze({
-    cancel_capture: FAULT_MATRIX_PHASES,
-    disable_fixture_handler: Object.freeze(["lease_acquired", "capture_in_progress"] as const),
-    submit_competing_capture: Object.freeze(["lease_acquired", "capture_in_progress"] as const),
-    replace_fixture_world: Object.freeze(["lease_acquired", "capture_in_progress"] as const),
-    write_invalid_artifact: Object.freeze(["capture_in_progress"] as const),
-    stop_owned_workbench: Object.freeze(["lease_acquired", "capture_in_progress", "restoration_in_progress"] as const),
+    complete_capture: Object.freeze(["terminal_release"] as const),
+    cancel_capture: Object.freeze([
+      "lease_acquired", "capture_in_progress", "restoration_in_progress", "terminal_release",
+    ] as const),
+    disable_fixture_handler: FAULT_MATRIX_PHASES,
+    submit_competing_capture: Object.freeze(["lease_acquired"] as const),
+    replace_fixture_world: FAULT_MATRIX_PHASES,
+    write_truncated_artifact: Object.freeze(["capture_in_progress"] as const),
+    write_crc_artifact: Object.freeze(["capture_in_progress"] as const),
+    write_mismatched_artifact: Object.freeze(["capture_in_progress"] as const),
+    stop_owned_workbench: FAULT_MATRIX_PHASES,
+    release_twice: Object.freeze(["terminal_release"] as const),
   }),
 });
 
@@ -142,7 +152,8 @@ export function isCanonicalFaultMatrixTerminal(value: unknown): value is FaultMa
   }
   const errorCode = value.errorCode;
   if (errorCode !== null && (typeof errorCode !== "string" || !Object.hasOwn(ERROR_REGISTRY, errorCode))) return false;
-  return (value.state !== "completed" && value.state !== "cancelled") || errorCode === null;
+  if (value.state === "completed" || value.state === "cancelled") return errorCode === null;
+  return value.state === "failed" && errorCode !== null;
 }
 
 function nonEmptyProof(value: unknown, label: string): asserts value is string {
@@ -349,50 +360,148 @@ const RUNTIME_CANCEL_LEASE_ACQUIRED_POSE: RuntimeFaultMatrixCase = {
   },
   // A cancelled terminal state carries no errorCode: the runtime wire protocol
   // (RFO_ObserverService.BuildStatusJson) only publishes errorCode for a
-  // failed state, and isCanonicalFaultMatrixTerminal enforces the same rule.
+  // failed state, and the host's asynchronous job projection preserves it.
   expectedTerminal: { state: "cancelled", errorCode: null },
   cameraDisposition: "restored",
   requiredChecks: ["lifecycle_vacant", "endpoint_vacant", "child_vacant", "exact_owner_vacant"],
   requiredEvidence: ["public_terminal", "deadline", "world_revision", "camera", "artifact", "cleanup"],
 };
 
-const WORKBENCH_CANCEL_LEASE_ACQUIRED_POSE: WorkbenchFaultMatrixCase = {
-  schemaVersion: FAULT_MATRIX_SCHEMA_VERSION,
-  id: "workbench.cancel_capture.lease_acquired.pose",
-  backend: "workbench",
-  view: "pose",
-  injection: { phase: "lease_acquired", action: "cancel_capture" },
-  phaseSupport: {
+const WORKBENCH_VIEWS = Object.freeze(["current", "pose", "lookAt"] as const);
+const WORKBENCH_CANCEL_PHASES = Object.freeze([
+  "lease_acquired", "capture_in_progress", "restoration_in_progress", "terminal_release",
+] as const);
+const WORKBENCH_ARTIFACT_ACTIONS = Object.freeze([
+  "write_truncated_artifact", "write_crc_artifact", "write_mismatched_artifact",
+] as const satisfies readonly WorkbenchFaultAction[]);
+const WORKBENCH_REQUIRED_CHECKS = Object.freeze([
+  "lifecycle_vacant", "endpoint_vacant", "child_vacant", "exact_owner_vacant",
+] as const satisfies readonly MatrixRequiredCheck[]);
+const WORKBENCH_REQUIRED_EVIDENCE = Object.freeze([
+  "public_terminal", "deadline", "world_revision", "camera", "artifact", "cleanup", "retained_diagnostics",
+] as const satisfies readonly MatrixEvidenceField[]);
+
+/** Product-observable Workbench boundaries shared by every Phase 3 declaration. */
+function workbenchPhaseSupport(): PhaseSupportMap {
+  return {
     before_lease: {
-      kind: "not_applicable",
-      rationale: "This is the Phase 3 vertical-slice case; it injects only at lease_acquired. Workbench Submit is a single synchronous NET API call with no repeated poll point before the lease is retained, so a before_lease barrier has no observable hold point yet. The remaining canonical phases are deferred until this slice has a retained live result.",
+      kind: "observable",
+      publicStatusPredicate: "the armed case has no retained job, no camera lease, and no recorded camera mutation before submission begins",
+      fixtureAcknowledgement: "the fixture acknowledged before submission while retained job and camera state evidence were both absent",
     },
     lease_acquired: {
       kind: "observable",
-      publicStatusPredicate: "the handler job state equals accepted or settling and cameraLeaseHeld equals true for the same job and handler lease",
-      fixtureAcknowledgement: "RFO_WorkbenchObserverMatrixPlugin observed OnLeaseAcquiredBarrier held before Advance progressed settle polling for the armed job",
+      publicStatusPredicate: "the retained job reports cameraLeaseHeld true before screenshot issuance",
+      fixtureAcknowledgement: "the fixture acknowledged the retained job and active editor camera lease before screenshot issuance",
     },
     capture_in_progress: {
-      kind: "not_applicable",
-      rationale: "This is the Phase 3 vertical-slice case; it injects only at lease_acquired. The remaining canonical phases are deferred until this slice has a retained live result and measured timing to budget against.",
+      kind: "observable",
+      publicStatusPredicate: "the retained job reports capturing or awaiting artifact after screenshot issuance succeeded",
+      fixtureAcknowledgement: "the fixture acknowledged successful screenshot issuance before artifact readiness or restoration",
     },
     restoration_in_progress: {
-      kind: "not_applicable",
-      rationale: "This is the Phase 3 vertical-slice case; it injects only at lease_acquired. The remaining canonical phases are deferred until this slice has a retained live result and measured timing to budget against.",
+      kind: "observable",
+      publicStatusPredicate: "the retained job reports restoring after artifact readiness and before exact camera restoration is confirmed",
+      fixtureAcknowledgement: "the fixture yielded after publishing restoring and before exact camera restoration completed",
     },
     terminal_release: {
-      kind: "not_applicable",
-      rationale: "This is the Phase 3 vertical-slice case; it injects only at lease_acquired. The remaining canonical phases are deferred until this slice has a retained live result and measured timing to budget against.",
+      kind: "observable",
+      publicStatusPredicate: "the terminal job reports cameraLeaseHeld false and restorationConfirmed true before release",
+      fixtureAcknowledgement: "the fixture acknowledged the restored terminal job before release disposed its artifact or reference",
     },
-  },
-  // A cancelled terminal state carries no errorCode: EMCP_WB_ObserverJobResponse
-  // only publishes terminalErrorCode for a failed state, and
-  // isCanonicalFaultMatrixTerminal enforces the same rule.
-  expectedTerminal: { state: "cancelled", errorCode: null },
-  cameraDisposition: "restored",
-  requiredChecks: ["lifecycle_vacant", "endpoint_vacant", "child_vacant", "exact_owner_vacant"],
-  requiredEvidence: ["public_terminal", "deadline", "world_revision", "camera", "artifact", "cleanup"],
-};
+  };
+}
+
+function workbenchCase(options: {
+  readonly action: WorkbenchFaultAction;
+  readonly phase: FaultMatrixPhase;
+  readonly view: Exclude<FaultMatrixView, null>;
+  readonly expectedTerminal: FaultMatrixTerminal;
+  readonly cameraDisposition: WorkbenchFaultMatrixCase["cameraDisposition"];
+}): WorkbenchFaultMatrixCase {
+  return {
+    schemaVersion: FAULT_MATRIX_SCHEMA_VERSION,
+    id: `workbench.${options.action}.${options.phase}.${viewId(options.view)}`,
+    backend: "workbench",
+    view: options.view,
+    injection: { phase: options.phase, action: options.action },
+    phaseSupport: workbenchPhaseSupport(),
+    expectedTerminal: { ...options.expectedTerminal },
+    cameraDisposition: options.cameraDisposition,
+    requiredChecks: WORKBENCH_REQUIRED_CHECKS,
+    requiredEvidence: WORKBENCH_REQUIRED_EVIDENCE,
+  };
+}
+
+const WORKBENCH_PHASE_3_CASES: readonly WorkbenchFaultMatrixCase[] = Object.freeze([
+  ...WORKBENCH_VIEWS.map((view) => workbenchCase({
+    action: "complete_capture",
+    phase: "terminal_release",
+    view,
+    expectedTerminal: { state: "completed", errorCode: null },
+    cameraDisposition: "restored",
+  })),
+  ...WORKBENCH_CANCEL_PHASES.flatMap((phase) => WORKBENCH_VIEWS.map((view) => workbenchCase({
+    action: "cancel_capture",
+    phase,
+    view,
+    expectedTerminal: { state: "cancelled", errorCode: null },
+    cameraDisposition: "restored",
+  }))),
+  ...FAULT_MATRIX_PHASES.flatMap((phase) => WORKBENCH_VIEWS.map((view) => workbenchCase({
+    action: "disable_fixture_handler",
+    phase,
+    view,
+    expectedTerminal: { state: "failed", errorCode: "TRANSPORT_UNAVAILABLE" },
+    cameraDisposition: phase === "before_lease"
+      ? "not_acquired"
+      : phase === "terminal_release" ? "restored" : "exact_process_exit",
+  }))),
+  ...WORKBENCH_VIEWS.map((view) => workbenchCase({
+    action: "submit_competing_capture",
+    phase: "lease_acquired",
+    view,
+    expectedTerminal: { state: "failed", errorCode: "CAMERA_BUSY" },
+    cameraDisposition: "restored",
+  })),
+  ...FAULT_MATRIX_PHASES.flatMap((phase) => WORKBENCH_VIEWS.map((view) => workbenchCase({
+    action: "replace_fixture_world",
+    phase,
+    view,
+    expectedTerminal: phase === "terminal_release"
+      ? { state: "completed", errorCode: null }
+      : {
+          state: "failed",
+          errorCode: phase === "before_lease" ? "WORLD_CHANGED" : "RESTORATION_UNCONFIRMED",
+        },
+    cameraDisposition: phase === "before_lease"
+      ? "not_acquired"
+      : phase === "terminal_release" ? "restored" : "exact_process_exit",
+  }))),
+  ...WORKBENCH_ARTIFACT_ACTIONS.map((action) => workbenchCase({
+    action,
+    phase: "capture_in_progress",
+    view: "pose",
+    expectedTerminal: { state: "failed", errorCode: "ARTIFACT_INVALID" },
+    cameraDisposition: "restored",
+  })),
+  ...FAULT_MATRIX_PHASES.flatMap((phase) => WORKBENCH_VIEWS.map((view) => workbenchCase({
+    action: "stop_owned_workbench",
+    phase,
+    view,
+    expectedTerminal: phase === "terminal_release"
+      ? { state: "completed", errorCode: null }
+      : { state: "failed", errorCode: "WORKBENCH_EXITED" },
+    cameraDisposition: phase === "terminal_release" ? "restored" : "exact_process_exit",
+  }))),
+  ...WORKBENCH_VIEWS.map((view) => workbenchCase({
+    action: "release_twice",
+    phase: "terminal_release",
+    view,
+    expectedTerminal: { state: "completed", errorCode: null },
+    cameraDisposition: "restored",
+  })),
+]);
 
 /**
  * Phase 2 pilot: exactly one end-to-end runtime case, per the phase-2 plan's
@@ -404,13 +513,12 @@ const WORKBENCH_CANCEL_LEASE_ACQUIRED_POSE: WorkbenchFaultMatrixCase = {
  * injection action, and the existing positive-path script already proves the
  * success path; extending that shared contract is out of scope for one pilot.
  *
- * Phase 3 vertical slice: one end-to-end Workbench case
- * (WB-CANCEL-LEASE-ACQUIRED-POSE), matching the same pilot-first sequencing
- * before the full Workbench case table (cancellation at every phase,
- * transport loss, lease contention, world loss, artifact failure, owned
- * shutdown, terminal-release idempotency) is added.
+ * Phase 3 adds the complete Workbench inventory while retaining the Phase 1
+ * lower-case dotted identifiers. Each entry is generated from explicit typed
+ * phase, action, and view sets, then validated and deep-frozen with the runtime
+ * pilot by the shared catalog constructor.
  */
 export const OBSERVER_FAULT_MATRIX = defineFaultMatrix([
   RUNTIME_CANCEL_LEASE_ACQUIRED_POSE,
-  WORKBENCH_CANCEL_LEASE_ACQUIRED_POSE,
+  ...WORKBENCH_PHASE_3_CASES,
 ]);

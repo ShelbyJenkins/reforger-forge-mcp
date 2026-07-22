@@ -21,33 +21,34 @@ class RFO_ObserverCameraLease
 	protected bool m_RFO_RestorationConfirmed;
 	protected bool m_RFO_RestoreTargetSelected;
 	protected bool m_RFO_RestorationPostFrameConfirmed;
+	protected string m_RFO_LastLeaseabilityReason;
+
+	// Read-only readiness probe shared by capability advertisement and the
+	// per-job resolving state. It deliberately stops before spawning or
+	// selecting an observer camera, so polling it cannot mutate camera state.
+	bool CanAcquire(BaseWorld world)
+	{
+		ArmaReforgerScripted game;
+		CameraManager manager;
+		CameraBase original;
+		bool detachedPlayerCamera;
+		int cameraId;
+		return ResolveLeaseableCamera(world, game, manager, original, detachedPlayerCamera, cameraId);
+	}
+
+	string GetLastLeaseabilityReason()
+	{
+		return m_RFO_LastLeaseabilityReason;
+	}
 
 	bool Acquire(string jobId, BaseWorld world, int worldEpoch, vector requestedMatrix[4], float fovDegrees)
 	{
-		if (m_RFO_Acquired || !world || !RFO_ObserverCapabilities.CAMERA_RESTORE_PROVEN)
-			return false;
-		ArmaReforgerScripted game = GetGame();
-		if (!game || game.GetWorld() != world)
-			return false;
-
-		CameraManager manager = game.GetCameraManager();
+		ArmaReforgerScripted game;
+		CameraManager manager;
 		CameraBase original;
 		bool detachedPlayerCamera;
-		if (manager)
-			original = manager.CurrentCamera();
-		if (!original || original.IsDeleted())
-		{
-			original = FindPlayerCamera();
-			detachedPlayerCamera = original && !original.IsDeleted();
-		}
-		// Exact restoration requires a CameraBase snapshot, including the near
-		// plane. Reforger 1.7 exposes no BaseWorld near-plane getter, so a raw
-		// world-slot-only camera cannot be leased without inventing state.
-		if (!original || original.IsDeleted())
-			return false;
-
-		int cameraId = original.GetCameraIndex();
-		if (cameraId < 0 || world.GetCurrentCameraId() != cameraId)
+		int cameraId;
+		if (!ResolveLeaseableCamera(world, game, manager, original, detachedPlayerCamera, cameraId))
 			return false;
 		original.GetWorldCameraTransform(m_RFO_OriginalMatrix);
 		m_RFO_OriginalFov = original.GetVerticalFOV();
@@ -55,7 +56,10 @@ class RFO_ObserverCameraLease
 		m_RFO_OriginalFarPlane = original.GetFarPlane();
 		RFO_ObserverCamera observer = SpawnObserverCamera(game, world, cameraId, requestedMatrix, fovDegrees, m_RFO_OriginalNearPlane, m_RFO_OriginalFarPlane);
 		if (!observer)
+		{
+			m_RFO_LastLeaseabilityReason = "observer_spawn_failed";
 			return false;
+		}
 
 		// A manager-owned original can be replaced deterministically only when both
 		// cameras are registered. MpTest instead exposes a detached player camera;
@@ -68,12 +72,14 @@ class RFO_ObserverCameraLease
 			if (!manager || manager.CurrentCamera() != observer)
 			{
 				DestroyObserverCamera(observer);
+				m_RFO_LastLeaseabilityReason = "manager_selection_failed";
 				return false;
 			}
 		}
 		else if (manager && manager.CurrentCamera() && manager.CurrentCamera() != observer)
 		{
 			DestroyObserverCamera(observer);
+			m_RFO_LastLeaseabilityReason = "camera_owner_changed";
 			return false;
 		}
 		else if (manager && manager.CurrentCamera() == observer)
@@ -88,6 +94,7 @@ class RFO_ObserverCameraLease
 				original.SetFarPlane(m_RFO_OriginalFarPlane);
 				original.ApplyTransform(0.0);
 				DestroyObserverCamera(observer);
+				m_RFO_LastLeaseabilityReason = "restore_target_unregistered";
 				return false;
 			}
 			detachedPlayerCamera = false;
@@ -96,6 +103,7 @@ class RFO_ObserverCameraLease
 		Initialize(jobId, world, worldEpoch, manager, original, observer, cameraId, requestedMatrix, fovDegrees);
 		m_RFO_UsesDetachedPlayerCamera = detachedPlayerCamera;
 		observer.Arm();
+		m_RFO_LastLeaseabilityReason = string.Empty;
 		return true;
 	}
 
@@ -290,6 +298,77 @@ class RFO_ObserverCameraLease
 		m_RFO_UsesDetachedPlayerCamera = false;
 	}
 
+	protected bool ResolveLeaseableCamera(BaseWorld world, out ArmaReforgerScripted game, out CameraManager manager, out CameraBase original, out bool detachedPlayerCamera, out int cameraId)
+	{
+		game = null;
+		manager = null;
+		original = null;
+		detachedPlayerCamera = false;
+		cameraId = -1;
+		m_RFO_LastLeaseabilityReason = string.Empty;
+		if (m_RFO_Acquired)
+		{
+			m_RFO_LastLeaseabilityReason = "lease_already_held";
+			return false;
+		}
+		if (!RFO_ObserverCapabilities.CAMERA_RESTORE_PROVEN)
+		{
+			m_RFO_LastLeaseabilityReason = "restoration_unproven";
+			return false;
+		}
+		if (!world)
+		{
+			m_RFO_LastLeaseabilityReason = "world_unavailable";
+			return false;
+		}
+		game = GetGame();
+		if (!game)
+		{
+			m_RFO_LastLeaseabilityReason = "game_unavailable";
+			return false;
+		}
+		if (game.GetWorld() != world)
+		{
+			m_RFO_LastLeaseabilityReason = "world_mismatch";
+			return false;
+		}
+
+		manager = game.GetCameraManager();
+		if (manager)
+			original = manager.CurrentCamera();
+		if (!original || original.IsDeleted())
+		{
+			original = FindPlayerCamera();
+			detachedPlayerCamera = original && !original.IsDeleted();
+		}
+		// Exact restoration requires a CameraBase snapshot, including the near
+		// plane. Reforger 1.7 exposes no BaseWorld near-plane getter, so a raw
+		// world-slot-only camera cannot be leased without inventing state.
+		if (!original || original.IsDeleted())
+		{
+			m_RFO_LastLeaseabilityReason = "camera_unavailable";
+			return false;
+		}
+
+		cameraId = original.GetCameraIndex();
+		if (cameraId < 0)
+		{
+			m_RFO_LastLeaseabilityReason = "camera_slot_unavailable";
+			return false;
+		}
+		if (world.GetCurrentCameraId() != cameraId)
+		{
+			m_RFO_LastLeaseabilityReason = "camera_slot_mismatch";
+			return false;
+		}
+		if (!detachedPlayerCamera && (!manager || manager.CurrentCamera() != original || !CameraRegistered(manager, original)))
+		{
+			m_RFO_LastLeaseabilityReason = "manager_camera_unregistered";
+			return false;
+		}
+		return true;
+	}
+
 	protected RFO_ObserverCamera SpawnObserverCamera(ArmaReforgerScripted game, BaseWorld world, int cameraId, vector requestedMatrix[4], float fovDegrees, float nearPlane, float farPlane)
 	{
 		if (!game || !world || cameraId < 0)
@@ -480,5 +559,6 @@ class RFO_ObserverCameraLease
 		m_RFO_UsesDetachedPlayerCamera = false;
 		m_RFO_WorldCameraId = 0;
 		m_RFO_LastPostFrameCommit = 0;
+		m_RFO_LastLeaseabilityReason = string.Empty;
 	}
 }

@@ -26,6 +26,14 @@ function mapError(error: unknown): CaptureError {
       error.code === "HANDLER_REJECTED" ? "CAPTURE_REJECTED" : error.code;
     return new CaptureError(code, error.message);
   }
+  // The Workbench activity gate owns the process-wide capture lease. A second
+  // observer submission is a public camera-contention result, not a transport
+  // failure merely because the gate rejects it before the handler is called.
+  if ((error as { code?: unknown } | null | undefined)?.code === "ACTIVE_CAPTURE") {
+    return new CaptureError("CAMERA_BUSY", error instanceof Error
+      ? error.message
+      : "Another Workbench observer capture owns the camera lease");
+  }
   const code = canonicalPublicObserverErrorCode(
     (error as { code?: unknown } | null | undefined)?.code,
     "TRANSPORT_UNAVAILABLE"
