@@ -110,6 +110,49 @@ describe("complete Workbench failure-matrix dispatch", () => {
     expect(shutdown).toBeLessThan(confirmed);
   });
 
+  it("lets the before-submit capture seam own a before-lease Workbench shutdown", async () => {
+    const matrixCase = caseForId(
+      OBSERVER_FAULT_MATRIX,
+      "workbench.stop_owned_workbench.before_lease.current"
+    ) as WorkbenchFaultMatrixCase;
+    const harness = fakeHarness(matrixCase);
+    const capture = harness.input.application.capture;
+    const performShutdown = harness.input.actions.shutdownOwnedWorkbench!;
+    let shutdownPromise: Promise<{ readonly exactOwnerVacant: boolean }> | null = null;
+    const shutdownOwnedWorkbench = () => {
+      shutdownPromise ??= performShutdown();
+      return shutdownPromise;
+    };
+
+    const entry = await runWorkbenchMatrixCase({
+      ...harness.input,
+      application: {
+        ...harness.input.application,
+        capture: async (input) => {
+          if (!String(input.idempotencyKey).includes("matrix-primary")) {
+            return capture(input);
+          }
+          // Model live discovery Ping acknowledging the barrier before Submit
+          // reaches the acceptance adapter's armed delivery seam.
+          await new Promise<void>((resolveDelay) => setTimeout(resolveDelay, 0));
+          harness.calls.push("capture:before-submit-hook");
+          await shutdownOwnedWorkbench();
+          return capture(input);
+        },
+      },
+      actions: {
+        ...harness.input.actions,
+        shutdownOwnedWorkbench,
+      },
+    });
+
+    expect(entry.publicTerminal).toEqual({ state: "failed", errorCode: "WORKBENCH_EXITED" });
+    expect(harness.calls.indexOf("capture:before-submit-hook")).toBeLessThan(
+      harness.calls.indexOf("shutdownOwnedWorkbench")
+    );
+    expect(harness.calls.filter((call) => call === "shutdownOwnedWorkbench")).toHaveLength(1);
+  });
+
   it("starts the declared capture after release publication so its real Ping both drains and fails", async () => {
     const matrixCase = caseForId(
       OBSERVER_FAULT_MATRIX,
@@ -145,6 +188,47 @@ describe("complete Workbench failure-matrix dispatch", () => {
         },
       })).rejects.toThrow(/handler-loss seam was not consumed at the declared boundary/);
     }
+  });
+
+  it("waits for artifact validation instead of treating a nonterminal status as success", async () => {
+    const matrixCase = caseForId(
+      OBSERVER_FAULT_MATRIX,
+      "workbench.write_crc_artifact.capture_in_progress.pose"
+    ) as WorkbenchFaultMatrixCase;
+    const harness = fakeHarness(matrixCase);
+    const jobStatus = harness.input.application.jobStatus;
+    const artifactMutationResult = harness.input.actions.artifactMutationResult!;
+    let statusCalls = 0;
+    let mutationInvoked = false;
+
+    const entry = await runWorkbenchMatrixCase({
+      ...harness.input,
+      application: {
+        ...harness.input.application,
+        jobStatus: async (sessionId, jobId) => {
+          statusCalls += 1;
+          if (jobId === "job-primary" && statusCalls === 1) {
+            return { state: "capturing" };
+          }
+          try {
+            return await jobStatus(sessionId, jobId);
+          } finally {
+            if (jobId === "job-primary") mutationInvoked = true;
+          }
+        },
+      },
+      actions: {
+        ...harness.input.actions,
+        artifactMutationResult: () => mutationInvoked ? artifactMutationResult() : null,
+      },
+    });
+
+    expect(statusCalls).toBeGreaterThan(1);
+    expect(entry).toMatchObject({
+      result: "passed",
+      publicTerminal: { state: "failed", errorCode: "ARTIFACT_INVALID" },
+      artifactEvidence: { validation: "rejected", manifestPublished: false },
+    });
   });
 
   it("rejects a completed requested view whose independently reported camera is corrupted", async () => {

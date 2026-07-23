@@ -288,6 +288,21 @@ describe("live observer acceptance support", () => {
       measurements: rebuilt.measurements.filter((item) =>
         item.operation !== "waitForOperationalBaselineProcessVacancy"),
     })).toThrow(/supervised exit-settle vacancy evidence/);
+    const observerPingMeasurements = rebuilt.measurements.map((item) =>
+      item.operation === "WorkbenchObserverAdapter.ping(EMCP_WB_Ping)"
+        ? { ...item, operation: "WorkbenchObserverAdapter.ping(EMCP_WB_ObserverPing)" }
+        : item);
+    expect(() => buildOperationalBaselineArtifact({
+      ...rebuilt,
+      measurements: observerPingMeasurements,
+    })).not.toThrow();
+    expect(() => buildOperationalBaselineArtifact({
+      ...rebuilt,
+      measurements: observerPingMeasurements.map((item) =>
+        item.operation === "WorkbenchObserverAdapter.ping(EMCP_WB_ObserverPing)"
+          ? { ...item, operation: "WorkbenchObserverAdapter.ping(unknown)" }
+          : item),
+    })).toThrow(/lifecycle\/NET API evidence/);
   });
 
   it("waits deterministically for delayed supervised-process vacancy", async () => {

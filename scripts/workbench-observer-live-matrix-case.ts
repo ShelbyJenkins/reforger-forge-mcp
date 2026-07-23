@@ -13,6 +13,8 @@ import {
   pollUntil,
   systemClock,
   systemSleeper,
+  type Clock,
+  type Sleeper,
 } from "../src/foundation/time.js";
 import type {
   ObserverApplication,
@@ -212,6 +214,46 @@ export function requireWorkbenchReplacementWorldId(
     throw new Error("Opening Matrix B did not change the observed Workbench world identity");
   }
   return currentWorldId;
+}
+
+/**
+ * `openResource` returns before the observer inventory necessarily publishes
+ * the newly opened world. Keep probing the same Workbench lifecycle until its
+ * renderer registration advances from the original world identity.
+ */
+export async function waitForWorkbenchReplacementWorld(
+  probe: () => Promise<Record<string, unknown>>,
+  originalWorldId: string,
+  expectedInstanceId: string,
+  deadline: number,
+  timing: {
+    readonly clock?: Clock;
+    readonly sleeper?: Sleeper;
+    readonly intervalMs?: number;
+  } = {}
+): Promise<string> {
+  const result = await pollUntil<string>({
+    clock: timing.clock ?? systemClock,
+    sleeper: timing.sleeper ?? systemSleeper,
+    deadline: deadlineAt(deadline),
+    intervalMs: timing.intervalMs ?? 250,
+    probe: async () => {
+      const candidate = await probe();
+      if (requiredString(candidate.instanceId, "Replacement Workbench instance ID") !==
+          expectedInstanceId) {
+        throw new Error("Opening Matrix B changed the exact Workbench lifecycle instance");
+      }
+      const currentWorldId = requiredString(
+        candidate.worldId,
+        "Replacement Workbench matrix world ID"
+      );
+      return currentWorldId === originalWorldId ? undefined : currentWorldId;
+    },
+  });
+  if (result.kind === "expired") {
+    throw new Error("Opening Matrix B did not change the observed Workbench world identity");
+  }
+  return result.value;
 }
 
 async function inspectWorkbenchDecoy(
@@ -744,6 +786,7 @@ class WorkbenchLiveMatrixCaseExecution {
         this.runtime.adapter.confirmExactOwnerExit(jobId, exactOwnerVacant);
       },
       replaceFixtureWorld: () => this.replaceFixtureWorld(),
+      confirmFixtureWorldReplacement: () => this.confirmFixtureWorldReplacement(),
       armTerminalReleaseOwnerShutdown: (jobId) => {
         this.armTerminalReleaseOwnerShutdown(jobId);
       },
@@ -755,8 +798,8 @@ class WorkbenchLiveMatrixCaseExecution {
     };
   }
 
-  private async replaceFixtureWorld(): Promise<{ readonly currentWorldId: string }> {
-    const { application, client, project } = this.runtime;
+  private async replaceFixtureWorld(): Promise<void> {
+    const { client, project } = this.runtime;
     if (!project.alternateWorldResource) {
       throw new Error("The disposable matrix project omitted its alternate world");
     }
@@ -770,19 +813,18 @@ class WorkbenchLiveMatrixCaseExecution {
     if (replaced.status !== "ok" || !String(replaced.message ?? "").startsWith("Opened resource:")) {
       throw new Error("The disposable alternate Workbench world did not open");
     }
-    const replacement = await this.services.waitForCaptureCapability(
-      application,
+  }
+
+  private async confirmFixtureWorldReplacement(): Promise<{ readonly currentWorldId: string }> {
+    const { application } = this.runtime;
+    const currentWorldId = await waitForWorkbenchReplacementWorld(
+      () => this.services.waitForCaptureCapability(application, this.caseDeadline),
+      this.requireExpectedWorldId(),
+      this.requireInstanceId(),
       this.caseDeadline
     );
-    if (requiredString(replacement.instanceId, "Replacement Workbench instance ID") !==
-        this.requireInstanceId()) {
-      throw new Error("Opening Matrix B changed the exact Workbench lifecycle instance");
-    }
     return {
-      currentWorldId: requireWorkbenchReplacementWorldId(
-        this.requireExpectedWorldId(),
-        replacement.worldId
-      ),
+      currentWorldId,
     };
   }
 

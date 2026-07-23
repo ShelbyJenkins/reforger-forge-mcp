@@ -163,7 +163,14 @@ export function fakeHarness(matrixCase: WorkbenchFaultMatrixCase): FakeHarness {
         if (action === "replace_fixture_world") {
           throw Object.assign(new Error("world changed"), { code: "WORLD_CHANGED" });
         }
-        if (action === "stop_owned_workbench" && shutdownComplete) {
+        if (action === "stop_owned_workbench") {
+          // Model the live acceptance adapter's armed before-Submit hook. The
+          // hook owns the shutdown even though discovery Ping reached the
+          // fixture barrier before the primary job ID became public.
+          if (!shutdownComplete) {
+            calls.push("shutdownOwnedWorkbench");
+            shutdownComplete = true;
+          }
           throw Object.assign(new Error("Workbench exited"), { code: "WORKBENCH_EXITED" });
         }
       }
@@ -175,7 +182,15 @@ export function fakeHarness(matrixCase: WorkbenchFaultMatrixCase): FakeHarness {
     },
     async jobStatus(_sessionId: string | undefined, jobId: string) {
       calls.push(`jobStatus:${jobId}`);
-      if (jobId === "job-followup") return completed();
+      if (jobId === "job-followup") {
+        return publicStatus(
+          "completed",
+          null,
+          true,
+          { kind: "current" },
+          action === "replace_fixture_world" ? "world-2" : "world-1"
+        );
+      }
       if (action === "disable_fixture_handler") {
         handlerLossCategory = phase === "before_lease" || matrixCase.view === "pose"
           ? "handler_response_lost"
@@ -307,6 +322,10 @@ export function fakeHarness(matrixCase: WorkbenchFaultMatrixCase): FakeHarness {
     }),
     replaceFixtureWorld: async () => {
       calls.push("replaceWorld");
+    },
+    confirmFixtureWorldReplacement: async () => {
+      calls.push("confirmReplacementWorld");
+      if (!barrierReleased) throw new Error("replacement confirmation preceded barrier release");
       return { currentWorldId: "world-2" };
     },
     armTerminalReleaseOwnerShutdown: () => {

@@ -573,6 +573,18 @@ describe("observer failure-matrix evidence", () => {
     }
   });
 
+  it("redacts capability assignments in ordinary timeout diagnostics", () => {
+    const timeout = matrixRetainedDiagnostic(
+      "Error: Timed out waiting for Workbench observer capture capability: observer handler has not responded"
+    );
+    const assignment = matrixRetainedDiagnostic("capability=alphabeticsecret");
+
+    expect(timeout.tail).toBe(
+      "Error: Timed out waiting for Workbench observer capture capability: [REDACTED] handler has not responded"
+    );
+    expect(assignment.tail).toBe("capability=[REDACTED]");
+  });
+
   it("byte-bounds multibyte diagnostics and rejects unsafe text outside diagnostic fields", () => {
     const diagnostic = matrixRetainedDiagnostic("😀".repeat(4_096));
     expect(diagnostic.byteCount).toBeLessThanOrEqual(4_096);

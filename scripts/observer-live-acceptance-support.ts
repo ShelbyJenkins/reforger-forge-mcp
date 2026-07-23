@@ -784,11 +784,14 @@ export function buildOperationalBaselineArtifact(input: Omit<
     }
     if (input.backend === "workbench") {
       const launch = passed("launch", "WorkbenchClient.ensureRunning", "running_confirmation");
-      const managed = passed(
-        "managed_call",
+      const managed = [
         "WorkbenchObserverAdapter.ping(EMCP_WB_Ping)",
+        "WorkbenchObserverAdapter.ping(EMCP_WB_ObserverPing)",
+      ].map((operation) => passed(
+        "managed_call",
+        operation,
         "representative_net_api"
-      );
+      )).find((measurement) => measurement !== undefined);
       const termination = passed(
         "shutdown",
         "WorkbenchClient.shutdownOwnedWorkbench",
@@ -1237,14 +1240,14 @@ const FAILURE_MATRIX_REQUIRED_SOURCE_PATHS = Object.freeze([
   "src/foundation/time.ts",
   "src/observer/public-contract.ts",
 ] as const);
-const MATRIX_PORTABLE_IDENTIFIER_ASSIGNMENT = /((?:pid|process[_ -]?id|hostname|host|username|user|lifecycle(?:id|generation|[_ -]id|[_ -]generation)|handler(?:id|lease|[_ -]id|[_ -]lease)|(?:job|run|session|instance|runtime|request|reservation)(?:id|[_ -]id)?)\s*[:=]\s*)([^\s,;}\]]+)/gi;
+const MATRIX_PORTABLE_IDENTIFIER_ASSIGNMENT = /((?:pid|process[_ -]?id|hostname|host|username|user|capability|owner|lifecycle(?:id|generation|[_ -]id|[_ -]generation)|handler(?:id|lease|[_ -]id|[_ -]lease)|(?:job|run|session|instance|runtime|request|reservation)(?:id|[_ -]id)?)\s*[:=]\s*)(?!\[REDACTED\])([^\s,;}\]]+)/gi;
 const MATRIX_CHECK_FIELD: Readonly<Record<string, keyof MatrixCaseEntry["cleanup"]>> = Object.freeze({
   lifecycle_vacant: "lifecycleVacant",
   endpoint_vacant: "endpointVacant",
   child_vacant: "childVacant",
   exact_owner_vacant: "exactOwnerVacant",
 });
-const MATRIX_LOCAL_IDENTIFIER_ASSIGNMENT = /(\b(?:pid|process(?:[_ -]?id)?|host(?:name)?|user(?:name)?|lifecycle(?:[_ -]?(?:id|generation))?|handler(?:[_ -]?(?:id|lease))?|(?:job|run|session|instance|runtime|request|reservation)(?:[_ -]?id)?)\s*[:=]\s*)(?:"(?:\\.|[^"\\])*"|[^\s,;}\]]+)/gi;
+const MATRIX_LOCAL_IDENTIFIER_ASSIGNMENT = /(\b(?:pid|process(?:[_ -]?id)?|host(?:name)?|user(?:name)?|capability|owner|lifecycle(?:[_ -]?(?:id|generation))?|handler(?:[_ -]?(?:id|lease))?|(?:job|run|session|instance|runtime|request|reservation)(?:[_ -]?id)?)\s*[:=]\s*)(?!\[REDACTED\])(?:"(?:\\.|[^"\\])*"|[^\s,;}\]]+)/gi;
 const MATRIX_LOCAL_IDENTIFIER_PROSE = /(\b(?:job|run|session|instance|runtime|request|reservation)(?:[_ -]?id)?\s+)((?=[A-Za-z0-9._:-]{8,}(?:\b|$))(?=[A-Za-z0-9._:-]*[0-9._:-])[A-Za-z0-9._:-]+)/gi;
 const MATRIX_PID_PROSE = /(\b(?:pid(?:\(s\)|s)?|process(?:[_ -]?id)(?:\(s\)|s)?)\s*(?::|=|#|\s)\s*)(\d{1,10}(?:\s*,\s*\d{1,10})*)/gi;
 
@@ -1256,7 +1259,7 @@ function exactKeys(value: unknown, expected: readonly string[], _label: string):
 }
 
 const MATRIX_LOCAL_IDENTIFIER_KEYS = new Set([
-  "pid", "processid", "hostname", "host", "username", "user",
+  "pid", "processid", "hostname", "host", "username", "user", "capability", "owner",
   "lifecycleid", "lifecyclegeneration", "handlerid", "handlerlease",
   "job", "jobid", "run", "runid", "session", "sessionid",
   "instance", "instanceid", "runtime", "runtimeid", "request", "requestid",

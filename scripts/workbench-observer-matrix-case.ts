@@ -70,7 +70,8 @@ export interface WorkbenchMatrixCaseActions {
     readonly jobId: string | null;
   }) => void;
   readonly handlerLossResult?: () => WorkbenchHandlerLossResult;
-  readonly replaceFixtureWorld?: () => Promise<void | { readonly currentWorldId: string }>;
+  readonly replaceFixtureWorld?: () => Promise<void>;
+  readonly confirmFixtureWorldReplacement?: () => Promise<{ readonly currentWorldId: string }>;
   readonly shutdownOwnedWorkbench?: () => Promise<WorkbenchMatrixShutdownEvidence>;
   readonly verifyShutdownDecoy?: () => Promise<WorkbenchDecoyIdentityResult | undefined>;
   readonly armTerminalReleaseOwnerShutdown?: (jobId: string) => void;
@@ -289,6 +290,23 @@ function assertRestoredWorkbenchCameraProof(
   }
 }
 
+function assertReplacementWorkbenchCameraProof(
+  baseline: Pick<WorkbenchObserverJobStatus, "worldIdentity">,
+  restored: Record<string, unknown>,
+  expectedWorldIdentity: string,
+  label: string
+): void {
+  const observed = workbenchCameraProof(restored, label);
+  if (expectedWorldIdentity === baseline.worldIdentity ||
+      observed.worldIdentity !== expectedWorldIdentity) {
+    throw new Error(`${label} did not match the replacement editor world identity`);
+  }
+  // A newly opened editor world owns a different legitimate current camera.
+  // workbenchCameraProof above still requires complete finite camera/FOV/owner
+  // evidence; comparing those values to the previous world's camera would turn
+  // an intentional world switch into a false restoration failure.
+}
+
 function assertDeclaredWorkbenchTerminal(
   matrixCase: WorkbenchFaultMatrixCase,
   terminal: FaultMatrixTerminal
@@ -455,6 +473,7 @@ class WorkbenchMatrixCaseExecution {
     await this.requirePrimarySubmissionAfterBarrier();
     await this.prepareDeclaredAction();
     await this.releaseDeclaredBarrier();
+    await this.confirmDeclaredActionAfterBarrier();
     this.startBeforeLeaseCaptureIfRequired();
     await this.observeDeclaredActionOutcome();
 
@@ -587,9 +606,18 @@ class WorkbenchMatrixCaseExecution {
       return;
     }
     if (action === "replace_fixture_world") {
-      const replacement = await requireAction(actions.replaceFixtureWorld, action)();
-      if (replacement) this.currentWorldId = replacement.currentWorldId;
+      await requireAction(actions.replaceFixtureWorld, action)();
     }
+  }
+
+  private async confirmDeclaredActionAfterBarrier(): Promise<void> {
+    const { actions, matrixCase } = this.input;
+    if (matrixCase.injection.action !== "replace_fixture_world") return;
+    const replacement = await requireAction(
+      actions.confirmFixtureWorldReplacement,
+      "replace_fixture_world:confirm"
+    )();
+    this.currentWorldId = replacement.currentWorldId;
   }
 
   private async releaseDeclaredBarrier(): Promise<void> {
@@ -648,12 +676,34 @@ class WorkbenchMatrixCaseExecution {
     }
     if (action === "write_truncated_artifact" || action === "write_crc_artifact" ||
         action === "write_mismatched_artifact") {
-      try {
-        await application.jobStatus(undefined, this.primaryJobId!);
-        throw new Error("Workbench artifact mutation unexpectedly passed public validation");
-      } catch (error) {
-        this.recordPublicTerminal(canonicalTerminalFromError(error));
+      let observedTerminal: FaultMatrixTerminal | null = null;
+      const observed = await pollUntil<true>({
+        clock: systemClock,
+        sleeper: systemSleeper,
+        deadline: deadlineAt(this.input.caseDeadline),
+        intervalMs: 250,
+        probe: async () => {
+          let status: Record<string, unknown>;
+          try {
+            status = await application.jobStatus(undefined, this.primaryJobId!);
+          } catch (error) {
+            observedTerminal = canonicalTerminalFromError(error);
+            return true;
+          }
+          if (typeof status.state !== "string") {
+            throw new Error("Workbench artifact mutation status omitted its public state");
+          }
+          if (!TERMINAL_STATES.has(status.state)) return undefined;
+          observedTerminal = canonicalTerminalFromStatus(status);
+          return true;
+        },
+      });
+      if (observed.kind === "expired" || !observedTerminal) {
+        throw new Error(
+          "Workbench artifact mutation did not reach a public terminal before its case deadline"
+        );
       }
+      this.recordPublicTerminal(observedTerminal);
       const mutation = requireAction(actions.artifactMutationResult, action)();
       if (!mutation) throw new Error("Workbench artifact case did not invoke its one-shot mutation hook");
       this.terminalStatus = { ...await adapter.status(this.primaryJobId!) };
@@ -745,6 +795,22 @@ class WorkbenchMatrixCaseExecution {
   }
 
   private async observeExactOwnerShutdown(): Promise<void> {
+    if (this.input.matrixCase.injection.phase === "before_lease") {
+      // The capture's discovery Ping can acknowledge the fixture barrier before
+      // Submit acquires its activity lease. Let the armed before-submit hook own
+      // the shutdown boundary; otherwise the dispatcher can stop Workbench in
+      // that gap and collapse the declared WORKBENCH_EXITED result into a
+      // generic transport failure.
+      const outcome = await this.requirePrimaryOutcome();
+      if (outcome.result) throw new Error("Workbench owned-shutdown capture unexpectedly succeeded");
+      this.recordPublicTerminal(canonicalTerminalFromError(outcome.error));
+      const shutdown = await requireAction(
+        this.input.actions.shutdownOwnedWorkbench,
+        "stop_owned_workbench"
+      )();
+      this.exactOwnerVacant = shutdown.exactOwnerVacant;
+      return;
+    }
     if (this.primaryJobId) {
       requireAction(
         this.input.actions.requireExactOwnerExit,
@@ -894,17 +960,25 @@ class WorkbenchMatrixCaseExecution {
         followUpTerminal.restorationConfirmed !== true) {
       throw new Error("Workbench matrix follow-up did not prove a fresh restored camera acquisition");
     }
-    assertRestoredWorkbenchCameraProof(
-      this.input.baselineCurrent,
-      followUpTerminal,
-      "Workbench matrix post-restoration current capture",
-      action !== "replace_fixture_world"
-    );
+    if (action === "replace_fixture_world") {
+      assertReplacementWorkbenchCameraProof(
+        this.input.baselineCurrent,
+        followUpTerminal,
+        this.currentWorldId,
+        "Workbench matrix post-restoration current capture"
+      );
+    } else {
+      assertRestoredWorkbenchCameraProof(
+        this.input.baselineCurrent,
+        followUpTerminal,
+        "Workbench matrix post-restoration current capture"
+      );
+    }
     await this.input.application.readJob(undefined, followUpJobId);
     await this.input.adapter.release(followUpJobId);
-    this.diagnostics.push(
-      "fresh current-view acquisition matched the baseline editor camera after restoration"
-    );
+    this.diagnostics.push(action === "replace_fixture_world"
+      ? "fresh current-view acquisition proved complete camera evidence in the replacement editor world"
+      : "fresh current-view acquisition matched the baseline editor camera after restoration");
   }
 
   private async finishFixtureCase(): Promise<void> {
