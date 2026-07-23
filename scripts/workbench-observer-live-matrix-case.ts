@@ -23,6 +23,7 @@ import type {
 import { WorkbenchNetApiClient } from "../src/workbench/net-api-client.js";
 import type {
   WorkbenchCameraMatrix,
+  WorkbenchObserverInstance,
   WorkbenchObserverJobStatus,
 } from "../src/workbench/observer-adapter.js";
 import type { WindowsLifecycleBackend } from "../src/workbench/process-guard.js";
@@ -217,12 +218,12 @@ export function requireWorkbenchReplacementWorldId(
 }
 
 /**
- * `openResource` returns before the observer inventory necessarily publishes
- * the newly opened world. Keep probing the same Workbench lifecycle until its
- * renderer registration advances from the original world identity.
+ * `openResource` returns before observer Ping necessarily publishes the newly
+ * opened world. Keep probing the same Workbench lifecycle until its identity
+ * advances, without requiring capture eligibility from the invalidated lease.
  */
 export async function waitForWorkbenchReplacementWorld(
-  probe: () => Promise<Record<string, unknown>>,
+  probe: () => Promise<Pick<WorkbenchObserverInstance, "instanceId" | "worldIdentity">>,
   originalWorldId: string,
   expectedInstanceId: string,
   deadline: number,
@@ -244,7 +245,7 @@ export async function waitForWorkbenchReplacementWorld(
         throw new Error("Opening Matrix B changed the exact Workbench lifecycle instance");
       }
       const currentWorldId = requiredString(
-        candidate.worldId,
+        candidate.worldIdentity,
         "Replacement Workbench matrix world ID"
       );
       return currentWorldId === originalWorldId ? undefined : currentWorldId;
@@ -816,9 +817,8 @@ class WorkbenchLiveMatrixCaseExecution {
   }
 
   private async confirmFixtureWorldReplacement(): Promise<{ readonly currentWorldId: string }> {
-    const { application } = this.runtime;
     const currentWorldId = await waitForWorkbenchReplacementWorld(
-      () => this.services.waitForCaptureCapability(application, this.caseDeadline),
+      () => this.runtime.adapter.ping(),
       this.requireExpectedWorldId(),
       this.requireInstanceId(),
       this.caseDeadline

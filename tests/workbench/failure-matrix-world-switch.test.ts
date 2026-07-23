@@ -9,13 +9,14 @@ import { runWorkbenchMatrixCase } from "../../scripts/workbench-observer-matrix-
 import { fakeHarness } from "./failure-matrix-runner-fixture.js";
 
 describe("Workbench failure-matrix world replacement", () => {
-  it("waits for the same lifecycle to publish a changed world identity", async () => {
+  it("waits for raw Ping to publish a changed world identity without capture eligibility", async () => {
     let now = 1_000;
     let probes = 0;
     const worldId = await waitForWorkbenchReplacementWorld(
       async () => ({
         instanceId: "instance-1",
-        worldId: ++probes === 1 ? "world-1" : "world-2",
+        worldIdentity: ++probes === 1 ? "world-1" : "world-2",
+        capabilities: [],
       }),
       "world-1",
       "instance-1",
