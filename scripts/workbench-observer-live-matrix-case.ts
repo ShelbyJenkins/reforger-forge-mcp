@@ -1,4 +1,4 @@
-import { spawn, spawnSync, type ChildProcess } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
@@ -26,6 +26,8 @@ import type {
 import type { WindowsLifecycleBackend } from "../src/workbench/process-guard.js";
 import {
   analyzePngMaterial,
+  captureStableFailureMatrixSource,
+  failureMatrixSourceRevision,
   matrixRetainedDiagnostic,
   operationalBaselineDirectoryIdentity,
   operationalBaselineEnvironment,
@@ -326,28 +328,7 @@ export function workbenchMatrixSourceRevision(): {
   readonly commit: string | null;
   readonly tree: "clean" | "dirty" | "unavailable";
 } {
-  const repositoryRoot = WORKBENCH_OBSERVER_ACCEPTANCE_REPOSITORY_ROOT;
-  const safeDirectory = repositoryRoot.replace(/\\/g, "/");
-  const revision = spawnSync("git", [
-    "-c", `safe.directory=${safeDirectory}`, "rev-parse", "HEAD",
-  ], {
-    cwd: repositoryRoot,
-    encoding: "utf8",
-    windowsHide: true,
-  });
-  const status = spawnSync("git", [
-    "-c", `safe.directory=${safeDirectory}`,
-    "status", "--porcelain", "--untracked-files=normal",
-  ], {
-    cwd: repositoryRoot,
-    encoding: "utf8",
-    windowsHide: true,
-  });
-  const commit = revision.status === 0 && /^[a-f0-9]{40}$/i.test(revision.stdout.trim())
-    ? revision.stdout.trim().toLowerCase()
-    : null;
-  if (!commit || status.status !== 0) return { commit, tree: "unavailable" };
-  return { commit, tree: status.stdout.trim() ? "dirty" : "clean" };
+  return failureMatrixSourceRevision(WORKBENCH_OBSERVER_ACCEPTANCE_REPOSITORY_ROOT);
 }
 
 export function captureStableWorkbenchMatrixSource(input: {
@@ -358,18 +339,7 @@ export function captureStableWorkbenchMatrixSource(input: {
   readonly sourceRevision: ReturnType<typeof workbenchMatrixSourceRevision>;
   readonly stable: boolean;
 } {
-  const sourceBefore = input.readSource();
-  const revisionBefore = input.readRevision();
-  const sourceAfter = input.readSource();
-  const revisionAfter = input.readRevision();
-  return {
-    source: sourceAfter,
-    sourceRevision: revisionAfter,
-    stable: operationalBaselineProcedureSha256(sourceBefore) ===
-        operationalBaselineProcedureSha256(sourceAfter) &&
-      revisionBefore.commit === revisionAfter.commit &&
-      revisionBefore.tree === revisionAfter.tree,
-  };
+  return captureStableFailureMatrixSource(input);
 }
 
 export function workbenchFailureDeadlineEvidence(

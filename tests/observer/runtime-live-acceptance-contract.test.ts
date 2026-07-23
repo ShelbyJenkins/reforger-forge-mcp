@@ -310,6 +310,19 @@ describe("live graphical runtime observer acceptance contract", () => {
 
   it("keeps the runtime failure-matrix runner on exact owned-lifecycle shutdown with no direct process-kill path", () => {
     const source = readFileSync(resolve("scripts/observer-runtime-failure-matrix.ts"), "utf8");
+    expect(source).toContain("captureStableFailureMatrixSource({");
+    expect(source).toContain("failureMatrixSourceRevision(REPOSITORY_ROOT)");
+    expect(source).toContain("A full runtime matrix requires a clean committed source revision before launch");
+    expect(source).toContain("operationalBaselineProcedureSha256(initialSource.source)");
+    expect(source).toContain("finalSource.sourceRevision.commit !== initialSource.sourceRevision.commit");
+    expect(source).toContain("sourceRevision: finalSource.sourceRevision");
+    const initialSourceIndex = source.indexOf("const initialSource =");
+    const executableIndex = source.indexOf("const executable = findRuntimeExecutable");
+    const restAfterIndex = source.indexOf('baseline.sampleProcessCounts("rest.afterShutdown")');
+    const finalSourceIndex = source.indexOf("const finalSource =");
+    expect(initialSourceIndex).toBeGreaterThan(-1);
+    expect(executableIndex).toBeGreaterThan(initialSourceIndex);
+    expect(finalSourceIndex).toBeGreaterThan(restAfterIndex);
     expect(source).toContain("await runtimeManager.stop({");
     expect(source).toContain("closeObserverRuntimeLifecycle(runtimeManager, application)");
     expect(source).toContain("scheduler.finishCase()");

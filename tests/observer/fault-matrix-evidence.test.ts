@@ -1,10 +1,12 @@
 import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { defineFaultMatrix, type FaultMatrixCase } from "../../observer/protocol/fault-matrix.js";
 import {
   buildObserverFailureMatrixArtifact,
+  captureStableFailureMatrixSource,
+  failureMatrixSourceRevision,
   failureMatrixSourceClosureSha256,
   matrixRetainedDiagnostic,
   operationalBaselineEnvironment,
@@ -173,6 +175,51 @@ function ownedWorkbenchInput(): FailureMatrixArtifactInput {
 }
 
 describe("observer failure-matrix evidence", () => {
+  it("captures clean, dirty, and unavailable Git source revisions", () => {
+    const repositoryRoot = join(tmpdir(), "rfo-matrix-repository");
+    let statusOutput = "";
+    const runGit = vi.fn((argumentsArray: readonly string[], _cwd: string) => ({
+      status: 0,
+      stdout: argumentsArray.includes("rev-parse") ? `${"A".repeat(40)}\n` : statusOutput,
+    }));
+
+    expect(failureMatrixSourceRevision(repositoryRoot, runGit)).toEqual({
+      commit: "a".repeat(40),
+      tree: "clean",
+    });
+    statusOutput = " M scripts/harness.ts\n";
+    expect(failureMatrixSourceRevision(repositoryRoot, runGit)).toEqual({
+      commit: "a".repeat(40),
+      tree: "dirty",
+    });
+    const resolvedRoot = resolve(repositoryRoot);
+    const safeDirectory = `safe.directory=${resolvedRoot.replace(/\\/g, "/")}`;
+    expect(runGit.mock.calls.every(([argumentsArray, cwd]) =>
+      argumentsArray.includes(safeDirectory) && cwd === resolvedRoot)).toBe(true);
+    expect(failureMatrixSourceRevision(repositoryRoot, () => ({
+      status: 1,
+      stdout: "",
+    }))).toEqual({ commit: null, tree: "unavailable" });
+  });
+
+  it("detects revision drift inside a stable source-identity bracket", () => {
+    const source = input().source;
+    for (const changedRevision of [
+      { commit: "b".repeat(40), tree: "clean" as const },
+      { commit: "a".repeat(40), tree: "dirty" as const },
+    ]) {
+      const readRevision = vi.fn()
+        .mockReturnValueOnce({ commit: "a".repeat(40), tree: "clean" as const })
+        .mockReturnValueOnce(changedRevision);
+      const captured = captureStableFailureMatrixSource({
+        readSource: () => source,
+        readRevision,
+      });
+      expect(captured.stable).toBe(false);
+      expect(captured.sourceRevision).toEqual(changedRevision);
+    }
+  });
+
   it("accepts the bounded aggregate timeout required by 69 serial Workbench cases", () => {
     const candidate = input();
     const artifact = buildObserverFailureMatrixArtifact({

@@ -1171,6 +1171,60 @@ export interface FailureMatrixPublication {
   readonly artifact: ObserverFailureMatrixArtifact;
 }
 
+type FailureMatrixGitRunner = (
+  argumentsArray: readonly string[],
+  cwd: string
+) => { readonly status: number | null; readonly stdout: string };
+
+export function failureMatrixSourceRevision(
+  repositoryRoot: string,
+  runGit: FailureMatrixGitRunner = (argumentsArray, cwd) => {
+    const result = spawnSync("git", argumentsArray, {
+      cwd,
+      encoding: "utf8",
+      windowsHide: true,
+    });
+    return { status: result.status, stdout: result.stdout };
+  }
+): FailureMatrixSourceRevision {
+  const root = resolve(repositoryRoot);
+  const safeDirectory = root.replace(/\\/g, "/");
+  const revision = runGit([
+    "-c", `safe.directory=${safeDirectory}`, "rev-parse", "HEAD",
+  ], root);
+  const status = runGit([
+    "-c", `safe.directory=${safeDirectory}`,
+    "status", "--porcelain", "--untracked-files=normal",
+  ], root);
+  const commit = revision.status === 0 && /^[a-f0-9]{40}$/i.test(revision.stdout.trim())
+    ? revision.stdout.trim().toLowerCase()
+    : null;
+  if (!commit || status.status !== 0) return { commit, tree: "unavailable" };
+  return { commit, tree: status.stdout.trim() ? "dirty" : "clean" };
+}
+
+export function captureStableFailureMatrixSource(input: {
+  readonly readSource: () => OperationalBaselineArtifact["source"];
+  readonly readRevision: () => FailureMatrixSourceRevision;
+}): {
+  readonly source: OperationalBaselineArtifact["source"];
+  readonly sourceRevision: FailureMatrixSourceRevision;
+  readonly stable: boolean;
+} {
+  const sourceBefore = input.readSource();
+  const revisionBefore = input.readRevision();
+  const sourceAfter = input.readSource();
+  const revisionAfter = input.readRevision();
+  return {
+    source: sourceAfter,
+    sourceRevision: revisionAfter,
+    stable: operationalBaselineProcedureSha256(sourceBefore) ===
+        operationalBaselineProcedureSha256(sourceAfter) &&
+      revisionBefore.commit === revisionAfter.commit &&
+      revisionBefore.tree === revisionAfter.tree,
+  };
+}
+
 const MATRIX_DIAGNOSTIC_MAXIMUM = 4 * 1024;
 const MATRIX_SUMMARY_MAXIMUM = 256 * 1024;
 const MATRIX_HASH = /^[a-f0-9]{64}$/;

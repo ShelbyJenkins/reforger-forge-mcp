@@ -50,11 +50,14 @@ import {
 } from "./observer-runtime-launch-support.js";
 import {
   buildObserverFailureMatrixArtifact,
+  captureStableFailureMatrixSource,
+  failureMatrixSourceRevision,
   matrixRetainedDiagnostic,
   OperationalBaselineRecorder,
   operationalBaselineDirectoryIdentity,
   operationalBaselineEnvironment,
   operationalBaselineLaunchArgumentIdentity,
+  operationalBaselineProcedureSha256,
   operationalBaselineSource,
   waitForOperationalBaselineProcessVacancy,
   writeObserverFailureMatrixArtifact,
@@ -657,6 +660,31 @@ export async function runRuntimeFailureMatrix(
     throw new Error("Runtime fault-matrix mode rejects --launch-arg; launch and fixture arguments are fully owned");
   }
 
+  const runtimeCaseIds = OBSERVER_FAULT_MATRIX.cases
+    .filter((item) => item.backend === "runtime")
+    .map((item) => item.id);
+  const fullCoverage = runtimeCaseIds.length === 1 && runtimeCaseIds[0] === matrixCase.id;
+  const readMatrixSource = () => operationalBaselineSource(
+    join(REPOSITORY_ROOT, "scripts", "observer-runtime-failure-matrix.ts"),
+    "scripts/observer-runtime-failure-matrix.ts",
+    REPOSITORY_ROOT,
+    RUNTIME_FAILURE_MATRIX_SOURCES,
+    OBSERVER_OPERATIONAL_BASELINE_SOURCE_CLOSURES
+  );
+  const readSourceRevision = () => failureMatrixSourceRevision(REPOSITORY_ROOT);
+  const initialSource = captureStableFailureMatrixSource({
+    readSource: readMatrixSource,
+    readRevision: readSourceRevision,
+  });
+  if (!initialSource.stable) {
+    throw new Error("The runtime matrix source bytes or revision changed during initial identity capture");
+  }
+  if (fullCoverage &&
+      (initialSource.sourceRevision.tree !== "clean" ||
+        initialSource.sourceRevision.commit === null)) {
+    throw new Error("A full runtime matrix requires a clean committed source revision before launch");
+  }
+
   const worldResource = boundedText(
     options.worldResource ?? DEFAULT_RUNTIME_OBSERVER_WORLD,
     "Runtime matrix world resource",
@@ -726,13 +754,6 @@ export async function runRuntimeFailureMatrix(
     readSupervisedProcessCounts: readProcessCounts,
   });
   const baselineEnvironment = operationalBaselineEnvironment({ gameExecutable: executable });
-  const baselineSource = operationalBaselineSource(
-    join(REPOSITORY_ROOT, "scripts", "observer-runtime-failure-matrix.ts"),
-    "scripts/observer-runtime-failure-matrix.ts",
-    REPOSITORY_ROOT,
-    RUNTIME_FAILURE_MATRIX_SOURCES,
-    OBSERVER_OPERATIONAL_BASELINE_SOURCE_CLOSURES
-  );
   baseline.sampleProcessCounts("rest.beforeLaunch");
 
   let runtimeId: string | null = null;
@@ -1098,6 +1119,21 @@ export async function runRuntimeFailureMatrix(
     }
     baseline.sampleProcessCounts("rest.afterShutdown");
   }
+  const finalSource = captureStableFailureMatrixSource({
+    readSource: readMatrixSource,
+    readRevision: readSourceRevision,
+  });
+  if (!finalSource.stable ||
+      operationalBaselineProcedureSha256(initialSource.source) !==
+        operationalBaselineProcedureSha256(finalSource.source)) {
+    failure ??= new Error("The runtime matrix source bytes or revision changed during final identity capture");
+  }
+  if (fullCoverage &&
+      (finalSource.sourceRevision.tree !== "clean" ||
+        finalSource.sourceRevision.commit === null ||
+        finalSource.sourceRevision.commit !== initialSource.sourceRevision.commit)) {
+    failure ??= new Error("The runtime matrix source revision changed or became dirty during execution");
+  }
   const overallResult: "passed" | "failed" = failure || !caseEntry || caseEntry.result !== "passed" ? "failed" : "passed";
   const finalCaseEntry: MatrixCaseEntry = caseEntry ?? observedFailedCaseEntry ?? {
     caseId: matrixCase.id,
@@ -1161,7 +1197,7 @@ export async function runRuntimeFailureMatrix(
     result: overallResult,
     environment: baselineEnvironment,
     workload,
-    source: baselineSource,
+    source: finalSource.source,
     limitations,
     ...(overallResult === "failed" ? {
       failureName: failure instanceof Error ? failure.name : "RuntimeFailureMatrixError",
@@ -1178,6 +1214,7 @@ export async function runRuntimeFailureMatrix(
     matrix: OBSERVER_FAULT_MATRIX,
     cases: [finalCaseEntry],
     source: baselineArtifact.source,
+    sourceRevision: finalSource.sourceRevision,
     measurements: baselineArtifact.measurements,
     processCounts: baselineArtifact.processCounts,
     limitations: baselineArtifact.limitations,

@@ -12,7 +12,11 @@ describe("runner safety/source closure", () => {
       join(process.cwd(), "scripts", "workbench-observer-live-matrix-case.ts"),
       "utf8"
     );
-    const ownedSource = `${source}\n${liveCaseSource}`;
+    const sharedSource = readFileSync(
+      join(process.cwd(), "scripts", "observer-live-acceptance-support.ts"),
+      "utf8"
+    );
+    const ownedSource = `${source}\n${liveCaseSource}\n${sharedSource}`;
     expect(source).toContain('"scripts/observer-workbench-failure-support.ts"');
     expect(source).toContain('"scripts/workbench-observer-acceptance-adapter.ts"');
     expect(source).toContain('"scripts/workbench-observer-acceptance-runtime.ts"');
