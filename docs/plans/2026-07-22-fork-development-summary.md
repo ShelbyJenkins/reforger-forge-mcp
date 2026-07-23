@@ -11,6 +11,41 @@ This document is a high-level record of the work completed in this fork. It is
 intended to show what changed and why without duplicating the detailed design
 plans, implementation notes, or individual commit history.
 
+## What this enables
+
+At a product level, the fork adds safe, agent-driven control of Arma Reforger
+Tools and a complete local screenshot-evidence workflow for both the game and
+Workbench.
+
+| Feature | What it supports |
+|---|---|
+| Safe Workbench control | Agents can launch, reuse, diagnose, restart, and shut down the exact intended Workbench project without taking ownership of an unrelated editor process. |
+| Managed game runtime | A graphical Arma Reforger process can be prepared, explicitly started, inspected, and restoration-gated stopped through an exact-owned lifecycle. |
+| Runtime screenshots | The game can capture the current camera, an explicit camera pose, or a look-at target as a validated PNG. |
+| Workbench screenshots | An already-running managed Workbench can capture the editor's current view, explicit poses, and look-at views through dedicated observer handlers. |
+| Camera safety | Pose-based captures hold a lease and must prove the original camera was restored before completion, shutdown, or restart can proceed. |
+| Asynchronous capture jobs | Longer captures can be submitted, polled, read, cancelled, and released without blocking one MCP request indefinitely. |
+| Renderer discovery | Tools can inventory compatible runtime and Workbench renderers, their health, capabilities, lifecycle identity, and world revision before capture. |
+| Evidence runs | Reviewed captures can be grouped into a managed run and finalized as a portable bundle containing PNGs, metadata, a manifest, source provenance, and a readable result summary. |
+| Reproducible target builds | A reviewed `.gproj` can be built into a unique external directory with exact process attribution, fresh-output checks, and a structured receipt. |
+| Recovery and diagnostics | Durable lifecycle state and bounded diagnostics support safe recovery after helper failure, process exit, MCP restart, endpoint conflict, or incomplete cleanup. |
+| Local failure testing | Maintainers can inject controlled cancellation, transport, world, artifact, lease, and owner-shutdown faults into disposable fixtures and retain sanitized results. |
+| Safer automation defaults | Operations are deadline-bounded, target-confined, identity-checked, redacted for publication, and designed to fail closed when ownership or restoration cannot be proven. |
+
+The primary new observer-facing tools are:
+
+- `observer_setup` for companion staging and health checks;
+- `observer_prepare_launch` and `observer_runtime` for explicit graphical
+  runtime lifecycle;
+- `observer_instances` for renderer inventory;
+- `observer_capture` and `observer_job` for synchronous or asynchronous
+  screenshots; and
+- `observer_run` for reviewed evidence collection and export.
+
+Existing Workbench operations such as `wb_launch`, `wb_restart`, `wb_shutdown`,
+and diagnostics were substantially hardened around the new exact-owner
+lifecycle.
+
 ## At a glance
 
 | Area | Outcome |
