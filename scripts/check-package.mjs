@@ -299,7 +299,7 @@ try {
 const requiredFiles = [
   "LICENSE",
   "README.md",
-  "RELEASE_NOTES_v1.1.0.md",
+  "docs/release-notes/RELEASE_NOTES_v1.1.0.md",
   "dist/index.js",
   "dist/observer/agent/artifacts.js",
   "dist/observer/agent/application.js",
@@ -350,9 +350,13 @@ const requiredFiles = [
   "dist/workbench/runner.js",
   "dist/workbench/session-controller.js",
   "dist/workbench/session-state.js",
-  "configs/claude-desktop.json",
-  "configs/cursor-global.json",
-  "docs/AGENTS.md",
+  "agents/AGENTS.md",
+  "agents/README.md",
+  "agents/configs/claude-desktop.json",
+  "agents/configs/cursor-global.json",
+  "agents/configs/stdio-template.json",
+  "agents/configs/vscode-template.json",
+  "agents/install-agents.ps1",
   "observer/README.md",
   "observer/protocol/VERSION",
   "observer/protocol/capabilities.md",
@@ -374,8 +378,7 @@ const requiredFiles = [
   "scripts/check-package.mjs",
   "scripts/lib/addon-inventory.mjs",
   "scripts/lib/packed-archive.mjs",
-  "scripts/install-agents.ps1",
-  "scripts/list-tools.mjs",
+  "scripts/verify-mcp-server.mjs",
   "scripts/run-observer-enforce-mailbox-acceptance.mjs",
   "scripts/update-observer-source-manifest.mjs",
   "scripts/setup.ps1",
@@ -383,7 +386,7 @@ const requiredFiles = [
   "tests/fixtures/enforce-mailbox-acceptance-addon/addon.gproj",
   "tests/fixtures/enforce-mailbox-acceptance-addon/Scripts/WorkbenchGame/RFO_MailboxAcceptancePlugin.c",
 ];
-const requiredPrefixes = ["configs/", "data/"];
+const requiredPrefixes = ["agents/configs/", "data/"];
 
 const missingFiles = requiredFiles.filter((path) => !files.has(path));
 const missingPrefixes = requiredPrefixes.filter(
@@ -509,39 +512,94 @@ if (missingFiles.length || missingPrefixes.length || legacyPackagedHandlers.leng
     throw new Error("Installed package does not advertise any executable bins");
   }
 
+  const binRuntimeRoot = join(temporaryRoot, "bin-runtime");
+  const workbenchRoot = join(binRuntimeRoot, "workbench");
+  const gameRoot = join(binRuntimeRoot, "game");
+  const projectRoot = join(binRuntimeRoot, "project");
+  const observerRoot = join(binRuntimeRoot, "observer");
+  const observerProfileRoot = join(observerRoot, "profiles");
+  const evidenceRoot = join(binRuntimeRoot, "evidence");
+  const supportingLogRoot = join(binRuntimeRoot, "supporting-logs");
+  for (const directory of [
+    workbenchRoot,
+    join(workbenchRoot, "Workbench"),
+    gameRoot,
+    join(gameRoot, "addons"),
+    projectRoot,
+    observerRoot,
+    observerProfileRoot,
+    evidenceRoot,
+    supportingLogRoot,
+  ]) {
+    mkdirSync(directory, { recursive: true });
+  }
+  writeFileSync(
+    join(workbenchRoot, "Workbench", "ArmaReforgerWorkbenchSteamDiag.exe"),
+    "",
+    "utf8"
+  );
+  writeFileSync(join(gameRoot, "ArmaReforgerSteam.exe"), "", "utf8");
+  const installedConfigurationPath = join(binRuntimeRoot, "reforger-forge.json");
+  writeFileSync(
+    installedConfigurationPath,
+    `${JSON.stringify({
+      workbenchPath: workbenchRoot,
+      gamePath: gameRoot,
+      projectPath: projectRoot,
+      observer: {
+        managedRoot: observerRoot,
+        profileRoot: observerProfileRoot,
+        agentPath: join(
+          installedPackageRoot,
+          "dist",
+          "observer",
+          "agent",
+          "private-child.js"
+        ),
+        evidenceRoots: [evidenceRoot],
+        supportingLogRoots: [supportingLogRoot],
+      },
+    }, null, 2)}\n`,
+    "utf8"
+  );
   const safeInvocations = new Map([
-    ["reforger-forge-mcp", { arguments: [], input: "" }],
+    ["reforger-forge-mcp", {
+      arguments: ["--config", installedConfigurationPath],
+      input: "",
+    }],
     ["reforger-forge-workbench", {
       arguments: ["--version"],
       expectedStdout: installedManifest.version,
     }],
   ]);
-  const evidenceRoot = join(temporaryRoot, "bin-runtime", "evidence");
-  const supportingLogRoot = join(temporaryRoot, "bin-runtime", "supporting-logs");
-  mkdirSync(evidenceRoot, { recursive: true });
-  mkdirSync(supportingLogRoot, { recursive: true });
-  const probeEnvironment = {
-    ...npmEnvironment,
-    REFORGER_FORGE_OBSERVER_ROOT: join(temporaryRoot, "bin-runtime", "observer"),
-    REFORGER_FORGE_OBSERVER_PROFILE_ROOT: join(
-      temporaryRoot,
-      "bin-runtime",
-      "observer",
-      "profiles"
-    ),
-    REFORGER_FORGE_OBSERVER_AGENT_PATH: join(
-      installedPackageRoot,
-      "dist",
-      "observer",
-      "agent",
-      "private-child.js"
-    ),
-    REFORGER_FORGE_OBSERVER_EVIDENCE_ROOTS: evidenceRoot,
-    REFORGER_FORGE_OBSERVER_SUPPORTING_LOG_ROOTS: supportingLogRoot,
-    ENFUSION_PROJECT_PATH: join(temporaryRoot, "bin-runtime", "project"),
-    ENFUSION_GAME_PATH: join(temporaryRoot, "bin-runtime", "game"),
-    ENFUSION_WORKBENCH_PATH: join(temporaryRoot, "bin-runtime", "workbench"),
-  };
+  const probeEnvironment = { ...npmEnvironment };
+  for (const key of [
+    "ENFUSION_WORKBENCH_PATH",
+    "ENFUSION_PROJECT_PATH",
+    "ENFUSION_GAME_PATH",
+    "ENFUSION_EXTRACTED_PATH",
+    "ENFUSION_MCP_DATA_DIR",
+    "ENFUSION_WORKBENCH_HOST",
+    "ENFUSION_WORKBENCH_PORT",
+    "ENFUSION_DEFAULT_MOD",
+    "REFORGER_FORGE_DEBUG",
+    "REFORGER_FORGE_WORKBENCH_LOG_ROOT",
+    "REFORGER_FORGE_OBSERVER_ROOT",
+    "REFORGER_FORGE_OBSERVER_PROFILE_ROOT",
+    "REFORGER_FORGE_OBSERVER_AGENT_PATH",
+    "REFORGER_FORGE_OBSERVER_EVIDENCE_ROOTS",
+    "REFORGER_FORGE_OBSERVER_SUPPORTING_LOG_ROOTS",
+    "REFORGER_FORGE_OBSERVER_STARTUP_TIMEOUT_MS",
+    "REFORGER_FORGE_OBSERVER_REQUEST_TIMEOUT_MS",
+    "REFORGER_FORGE_OBSERVER_CAPTURE_TIMEOUT_MS",
+    "REFORGER_FORGE_OBSERVER_MAX_INLINE_IMAGE_BYTES",
+    "REFORGER_FORGE_OBSERVER_RETENTION_INTERVAL_MS",
+    "REFORGER_FORGE_OBSERVER_RETENTION_MAX_AGE_MS",
+    "REFORGER_FORGE_OBSERVER_RETENTION_MAX_BYTES",
+    "REFORGER_FORGE_OBSERVER_SESSION_TTL_MS",
+  ]) {
+    delete probeEnvironment[key];
+  }
 
   for (const [binName, target] of Object.entries(advertisedBins)) {
     if (typeof target !== "string" || target.length === 0) {

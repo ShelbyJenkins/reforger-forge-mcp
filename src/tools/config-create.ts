@@ -168,7 +168,7 @@ export function registerConfigCreate(
           content: [
             {
               type: "text",
-              text: `Generated config (no project path configured — not written to disk):\n\n\`\`\`\n${content}\n\`\`\`\n\nSet ENFUSION_PROJECT_PATH to write files automatically.`,
+              text: `Generated config (no project path configured — not written to disk):\n\n\`\`\`\n${content}\n\`\`\`\n\nUse --config/--project-path to write files automatically.`,
             },
           ],
         };

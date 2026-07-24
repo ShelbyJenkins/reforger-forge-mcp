@@ -1,0 +1,13 @@
+{
+  "servers": {
+    "reforger-forge": {
+      "type": "stdio",
+      "command": "node",
+      "args": [
+        "REPLACE_WITH_ABSOLUTE_PATH/dist/index.js",
+        "--config",
+        "REPLACE_WITH_ABSOLUTE_CONFIG_PATH/reforger-forge.config.json"
+      ]
+    }
+  }
+}

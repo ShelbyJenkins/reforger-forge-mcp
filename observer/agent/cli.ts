@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { AGENT_VERSION } from "../protocol/index.js";
 import { requestObserverControl } from "./control-client.js";
 import { errorBody } from "./errors.js";
-import { observerLogger } from "./logger.js";
+import { observerLogger, setObserverDebugEnabled } from "./logger.js";
 import { inspectPaths } from "./paths.js";
 import { createObserverApplication } from "./application.js";
 
@@ -57,6 +57,7 @@ function createCliApplication(options: ReturnType<typeof baseOptions> & { port?:
 
 export async function runCli(argumentsArray: string[]): Promise<void> {
   try {
+    setObserverDebugEnabled(argumentsArray.includes("--debug"));
     const command = argumentsArray[0] ?? "serve";
     if (command === "--version" || command === "version") {
       process.stdout.write(`${AGENT_VERSION}\n`);

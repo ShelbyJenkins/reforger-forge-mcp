@@ -1,8 +1,15 @@
 import { readFileSync, existsSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { logger } from "../utils/logger.js";
 import type { PrefabRecipe, RecipeVariant } from "./recipe.js";
-import { loadConfig } from "../config.js";
+
+const PACKAGE_DATA_DIRECTORY = resolve(
+  dirname(fileURLToPath(import.meta.url)),
+  "..",
+  "..",
+  "data"
+);
 
 /**
  * RecipeLoader - Loads, validates, caches, and merges prefab recipes.
@@ -14,6 +21,8 @@ import { loadConfig } from "../config.js";
 export class RecipeLoader {
   private cache: Map<string, PrefabRecipe> = new Map();
   private loaded = false;
+
+  constructor(private readonly dataDirectory = PACKAGE_DATA_DIRECTORY) {}
 
   /**
    * Get a recipe by ID, optionally applying a variant override.
@@ -78,8 +87,7 @@ export class RecipeLoader {
       "generic",
     ];
 
-    const config = loadConfig();
-    const recipesDir = join(config.dataDir, "recipes");
+    const recipesDir = join(this.dataDirectory, "recipes");
 
     for (const id of recipeIds) {
       const path = join(recipesDir, `${id}.json`);

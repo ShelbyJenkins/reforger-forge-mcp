@@ -81,6 +81,7 @@ const RUNTIME_FAILURE_MATRIX_SOURCES = Object.freeze([
 
 export interface RuntimeFailureMatrixOptions {
   readonly confirmed: boolean;
+  readonly configPath: string;
   readonly environment?: NodeJS.ProcessEnv;
   readonly artifactRoot?: string;
   readonly validationRoot?: string;
@@ -690,7 +691,7 @@ export async function runRuntimeFailureMatrix(
     "Runtime matrix world resource",
     1_024
   );
-  const executable = findRuntimeExecutable(options.executablePath);
+  const executable = findRuntimeExecutable(options.executablePath, options.configPath);
   const validationRoot = options.validationRoot ?? join(REPOSITORY_ROOT, "docs", "validation");
 
   assertArmaVacant("Runtime failure-matrix preflight");

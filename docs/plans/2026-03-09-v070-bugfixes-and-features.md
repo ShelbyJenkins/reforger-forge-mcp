@@ -1383,11 +1383,11 @@ npm version minor --no-git-tag-version
 # This bumps 0.6.4 → 0.7.0
 ```
 
-**Step 2: Update UPGRADE_IDEAS.md**
+**Step 2: Update docs/UPGRADE_IDEAS.md**
 
 Mark items #9, #12, #14 as done with strikethrough.
 
-**Step 3: Update TODO.md**
+**Step 3: Update docs/TODO.md**
 
 Remove or mark as fixed any bugs that were addressed (enfusion-text escaping, extractParamNames, socket handling, PAK bounds, protocol response, handler rollback, pattern collisions, asset-search GUID errors, scenario cleanup).
 

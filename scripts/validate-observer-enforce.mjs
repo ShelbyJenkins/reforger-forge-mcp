@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   existsSync,
   cpSync,
@@ -13,12 +13,11 @@ import {
 import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { redactText } from "#foundation/redact";
 
 const scriptDirectory = dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = resolve(scriptDirectory, "..");
-const defaultConfigPath = join(repositoryRoot, "reforger-forge.config.json");
 const defaultArtifactPath = join(repositoryRoot, ".artifacts", "observer-enforce-compile.json");
 const runtimeAddonProjectPath = join(repositoryRoot, "observer", "addon", "addon.gproj");
 const workbenchAddonProjectPath = join(repositoryRoot, "observer", "workbench-addon", "addon.gproj");
@@ -67,7 +66,7 @@ function fail(message) {
 function parseArguments(argv) {
   const result = {
     artifactPath: defaultArtifactPath,
-    configPath: defaultConfigPath,
+    configPath: null,
     configuration: "PC",
     timeoutMs: 180_000,
     workbenchPath: null,
@@ -75,8 +74,14 @@ function parseArguments(argv) {
     target: "both",
     protocolOnly: false,
   };
+  const seen = new Set();
+  const repeatable = new Set(["--addons-dir"]);
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index];
+    if (argument.startsWith("--") && !repeatable.has(argument)) {
+      if (seen.has(argument)) throw new Error(`${argument} may be supplied only once`);
+      seen.add(argument);
+    }
     const value = argv[index + 1];
     if (["--artifact", "--config", "--configuration", "--timeout-ms", "--workbench", "--addons-dir", "--target"].includes(argument)) {
       if (!value || value.startsWith("--")) throw new Error(`${argument} requires a value`);
@@ -104,6 +109,9 @@ function parseArguments(argv) {
   }
   if (!["runtime", "workbench", "both"].includes(result.target)) {
     throw new Error("--target must be runtime, workbench, or both");
+  }
+  if (!result.help && !result.protocolOnly && !result.configPath) {
+    throw new Error("Native Enforce validation requires --config <file>");
   }
   return result;
 }
@@ -135,11 +143,32 @@ function resolveWorkbenchExecutable(workbenchPath) {
   throw new Error(`Could not find ${workbenchExecutableName} beneath the configured Workbench path`);
 }
 
-function readConfiguration(path) {
-  if (!existsSync(path)) return {};
-  const value = JSON.parse(readFileSync(path, "utf8"));
-  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Workbench config must be a JSON object");
-  return value;
+async function loadValidatedConfiguration(options) {
+  const compiledConfigPath = join(repositoryRoot, "dist", "config.js");
+  const sourceConfigPath = join(repositoryRoot, "src", "config.ts");
+  requiredFile(
+    compiledConfigPath,
+    "Compiled configuration loader (run npm run build before native validation)"
+  );
+  if (existsSync(sourceConfigPath) &&
+      statSync(compiledConfigPath).mtimeMs < statSync(sourceConfigPath).mtimeMs) {
+    throw new Error("Compiled configuration loader is older than src/config.ts; run npm run build");
+  }
+  const {
+    EXPLICIT_CONFIGURATION_CONTRACT_VERSION,
+    loadConfig,
+  } = await import(pathToFileURL(compiledConfigPath).href);
+  if (EXPLICIT_CONFIGURATION_CONTRACT_VERSION !== 1) {
+    throw new Error("Compiled configuration loader does not implement the required explicit-config contract; run npm run build");
+  }
+  const argumentsArray = ["--config", options.configPath];
+  if (options.workbenchPath) {
+    argumentsArray.push("--workbench-path", options.workbenchPath);
+  }
+  for (const directory of options.addonDirectories) {
+    argumentsArray.push("--workbench-addon-dir", directory);
+  }
+  return loadConfig(argumentsArray);
 }
 
 function workbenchIsRunning() {
@@ -285,8 +314,9 @@ function validateProtocolPreflight(target) {
 function runBothTargets(options) {
   const targetResults = {};
   let passed = true;
+  const aggregateRunId = randomUUID();
   for (const target of ["runtime", "workbench"]) {
-    const targetArtifactPath = `${options.artifactPath}.${target}.json`;
+    const targetArtifactPath = `${options.artifactPath}.${aggregateRunId}.${target}.json`;
     const arguments_ = [
       "--target", target,
       "--artifact", targetArtifactPath,
@@ -342,9 +372,10 @@ if (!options) {
   // parseArguments already reported the failure.
 } else if (options.help) {
   process.stdout.write(
-    "Usage: node scripts/validate-observer-enforce.mjs [--config path] [--workbench path] " +
+    "Usage: node scripts/validate-observer-enforce.mjs --config path [--workbench path] " +
     "[--addons-dir path ...] [--configuration PC] [--timeout-ms 180000] [--artifact path] " +
-    "[--protocol-only] [--target runtime|workbench|both]\n"
+    "[--target runtime|workbench|both]\n" +
+    "       node scripts/validate-observer-enforce.mjs --protocol-only [--target runtime|workbench|both]\n"
   );
 } else if (!protocolPreflightPassed) {
   // The preflight already emitted a categorized drift failure. Never launch a
@@ -364,16 +395,9 @@ if (!options) {
     requiredFile(addonProjectPath, `${options.target} addon project`);
     requiredFile(addonManifestPath, `${options.target} addon source manifest`);
     requiredFile(requiredSourcePath, `${options.target} generated protocol source`);
-    const config = readConfiguration(options.configPath);
-    const configuredWorkbenchPath = options.workbenchPath ??
-      (typeof config.workbenchPath === "string" && config.workbenchPath.length > 0 ? resolve(config.workbenchPath) : null);
-    if (!configuredWorkbenchPath) throw new Error("Configure workbenchPath or pass --workbench");
-    const executable = resolveWorkbenchExecutable(configuredWorkbenchPath);
-    const configuredAddonDirectories = options.addonDirectories.length > 0
-      ? options.addonDirectories
-      : Array.isArray(config.workbenchAddonDirs)
-        ? config.workbenchAddonDirs.filter((value) => typeof value === "string" && value.length > 0).map((value) => resolve(value))
-        : [];
+    const config = await loadValidatedConfiguration(options);
+    const executable = resolveWorkbenchExecutable(config.workbenchPath);
+    const configuredAddonDirectories = config.workbenchAddonDirs ?? [];
     if (configuredAddonDirectories.length === 0) {
       throw new Error("Configure workbenchAddonDirs or pass at least one --addons-dir for project dependency resolution");
     }

@@ -75,6 +75,7 @@ import {
   WORKBENCH_MATRIX_FIXTURE_TEMPLATE_DIR,
   WorkbenchObserverAcceptanceRuntime,
   acceptanceConfig,
+  loadAcceptanceBaseConfig,
   workbenchEnvironmentExecutables,
 } from "./workbench-observer-acceptance-runtime.js";
 import {
@@ -183,6 +184,7 @@ const TERMINAL_STATES = new Set<string>(OBSERVER_TERMINAL_STATES);
 
 export interface WorkbenchObserverAcceptanceOptions {
   confirmed: boolean;
+  configPath: string;
   environment?: NodeJS.ProcessEnv;
   artifactRoot?: string;
   /** Defaults to the repository's docs/validation directory. */
@@ -684,6 +686,7 @@ export async function runWorkbenchObserverAcceptance(
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 60_000 || timeoutMs > 600_000) {
     throw new Error("Live Workbench observer timeout must be 60000..600000 ms");
   }
+  loadAcceptanceBaseConfig(options.configPath);
   assertNoArmaOrWorkbench();
   const artifactRoot = canonicalDirectory(
     options.artifactRoot ?? (() => {
@@ -699,14 +702,28 @@ export async function runWorkbenchObserverAcceptance(
   const validationRoot = resolve(
     options.validationRoot ?? join(REPOSITORY_ROOT, "docs", "validation")
   );
-  const runtime = new WorkbenchObserverAcceptanceRuntime({
-    runDirectory,
-    clientIdPrefix: "live-workbench-observer",
-    launchTimeoutMs: Math.min(180_000, timeoutMs),
-    createAdapter: (client) => new WorkbenchObserverAdapter(client, {
-      handlerTimeoutMs: 10_000,
-    }),
-  });
+  let runtime: WorkbenchObserverAcceptanceRuntime<WorkbenchObserverAdapter>;
+  try {
+    runtime = new WorkbenchObserverAcceptanceRuntime({
+      configPath: options.configPath,
+      runDirectory,
+      clientIdPrefix: "live-workbench-observer",
+      launchTimeoutMs: Math.min(180_000, timeoutMs),
+      createAdapter: (client) => new WorkbenchObserverAdapter(client, {
+        handlerTimeoutMs: 10_000,
+      }),
+    });
+  } catch (error) {
+    try {
+      rmSync(runDirectory, { recursive: true, force: true });
+    } catch (cleanupError) {
+      throw new AggregateError(
+        [error, cleanupError],
+        "Workbench observer composition failed and its unlaunched scratch directory could not be removed"
+      );
+    }
+    throw error;
+  }
   const {
     application,
     adapter,
@@ -1229,6 +1246,7 @@ export async function runWorkbenchObserverAcceptance(
 
 export interface WorkbenchFailureMatrixOptions {
   readonly confirmed: boolean;
+  readonly configPath: string;
   readonly environment?: NodeJS.ProcessEnv;
   readonly artifactRoot?: string;
   readonly validationRoot?: string;
@@ -1296,6 +1314,7 @@ const WORKBENCH_LIVE_MATRIX_CASE_SERVICES: WorkbenchLiveMatrixCaseServices = {
 };
 
 async function runLiveWorkbenchMatrixCase(input: {
+  readonly configPath: string;
   readonly matrixCase: WorkbenchFaultMatrixCase;
   readonly caseDirectory: string;
   readonly timeoutMs: number;
@@ -1333,6 +1352,7 @@ export async function runWorkbenchFailureMatrix(
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 60_000 || timeoutMs > 600_000) {
     throw new Error("Live Workbench matrix per-case timeout must be 60000..600000 ms");
   }
+  loadAcceptanceBaseConfig(options.configPath);
   const initialSourceRevision = workbenchMatrixSourceRevision();
   if (!options.only &&
       (initialSourceRevision.tree !== "clean" || initialSourceRevision.commit === null)) {
@@ -1369,6 +1389,7 @@ export async function runWorkbenchFailureMatrix(
     let outcome: WorkbenchLiveMatrixCaseOutcome;
     try {
       outcome = await runLiveWorkbenchMatrixCase({
+        configPath: options.configPath,
         matrixCase,
         caseDirectory,
         timeoutMs,
@@ -1379,6 +1400,7 @@ export async function runWorkbenchFailureMatrix(
       // guarded launch body. Preserve a bounded failed row and continue so one
       // aggregate diagnostic artifact still covers the complete selection.
       const fallbackConfig = acceptanceConfig(
+        options.configPath,
         join(caseDirectory, "fallback-project"),
         join(caseDirectory, "fallback-managed")
       );
@@ -1471,6 +1493,7 @@ export async function runWorkbenchFailureMatrix(
     selectedCaseIds: selectedCases.map((matrixCase) => matrixCase.id),
   };
   const aggregateConfig = acceptanceConfig(
+    options.configPath,
     join(aggregateRunDirectory, "aggregate-project"),
     join(aggregateRunDirectory, "aggregate-managed")
   );
@@ -1580,9 +1603,9 @@ export async function runWorkbenchFailureMatrix(
   return { ...publication, runDirectory: reviewDirectory };
 }
 function usage(): string {
-  return `Usage: npm run dev:observer:acceptance:workbench -- [--confirm-live-run] [--artifact-root <directory>] [--validation-root <directory>] [--timeout-ms <60000..600000>]\n` +
-    `       npm run dev:observer:acceptance:workbench -- --matrix --confirm-live-run [matrix options]\n` +
-    `       npm run dev:observer:acceptance:workbench -- --only <workbench-case-id> --confirm-live-run [--keep-profile] [matrix options]\n` +
+  return `Usage: npm run dev:observer:acceptance:workbench -- --config <file> [--confirm-live-run] [--artifact-root <directory>] [--validation-root <directory>] [--timeout-ms <60000..600000>]\n` +
+    `       npm run dev:observer:acceptance:workbench -- --config <file> --matrix --confirm-live-run [matrix options]\n` +
+    `       npm run dev:observer:acceptance:workbench -- --config <file> --only <workbench-case-id> --confirm-live-run [--keep-profile] [matrix options]\n` +
     `       npm run dev:observer:acceptance:workbench -- --list-cases\n\n` +
     `No matrix selector runs the existing positive-path acceptance. --matrix selects all 69 Workbench cases; --only selects one partial-coverage case.\n` +
     `Required environment: ${LIVE_WORKBENCH_OBSERVER_ENVIRONMENT}=1\n`;
@@ -1614,6 +1637,7 @@ export function readWorkbenchCliFlag(args: readonly string[], name: string): boo
 
 interface WorkbenchCliLiveOptions {
   readonly confirmed: boolean;
+  readonly configPath: string;
   readonly artifactRoot?: string;
   readonly validationRoot?: string;
   readonly timeoutMs?: number;
@@ -1630,7 +1654,9 @@ export function parseWorkbenchObserverCliArgs(args: readonly string[]): Workbenc
   const seen = new Set<string>();
   const values: Record<string, string> = {};
   const flags = new Set<string>();
-  const valueOptions = new Set(["--artifact-root", "--validation-root", "--timeout-ms", "--only"]);
+  const valueOptions = new Set([
+    "--config", "--artifact-root", "--validation-root", "--timeout-ms", "--only",
+  ]);
   const flagOptions = new Set([
     "--help", "--list-cases", "--confirm-live-run", "--matrix", "--keep-profile",
   ]);
@@ -1666,6 +1692,10 @@ export function parseWorkbenchObserverCliArgs(args: readonly string[]): Workbenc
   if (flags.has("--keep-profile") && !values["--only"]) {
     throw new Error("--keep-profile is valid only together with --only");
   }
+  const configPath = values["--config"];
+  if (!configPath) {
+    throw new Error("Live Workbench observer acceptance requires --config <file>");
+  }
   const timeoutValue = values["--timeout-ms"];
   const timeoutMs = timeoutValue === undefined ? undefined : Number(timeoutValue);
   if (timeoutMs !== undefined &&
@@ -1674,6 +1704,7 @@ export function parseWorkbenchObserverCliArgs(args: readonly string[]): Workbenc
   }
   const common: WorkbenchCliLiveOptions = {
     confirmed: flags.has("--confirm-live-run"),
+    configPath,
     ...(values["--artifact-root"] ? { artifactRoot: values["--artifact-root"] } : {}),
     ...(values["--validation-root"] ? { validationRoot: values["--validation-root"] } : {}),
     ...(timeoutMs !== undefined ? { timeoutMs } : {}),

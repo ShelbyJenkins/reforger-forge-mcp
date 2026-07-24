@@ -37,6 +37,35 @@ The MCP now has an intelligent prefab creation system that guides users through 
 
 ---
 
+## Architecture Layers
+
+1. **User layer**
+   - An LLM interprets the user's intent.
+   - It calls the prefab tool with the requested action, prefab type, variant, name, and optional customizations.
+
+2. **MCP tool layer** (`src/tools/prefab.ts`)
+   - Validates inputs.
+   - Loads the matching recipe.
+   - Resolves prefab ancestry.
+   - Calls `generatePrefab()`.
+   - Writes the prefab and formats the response with its follow-up checklist.
+
+3. **Recipe layer** (`src/templates/recipe*.ts` and `data/recipes/*.json`)
+   - Defines the recipe schema.
+   - Lazily loads, validates, and caches recipe data.
+   - Applies variant specializations such as handgun or rifle.
+
+4. **Integration layer**
+   - The ancestry resolver walks parent chains and preserves inherited component GUIDs.
+   - The prefab generator combines inherited, recipe-provided, and user-provided components.
+   - The serializer converts the resulting entity tree to Enfusion `.et` text.
+
+5. **Output layer**
+   - Writes the generated prefab to the target project.
+   - Returns the resulting path, ancestry summary, and configuration checklist.
+
+---
+
 ## Data Layer: 12 Recipe Categories
 
 ### Complete Inventory
@@ -155,6 +184,33 @@ Response to user:
   [ ] Configure SightsComponent ADS camera
   [ ] Verify magazine/ammo compatibility
 ```
+
+---
+
+## Component Merging Strategy
+
+The generator combines three component sources:
+
+```text
+ancestorComponents + recipeComponents + userComponents
+```
+
+Components are considered in this order:
+
+1. **Ancestor components** preserve the GUIDs resolved from the parent chain.
+2. **Recipe components** fill gaps that are not already supplied by ancestry.
+3. **User components** are appended as explicit request-level customizations.
+
+For example:
+
+```text
+ancestor: [WeaponComponent{GUID1}, MuzzleComponent{GUID2}, ...]
+recipe:   [MeshObject, WeaponSoundComponent]
+result:   [WeaponComponent{GUID1}, MuzzleComponent{GUID2}, ...,
+           MeshObject{newGUID}, WeaponSoundComponent{newGUID}]
+```
+
+This preserves inherited component identity while adding the recipe's required customization points. The generator does not deduplicate user components by type; a caller that intends to modify an inherited component must supply the appropriate GUID and valid Enfusion override semantics.
 
 ---
 

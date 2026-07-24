@@ -74,6 +74,30 @@ function manifestForEnforceTarget(outputPath: string) {
 }
 
 describe("observer package and source contracts", () => {
+  it("rejects stale native config loaders and stale aggregate target artifacts", () => {
+    const enforce = readFileSync(
+      join(repositoryRoot, "scripts", "validate-observer-enforce.mjs"),
+      "utf8"
+    );
+    const mailbox = readFileSync(
+      join(repositoryRoot, "scripts", "run-observer-enforce-mailbox-acceptance.mjs"),
+      "utf8"
+    );
+
+    for (const source of [enforce, mailbox]) {
+      expect(source).toContain("EXPLICIT_CONFIGURATION_CONTRACT_VERSION !== 1");
+      expect(source).toContain("Compiled configuration loader is older than src/config.ts");
+      expect(source).toContain('loadConfig(argumentsArray)');
+    }
+    expect(enforce).toContain("const aggregateRunId = randomUUID()");
+    expect(enforce).toContain(
+      "`${options.artifactPath}.${aggregateRunId}.${target}.json`"
+    );
+    expect(enforce).not.toContain(
+      "const targetArtifactPath = `${options.artifactPath}.${target}.json`"
+    );
+  });
+
   it("keeps observer and MCP builds separate and publishes required runtime assets", () => {
     const packageJson = JSON.parse(readFileSync(join(repositoryRoot, "package.json"), "utf8"));
     const gitAttributes = readFileSync(join(repositoryRoot, ".gitattributes"), "utf8");
@@ -252,8 +276,11 @@ describe("observer package and source contracts", () => {
       "observer_runtime",
       "observer_setup",
     ];
-    const toolLister = readFileSync(join(repositoryRoot, "scripts", "list-tools.mjs"), "utf8");
-    const observerBlock = toolLister.match(/const observerNames = new Set\(\[([\s\S]*?)\]\);/)?.[1] ?? "";
+    const serverVerifier = readFileSync(
+      join(repositoryRoot, "scripts", "verify-mcp-server.mjs"),
+      "utf8"
+    );
+    const observerBlock = serverVerifier.match(/const observerNames = new Set\(\[([\s\S]*?)\]\);/)?.[1] ?? "";
     const discovered = [...observerBlock.matchAll(/"(observer_[a-z_]+)"/g)]
       .map((match) => match[1])
       .sort();
@@ -274,7 +301,7 @@ describe("observer package and source contracts", () => {
     expect(observerReadme).toContain("terminal restoration");
     expect(observerReadme).toContain("lifecycle recovery");
 
-    const agentInstructions = readFileSync(join(repositoryRoot, "docs", "AGENTS.md"), "utf8");
+    const agentInstructions = readFileSync(join(repositoryRoot, "agents", "AGENTS.md"), "utf8");
     expect(agentInstructions).toContain("`observer_runtime`");
     expect(agentInstructions).toContain("preparedLaunchId");
   });

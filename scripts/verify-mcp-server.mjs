@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
- * Lists all tools registered by ReforgerForge MCP.
- * Run: node scripts/list-tools.mjs
+ * Verifies the ReforgerForge MCP server and its registered tool contract.
+ * Run: node scripts/verify-mcp-server.mjs --config C:\path\to\config.json
  */
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
@@ -11,14 +11,15 @@ import { fileURLToPath } from "node:url";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const serverPath = join(root, "dist", "index.js");
+const serverArguments = process.argv.slice(2);
 
 const transport = new StdioClientTransport({
   command: "node",
-  args: [serverPath],
+  args: [serverPath, ...serverArguments],
   cwd: root,
 });
 
-const client = new Client({ name: "tool-lister", version: "1.1.0" });
+const client = new Client({ name: "server-verifier", version: "1.1.0" });
 
 console.log("Connecting to ReforgerForge MCP...\n");
 

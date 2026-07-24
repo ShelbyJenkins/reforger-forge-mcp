@@ -124,7 +124,7 @@ export function registerScriptCreate(server: McpServer, config: Config, searchEn
           content: [
             {
               type: "text",
-              text: `Generated script (no project path configured — not written to disk):\n\n\`\`\`c\n${code}\`\`\`\n\nSet ENFUSION_PROJECT_PATH to write files automatically.`,
+              text: `Generated script (no project path configured — not written to disk):\n\n\`\`\`c\n${code}\`\`\`\n\nUse --config/--project-path to write files automatically.`,
             },
           ],
         };

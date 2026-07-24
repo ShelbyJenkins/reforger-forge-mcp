@@ -9,6 +9,11 @@
   - Optionally installs reforger-forge into supported MCP clients
 #>
 
+param(
+    [Parameter(Mandatory = $true)]
+    [string]$ConfigPath
+)
+
 $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $PSScriptRoot
 
@@ -19,12 +24,12 @@ Write-Host "Repo: $Root"
 
 $requiredAssets = @(
     "reforger-forge.config.example.json",
-    "scripts\list-tools.mjs",
-    "scripts\install-agents.ps1",
+    "scripts\verify-mcp-server.mjs",
+    "agents\install-agents.ps1",
     "scripts\windows\workbench-lifecycle.ps1",
-    "docs\AGENTS.md",
-    "configs\claude-desktop.json",
-    "configs\cursor-global.json"
+    "agents\AGENTS.md",
+    "agents\configs\claude-desktop.json",
+    "agents\configs\cursor-global.json"
 )
 foreach ($asset in $requiredAssets) {
     if (-not (Test-Path (Join-Path $Root $asset) -PathType Leaf)) {
@@ -51,11 +56,18 @@ if ($nodeMajor -lt 20) {
 }
 Write-Host "Node.js: $nodeVersion"
 
-# Create local config if missing
-$configPath = Join-Path $Root "reforger-forge.config.json"
-if (-not (Test-Path $configPath)) {
-    Copy-Item (Join-Path $Root "reforger-forge.config.example.json") $configPath
-    Write-Host "Created reforger-forge.config.json - edit your projectPath if needed." -ForegroundColor Yellow
+# Create the explicitly selected config if missing, then stop so placeholder
+# installation paths cannot be mistaken for a valid setup.
+$ConfigPath = [System.IO.Path]::GetFullPath($ConfigPath)
+if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) {
+    $configDirectory = Split-Path $ConfigPath -Parent
+    if ($configDirectory -and -not (Test-Path -LiteralPath $configDirectory)) {
+        New-Item -ItemType Directory -Force -Path $configDirectory | Out-Null
+    }
+    Copy-Item -LiteralPath (Join-Path $Root "reforger-forge.config.example.json") -Destination $ConfigPath
+    Write-Host "Created $ConfigPath" -ForegroundColor Yellow
+    Write-Host "Edit its required paths, then rerun this exact setup command." -ForegroundColor Yellow
+    exit 2
 }
 
 # Build
@@ -72,16 +84,16 @@ Write-Host "Build complete." -ForegroundColor Green
 # List tools
 Write-Host ""
 Write-Host "Verifying tools..." -ForegroundColor Yellow
-node (Join-Path $Root "scripts\list-tools.mjs")
+node (Join-Path $Root "scripts\verify-mcp-server.mjs") --config $ConfigPath
 if ($LASTEXITCODE -ne 0) { exit 1 }
 
-# Optional global Cursor config
+# Optional MCP client installation
 Write-Host ""
-$answer = Read-Host "Install into AI agents? (all/cursor/antigravity/claude/windsurf/vscode/continue/kiro/n)"
+$answer = Read-Host "Install into AI agents? (all/codex/cursor/antigravity/claude/windsurf/vscode/continue/kiro/n)"
 if ($answer -eq "all") {
-    & (Join-Path $Root "scripts\install-agents.ps1") -All
+    & (Join-Path $Root "agents\install-agents.ps1") -ConfigPath $ConfigPath -All
 } elseif ($answer -ne "n" -and $answer -ne "N" -and $answer -ne "") {
-    & (Join-Path $Root "scripts\install-agents.ps1") -Agent $answer
+    & (Join-Path $Root "agents\install-agents.ps1") -ConfigPath $ConfigPath -Agent $answer
 }
 
 Write-Host ""

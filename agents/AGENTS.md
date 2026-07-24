@@ -7,8 +7,8 @@ in any committed copy. It is written for coding agents that can use the
 ReforgerForge MCP server.
 
 Do not put private machine paths, account names, tokens, or local MCP config in
-the committed version of this file. Keep those values in the ignored
-`reforger-forge.config.json` or in the MCP client's local configuration.
+the committed version of this file. Keep them in one ignored JSON file selected
+explicitly by the MCP client's `--config <absolute-path>` arguments.
 
 ## Workspace Facts
 
@@ -40,15 +40,19 @@ ReforgerForge requires Node.js 20 or newer. Arma Reforger Tools is required for
 builds, resource registration, and live editor-control operations, and the Arma
 Reforger game installation is required for base-game asset browsing.
 
-1. Build and install ReforgerForge into the MCP client as described in its
-   README.
-2. Copy `reforger-forge.config.example.json` to
-   `reforger-forge.config.json` in the ReforgerForge repository.
-3. Set the local Workbench, game, project, and addon-root paths.
-4. After changing path, host, or port values, rerun
-   `scripts/install-agents.ps1` so clients receive the new environment values,
-   then restart the MCP process.
+1. Build ReforgerForge as described in its README.
+2. Copy `reforger-forge.config.example.json` to an ignored local path and set
+   the Workbench, game, project, and addon-root paths.
+3. Install the MCP client entry with the absolute server path followed by
+   `--config <absolute-config-path>`.
+4. Restart the MCP process after changing values in that file. Rerun the
+   installer only if the selected file path changes.
 5. Confirm the client can see the `reforger-forge` tools.
+
+ReforgerForge does not discover a package-local or user-home file and does not
+read environment variables for server configuration. CLI values override the
+explicit file. Relative paths in that file resolve from the file's directory,
+while relative CLI paths resolve from the MCP process working directory.
 
 Use placeholders rather than real local paths in committed documentation:
 
@@ -153,8 +157,8 @@ Project scripts and CI should call the packaged lifecycle runner instead of
 maintaining another process guard:
 
 ```text
-reforger-forge-workbench editor --gproj <path> --foreground
-reforger-forge-workbench build --gproj <path> --platform PC --output <path> --timeout-ms <n>
+reforger-forge-workbench --config <config> editor --gproj <path> --foreground
+reforger-forge-workbench --config <config> build --gproj <path> --platform PC --output <path> --timeout-ms <n>
 ```
 
 Editor ownership is foreground-only. The canonical target-build plan is
@@ -206,7 +210,7 @@ controller path without changing the public build command:
 
 ```powershell
 $env:RFO_RUN_LIVE_WORKBENCH_BUILD_ACCEPTANCE = '1'
-npm run dev:workbench:acceptance:build -- --confirm-live-run --gproj <ABSOLUTE_TARGET_GPROJ> --output-root <EXTERNAL_OUTPUT_PARENT>
+npm run dev:workbench:acceptance:build -- --config <CONFIG_PATH> --confirm-live-run --gproj <ABSOLUTE_TARGET_GPROJ> --output-root <EXTERNAL_OUTPUT_PARENT>
 ```
 
 It creates two distinct exclusive output directories and writes sanitized

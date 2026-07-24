@@ -50,7 +50,7 @@ export function registerWbEntityDuplicate(
           .string()
           .optional()
           .describe(
-            "Addon folder name under ENFUSION_PROJECT_PATH (e.g. 'MyMod'). " +
+            "Addon folder name under the configured projectPath (e.g. 'MyMod'). " +
             "If omitted, the first addon found in the project path is used."
           ),
         replaceInScene: z

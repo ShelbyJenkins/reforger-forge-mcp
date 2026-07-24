@@ -463,30 +463,17 @@ function companionReadiness(
   });
 }
 
-function resolveMcpWorkingDirectory(
-  config: WorkbenchLaunchConfiguration,
-  executablePath: string
-): string {
-  const configuredCandidates = [
-    config.gamePath,
-    process.env.ENFUSION_GAME_PATH,
-    resolve(config.workbenchPath, "..", "Arma Reforger"),
-    resolve(config.workbenchPath, "..", "ArmaReforger"),
-    resolve(config.workbenchPath, "..", "..", "Arma Reforger"),
-    resolve(config.workbenchPath, "..", "..", "ArmaReforger"),
-  ];
-  for (const candidate of configuredCandidates) {
-    if (typeof candidate !== "string" || candidate.trim().length === 0) continue;
-    try {
-      const canonical = realpathSync.native(resolve(candidate.trim()));
-      if (statSync(canonical).isDirectory() && statSync(join(canonical, "addons")).isDirectory()) {
-        return canonical;
-      }
-    } catch {
-      // Fall back to the executable directory, matching the existing MCP policy.
-    }
+function resolveMcpWorkingDirectory(config: WorkbenchLaunchConfiguration): string {
+  const gamePath = canonicalDirectory(config.gamePath, "Configured Arma Reforger game path");
+  try {
+    if (statSync(join(gamePath, "addons")).isDirectory()) return gamePath;
+  } catch {
+    // Report the explicit installation path below.
   }
-  return dirname(executablePath);
+  throw planError(
+    "INVALID_CONFIG",
+    `Configured Arma Reforger game path has no addons directory: ${gamePath}`
+  );
 }
 
 function spawnPolicy(
@@ -721,7 +708,7 @@ export function buildMcpEditorLaunchPlan(
       prepared.ownerArgument
     ),
     spawnOptions: spawnPolicy(
-      resolveMcpWorkingDirectory(input.config, prepared.executablePath),
+      resolveMcpWorkingDirectory(input.config),
       true,
       false
     ),

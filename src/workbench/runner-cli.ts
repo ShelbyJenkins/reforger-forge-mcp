@@ -4,8 +4,9 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import type { Config } from "../config.js";
-import { loadConfig } from "../config.js";
+import { loadConfig, partitionConfigurationArguments } from "../config.js";
 import { redactText } from "../foundation/redact.js";
+import { setDebugEnabled } from "../utils/logger.js";
 import {
   parseWorkbenchRunnerArguments,
   runWorkbenchIntent,
@@ -37,9 +38,10 @@ interface WorkbenchRunnerCliOutput {
 }
 
 export interface WorkbenchRunnerCliDependencies {
-  readonly loadConfiguration?: () => Config;
+  readonly loadConfiguration?: (argumentsArray: readonly string[]) => Config;
   readonly runIntent?: typeof runWorkbenchIntent;
   readonly packageVersion?: () => string;
+  readonly setDebug?: (enabled: boolean) => void;
   readonly stdout?: WorkbenchRunnerCliOutput;
   readonly stderr?: WorkbenchRunnerCliOutput;
   readonly signal?: AbortSignal;
@@ -55,15 +57,21 @@ export async function executeWorkbenchRunnerCli(
 ): Promise<number> {
   const stdout = dependencies.stdout ?? { write: (value: string) => process.stdout.write(value) };
   const stderr = dependencies.stderr ?? { write: (value: string) => process.stderr.write(value) };
-  if (cliArguments.length === 1 && cliArguments[0] === "--version") {
+  const partitioned = partitionConfigurationArguments(cliArguments);
+  if (partitioned.remainingArguments.length === 1
+      && partitioned.remainingArguments[0] === "--version") {
     stdout.write(`${(dependencies.packageVersion ?? installedPackageVersion)()}\n`);
     return 0;
   }
 
   try {
-    const intent = parseWorkbenchRunnerArguments(cliArguments);
+    const intent = parseWorkbenchRunnerArguments(partitioned.remainingArguments);
+    const config = (dependencies.loadConfiguration ?? loadConfig)(
+      partitioned.configurationArguments
+    );
+    (dependencies.setDebug ?? setDebugEnabled)(config.debug === true);
     const receipt = await (dependencies.runIntent ?? runWorkbenchIntent)(
-      (dependencies.loadConfiguration ?? loadConfig)(),
+      config,
       intent,
       dependencies.signal ? { signal: dependencies.signal } : {}
     );

@@ -139,13 +139,15 @@ const EVALUATOR_CONTRACT = Object.freeze({
 
 export interface WorkbenchBuildAcceptanceOptions {
   confirmed: boolean;
+  /** Explicit configuration file. Required unless the test-only config seam is supplied. */
+  configPath?: string;
   gprojPath: string;
   outputParent: string;
   timeoutMs?: number;
   environment?: NodeJS.ProcessEnv;
   /** Test seam only. The CLI always writes beneath repository docs/validation. */
   validationRoot?: string;
-  /** Test seam only. The CLI loads the controlled local configuration. */
+  /** Test seam only. The CLI always loads configPath. */
   config?: Config;
 }
 
@@ -991,7 +993,10 @@ export async function runWorkbenchBuildAcceptance(
   const timeoutMs = requireTimeout(options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
   const now = dependencies.now ?? Date.now;
   const randomId = dependencies.randomId ?? randomUUID;
-  const config = options.config ?? loadConfig();
+  if (!options.config && !options.configPath) {
+    throw acceptanceError("Live target-build acceptance requires --config <file>.");
+  }
+  const config = options.config ?? loadConfig(["--config", options.configPath!]);
   if (!isLoopbackLifecycleHost(config.workbenchHost)) {
     throw acceptanceError("Controlled target-build acceptance requires a numeric loopback endpoint.");
   }
@@ -1086,6 +1091,7 @@ export async function runWorkbenchBuildAcceptance(
   };
   const username = options.environment?.USERNAME ?? process.env.USERNAME ?? "";
   assertSanitizedBuildAcceptanceArtifact(artifact, [
+    options.configPath ?? "",
     options.gprojPath,
     options.outputParent,
     bundle.bundleRoot,
@@ -1105,6 +1111,7 @@ export async function runWorkbenchBuildAcceptance(
 
 interface ParsedArguments {
   confirmed: boolean;
+  configPath: string;
   gprojPath: string;
   outputParent: string;
   timeoutMs: number;
@@ -1113,6 +1120,7 @@ interface ParsedArguments {
 
 export function parseWorkbenchBuildAcceptanceArguments(argv: readonly string[]): ParsedArguments {
   let confirmed = false;
+  let configPath = "";
   let gprojPath = "";
   let outputParent = "";
   let timeoutMs = DEFAULT_TIMEOUT_MS;
@@ -1126,7 +1134,11 @@ export function parseWorkbenchBuildAcceptanceArguments(argv: readonly string[]):
     const argument = argv[index];
     if (argument === LIVE_WORKBENCH_BUILD_CONFIRMATION) confirmed = true;
     else if (argument === "--help" || argument === "-h") help = true;
-    else if (argument === "--gproj") {
+    else if (argument === "--config") {
+      if (configPath) throw acceptanceError("--config may be supplied only once.");
+      configPath = take(index, argument);
+      index += 1;
+    } else if (argument === "--gproj") {
       if (gprojPath) throw acceptanceError("--gproj may be supplied only once.");
       gprojPath = take(index, argument);
       index += 1;
@@ -1141,16 +1153,19 @@ export function parseWorkbenchBuildAcceptanceArguments(argv: readonly string[]):
       throw acceptanceError(`Unknown target-build acceptance option: ${argument}`);
     }
   }
-  if (!help && (!gprojPath || !outputParent)) {
-    throw acceptanceError("Live target-build acceptance requires --gproj and --output-root.");
+  if (!help && (!configPath || !gprojPath || !outputParent)) {
+    throw acceptanceError(
+      "Live target-build acceptance requires --config, --gproj, and --output-root."
+    );
   }
   if (!help) requireTimeout(timeoutMs);
-  return { confirmed, gprojPath, outputParent, timeoutMs, help };
+  return { confirmed, configPath, gprojPath, outputParent, timeoutMs, help };
 }
 
 export function workbenchBuildAcceptanceUsage(): string {
   return "Usage: npm run dev:workbench:acceptance:build -- --confirm-live-run " +
-    "--gproj <absolute-real-target.gproj> --output-root <existing-external-directory> " +
+    "--config <file> --gproj <absolute-real-target.gproj> " +
+    "--output-root <existing-external-directory> " +
     "[--timeout-ms <60000..3600000>]\n\n" +
     `Also set ${LIVE_WORKBENCH_BUILD_ENVIRONMENT}=1. The harness creates and retains two ` +
     "exclusive output roots, runs the controller target_build path twice, and writes only a " +
@@ -1192,6 +1207,7 @@ async function main(): Promise<void> {
   try {
     const result = await runWorkbenchBuildAcceptance({
       confirmed: parsed.confirmed,
+      configPath: parsed.configPath,
       gprojPath: parsed.gprojPath,
       outputParent: parsed.outputParent,
       timeoutMs: parsed.timeoutMs,
@@ -1206,6 +1222,7 @@ async function main(): Promise<void> {
     process.stderr.write(`${redactConsoleError(error, [
       parsed.gprojPath,
       parsed.outputParent,
+      parsed.configPath,
       process.env.USERNAME ?? "",
     ])}\n`);
     process.exitCode = 1;

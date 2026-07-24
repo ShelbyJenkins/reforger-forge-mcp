@@ -33,7 +33,7 @@ export function registerWorkshopInfo(server: McpServer, config: Config): void {
         if (!basePath) {
           return {
             content: [
-              { type: "text", text: "No project path configured. Set ENFUSION_PROJECT_PATH or provide projectPath parameter." },
+              { type: "text", text: "No project path configured. Use --config/--project-path or provide projectPath." },
             ],
             isError: true,
           };

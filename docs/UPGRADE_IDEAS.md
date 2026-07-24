@@ -349,7 +349,7 @@ After implementing any upgrade, complete **all** of the following before marking
 
 ### 23. Multi-Mod Workspace Support
 
-**What**: Currently `ENFUSION_PROJECT_PATH` points to a single addon. Support a workspace model where the path points to the `addons/` directory and tools accept a `modName` parameter to select which addon to operate on. `project_browse` would list all addons in the workspace, and creation tools would scope to the selected one.
+**What**: The explicitly configured `projectPath` currently points to a single addon. Support a workspace model where the path points to the `addons/` directory and tools accept a `modName` parameter to select which addon to operate on. `project_browse` would list all addons in the workspace, and creation tools would scope to the selected one.
 
 **Why**: Many modders work on multiple mods simultaneously. The current single-path design means switching mods requires restarting the MCP server or passing `projectPath` on every call. `mod_create` already creates subdirectories under `projectPath`, but other tools don't navigate them well.
 

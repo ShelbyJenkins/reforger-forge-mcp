@@ -11,16 +11,14 @@ import {
   DEFAULT_RUNTIME_OBSERVER_POSE_POSITION,
   DEFAULT_RUNTIME_OBSERVER_WORLD,
   LIVE_RUNTIME_OBSERVER_ENVIRONMENT,
-  assertRuntimeCliSingletonOptions,
   assertCurrentViewReleasedFromDisplaced,
   assertMatrixClose,
   assertLiveRuntimeObserverAuthorized,
   assertRequestedPoseRendered,
   captureMatrix,
+  parseRuntimeCliArguments,
   parseQuaternion,
   parseVector3,
-  readSingletonCliFlag,
-  readSingletonCliOption,
   recordRestorationImageSimilarity,
   resolveRuntimeAcceptanceArtifactRoot,
   runtimePoseMatrix,
@@ -48,22 +46,53 @@ describe("live graphical runtime observer acceptance contract", () => {
     expect(() => parseQuaternion("0,0,0,2", "pose")).toThrow(/normalized quaternion/);
   });
 
-  it("rejects duplicate singleton CLI options while preserving repeated launch arguments", () => {
-    expect(readSingletonCliOption(["--only", "case-a"], "--only")).toBe("case-a");
-    expect(() => readSingletonCliOption(
+  it("strictly validates CLI arguments while preserving repeated dash-prefixed launch arguments", () => {
+    expect(parseRuntimeCliArguments(
+      ["--only", "case-a"]
+    ).values.get("--only")).toBe("case-a");
+    expect(() => parseRuntimeCliArguments(
       ["--only", "case-a", "--only", "case-b"],
-      "--only"
     )).toThrow(/only once/);
-    expect(() => readSingletonCliFlag(
-      ["--keep-profile", "--keep-profile"],
-      "--keep-profile"
+    expect(() => parseRuntimeCliArguments(
+      ["--keep-profile", "--keep-profile"]
     )).toThrow(/only once/);
-    expect(() => assertRuntimeCliSingletonOptions([
+    expect(() => parseRuntimeCliArguments([
       "--list-cases", "--only", "case-a", "--only", "case-b",
     ])).toThrow(/--only may be specified only once/);
-    expect(() => assertRuntimeCliSingletonOptions([
-      "--launch-arg", "-foo", "--launch-arg", "bar",
+    expect(() => parseRuntimeCliArguments([
+      "--config", "fixture.json",
+      "--launch-arg", "-foo",
+      "--launch-arg", "--server",
+      "--launch-arg", "bar",
     ])).not.toThrow();
+    expect(parseRuntimeCliArguments([
+      "--launch-arg", "-foo",
+      "--launch-arg", "--server",
+      "--launch-arg", "bar",
+    ]).repeatedValues.get("--launch-arg")).toEqual(["-foo", "--server", "bar"]);
+    const consumedFlag = parseRuntimeCliArguments([
+      "--config", "fixture.json",
+      "--launch-arg", "--confirm-live-run",
+    ]);
+    expect(consumedFlag.flags.has("--confirm-live-run")).toBe(false);
+    expect(consumedFlag.repeatedValues.get("--launch-arg")).toEqual([
+      "--confirm-live-run",
+    ]);
+    expect(() => parseRuntimeCliArguments(["--unknown"])).toThrow(
+      /Unknown runtime observer acceptance argument: --unknown/
+    );
+    expect(() => parseRuntimeCliArguments(["stray-token"])).toThrow(
+      /Unknown runtime observer acceptance argument: stray-token/
+    );
+    expect(() => parseRuntimeCliArguments(["--config"])).toThrow(
+      /--config requires a value/
+    );
+    expect(() => parseRuntimeCliArguments(["--config", "--confirm-live-run"])).toThrow(
+      /--config requires a value/
+    );
+    expect(() => parseRuntimeCliArguments(["--launch-arg"])).toThrow(
+      /--launch-arg requires a value/
+    );
   });
 
   it("defaults to an installed stock fixture outside the current project", () => {
@@ -201,7 +230,9 @@ describe("live graphical runtime observer acceptance contract", () => {
     expect(source).toContain("}, runtimeManager);");
     expect(source).toContain("new OwnedRuntimeManager({");
     expect(source).toContain("executableResolver: () => executable");
-    expect(source).toContain("findRuntimeExecutable(options.executablePath)");
+    expect(source).toContain(
+      "findRuntimeExecutable(options.executablePath, options.configPath)"
+    );
     expect(source).toContain("await runtimeManager.start({");
     expect(source.match(/runtimeManager\.status\(/g)).toHaveLength(2);
     expect(source).toContain("await runtimeManager.stop({");
@@ -287,6 +318,8 @@ describe("live graphical runtime observer acceptance contract", () => {
     const source = readFileSync(resolve("scripts/observer-runtime-launch-support.ts"), "utf8");
     expect(source).toContain('"-server", worldResource');
     expect(source).toContain("assertExternalRoot(root, label)");
+    expect(source).toContain('loadConfig(["--config", configPath])');
+    expect(source).not.toContain("loadConfig()");
     expect(source).not.toMatch(/taskkill|Stop-Process|KillProcess|execSync|shell:\s*true|\.kill\(/i);
   });
 
@@ -297,6 +330,8 @@ describe("live graphical runtime observer acceptance contract", () => {
     expect(source).toContain('if (keepProfile && !only)');
     expect(source).toContain('"--keep-profile is valid only together with --only"');
     expect(source).toContain('"--only (fault-matrix mode) rejects a user-selected --addon-dir');
+    expect(source).toContain("parseRuntimeCliArguments(process.argv.slice(2))");
+    expect(source).not.toMatch(/environment\.RFO_RUNTIME_OBSERVER_(?!ACCEPTANCE_RESULT|EVIDENCE)/);
     expect(source).toContain('readFlag("--list-cases")');
     const listCasesIndex = source.indexOf('readFlag("--list-cases")');
     const helpIndex = source.indexOf('readFlag("--help")');

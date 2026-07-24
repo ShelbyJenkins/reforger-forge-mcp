@@ -5,7 +5,6 @@ import {
   existsSync,
   lstatSync,
   mkdirSync,
-  readFileSync,
   realpathSync,
   rmSync,
   writeFileSync,
@@ -36,10 +35,6 @@ const SCRIPT_PATH = fileURLToPath(import.meta.url);
 export const WORKBENCH_OBSERVER_ACCEPTANCE_REPOSITORY_ROOT = resolve(
   dirname(SCRIPT_PATH),
   ".."
-);
-const LOCAL_CONFIG_PATH = join(
-  WORKBENCH_OBSERVER_ACCEPTANCE_REPOSITORY_ROOT,
-  "reforger-forge.config.json"
 );
 
 export const BASE_EVERON_WORLD = "{853E92315D1D9EFE}worlds/Eden/Eden.ent";
@@ -153,17 +148,9 @@ export function createDisposableProject(
   };
 }
 
-/** Load and constrain the local configuration used by native acceptance only. */
-export function acceptanceConfig(projectRoot: string, managedRoot: string): Config {
-  if (!existsSync(LOCAL_CONFIG_PATH)) {
-    throw new Error(
-      "Live Workbench acceptance requires the repository-local, gitignored reforger-forge.config.json"
-    );
-  }
-  // Parse independently first so a malformed local file cannot silently fall
-  // back to machine defaults in loadConfig().
-  JSON.parse(readFileSync(LOCAL_CONFIG_PATH, "utf8"));
-  const local = loadConfig();
+/** Validate and normalize exactly one explicit configuration before creating run state. */
+export function loadAcceptanceBaseConfig(configPath: string): Config {
+  const local = loadConfig(["--config", configPath]);
   const workbenchPath = canonicalDirectory(local.workbenchPath, "Workbench tools directory");
   const gamePath = canonicalDirectory(local.gamePath, "Arma Reforger game directory");
   const configuredRoots = (local.workbenchAddonDirs ?? []).map((path, index) =>
@@ -176,11 +163,24 @@ export function acceptanceConfig(projectRoot: string, managedRoot: string): Conf
     ...local,
     workbenchPath,
     gamePath,
+    workbenchAddonDirs: configuredRoots,
+  };
+}
+
+/** Constrain a validated explicit configuration to one native acceptance run. */
+export function acceptanceConfig(
+  configPath: string,
+  projectRoot: string,
+  managedRoot: string,
+  baseConfig: Config = loadAcceptanceBaseConfig(configPath)
+): Config {
+  return {
+    ...baseConfig,
     projectPath: projectRoot,
-    workbenchAddonDirs: [...configuredRoots, projectRoot],
+    workbenchAddonDirs: [...(baseConfig.workbenchAddonDirs ?? []), projectRoot],
     workbenchScriptAuthorizeAll: false,
     observer: {
-      ...local.observer!,
+      ...baseConfig.observer!,
       managedRoot,
       profileRoot: join(managedRoot, "profiles"),
     },
@@ -256,6 +256,7 @@ export function combineWorkbenchObserverAcceptanceProcessCounts(
 export interface WorkbenchObserverAcceptanceRuntimeOptions<
   Adapter extends WorkbenchObserverAcceptanceAdapter = WorkbenchObserverAcceptanceAdapter
 > {
+  readonly configPath: string;
   readonly runDirectory: string;
   readonly clientIdPrefix: string;
   readonly stageMatrixFixture?: boolean;
@@ -307,6 +308,41 @@ export class WorkbenchObserverAcceptanceRuntime<
     this.projectRoot = join(options.runDirectory, "project");
     this.managedRoot = join(options.runDirectory, "observer-managed");
     this.evidenceRoot = join(options.runDirectory, "evidence");
+    const baseConfig = loadAcceptanceBaseConfig(options.configPath);
+    this.config = acceptanceConfig(
+      options.configPath,
+      this.projectRoot,
+      this.managedRoot,
+      baseConfig
+    );
+    const helperPath = join(
+      WORKBENCH_OBSERVER_ACCEPTANCE_REPOSITORY_ROOT,
+      "scripts",
+      "windows",
+      "workbench-lifecycle.ps1"
+    );
+    const observerAgentPath = join(
+      WORKBENCH_OBSERVER_ACCEPTANCE_REPOSITORY_ROOT,
+      "dist",
+      "observer",
+      "agent",
+      "private-child.js"
+    );
+    const sourceAddon = join(
+      WORKBENCH_OBSERVER_ACCEPTANCE_REPOSITORY_ROOT,
+      "observer",
+      "addon"
+    );
+    if (!existsSync(helperPath) || !lstatSync(helperPath).isFile()) {
+      throw new Error(`Workbench lifecycle helper is missing: ${helperPath}`);
+    }
+    if (!existsSync(observerAgentPath) || !lstatSync(observerAgentPath).isFile()) {
+      throw new Error(`Compiled observer agent is missing: ${observerAgentPath}`);
+    }
+    if (!existsSync(sourceAddon) || !lstatSync(sourceAddon).isDirectory()) {
+      throw new Error(`Observer source addon is missing: ${sourceAddon}`);
+    }
+
     mkdirSync(this.projectRoot, { recursive: true });
     mkdirSync(this.managedRoot, { recursive: true });
     mkdirSync(this.evidenceRoot, { recursive: true });
@@ -314,13 +350,6 @@ export class WorkbenchObserverAcceptanceRuntime<
     this.project = createDisposableProject(this.projectRoot, {
       stageMatrixFixture: options.stageMatrixFixture,
     });
-    this.config = acceptanceConfig(this.projectRoot, this.managedRoot);
-    const helperPath = join(
-      WORKBENCH_OBSERVER_ACCEPTANCE_REPOSITORY_ROOT,
-      "scripts",
-      "windows",
-      "workbench-lifecycle.ps1"
-    );
     this.lifecycleBackend = new WindowsLifecycleBackend(helperPath, {
       helperTimeoutMs: options.helperTimeoutMs,
       operationDeadlineAtMs: options.operationDeadlineAtMs,
@@ -373,26 +402,12 @@ export class WorkbenchObserverAcceptanceRuntime<
     );
     this.adapter = options.createAdapter(this.client);
 
-    const observerAgentPath = join(
-      WORKBENCH_OBSERVER_ACCEPTANCE_REPOSITORY_ROOT,
-      "dist",
-      "observer",
-      "agent",
-      "private-child.js"
-    );
-    if (!existsSync(observerAgentPath)) {
-      throw new Error(`Compiled observer agent is missing: ${observerAgentPath}`);
-    }
     this.application = createObserverApplication({
       agentPath: observerAgentPath,
       managedRoot: this.managedRoot,
       profileRoot: join(this.managedRoot, "profiles"),
       projectPath: this.projectRoot,
-      sourceAddon: join(
-        WORKBENCH_OBSERVER_ACCEPTANCE_REPOSITORY_ROOT,
-        "observer",
-        "addon"
-      ),
+      sourceAddon,
       requestTimeoutMs: 60_000,
       ...(options.applicationRequestDeadlineAtMs
         ? { requestDeadlineAtMs: options.applicationRequestDeadlineAtMs }

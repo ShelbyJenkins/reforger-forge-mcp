@@ -400,12 +400,12 @@ function logRootCandidates(addonDirectories: readonly string[]): string[] {
 
 export function resolveWorkbenchLogRoot(
   addonDirectories: readonly string[],
-  explicitPath = process.env.REFORGER_FORGE_WORKBENCH_LOG_ROOT
+  explicitPath?: string
 ): string {
   if (explicitPath !== undefined) {
     if (typeof explicitPath !== "string" || explicitPath.trim().length === 0) {
       throw new WorkbenchRunnerError(
-        "REFORGER_FORGE_WORKBENCH_LOG_ROOT must be a non-empty directory path.",
+        "Explicit Workbench log root must be a non-empty directory path.",
         "INVALID_LOG_ROOT"
       );
     }
@@ -423,7 +423,7 @@ export function resolveWorkbenchLogRoot(
       ? "No Workbench log root could be derived from workbenchAddonDirs."
       : `Derived ${roots.size} distinct Workbench log roots.`;
     throw new WorkbenchRunnerError(
-      `${detail} Set REFORGER_FORGE_WORKBENCH_LOG_ROOT explicitly.`,
+      `${detail} Provide an explicit Workbench log root.`,
       "INVALID_LOG_ROOT"
     );
   }
@@ -1534,7 +1534,8 @@ export function parseWorkbenchRunnerArguments(argv: readonly string[]): ParsedWo
   if (command !== "editor" && command !== "build") {
     throw new WorkbenchRunnerError(
       "Usage: reforger-forge-workbench editor --gproj <path> --foreground | " +
-        "build --gproj <path> --platform PC --output <path> --timeout-ms <n>",
+        "build --gproj <path> --platform PC --output <path> --timeout-ms <n>; " +
+        "supply shared configuration with --config <file> or explicit configuration flags",
       "INVALID_INTENT"
     );
   }

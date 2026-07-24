@@ -888,7 +888,7 @@ export function registerAnimationGraph(server: McpServer, config: Config): void 
                 content: [
                   {
                     type: "text",
-                    text: "No project path configured. Set ENFUSION_PROJECT_PATH or provide projectPath.",
+                    text: "No project path configured. Use --config/--project-path or provide projectPath.",
                   },
                 ],
                 isError: true,
@@ -1050,7 +1050,7 @@ export function registerAnimationGraph(server: McpServer, config: Config): void 
             }
           } else {
             parts.push(
-              `## Step 1: AGR + AST — Skipped\nNo project path configured. Set ENFUSION_PROJECT_PATH or provide projectPath.`
+              `## Step 1: AGR + AST — Skipped\nNo project path configured. Use --config/--project-path or provide projectPath.`
             );
           }
         }

@@ -12,7 +12,6 @@
     "src/scraper/source-remote.ts",
     "scripts/**/*.ts",
     "scripts/**/*.mjs",
-    "test-mcp-connection.js",
     "tests/**/*.ts",
     "tests/**/*.mjs"
   ],

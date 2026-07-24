@@ -144,6 +144,7 @@ export interface RuntimeObserverMarkerExpectation {
 
 export interface RuntimeObserverAcceptanceOptions {
   confirmed: boolean;
+  configPath: string;
   environment?: NodeJS.ProcessEnv;
   artifactRoot?: string;
   /** Defaults to the repository's docs/validation directory. */
@@ -561,7 +562,7 @@ export async function runRuntimeObserverAcceptance(
   const poseView = validatePose(options);
   const lookAtView = validateLookAt(options);
   const fixture = inspectAddonFixture(options.addonDirectory);
-  const executable = findRuntimeExecutable(options.executablePath);
+  const executable = findRuntimeExecutable(options.executablePath, options.configPath);
   const baseArguments = launchArguments(worldResource, fixture, options.launchArguments);
   let baselineLaunchArguments = operationalBaselineLaunchArgumentIdentity(baseArguments, false);
   const baselineFixtureContent = fixture
@@ -1299,55 +1300,70 @@ export async function runRuntimeObserverAcceptance(
   return { runDirectory, summaryPath, evidenceDirectory, baselinePath, summary };
 }
 
-export function readSingletonCliOption(argv: readonly string[], name: string): string | undefined {
-  const indexes = argv.flatMap((value, index) => value === name ? [index] : []);
-  if (indexes.length > 1) throw new Error(`${name} may be specified only once`);
-  const index = indexes[0];
-  if (index === undefined) return undefined;
-  const value = argv[index + 1];
-  if (!value || value.startsWith("--")) throw new Error(`${name} requires a value`);
-  return value;
-}
-
-export function readSingletonCliFlag(argv: readonly string[], name: string): boolean {
-  const count = argv.filter((value) => value === name).length;
-  if (count > 1) throw new Error(`${name} may be specified only once`);
-  return count === 1;
-}
-
-const RUNTIME_SINGLETON_CLI_OPTIONS = Object.freeze([
+const RUNTIME_SINGLETON_CLI_FLAGS = new Set<string>([
   "--help", "-h", "--list-cases", "--confirm-live-run", "--keep-profile",
-  "--only", "--world", "--addon-dir", "--executable", "--artifact-root",
+]);
+
+const RUNTIME_SINGLETON_CLI_VALUE_OPTIONS = new Set<string>([
+  "--config", "--only", "--world", "--addon-dir", "--executable", "--artifact-root",
   "--validation-root", "--timeout-ms", "--pose-position", "--pose-orientation",
   "--pose-fov", "--look-at-position", "--look-at-target", "--look-at-fov",
   "--marker-rgb", "--marker-roi",
-] as const);
+]);
 
-export function assertRuntimeCliSingletonOptions(argv: readonly string[]): void {
-  for (const name of RUNTIME_SINGLETON_CLI_OPTIONS) {
-    if (argv.filter((value) => value === name).length > 1) {
-      throw new Error(`${name} may be specified only once`);
+const RUNTIME_REPEATABLE_CLI_VALUE_OPTIONS = new Set<string>(["--launch-arg"]);
+
+export interface ParsedRuntimeCliArguments {
+  readonly flags: ReadonlySet<string>;
+  readonly values: ReadonlyMap<string, string>;
+  readonly repeatedValues: ReadonlyMap<string, readonly string[]>;
+}
+
+export function parseRuntimeCliArguments(
+  argv: readonly string[]
+): ParsedRuntimeCliArguments {
+  const seenSingletons = new Set<string>();
+  const flags = new Set<string>();
+  const values = new Map<string, string>();
+  const repeatedValues = new Map<string, string[]>();
+  for (let index = 0; index < argv.length; index += 1) {
+    const name = argv[index];
+    if (RUNTIME_SINGLETON_CLI_FLAGS.has(name)) {
+      const key = name === "-h" ? "--help" : name;
+      if (seenSingletons.has(key)) throw new Error(`${name} may be specified only once`);
+      seenSingletons.add(key);
+      flags.add(key);
+      continue;
     }
+    if (RUNTIME_SINGLETON_CLI_VALUE_OPTIONS.has(name)) {
+      if (seenSingletons.has(name)) throw new Error(`${name} may be specified only once`);
+      seenSingletons.add(name);
+      const value = argv[index + 1];
+      if (
+        !value ||
+        value.startsWith("--") ||
+        RUNTIME_SINGLETON_CLI_FLAGS.has(value) ||
+        RUNTIME_SINGLETON_CLI_VALUE_OPTIONS.has(value) ||
+        RUNTIME_REPEATABLE_CLI_VALUE_OPTIONS.has(value)
+      ) {
+        throw new Error(`${name} requires a value`);
+      }
+      values.set(name, value);
+      index += 1;
+      continue;
+    }
+    if (RUNTIME_REPEATABLE_CLI_VALUE_OPTIONS.has(name)) {
+      const value = argv[index + 1];
+      if (!value) throw new Error(`${name} requires a value`);
+      const existing = repeatedValues.get(name) ?? [];
+      existing.push(value);
+      repeatedValues.set(name, existing);
+      index += 1;
+      continue;
+    }
+    throw new Error(`Unknown runtime observer acceptance argument: ${name}`);
   }
-}
-
-function readOption(name: string): string | undefined {
-  return readSingletonCliOption(process.argv, name);
-}
-
-function readFlag(name: string): boolean {
-  return readSingletonCliFlag(process.argv, name);
-}
-
-function readOptions(name: string): string[] {
-  const values: string[] = [];
-  for (let index = 0; index < process.argv.length; index += 1) {
-    if (process.argv[index] !== name) continue;
-    const value = process.argv[index + 1];
-    if (!value || value.startsWith("--")) throw new Error(`${name} requires a value`);
-    values.push(value);
-  }
-  return values;
+  return { flags, values, repeatedValues };
 }
 
 export function parseVector3(value: string, label: string): Vector3 {
@@ -1370,14 +1386,15 @@ export function parseQuaternion(value: string, label: string): Quaternion {
   return parts as Quaternion;
 }
 
-function parseMarker(environment: NodeJS.ProcessEnv): RuntimeObserverMarkerExpectation | undefined {
-  const rawColor = readOption("--marker-rgb") ?? environment.RFO_RUNTIME_OBSERVER_MARKER_RGB;
+function parseMarker(
+  rawColor: string | undefined,
+  rawRoi: string | undefined
+): RuntimeObserverMarkerExpectation | undefined {
   if (!rawColor) return undefined;
   const color = parseVector3(rawColor, "Marker RGB");
   if (color.some((value) => !Number.isInteger(value) || value < 0 || value > 255)) {
     throw new Error("Marker RGB channels must be integers from 0 through 255");
   }
-  const rawRoi = readOption("--marker-roi") ?? environment.RFO_RUNTIME_OBSERVER_MARKER_ROI;
   let roi: NormalizedImageRegion | undefined;
   if (rawRoi) {
     const parts = rawRoi.split(",").map((item) => Number(item.trim()));
@@ -1391,7 +1408,7 @@ function parseMarker(environment: NodeJS.ProcessEnv): RuntimeObserverMarkerExpec
 
 function usage(): string {
   return [
-    "Usage: npm run dev:observer:acceptance:runtime -- --confirm-live-run [--world <resource>]",
+    "Usage: npm run dev:observer:acceptance:runtime -- --config <file> --confirm-live-run [--world <resource>]",
     "       [--addon-dir <directory>] [--executable <file>] [--artifact-root <directory>]",
     "       [--validation-root <directory>]",
     "       [--timeout-ms <60000..900000>] [--launch-arg <token>]...",
@@ -1400,7 +1417,7 @@ function usage(): string {
     "       [--marker-rgb <r,g,b>] [--marker-roi <x,y,width,height>]",
     "",
     "Fault-matrix mode:",
-    "  npm run dev:observer:acceptance:runtime -- --only <case-id> --confirm-live-run",
+    "  npm run dev:observer:acceptance:runtime -- --config <file> --only <case-id> --confirm-live-run",
     "       [--keep-profile] [--executable <file>] [--artifact-root <directory>] [--validation-root <directory>]",
     "  npm run dev:observer:acceptance:runtime -- --list-cases",
     "Matrix mode always creates and validates its own disposable fixture; it rejects --addon-dir.",
@@ -1414,8 +1431,13 @@ function usage(): string {
 }
 
 async function runCli(): Promise<void> {
-  assertRuntimeCliSingletonOptions(process.argv);
-  if (readFlag("--help") || readFlag("-h")) {
+  const parsed = parseRuntimeCliArguments(process.argv.slice(2));
+  const readFlag = (name: string): boolean => parsed.flags.has(name === "-h" ? "--help" : name);
+  const readOption = (name: string): string | undefined => parsed.values.get(name);
+  const readOptions = (name: string): string[] => [
+    ...(parsed.repeatedValues.get(name) ?? []),
+  ];
+  if (readFlag("--help")) {
     process.stdout.write(usage());
     return;
   }
@@ -1426,22 +1448,27 @@ async function runCli(): Promise<void> {
     return;
   }
   const environment = process.env;
+  const configPath = readOption("--config");
+  if (!configPath) {
+    throw new Error("Live runtime observer acceptance requires --config <file>");
+  }
   const only = readOption("--only");
   const keepProfile = readFlag("--keep-profile");
   if (keepProfile && !only) {
     throw new Error("--keep-profile is valid only together with --only");
   }
   if (only !== undefined) {
-    const addonDir = readOption("--addon-dir") ?? environment.RFO_RUNTIME_OBSERVER_ADDON_DIR;
+    const addonDir = readOption("--addon-dir");
     if (addonDir) {
       throw new Error("--only (fault-matrix mode) rejects a user-selected --addon-dir; it always creates its own fixture");
     }
     const result = await runRuntimeFailureMatrix({
       confirmed: readFlag("--confirm-live-run"),
+      configPath,
       environment,
-      worldResource: readOption("--world") ?? environment.RFO_RUNTIME_OBSERVER_WORLD,
-      executablePath: readOption("--executable") ?? environment.RFO_RUNTIME_OBSERVER_EXECUTABLE,
-      artifactRoot: readOption("--artifact-root") ?? environment.RFO_RUNTIME_OBSERVER_ARTIFACT_ROOT,
+      worldResource: readOption("--world"),
+      executablePath: readOption("--executable"),
+      artifactRoot: readOption("--artifact-root"),
       validationRoot: readOption("--validation-root"),
       launchArguments: readOptions("--launch-arg"),
       only,
@@ -1454,21 +1481,22 @@ async function runCli(): Promise<void> {
     );
     return;
   }
-  const worldResource = readOption("--world") ?? environment.RFO_RUNTIME_OBSERVER_WORLD;
-  const posePosition = readOption("--pose-position") ?? environment.RFO_RUNTIME_OBSERVER_POSE_POSITION;
-  const poseOrientation = readOption("--pose-orientation") ?? environment.RFO_RUNTIME_OBSERVER_POSE_ORIENTATION;
-  const poseFov = readOption("--pose-fov") ?? environment.RFO_RUNTIME_OBSERVER_POSE_FOV;
-  const lookAtPosition = readOption("--look-at-position") ?? environment.RFO_RUNTIME_OBSERVER_LOOK_AT_POSITION;
-  const lookAtTarget = readOption("--look-at-target") ?? environment.RFO_RUNTIME_OBSERVER_LOOK_AT_TARGET;
-  const lookAtFov = readOption("--look-at-fov") ?? environment.RFO_RUNTIME_OBSERVER_LOOK_AT_FOV;
-  const timeout = readOption("--timeout-ms") ?? environment.RFO_RUNTIME_OBSERVER_TIMEOUT_MS;
+  const worldResource = readOption("--world");
+  const posePosition = readOption("--pose-position");
+  const poseOrientation = readOption("--pose-orientation");
+  const poseFov = readOption("--pose-fov");
+  const lookAtPosition = readOption("--look-at-position");
+  const lookAtTarget = readOption("--look-at-target");
+  const lookAtFov = readOption("--look-at-fov");
+  const timeout = readOption("--timeout-ms");
   const result = await runRuntimeObserverAcceptance({
     confirmed: readFlag("--confirm-live-run"),
+    configPath,
     environment,
     worldResource,
-    addonDirectory: readOption("--addon-dir") ?? environment.RFO_RUNTIME_OBSERVER_ADDON_DIR,
-    executablePath: readOption("--executable") ?? environment.RFO_RUNTIME_OBSERVER_EXECUTABLE,
-    artifactRoot: readOption("--artifact-root") ?? environment.RFO_RUNTIME_OBSERVER_ARTIFACT_ROOT,
+    addonDirectory: readOption("--addon-dir"),
+    executablePath: readOption("--executable"),
+    artifactRoot: readOption("--artifact-root"),
     validationRoot: readOption("--validation-root"),
     timeoutMs: timeout ? Number(timeout) : undefined,
     launchArguments: readOptions("--launch-arg"),
@@ -1480,7 +1508,7 @@ async function runCli(): Promise<void> {
     lookAtPosition: lookAtPosition ? parseVector3(lookAtPosition, "Look-at position") : undefined,
     lookAtTarget: lookAtTarget ? parseVector3(lookAtTarget, "Look-at target") : undefined,
     lookAtFov: lookAtFov ? Number(lookAtFov) : undefined,
-    marker: parseMarker(environment),
+    marker: parseMarker(readOption("--marker-rgb"), readOption("--marker-roi")),
   });
   process.stdout.write(
     `Runtime observer acceptance passed.\n` +

@@ -141,7 +141,11 @@ The EnfusionMCP project GUID must be valid hex: `454E465553494D435000`
 
 ## wb_launch — Game Directory Resolution
 
-`findGameDir()` in `client.js` checks `ENFUSION_GAME_PATH` env var first (set in `claude_desktop_config.json`, read by both Claude Desktop and Claude Code VS Code extension). If not set, walks up two directory levels from `workbenchPath` and tries `Arma Reforger` / `ArmaReforger` sibling folders.
+`wb_launch` uses exactly the `gamePath` supplied by the explicit
+`--config <file>` or `--game-path <directory>` invocation. ReforgerForge does
+not read environment variables or guess sibling installations. Startup
+requires that directory to contain `addons` and a supported graphical Arma
+Reforger executable.
 
 ---
 
@@ -278,7 +282,7 @@ Claude Code uses `~/.claude.json` (not `claude_desktop_config.json`). To point a
 
 ```bash
 claude mcp remove enfusion-mcp
-claude mcp add --scope user enfusion-mcp -- node /path/to/enfusion-mcp-BK/dist/index.js
+claude mcp add --scope user reforger-forge -- node /path/to/reforger-forge-mcp/dist/index.js --config /path/to/reforger-forge.json
 ```
 
 Requires Claude Code restart to pick up new tool schemas.
@@ -293,7 +297,7 @@ Requires Claude Code restart to pick up new tool schemas.
 File-copied prefabs have no GUID registered in Workbench's resource DB → `{0000000000000000}` errors at runtime → slot fails to spawn.
 
 **Correct MCP workflow (game_duplicate tool — confirmed working):**
-1. Read the loose `.et` from `ENFUSION_GAME_PATH/addons/data/DataXXX/` (files are unpacked on disk, no pak needed)
+1. Read the loose `.et` through `game_read`/`game_duplicate`; those tools use the explicitly configured `gamePath` and its `addons/data/DataXXX/` tree
 2. Write copy to mod folder
 3. Call `ResourceManager.RegisterResourceFile(absPath, false)` → Workbench creates a `.meta` file with a new GUID
 4. Reference the duplicate using the GUID from the `.meta` file: `{METAGUID}Prefabs/path/to/copy.et`

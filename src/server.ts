@@ -161,6 +161,7 @@ export function registerTools(server: McpServer, config: Config): RegisteredTool
     handlerTimeoutMs: observerConfig?.requestTimeoutMs,
   });
   const observerApplication = createObserverApplication({
+    debug: config.debug,
     agentPath: observerConfig?.agentPath,
     managedRoot: observerConfig?.managedRoot,
     profileRoot: observerConfig?.profileRoot,

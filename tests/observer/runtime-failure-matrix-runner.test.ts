@@ -529,6 +529,7 @@ describe("runRuntimeFailureMatrix authorization gate", () => {
   it("rejects an unconfirmed run before any filesystem or process interaction", async () => {
     await expect(runRuntimeFailureMatrix({
       confirmed: false,
+      configPath: "not-read-before-live-preflight.json",
       environment: {},
       only: PILOT_CASE.id,
     })).rejects.toThrow(/--confirm-live-run/);
@@ -537,6 +538,7 @@ describe("runRuntimeFailureMatrix authorization gate", () => {
   it("rejects a confirmed run missing the live environment gate", async () => {
     await expect(runRuntimeFailureMatrix({
       confirmed: true,
+      configPath: "not-read-before-live-preflight.json",
       environment: {},
       only: PILOT_CASE.id,
     })).rejects.toThrow(/RFO_RUN_LIVE_RUNTIME_OBSERVER_ACCEPTANCE/);
@@ -545,6 +547,7 @@ describe("runRuntimeFailureMatrix authorization gate", () => {
   it("rejects an undeclared case ID once authorized, before touching the filesystem or a process", async () => {
     await expect(runRuntimeFailureMatrix({
       confirmed: true,
+      configPath: "not-read-before-live-preflight.json",
       environment: { RFO_RUN_LIVE_RUNTIME_OBSERVER_ACCEPTANCE: "1" },
       only: "runtime.cancel_capture.before_lease.pose",
     })).rejects.toThrow(/Unknown fault-matrix case/);
@@ -553,6 +556,7 @@ describe("runRuntimeFailureMatrix authorization gate", () => {
   it("rejects all user launch arguments in matrix mode before filesystem or process interaction", async () => {
     await expect(runRuntimeFailureMatrix({
       confirmed: true,
+      configPath: "not-read-before-live-preflight.json",
       environment: { RFO_RUN_LIVE_RUNTIME_OBSERVER_ACCEPTANCE: "1" },
       only: PILOT_CASE.id,
       launchArguments: ["-addonsDir", "unattested"],

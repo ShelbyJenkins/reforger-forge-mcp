@@ -3,6 +3,7 @@ import { pathToFileURL } from "node:url";
 import { createObserverApplication, type CreateObserverApplicationOptions } from "./application.js";
 import type { ObserverApplicationOperationName } from "./application-operations.js";
 import { errorBody, ObserverError } from "./errors.js";
+import { setObserverDebugEnabled } from "./logger.js";
 
 export {
   claimRuntimeStopReservation,
@@ -73,6 +74,7 @@ const PRIVATE_ALLOWLIST = new Set<ObserverApplicationOperationName>([
 
 export async function runPrivateObserverChild(argumentsArray: string[]): Promise<void> {
   if (!process.send || !process.connected) throw new ObserverError("TRANSPORT_UNAVAILABLE", "Private observer agent requires an inherited Node IPC channel", 503);
+  setObserverDebugEnabled(argumentsArray.includes("--debug"));
   const options: CreateObserverApplicationOptions = {
     root: option(argumentsArray, "--root"),
     profileRoot: option(argumentsArray, "--profile-root"),

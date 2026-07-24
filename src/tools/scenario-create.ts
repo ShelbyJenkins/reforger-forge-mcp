@@ -285,7 +285,7 @@ export function registerScenarioCreate(server: McpServer, config: Config): void 
         if (output.ambientVehiclesLayer) {
           parts.push(``, `**Worlds/${scenarioName}_Layers/AmbientVehicles.layer**`, `\`\`\``, output.ambientVehiclesLayer, `\`\`\``);
         }
-        parts.push(``, `Set ENFUSION_PROJECT_PATH to write files automatically.`);
+        parts.push(``, `Use --config/--project-path to write files automatically.`);
         return {
           content: [{ type: "text" as const, text: parts.join("\n") }],
         };

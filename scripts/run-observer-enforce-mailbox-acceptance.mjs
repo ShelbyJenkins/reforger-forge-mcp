@@ -21,7 +21,6 @@ import { redactDiagnostic, redactText } from "#foundation/redact";
 
 const scriptDirectory = dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = resolve(scriptDirectory, "..");
-const defaultConfigPath = join(repositoryRoot, "reforger-forge.config.json");
 const defaultArtifactPath = join(
   repositoryRoot,
   ".artifacts",
@@ -58,7 +57,7 @@ const maxDiagnosticScanBytes = 8 * 1024 * 1024;
 function parseArguments(argv) {
   const options = {
     artifactPath: defaultArtifactPath,
-    configPath: defaultConfigPath,
+    configPath: null,
     workbenchPath: null,
     addonDirectories: [],
     timeoutMs: 240_000,
@@ -66,8 +65,13 @@ function parseArguments(argv) {
     help: false,
   };
   const valued = new Set(["--artifact", "--config", "--workbench", "--addons-dir", "--timeout-ms"]);
+  const seen = new Set();
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index];
+    if (argument.startsWith("--") && argument !== "--addons-dir") {
+      if (seen.has(argument)) throw new Error(`${argument} may be supplied only once`);
+      seen.add(argument);
+    }
     if (valued.has(argument)) {
       const value = argv[++index];
       if (!value || value.startsWith("--")) throw new Error(`${argument} requires a value`);
@@ -86,6 +90,9 @@ function parseArguments(argv) {
   }
   if (!Number.isSafeInteger(options.timeoutMs) || options.timeoutMs < 30_000 || options.timeoutMs > 900_000) {
     throw new Error("--timeout-ms must be an integer from 30000 through 900000");
+  }
+  if (!options.help && !options.configPath) {
+    throw new Error("Workbench Enforce mailbox acceptance requires --config <file>");
   }
   return options;
 }
@@ -108,13 +115,32 @@ function requiredDirectory(path, label) {
   return path;
 }
 
-function readConfiguration(path) {
-  if (!existsSync(path)) return {};
-  const parsed = JSON.parse(readFileSync(path, "utf8"));
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-    throw new Error("Workbench config must contain a JSON object");
+async function loadValidatedConfiguration(options) {
+  const compiledConfigPath = join(repositoryRoot, "dist", "config.js");
+  const sourceConfigPath = join(repositoryRoot, "src", "config.ts");
+  requiredFile(
+    compiledConfigPath,
+    "Compiled configuration loader (run npm run build before mailbox acceptance)"
+  );
+  if (existsSync(sourceConfigPath) &&
+      statSync(compiledConfigPath).mtimeMs < statSync(sourceConfigPath).mtimeMs) {
+    throw new Error("Compiled configuration loader is older than src/config.ts; run npm run build");
   }
-  return parsed;
+  const {
+    EXPLICIT_CONFIGURATION_CONTRACT_VERSION,
+    loadConfig,
+  } = await import(pathToFileURL(compiledConfigPath).href);
+  if (EXPLICIT_CONFIGURATION_CONTRACT_VERSION !== 1) {
+    throw new Error("Compiled configuration loader does not implement the required explicit-config contract; run npm run build");
+  }
+  const argumentsArray = ["--config", options.configPath];
+  if (options.workbenchPath) {
+    argumentsArray.push("--workbench-path", options.workbenchPath);
+  }
+  for (const directory of options.addonDirectories) {
+    argumentsArray.push("--workbench-addon-dir", directory);
+  }
+  return loadConfig(argumentsArray);
 }
 
 function resolveWorkbenchExecutable(workbenchPath) {
@@ -788,20 +814,9 @@ async function runAcceptance(options) {
   requiredDirectory(acceptanceAddonRoot, "Enforce mailbox acceptance addon");
   requiredFile(acceptanceProjectPath, "Enforce mailbox acceptance project");
 
-  const config = readConfiguration(options.configPath);
-  const configuredWorkbenchPath = options.workbenchPath ??
-    (typeof config.workbenchPath === "string" && config.workbenchPath.length > 0
-      ? resolve(config.workbenchPath)
-      : null);
-  if (!configuredWorkbenchPath) throw new Error("Configure workbenchPath or pass --workbench");
-  const executable = resolveWorkbenchExecutable(configuredWorkbenchPath);
-  const configuredAddonDirectories = options.addonDirectories.length > 0
-    ? options.addonDirectories
-    : Array.isArray(config.workbenchAddonDirs)
-      ? config.workbenchAddonDirs
-        .filter((value) => typeof value === "string" && value.length > 0)
-        .map((value) => resolve(value))
-      : [];
+  const config = await loadValidatedConfiguration(options);
+  const executable = resolveWorkbenchExecutable(config.workbenchPath);
+  const configuredAddonDirectories = config.workbenchAddonDirs ?? [];
   for (const directory of configuredAddonDirectories) requiredDirectory(directory, "Configured Workbench addon directory");
 
   const preflightPids = listWorkbenchPids();
@@ -1285,7 +1300,7 @@ try {
   if (options.help) {
     process.stdout.write(
       "Usage: node scripts/run-observer-enforce-mailbox-acceptance.mjs " +
-      "[--config path] [--workbench path] [--addons-dir path ...] " +
+      "--config path [--workbench path] [--addons-dir path ...] " +
       "[--timeout-ms 240000] [--artifact path] [--keep-profile]\n"
     );
   } else {

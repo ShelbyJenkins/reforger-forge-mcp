@@ -231,9 +231,15 @@ export function inspectAddonFixture(input: string | undefined): AddonFixture | n
   };
 }
 
-export function findRuntimeExecutable(explicit: string | undefined): string {
+export function findRuntimeExecutable(
+  explicit: string | undefined,
+  configPath: string
+): string {
+  const gameRoot = canonicalDirectory(
+    loadConfig(["--config", configPath]).gamePath,
+    "Arma Reforger game directory"
+  );
   if (explicit) return canonicalFile(explicit, "Arma Reforger graphical runtime executable");
-  const gameRoot = canonicalDirectory(loadConfig().gamePath, "Arma Reforger game directory");
   const candidates = [
     join(gameRoot, "ArmaReforgerSteamDiag.exe"),
     join(gameRoot, "ArmaReforgerDiag.exe"),

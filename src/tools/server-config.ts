@@ -118,7 +118,7 @@ export function registerServerConfig(
           content: [
             {
               type: "text",
-              text: `Generated server config (no project path — not written to disk):\n\n\`\`\`json\n${content}\n\`\`\`\n\nSet ENFUSION_PROJECT_PATH to write files automatically.`,
+              text: `Generated server config (no project path — not written to disk):\n\n\`\`\`json\n${content}\n\`\`\`\n\nUse --config/--project-path to write files automatically.`,
             },
           ],
         };

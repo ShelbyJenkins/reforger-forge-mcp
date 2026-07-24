@@ -188,6 +188,8 @@ describe("controlled target-only Workbench build acceptance", () => {
   it("parses one explicit real target and external output parent", () => {
     expect(parseWorkbenchBuildAcceptanceArguments([
       "--confirm-live-run",
+      "--config",
+      "C:\\controlled\\reforger-forge.config.json",
       "--gproj",
       "C:\\controlled\\Example.gproj",
       "--output-root",
@@ -196,6 +198,7 @@ describe("controlled target-only Workbench build acceptance", () => {
       "120000",
     ])).toEqual({
       confirmed: true,
+      configPath: "C:\\controlled\\reforger-forge.config.json",
       gprojPath: "C:\\controlled\\Example.gproj",
       outputParent: "D:\\retained-builds",
       timeoutMs: 120_000,
@@ -203,9 +206,11 @@ describe("controlled target-only Workbench build acceptance", () => {
     });
     expect(() => parseWorkbenchBuildAcceptanceArguments([
       "--confirm-live-run",
+      "--config",
+      "C:\\controlled\\reforger-forge.config.json",
       "--output-root",
       "D:\\retained-builds",
-    ])).toThrow(/--gproj and --output-root/);
+    ])).toThrow(/--config, --gproj, and --output-root/);
     expect(() => parseWorkbenchBuildAcceptanceArguments(["--unknown"])).toThrow(/Unknown/);
   });
 

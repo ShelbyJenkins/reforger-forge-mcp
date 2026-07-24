@@ -136,7 +136,7 @@ export function registerLayoutCreate(server: McpServer, config: Config): void {
           content: [
             {
               type: "text",
-              text: `Generated layout (no project path configured — not written to disk):\n\n\`\`\`\n${content}\n\`\`\`\n\nSet ENFUSION_PROJECT_PATH to write files automatically.`,
+              text: `Generated layout (no project path configured — not written to disk):\n\n\`\`\`\n${content}\n\`\`\`\n\nUse --config/--project-path to write files automatically.`,
             },
           ],
         };

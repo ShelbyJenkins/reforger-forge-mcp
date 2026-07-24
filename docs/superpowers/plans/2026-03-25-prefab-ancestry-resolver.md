@@ -1255,9 +1255,9 @@ npx vitest run --reporter=verbose
 
 Expected: all tests pass. Note the total pass count.
 
-- [ ] **Step 3: Mark #15 done in UPGRADE_IDEAS.md**
+- [ ] **Step 3: Mark #15 done in docs/UPGRADE_IDEAS.md**
 
-In `UPGRADE_IDEAS.md`, update the heading and summary table entry for item 15:
+In `docs/UPGRADE_IDEAS.md`, update the heading and summary table entry for item 15:
 
 Heading (line ~227):
 ```markdown
@@ -1272,6 +1272,6 @@ Summary table row:
 - [ ] **Step 4: Commit**
 
 ```bash
-git add UPGRADE_IDEAS.md
+git add docs/UPGRADE_IDEAS.md
 git commit -m "docs: mark upgrade #15 prefab ancestry resolver as done"
 ```

@@ -5,23 +5,29 @@
 
 .DESCRIPTION
   Merges the reforger-forge server entry into agent MCP config files.
-  Supports: Cursor, Google Antigravity, Claude Desktop, Windsurf,
+  Supports: Codex, Cursor, Google Antigravity, Claude Desktop, Windsurf,
   VS Code (Copilot), Kiro (workspace), and Continue.dev.
 
 .PARAMETER All
   Install to all supported agents without prompting.
 
 .PARAMETER Agent
-  Install to a specific agent: cursor, antigravity, claude, windsurf, vscode, continue, kiro
+  Install to a specific agent: codex, cursor, antigravity, claude, windsurf, vscode, continue, kiro
+
+.PARAMETER ConfigPath
+  Explicit ReforgerForge JSON configuration passed to every MCP registration.
 
 .EXAMPLE
-  .\scripts\install-agents.ps1 -All
-  .\scripts\install-agents.ps1 -Agent antigravity
+  .\agents\install-agents.ps1 -ConfigPath C:\path\to\config.json -All
+  .\agents\install-agents.ps1 -ConfigPath C:\path\to\config.json -Agent codex
+  .\agents\install-agents.ps1 -ConfigPath C:\path\to\config.json -Agent antigravity
 #>
 
 param(
+    [Parameter(Mandatory = $true)]
+    [string]$ConfigPath,
     [switch]$All,
-    [ValidateSet("cursor", "antigravity", "claude", "windsurf", "vscode", "continue", "kiro", "all")]
+    [ValidateSet("codex", "cursor", "antigravity", "claude", "windsurf", "vscode", "continue", "kiro", "all")]
     [string]$Agent = ""
 )
 
@@ -29,54 +35,45 @@ $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $PSScriptRoot
 $ServerEntry = Join-Path $Root "dist\index.js"
 $LifecycleHelper = Join-Path $Root "scripts\windows\workbench-lifecycle.ps1"
+$Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 
-if (-not (Test-Path $ServerEntry)) {
+if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) {
+    Write-Host "ERROR: Explicit config file not found: $ConfigPath" -ForegroundColor Red
+    exit 1
+}
+$ResolvedConfigPath = (Resolve-Path -LiteralPath $ConfigPath).Path
+
+if (-not (Test-Path -LiteralPath $ServerEntry -PathType Leaf)) {
     Write-Host "ERROR: Server not built. Run: npm run build" -ForegroundColor Red
     exit 1
 }
-if (-not (Test-Path $LifecycleHelper -PathType Leaf)) {
+if (-not (Test-Path -LiteralPath $LifecycleHelper -PathType Leaf)) {
     Write-Host "ERROR: Bundled Windows lifecycle helper is missing: $LifecycleHelper" -ForegroundColor Red
     exit 1
 }
 
 Write-Host "Verifying registered tools..." -ForegroundColor Yellow
-node (Join-Path $Root "scripts\list-tools.mjs")
+node (Join-Path $Root "scripts\verify-mcp-server.mjs") --config $ResolvedConfigPath
 if ($LASTEXITCODE -ne 0) { exit 1 }
 Write-Host ""
-
-$configPath = Join-Path $Root "reforger-forge.config.json"
-if (-not (Test-Path $configPath)) {
-    Copy-Item (Join-Path $Root "reforger-forge.config.example.json") $configPath
-}
-$config = Get-Content $configPath -Raw | ConvertFrom-Json
-
-$envBlock = [ordered]@{
-    ENFUSION_WORKBENCH_PATH = $config.workbenchPath
-    ENFUSION_GAME_PATH      = $config.gamePath
-    ENFUSION_PROJECT_PATH   = $config.projectPath
-    ENFUSION_WORKBENCH_HOST = $config.workbenchHost
-    ENFUSION_WORKBENCH_PORT = "$($config.workbenchPort)"
-}
 
 # Standard mcpServers entry (Cursor, Antigravity, Windsurf, Claude, Continue, Kiro)
 $stdioEntry = [ordered]@{
     command = "node"
-    args    = @($ServerEntry)
-    env     = $envBlock
+    args    = @($ServerEntry, "--config", $ResolvedConfigPath)
 }
 
 # VS Code uses "servers" with type: stdio
 $vscodeEntry = [ordered]@{
     type    = "stdio"
     command = "node"
-    args    = @($ServerEntry)
-    env     = $envBlock
+    args    = @($ServerEntry, "--config", $ResolvedConfigPath)
 }
 
 function Merge-McpServers {
     param(
         [string]$Path,
-        [hashtable]$Entry,
+        [System.Collections.IDictionary]$Entry,
         [string]$Key = "reforger-forge",
         [string]$RootKey = "mcpServers"
     )
@@ -84,21 +81,76 @@ function Merge-McpServers {
     if ($dir -and -not (Test-Path $dir)) {
         New-Item -ItemType Directory -Force -Path $dir | Out-Null
     }
-    if (Test-Path $Path) {
-        $existing = Get-Content $Path -Raw | ConvertFrom-Json
+    if (Test-Path -LiteralPath $Path -PathType Leaf) {
+        $existing = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
     } else {
         $existing = [PSCustomObject]@{}
     }
-    if (-not $existing.$RootKey) {
+    if ($existing -isnot [PSCustomObject]) {
+        throw "MCP config root must be a JSON object: $Path"
+    }
+    $rootProperty = $existing.PSObject.Properties[$RootKey]
+    if ($null -eq $rootProperty -or $null -eq $rootProperty.Value) {
         $existing | Add-Member -NotePropertyName $RootKey -NotePropertyValue ([PSCustomObject]@{}) -Force
+    } elseif ($rootProperty.Value -isnot [PSCustomObject]) {
+        throw "MCP config '$RootKey' must be a JSON object: $Path"
     }
     $existing.$RootKey | Add-Member -NotePropertyName $Key -NotePropertyValue $Entry -Force
-    $existing | ConvertTo-Json -Depth 10 | Set-Content $Path -Encoding UTF8
+    $json = $existing | ConvertTo-Json -Depth 100
+    [System.IO.File]::WriteAllText(
+        $Path,
+        $json + [Environment]::NewLine,
+        $Utf8NoBom
+    )
     Write-Host "  Updated: $Path" -ForegroundColor Green
 }
 
 function Install-Cursor {
     Merge-McpServers -Path (Join-Path $env:USERPROFILE ".cursor\mcp.json") -Entry $stdioEntry
+}
+
+function Install-Codex {
+    $codexCommand = Get-Command codex -CommandType Application -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    if ($null -eq $codexCommand) {
+        if ($All -or $Agent -eq "all") {
+            Write-Warning "Skipped Codex because the Codex CLI is not installed or is not available on PATH."
+            return
+        }
+        throw "Codex CLI is not installed or is not available on PATH."
+    }
+
+    $existingJson = & $codexCommand.Source mcp get reforger-forge --json 2>$null
+    if ($LASTEXITCODE -eq 0) {
+        try {
+            $existing = $existingJson | ConvertFrom-Json
+        } catch {
+            throw "Codex returned an invalid MCP registration for 'reforger-forge': $($_.Exception.Message)"
+        }
+        $existingArgs = @($existing.transport.args)
+        $alreadyCurrent =
+            $existing.transport.type -eq "stdio" -and
+            $existing.transport.command -eq "node" -and
+            $existingArgs.Count -eq 3 -and
+            $existingArgs[0] -eq $ServerEntry -and
+            $existingArgs[1] -eq "--config" -and
+            $existingArgs[2] -eq $ResolvedConfigPath
+        if ($alreadyCurrent) {
+            Write-Host "  Already current: Codex MCP registration" -ForegroundColor Green
+            return
+        }
+
+        & $codexCommand.Source mcp remove reforger-forge
+        if ($LASTEXITCODE -ne 0) {
+            throw "Codex could not remove the existing 'reforger-forge' MCP registration."
+        }
+    }
+
+    & $codexCommand.Source mcp add reforger-forge -- node $ServerEntry --config $ResolvedConfigPath
+    if ($LASTEXITCODE -ne 0) {
+        throw "Codex could not add the 'reforger-forge' MCP registration."
+    }
+    Write-Host "  Updated through Codex CLI: reforger-forge" -ForegroundColor Green
 }
 
 function Install-Antigravity {
@@ -123,20 +175,7 @@ function Install-VSCode {
 }
 
 function Install-Continue {
-    $path = Join-Path $env:USERPROFILE ".continue\config.json"
-    $dir = Split-Path $path -Parent
-    if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
-    if (Test-Path $path) {
-        $existing = Get-Content $path -Raw | ConvertFrom-Json
-    } else {
-        $existing = [PSCustomObject]@{}
-    }
-    if (-not $existing.mcpServers) {
-        $existing | Add-Member -NotePropertyName mcpServers -NotePropertyValue ([PSCustomObject]@{}) -Force
-    }
-    $existing.mcpServers | Add-Member -NotePropertyName "reforger-forge" -NotePropertyValue $stdioEntry -Force
-    $existing | ConvertTo-Json -Depth 10 | Set-Content $path -Encoding UTF8
-    Write-Host "  Updated: $path" -ForegroundColor Green
+    Merge-McpServers -Path (Join-Path $env:USERPROFILE ".continue\config.json") -Entry $stdioEntry
 }
 
 function Install-Kiro {
@@ -144,8 +183,7 @@ function Install-Kiro {
     New-Item -ItemType Directory -Force -Path $kiroDir | Out-Null
     $entry = [ordered]@{
         command     = "node"
-        args        = @($ServerEntry)
-        env         = $envBlock
+        args        = @($ServerEntry, "--config", $ResolvedConfigPath)
         disabled    = $false
         autoApprove = @()
     }
@@ -153,6 +191,7 @@ function Install-Kiro {
 }
 
 $agents = @{
+    codex       = @{ Name = "Codex";               Fn = { Install-Codex } }
     cursor      = @{ Name = "Cursor";              Fn = { Install-Cursor } }
     antigravity = @{ Name = "Google Antigravity";  Fn = { Install-Antigravity } }
     claude      = @{ Name = "Claude Desktop";      Fn = { Install-Claude } }
@@ -166,6 +205,7 @@ Write-Host ""
 Write-Host "ReforgerForge MCP - Agent Installer" -ForegroundColor Cyan
 Write-Host "===================================" -ForegroundColor Cyan
 Write-Host "Server: $ServerEntry"
+Write-Host "Config: $ResolvedConfigPath"
 Write-Host ""
 
 if ($All -or $Agent -eq "all") {
@@ -178,7 +218,7 @@ if ($All -or $Agent -eq "all") {
     & $agents[$Agent].Fn
 } else {
     Write-Host "Select agents to install (comma-separated keys):" -ForegroundColor Yellow
-    Write-Host "  cursor, antigravity, claude, windsurf, vscode, continue, kiro"
+    Write-Host "  codex, cursor, antigravity, claude, windsurf, vscode, continue, kiro"
     Write-Host "  Or use: -All   or   -Agent antigravity"
     Write-Host ""
     $input = Read-Host "Agents (or 'all')"
@@ -188,13 +228,17 @@ if ($All -or $Agent -eq "all") {
             & $agents[$key].Fn
         }
     } else {
-        foreach ($key in ($input -split "," | ForEach-Object { $_.Trim() })) {
-            if ($agents.ContainsKey($key)) {
-                Write-Host "Installing: $($agents[$key].Name)..." -ForegroundColor Yellow
-                & $agents[$key].Fn
-            } else {
-                Write-Host "Unknown agent: $key" -ForegroundColor Red
-            }
+        $selected = @($input -split "," | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+        if ($selected.Count -eq 0) {
+            throw "At least one agent key is required."
+        }
+        $unknown = @($selected | Where-Object { -not $agents.ContainsKey($_) })
+        if ($unknown.Count -gt 0) {
+            throw "Unknown agent key(s): $($unknown -join ', ')"
+        }
+        foreach ($key in $selected) {
+            Write-Host "Installing: $($agents[$key].Name)..." -ForegroundColor Yellow
+            & $agents[$key].Fn
         }
     }
 }
@@ -203,6 +247,7 @@ Write-Host ""
 Write-Host "Done! Restart your agent and verify 'reforger-forge' is available." -ForegroundColor Green
 Write-Host ""
 Write-Host "Agent config locations:" -ForegroundColor Cyan
+Write-Host "  Codex:        managed by 'codex mcp' (normally $env:USERPROFILE\.codex\config.toml)"
 Write-Host "  Cursor:       $env:USERPROFILE\.cursor\mcp.json"
 Write-Host "  Antigravity:  $env:USERPROFILE\.gemini\config\mcp_config.json"
 Write-Host "  Claude:       $env:APPDATA\Claude\claude_desktop_config.json"

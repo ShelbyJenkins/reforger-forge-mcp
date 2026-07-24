@@ -1,5 +1,11 @@
 import { redactDiagnostic, redactText } from "#foundation/redact";
 
+let debugEnabled = false;
+
+export function setObserverDebugEnabled(enabled: boolean): void {
+  debugEnabled = enabled;
+}
+
 function write(level: string, message: string, fields?: Record<string, unknown>): void {
   const suffix = fields && Object.keys(fields).length > 0
     ? ` ${JSON.stringify(redactDiagnostic(fields, { profile: "diagnostic" }))}`
@@ -12,7 +18,7 @@ export const observerLogger = {
   warn: (message: string, fields?: Record<string, unknown>) => write("WARN", message, fields),
   error: (message: string, fields?: Record<string, unknown>) => write("ERROR", message, fields),
   debug: (message: string, fields?: Record<string, unknown>) => {
-    if (process.env.REFORGER_FORGE_OBSERVER_DEBUG) write("DEBUG", message, fields);
+    if (debugEnabled) write("DEBUG", message, fields);
   },
 };
 

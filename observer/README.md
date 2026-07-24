@@ -46,6 +46,17 @@ merged `-addonsDir`, one merged `-addons`, one matching `-profile`, and
 
 ## MCP integration
 
+Observer settings reach the MCP only through an explicit server invocation such
+as `node dist/index.js --config C:\path\to\config.json` or the corresponding
+`--observer-*` CLI flags. There is no package/home config discovery and no
+environment-variable server configuration. The live-test environment variables
+documented below are repository-harness authorization gates only; they do not
+configure an installed MCP server or override harness inputs. CLI flags override
+the selected file;
+repeat `--observer-evidence-root` or `--observer-supporting-log-root` to replace
+and order either allowlist for one MCP instance. Relative paths in the selected
+JSON file resolve from that file's directory.
+
 The MCP server creates one host observer application. Its shared capture
 service owns routing, public jobs, idempotency, deadlines, run binding,
 promotion, cancellation, and release for both runtime and Workbench backends.
@@ -141,13 +152,15 @@ npm run protocol:check
 npm run observer:manifest:check
 npm run build
 npm run observer:validate:enforce -- --protocol-only --target both
-npm run observer:validate:enforce -- --target both
-npm run observer:acceptance:enforce-mailbox
+npm run observer:validate:enforce -- --config <CONFIG_PATH> --target both
+npm run observer:acceptance:enforce-mailbox -- --config <CONFIG_PATH>
 ```
 
-The controlled commands read only Workbench/add-on paths from the gitignored
-local config, refuse an already-running Workbench, use isolated temporary
-profiles, and write sanitized JSON evidence. `observer:validate:enforce` checks
+The controlled commands use the file supplied with `--config` as their explicit
+base. Their documented `--workbench` and repeated `--addons-dir` flags can
+override those paths for one validation process. They refuse an already-running
+Workbench, use isolated temporary profiles, and write sanitized JSON evidence.
+`observer:validate:enforce` checks
 canonical source and descriptor/C/consumer drift before any compiler launch;
 its compile artifact is target-specific and deliberately records
 `behavioralMailboxAcceptance.result: "not_run"`.
@@ -428,7 +441,7 @@ environment gate and an independent command-line confirmation:
 
 ```powershell
 $env:RFO_RUN_LIVE_RUNTIME_OBSERVER_ACCEPTANCE = '1'
-npm run dev:observer:acceptance:runtime -- --confirm-live-run
+npm run dev:observer:acceptance:runtime -- --config <CONFIG_PATH> --confirm-live-run
 ```
 
 By default the harness uses the installed stock world
@@ -454,6 +467,20 @@ harness also finds a graphical Diag executable beneath the configured
   deterministic color marker in the look-at capture.
 - `--artifact-root` and `--timeout-ms` to select the external retained run root
   and bounded deadline. Run with `--help` for the complete syntax.
+
+The runtime failure pilot uses the same explicit configuration contract:
+
+```powershell
+npm run dev:observer:acceptance:runtime -- --list-cases
+
+$env:RFO_RUN_LIVE_RUNTIME_OBSERVER_ACCEPTANCE = '1'
+npm run dev:observer:acceptance:runtime -- --config <CONFIG_PATH> --only runtime.cancel_capture.lease_acquired.pose --confirm-live-run
+```
+
+`--only` executes one validated fault case and records partial coverage.
+`--keep-profile` is accepted only with `--only` and only retains a failed
+selected-case directory. No selector remains the five-view positive path; there
+is no implicit or full-matrix runtime mode.
 
 The harness stages managed and profile data beneath an external temporary run
 root, begins a managed observer run, prepares the launch, and selects exactly
@@ -494,12 +521,6 @@ the host application, and proves process vacancy. It retains the external
 its `screenshots` directory. A successful run removes its exact owned managed,
 profile, and diagnostic scratch, leaving only the summary and finalized
 evidence.
-
-The Vitest live entry is skipped unless both
-`RFO_RUN_LIVE_RUNTIME_OBSERVER_ACCEPTANCE=1` and
-`RFO_CONFIRM_LIVE_RUNTIME_OBSERVER_ACCEPTANCE=1` are set. It uses the same
-stock world by default; `RFO_RUNTIME_OBSERVER_WORLD` is an optional override.
-Run it through `npm run test:observer:integration`.
 
 Five-capture v2 automation passed on July 17, 2026 local (July 18 UTC) against
 Reforger 1.7.0.54 and stock
@@ -627,12 +648,12 @@ requires both confirmations:
 
 ```powershell
 $env:RFO_RUN_LIVE_WORKBENCH_OBSERVER_ACCEPTANCE = '1'
-npm run dev:observer:acceptance:workbench -- --confirm-live-run
+npm run dev:observer:acceptance:workbench -- --config <CONFIG_PATH> --confirm-live-run
 ```
 
-The harness reads machine paths only from the gitignored
-`reforger-forge.config.json`. Optional `--artifact-root` and `--timeout-ms`
-arguments control the retained evidence location and deadline. It creates a
+The harness reads machine paths only from the file supplied with `--config`.
+Optional `--artifact-root` and `--timeout-ms` arguments control the retained
+evidence location and deadline. It creates a
 run-specific `Worlds/ObserverAcceptance.ent` inheriting stock Everon and captures
 `initial-current`, `explicit-pose`, `post-pose-restoration-current`,
 `explicit-look-at`, and `post-look-at-restoration-current`. Both explicit views
@@ -641,8 +662,6 @@ current views. The harness verifies their exact matrices and FOVs, exact
 post-view restoration of camera owner/matrix/FOV/world identity, native PNG
 material variation, lease release, clean-target invariance, exact-owner
 shutdown, and final process vacancy.
-The Vitest live entry is additionally skipped unless
-`RFO_CONFIRM_LIVE_WORKBENCH_OBSERVER_ACCEPTANCE=1` is set.
 
 The command above has no selector and remains the five-view positive-path
 acceptance. Failure-matrix modes are explicit:
@@ -651,8 +670,8 @@ acceptance. Failure-matrix modes are explicit:
 npm run dev:observer:acceptance:workbench -- --list-cases
 
 $env:RFO_RUN_LIVE_WORKBENCH_OBSERVER_ACCEPTANCE = '1'
-npm run dev:observer:acceptance:workbench -- --matrix --confirm-live-run
-npm run dev:observer:acceptance:workbench -- --only workbench.cancel_capture.lease_acquired.pose --confirm-live-run
+npm run dev:observer:acceptance:workbench -- --config <CONFIG_PATH> --matrix --confirm-live-run
+npm run dev:observer:acceptance:workbench -- --config <CONFIG_PATH> --only workbench.cancel_capture.lease_acquired.pose --confirm-live-run
 ```
 
 `--matrix` executes all 69 Workbench cases serially with fresh per-case state
@@ -716,4 +735,7 @@ current 69-case implementation. Dedicated/headless non-render behavior,
 minimized/out-of-focus rendering, native fault injection, and remote/delegated
 rendering therefore remain outside current live proof.
 
-Real-engine tests belong under `tests/observer/integration` and run only through `npm run test:observer:integration` with disposable profiles and target projects.
+Real-engine screenshot acceptance runs only through the explicit CLI harnesses
+documented above. `npm run test:observer:integration` is reserved for the
+harmless exact-owned runtime native fixture; it does not launch Arma Reforger or
+Workbench.

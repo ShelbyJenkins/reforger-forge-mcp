@@ -119,6 +119,7 @@ export interface WorkbenchLiveMatrixCaseServices {
 }
 
 export interface RunLiveWorkbenchMatrixCaseInput {
+  readonly configPath: string;
   readonly matrixCase: WorkbenchFaultMatrixCase;
   readonly caseDirectory: string;
   readonly timeoutMs: number;
@@ -510,6 +511,7 @@ class WorkbenchLiveMatrixCaseExecution {
       ? createOneShotWorkbenchPngArtifactHook(this.mutation)
       : null;
     this.runtime = new WorkbenchObserverAcceptanceRuntime({
+      configPath: input.configPath,
       runDirectory: input.caseDirectory,
       clientIdPrefix: "live-workbench-matrix",
       stageMatrixFixture: true,

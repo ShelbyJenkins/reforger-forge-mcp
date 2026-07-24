@@ -7,11 +7,14 @@ Thanks for helping improve ReforgerForge MCP!
 See [README.md](README.md#agent-setup) for full instructions. Quick install:
 
 ```powershell
-.\scripts\install-agents.ps1 -All          # all supported agents
-.\scripts\install-agents.ps1 -Agent antigravity   # Google Antigravity only
+$ConfigPath = (Resolve-Path .\reforger-forge.config.json).Path
+.\agents\install-agents.ps1 -ConfigPath $ConfigPath -All
+.\agents\install-agents.ps1 -ConfigPath $ConfigPath -Agent antigravity
 ```
 
-Supported agents: Cursor, Google Antigravity, Claude Desktop, Windsurf, VS Code Copilot, Continue.dev, Kiro.
+Installer-supported clients: Codex, Cursor, Google Antigravity, Claude Desktop,
+Windsurf, VS Code Copilot, Continue.dev, and Kiro. The Codex installation uses
+the standard `codex mcp` CLI; other clients use their supported JSON formats.
 
 ## Making Changes
 
@@ -19,7 +22,7 @@ Supported agents: Cursor, Google Antigravity, Claude Desktop, Windsurf, VS Code 
 2. Make your changes in `src/`
 3. Run tests: `npm test`
 4. Build: `npm run build`
-5. Verify tools: `node scripts/list-tools.mjs`
+5. Verify the MCP server: `npm run mcp:verify -- --config <path>`
 6. Open a pull request
 
 ## Code Style

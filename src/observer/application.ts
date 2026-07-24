@@ -50,6 +50,7 @@ export type ObserverCaptureResult =
   | { asynchronous: false; job: Record<string, unknown>; image: Buffer; metadata: Record<string, unknown> };
 
 export interface CreateObserverApplicationOptions {
+  debug?: boolean;
   agentPath?: string;
   managedRoot?: string;
   profileRoot?: string;
@@ -186,6 +187,7 @@ class DefaultObserverApplication implements ObserverApplication {
     add("--retention-max-bytes", options.retentionMaxBytes);
     add("--sweep-interval-ms", options.privateChildSweepIntervalMs);
     add("--session-terminal-retention-ms", options.privateChildSessionTerminalRetentionMs);
+    if (options.debug) argumentsArray.push("--debug");
     for (const root of options.evidenceRoots ?? []) add("--evidence-root", root);
     for (const root of options.supportingLogRoots ?? []) add("--supporting-log-root", root);
     this.agentClient = new ObserverAgentClient({

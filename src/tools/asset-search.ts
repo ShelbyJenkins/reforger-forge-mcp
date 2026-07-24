@@ -224,7 +224,7 @@ export function registerAssetSearch(server: McpServer, config: Config): void {
           content: [
             {
               type: "text",
-              text: `Base game not found at ${config.gamePath}. Set ENFUSION_GAME_PATH or ensure Arma Reforger is installed.`,
+              text: `Base game not found at ${config.gamePath}. Configure gamePath with --config or --game-path and ensure Arma Reforger is installed.`,
             },
           ],
           isError: true,

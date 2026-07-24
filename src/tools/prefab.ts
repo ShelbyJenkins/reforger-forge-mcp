@@ -280,7 +280,7 @@ export function registerPrefab(server: McpServer, config: Config): void {
             content: [
               {
                 type: "text",
-                text: `Generated prefab (no project path configured — not written to disk):\n\n\`\`\`\n${content}\n\`\`\`${checklist}\n\nSet ENFUSION_PROJECT_PATH to write files automatically.${ancestryNote}`,
+                text: `Generated prefab (no project path configured — not written to disk):\n\n\`\`\`\n${content}\n\`\`\`${checklist}\n\nUse --config/--project-path to write files automatically.${ancestryNote}`,
               },
             ],
           };

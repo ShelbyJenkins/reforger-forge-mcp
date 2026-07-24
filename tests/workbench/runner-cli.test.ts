@@ -60,6 +60,61 @@ function dependencies(
 }
 
 describe("Workbench runner CLI contract", () => {
+  it("forwards shared configuration flags to the loader without exposing them to the intent parser", async () => {
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    const config = { marker: "explicit-config", debug: true } as unknown as Config;
+    const loadConfiguration = vi.fn(() => config);
+    const setDebug = vi.fn();
+    const runIntent = vi.fn(async (receivedConfig: Config) => {
+      expect(receivedConfig).toBe(config);
+      return receipt(status("exited", 0));
+    }) as NonNullable<WorkbenchRunnerCliDependencies["runIntent"]>;
+
+    await expect(executeWorkbenchRunnerCli([
+      "editor",
+      "--config", "C:\\instances\\observer.json",
+      "--gproj", "C:\\target\\project.gproj",
+      "--workbench-addon-dir", "C:\\addons\\first",
+      "--workbench-addon-dir", "C:\\addons\\second",
+      "--debug",
+      "--foreground",
+    ], {
+      loadConfiguration,
+      setDebug,
+      runIntent,
+      stdout: { write: (line) => stdout.push(line) },
+      stderr: { write: (line) => stderr.push(line) },
+    })).resolves.toBe(0);
+
+    expect(loadConfiguration).toHaveBeenCalledOnce();
+    expect(loadConfiguration).toHaveBeenCalledWith([
+      "--config", "C:\\instances\\observer.json",
+      "--workbench-addon-dir", "C:\\addons\\first",
+      "--workbench-addon-dir", "C:\\addons\\second",
+      "--debug",
+    ]);
+    expect(setDebug).toHaveBeenCalledOnce();
+    expect(setDebug).toHaveBeenCalledWith(true);
+    expect(runIntent).toHaveBeenCalledOnce();
+    expect(stderr).toEqual([]);
+    expect(stdout).toHaveLength(1);
+  });
+
+  it("reports the version without requiring configuration", async () => {
+    const stdout: string[] = [];
+    const loadConfiguration = vi.fn(() => ({} as Config));
+
+    await expect(executeWorkbenchRunnerCli(["--version"], {
+      loadConfiguration,
+      packageVersion: () => "9.8.7",
+      stdout: { write: (line) => stdout.push(line) },
+    })).resolves.toBe(0);
+
+    expect(loadConfiguration).not.toHaveBeenCalled();
+    expect(stdout).toEqual(["9.8.7\n"]);
+  });
+
   it.each([
     ["zero exit", status("exited", 0), 0],
     ["nonzero exit", status("exited", 1), 1],

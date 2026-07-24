@@ -55,7 +55,7 @@ export function registerProject(server: McpServer, config: Config): void {
           content: [
             {
               type: "text",
-              text: "No project path configured. Set ENFUSION_PROJECT_PATH environment variable or provide projectPath parameter.",
+              text: "No project path configured. Use --config/--project-path or provide projectPath.",
             },
           ],
           isError: true,
