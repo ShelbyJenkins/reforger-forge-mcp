@@ -8,6 +8,7 @@ import {
 } from "node:fs";
 import { dirname } from "node:path";
 import type { Config } from "../config.js";
+import { projectPathRequiredMessage } from "../utils/project-path.js";
 import type { WorkbenchClient } from "../workbench/client.js";
 import { validateProjectPath } from "../utils/safe-path.js";
 import { resolveGameDataPath, findLooseFile, resolveAddonDir } from "../utils/game-paths.js";
@@ -73,6 +74,15 @@ export function registerGameDuplicate(
       },
     },
     async ({ sourcePath, destPath, modName, flatten, register }) => {
+      if (!config.projectPath) {
+        return {
+          content: [{
+            type: "text",
+            text: projectPathRequiredMessage("game_duplicate"),
+          }],
+          isError: true,
+        };
+      }
       // Strip GUID prefix from sourcePath if present: {GUID}path → path
       const bareSourcePath = sourcePath.replace(/^\{[0-9A-Fa-f]{16}\}/, "");
 

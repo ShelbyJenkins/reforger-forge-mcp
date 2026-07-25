@@ -1,61 +1,51 @@
-# Agent Setup
+# MCP Client Notes
 
-ReforgerForge uses **stdio MCP** (local Node.js process). Every agent below runs
-the same server with `--config <absolute-path>`.
+For prerequisites, default setup behavior, Doctor, receipts, Steam discovery,
+configuration overrides, and manual installation, see the
+[complete setup guide](../setup.md).
 
-Run commands from the ReforgerForge repository root after building the server.
-
-## Workspace instructions
-
-Copy [the starter `AGENTS.md`](AGENTS.md) into the root of your modding
-workspace and replace its placeholders. It gives coding agents a practical
-setup checklist, MCP tool-routing guide, Workbench workflow, resource-safety
-rules, validation steps, and troubleshooting reference.
-
-## Supported clients
-
-| Agent | Config file | Install command |
-|-------|-------------|-----------------|
-| **Codex** | `%USERPROFILE%\.codex\config.toml` | `.\agents\install-agents.ps1 -ConfigPath <path> -Agent codex` |
-| **Cursor** | `%USERPROFILE%\.cursor\mcp.json` | `.\agents\install-agents.ps1 -ConfigPath <path> -Agent cursor` |
-| **Google Antigravity** | `%USERPROFILE%\.gemini\config\mcp_config.json` | `.\agents\install-agents.ps1 -ConfigPath <path> -Agent antigravity` |
-| **Claude Desktop** | `%APPDATA%\Claude\claude_desktop_config.json` | `.\agents\install-agents.ps1 -ConfigPath <path> -Agent claude` |
-| **Windsurf** | `%USERPROFILE%\.codeium\windsurf\mcp_config.json` | `.\agents\install-agents.ps1 -ConfigPath <path> -Agent windsurf` |
-| **VS Code (Copilot)** | `%APPDATA%\Code\User\mcp.json` + `.vscode\mcp.json` | `.\agents\install-agents.ps1 -ConfigPath <path> -Agent vscode` |
-| **Continue.dev** | `%USERPROFILE%\.continue\config.json` | `.\agents\install-agents.ps1 -ConfigPath <path> -Agent continue` |
-| **Kiro** | `.kiro/settings/mcp.json` (workspace) | `.\agents\install-agents.ps1 -ConfigPath <path> -Agent kiro` |
-| **All installer-supported agents** | All installer rows above | `.\agents\install-agents.ps1 -ConfigPath <path> -All` |
+This page contains only registration targets, commands, migration caveats, and
+refresh steps specific to each MCP client.
 
 ## Codex
 
-The installer uses the standard Codex MCP CLI documented in the
-[official Codex MCP guide](https://learn.chatgpt.com/docs/extend/mcp):
+Automatic setup uses the Codex MCP CLI and its default user/global scope. The
+registration is named `reforger-forge`.
 
-```powershell
-.\agents\install-agents.ps1 -ConfigPath <path> -Agent codex
-```
-
-The equivalent manual commands are:
+The equivalent config-free manual commands are:
 
 ```powershell
 $ServerPath = (Resolve-Path .\dist\index.js).Path
-$ConfigPath = (Resolve-Path .\reforger-forge.config.json).Path
-codex mcp add reforger-forge -- node $ServerPath --config $ConfigPath
+codex mcp add reforger-forge -- node $ServerPath
 codex mcp list
 ```
 
-If a registration with that name already exists, run
-`codex mcp remove reforger-forge` first. Restart Codex after adding or replacing
-the server.
+If a registration with that name already exists, remove or replace it through
+the Codex CLI. To register an explicit ReforgerForge override, follow
+[Registering an explicit override](../setup.md#registering-an-explicit-override).
 
 ## Google Antigravity
 
-1. Run `.\agents\install-agents.ps1 -ConfigPath <path> -Agent antigravity`
-2. Open Antigravity → **Settings** → **Customizations** → **Open MCP Config**
-3. Confirm `reforger-forge` appears, then click **Refresh** in Installed MCP Servers
-4. The shared config is at `~/.gemini/config/mcp_config.json` (same file used by Antigravity CLI)
+Automatic setup uses one user target. Fresh registrations use
+`%USERPROFILE%\.gemini\config\mcp_config.json`. If Antigravity is positively
+detected and the alternate
+`%USERPROFILE%\.gemini\antigravity\mcp_config.json` already exists while the
+canonical file does not, setup updates that alternate file instead. It never
+writes both.
 
-Manual config (if needed):
+A shared `.gemini\config` file by itself is not positive Antigravity detection
+evidence.
+
+The explicit-config manual installer always writes the canonical
+`.gemini\config\mcp_config.json` target. It does not retain an existing
+alternate `.gemini\antigravity\mcp_config.json`, so review both files before
+using `install-agents.ps1 -All`.
+
+After setup, open Antigravity → **Settings** → **Customizations** →
+**Open MCP Config**, confirm `reforger-forge` appears, and refresh Installed MCP
+Servers if necessary.
+
+The config-free entry has this shape:
 
 ```json
 {
@@ -63,9 +53,7 @@ Manual config (if needed):
     "reforger-forge": {
       "command": "node",
       "args": [
-        "C:\\full\\path\\to\\reforger-forge-mcp\\dist\\index.js",
-        "--config",
-        "C:\\full\\path\\to\\reforger-forge.config.json"
+        "C:\\full\\path\\to\\reforger-forge-mcp\\dist\\index.js"
       ]
     }
   }
@@ -74,58 +62,113 @@ Manual config (if needed):
 
 ## Cursor
 
-For a global install, run the install script or merge
-`agents/configs/cursor-global.json`. For a workspace-only install, copy
-`agents/configs/stdio-template.json` to `.cursor/mcp.json` and replace the
-placeholder path. Generated workspace config is intentionally ignored by Git.
+Automatic setup updates the user registration at
+`%USERPROFILE%\.cursor\mcp.json` under `mcpServers`.
 
-Restart → **MCP: Restart Servers**
+For a manual config-free install, merge
+[cursor-global.json](configs/cursor-global.json). To intentionally create a
+workspace-only registration instead, copy
+[stdio-template.json](configs/stdio-template.json) to `.cursor/mcp.json` and
+replace the absolute server-path placeholder.
+
+After changing the registration, run **MCP: Restart Servers**.
 
 ## Claude Desktop
 
-Merge `agents/configs/claude-desktop.json` or run the install script.
+Automatic setup writes only the user target
+`%APPDATA%\Claude\claude_desktop_config.json` under `mcpServers` when Claude
+Desktop is detected.
 
-- Windows: `%APPDATA%\Claude\claude_desktop_config.json`
+For a manual config-free install, merge
+[claude-desktop.json](configs/claude-desktop.json) into the client's
+`mcpServers` object, then restart Claude Desktop.
 
 ## Claude Code
 
+Automatic setup uses a named `reforger-forge` registration with
+`--scope user`. It inspects the entry through `claude mcp get` and reads the
+exact user state from `%USERPROFILE%\.claude.json`, or
+`%CLAUDE_CONFIG_DIR%\.claude.json` when that override is set.
+
+A same-named local/project entry takes precedence over user scope. Setup leaves
+that entry unchanged and reports the conflict for manual attention.
+
+Command discovery prefers `claude` on `PATH`. When it is absent, setup checks
+the standard VS Code and VS Code Insiders extension installations for
+`anthropic.claude-code-*`, ignores obsolete versions, and selects the newest
+validated bundled native CLI. Invalid, incomplete, or symbolic-link-backed
+extension candidates are never executed. Custom VS Code `--extensions-dir`
+locations remain manual.
+
+The config-free manual equivalent is:
+
 ```powershell
-claude mcp add --scope user reforger-forge -- node "FULL_PATH\reforger-forge-mcp\dist\index.js" --config "FULL_PATH\reforger-forge.config.json"
+claude mcp add --scope user reforger-forge -- node "FULL_PATH\reforger-forge-mcp\dist\index.js"
 ```
+
+To add an explicit ReforgerForge config, append
+`--config "FULL_PATH\reforger-forge.config.json"` after the server path.
 
 ## VS Code (GitHub Copilot)
 
-Uses `servers` key (not `mcpServers`). Run the install script—it writes both
-user-level and workspace `.vscode/mcp.json`.
+VS Code uses the `servers` key rather than `mcpServers`. Automatic setup updates
+only the user target `%APPDATA%\Code\User\mcp.json`; it does not also write the
+workspace target `.vscode\mcp.json`.
 
-Command palette: **MCP: List Servers** → verify `reforger-forge` is running.
+The explicit-config manual installer is intentionally different: it writes
+both `%APPDATA%\Code\User\mcp.json` and the ReforgerForge repository's
+`.vscode\mcp.json`. Use its `-All` mode only when that workspace registration
+is also wanted.
 
-## Windsurf (Cascade)
+For manual config-free registration, merge
+[vscode-template.json](configs/vscode-template.json) into the selected
+`mcp.json`.
 
-Global config only at `%USERPROFILE%\.codeium\windsurf\mcp_config.json`. Run the
-install script, then refresh the MCP list in the Cascade panel.
+Open **MCP: List Servers** from the command palette and verify that
+`reforger-forge` is running.
+
+## Windsurf
+
+Automatic setup uses the user target
+`%USERPROFILE%\.codeium\windsurf\mcp_config.json` under `mcpServers`.
+
+Refresh the MCP list in the Cascade panel after registration if Windsurf does
+not reload it automatically.
 
 ## Continue.dev
 
-Run the install script. MCP servers live inside
-`%USERPROFILE%\.continue\config.json` under `mcpServers`.
+Automatic setup updates the `mcpServers` sequence in the user target
+`%USERPROFILE%\.continue\config.yaml`. It preserves unrelated YAML content.
 
-## Any other MCP client
+Continue's legacy `config.json` and `config.yml` formats are not migrated
+automatically. If one exists without the current `config.yaml`, setup reports a
+manual migration instead of creating a competing file.
 
-Use the stdio template at `agents/configs/stdio-template.json`. Replace both
-absolute-path placeholders with the built server and selected config locations.
+The explicit-config manual installer targets the legacy
+`%USERPROFILE%\.continue\config.json` file rather than current
+`config.yaml`. Review or migrate the Continue configuration before including
+Continue in `install-agents.ps1 -All`.
 
-```json
-{
-  "mcpServers": {
-    "reforger-forge": {
-      "command": "node",
-      "args": [
-        "/absolute/path/to/reforger-forge-mcp/dist/index.js",
-        "--config",
-        "/absolute/path/to/reforger-forge.config.json"
-      ]
-    }
-  }
-}
-```
+## Kiro
+
+Automatic setup uses the user target
+`%USERPROFILE%\.kiro\settings\mcp.json`, or
+`%KIRO_HOME%\settings\mcp.json` when `KIRO_HOME` is set.
+
+Parameterless setup never infers or writes a workspace
+`.kiro\settings\mcp.json`.
+
+The explicit-config manual installer instead writes the ReforgerForge
+repository's `.kiro\settings\mcp.json`. Use its `-All` mode only when that
+workspace registration is wanted.
+
+## Other MCP clients
+
+Use [stdio-template.json](configs/stdio-template.json), replace the absolute
+server-path placeholder, and merge the entry into the client's MCP
+configuration.
+
+If the client uses a `servers` key rather than `mcpServers`, adapt the outer
+container to that client's schema. To opt into a custom ReforgerForge config,
+follow [Registering an explicit override](../setup.md#registering-an-explicit-override)
+and add the `--config` arguments to the client's server entry.

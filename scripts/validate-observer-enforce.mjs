@@ -158,7 +158,7 @@ async function loadValidatedConfiguration(options) {
     EXPLICIT_CONFIGURATION_CONTRACT_VERSION,
     loadConfig,
   } = await import(pathToFileURL(compiledConfigPath).href);
-  if (EXPLICIT_CONFIGURATION_CONTRACT_VERSION !== 1) {
+  if (EXPLICIT_CONFIGURATION_CONTRACT_VERSION !== 2) {
     throw new Error("Compiled configuration loader does not implement the required explicit-config contract; run npm run build");
   }
   const argumentsArray = ["--config", options.configPath];

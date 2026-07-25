@@ -15,6 +15,7 @@ import {
 } from "../animation/formatter.js";
 import { generateSuggestions, formatSuggestions } from "../animation/suggestions.js";
 import { generateGuide } from "../animation/guides.js";
+import { projectPathRequiredMessage } from "../utils/project-path.js";
 
 // ── Shared interface ──────────────────────────────────────────────────────────
 
@@ -798,7 +799,13 @@ export function registerAnimationGraph(server: McpServer, config: Config): void 
       if (opts.action === "author") {
         const basePath = opts.projectPath || config.projectPath;
         if (!basePath) {
-          return { content: [{ type: "text", text: "No project path configured." }], isError: true };
+          return {
+            content: [{
+              type: "text",
+              text: projectPathRequiredMessage("animation_graph author", "projectPath"),
+            }],
+            isError: true,
+          };
         }
 
         if (!opts.vehicleName) {
@@ -888,7 +895,7 @@ export function registerAnimationGraph(server: McpServer, config: Config): void 
                 content: [
                   {
                     type: "text",
-                    text: "No project path configured. Use --config/--project-path or provide projectPath.",
+                    text: projectPathRequiredMessage("animation_graph inspect", "projectPath"),
                   },
                 ],
                 isError: true,
@@ -991,6 +998,18 @@ export function registerAnimationGraph(server: McpServer, config: Config): void 
           if (!opts.agfPath) {
             return { content: [{ type: "text", text: "agfPath is required for suggest sub-action." }], isError: true };
           }
+          if (opts.source === "mod" && !opts.projectPath && !config.projectPath) {
+            return {
+              content: [{
+                type: "text",
+                text: projectPathRequiredMessage(
+                  "animation_graph setup suggest",
+                  "projectPath"
+                ),
+              }],
+              isError: true,
+            };
+          }
           const agfContent = readFileForTool(opts.agfPath, opts.source, opts.projectPath, config);
           if (!agfContent) {
             return { content: [{ type: "text", text: `Could not read AGF file: ${opts.agfPath}` }], isError: true };
@@ -1008,6 +1027,20 @@ export function registerAnimationGraph(server: McpServer, config: Config): void 
         // Handle setup sub-action
         if (!opts.vehicleName) {
           return { content: [{ type: "text", text: "vehicleName is required for setup action." }], isError: true };
+        }
+        if ((opts.step === "all" || opts.step === "agr")
+            && !opts.projectPath
+            && !config.projectPath) {
+          return {
+            content: [{
+              type: "text",
+              text: projectPathRequiredMessage(
+                "animation_graph setup AGR generation",
+                "projectPath"
+              ),
+            }],
+            isError: true,
+          };
         }
 
         const cfg: VehicleConfig = {
@@ -1050,7 +1083,7 @@ export function registerAnimationGraph(server: McpServer, config: Config): void 
             }
           } else {
             parts.push(
-              `## Step 1: AGR + AST — Skipped\nNo project path configured. Use --config/--project-path or provide projectPath.`
+              `## Step 1: AGR + AST — Skipped\n${projectPathRequiredMessage("animation_graph setup AGR generation", "projectPath")}`
             );
           }
         }

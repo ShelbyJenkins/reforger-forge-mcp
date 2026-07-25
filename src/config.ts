@@ -5,10 +5,20 @@ import { z } from "zod";
 import {
   canonicalizePotentialPath,
   isPathContained,
+  pathComparisonKey,
 } from "./foundation/managed-path.js";
+import {
+  ARMA_REFORGER_APP_ID,
+  ARMA_REFORGER_TOOLS_APP_ID,
+  describeSteamDiscoveryFailure,
+  discoverSteamInstallations,
+  GAME_EXECUTABLE_RELATIVE_PATHS,
+  type SteamDiscoveryResult,
+  WORKBENCH_EXECUTABLE_RELATIVE_PATHS,
+} from "./platform/windows/steam-discovery.js";
 
 /** Bump whenever native JavaScript harnesses must reject an older compiled loader. */
-export const EXPLICIT_CONFIGURATION_CONTRACT_VERSION = 1;
+export const EXPLICIT_CONFIGURATION_CONTRACT_VERSION = 2;
 
 export interface ObserverConfig {
   /** Optional managed observer root. The agent default is outside projectPath. */
@@ -17,7 +27,7 @@ export interface ObserverConfig {
   profileRoot?: string;
   /** Optional override for the packaged private-child entry point. */
   agentPath?: string;
-  /** Existing directories allowed as curated observer evidence destinations. */
+  /** Approved observer evidence destinations; the project-derived default may be prospective. */
   evidenceRoots?: string[];
   /** Existing directories from which bounded text log attachments may be read. */
   supportingLogRoots?: string[];
@@ -34,8 +44,8 @@ export interface ObserverConfig {
 export interface Config {
   /** Path to the Arma Reforger Tools installation. */
   workbenchPath: string;
-  /** Addons container used as the default project/tool root. */
-  projectPath: string;
+  /** Optional addons container used as the default project/tool root. */
+  projectPath?: string;
   /** Path to the Arma Reforger game installation. */
   gamePath: string;
   /** Optional ordered addon roots passed to Workbench as one -addonsDir value. */
@@ -89,13 +99,6 @@ const OBSERVER_NUMERIC_BOUNDS: Record<
 };
 
 const packageDirectory = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const WORKBENCH_EXECUTABLE_NAME = "ArmaReforgerWorkbenchSteamDiag.exe";
-const GAME_EXECUTABLE_NAMES = [
-  "ArmaReforgerSteamDiag.exe",
-  "ArmaReforgerDiag.exe",
-  "ArmaReforgerSteam.exe",
-  "ArmaReforger.exe",
-] as const;
 const pathValue = z.string().trim().min(1).max(32_768);
 const boundedInteger = (key: ObserverNumericKey) => {
   const [minimum, maximum] = OBSERVER_NUMERIC_BOUNDS[key];
@@ -151,6 +154,8 @@ interface ParsedConfigurationArguments {
 export interface LoadConfigOptions {
   /** Base for relative --config and CLI path values. */
   cwd?: string;
+  /** Override Steam discovery for hermetic tests and embedders. */
+  discoverSteam?: () => SteamDiscoveryResult;
 }
 
 const INTERNAL_OBSERVER_DEFAULTS: ObserverConfig = {
@@ -202,7 +207,17 @@ const REPEATABLE_FLAGS = new Set([
   "--observer-supporting-log-root",
 ]);
 
-const CONFIGURATION_FLAGS = new Set([...VALUE_FLAGS, ...BOOLEAN_FLAGS]);
+const CLEAR_ARRAY_FLAGS = new Set([
+  "--no-workbench-addon-dirs",
+  "--no-observer-evidence-roots",
+  "--no-observer-supporting-log-roots",
+]);
+
+const CONFIGURATION_FLAGS = new Set([
+  ...VALUE_FLAGS,
+  ...BOOLEAN_FLAGS,
+  ...CLEAR_ARRAY_FLAGS,
+]);
 
 export const CONFIGURATION_USAGE = [
   "Configuration:",
@@ -211,6 +226,7 @@ export const CONFIGURATION_USAGE = [
   "  --game-path <directory>                 Override gamePath.",
   "  --project-path <directory>              Override projectPath.",
   "  --workbench-addon-dir <directory>       Replace workbenchAddonDirs; repeat for each root.",
+  "  --no-workbench-addon-dirs               Replace workbenchAddonDirs with an empty array.",
   "  --workbench-host <host>                 Override the NET API host.",
   "  --workbench-port <1..65535>             Override the NET API port.",
   "  --workbench-script-authorize-all        Enable protected Workbench script operations.",
@@ -221,7 +237,9 @@ export const CONFIGURATION_USAGE = [
   "  --observer-profile-root <directory>     Override the observer profile root.",
   "  --observer-agent-path <file>            Override the private observer child.",
   "  --observer-evidence-root <directory>    Replace evidenceRoots; repeat for each root.",
+  "  --no-observer-evidence-roots            Replace evidenceRoots with an empty array.",
   "  --observer-supporting-log-root <dir>    Replace supportingLogRoots; repeat for each root.",
+  "  --no-observer-supporting-log-roots      Replace supportingLogRoots with an empty array.",
   "  --observer-*-ms / --observer-max-*      Override the documented observer limits.",
   "  --debug / --no-debug                    Enable or disable diagnostic logging.",
 ].join("\n");
@@ -269,8 +287,12 @@ function numericFlag(flag: string, raw: string, minimum = 1, maximum = Number.MA
   return value;
 }
 
-function resolveCliPath(cwd: string, value: string): string {
-  return isAbsolute(value) ? resolve(value) : resolve(cwd, value);
+function resolveCliPath(cwd: string, value: string, flag: string): string {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    throw new ConfigurationError(`${flag} requires a non-empty path.`);
+  }
+  return isAbsolute(trimmed) ? resolve(trimmed) : resolve(cwd, trimmed);
 }
 
 function parseConfigurationArguments(
@@ -312,22 +334,22 @@ function parseConfigurationArguments(
 
     switch (flag) {
       case "--config":
-        configPath = resolveCliPath(cwd, raw!);
+        configPath = resolveCliPath(cwd, raw!, flag);
         break;
       case "--workbench-path":
-        overrides.workbenchPath = resolveCliPath(cwd, raw!);
+        overrides.workbenchPath = resolveCliPath(cwd, raw!, flag);
         break;
       case "--game-path":
-        overrides.gamePath = resolveCliPath(cwd, raw!);
+        overrides.gamePath = resolveCliPath(cwd, raw!, flag);
         break;
       case "--project-path":
-        overrides.projectPath = resolveCliPath(cwd, raw!);
+        overrides.projectPath = resolveCliPath(cwd, raw!, flag);
         break;
       case "--workbench-addon-dir":
-        workbenchAddonDirs.push(resolveCliPath(cwd, raw!));
+        workbenchAddonDirs.push(resolveCliPath(cwd, raw!, flag));
         break;
       case "--extracted-path":
-        overrides.extractedPath = resolveCliPath(cwd, raw!);
+        overrides.extractedPath = resolveCliPath(cwd, raw!, flag);
         break;
       case "--workbench-host":
         overrides.workbenchHost = raw!;
@@ -349,19 +371,19 @@ function parseConfigurationArguments(
         overrides.debug = flag === "--debug";
         break;
       case "--observer-managed-root":
-        observer.managedRoot = resolveCliPath(cwd, raw!);
+        observer.managedRoot = resolveCliPath(cwd, raw!, flag);
         break;
       case "--observer-profile-root":
-        observer.profileRoot = resolveCliPath(cwd, raw!);
+        observer.profileRoot = resolveCliPath(cwd, raw!, flag);
         break;
       case "--observer-agent-path":
-        observer.agentPath = resolveCliPath(cwd, raw!);
+        observer.agentPath = resolveCliPath(cwd, raw!, flag);
         break;
       case "--observer-evidence-root":
-        evidenceRoots.push(resolveCliPath(cwd, raw!));
+        evidenceRoots.push(resolveCliPath(cwd, raw!, flag));
         break;
       case "--observer-supporting-log-root":
-        supportingLogRoots.push(resolveCliPath(cwd, raw!));
+        supportingLogRoots.push(resolveCliPath(cwd, raw!, flag));
         break;
       case "--observer-startup-timeout-ms":
         setObserverNumber("startupTimeoutMs", flag, raw!);
@@ -387,12 +409,50 @@ function parseConfigurationArguments(
       case "--observer-session-ttl-ms":
         setObserverNumber("sessionTtlMs", flag, raw!);
         break;
+      case "--no-workbench-addon-dirs":
+      case "--no-observer-evidence-roots":
+      case "--no-observer-supporting-log-roots":
+        break;
     }
   }
 
-  if (workbenchAddonDirs.length > 0) overrides.workbenchAddonDirs = workbenchAddonDirs;
-  if (evidenceRoots.length > 0) observer.evidenceRoots = evidenceRoots;
-  if (supportingLogRoots.length > 0) observer.supportingLogRoots = supportingLogRoots;
+  const replaceArray = <T>(
+    clearFlag: string,
+    valueFlag: string,
+    values: T[]
+  ): T[] | undefined => {
+    if (seen.has(clearFlag) && values.length > 0) {
+      throw new ConfigurationError(
+        `${clearFlag} cannot be combined with ${valueFlag}.`
+      );
+    }
+    if (seen.has(clearFlag)) return [];
+    return values.length > 0 ? values : undefined;
+  };
+  const addonOverrides = replaceArray(
+    "--no-workbench-addon-dirs",
+    "--workbench-addon-dir",
+    workbenchAddonDirs
+  );
+  const evidenceOverrides = replaceArray(
+    "--no-observer-evidence-roots",
+    "--observer-evidence-root",
+    evidenceRoots
+  );
+  const logOverrides = replaceArray(
+    "--no-observer-supporting-log-roots",
+    "--observer-supporting-log-root",
+    supportingLogRoots
+  );
+  if (addonOverrides !== undefined) {
+    overrides.workbenchAddonDirs = addonOverrides;
+  }
+  if (evidenceOverrides !== undefined) {
+    observer.evidenceRoots = evidenceOverrides;
+  }
+  if (logOverrides !== undefined) {
+    observer.supportingLogRoots = logOverrides;
+  }
   if (Object.keys(observer).length > 0) overrides.observer = observer;
   return { configPath, overrides };
 }
@@ -558,27 +618,36 @@ function validateConfig(config: Config): Config {
   config.gamePath = requireDirectory(config.gamePath, "gamePath");
   requireOneInstallationFile(
     config.workbenchPath,
-    [
-      join("Workbench", WORKBENCH_EXECUTABLE_NAME),
-      WORKBENCH_EXECUTABLE_NAME,
-    ],
+    WORKBENCH_EXECUTABLE_RELATIVE_PATHS,
     "workbenchPath"
   );
-  requireDirectory(join(config.gamePath, "addons"), "gamePath/addons");
+  const gameAddons = requireDirectory(
+    join(config.gamePath, "addons"),
+    "gamePath/addons"
+  );
+  if (pathComparisonKey(gameAddons) === pathComparisonKey(config.gamePath)
+      || !isPathContained(config.gamePath, gameAddons)) {
+    throw new ConfigurationError(
+      "gamePath/addons must resolve beneath gamePath."
+    );
+  }
   requireOneInstallationFile(
     config.gamePath,
-    GAME_EXECUTABLE_NAMES,
+    GAME_EXECUTABLE_RELATIVE_PATHS,
     "gamePath"
   );
-  config.projectPath = requireDirectory(config.projectPath, "projectPath");
+  if (config.projectPath) {
+    config.projectPath = requireDirectory(config.projectPath, "projectPath");
+  }
   if (isPathContained(config.workbenchPath, config.gamePath)
       || isPathContained(config.gamePath, config.workbenchPath)) {
     throw new ConfigurationError("workbenchPath and gamePath must not overlap.");
   }
-  if (isPathContained(config.workbenchPath, config.projectPath)
-      || isPathContained(config.projectPath, config.workbenchPath)
-      || isPathContained(config.gamePath, config.projectPath)
-      || isPathContained(config.projectPath, config.gamePath)) {
+  if (config.projectPath
+      && (isPathContained(config.workbenchPath, config.projectPath)
+        || isPathContained(config.projectPath, config.workbenchPath)
+        || isPathContained(config.gamePath, config.projectPath)
+        || isPathContained(config.projectPath, config.gamePath))) {
     throw new ConfigurationError(
       "projectPath must not overlap the Workbench or Arma Reforger installation."
     );
@@ -621,7 +690,9 @@ function validateConfig(config: Config): Config {
   ] as const) {
     if (!path) continue;
     const protectedRoot = [
-      ["projectPath", config.projectPath],
+      ...(config.projectPath
+        ? [["projectPath", config.projectPath] as const]
+        : []),
       ["workbenchPath", config.workbenchPath],
       ["gamePath", config.gamePath],
     ] as const;
@@ -677,8 +748,8 @@ function validateConfig(config: Config): Config {
 }
 
 /**
- * Load one explicit configuration. No package/home file discovery and no
- * environment-variable configuration are performed.
+ * Load effective configuration using internal defaults, Steam discovery, one
+ * optional explicit override file, and finally explicit CLI overrides.
  */
 export function loadConfig(
   argv: readonly string[] = [],
@@ -689,20 +760,96 @@ export function loadConfig(
   const fileConfig = parsed.configPath ? readExplicitConfig(parsed.configPath) : {};
   const fileObserver = fileConfig.observer ?? {};
   const cliObserver = parsed.overrides.observer ?? {};
-  const config = {
+  const explicitConfig = {
+    ...fileConfig,
+    ...parsed.overrides,
+  };
+  const needsWorkbenchDiscovery = explicitConfig.workbenchPath === undefined;
+  const needsGameDiscovery = explicitConfig.gamePath === undefined;
+  const discoveryDefaults: ConfigOverrides = {};
+  if (needsWorkbenchDiscovery || needsGameDiscovery) {
+    const discovery = (options.discoverSteam ?? discoverSteamInstallations)();
+    const malformedDiagnostics = discovery.errors.filter(
+      (diagnostic) => diagnostic.code === "METADATA_MALFORMED"
+    );
+    const relevantMalformedMetadata =
+      discovery.status === "malformed" &&
+      (
+        malformedDiagnostics.length === 0 ||
+        malformedDiagnostics.some((diagnostic) =>
+          diagnostic.source !== "manifest" ||
+          diagnostic.appId === undefined ||
+          (needsWorkbenchDiscovery
+            && diagnostic.appId === ARMA_REFORGER_TOOLS_APP_ID) ||
+          (needsGameDiscovery
+            && diagnostic.appId === ARMA_REFORGER_APP_ID)
+        )
+      );
+    if (relevantMalformedMetadata || discovery.status === "unsupported") {
+      throw new ConfigurationError(describeSteamDiscoveryFailure(discovery));
+    }
+    const discoveredWorkbench =
+      discovery.workbenchPath ??
+      (discovery.workbenchCandidates.length === 1
+        ? discovery.workbenchCandidates[0]
+        : undefined);
+    const discoveredGame =
+      discovery.gamePath ??
+      (discovery.gameCandidates.length === 1
+        ? discovery.gameCandidates[0]
+        : undefined);
+    if ((needsWorkbenchDiscovery && !discoveredWorkbench)
+        || (needsGameDiscovery && !discoveredGame)) {
+      throw new ConfigurationError(describeSteamDiscoveryFailure(discovery));
+    }
+    if (needsWorkbenchDiscovery) {
+      discoveryDefaults.workbenchPath = discoveredWorkbench;
+    }
+    if (needsGameDiscovery) {
+      discoveryDefaults.gamePath = discoveredGame;
+    }
+  }
+
+  const merged = {
     dataDir: resolve(packageDirectory, "data"),
     patternsDir: resolve(packageDirectory, "data", "patterns"),
     workbenchHost: "127.0.0.1",
     workbenchPort: 5775,
     workbenchScriptAuthorizeAll: false,
     debug: false,
+    ...discoveryDefaults,
     ...fileConfig,
     ...parsed.overrides,
+  };
+  if (merged.workbenchAddonDirs === undefined && merged.gamePath) {
+    merged.workbenchAddonDirs = [join(merged.gamePath, "addons")];
+  }
+  const evidenceRoots =
+    cliObserver.evidenceRoots ??
+    fileObserver.evidenceRoots;
+  const config = {
+    ...merged,
     observer: {
       ...INTERNAL_OBSERVER_DEFAULTS,
       ...fileObserver,
       ...cliObserver,
+      ...(evidenceRoots !== undefined ? { evidenceRoots } : {}),
     },
   } as Config;
-  return validateConfig(config);
+  const validated = validateConfig(config);
+  if (validated.projectPath
+      && validated.observer
+      && validated.observer.evidenceRoots === undefined) {
+    const evidenceRoot = requireProspectiveDirectory(
+      join(validated.projectPath, ".reforger-forge-screenshots"),
+      "derived observer evidence root"
+    );
+    if (!isPathContained(validated.projectPath, evidenceRoot)) {
+      throw new ConfigurationError(
+        "Derived observer evidence root must remain beneath projectPath."
+      );
+    }
+    validated.observer.evidenceRoots = [evidenceRoot];
+  }
+  return validated;
 }

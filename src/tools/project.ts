@@ -6,6 +6,7 @@ import { dirname } from "node:path";
 import type { Config } from "../config.js";
 import { validateProjectPath } from "../utils/safe-path.js";
 import { listDirectory, formatSize } from "../utils/dir-listing.js";
+import { projectPathRequiredMessage } from "../utils/project-path.js";
 
 export function registerProject(server: McpServer, config: Config): void {
   server.registerTool(
@@ -55,7 +56,7 @@ export function registerProject(server: McpServer, config: Config): void {
           content: [
             {
               type: "text",
-              text: "No project path configured. Use --config/--project-path or provide projectPath.",
+              text: projectPathRequiredMessage("project", "projectPath"),
             },
           ],
           isError: true,

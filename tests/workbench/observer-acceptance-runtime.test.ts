@@ -70,7 +70,11 @@ describe("Workbench observer acceptance runtime composition", () => {
     await withTemporaryDirectory((root) => {
       const configPath = join(root, "invalid-config.json");
       const runDirectory = join(root, "uncreated-run");
-      writeFileSync(configPath, "{}\n", "utf8");
+      writeFileSync(
+        configPath,
+        `${JSON.stringify({ workbenchPath: join(root, "missing-workbench") })}\n`,
+        "utf8"
+      );
 
       expect(() => new WorkbenchObserverAcceptanceRuntime({
         configPath,
@@ -79,7 +83,7 @@ describe("Workbench observer acceptance runtime composition", () => {
         createAdapter: () => {
           throw new Error("adapter construction must not be reached");
         },
-      })).toThrow(/required|workbenchPath|projectPath|gamePath/i);
+      })).toThrow(/workbenchPath/i);
       expect(existsSync(runDirectory)).toBe(false);
     });
   });

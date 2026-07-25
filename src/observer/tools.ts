@@ -1,5 +1,6 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { randomUUID } from "node:crypto";
+import { resolve } from "node:path";
 import { z } from "zod";
 import type { ObserverApplication, ObserverCaptureResult } from "./application.js";
 import { ObserverCoordinatorError } from "./errors.js";
@@ -15,6 +16,19 @@ import {
 } from "./public-contract.js";
 
 const finite = () => z.number().finite();
+
+function uniqueEvidenceRoots(
+  roots: readonly string[] | undefined
+): readonly string[] {
+  if (!roots) return [];
+  const seen = new Set<string>();
+  return roots.filter((root) => {
+    const key = resolve(root).toLowerCase();
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
 
 // Public MCP schemas must use homogeneous array items. Positional tuple schemas
 // serialize as draft-07 `items: [...]` with nested item references, which some
@@ -59,6 +73,7 @@ export interface ObserverToolDefaults {
   defaultCaptureTimeoutMs?: number;
   workbenchClient?: WorkbenchClient;
   projectPath?: string;
+  evidenceRoots?: readonly string[];
   ownedRuntimeManager?: OwnedRuntimeManager;
 }
 
@@ -362,15 +377,32 @@ export function registerObserverTools(
           if (!input.runId) throw new ObserverCoordinatorError("INVALID_REQUEST", "runId is required for observer_run discard");
           result = await application.discardRun(input.runId);
         } else {
-          if (!input.runId || !input.evidenceRoot || !input.includeCaptureLabels || !input.review) {
+          if (!input.runId || !input.includeCaptureLabels || !input.review) {
             throw new ObserverCoordinatorError(
               "INVALID_REQUEST",
-              "runId, evidenceRoot, includeCaptureLabels, and review are required for observer_run finalize"
+              "runId, includeCaptureLabels, and review are required for observer_run finalize"
+            );
+          }
+          const evidenceRoots = uniqueEvidenceRoots(defaults.evidenceRoots);
+          if (evidenceRoots.length === 0) {
+            throw new ObserverCoordinatorError(
+              "CAPABILITY_UNAVAILABLE",
+              "observer_run finalize requires an evidence destination; supply --project-path, --observer-evidence-root, or observer.evidenceRoots in an optional --config file"
+            );
+          }
+          const evidenceRoot = input.evidenceRoot ??
+            (evidenceRoots.length === 1
+              ? evidenceRoots[0]
+              : undefined);
+          if (!evidenceRoot) {
+            throw new ObserverCoordinatorError(
+              "INVALID_REQUEST",
+              "observer_run finalize is ambiguous because multiple evidence roots are configured; provide evidenceRoot explicitly"
             );
           }
           result = await application.finalizeRun({
             runId: input.runId,
-            evidenceRoot: input.evidenceRoot,
+            evidenceRoot,
             includeCaptureLabels: input.includeCaptureLabels,
             review: input.review,
             ...(input.runtimeConfig ? { runtimeConfig: input.runtimeConfig } : {}),

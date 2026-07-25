@@ -154,4 +154,114 @@ describe("observer MCP tools", () => {
     expect(result.content[0].text).toContain('"jobId":"job-2"');
     expect(result.content.some((item) => item.type === "image")).toBe(false);
   });
+
+  it("uses the sole configured evidence root when finalize omits evidenceRoot", async () => {
+    const finalizeRun = vi.fn(async (input) => input);
+    const coordinator = toolApplication({ finalizeRun });
+    const tools = toolRegistry(coordinator, {} as never, {
+      evidenceRoots: ["C:\\evidence"],
+    });
+
+    const result = await tools.get("observer_run")!.handler({
+      action: "finalize",
+      runId: "20260717T184233Z-a1b2c3d4",
+      includeCaptureLabels: ["proof"],
+      review: {
+        imagesReviewed: false,
+        outcome: "Unreviewed",
+        summary: "Pending review.",
+      },
+      releaseManagedArtifacts: true,
+    }, { signal: new AbortController().signal });
+
+    expect(result.isError).not.toBe(true);
+    expect(finalizeRun).toHaveBeenCalledWith(expect.objectContaining({
+      evidenceRoot: "C:\\evidence",
+    }));
+  });
+
+  it("treats duplicate configured evidence roots as one effective destination", async () => {
+    const finalizeRun = vi.fn(async (input) => input);
+    const coordinator = toolApplication({ finalizeRun });
+    const tools = toolRegistry(coordinator, {} as never, {
+      evidenceRoots: ["C:\\evidence", "c:\\EVIDENCE"],
+    });
+
+    const result = await tools.get("observer_run")!.handler({
+      action: "finalize",
+      runId: "20260717T184233Z-a1b2c3d4",
+      includeCaptureLabels: ["proof"],
+      review: {
+        imagesReviewed: false,
+        outcome: "Unreviewed",
+        summary: "Pending review.",
+      },
+      releaseManagedArtifacts: true,
+    }, { signal: new AbortController().signal });
+
+    expect(result.isError).not.toBe(true);
+    expect(finalizeRun).toHaveBeenCalledWith(expect.objectContaining({
+      evidenceRoot: "C:\\evidence",
+    }));
+  });
+
+  it("returns actionable errors when an omitted finalize root is absent or ambiguous", async () => {
+    const input = {
+      action: "finalize",
+      runId: "20260717T184233Z-a1b2c3d4",
+      includeCaptureLabels: ["proof"],
+      review: {
+        imagesReviewed: false,
+        outcome: "Unreviewed",
+        summary: "Pending review.",
+      },
+      releaseManagedArtifacts: true,
+    };
+    const coordinator = toolApplication({ finalizeRun: vi.fn() });
+    const withoutRoots = toolRegistry(coordinator);
+    const noRoot = await withoutRoots.get("observer_run")!.handler(
+      input,
+      { signal: new AbortController().signal }
+    );
+    expect(noRoot.isError).toBe(true);
+    expect(noRoot.content[0].text).toContain("CAPABILITY_UNAVAILABLE");
+    expect(noRoot.content[0].text).toContain("--project-path");
+
+    const withMultiple = toolRegistry(coordinator, {} as never, {
+      evidenceRoots: ["C:\\first", "C:\\second"],
+    });
+    const ambiguous = await withMultiple.get("observer_run")!.handler(
+      input,
+      { signal: new AbortController().signal }
+    );
+    expect(ambiguous.isError).toBe(true);
+    expect(ambiguous.content[0].text).toContain("multiple evidence roots");
+    expect(coordinator.finalizeRun).not.toHaveBeenCalled();
+  });
+
+  it("preserves an explicit finalize root when multiple roots are configured", async () => {
+    const finalizeRun = vi.fn(async (input) => input);
+    const coordinator = toolApplication({ finalizeRun });
+    const tools = toolRegistry(coordinator, {} as never, {
+      evidenceRoots: ["C:\\first", "C:\\second"],
+    });
+
+    const result = await tools.get("observer_run")!.handler({
+      action: "finalize",
+      runId: "20260717T184233Z-a1b2c3d4",
+      evidenceRoot: "C:\\second",
+      includeCaptureLabels: ["proof"],
+      review: {
+        imagesReviewed: false,
+        outcome: "Unreviewed",
+        summary: "Pending review.",
+      },
+      releaseManagedArtifacts: true,
+    }, { signal: new AbortController().signal });
+
+    expect(result.isError).not.toBe(true);
+    expect(finalizeRun).toHaveBeenCalledWith(expect.objectContaining({
+      evidenceRoot: "C:\\second",
+    }));
+  });
 });

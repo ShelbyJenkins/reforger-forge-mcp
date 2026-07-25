@@ -1,8 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  existsSync,
   mkdirSync,
   mkdtempSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -12,6 +14,7 @@ import {
   loadConfig,
   partitionConfigurationArguments,
 } from "../src/config.js";
+import type { SteamDiscoveryResult } from "../src/platform/windows/steam-discovery.js";
 
 interface FixturePaths {
   readonly workbench: string;
@@ -67,6 +70,23 @@ function requiredFileValues(
   };
 }
 
+function discoveryResult(
+  overrides: Partial<SteamDiscoveryResult> = {}
+): SteamDiscoveryResult {
+  return {
+    status: "success",
+    workbenchPath: fixturePaths.workbench,
+    gamePath: fixturePaths.game,
+    workbenchAddonDirs: [join(fixturePaths.game, "addons")],
+    workbenchCandidates: [fixturePaths.workbench],
+    gameCandidates: [fixturePaths.game],
+    steamRoots: [],
+    libraryRoots: [],
+    errors: [],
+    ...overrides,
+  };
+}
+
 beforeEach(() => {
   temporaryRoot = mkdtempSync(join(tmpdir(), "reforger-forge-config-test-"));
   configurationDirectory = createDirectory("configuration");
@@ -82,7 +102,7 @@ afterEach(() => {
   rmSync(temporaryRoot, { recursive: true, force: true });
 });
 
-describe("explicit configuration contract", () => {
+describe("effective configuration contract", () => {
   it("does not discover package-local files or read configuration from the environment", () => {
     writeFileSync(
       join(temporaryRoot, "reforger-forge.config.json"),
@@ -97,12 +117,47 @@ describe("explicit configuration contract", () => {
     vi.stubEnv("ENFUSION_GAME_PATH", fixturePaths.game);
     vi.stubEnv("ENFUSION_PROJECT_PATH", fixturePaths.project);
 
-    expect(() => loadConfig([], { cwd: temporaryRoot })).toThrowError(
-      /workbenchPath is required/
+    const discoverSteam = vi.fn(() => discoveryResult({
+      status: "not_found",
+      workbenchPath: undefined,
+      gamePath: undefined,
+      workbenchAddonDirs: undefined,
+      workbenchCandidates: [],
+      gameCandidates: [],
+      errors: [{
+        code: "NOT_FOUND",
+        source: "discovery",
+        message: "fixture has no Steam installation",
+      }],
+    }));
+
+    expect(() => loadConfig([], {
+      cwd: temporaryRoot,
+      discoverSteam,
+    })).toThrowError(
+      /Steam discovery not_found/
     );
+    expect(discoverSteam).toHaveBeenCalledOnce();
   });
 
-  it("loads exactly the requested file and retains only safe internal defaults", () => {
+  it("starts from Steam discovery with no config and no project path", () => {
+    const config = loadConfig([], {
+      cwd: temporaryRoot,
+      discoverSteam: () => discoveryResult(),
+    });
+
+    expect(config).toMatchObject({
+      workbenchPath: fixturePaths.workbench,
+      gamePath: fixturePaths.game,
+      workbenchAddonDirs: [join(fixturePaths.game, "addons")],
+      workbenchHost: "127.0.0.1",
+      workbenchPort: 5775,
+    });
+    expect(config.projectPath).toBeUndefined();
+    expect(config.observer!.evidenceRoots).toBeUndefined();
+  });
+
+  it("loads exactly the requested partial file and retains safe internal defaults", () => {
     const configPath = writeConfig(requiredFileValues());
 
     const config = loadConfig(["--config", configPath], {
@@ -124,6 +179,12 @@ describe("explicit configuration contract", () => {
         maxInlineImageBytes: 8 * 1024 * 1024,
       },
     });
+    const derivedEvidenceRoot = join(
+      fixturePaths.project,
+      ".reforger-forge-screenshots"
+    );
+    expect(config.observer!.evidenceRoots).toEqual([derivedEvidenceRoot]);
+    expect(existsSync(derivedEvidenceRoot)).toBe(false);
   });
 
   it("ignores configuration environment variables even when an explicit file is loaded", () => {
@@ -227,6 +288,22 @@ describe("explicit configuration contract", () => {
     expect(fileEvidence).not.toBe(cliEvidenceOne);
   });
 
+  it("keeps CLI precedence independent of where --config appears", () => {
+    const configPath = writeConfig(requiredFileValues({
+      workbenchHost: "file-host",
+      workbenchScriptAuthorizeAll: true,
+    }));
+
+    const config = loadConfig([
+      "--workbench-host", "cli-host",
+      "--no-workbench-script-authorize-all",
+      "--config", configPath,
+    ]);
+
+    expect(config.workbenchHost).toBe("cli-host");
+    expect(config.workbenchScriptAuthorizeAll).toBe(false);
+  });
+
   it("supports a CLI-only configuration", () => {
     const workbench = createWorkbenchInstallation("cli-only", "workbench");
     const game = createGameInstallation("cli-only", "game");
@@ -239,17 +316,217 @@ describe("explicit configuration contract", () => {
     ]);
 
     expect(config).toMatchObject({ workbenchPath: workbench, gamePath: game, projectPath: project });
+    expect(config.observer!.evidenceRoots).toEqual([
+      join(project, ".reforger-forge-screenshots"),
+    ]);
   });
 
-  it("does not derive a missing game path from the Workbench path", () => {
+  it("maps every JSON-configurable scalar and array setting to CLI", () => {
+    const workbench = createWorkbenchInstallation("all-cli", "workbench");
+    const game = createGameInstallation("all-cli", "game");
+    const project = createDirectory("all-cli", "project");
+    const addon = createDirectory("all-cli", "addon");
+    const extracted = createDirectory("all-cli", "extracted");
+    const managedRoot = createDirectory("all-cli", "managed");
+    const profileRoot = createDirectory("all-cli", "profiles");
+    const evidenceRoot = createDirectory("all-cli", "evidence");
+    const logRoot = createDirectory("all-cli", "logs");
+    const agentPath = join(temporaryRoot, "all-cli", "private-child.js");
+    writeFileSync(agentPath, "", "utf8");
+
+    const config = loadConfig([
+      "--workbench-path", workbench,
+      "--game-path", game,
+      "--project-path", project,
+      "--workbench-addon-dir", addon,
+      "--workbench-script-authorize-all",
+      "--workbench-host", "cli-host",
+      "--workbench-port", "6001",
+      "--extracted-path", extracted,
+      "--default-mod", "CliMod",
+      "--observer-managed-root", managedRoot,
+      "--observer-profile-root", profileRoot,
+      "--observer-agent-path", agentPath,
+      "--observer-evidence-root", evidenceRoot,
+      "--observer-supporting-log-root", logRoot,
+      "--observer-startup-timeout-ms", "11000",
+      "--observer-request-timeout-ms", "32000",
+      "--observer-capture-timeout-ms", "33000",
+      "--observer-max-inline-image-bytes", "9000000",
+      "--observer-retention-interval-ms", "61000",
+      "--observer-retention-max-age-ms", "700000000",
+      "--observer-retention-max-bytes", "600000000",
+      "--observer-session-ttl-ms", "1300000",
+      "--debug",
+    ]);
+
+    expect(config).toMatchObject({
+      workbenchPath: workbench,
+      gamePath: game,
+      projectPath: project,
+      workbenchAddonDirs: [addon],
+      workbenchScriptAuthorizeAll: true,
+      workbenchHost: "cli-host",
+      workbenchPort: 6001,
+      extractedPath: extracted,
+      defaultMod: "CliMod",
+      debug: true,
+      observer: {
+        managedRoot,
+        profileRoot,
+        agentPath,
+        evidenceRoots: [evidenceRoot],
+        supportingLogRoots: [logRoot],
+        startupTimeoutMs: 11_000,
+        requestTimeoutMs: 32_000,
+        defaultCaptureTimeoutMs: 33_000,
+        maxInlineImageBytes: 9_000_000,
+        retentionIntervalMs: 61_000,
+        retentionMaxAgeMs: 700_000_000,
+        retentionMaxBytes: 600_000_000,
+        sessionTtlMs: 1_300_000,
+      },
+    });
+  });
+
+  it("uses Steam discovery only for an installation path omitted by explicit config", () => {
+    const explicitWorkbench = createWorkbenchInstallation(
+      "configuration",
+      "explicit-workbench"
+    );
     const configPath = writeConfig({
-      workbenchPath: "./workbench",
+      workbenchPath: "./explicit-workbench",
       projectPath: "./project",
     });
-
-    expect(() => loadConfig(["--config", configPath])).toThrowError(
-      /gamePath is required/
+    const discoveredWorkbench = createWorkbenchInstallation(
+      "discovered",
+      "workbench"
     );
+    const discoverSteam = vi.fn(() => discoveryResult({
+      workbenchPath: discoveredWorkbench,
+      workbenchCandidates: [discoveredWorkbench],
+    }));
+
+    const config = loadConfig(["--config", configPath], { discoverSteam });
+
+    expect(config.workbenchPath).toBe(explicitWorkbench);
+    expect(config.workbenchPath).not.toBe(discoveredWorkbench);
+    expect(config.gamePath).toBe(fixturePaths.game);
+    expect(discoverSteam).toHaveBeenCalledOnce();
+  });
+
+  it("ignores malformed metadata only for an explicitly overridden app", () => {
+    const explicitWorkbench = createWorkbenchInstallation(
+      "configuration",
+      "explicit-workbench"
+    );
+    const configPath = writeConfig({
+      workbenchPath: "./explicit-workbench",
+    });
+    const config = loadConfig(["--config", configPath], {
+      discoverSteam: () => discoveryResult({
+        status: "malformed",
+        workbenchPath: undefined,
+        workbenchCandidates: [],
+        errors: [{
+          code: "METADATA_MALFORMED",
+          source: "manifest",
+          appId: "1874910",
+          message: "broken Tools manifest",
+        }],
+      }),
+    });
+
+    expect(config.workbenchPath).toBe(explicitWorkbench);
+    expect(config.gamePath).toBe(fixturePaths.game);
+  });
+
+  it("applies discovery, then config, then CLI precedence", () => {
+    const discoveredWorkbench = createWorkbenchInstallation("discovered", "workbench");
+    const discoveredGame = createGameInstallation("discovered", "game");
+    const fileGame = createGameInstallation("configuration", "file-game");
+    const cliGame = createGameInstallation("cli", "game");
+    const configPath = writeConfig({
+      gamePath: "./file-game",
+      workbenchHost: "file-host",
+    });
+
+    const config = loadConfig([
+      "--config", configPath,
+      "--game-path", cliGame,
+      "--workbench-host", "cli-host",
+    ], {
+      discoverSteam: () => discoveryResult({
+        workbenchPath: discoveredWorkbench,
+        gamePath: discoveredGame,
+        workbenchAddonDirs: [join(discoveredGame, "addons")],
+        workbenchCandidates: [discoveredWorkbench],
+        gameCandidates: [discoveredGame],
+      }),
+    });
+
+    expect(config.workbenchPath).toBe(discoveredWorkbench);
+    expect(config.gamePath).toBe(cliGame);
+    expect(config.gamePath).not.toBe(fileGame);
+    expect(config.workbenchAddonDirs).toEqual([join(cliGame, "addons")]);
+    expect(config.workbenchHost).toBe("cli-host");
+  });
+
+  it("lets an explicit empty evidence allowlist suppress the project-derived default", () => {
+    const configPath = writeConfig(requiredFileValues({
+      observer: { evidenceRoots: [] },
+    }));
+
+    const config = loadConfig(["--config", configPath]);
+
+    expect(config.observer!.evidenceRoots).toEqual([]);
+  });
+
+  it("lets CLI clear flags express empty array overrides", () => {
+    const configPath = writeConfig(requiredFileValues({
+      workbenchAddonDirs: ["./game/addons"],
+      observer: {
+        evidenceRoots: ["./project"],
+        supportingLogRoots: ["./project"],
+      },
+    }));
+
+    const config = loadConfig([
+      "--config", configPath,
+      "--no-workbench-addon-dirs",
+      "--no-observer-evidence-roots",
+      "--no-observer-supporting-log-roots",
+    ]);
+
+    expect(config.workbenchAddonDirs).toEqual([]);
+    expect(config.observer!.evidenceRoots).toEqual([]);
+    expect(config.observer!.supportingLogRoots).toEqual([]);
+  });
+
+  it("rejects contradictory array replacement flags regardless of order", () => {
+    expect(() => loadConfig([
+      "--no-workbench-addon-dirs",
+      "--workbench-addon-dir", join(fixturePaths.game, "addons"),
+      "--workbench-path", fixturePaths.workbench,
+      "--game-path", fixturePaths.game,
+    ])).toThrowError(/cannot be combined/);
+  });
+
+  it("derives evidence from the final CLI project path", () => {
+    const fileProject = fixturePaths.project;
+    const cliProject = createDirectory("cli-project");
+    const configPath = writeConfig(requiredFileValues());
+
+    const config = loadConfig([
+      "--config", configPath,
+      "--project-path", cliProject,
+    ]);
+
+    expect(config.projectPath).toBe(cliProject);
+    expect(config.projectPath).not.toBe(fileProject);
+    expect(config.observer!.evidenceRoots).toEqual([
+      join(cliProject, ".reforger-forge-screenshots"),
+    ]);
   });
 
   it("rejects an add-on root that cannot be represented in Workbench's -addonsDir argument", () => {
@@ -322,6 +599,18 @@ describe("explicit configuration contract", () => {
       "--config",
       writeConfig(requiredFileValues({ gamePath: emptyGame }), "bad-game.json"),
     ])).toThrowError(/gamePath must contain one supported executable/);
+  });
+
+  it("rejects an explicit game whose addons junction escapes gamePath", () => {
+    const game = createGameInstallation("escaped-game");
+    rmSync(join(game, "addons"), { recursive: true, force: true });
+    const externalAddons = createDirectory("external-addons");
+    symlinkSync(externalAddons, join(game, "addons"), "junction");
+
+    expect(() => loadConfig([
+      "--workbench-path", fixturePaths.workbench,
+      "--game-path", game,
+    ])).toThrowError(/gamePath\/addons must resolve beneath gamePath/);
   });
 
   it("rejects project roots that overlap an installation", () => {
@@ -437,5 +726,15 @@ describe("partitionConfigurationArguments", () => {
       "--config",
       "--foreground",
     ])).toThrowError(ConfigurationError);
+  });
+
+  it("rejects empty path flags instead of inferring the working directory", () => {
+    expect(() => loadConfig([
+      "--project-path", "   ",
+      "--workbench-path", fixturePaths.workbench,
+      "--game-path", fixturePaths.game,
+    ], { cwd: fixturePaths.project })).toThrowError(
+      /--project-path requires a non-empty path/
+    );
   });
 });

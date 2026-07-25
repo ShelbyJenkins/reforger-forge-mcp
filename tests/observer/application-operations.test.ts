@@ -13,7 +13,19 @@ describe("ObserverApplicationOperations", () => {
       expect(status).toMatchObject({ agentInstanceId: app.agentInstanceId, evidence: { enabled: false } });
       expect(JSON.stringify(status)).not.toMatch(/launchNonce|registeredInstanceNonce|artifactPath/);
       await expect(app.operations.execute("unknown" as never)).rejects.toMatchObject({ code: "INVALID_REQUEST" });
-      await expect(app.operations.execute("runBegin", { title: "cannot finish" })).rejects.toMatchObject({ code: "CAPABILITY_UNAVAILABLE" });
+      const run = await app.operations.execute("runBegin", {
+        title: "can capture but cannot finalize",
+      }) as { runId: string };
+      await expect(app.operations.execute("runFinalize", {
+        runId: run.runId,
+        evidenceRoot: join(root, "unconfigured-evidence"),
+        includeCaptureLabels: ["proof"],
+        review: {
+          imagesReviewed: false,
+          outcome: "Unreviewed",
+          summary: "No exporter configured.",
+        },
+      })).rejects.toMatchObject({ code: "CAPABILITY_UNAVAILABLE" });
       await app.server.close();
     }, { prefix: "rfo-operations-" });
   });

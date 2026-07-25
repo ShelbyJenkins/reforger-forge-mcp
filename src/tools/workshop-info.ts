@@ -4,6 +4,7 @@ import { readFileSync, existsSync, readdirSync } from "node:fs";
 import { resolve, join } from "node:path";
 import type { Config } from "../config.js";
 import { parse, type EnfusionNode } from "../formats/enfusion-text.js";
+import { projectPathRequiredMessage } from "../utils/project-path.js";
 
 export function registerWorkshopInfo(server: McpServer, config: Config): void {
   server.registerTool(
@@ -33,7 +34,7 @@ export function registerWorkshopInfo(server: McpServer, config: Config): void {
         if (!basePath) {
           return {
             content: [
-              { type: "text", text: "No project path configured. Use --config/--project-path or provide projectPath." },
+              { type: "text", text: projectPathRequiredMessage("workshop_info", "projectPath") },
             ],
             isError: true,
           };

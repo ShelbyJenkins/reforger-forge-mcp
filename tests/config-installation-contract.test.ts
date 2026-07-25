@@ -40,21 +40,21 @@ function readServerEntry(
   return root?.["reforger-forge"] as Record<string, unknown>;
 }
 
-describe("explicit MCP client configuration contract", () => {
+describe("standard MCP client configuration contract", () => {
   it.each(clientTemplates)(
-    "$path launches node with exactly one explicit config and no environment block",
+    "$path launches node with only the server entry and no override settings",
     ({ path, rootKey }) => {
       const entry = readServerEntry(path, rootKey);
       const serialized = JSON.stringify(entry);
       const args = entry.args as unknown[];
 
       expect(entry.command).toBe("node");
-      expect(args).toHaveLength(3);
-      expect(args[1]).toBe("--config");
+      expect(args).toHaveLength(1);
       expect(typeof args[0]).toBe("string");
-      expect(typeof args[2]).toBe("string");
+      expect(args[0]).toMatch(/dist[\\/]index\.js$/);
       expect(entry).not.toHaveProperty("env");
       expect(entry).not.toHaveProperty("env_vars");
+      expect(serialized).not.toMatch(/--config|--project-path/i);
       expect(serialized).not.toMatch(/ENFUSION_|REFORGER_FORGE_/);
     }
   );
@@ -81,9 +81,15 @@ describe("explicit MCP client configuration contract", () => {
     expect(JSON.stringify(entry)).not.toMatch(/\bcmd(?:\.exe)?\b/i);
   });
 
-  it("the PowerShell installer registers --config instead of copying values into env", () => {
+});
+
+describe("manual explicit-configuration installer contract", () => {
+  it("accepts ConfigPath and registers it instead of copying values into env", () => {
     const installer = read("agents/install-agents.ps1");
 
+    expect(installer).toMatch(
+      /\[Parameter\(Mandatory\s*=\s*\$true\)\]\s*\r?\n\s*\[string\]\$ConfigPath/
+    );
     expect(installer).toMatch(/\[string\]\$ConfigPath/);
     expect(installer).toContain('@($ServerEntry, "--config", $ResolvedConfigPath)');
     expect(installer).not.toMatch(/ENFUSION_|REFORGER_FORGE_|envBlock/);
@@ -112,26 +118,5 @@ describe("explicit MCP client configuration contract", () => {
     expect(installer).toContain("ConvertTo-Json -Depth 100");
     expect(installer).toContain("[System.IO.File]::WriteAllText(");
     expect(installer).not.toMatch(/\bSet-Content\b/);
-  });
-
-  it("setup forwards the selected config to verification and installation", () => {
-    const setup = read("scripts/setup.ps1");
-
-    expect(setup).toContain("scripts\\verify-mcp-server.mjs\") --config $ConfigPath");
-    expect(setup).toContain("agents\\install-agents.ps1");
-    expect(setup).toContain("-ConfigPath $ConfigPath");
-    expect(setup).toContain("all/codex/cursor/");
-  });
-
-  it("documents the standard Codex registration with the explicit server argument", () => {
-    const repositoryReadme = read("README.md");
-    const readme = read("agents/README.md");
-    const command =
-      "codex mcp add reforger-forge -- node $ServerPath --config $ConfigPath";
-
-    expect(repositoryReadme).toContain("[agent setup guide](agents/README.md)");
-    expect(readme).toContain(command);
-    expect(command).not.toContain("--env");
-    expect(readme).toContain("codex mcp list");
   });
 });

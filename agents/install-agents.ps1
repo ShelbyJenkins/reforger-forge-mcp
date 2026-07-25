@@ -52,6 +52,8 @@ if (-not (Test-Path -LiteralPath $LifecycleHelper -PathType Leaf)) {
     exit 1
 }
 
+# This is the public standalone override installer, so it always verifies
+# before its first client-config write.
 Write-Host "Verifying registered tools..." -ForegroundColor Yellow
 node (Join-Path $Root "scripts\verify-mcp-server.mjs") --config $ResolvedConfigPath
 if ($LASTEXITCODE -ne 0) { exit 1 }

@@ -4,6 +4,7 @@ import { randomBytes } from "node:crypto";
 import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { resolve, join } from "node:path";
 import type { Config } from "../config.js";
+import { projectPathRequiredMessage } from "../utils/project-path.js";
 
 // ── Manifest schema ──────────────────────────────────────────────────────────
 
@@ -168,6 +169,15 @@ export function registerBuildingSetup(server: McpServer, config: Config): void {
       },
     },
     async ({ manifestPath, modPrefix, outputDir, dryRun }) => {
+      if (!outputDir && !config.projectPath) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: projectPathRequiredMessage("building_setup", "outputDir"),
+          }],
+          isError: true,
+        };
+      }
       // Read and parse manifest
       let rawManifest: string;
       try {
@@ -185,7 +195,7 @@ export function registerBuildingSetup(server: McpServer, config: Config): void {
 
       const outDir = outputDir
         ? resolve(outputDir)
-        : resolve(config.projectPath, "Prefabs", "Structures", manifest.building_name);
+        : resolve(config.projectPath!, "Prefabs", "Structures", manifest.building_name);
 
       const lines: string[] = [];
       lines.push(`=== Building Setup: ${manifest.building_name} ===`);

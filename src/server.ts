@@ -184,6 +184,7 @@ export function registerTools(server: McpServer, config: Config): RegisteredTool
     defaultCaptureTimeoutMs: observerConfig?.defaultCaptureTimeoutMs,
     workbenchClient: wbClient,
     projectPath: config.projectPath,
+    evidenceRoots: observerConfig?.evidenceRoots,
     ownedRuntimeManager,
   });
   let observerShutdown: Promise<Record<string, unknown>> | null = null;

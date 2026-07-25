@@ -7,8 +7,9 @@ in any committed copy. It is written for coding agents that can use the
 ReforgerForge MCP server.
 
 Do not put private machine paths, account names, tokens, or local MCP config in
-the committed version of this file. Keep them in one ignored JSON file selected
-explicitly by the MCP client's `--config <absolute-path>` arguments.
+the committed version of this file. If this workspace needs overrides, keep
+them in one ignored JSON file selected explicitly by the MCP client's
+`--config <absolute-path>` arguments.
 
 ## Workspace Facts
 
@@ -40,21 +41,44 @@ ReforgerForge requires Node.js 20 or newer. Arma Reforger Tools is required for
 builds, resource registration, and live editor-control operations, and the Arma
 Reforger game installation is required for base-game asset browsing.
 
-1. Build ReforgerForge as described in its README.
-2. Copy `reforger-forge.config.example.json` to an ignored local path and set
-   the Workbench, game, project, and addon-root paths.
-3. Install the MCP client entry with the absolute server path followed by
+1. From the ReforgerForge repository, run `.\scripts\setup.ps1`. It installs,
+   builds, verifies config-free startup, and attempts registration in every
+   detected supported MCP client.
+2. Confirm the client can see the `reforger-forge` tools.
+3. Let normal startup discover the Steam installations and base addon root.
+4. If this workspace needs project-scoped defaults or nonstandard paths, copy
+   `reforger-forge.config.example.json` to an ignored local path, keep only the
+   required overrides, and manually register the server with
    `--config <absolute-config-path>`.
-4. Restart the MCP process after changing values in that file. Rerun the
-   installer only if the selected file path changes.
-5. Confirm the client can see the `reforger-forge` tools.
+5. Restart the MCP process after changing values in an explicit config. Rerun
+   the manual installer only if the selected file path changes.
+
+Use `.\scripts\setup.ps1 -Doctor` for a read-only installation and registration
+inspection. It is valid for the receipt to show no config and no project;
+Workbench NET API and observer capture remain `not tested`. If an already
+running Workbench should be checked, use
+`.\scripts\setup.ps1 -Doctor -CheckWorkbench`; this makes exactly one read-only
+`EMCP_WB_Ping` and never launches or terminates Workbench or the game. Add
+`-Json` to setup or Doctor for one machine-readable receipt on stdout.
+Registration success proves only that the client entry is current, not that the
+client restarted or loaded it. Receipts list exact files and backups for direct
+edits; Codex and Claude Code CLI-owned updates are disclosed separately with
+their concrete storage file marked unverified.
+
+Claude Code command discovery is PATH-first. If `claude` is absent, setup and
+Doctor may use only the newest validated, non-obsolete native CLI from the
+standard Anthropic VS Code or VS Code Insiders extension installations; do not
+guess a binary from extension-directory presence alone. Custom
+`--extensions-dir` locations remain manual.
 
 ReforgerForge does not discover a package-local or user-home file and does not
-read environment variables for server configuration. CLI values override the
-explicit file. Relative paths in that file resolve from the file's directory,
-while relative CLI paths resolve from the MCP process working directory.
+read environment variables for server configuration. A config is optional and
+is loaded only when its path is supplied. CLI values override the explicit
+file. Relative paths in that file resolve from the file's directory, while
+relative CLI paths resolve from the MCP process working directory.
 
-Use placeholders rather than real local paths in committed documentation:
+For an optional override, use placeholders rather than real local paths in
+committed documentation:
 
 ```json
 {

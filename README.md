@@ -18,81 +18,23 @@ Describe what you want to build — your AI agent handles API research, code gen
 
 ## Quick Start
 
+Windows and Node.js 20 or newer are required. From a fresh clone, run the
+parameterless setup command:
+
 ```powershell
 git clone https://github.com/wastelandgoats/reforger-forge-mcp.git
 cd reforger-forge-mcp
-npm install
-npm run build
+.\scripts\setup.ps1
 ```
 
-Windows is required.
-
-Choose an explicit configuration file. The package root is a convenient
-location, but ReforgerForge does not discover this file automatically:
-
-```powershell
-Copy-Item reforger-forge.config.example.json reforger-forge.config.json
-# Edit reforger-forge.config.json, then:
-$ConfigPath = (Resolve-Path .\reforger-forge.config.json).Path
-npm run mcp:verify -- --config $ConfigPath
-```
-
-Install the same explicit file into one or more supported agents:
-
-```powershell
-# Install into all clients supported by the installer
-.\agents\install-agents.ps1 -ConfigPath $ConfigPath -All
-
-# Or pick one
-.\agents\install-agents.ps1 -ConfigPath $ConfigPath -Agent codex
-.\agents\install-agents.ps1 -ConfigPath $ConfigPath -Agent antigravity
-.\agents\install-agents.ps1 -ConfigPath $ConfigPath -Agent cursor
-```
-
-If local PowerShell policy blocks direct `.ps1` execution, use a process-local
-bypass for this invocation:
-
-```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\agents\install-agents.ps1 -ConfigPath $ConfigPath -All
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup.ps1 -ConfigPath $ConfigPath
-```
-
-Alternatively, `.\scripts\setup.ps1 -ConfigPath <path>` installs dependencies,
-builds, verifies the explicit configuration, and offers the same client
-installation choices. If the selected file does not exist, setup creates it
-from the example and stops so you can edit the placeholder paths before
-rerunning the command.
-
-## Agent Setup
-
-See the [agent setup guide](agents/README.md) for supported clients, installer
-commands, manual MCP templates, and copy-ready workspace instructions.
+For setup behavior, Doctor, Steam discovery, optional configuration, CLI
+overrides, and manual registration, see the [complete setup guide](setup.md).
+For client-specific registration and refresh notes, see
+[MCP client notes](agents/README.md).
 
 ---
 
-### Configure paths
-
-| Key | Description |
-|-----|-------------|
-| `observer` | Optional evidence/log allowlists, private-agent timeouts, inline image limit, retention, managed root, profile root, and session TTL. Defaults keep observer state outside `projectPath`. |
-| `workbenchPath` | Arma Reforger Tools (Steam) install |
-| `gamePath` | Arma Reforger game install |
-| `projectPath` | Where your mods are saved |
-| `workbenchAddonDirs` | Ordered base-game and Workshop addon roots passed to Workbench as one `-addonsDir` value |
-| `workbenchScriptAuthorizeAll` | Opt in to Workbench's `-scriptAuthorizeAll` flag for trusted local projects; defaults to `false` |
-
-`workbenchScriptAuthorizeAll` suppresses prompts for protected `RunCmd`,
-`RunProcess`, `KillProcess`, and out-of-profile `FileIO` operations. Leave it
-disabled unless you trust the active project and all of its dependencies.
-
-Automated launches enforce `-noThrow`. Assertions remain in the Workbench log
-and can still fail a validation gate, but they cannot block the agent behind a
-dialog that requires a person to dismiss it.
-
-Restart the MCP server after changing its explicit file. You do not need to
-rerun the installer unless the file path itself changes.
-
-### Observer capture workflow
+## Observer capture workflow
 
 The runtime observer and Workbench helper are separately staged companion
 addons. Their managed files, lifecycle receipts, and profiles remain outside
@@ -473,9 +415,6 @@ tool is advertised because those operations cannot be made reliably modal-free.
 | `wb_script_editor` | Read/write lines in the open Script Editor file — get file, read/write/insert/remove lines, line count. |
 | `wb_validate` | Validate material or texture resources using Workbench built-in validators. Returns errors and warnings. |
 
-Run `npm run mcp:verify -- --config <CONFIG_PATH>` anytime to verify every
-required tool registers on your machine.
-
 ---
 
 ## Usage Examples
@@ -489,91 +428,6 @@ Generate a Conflict scenario for Everon with 3 bases
 Inspect the inheritance chain for Rifle_M16A2.et
 Prepare an observer launch and capture the current runtime view
 ```
-
----
-
-## Configuration
-
-Configuration is explicit. Start the MCP with one selected JSON file:
-
-```powershell
-node dist/index.js --config C:\path\to\reforger-forge.config.json
-```
-
-Or omit `--config` and supply all three required installation/project paths
-directly:
-
-```powershell
-node dist/index.js `
-  --workbench-path "C:\path\to\Arma Reforger Tools" `
-  --game-path "C:\path\to\Arma Reforger" `
-  --project-path "C:\path\to\arma-projects\addons"
-```
-
-ReforgerForge performs no package-local or user-home config discovery and reads
-no environment variables for server configuration. Its complete precedence is:
-
-```text
-safe internal constants < explicit --config file < explicit CLI flags
-```
-
-CLI flags can make small per-client adjustments to a shared file. Repeated
-`--workbench-addon-dir`, `--observer-evidence-root`, and
-`--observer-supporting-log-root` flags replace their corresponding arrays in
-the file, preserving command-line order. Boolean settings use paired flags such
-as `--debug` / `--no-debug` and `--workbench-script-authorize-all` /
-`--no-workbench-script-authorize-all`.
-
-| JSON setting | CLI flag | Default or requirement |
-|--------------|----------|------------------------|
-| `workbenchPath` | `--workbench-path` | Required Tools installation containing the diagnostic Workbench executable |
-| `gamePath` | `--game-path` | Required game installation containing `addons` and a supported graphical executable |
-| `projectPath` | `--project-path` | Required existing addons-container directory |
-| `workbenchAddonDirs` | repeat `--workbench-addon-dir` | Optional ordered existing directories |
-| `extractedPath` | `--extracted-path` | Optional existing directory |
-| `workbenchHost` | `--workbench-host` | `127.0.0.1` |
-| `workbenchPort` | `--workbench-port` | `5775` |
-| `workbenchScriptAuthorizeAll` | paired authorize flags above | `false` |
-| `defaultMod` | `--default-mod` | none |
-| `debug` | `--debug` / `--no-debug` | `false` |
-| `observer.managedRoot` | `--observer-managed-root` | platform-local application/state directory |
-| `observer.profileRoot` | `--observer-profile-root` | `<managed root>/profiles` |
-| `observer.agentPath` | `--observer-agent-path` | packaged private child, or an existing regular file |
-| `observer.evidenceRoots` | repeat `--observer-evidence-root` | existing directories; none means finalization is disabled |
-| `observer.supportingLogRoots` | repeat `--observer-supporting-log-root` | existing directories; defaults to the managed observer log root |
-| `observer.startupTimeoutMs` | `--observer-startup-timeout-ms` | `10000` |
-| `observer.requestTimeoutMs` | `--observer-request-timeout-ms` | `30000` |
-| `observer.defaultCaptureTimeoutMs` | `--observer-capture-timeout-ms` | `30000` |
-| `observer.maxInlineImageBytes` | `--observer-max-inline-image-bytes` | `8388608` |
-| `observer.retentionIntervalMs` | `--observer-retention-interval-ms` | `60000` |
-| `observer.retentionMaxAgeMs` | `--observer-retention-max-age-ms` | `604800000` |
-| `observer.retentionMaxBytes` | `--observer-retention-max-bytes` | `536870912` |
-| `observer.sessionTtlMs` | `--observer-session-ttl-ms` | `1200000` |
-
-Relative paths in the JSON file resolve from that file's directory. Relative
-CLI paths resolve from the process working directory. Startup fails when a
-required path is missing or invalid, when a configured installation/addon path
-is not an existing directory, or when the strict JSON shape is invalid.
-`workbenchPath` must contain `ArmaReforgerWorkbenchSteamDiag.exe` either at its
-root or under `Workbench`. `gamePath` must contain `addons` and one of
-`ArmaReforgerSteamDiag.exe`, `ArmaReforgerDiag.exe`,
-`ArmaReforgerSteam.exe`, or `ArmaReforger.exe`. Installation and project roots
-must not overlap, and Workbench add-on roots cannot contain commas because
-`-addonsDir` is comma-delimited. Observer managed/profile roots may have a
-missing tail, but
-their nearest existing ancestor must be a directory and they cannot overlap
-the project or either installation. Obsolete or unknown settings, including
-`workbenchNoThrow`, are rejected; automated launches always enforce
-`-noThrow`.
-
----
-
-## Requirements
-
-- **Node.js 20+**
-- **Windows** — required for the exact automated Workbench lifecycle guarantee
-- **Arma Reforger Tools** (Steam) — for resource registration and reviewed live editor-control tools
-- **Arma Reforger** (Steam) — for game asset browsing
 
 ---
 
@@ -591,9 +445,10 @@ npm test                       # Run hermetic default unit/contract suite
 npm run test:integration       # Run bounded native/fixture integration contracts
 npm run test:observer:integration  # Run the harmless exact-owned runtime native fixture
 npm run test:package           # Verify published-package contents
-npm run dev -- --config <CONFIG_PATH>                 # Run server in dev mode
-npm run mcp:verify -- --config <CONFIG_PATH>          # Verify the MCP server and tool registration
-.\agents\install-agents.ps1 -ConfigPath <CONFIG_PATH> -All
+npm run dev                                           # Run the config-free server in dev mode
+npm run dev -- --config <CONFIG_PATH>                 # Run with explicit overrides
+npm run mcp:verify                                    # Verify config-free discovery and tool registration
+npm run mcp:verify -- --config <CONFIG_PATH>          # Verify explicit overrides
 ```
 
 After changing canonical observer protocol vocabulary, run
@@ -741,6 +596,7 @@ machine paths are loaded through the explicit config argument.
 
 ```
 reforger-forge-mcp/
+├── setup.md                    # Complete installation and configuration guide
 ├── src/                         # TypeScript source
 ├── data/                        # API index, wiki, patterns, knowledge base
 ├── observer/
@@ -748,10 +604,10 @@ reforger-forge-mcp/
 │   └── workbench-addon/         # Managed Workbench helper companion
 ├── agents/
 │   ├── AGENTS.md               # Copy-ready modding workspace instructions
-│   ├── install-agents.ps1      # Install into supported JSON-configured clients
-│   └── configs/                # Manual install templates
+│   ├── install-agents.ps1      # Manual explicit-config client installer
+│   └── configs/                # Config-free manual registration templates
 ├── scripts/
-│   ├── setup.ps1                # Build + verify explicit configuration
+│   ├── setup.ps1                # One-command build, verify, and client registration
 │   ├── verify-mcp-server.mjs    # Verify MCP startup and tool registration
 │   └── windows/                 # Named-mutex and exact-process lifecycle helper
 └── dist/                        # Built server (generated)

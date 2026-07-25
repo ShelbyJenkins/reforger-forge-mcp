@@ -85,7 +85,7 @@ describe("observer package and source contracts", () => {
     );
 
     for (const source of [enforce, mailbox]) {
-      expect(source).toContain("EXPLICIT_CONFIGURATION_CONTRACT_VERSION !== 1");
+      expect(source).toContain("EXPLICIT_CONFIGURATION_CONTRACT_VERSION !== 2");
       expect(source).toContain("Compiled configuration loader is older than src/config.ts");
       expect(source).toContain('loadConfig(argumentsArray)');
     }
@@ -138,6 +138,7 @@ describe("observer package and source contracts", () => {
       "observer/workbench-addon",
       "observer/protocol",
       "observer/README.md",
+      "setup.md",
     ]));
     expect(packageJson.files).not.toContain("mod");
     const observerReleaseAssets = [
@@ -276,11 +277,20 @@ describe("observer package and source contracts", () => {
       "observer_runtime",
       "observer_setup",
     ];
-    const serverVerifier = readFileSync(
-      join(repositoryRoot, "scripts", "verify-mcp-server.mjs"),
-      "utf8"
-    );
-    const observerBlock = serverVerifier.match(/const observerNames = new Set\(\[([\s\S]*?)\]\);/)?.[1] ?? "";
+    const serverVerifier = [
+      readFileSync(
+        join(repositoryRoot, "scripts", "verify-mcp-server.mjs"),
+        "utf8"
+      ),
+      readFileSync(
+        join(repositoryRoot, "src", "setup", "server-verification.ts"),
+        "utf8"
+      ),
+    ].join("\n");
+    const observerBlock =
+      serverVerifier.match(
+        /const REQUIRED_OBSERVER_TOOLS = \[([\s\S]*?)\] as const;/
+      )?.[1] ?? "";
     const discovered = [...observerBlock.matchAll(/"(observer_[a-z_]+)"/g)]
       .map((match) => match[1])
       .sort();

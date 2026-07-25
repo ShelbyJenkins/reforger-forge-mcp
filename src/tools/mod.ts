@@ -3,6 +3,7 @@ import { z } from "zod";
 import { existsSync, mkdirSync, writeFileSync, readdirSync, readFileSync } from "node:fs";
 import { resolve, join, extname, relative } from "node:path";
 import type { Config } from "../config.js";
+import { projectPathRequiredMessage } from "../utils/project-path.js";
 import { generateGproj } from "../templates/gproj.js";
 import { generateScript } from "../templates/script.js";
 import type { PatternLibrary } from "../patterns/loader.js";
@@ -387,7 +388,7 @@ export function registerMod(
             content: [
               {
                 type: "text",
-                text: "No project path configured. Use --config/--project-path or provide projectPath.",
+                text: projectPathRequiredMessage("mod create", "projectPath"),
               },
             ],
             isError: true,
@@ -596,33 +597,37 @@ export function registerMod(
       // action === "validate"
       let basePath: string;
       if (projectPath) {
-        // Validate user-supplied path is within the configured project directory
-        try {
-          basePath = validateProjectPath(config.projectPath, projectPath);
-        } catch {
+        if (config.projectPath) {
+          // Keep the existing configured-container boundary when one exists.
+          try {
+            basePath = validateProjectPath(config.projectPath, projectPath);
+          } catch {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: `Invalid project path: "${projectPath}". Path must be within the configured project directory (${config.projectPath}).`,
+                },
+              ],
+            };
+          }
+        } else {
+          // A complete explicit target is sufficient for this read-only action.
+          basePath = resolve(projectPath);
+        }
+      } else {
+        if (!config.projectPath) {
           return {
             content: [
               {
                 type: "text",
-                text: `Invalid project path: "${projectPath}". Path must be within the configured project directory (${config.projectPath}).`,
+                text: projectPathRequiredMessage("mod validate", "projectPath"),
               },
             ],
+            isError: true,
           };
         }
-      } else {
         basePath = config.projectPath;
-      }
-
-      if (!basePath) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: "No project path configured. Use --config/--project-path or provide projectPath.",
-            },
-          ],
-          isError: true,
-        };
       }
 
       if (!existsSync(basePath)) {

@@ -9,7 +9,10 @@ import {
   type ObserverApplication,
   type ObserverCaptureInput,
 } from "../../src/observer/application.js";
-import { registerObserverTools } from "../../src/observer/tools.js";
+import {
+  registerObserverTools,
+  type ObserverToolDefaults,
+} from "../../src/observer/tools.js";
 import type { OwnedRuntimeManager } from "../../src/observer/owned-runtime-manager.js";
 import type {
   WorkbenchObserverInstance,
@@ -153,7 +156,8 @@ export interface RegisteredTool {
 
 export function toolRegistry(
   coordinator: ObserverApplication,
-  ownedRuntimeManager: OwnedRuntimeManager = {} as OwnedRuntimeManager
+  ownedRuntimeManager: OwnedRuntimeManager = {} as OwnedRuntimeManager,
+  defaults: Omit<ObserverToolDefaults, "ownedRuntimeManager"> = {}
 ): Map<string, RegisteredTool> {
   const tools = new Map<string, RegisteredTool>();
   const server = {
@@ -162,7 +166,7 @@ export function toolRegistry(
       tools.set(name, { definition, handler });
     },
   } as unknown as McpServer;
-  registerObserverTools(server, coordinator, { ownedRuntimeManager });
+  registerObserverTools(server, coordinator, { ...defaults, ownedRuntimeManager });
   return tools;
 }
 

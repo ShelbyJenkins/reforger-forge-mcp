@@ -60,7 +60,7 @@
     "dev:workbench:acceptance:lifecycle": "npm run build && tsx scripts/run-workbench-lifecycle-acceptance.ts",
     "test:package": "npm run build && node scripts/check-package.mjs",
     "test:watch": "vitest",
-    "prepare": "npm run build"
+    "prepack": "npm run build"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.26.0",
@@ -69,6 +69,7 @@
     "domhandler": "5.0.3",
     "lmdb": "3.5.6",
     "safe-stable-stringify": "2.5.0",
+    "yaml": "^2.9.0",
     "zod": "^3.25.0"
   },
   "devDependencies": {
@@ -107,6 +108,7 @@
     "tests/fixtures/enforce-mailbox-acceptance-addon/Scripts/WorkbenchGame/RFO_MailboxAcceptancePlugin.c",
     "docs/release-notes/RELEASE_NOTES_v1.1.0.md",
     "README.md",
+    "setup.md",
     "LICENSE"
   ],
   "repository": {

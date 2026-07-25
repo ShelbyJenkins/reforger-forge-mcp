@@ -26,7 +26,6 @@ import { WorkbenchProcessGuard } from "../../src/workbench/process-guard.js";
 function config(): Config {
   return {
     workbenchPath: process.cwd(),
-    projectPath: process.cwd(),
     gamePath: process.cwd(),
     dataDir: process.cwd(),
     patternsDir: process.cwd(),
@@ -35,7 +34,7 @@ function config(): Config {
   };
 }
 
-describe("registerTools explicit shutdown ownership", () => {
+describe("project-neutral registerTools shutdown ownership", () => {
   it("returns the supported, idempotent observer lifecycle disposer", async () => {
     const server = new McpServer({ name: "embedded-test", version: "1.0.0" });
     const disposeTools = registerTools(server, config());

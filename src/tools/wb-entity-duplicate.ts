@@ -8,6 +8,7 @@ import {
 } from "node:fs";
 import { dirname } from "node:path";
 import type { Config } from "../config.js";
+import { projectPathRequiredMessage } from "../utils/project-path.js";
 import type { WorkbenchClient } from "../workbench/client.js";
 import { resolveGameDataPath, findLooseFile, resolveAddonDir } from "../utils/game-paths.js";
 import { validateProjectPath } from "../utils/safe-path.js";
@@ -63,6 +64,15 @@ export function registerWbEntityDuplicate(
       },
     },
     async ({ entityName, destPath, modName, replaceInScene }) => {
+      if (!config.projectPath) {
+        return {
+          content: [{
+            type: "text",
+            text: projectPathRequiredMessage("wb_entity_duplicate"),
+          }],
+          isError: true,
+        };
+      }
       const modeErr = requireEditMode(client, "duplicate entity");
       if (modeErr) {
         return { content: [{ type: "text" as const, text: modeErr + formatConnectionStatus(client) }] };

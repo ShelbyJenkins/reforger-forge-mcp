@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { FileEvidenceBundleService, type EvidenceRunExportSnapshot } from "../../observer/agent/evidence-bundle-service.js";
@@ -14,11 +14,11 @@ describe("FileEvidenceBundleService", () => {
       const exportWork = join(root, "export-work");
       const evidence = join(root, "evidence");
       const logs = join(root, "logs");
-      mkdirSync(evidence);
       mkdirSync(logs);
       const logPath = join(logs, "runtime.log");
       writeFileSync(logPath, "Authorization: Bearer do-not-export\ntoken=also-secret\nready\n");
       const service = new FileEvidenceBundleService(exportWork, [evidence], [logs]);
+      expect(existsSync(evidence)).toBe(false);
       const runId = "20260719T130000Z-a1b2c3d4";
       const artifact = {
         backend: "workbench" as const,
@@ -45,7 +45,9 @@ describe("FileEvidenceBundleService", () => {
         supportingFiles: [{ kind: "relevantLog", label: "runtime", path: logPath }],
         releaseManagedArtifacts: true,
       });
+      expect(existsSync(evidence)).toBe(false);
       const receipt = service.export(snapshot, prepared);
+      expect(existsSync(evidence)).toBe(true);
       const manifest = JSON.parse(readFileSync(join(receipt.evidenceDirectory, "manifest.json"), "utf8"));
       expect(manifest).toMatchObject({ manifestVersion: 1, runId, export: { completionMarker: "manifest.json" } });
       expect(manifest.files.map((file: { path: string }) => file.path)).not.toContain("manifest.json");

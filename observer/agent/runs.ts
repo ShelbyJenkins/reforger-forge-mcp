@@ -169,7 +169,6 @@ export class ObserverRunStore {
   }
 
   begin(input: ObserverRunBeginInput): Record<string, unknown> {
-    this.assertExportAdmission();
     const normalized = {
       title: boundedText(input.title, "Run title", 256)!,
       caseIds: validateCaseIds(input.caseIds),
@@ -203,7 +202,6 @@ export class ObserverRunStore {
   }
 
   reserveCapture(input: ReserveRunCaptureInput): Record<string, unknown> {
-    this.assertExportAdmission();
     const record = this.requireOpen(input.runId);
     const label = normalizeEvidenceLabel(input.captureLabel);
     const idempotencyHash = sha256Hex(boundedText(input.idempotencyKey, "Idempotency key", 128)!);

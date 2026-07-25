@@ -9,19 +9,26 @@ import {
   type Config,
 } from "./config.js";
 import { registerTools } from "./server.js";
+import {
+  discoverSteamInstallations,
+  STEAM_DISCOVERY_EXIT_CODES,
+} from "./platform/windows/steam-discovery.js";
 import { logger, setDebugEnabled } from "./utils/logger.js";
 
 const SERVER_VERSION = "1.1.0";
 
 function usage(): string {
   return [
-    "Usage: reforger-forge-mcp [configuration options]",
+    "Usage:",
+    "  reforger-forge-mcp [configuration options]",
+    "  reforger-forge-mcp discover-steam",
     "",
-    "Required installation paths must come from an explicit --config file or CLI flags.",
+    "Steam installation paths are discovered automatically when not explicitly supplied.",
     "",
     CONFIGURATION_USAGE,
     "",
     "Other:",
+    "  discover-steam                          Print Steam discovery as JSON and exit.",
     "  -h, --help                               Show this help.",
     "  --version                                Show the package version.",
     "",
@@ -89,6 +96,16 @@ async function runServer(config: Config): Promise<void> {
 
 async function main(argv: readonly string[]): Promise<void> {
   const partitioned = partitionConfigurationArguments(argv);
+  if (partitioned.remainingArguments.length === 1
+      && partitioned.remainingArguments[0] === "discover-steam") {
+    if (partitioned.configurationArguments.length > 0) {
+      throw new Error("discover-steam does not accept server configuration arguments.");
+    }
+    const result = discoverSteamInstallations();
+    process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+    process.exitCode = STEAM_DISCOVERY_EXIT_CODES[result.status];
+    return;
+  }
   if (partitioned.remainingArguments.length === 1
       && ["-h", "--help"].includes(partitioned.remainingArguments[0])) {
     process.stdout.write(usage());

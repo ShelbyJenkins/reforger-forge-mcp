@@ -16,6 +16,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "nod
 import { isDeepStrictEqual } from "node:util";
 import { sha256File, sha256Hex } from "#foundation/digest";
 import { BoundedJsonStore, JsonStoreError } from "#foundation/json-store";
+import { canonicalizePotentialPath } from "#foundation/managed-path";
 import { redactText } from "#foundation/redact";
 import { AGENT_VERSION, DEFAULT_LIMITS, PROTOCOL_VERSION, SHA256_PATTERN } from "../protocol/index.js";
 import type { ManagedArtifactRef } from "./artifacts.js";
@@ -169,14 +170,18 @@ export class FileEvidenceBundleService implements EvidenceBundleService {
   readonly exportWorkRoot: string;
   readonly evidenceRoots: readonly string[];
   readonly supportingLogRoots: readonly string[];
-  private readonly evidenceIdentities: ReadonlyMap<string, FilesystemIdentity>;
+  private readonly evidenceIdentities = new Map<string, FilesystemIdentity>();
 
   constructor(exportWorkRoot: string, evidenceRoots: readonly string[], supportingLogRoots: readonly string[] = []) {
     if (evidenceRoots.length === 0) throw new ObserverError("CAPABILITY_UNAVAILABLE", "Evidence bundle service requires at least one evidence root", 409);
     this.exportWorkRoot = ensureCanonicalDirectory(exportWorkRoot);
-    this.evidenceRoots = evidenceRoots.map((root) => this.approvedRoot(root, "Evidence root"));
+    this.evidenceRoots = evidenceRoots.map((root) => this.approvedEvidenceRoot(root));
     this.supportingLogRoots = supportingLogRoots.map((root) => this.approvedRoot(root, "Supporting log root"));
-    this.evidenceIdentities = new Map(this.evidenceRoots.map((root) => [comparisonPath(root), identity(root)]));
+    for (const root of this.evidenceRoots) {
+      if (existsSync(root)) {
+        this.evidenceIdentities.set(comparisonPath(root), identity(root));
+      }
+    }
   }
 
   prepare(input: EvidenceBundleFinalizeInput): PreparedEvidenceExport {
@@ -238,6 +243,7 @@ export class FileEvidenceBundleService implements EvidenceBundleService {
 
   export(snapshot: EvidenceRunExportSnapshot, prepared: PreparedEvidenceExport): EvidenceExportReceipt {
     this.assertSnapshot(snapshot, prepared.input.runId);
+    this.activateEvidenceRoot(prepared.evidenceRoot);
     if (existsSync(prepared.outputRoot)) {
       try {
         const verified = this.verifyBundle(snapshot, prepared.outputRoot, prepared.evidenceRoot, prepared.fingerprint, prepared.input, prepared.includeCaptureLabels);
@@ -559,15 +565,72 @@ export class FileEvidenceBundleService implements EvidenceBundleService {
     if (dirname(absolute) === absolute) throw new ObserverError("INVALID_REQUEST", `${label} must not be a filesystem root`);
     return canonicalizeExistingDirectory(absolute, label);
   }
+  private approvedEvidenceRoot(input: string): string {
+    const source = boundedText(input, "Evidence root", 32_768)!;
+    assertWindowsPath(source, "Evidence root");
+    const absolute = resolve(source);
+    if (dirname(absolute) === absolute) {
+      throw new ObserverError("INVALID_REQUEST", "Evidence root must not be a filesystem root");
+    }
+    if (existsSync(absolute) && lstatSync(absolute).isSymbolicLink()) {
+      throw new ObserverError("INVALID_REQUEST", "Evidence root must not be a symbolic link");
+    }
+    try {
+      return canonicalizePotentialPath(absolute, {
+        linkPolicy: "follow-existing",
+        existingAncestor: "directory",
+        label: "Evidence root",
+      });
+    } catch (error) {
+      throw new ObserverError(
+        "INVALID_REQUEST",
+        `Evidence root is invalid: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+  }
   private resolveEvidenceRoot(input: string): string {
     assertWindowsPath(input, "Evidence root");
-    const absolute = resolve(input);
-    if (!existsSync(absolute) || lstatSync(absolute).isSymbolicLink()) throw new ObserverError("INVALID_REQUEST", "Evidence root is not an existing regular directory");
-    const canonical = canonicalizeExistingDirectory(absolute, "Evidence root");
-    const approved = this.evidenceRoots.find((root) => comparisonPath(root) === comparisonPath(canonical));
+    const candidate = this.approvedEvidenceRoot(input);
+    const approved = this.evidenceRoots.find((root) => comparisonPath(root) === comparisonPath(candidate));
     if (!approved) throw new ObserverError("INVALID_REQUEST", "Evidence root is not in the configured allowlist", 403);
-    this.revalidateEvidenceRoot(approved);
+    if (existsSync(approved)) {
+      const key = comparisonPath(approved);
+      if (!this.evidenceIdentities.has(key)) {
+        this.evidenceIdentities.set(key, identity(approved));
+      }
+      this.revalidateEvidenceRoot(approved);
+    }
     return approved;
+  }
+  private activateEvidenceRoot(root: string): void {
+    const approved = this.evidenceRoots.find(
+      (candidate) => comparisonPath(candidate) === comparisonPath(root)
+    );
+    if (!approved) {
+      throw new ObserverError("INVALID_REQUEST", "Evidence root is not in the configured allowlist", 403);
+    }
+    const prospective = this.approvedEvidenceRoot(approved);
+    if (comparisonPath(prospective) !== comparisonPath(approved)) {
+      throw new ObserverError("ARTIFACT_INVALID", "Configured evidence root changed before creation", 409);
+    }
+    if (!existsSync(approved)) {
+      mkdirSync(approved, { recursive: true, mode: 0o755 });
+    }
+    if (lstatSync(approved).isSymbolicLink()) {
+      throw new ObserverError("ARTIFACT_INVALID", "Configured evidence root became a symbolic link", 409);
+    }
+    const canonical = canonicalizeExistingDirectory(approved, "Evidence root");
+    if (comparisonPath(canonical) !== comparisonPath(approved)) {
+      throw new ObserverError("ARTIFACT_INVALID", "Configured evidence root changed during creation", 409);
+    }
+    const key = comparisonPath(approved);
+    const currentIdentity = identity(canonical);
+    const expectedIdentity = this.evidenceIdentities.get(key);
+    if (expectedIdentity && !sameIdentity(expectedIdentity, currentIdentity)) {
+      throw new ObserverError("ARTIFACT_INVALID", "Configured evidence root changed identity", 409);
+    }
+    this.evidenceIdentities.set(key, currentIdentity);
+    this.revalidateEvidenceRoot(approved);
   }
   private resolveSupportingFile(input: string): string {
     assertWindowsPath(input, "Supporting log path");

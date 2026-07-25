@@ -46,16 +46,18 @@ merged `-addonsDir`, one merged `-addons`, one matching `-profile`, and
 
 ## MCP integration
 
-Observer settings reach the MCP only through an explicit server invocation such
-as `node dist/index.js --config C:\path\to\config.json` or the corresponding
-`--observer-*` CLI flags. There is no package/home config discovery and no
-environment-variable server configuration. The live-test environment variables
-documented below are repository-harness authorization gates only; they do not
-configure an installed MCP server or override harness inputs. CLI flags override
-the selected file;
+Observer settings reach the MCP through an explicitly selected partial config,
+the corresponding `--observer-*` CLI flags, or the evidence-root default
+derived by `--project-path`/`projectPath`. There is no package/home config
+discovery and no environment-variable server configuration. The live-test
+environment variables documented below are repository-harness authorization
+gates only; they do not configure an installed MCP server or override harness
+inputs. CLI flags override the selected file;
 repeat `--observer-evidence-root` or `--observer-supporting-log-root` to replace
 and order either allowlist for one MCP instance. Relative paths in the selected
 JSON file resolve from that file's directory.
+Use `--no-observer-evidence-roots` or
+`--no-observer-supporting-log-roots` for an explicit empty-array override.
 
 The MCP server creates one host observer application. Its shared capture
 service owns routing, public jobs, idempotency, deadlines, run binding,
@@ -100,9 +102,9 @@ inventing backend epochs. New callers should echo it as
 compatibility. The durable run store is backend-neutral. Filesystem bundle
 construction, member hashing, log redaction, manifest-last publication,
 verification, and interrupted-export recovery live in an optional exporter.
-Without configured evidence roots, new begin/reserve/finalize requests fail
-immediately, while status, failure, discard, and cleanup remain available for
-existing durable records.
+Without configured evidence roots, run creation and capture remain available,
+but finalization fails with `CAPABILITY_UNAVAILABLE`; status, failure, discard,
+and cleanup also remain available for durable records.
 
 Runtime sessions support acknowledged REST delivery with a confined mailbox
 fallback. Registration, heartbeats, job idempotency, artifact completion, and
@@ -300,7 +302,10 @@ swap-and-restored during the exact process-creation interval.
 
 ## Using screenshots effectively
 
-Configure one or more existing evidence destinations before finalizing:
+When `projectPath` is configured, the default evidence destination is
+`<projectPath>\.reforger-forge-screenshots`. It is created lazily during the
+first finalization. Configure one or more existing custom destinations only
+when that default is unsuitable:
 
 ```json
 {
@@ -394,7 +399,8 @@ completes. If the PNG exceeds the inline limit, leave it managed and finalize
 the run; do not copy a private artifact path.
 
 After an image-capable reviewer has inspected the selected captures, finalize
-the run into an allowlisted root:
+the run into an allowlisted root. `evidenceRoot` may be omitted when exactly
+one root is effective:
 
 ```json
 {

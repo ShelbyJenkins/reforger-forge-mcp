@@ -28,5 +28,10 @@
   // reliable while consumers may deep-import library modules.
   "include": ["files", "dependencies", "devDependencies", "unlisted", "binaries"],
   "treatConfigHintsAsErrors": true,
-  "ignoreBinaries": ["where.exe", "tasklist.exe", "taskkill.exe"]
+  "ignoreBinaries": [
+    "where.exe",
+    "tasklist.exe",
+    "taskkill.exe",
+    "reg.exe"
+  ]
 }

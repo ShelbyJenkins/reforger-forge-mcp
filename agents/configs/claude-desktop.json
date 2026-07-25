@@ -3,9 +3,7 @@
     "reforger-forge": {
       "command": "node",
       "args": [
-        "C:\\path\\to\\reforger-forge-mcp\\dist\\index.js",
-        "--config",
-        "C:\\path\\to\\reforger-forge.config.json"
+        "C:\\path\\to\\reforger-forge-mcp\\dist\\index.js"
       ]
     }
   }
