@@ -302,6 +302,11 @@ Automated Workbench launches enforce `-noThrow`. Assertions remain in the
 Workbench log and can still fail a validation gate, but they cannot block an
 agent behind a dialog that requires a person to dismiss it.
 
+Use `wb_log_query` with the `logDirectory` returned by `wb_build` to inspect
+only relevant managed Workbench log lines. It requires one or more addon,
+severity, channel, or case-insensitive text filters and never returns an
+unfiltered raw log dump.
+
 ### Path validation
 
 Startup fails when:

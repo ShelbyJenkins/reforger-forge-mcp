@@ -295,6 +295,7 @@ recovery, and this replacement path never signals a Workbench process.
 |------|-------------|
 | `wb_launch` | Launch or reuse one exact canonical `.gproj` under the version-3 MCP lease and verified companion identity. Different targets, live-other-MCP owners, occupied endpoints, and user-owned/unverifiable Workbench processes are refused. |
 | `wb_build` | Build one explicit `.gproj` into a caller-exclusive empty output directory under the current MCP owner. Returns the full guarded receipt after exact cleanup, endpoint vacancy, and fresh hashed output proof. |
+| `wb_log_query` | Filter an attributed Workbench build/editor log directory by addon reference, severity, channel, and/or case-insensitive text substring. Requires at least one filter and returns bounded matching lines rather than the full raw log. |
 | `wb_connect` | Test connection to Workbench NET API. Returns connection status and editor mode. |
 | `wb_diagnose` | Non-mutating diagnostic — config, packaged/staged companion identity, NET API identity, lifecycle schema/generation/phase, canonical target, endpoint, lease status, and operation. |
 | `wb_restart` | Preflight a complete replacement, then terminate through the retained verified process handle and restart the same canonical `.gproj`. A live different MCP owner cannot be claimed. |

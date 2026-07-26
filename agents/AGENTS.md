@@ -336,6 +336,7 @@ name below.
 | Generate Conflict scenario files | `scenario_create_conflict` (offline) |
 | Create or validate an addon | `mod` (`action=build` is retired) |
 | Build one exact addon while MCP is active | `wb_build` |
+| Query matching lines from a managed Workbench log directory | `wb_log_query` |
 | Stage or diagnose the observer companion addon | `observer_setup` |
 | Begin, inspect, finalize, or discard a managed evidence run | `observer_run` |
 | Prepare an instrumented runtime argument array without launching it | `observer_prepare_launch` |
