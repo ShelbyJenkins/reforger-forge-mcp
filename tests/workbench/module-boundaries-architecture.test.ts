@@ -167,7 +167,6 @@ describe("Workbench architecture boundaries", () => {
     const runner = source("runner.ts");
     for (const method of [
       "runForegroundEditor",
-      "runTemporaryCompanionPreflight",
       "runTargetBuild",
     ]) {
       expect(runner).toContain(`controller.${method}(`);

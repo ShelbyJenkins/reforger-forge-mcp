@@ -96,6 +96,29 @@ describe("OwnedRuntimeManager", () => {
     expect(value.backend.terminateCalls).toHaveLength(1);
   });
 
+  it("never reports stop success when a termination backend claims success but the exact process survives", async () => {
+    const value = makeHarness();
+    const started = await value.start("surviving-exact-process-start");
+    value.backend.terminationResult = { kind: "terminated" };
+
+    await expect(value.stop(started.runtimeId, "surviving-exact-process-stop"))
+      .rejects.toMatchObject({
+        code: "RECOVERY_REQUIRED",
+        details: {
+          runtimeId: started.runtimeId,
+          state: "stopping",
+        },
+      });
+    expect(value.backend.processes.has(started.pid)).toBe(true);
+    expect(value.backend.terminateCalls).toHaveLength(1);
+    expect(recordExists(value.manager, "stops", started.runtimeId)).toBe(false);
+    await expect(value.manager.status(started.runtimeId)).resolves.toMatchObject({
+      state: "stopping",
+      terminationComplete: false,
+      observerCleanupPending: false,
+    });
+  });
+
   it("does not publish vacancy after losing the mutex lease during exact termination", async () => {
     const backend = createLeaseLosingBackend();
     const value = makeHarness({ backend });

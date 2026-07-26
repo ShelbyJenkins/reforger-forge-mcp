@@ -31,6 +31,7 @@ import {
 } from "./workbench/helper-addon.js";
 import { WorkbenchObserverAdapter } from "./workbench/observer-adapter.js";
 import { registerWbLaunch } from "./tools/wb-launch.js";
+import { registerWbBuild } from "./tools/wb-build.js";
 import { registerWbConnect } from "./tools/wb-connect.js";
 import { registerWbDiagnose } from "./tools/wb-diagnose.js";
 import { registerWbReload } from "./tools/wb-reload.js";
@@ -194,6 +195,7 @@ export function registerTools(server: McpServer, config: Config): RegisteredTool
     // never closed on the embedded-server disposal path, leaking its handle
     // (and, on Windows, the memory map) until process exit.
     observerShutdown ??= (async () => {
+      await wbClient.closeOwnerScopedTargetBuild();
       try {
         return await observerApplication.closeRuntimeLifecycle();
       } finally {
@@ -203,6 +205,11 @@ export function registerTools(server: McpServer, config: Config): RegisteredTool
     return observerShutdown;
   };
   registerWbLaunch(server, config, wbClient);
+  registerWbBuild(server, config, wbClient, {
+    companionProvider: workbenchComposition.companionProvider,
+    managedRoot: observerConfig?.managedRoot ?? defaultWorkbenchHelperManagedRoot(),
+    processGuard: workbenchComposition.processGuard,
+  });
   registerWbConnect(server, wbClient);
   registerWbDiagnose(server, wbClient);
   registerWbReload(server, wbClient);

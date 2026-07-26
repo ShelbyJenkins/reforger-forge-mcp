@@ -25,6 +25,63 @@ import {
 
 afterEach(cleanupOwnedRuntimeManagerFixtures);
 
+const onePointZeroOneArguments = [
+  "-window",
+  "-addons",
+  "36374155AAC14289",
+  "-world",
+  "{25C334183474A8F7}Worlds/Testing/OPZO_BodyIdentityValidation/OPZO_BodyIdentityValidation.ent",
+];
+
+function makeAgentBackedRuntimeHarness(prefix: string) {
+  const root = mkdtempSync(join(tmpdir(), prefix));
+  roots.push(root);
+  const executable = join(root, "ArmaReforgerSteamDiag.exe");
+  writeFileSync(executable, "fixture");
+  const clock = new ManualTime({ nowMs: Date.parse("2026-07-18T12:00:00.000Z") });
+  const profileRoot = join(root, "agent-profiles");
+  const profilePath = join(profileRoot, "runtime-profile");
+  mkdirSync(profilePath, { recursive: true });
+  const agent = createObserverApplication({
+    root: join(root, "agent-managed"),
+    profileRoot,
+    sourceDirectory: observerAddonSource,
+    clock,
+    sessionStore: { terminalRetentionMs: 0 },
+    registry: { staleAfterMs: 1_000, staleRetentionMs: 0 },
+  });
+  openAgents.push(agent);
+  const session = agent.control.sessions.create({
+    bundleDigest: testBundleDigest,
+    stagedAddonPath: join(root, "addons", testBundleDigest, "ReforgerForgeObserver"),
+    profilePath,
+    agent: { host: "127.0.0.1", port: 47831, instanceId: agent.control.agentInstanceId },
+    buildIdentity: OBSERVER_BUILD_IDENTITY,
+    expectedRuntimeKind: "listenServer",
+    ttlMs: 1_000,
+    transportPreference: ["rest"],
+  });
+  const registration = graphicalRegistration(session, {
+    agentInstanceId: agent.control.agentInstanceId,
+    runtimeKind: "listenServer",
+    instanceId: `instance-${prefix.replace(/[^a-z0-9]/gi, "-")}`,
+    instanceNonce: `instance_nonce_${prefix.replace(/[^a-z0-9]/gi, "_")}_123456789`,
+  });
+  agent.registry.register(registration, session.contract.sessionToken);
+  const backend = createFakeBackend();
+  const gate = new AgentBackedGate(agent);
+  const value = makeHarness({
+    root,
+    backend,
+    gate,
+    preparedSessionId: session.record.sessionId,
+    preparedExpiresAt: session.contract.expiresAt,
+    preparedProfilePath: profilePath,
+  });
+  value.setExecutable(executable);
+  return { agent, backend, clock, gate, registration, session, value };
+}
+
 describe("OwnedRuntimeManager", () => {
   describe("pre-spawn recovery and reconciliation", () => {
   it("sweeps completed clusters while preserving live ownership obligations", async () => {
@@ -59,6 +116,87 @@ describe("OwnedRuntimeManager", () => {
     await live.manager.sweep();
     expect(recordExists(live.manager, "runtimes", liveStarted.runtimeId)).toBe(true);
     expect(live.manager.diagnosticStorageStats().activeOrRecoverableRuntimes).toBe(1);
+  });
+
+  it("recreates swept release authority before directly stopping a naturally exited runtime", async () => {
+    const { agent, backend, clock, session, value } =
+      makeAgentBackedRuntimeHarness("rfo-owned-runtime-release-expiry-");
+    const started = await value.start("release-expiry-start", onePointZeroOneArguments);
+
+    backend.processes.delete(started.pid);
+    const child = value.spawnCalls.at(-1)!.child;
+    child.exitCode = 0;
+    child.emit("exit", 0, null);
+    for (let attempt = 0; attempt < 50; attempt += 1) {
+      const diagnostics = agent.server.storeDiagnostics() as {
+        ownedRuntimeAuthorities: { releaseAcknowledged: number };
+      };
+      if (diagnostics.ownedRuntimeAuthorities.releaseAcknowledged === 1) break;
+      await new Promise((resolve) => setTimeout(resolve, 2));
+    }
+    expect(agent.server.storeDiagnostics()).toMatchObject({
+      ownedRuntimeLifecyclePins: { records: 0 },
+      ownedRuntimeAuthorities: { records: 1, releaseAcknowledged: 1 },
+    });
+    expect(recordExists(value.manager, "child-exits", started.runtimeId)).toBe(true);
+
+    // Cross both session and release-ack retention without calling status(),
+    // which previously happened to reconstruct the missing authority.
+    clock.advance(1_001);
+    value.setClock(clock.now());
+    agent.server.sweep(clock.now());
+    expect(agent.server.storeDiagnostics()).toMatchObject({
+      sessions: { records: 0, lifecycleLeased: 0 },
+      ownedRuntimeLifecyclePins: { records: 0 },
+      ownedRuntimeAuthorities: { records: 0, releaseAcknowledged: 0 },
+    });
+
+    await expect(value.stop(started.runtimeId, "release-expiry-stop")).resolves.toMatchObject({
+      state: "exited",
+      termination: "already_exited",
+      identityVacant: true,
+      terminationComplete: true,
+      observerCleanupPending: false,
+    });
+    expect(backend.terminateCalls).toEqual([]);
+    expect(recordExists(value.manager, "stop-completions", started.runtimeId)).toBe(true);
+    expect(agent.registry.diagnostics()
+      .filter((instance) => instance.sessionId === session.record.sessionId))
+      .toEqual([]);
+  });
+
+  it("re-acknowledges a swept release before resuming exact-vacancy stop completion", async () => {
+    const { agent, backend, clock, gate, value } =
+      makeAgentBackedRuntimeHarness("rfo-owned-runtime-completion-expiry-");
+    const started = await value.start("completion-expiry-start", onePointZeroOneArguments);
+    gate.completeFailures = 1;
+
+    await expect(value.stop(started.runtimeId, "completion-expiry-stop")).rejects.toMatchObject({
+      code: "SESSION_COMPLETION_FAILED",
+    });
+    expect(backend.terminateCalls).toHaveLength(1);
+    expect(recordExists(value.manager, "stops", started.runtimeId)).toBe(true);
+    expect(recordExists(value.manager, "stop-completions", started.runtimeId)).toBe(false);
+    expect(agent.server.storeDiagnostics()).toMatchObject({
+      ownedRuntimeLifecyclePins: { records: 0 },
+      ownedRuntimeAuthorities: { records: 1, releaseAcknowledged: 1 },
+    });
+
+    clock.advance(1_001);
+    value.setClock(clock.now());
+    agent.server.sweep(clock.now());
+    expect(agent.server.storeDiagnostics()).toMatchObject({
+      ownedRuntimeAuthorities: { records: 0, releaseAcknowledged: 0 },
+    });
+
+    await expect(value.stop(started.runtimeId, "completion-expiry-stop")).resolves.toMatchObject({
+      state: "exited",
+      identityVacant: true,
+      terminationComplete: true,
+      observerCleanupPending: false,
+    });
+    expect(backend.terminateCalls).toHaveLength(1);
+    expect(recordExists(value.manager, "stop-completions", started.runtimeId)).toBe(true);
   });
 
   it("keeps a live exact runtime stoppable past session TTL across manager reconciliation", async () => {
@@ -142,7 +280,7 @@ describe("OwnedRuntimeManager", () => {
 
     const released = agent.server.sweep(clock.now());
     expect(released.sessions.removedSessionIds).toEqual([created.record.sessionId]);
-    expect(released.instances.removedInstanceKeys).toHaveLength(1);
+    expect(released.instances.removedInstanceKeys).toEqual([]);
 
     const naturalProfilePath = join(profileRoot, "natural-exit-profile");
     mkdirSync(naturalProfilePath, { recursive: true });
@@ -164,14 +302,14 @@ describe("OwnedRuntimeManager", () => {
     }), naturalSession.contract.sessionToken);
     const naturalInput: ObserverLaunchInput = {
       runtimeKind: "listenServer",
-      arguments: ["-window"],
+      arguments: onePointZeroOneArguments,
       profilePath: naturalProfilePath,
       sessionTtlMs: 1_000,
       transportPreference: ["rest"],
       forceUpdate: false,
     };
     const naturalPrepared: ObserverPreparedLaunch = {
-      arguments: ["-window"],
+      arguments: onePointZeroOneArguments,
       sessionId: naturalSession.record.sessionId,
       expiresAt: naturalSession.contract.expiresAt,
       bundleDigest: naturalSession.contract.bundleDigest,
@@ -198,9 +336,25 @@ describe("OwnedRuntimeManager", () => {
     expect(agent.server.storeDiagnostics()).toMatchObject({
       ownedRuntimeLifecyclePins: { records: 0 },
     });
+    await expect(value.manager.status(naturalRuntime.runtimeId)).resolves.toMatchObject({
+      state: "exited",
+      exactOwned: true,
+      reason: expect.stringContaining("Direct child exit was reconciled"),
+    });
+    await expect(value.stop(naturalRuntime.runtimeId, "agent-natural-exit-stop"))
+      .resolves.toMatchObject({
+        state: "exited",
+        termination: "already_exited",
+        identityVacant: true,
+        terminationComplete: true,
+        observerCleanupPending: false,
+      });
+    expect(agent.registry.diagnostics()
+      .filter((instance) => instance.sessionId === naturalSession.record.sessionId))
+      .toEqual([]);
     const naturalReleased = agent.server.sweep(clock.now());
     expect(naturalReleased.sessions.removedSessionIds).toEqual([naturalSession.record.sessionId]);
-    expect(naturalReleased.instances.removedInstanceKeys).toHaveLength(1);
+    expect(naturalReleased.instances.removedInstanceKeys).toEqual([]);
     await agent.server.close();
   });
 

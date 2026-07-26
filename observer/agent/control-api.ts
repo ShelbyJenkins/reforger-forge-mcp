@@ -197,7 +197,11 @@ export class ObserverControlApi {
     const root = canonicalizeExistingDirectory(this.profileRoot, "Approved observer profile root");
     const lexical = resolve(requestedPath);
     if (!isPathContained(comparisonPath(root), comparisonPath(lexical))) {
-      throw new ObserverError("PROFILE_CONFLICT", "Observer profile must be beneath the approved profile root");
+      throw new ObserverError(
+        "PROFILE_CONFLICT",
+        `Observer profile must be beneath the approved profile root: ${root}. ` +
+          'Call observer_setup with action="doctor" to inspect profileRoot.'
+      );
     }
     assertManagedPath(root, lexical);
     const canonical = ensureCanonicalDirectory(lexical);

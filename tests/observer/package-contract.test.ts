@@ -152,7 +152,6 @@ describe("observer package and source contracts", () => {
       "scripts/observer-live-acceptance-support.ts",
       "scripts/observer-workbench-failure-support.ts",
       "scripts/run-runtime-observer-acceptance.ts",
-      "scripts/run-workbench-build-acceptance.ts",
       "scripts/run-workbench-observer-acceptance.ts",
       "scripts/workbench-observer-acceptance-adapter.ts",
       "scripts/workbench-observer-acceptance-runtime.ts",

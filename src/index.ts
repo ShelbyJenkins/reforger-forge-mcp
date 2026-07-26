@@ -13,6 +13,12 @@ import {
   discoverSteamInstallations,
   STEAM_DISCOVERY_EXIT_CODES,
 } from "./platform/windows/steam-discovery.js";
+import {
+  CHECK_ADDON_DIRS_COMMAND,
+  checkAddonDirs,
+  formatCheckAddonDirsReport,
+  parseCheckAddonDirsArguments,
+} from "./workbench/addon-dirs-diagnostic.js";
 import { logger, setDebugEnabled } from "./utils/logger.js";
 
 const SERVER_VERSION = "1.1.0";
@@ -22,6 +28,7 @@ function usage(): string {
     "Usage:",
     "  reforger-forge-mcp [configuration options]",
     "  reforger-forge-mcp discover-steam",
+    "  reforger-forge-mcp check-addon-dirs --gproj <path>",
     "",
     "Steam installation paths are discovered automatically when not explicitly supplied.",
     "",
@@ -29,6 +36,7 @@ function usage(): string {
     "",
     "Other:",
     "  discover-steam                          Print Steam discovery as JSON and exit.",
+    "  check-addon-dirs --gproj <path>         Report dependency GUID resolution by standard add-on root.",
     "  -h, --help                               Show this help.",
     "  --version                                Show the package version.",
     "",
@@ -55,16 +63,26 @@ async function runServer(config: Config): Promise<void> {
   const shutdown = (reason: string): Promise<void> => {
     if (shutdownPromise) return shutdownPromise;
     shutdownPromise = (async () => {
+      // An unresolved Promise does not keep Node's event loop alive. Retain
+      // one referenced handle while lifecycle cleanup is running so ordinary
+      // EOF/signal shutdown cannot exit between durable `stopping` and
+      // `vacant` publication. A parent transport may still enforce its own
+      // shorter kill deadline; the next MCP owner safely reconciles that cut.
+      const shutdownHold = setInterval(() => undefined, 1_000);
       process.stdin.off("end", onStdinEnd);
       process.stdin.off("close", onStdinClose);
       process.off("SIGINT", onSigint);
       process.off("SIGTERM", onSigterm);
       try {
-        reportSealResult(await disposeTools());
+        try {
+          reportSealResult(await disposeTools());
+        } finally {
+          await server.close();
+        }
+        logger.info(`ReforgerForge MCP server stopped (${reason})`);
       } finally {
-        await server.close();
+        clearInterval(shutdownHold);
       }
-      logger.info(`ReforgerForge MCP server stopped (${reason})`);
     })();
     return shutdownPromise;
   };
@@ -104,6 +122,16 @@ async function main(argv: readonly string[]): Promise<void> {
     const result = discoverSteamInstallations();
     process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
     process.exitCode = STEAM_DISCOVERY_EXIT_CODES[result.status];
+    return;
+  }
+  if (partitioned.remainingArguments[0] === CHECK_ADDON_DIRS_COMMAND) {
+    if (partitioned.configurationArguments.length > 0) {
+      throw new Error(`${CHECK_ADDON_DIRS_COMMAND} does not accept server configuration arguments.`);
+    }
+    const targetGprojPath = parseCheckAddonDirsArguments(
+      partitioned.remainingArguments
+    );
+    process.stdout.write(`${formatCheckAddonDirsReport(checkAddonDirs(targetGprojPath))}\n`);
     return;
   }
   if (partitioned.remainingArguments.length === 1

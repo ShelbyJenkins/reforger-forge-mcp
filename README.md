@@ -24,7 +24,7 @@ parameterless setup command:
 ```powershell
 git clone https://github.com/wastelandgoats/reforger-forge-mcp.git
 cd reforger-forge-mcp
-.\scripts\setup.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup.ps1
 ```
 
 For setup behavior, Doctor, Steam discovery, optional configuration, CLI
@@ -64,6 +64,10 @@ The returned `profilePath` is the outer directory passed to Enfusion's
 activation contract and observer-owned files are beneath that child's
 `ReforgerForgeObserver` directory. Do not append the inner `profile` segment to
 the launch argument yourself.
+
+Public observer errors redact absolute paths. If `PROFILE_CONFLICT` shows
+`<absolute-path>`, call `observer_setup` with `action="doctor"` and use
+`runtimeObserver.profileRoot` as the approved outer profile root.
 
 `preparedLaunchId` is bound to an immutable session, profile, runtime kind, and
 argument array. It is one-shot, expires with the prepared descriptor, and is
@@ -163,7 +167,7 @@ auto-launch it.
 | Tool | Workbench? | What it does |
 |------|-----------|-------------|
 | `project` | No | Browse, read, or write files in your mod project directory (`action`: browse / read / write). |
-| `mod` | No | Manage addons: `action=create` scaffolds a new addon and `action=validate` checks structure. Unsafe generic `action=build` is retired; use a project-owned bounded build wrapper. |
+| `mod` | No | Manage addons: `action=create` scaffolds a new addon and `action=validate` checks structure. Building is a Workbench lifecycle operation exposed separately as `wb_build`. |
 
 ### Code Generation (Offline)
 
@@ -257,9 +261,40 @@ identity expected by the running MCP. No Workbench helper source is written to
 the target project. The canonical `target_build` plan has no helper activation
 or NET-readiness capability.
 
+`wb_build` keeps the active MCP's local lifecycle writer admission for one
+direct, helper-free target build. It reuses that MCP's durable owner, process
+guard, and child supervisor; it does not launch the standalone Node runner,
+stage a build helper, or release the MCP lease during the build. Before the
+native spawn it re-audits the target's declared transitive dependency GUIDs
+against the effective add-on roots. Missing roots return `INVALID_CONFIG` with
+the exact GUIDs and the
+`workbenchAddonDirs`/`--workbench-addon-dir` recovery; duplicate providers are
+reported separately as ambiguous. A running editor is never stopped
+implicitly.
+
+The effective add-on roots automatically include the discovered base-game root
+and, when it exists, the standard Workshop root. Supplying one or more explicit
+`workbenchAddonDirs` / `--workbench-addon-dir` values adds to those defaults
+rather than replacing them; `--no-workbench-addon-dirs` remains the deliberate
+empty-root opt-out. To inspect dependency resolution without starting
+Workbench, run:
+
+```text
+node dist/index.js check-addon-dirs --gproj <path>
+```
+
+MCP shutdown cancels and awaits an active build while a referenced event-loop
+handle keeps ordinary EOF cleanup alive. A stdio parent may still enforce a
+shorter termination deadline. A later `wb_build` therefore repairs only a
+dead-owner interrupted state whose journal is safely replaceable and whose
+Workbench processes and NET API endpoint are both proven absent. Live,
+unverifiable, malformed, or occupied states remain preserved for attended
+recovery, and this replacement path never signals a Workbench process.
+
 | Tool | What it does |
 |------|-------------|
 | `wb_launch` | Launch or reuse one exact canonical `.gproj` under the version-3 MCP lease and verified companion identity. Different targets, live-other-MCP owners, occupied endpoints, and user-owned/unverifiable Workbench processes are refused. |
+| `wb_build` | Build one explicit `.gproj` into a caller-exclusive empty output directory under the current MCP owner. Returns the full guarded receipt after exact cleanup, endpoint vacancy, and fresh hashed output proof. |
 | `wb_connect` | Test connection to Workbench NET API. Returns connection status and editor mode. |
 | `wb_diagnose` | Non-mutating diagnostic — config, packaged/staged companion identity, NET API identity, lifecycle schema/generation/phase, canonical target, endpoint, lease status, and operation. |
 | `wb_restart` | Preflight a complete replacement, then terminate through the retained verified process handle and restart the same canonical `.gproj`. A live different MCP owner cannot be claimed. |
@@ -323,45 +358,29 @@ The shared catalog contains 69 Workbench failure-matrix cases and the harness
 has hermetic coverage, but no gated native matrix run or matrix image review is
 recorded for the current implementation.
 
-For project-owned scripts and CI, the packaged `reforger-forge-workbench`
-runner shares the same version-3 lifecycle and companion staging:
+While the MCP server is active, use `wb_build`. For project-owned scripts and
+CI where no MCP server owns the lease, use the packaged
+`reforger-forge-workbench` runner:
 
 ```text
 reforger-forge-workbench --config <config> editor --gproj <path> --foreground
 reforger-forge-workbench --config <config> build --gproj <path> --platform PC --output <path> --timeout-ms <n>
 ```
 
-Editor mode is intentionally foreground-only and returns its version-2 receipt
-only after exact helper endpoint and Ping qualification. The target-build plan
-itself is helper-free, uses a dedicated build profile, and performs no NET call.
-At this pre-removal boundary, however, the public build command still provides a
-guarded two-phase lifecycle under one machine lock and one absolute deadline.
-Its separate managed-companion editor preflight proves endpoint ownership and
-immutable Ping identity, then is exact-terminated and followed by an
-endpoint-vacancy proof before the distinct target-only child starts. The public
-command therefore still emits the version-3 build receipt, which keeps the two
-PIDs, lifecycle generations, and attributed log directories separate; binds the
-target add-on ID/GUID, project-file SHA-256, and companion bundle; and requires
-fresh nonempty output containing exactly one hashed `resourceDatabase.rdb`
-before reporting success. Timeout and nonzero exits have `output: null`; an
-exit-zero output-proof failure carries `validationFailure` and makes the CLI
-fail while preserving both attributed log directories. Removing the preflight
-and emitting a helper-free version-4 receipt remain gated on two consecutive
-controlled target-only Workbench acceptance runs plus green hermetic contracts.
+Editor mode is intentionally foreground-only and returns a receipt only after
+exact helper endpoint and Ping qualification. A build is one direct,
+helper-free target-only child under the guarded lifecycle: it uses a dedicated
+build profile, makes no NET call, and has no companion preflight. Before
+reporting success, it proves process ownership and endpoint vacancy, re-attests
+the target add-on ID/GUID and project-file SHA-256, and requires fresh nonempty
+output containing exactly one hashed `resourceDatabase.rdb`. Timeout and
+nonzero exits have `output: null`; an exit-zero output-proof failure carries
+`validationFailure` and makes the CLI fail.
 
-Maintainers can collect that pre-removal evidence through the repository-only
-controller harness. It requires both an environment gate and explicit command
-confirmation, an exact real target, and an external output parent:
-
-```powershell
-$env:RFO_RUN_LIVE_WORKBENCH_BUILD_ACCEPTANCE = '1'
-npm run dev:workbench:acceptance:build -- --config <CONFIG_PATH> --confirm-live-run --gproj <ABSOLUTE_TARGET_GPROJ> --output-root <EXTERNAL_OUTPUT_PARENT>
-```
-
-The harness runs the helper-free `target_build` controller path twice with
-distinct exclusive outputs and records a path/PID/token-sanitized artifact under
-`docs/validation`. Its existence is not acceptance evidence, and it neither
-removes the public helper preflight nor emits a version-4 receipt.
+For the unversioned editor/build receipt field tables, exit-code mapping, and
+the one caller-side target-identity check, see the [standalone runner CLI
+reference](docs/runner-cli.md). In particular, build receipts contain neither
+`preflight` nor `companionIdentity` fields.
 
 Guarded data build is supported on installed Workbench 1.7.0.54 with the exact
 Resource Manager sequence

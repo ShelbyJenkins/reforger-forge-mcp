@@ -9,6 +9,7 @@ import { generateScript } from "../templates/script.js";
 import type { PatternLibrary } from "../patterns/loader.js";
 import { validateFilename, validateProjectPath } from "../utils/safe-path.js";
 import type { SearchEngine } from "../index/search-engine.js";
+import { indexDeclaredProjectClasses } from "../index/project-script-classes.js";
 import { parse, getProperty } from "../formats/enfusion-text.js";
 
 // ─── build helpers ────────────────────────────────────────────────────────────
@@ -34,6 +35,10 @@ function derivePrefix(name: string): string {
 interface ValidationIssue {
   level: "error" | "warning" | "info";
   message: string;
+}
+
+interface ClassLookup {
+  hasClass(name: string): boolean;
 }
 
 type CheckName = "structure" | "gproj" | "scripts" | "prefabs" | "configs" | "references" | "naming";
@@ -195,7 +200,7 @@ function checkPrefabs(projectPath: string): ValidationIssue[] {
   return issues;
 }
 
-function checkConfigs(projectPath: string, searchEngine?: SearchEngine): ValidationIssue[] {
+function checkConfigs(projectPath: string, classLookup?: ClassLookup): ValidationIssue[] {
   const issues: ValidationIssue[] = [];
   const allConfigs = findFiles(projectPath, ".conf");
 
@@ -206,7 +211,7 @@ function checkConfigs(projectPath: string, searchEngine?: SearchEngine): Validat
       const root = parse(content);
 
       // Check root node type against API index (only if searchEngine available)
-      if (searchEngine && root.type && !searchEngine.hasClass(root.type)) {
+      if (classLookup && root.type && !classLookup.hasClass(root.type)) {
         issues.push({
           level: "warning",
           message: `${rel}: Root class "${root.type}" not found in API index — may be from another mod or misspelled.`,
@@ -214,10 +219,10 @@ function checkConfigs(projectPath: string, searchEngine?: SearchEngine): Validat
       }
 
       // Walk children and check their type names
-      if (searchEngine) {
+      if (classLookup) {
         const walkNodes = (node: ReturnType<typeof parse>) => {
           for (const child of node.children || []) {
-            if (child.type && /^[A-Z]/.test(child.type) && !searchEngine.hasClass(child.type)) {
+            if (child.type && /^[A-Z]/.test(child.type) && !classLookup.hasClass(child.type)) {
               issues.push({
                 level: "warning",
                 message: `${rel}: Class "${child.type}" not found in API index.`,
@@ -241,7 +246,7 @@ function checkConfigs(projectPath: string, searchEngine?: SearchEngine): Validat
   return issues;
 }
 
-function checkReferences(projectPath: string, searchEngine: SearchEngine): ValidationIssue[] {
+function checkReferences(projectPath: string, classLookup: ClassLookup): ValidationIssue[] {
   const issues: ValidationIssue[] = [];
 
   const allScripts = findFiles(projectPath, ".c");
@@ -256,7 +261,7 @@ function checkReferences(projectPath: string, searchEngine: SearchEngine): Valid
       const classMatch = content.match(/(?:modded\s+)?class\s+\w+\s*:\s*(\w+)/);
       if (classMatch) {
         const parentClass = classMatch[1];
-        if (!searchEngine.hasClass(parentClass)) {
+        if (!classLookup.hasClass(parentClass)) {
           issues.push({
             level: "warning",
             message: `${rel}: Extends "${parentClass}" which is not in the API index (may be from another mod)`,
@@ -641,14 +646,29 @@ export function registerMod(
 
       const enabledChecks = (checks as CheckName[] | undefined) ?? ALL_CHECKS;
       const allIssues: ValidationIssue[] = [];
+      const needsClassLookup =
+        enabledChecks.includes("configs") || enabledChecks.includes("references");
+      const projectClasses = needsClassLookup
+        ? indexDeclaredProjectClasses({
+            targetProjectPath: basePath,
+            searchRoots: [
+              ...(config.projectPath ? [config.projectPath] : []),
+              ...(config.workbenchAddonDirs ?? []),
+            ],
+          })
+        : new Set<string>();
+      const classLookup: ClassLookup = {
+        hasClass: (name) =>
+          searchEngine.hasClass(name) || projectClasses.has(name.toLowerCase()),
+      };
 
       const checkMap: Record<CheckName, () => ValidationIssue[]> = {
         structure: () => checkStructure(basePath),
         gproj: () => checkGproj(basePath),
         scripts: () => checkScripts(basePath),
         prefabs: () => checkPrefabs(basePath),
-        configs: () => checkConfigs(basePath, searchEngine),
-        references: () => checkReferences(basePath, searchEngine),
+        configs: () => checkConfigs(basePath, classLookup),
+        references: () => checkReferences(basePath, classLookup),
         naming: () => checkNaming(basePath),
       };
 

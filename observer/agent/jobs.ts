@@ -947,7 +947,7 @@ export class JobStore {
   require(sessionId: string, jobId: string): JobRecord {
     const record = this.jobs.get(jobId);
     if (!record || record.sessionId !== sessionId) {
-      throw new ObserverError("INVALID_REQUEST", "Observer job was not found", 404);
+      throw new ObserverError("JOB_NOT_FOUND", "Observer job was not found", 404);
     }
     return record;
   }

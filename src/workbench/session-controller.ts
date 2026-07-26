@@ -21,6 +21,10 @@ import {
   type WorkbenchActivityGateTiming,
 } from "./activity-gate.js";
 import {
+  WorkbenchAddonDependencyPreflightError,
+  assertWorkbenchAddonDependenciesAvailable,
+} from "./addon-dependencies.js";
+import {
   ChildSupervisor,
   type SupervisedChildExit,
   type SupervisedChildHandle,
@@ -31,7 +35,6 @@ import {
   WorkbenchLifecycleExecutionError,
   type WorkbenchLifecycleExecutionDependencies,
   type WorkbenchLifecycleExecutionPort,
-  type WorkbenchLifecycleReservation,
   type WorkbenchLifecycleSupervisedChild,
 } from "./lifecycle-execution.js";
 import {
@@ -198,8 +201,6 @@ export interface BoundedRunOptions {
   readonly beforeSpawn?: () => void;
   readonly terminationTimeoutMs?: number;
   readonly recoveryTimeoutMs?: number;
-  /** Internal V3 bridge: preserves the preflight reservation through target spawn. */
-  readonly handoff?: WorkbenchTargetBuildHandoff;
 }
 
 export interface WorkbenchTargetBuildRunResult<Snapshot>
@@ -220,77 +221,6 @@ export class WorkbenchRunError extends Error {
   constructor(message: string, public readonly code: WorkbenchRunErrorCode) {
     super(message);
     this.name = "WorkbenchRunError";
-  }
-}
-
-export interface WorkbenchTemporaryCompanionPreflightPlan {
-  readonly kind: "temporary_companion_preflight";
-  readonly executablePath: string;
-  readonly lifecycleTarget: WorkbenchLifecycleTarget;
-  readonly helper: Readonly<WorkbenchCompanionLaunch>;
-  readonly endpoint: Readonly<{ host: string; port: number }>;
-  readonly ownerArgument: string;
-  readonly argv: readonly string[];
-  readonly spawnOptions: Readonly<SpawnOptions>;
-}
-
-export interface WorkbenchPreflightProofContext<Qualification> {
-  readonly process: Readonly<WorkbenchIdentity>;
-  readonly lifecycleGeneration: string;
-  readonly qualification: Qualification;
-}
-
-export interface TemporaryCompanionPreflightOptions<Qualification>
-  extends ForegroundRunOptions<Qualification> {
-  readonly deadlineMs: number;
-  /** Best-effort precheck immediately before the transition-only lifecycle claim. */
-  readonly beforeClaim?: () => void;
-  /** Immediate post-claim reservation proof; failure returns the child-free state to vacant. */
-  readonly afterClaim?: () => void;
-  /** Evidence/reattestation hook after exact absence and vacancy, before handoff publication. */
-  readonly beforeHandoff?: (
-    proof: WorkbenchPreflightProofContext<Qualification>
-  ) => void | Promise<void>;
-}
-
-export interface WorkbenchTemporaryCompanionPreflightResult<Qualification>
-  extends WorkbenchPreflightProofContext<Qualification> {
-  readonly endpointOwnership: "verified";
-  readonly endpointVacancy: "verified";
-  readonly handoff: WorkbenchTargetBuildHandoff;
-}
-
-/** Opaque, one-shot reservation continuity between legacy V3 preflight and target build. */
-export class WorkbenchTargetBuildHandoff {
-  private status: "fresh" | "consumed" | "cancelled" = "fresh";
-
-  /** @internal Created only after exact preflight absence and endpoint vacancy. */
-  constructor(private readonly lifecycle: WorkbenchLifecycleReservation) {}
-
-  consume(
-    endpoint: Readonly<{ host: string; port: number }>,
-    target: WorkbenchLifecycleTarget
-  ): WorkbenchLifecycleReservation {
-    if (this.status !== "fresh") {
-      throw new WorkbenchRunError("Target-build lifecycle handoff was already consumed.", "INCOMPLETE_PROOF");
-    }
-    if (this.lifecycle.phase !== "starting" || this.lifecycle.workbench !== null ||
-        this.lifecycle.endpoint.host !== endpoint.host || this.lifecycle.endpoint.port !== endpoint.port ||
-        this.lifecycle.target?.comparisonKey !== target.comparisonKey ||
-        pathKey(this.lifecycle.target?.path ?? "") !== pathKey(target.path)) {
-      throw new WorkbenchRunError(
-        "Target-build lifecycle handoff no longer matches its endpoint and canonical target.",
-        "INCOMPLETE_PROOF"
-      );
-    }
-    this.status = "consumed";
-    return this.lifecycle;
-  }
-
-  cancel(): WorkbenchLifecycleReservation | null {
-    if (this.status !== "fresh") return null;
-    this.status = "cancelled";
-    return this.lifecycle;
   }
 }
 
@@ -341,6 +271,7 @@ export type WorkbenchErrorCode =
   | "LAUNCH_FAILED"
   | "TARGET_REQUIRED"
   | "AMBIGUOUS_TARGET"
+  | "INVALID_CONFIG"
   | "INVALID_TARGET"
   | "TARGET_CHANGED"
   | "TARGET_CONFLICT"
@@ -410,11 +341,17 @@ interface ManagedRunningAuthority {
   readonly snapshot: WorkbenchObserverSnapshot;
 }
 
+type CoordinatedLifecycleKind = LifecycleOperationKind | "target_build";
+
 interface ActiveLifecycleOperation {
-  kind: LifecycleOperationKind;
+  kind: CoordinatedLifecycleKind;
   operationId: string;
   targetKey: string | null;
   promise: Promise<unknown>;
+}
+
+export interface OwnerScopedTargetBuildOptions {
+  readonly signal?: AbortSignal;
 }
 
 export interface WorkbenchClientDependencies {
@@ -475,6 +412,9 @@ function captureBindingMatchesLifecycle(
 
 export class WorkbenchSessionController {
   private activeLifecycle: ActiveLifecycleOperation | null = null;
+  private activeTargetBuildAbort: AbortController | null = null;
+  private activeTargetBuildPromise: Promise<unknown> | null = null;
+  private targetBuildClosing = false;
   private ownedChild: OwnedChildObservation | null = null;
   private readonly childSupervisor: ChildSupervisor;
   private readonly runnerLifecycleExecution: WorkbenchLifecycleExecutionPort;
@@ -507,6 +447,151 @@ export class WorkbenchSessionController {
     return this.runnerLifecycleExecution;
   }
 
+  /**
+   * Keep one MCP-owned target build inside the same process-local lifecycle
+   * coordinator and writer gate as editor lifecycle and observer operations.
+   *
+   * The callback deliberately receives the shared lifecycle execution port so
+   * its one target-only build remains inside this controller's admission
+   * boundary for the full lifecycle.
+   */
+  async runOwnerScopedTargetBuild<T>(
+    gprojPath: string,
+    action: (
+      lifecycleExecution: WorkbenchLifecycleExecutionPort,
+      signal: AbortSignal
+    ) => Promise<T>,
+    options: OwnerScopedTargetBuildOptions = {}
+  ): Promise<T> {
+    if (this.targetBuildClosing) {
+      throw new WorkbenchError(
+        "Workbench target build is unavailable because the MCP server is shutting down.",
+        "LIFECYCLE_BUSY"
+      );
+    }
+    if (this.activeTargetBuildPromise) {
+      throw new WorkbenchError(
+        "Another owner-scoped Workbench target build is already active.",
+        "LIFECYCLE_BUSY"
+      );
+    }
+
+    let project: CanonicalProjectIdentity;
+    try {
+      project = canonicalizeGproj(gprojPath);
+    } catch (error) {
+      throw this.mapLifecycleError(error);
+    }
+
+    const operationAbort = new AbortController();
+    const forwardRequestAbort = (): void => {
+      operationAbort.abort(options.signal?.reason);
+    };
+    options.signal?.addEventListener("abort", forwardRequestAbort, { once: true });
+    if (options.signal?.aborted) forwardRequestAbort();
+
+    const promise = this.coordinateLifecycle(
+      "target_build",
+      project.comparisonKey,
+      () => this.activityGate.runLifecycle(
+        "owner-scoped target build",
+        async () => {
+          await this.reconcileOwnerScopedTargetBuildEntry(project);
+          return action(this.runnerLifecycleExecution, operationAbort.signal);
+        },
+        { signal: operationAbort.signal }
+      )
+    );
+    this.activeTargetBuildAbort = operationAbort;
+    this.activeTargetBuildPromise = promise;
+    try {
+      return await promise;
+    } finally {
+      options.signal?.removeEventListener("abort", forwardRequestAbort);
+      if (this.activeTargetBuildPromise === promise) {
+        this.activeTargetBuildPromise = null;
+        this.activeTargetBuildAbort = null;
+      }
+    }
+  }
+
+  /**
+   * Graceful MCP shutdown boundary: stop admitting builds, cancel the active
+   * request, and wait for its exact-child and endpoint cleanup before the
+   * shared process guard is closed.
+   */
+  async closeOwnerScopedTargetBuild(): Promise<void> {
+    this.targetBuildClosing = true;
+    const active = this.activeTargetBuildPromise;
+    this.activeTargetBuildAbort?.abort(
+      new Error("The MCP server is shutting down.")
+    );
+    if (active) await active.catch(() => undefined);
+  }
+
+  /**
+   * Recover only a replacement-owner state whose native absence is fully
+   * provable. This is deliberately narrower than editor launch recovery:
+   * wb_build never terminates or reuses a live Workbench.
+   *
+   * The initial target-less claim is required when a dead MCP left target A
+   * busy and the replacement request names target B. Retargeting happens only
+   * after process and endpoint vacancy are proven.
+   */
+  private async reconcileOwnerScopedTargetBuildEntry(
+    project: CanonicalProjectIdentity
+  ): Promise<void> {
+    const state = await this.processGuard.withLifecycleLock((session) =>
+      this.claimState(session, null)
+    );
+    await this.recoverUnpublishedSpawn(state, { terminateLive: false });
+    if (await this.inspectRecordedWorkbench(state) === "live") {
+      throw new WorkbenchError(
+        "Owner-scoped target build refused because an exact Workbench process is still live. " +
+          "Use wb_shutdown for an owned editor or wait for the active lifecycle to finish.",
+        "LIFECYCLE_BUSY"
+      );
+    }
+    await this.assertNoWorkbenchProcesses(
+      this.processGuard,
+      "Owner-scoped target-build recovery"
+    );
+    await this.waitForPortRelease();
+    // Make the final process/endpoint proof and vacant publication under one
+    // machine-mutex session. Native state cannot be transactionally locked,
+    // but this closes the unlocked proof-to-CAS gap and rejects cooperating
+    // lifecycle changes by exact generation and lease.
+    await this.processGuard.withLifecycleLock(async (session) => {
+      const current = await this.requireReservedLifecycle(session, state);
+      await this.assertNoWorkbenchProcesses(
+        session,
+        "Owner-scoped target-build recovery"
+      );
+      const vacancy = await session.verifyEndpointVacant({
+        host: this.host,
+        port: this.port,
+      });
+      if (vacancy.kind !== "vacant") {
+        const detail = vacancy.kind === "occupied"
+          ? `listener PID ${vacancy.listenerPid}: ${vacancy.message}`
+          : `${vacancy.reason}: ${vacancy.message}`;
+        throw new WorkbenchError(
+          `RECOVERY_REQUIRED: owner-scoped target-build recovery preserved its busy ` +
+            `reservation because final endpoint vacancy was not proven (${detail}).`,
+          "RECOVERY_REQUIRED"
+        );
+      }
+      await this.assertNoWorkbenchProcesses(
+        session,
+        "Owner-scoped target-build recovery"
+      );
+      await session.transitionToVacant(stateExpected(current), {
+        target: toLifecycleTarget(project),
+        companion: current.companion,
+      });
+    });
+  }
+
   static composeLifecycleExecution(
     dependencies: WorkbenchLifecycleExecutionDependencies = {}
   ): WorkbenchLifecycleExecutionPort {
@@ -524,14 +609,15 @@ export class WorkbenchSessionController {
   static composeRunner(
     host: string,
     port: number,
-    lifecycleExecution: WorkbenchLifecycleExecutionPort
+    lifecycleExecution: WorkbenchLifecycleExecutionPort,
+    processGuard: WorkbenchProcessGuard = new WorkbenchProcessGuard()
   ): WorkbenchSessionController {
     return new WorkbenchSessionController(
       host,
       port,
       undefined,
       "ReforgerForgeWorkbenchRunner",
-      new WorkbenchProcessGuard(),
+      processGuard,
       { lifecycleExecution }
     );
   }
@@ -807,252 +893,6 @@ export class WorkbenchSessionController {
     });
   }
 
-  /** Temporary V3 build qualification; removed only after the live target-only gate. */
-  async runTemporaryCompanionPreflight<Qualification>(
-    plan: WorkbenchTemporaryCompanionPreflightPlan,
-    options: TemporaryCompanionPreflightOptions<Qualification>
-  ): Promise<WorkbenchTemporaryCompanionPreflightResult<Qualification>> {
-    return this.activityGate.runLifecycle(
-      "temporary build companion preflight",
-      () => this.runTemporaryCompanionPreflightExclusive(plan, options),
-      { signal: options.signal }
-    );
-  }
-
-  private async runTemporaryCompanionPreflightExclusive<Qualification>(
-    plan: WorkbenchTemporaryCompanionPreflightPlan,
-    options: TemporaryCompanionPreflightOptions<Qualification>
-  ): Promise<WorkbenchTemporaryCompanionPreflightResult<Qualification>> {
-    if (plan.kind !== "temporary_companion_preflight" ||
-        !Number.isFinite(options.deadlineMs)) {
-      throw new WorkbenchRunError(
-        "Temporary companion preflight requires a finite deadline and validated plan.",
-        "INCOMPLETE_PROOF"
-      );
-    }
-    const execution = this.runnerLifecycleExecution;
-    const endpoint = { ...plan.endpoint };
-    const terminationTimeoutMs = options.terminationTimeoutMs ?? OWNED_PROCESS_EXIT_TIMEOUT_MS;
-    const recoveryTimeoutMs = options.recoveryTimeoutMs ?? OWNED_PROCESS_EXIT_TIMEOUT_MS;
-    await execution.assertSpawnJournalReplaceable();
-    await execution.assertNoWorkbenchBeforeReservation("Workbench companion preflight reservation");
-    await execution.assertEndpointVacantBeforeSpawn(endpoint, "Workbench companion preflight reservation");
-    options.beforeClaim?.();
-    let lifecycle = await execution.reserve({
-      endpoint,
-      target: plan.lifecycleTarget,
-      companion: plan.helper,
-    });
-    try {
-      options.afterClaim?.();
-    } catch (error) {
-      await execution.vacate(lifecycle, {
-        endpoint,
-        target: plan.lifecycleTarget,
-        companion: companionLifecycleState(plan.helper),
-      });
-      throw error;
-    }
-    let supervised: WorkbenchLifecycleSupervisedChild | null = null;
-    let identity: WorkbenchIdentity | null = null;
-    let qualification: Qualification | undefined;
-    let qualified = false;
-    let lifecycleGeneration: string | null = null;
-    let primaryError: unknown = null;
-    let cleanupError: unknown = null;
-    let absenceProven = false;
-    let endpointVacant = false;
-    let handoff: WorkbenchTargetBuildHandoff | null = null;
-
-    try {
-      if (options.signal?.aborted) {
-        throw new WorkbenchRunError("Workbench companion preflight was aborted before spawn.", "ABORTED");
-      }
-      if (Date.now() >= options.deadlineMs) {
-        throw new WorkbenchRunError(
-          "Workbench build deadline expired before companion preflight spawn.",
-          "DEADLINE_EXCEEDED"
-        );
-      }
-      await execution.assertNoWorkbenchProcesses();
-      options.beforeFinalVacancyCheck?.();
-      await execution.assertEndpointVacantBeforeSpawn(endpoint, "Workbench companion preflight spawn");
-      const spawned = await execution.spawnRecoverable({
-        lifecycle,
-        purpose: "runner_companion_preflight",
-        executablePath: plan.executablePath,
-        launchArguments: plan.argv,
-        spawnOptions: plan.spawnOptions,
-        ownerArgument: plan.ownerArgument,
-        launchedAtMs: Date.now(),
-        beforeSpawn: () => {
-          if (options.signal?.aborted) {
-            throw new WorkbenchRunError(
-              "Workbench companion preflight was aborted immediately before spawn.",
-              "ABORTED"
-            );
-          }
-          if (Date.now() >= options.deadlineMs) {
-            throw new WorkbenchRunError(
-              "Workbench build deadline expired immediately before companion preflight spawn.",
-              "DEADLINE_EXCEEDED"
-            );
-          }
-          options.beforeSpawn?.();
-        },
-        onSupervisedChild: (observed) => { supervised = observed; },
-      });
-      supervised = spawned.supervisedChild;
-      identity = spawned.identity;
-      lifecycle = spawned.lifecycle;
-      if (Date.now() >= options.deadlineMs) {
-        throw new WorkbenchRunError(
-          "Workbench build deadline expired before companion readiness could be qualified.",
-          "DEADLINE_EXCEEDED"
-        );
-      }
-      qualification = await options.qualify({
-        endpoint,
-        process: identity,
-        companion: plan.helper,
-        child: supervised.handle,
-        verifyEndpointOwner: () => execution.verifyEndpointOwner(endpoint, identity!),
-      });
-      qualified = true;
-      lifecycle = await execution.transition(lifecycle, {
-        phase: "running",
-        workbench: identity,
-        companion: companionLifecycleState(plan.helper),
-        operation: null,
-      });
-      lifecycleGeneration = lifecycle.generation;
-    } catch (error) {
-      primaryError = error;
-    }
-
-    try {
-      if (lifecycle.phase !== "vacant") {
-        lifecycle = await execution.transition(lifecycle, {
-          phase: "stopping",
-          workbench: identity,
-          operation: { kind: "shutdown", operationId: randomUUID() },
-        });
-      }
-    } catch (error) {
-      cleanupError = error;
-    }
-    if (supervised) {
-      const absence = await execution.ensureExactChildAbsent({
-        identity,
-        child: supervised.handle,
-        timeoutMs: terminationTimeoutMs,
-        recoveryTimeoutMs,
-      });
-      cleanupError ??= absence.error ?? null;
-      absenceProven = absence.absent;
-      execution.releaseAbsentSupervisedChild(supervised, absenceProven);
-    } else {
-      try {
-        await execution.assertNoWorkbenchProcesses();
-        absenceProven = true;
-      } catch (error) {
-        cleanupError ??= error;
-      }
-    }
-    if (absenceProven) {
-      try {
-        await this.waitForRunEndpointVacancy(
-          execution,
-          endpoint,
-          "Workbench companion preflight",
-          recoveryTimeoutMs
-        );
-        endpointVacant = true;
-      } catch (error) {
-        primaryError ??= error;
-      }
-    }
-    if (!primaryError && !cleanupError && identity && lifecycleGeneration &&
-        qualified && absenceProven && endpointVacant) {
-      try {
-        await options.beforeHandoff?.({
-          process: Object.freeze({ ...identity }),
-          lifecycleGeneration,
-          qualification: qualification as Qualification,
-        });
-      } catch (error) {
-        primaryError = error;
-      }
-    }
-    if (absenceProven && endpointVacant) {
-      try {
-        if (!primaryError && !cleanupError) {
-          lifecycle = await execution.transition(lifecycle, {
-            phase: "starting",
-            endpoint,
-            target: plan.lifecycleTarget,
-            workbench: null,
-            companion: companionLifecycleState(plan.helper),
-            operation: { kind: "launch", operationId: randomUUID() },
-          });
-          handoff = new WorkbenchTargetBuildHandoff(lifecycle);
-        } else {
-          lifecycle = await execution.vacate(lifecycle, {
-            endpoint,
-            target: plan.lifecycleTarget,
-            companion: companionLifecycleState(plan.helper),
-          });
-        }
-      } catch (error) {
-        cleanupError ??= error;
-      }
-    }
-    if (cleanupError) throw cleanupError;
-    if (primaryError) throw primaryError;
-    if (!identity || !qualified || !lifecycleGeneration || !absenceProven ||
-        !endpointVacant || !handoff) {
-      throw new WorkbenchRunError(
-        "Workbench companion preflight completed without a fully identity-bound proof.",
-        "INCOMPLETE_PROOF"
-      );
-    }
-    return Object.freeze({
-      process: Object.freeze({ ...identity }),
-      lifecycleGeneration,
-      qualification: qualification as Qualification,
-      endpointOwnership: "verified" as const,
-      endpointVacancy: "verified" as const,
-      handoff,
-    });
-  }
-
-  /** Execute one helper-free target plan with the final output proof inside the spawn cut. */
-  async cancelTargetBuildHandoff(
-    handoff: WorkbenchTargetBuildHandoff,
-    target: WorkbenchLifecycleTarget
-  ): Promise<boolean> {
-    return this.activityGate.runLifecycle("cancel target-build handoff", async () => {
-      const lifecycle = handoff.cancel();
-      if (!lifecycle) return false;
-      const endpoint = { host: this.host, port: this.port };
-      await this.runnerLifecycleExecution.assertNoWorkbenchProcesses();
-      const vacancy = await this.runnerLifecycleExecution.verifyEndpointVacant(endpoint);
-      if (vacancy.kind !== "vacant") {
-        throw new WorkbenchRunError(
-          `Target-build handoff cancellation preserved its busy reservation because endpoint ` +
-            `vacancy was not proven (${vacancy.kind}).`,
-          "ENDPOINT_UNVERIFIABLE"
-        );
-      }
-      await this.runnerLifecycleExecution.vacate(lifecycle, {
-        endpoint,
-        target,
-        companion: lifecycle.companion,
-      });
-      return true;
-    });
-  }
-
   /** Execute one helper-free target plan with the final output proof inside the spawn cut. */
   async runTargetBuild<Snapshot>(
     plan: TargetBuildLaunchPlan,
@@ -1093,14 +933,12 @@ export class WorkbenchSessionController {
     await execution.assertSpawnJournalReplaceable();
     await execution.assertNoWorkbenchBeforeReservation("Workbench target-build reservation");
     await execution.assertEndpointVacantBeforeSpawn(endpoint, "Workbench target-build reservation");
-    if (!options.handoff) reservation.assertStillReservedAndSnapshot();
-    let lifecycle = options.handoff
-      ? options.handoff.consume(endpoint, plan.lifecycleTarget)
-      : await execution.reserve({
-          endpoint,
-          target: plan.lifecycleTarget,
-          companion: null,
-        });
+    reservation.assertStillReservedAndSnapshot();
+    let lifecycle = await execution.reserve({
+      endpoint,
+      target: plan.lifecycleTarget,
+      companion: null,
+    });
     const reservedCompanion = lifecycle.companion;
     // The claim is the serialization point. A failed immediate recheck owns
     // enough durable authority to return the child-free reservation to vacant.
@@ -1150,7 +988,7 @@ export class WorkbenchSessionController {
       lifecycle = spawned.lifecycle;
       // A target-only process never advertises companion readiness. Its
       // identity-bound starting state remains the durable busy state until it
-      // advances to stopping, keeping version-3 editor invariants intact.
+      // advances to stopping.
       lifecycleGeneration = lifecycle.generation;
       const completion = await execution.waitForExitOrControl({
         child: supervised.handle,
@@ -2109,7 +1947,7 @@ export class WorkbenchSessionController {
   }
 
   private coordinateLifecycle<T>(
-    kind: LifecycleOperationKind,
+    kind: CoordinatedLifecycleKind,
     targetKey: string | null,
     action: (operationId: string) => Promise<T>
   ): Promise<T> {
@@ -2301,7 +2139,8 @@ export class WorkbenchSessionController {
   }
 
   private async recoverUnpublishedSpawn(
-    state: WorkbenchLifecycleStateV3
+    state: WorkbenchLifecycleStateV3,
+    options: { readonly terminateLive?: boolean } = {}
   ): Promise<void> {
     const journal = await this.processGuard.readSpawnJournal();
     if (journal.kind === "missing") return;
@@ -2339,13 +2178,6 @@ export class WorkbenchSessionController {
       // recovery path, including readiness reconciliation, remains in charge.
       return;
     }
-    if (state.target && record.metadata.targetKey !== state.target.comparisonKey) {
-      throw new WorkbenchError(
-        `RECOVERY_REQUIRED: exact unpublished Workbench PID ${identity.pid} belongs to a different ` +
-          "canonical target than the claimed lifecycle. No process was signalled.",
-        "RECOVERY_REQUIRED"
-      );
-    }
     let status: "live" | "absent";
     try {
       status = await this.processGuard.inspectOwnedWorkbench(identity);
@@ -2359,6 +2191,21 @@ export class WorkbenchSessionController {
     if (status === "absent") {
       this.releaseOwnedChildAfterExactAbsence(identity);
       return;
+    }
+    if (state.target && record.metadata.targetKey !== state.target.comparisonKey) {
+      throw new WorkbenchError(
+        `RECOVERY_REQUIRED: exact unpublished Workbench PID ${identity.pid} belongs to a different ` +
+          "canonical target than the claimed lifecycle. No process was signalled.",
+        "RECOVERY_REQUIRED"
+      );
+    }
+    if (options.terminateLive === false) {
+      throw new WorkbenchError(
+        `RECOVERY_REQUIRED: exact unpublished Workbench PID ${identity.pid} is still live. ` +
+          "Owner-scoped wb_build recovery never signals a live Workbench; use wb_shutdown " +
+          "for attended recovery. The spawn journal was preserved.",
+        "RECOVERY_REQUIRED"
+      );
     }
     await this.terminateExact(identity);
     await this.waitForPortRelease();
@@ -2666,7 +2513,7 @@ export class WorkbenchSessionController {
       );
     }
     try {
-      return buildMcpEditorLaunchPlan({
+      const plan = buildMcpEditorLaunchPlan({
         kind: "mcp_editor",
         config,
         project: currentProject,
@@ -2677,6 +2524,12 @@ export class WorkbenchSessionController {
           ? { managedRoot: config.observer.managedRoot }
           : {}),
       });
+      assertWorkbenchAddonDependenciesAvailable({
+        targetGprojPath: plan.project.displayPath,
+        addonRoots: plan.addonDirectories,
+        launchStatus: "No Workbench process was launched.",
+      });
+      return plan;
     } catch (error) {
       throw this.mapLifecycleError(error);
     }
@@ -2735,6 +2588,23 @@ export class WorkbenchSessionController {
         spawnOptions: { ...preflight.spawnOptions },
         ownerArgument,
         launchedAtMs,
+        beforeSpawn: () => {
+          revalidateProjectIdentity(preflight.project);
+          if (!this.companionProvider?.verifyStaged) {
+            throw new WorkbenchError(
+              "Workbench companion provider cannot re-attest the launched payload.",
+              "IDENTITY_UNVERIFIABLE"
+            );
+          }
+          this.companionProvider.verifyStaged(
+            preflight.helper,
+            preflight.project.displayPath
+          );
+          assertWorkbenchAddonDependenciesAvailable({
+            targetGprojPath: preflight.project.displayPath,
+            addonRoots: preflight.addonDirectories,
+          });
+        },
         supervisionKey: "owned-workbench",
         supervisionCallbacks: {
           onExit: async () => {
@@ -3034,6 +2904,9 @@ export class WorkbenchSessionController {
       return new WorkbenchError(error.message, code);
     }
     if (error instanceof WorkbenchActivityError) {
+      return new WorkbenchError(error.message, error.code);
+    }
+    if (error instanceof WorkbenchAddonDependencyPreflightError) {
       return new WorkbenchError(error.message, error.code);
     }
     if (error instanceof ProjectIdentityError) {

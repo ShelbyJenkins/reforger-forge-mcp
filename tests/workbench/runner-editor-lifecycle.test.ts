@@ -69,7 +69,6 @@ describe("standalone Workbench lifecycle runner", () => {
     expect(observedArgs).toContain("-wbModule=WorldEditor");
     expect(observedArgs).toContain("-run");
     expect(receipt).toMatchObject({
-      version: 2,
       intent: "editor",
       pid: 21_001,
       target: harness.projectPath,

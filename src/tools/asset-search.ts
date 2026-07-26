@@ -1,8 +1,9 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { readdirSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join, extname, relative } from "node:path";
 import type { Config } from "../config.js";
+import { parseResourceGuidIndex } from "../index/resource-database.js";
 import { logger } from "../utils/logger.js";
 import { PakVirtualFS } from "../pak/vfs.js";
 import { resolveGameDataPath } from "../utils/game-paths.js";
@@ -39,11 +40,26 @@ let cachedGuidDiag = "";
  * Entity catalogs contain lines like:
  *   m_sEntityPrefab "{657590C1EC9E27D3}Prefabs/Groups/OPFOR/Group_USSR_LightFireTeam.et"
  */
-function buildGuidIndex(basePath: string): { guidMap: Map<string, string>; diag: string } {
+function buildGuidIndex(
+  basePath: string,
+  pakVfs: PakVirtualFS | null
+): { guidMap: Map<string, string>; diag: string } {
   const guidMap = new Map<string, string>();
   const GUID_PATTERN = /\{([0-9A-Fa-f]{16})\}([^\s"]+\.et)/g;
 
-  let catalogCount = 0;
+  let looseCatalogCount = 0;
+  let packedCatalogCount = 0;
+  let databaseCount = 0;
+
+  function indexCatalog(content: string): void {
+    let match: RegExpExecArray | null;
+    GUID_PATTERN.lastIndex = 0;
+    while ((match = GUID_PATTERN.exec(content)) !== null) {
+      const guid = match[1].toUpperCase();
+      const prefabPath = match[2].replace(/\\/g, "/");
+      guidMap.set(prefabPath.toLowerCase(), guid);
+    }
+  }
 
   function walkCatalogs(dir: string): void {
     let entries;
@@ -58,16 +74,9 @@ function buildGuidIndex(basePath: string): { guidMap: Map<string, string>; diag:
         walkCatalogs(fullPath);
       } else if (entry.name.toLowerCase().endsWith(".conf") &&
                  dir.toLowerCase().includes("entitycatalog")) {
-        catalogCount++;
+        looseCatalogCount++;
         try {
-          const content = readFileSync(fullPath, "utf-8");
-          let match: RegExpExecArray | null;
-          GUID_PATTERN.lastIndex = 0;
-          while ((match = GUID_PATTERN.exec(content)) !== null) {
-            const guid = match[1].toUpperCase();
-            const prefabPath = match[2].replace(/\\/g, "/");
-            guidMap.set(prefabPath.toLowerCase(), guid);
-          }
+          indexCatalog(readFileSync(fullPath, "utf-8"));
         } catch (e) {
           logger.warn(`GUID index: failed to read catalog ${fullPath}: ${e}`);
         }
@@ -77,7 +86,41 @@ function buildGuidIndex(basePath: string): { guidMap: Map<string, string>; diag:
 
   walkCatalogs(basePath);
 
-  const diag = `${guidMap.size} GUIDs from ${catalogCount} catalogs (loose files)`;
+  if (pakVfs) {
+    for (const path of pakVfs.allFilePaths()) {
+      if (!path.toLowerCase().includes("entitycatalog")
+          || !path.toLowerCase().endsWith(".conf")) continue;
+      packedCatalogCount++;
+      try {
+        indexCatalog(pakVfs.readTextFile(path));
+      } catch (e) {
+        logger.warn(`GUID index: failed to read packed catalog ${path}: ${e}`);
+      }
+    }
+  }
+
+  const databaseCandidates = new Set([
+    join(basePath, "resourceDatabase.rdb"),
+    join(basePath, "data", "resourceDatabase.rdb"),
+  ]);
+  for (const path of databaseCandidates) {
+    if (!existsSync(path)) continue;
+    try {
+      const index = parseResourceGuidIndex(readFileSync(path));
+      for (const [resourcePath, guid] of index.entries) {
+        guidMap.set(resourcePath.toLowerCase(), guid);
+      }
+      databaseCount++;
+    } catch (e) {
+      logger.warn(`GUID index: failed to read resource database ${path}: ${e}`);
+    }
+  }
+
+  const catalogCount = looseCatalogCount + packedCatalogCount;
+  const diag =
+    `${guidMap.size} GUIDs from ${catalogCount} catalogs ` +
+    `(${looseCatalogCount} loose, ${packedCatalogCount} packed) and ` +
+    `${databaseCount} resource database${databaseCount === 1 ? "" : "s"}`;
   logger.info(`GUID index built: ${diag}`);
   return { guidMap, diag };
 }
@@ -115,10 +158,17 @@ function buildIndex(basePath: string, gamePath: string): AssetEntry[] {
 
   walk(basePath);
 
-  // 2. Build GUID index from loose entity catalog files
+  let pakVfs: PakVirtualFS | null = null;
+  try {
+    pakVfs = PakVirtualFS.get(gamePath);
+  } catch (e) {
+    logger.warn(`Failed to index pak files: ${e}`);
+  }
+
+  // 2. Build GUID index from catalogs and the addon's resource database
   let guidMap: Map<string, string> | null = null;
   try {
-    const { guidMap: gm, diag } = buildGuidIndex(basePath);
+    const { guidMap: gm, diag } = buildGuidIndex(basePath, pakVfs);
     guidMap = gm;
     cachedGuidDiag = diag;
   } catch (e) {
@@ -129,7 +179,6 @@ function buildIndex(basePath: string, gamePath: string): AssetEntry[] {
 
   // 3. Add entries from .pak files (skip duplicates already found as loose files)
   try {
-    const pakVfs = PakVirtualFS.get(gamePath);
     if (pakVfs) {
       for (const filePath of pakVfs.allFilePaths()) {
         if (seen.has(filePath.toLowerCase())) continue;
@@ -154,9 +203,9 @@ function buildIndex(basePath: string, gamePath: string): AssetEntry[] {
         continue;
       }
       // Strip leading DataXXX/ segment (e.g., "data005/prefabs/..." → "prefabs/...")
-      const slashIdx = pathLower.indexOf("/");
-      if (slashIdx !== -1) {
-        const stripped = pathLower.slice(slashIdx + 1);
+      const partitionMatch = /^data\d+\/(.+)$/i.exec(pathLower);
+      if (partitionMatch) {
+        const stripped = partitionMatch[1];
         if (guidMap.has(stripped)) {
           entry.guid = guidMap.get(stripped);
         }
@@ -283,9 +332,9 @@ export function registerAssetSearch(server: McpServer, config: Config): void {
 
         for (const { entry } of shown) {
           if (entry.guid) {
-            // Strip DataXXX/ prefix from display path to match the catalog's relative path
-            const slashIdx = entry.path.indexOf("/");
-            const displayPath = slashIdx !== -1 ? entry.path.slice(slashIdx + 1) : entry.path;
+            // Extracted assets may carry a DataXXX partition prefix. Packed
+            // paths such as Prefabs/... must retain their first segment.
+            const displayPath = entry.path.replace(/^Data\d+\//i, "");
             lines.push(`  {${entry.guid}}${displayPath}`);
           } else {
             lines.push(`  ${entry.path}`);

@@ -98,36 +98,37 @@ export function registerGameRead(server: McpServer, config: Config): void {
         // Fall through to pak VFS
         const pakVfs = PakVirtualFS.get(config.gamePath);
         if (pakVfs && pakVfs.exists(subPath)) {
-          const ext = extname(subPath).toLowerCase();
+          const canonicalPath = pakVfs.canonicalFilePath(subPath) ?? subPath;
+          const ext = extname(canonicalPath).toLowerCase();
           if (!TEXT_EXTENSIONS.has(ext)) {
             return {
               content: [
                 {
                   type: "text",
-                  text: `Binary file: ${subPath} (${ext}). Only text files (.c, .et, .conf, etc.) can be read.`,
+                  text: `Binary file: ${canonicalPath} (${ext}). Only text files (.c, .et, .conf, etc.) can be read.`,
                 },
               ],
             };
           }
 
-          const fileSize = pakVfs.fileSize(subPath);
+          const fileSize = pakVfs.fileSize(canonicalPath);
           if (fileSize > 512_000) {
             return {
               content: [
                 {
                   type: "text",
-                  text: `File too large: ${subPath} (${(fileSize / 1024).toFixed(0)} KB). Maximum readable size is 500 KB.`,
+                  text: `File too large: ${canonicalPath} (${(fileSize / 1024).toFixed(0)} KB). Maximum readable size is 500 KB.`,
                 },
               ],
             };
           }
 
-          const content = pakVfs.readTextFile(subPath);
+          const content = pakVfs.readTextFile(canonicalPath);
           return {
             content: [
               {
                 type: "text",
-                text: `// ${subPath} (from .pak)\n// ${content.length} bytes\n\n${content}`,
+                text: `// ${canonicalPath} (from .pak)\n// ${content.length} bytes\n\n${content}`,
               },
             ],
           };

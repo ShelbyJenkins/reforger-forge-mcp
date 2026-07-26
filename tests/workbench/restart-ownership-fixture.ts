@@ -1,4 +1,5 @@
 import { EventEmitter } from "node:events";
+import { createHash } from "node:crypto";
 import type { ChildProcess, SpawnOptions } from "node:child_process";
 import { expect, vi, type Mock } from "vitest";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -70,6 +71,21 @@ export interface RunningHarness {
   readonly child: FakeChild;
 }
 
+function fixtureProjectDocument(name: string): string {
+  const guid = createHash("sha256")
+    .update(`reforger-forge-restart-fixture:${name}`)
+    .digest("hex")
+    .slice(0, 16)
+    .toUpperCase();
+  return [
+    "GameProject {",
+    ` ID "${name}"`,
+    ` GUID "${guid}"`,
+    "}",
+    "",
+  ].join("\n");
+}
+
 export function createAsyncGate(): AsyncGate {
   let enter!: () => void;
   let release!: () => void;
@@ -91,7 +107,7 @@ export function createHarness(options: HarnessOptions = {}): Harness {
   mkdirSync(modDirectory, { recursive: true });
   mkdirSync(join(toolsRoot, "Workbench"), { recursive: true });
   mkdirSync(join(gamePath, "addons"), { recursive: true });
-  writeFileSync(projectPath, "project");
+  writeFileSync(projectPath, fixtureProjectDocument("ExampleMod"));
   writeFileSync(executablePath, "fake executable");
 
   const config: Config = {
@@ -168,7 +184,7 @@ export function addProject(harness: Harness, name: string): string {
   const directory = join(harness.root, "projects", name);
   const projectPath = join(directory, `${name}.gproj`);
   mkdirSync(directory, { recursive: true });
-  writeFileSync(projectPath, "project");
+  writeFileSync(projectPath, fixtureProjectDocument(name));
   return projectPath;
 }
 

@@ -24,6 +24,19 @@ function matchingLines(source: string, pattern: RegExp): string[] {
 }
 
 describe("one-command setup orchestration contract", () => {
+  it("documents policy-independent setup and Doctor entry points", () => {
+    const setupGuide = read("setup.md");
+    const policyIndependentPrefix =
+      "powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\\scripts\\setup.ps1";
+
+    expect(setupGuide).toContain(policyIndependentPrefix);
+    expect(setupGuide).toContain(`${policyIndependentPrefix} -Doctor`);
+    expect(setupGuide).toContain(`${policyIndependentPrefix} -Doctor -Json`);
+    expect(setupGuide).toContain(
+      `${policyIndependentPrefix} -Doctor -CheckWorkbench`
+    );
+  });
+
   it("accepts only Doctor, CheckWorkbench, and Json switches", () => {
     const setup = read("scripts/setup.ps1");
     const argumentGuard = setup.search(

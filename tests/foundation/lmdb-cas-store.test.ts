@@ -89,6 +89,28 @@ describe("LmdbCasStore", () => {
     }, { prefix: "rfo-lmdb-cas-cas-" });
   });
 
+  it("removes only the exact current generation", async () => {
+    await withTemporaryDirectory(async (root) => {
+      const store = createStore(root);
+      try {
+        await store.compareAndSwap(null, { generation: "g1", state: "new" });
+
+        await expect(store.compareAndRemove("stale")).resolves.toEqual({
+          kind: "conflict",
+          actualGeneration: "g1",
+        });
+        await expect(store.inspect()).resolves.toMatchObject({
+          kind: "versioned",
+          generation: "g1",
+        });
+        await expect(store.compareAndRemove("g1")).resolves.toEqual({ kind: "removed" });
+        await expect(store.inspect()).resolves.toEqual({ kind: "missing" });
+      } finally {
+        await store.close();
+      }
+    }, { prefix: "rfo-lmdb-cas-remove-" });
+  });
+
   it("allows exactly one of two same-generation writers", async () => {
     await withTemporaryDirectory(async (root) => {
       const first = createStore(root);

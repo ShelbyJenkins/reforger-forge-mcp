@@ -16,6 +16,8 @@ export interface VfsEntry {
 interface FileRef {
   pakPath: string;
   entry: PakFileEntry;
+  /** Original path spelling from the winning PAK. */
+  canonicalPath: string;
 }
 
 export interface PakVfsDiagnostic {
@@ -159,7 +161,13 @@ export class PakVirtualFS {
   exists(virtualPath: string): boolean {
     const norm = normalizePath(virtualPath);
     if (norm === "") return true; // root always exists
-    return this.fileIndex.has(norm) || this.resolveDir(norm) !== null;
+    return this.fileIndex.has(comparisonPath(norm)) || this.resolveDir(norm) !== null;
+  }
+
+  /** Return the original PAK spelling for a file path, if present. */
+  canonicalFilePath(virtualPath: string): string | null {
+    const norm = normalizePath(virtualPath);
+    return this.fileIndex.get(comparisonPath(norm))?.canonicalPath ?? null;
   }
 
   /**
@@ -168,7 +176,7 @@ export class PakVirtualFS {
    */
   readFile(virtualPath: string): Buffer {
     const norm = normalizePath(virtualPath);
-    const ref = this.fileIndex.get(norm);
+    const ref = this.fileIndex.get(comparisonPath(norm));
     if (!ref) {
       throw new Error(`File not found in pak: ${virtualPath}`);
     }
@@ -209,13 +217,13 @@ export class PakVirtualFS {
   /** Get decompressed file size without reading/inflating. Returns -1 if not found. */
   fileSize(virtualPath: string): number {
     const norm = normalizePath(virtualPath);
-    const ref = this.fileIndex.get(norm);
+    const ref = this.fileIndex.get(comparisonPath(norm));
     return ref ? ref.entry.decompressedLen : -1;
   }
 
   /** Get all file paths in the VFS (for building the asset search index). */
   allFilePaths(): string[] {
-    return Array.from(this.fileIndex.keys());
+    return Array.from(this.fileIndex.values(), (ref) => ref.canonicalPath);
   }
 
   /** Get the number of indexed files. */
@@ -252,7 +260,7 @@ export class PakVirtualFS {
 
       if (child.kind === "dir") {
         // Merge directories: create in target if missing, then recurse
-        let targetChild = target.children.get(name);
+        let targetChild = findChildCaseInsensitive(target, name);
         if (!targetChild || targetChild.kind !== "dir") {
           targetChild = { kind: "dir", name, children: new Map() };
           target.children.set(name, targetChild);
@@ -261,11 +269,13 @@ export class PakVirtualFS {
       } else {
         // File: add to target and flat index (first pak wins)
         const norm = normalizePath(childPath);
-        if (!this.fileIndex.has(norm)) {
+        const key = comparisonPath(norm);
+        if (!this.fileIndex.has(key)) {
           target.children.set(name, child);
-          this.fileIndex.set(norm, {
+          this.fileIndex.set(key, {
             pakPath: index.pakPath,
             entry: child,
+            canonicalPath: norm,
           });
           count++;
         }
@@ -284,7 +294,7 @@ export class PakVirtualFS {
     let current: PakDirEntry = this.root;
 
     for (const part of parts) {
-      const child = current.children.get(part);
+      const child = findChildCaseInsensitive(current, part);
       if (!child || child.kind !== "dir") return null;
       current = child;
     }
@@ -301,4 +311,21 @@ function normalizePath(p: string): string {
     .replace(/\\/g, "/")
     .replace(/^\/+|\/+$/g, "")
     .replace(/\/+/g, "/");
+}
+
+function comparisonPath(p: string): string {
+  return p.toLocaleLowerCase("en-US");
+}
+
+function findChildCaseInsensitive(
+  directory: PakDirEntry,
+  name: string
+): PakDirEntry | PakFileEntry | undefined {
+  const exact = directory.children.get(name);
+  if (exact) return exact;
+  const key = comparisonPath(name);
+  for (const [candidateName, child] of directory.children) {
+    if (comparisonPath(candidateName) === key) return child;
+  }
+  return undefined;
 }

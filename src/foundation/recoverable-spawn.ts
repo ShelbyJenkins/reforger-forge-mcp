@@ -36,6 +36,13 @@ export interface RecoverableSpawnJournal<
     previous: RecoverableSpawnRecord<Identity, Metadata> | null,
     next: RecoverableSpawnRecord<Identity, Metadata>
   ): Promise<RecoverableSpawnRecord<Identity, Metadata>>;
+  /**
+   * Retire the exact pre_spawn record after a separate pre-spawn policy hook
+   * fails. This is safe only before the process-creation callback is invoked.
+   */
+  discardPreSpawn?(
+    record: RecoverableSpawnRecord<Identity, Metadata>
+  ): Promise<void>;
 }
 
 export interface RecoverableSpawnFence {
@@ -55,6 +62,11 @@ export interface RecoverableSpawnOptions<
   readonly journal: RecoverableSpawnJournal<Identity, Metadata>;
   readonly fence?: RecoverableSpawnFence;
   readonly now?: () => number;
+  /**
+   * Synchronous policy revalidation after durable pre_spawn publication and
+   * immediately before process creation.
+   */
+  readonly beforeSpawn?: () => void;
   readonly spawn: () => Child;
   readonly childPid: (child: Child) => number | null | undefined;
   readonly awaitSpawn?: (child: Child) => Promise<void>;
@@ -86,6 +98,26 @@ export interface RecoverableSpawnResult<
   readonly identity: Identity;
   readonly publication: Published;
   readonly record: RecoverableSpawnRecord<Identity, Metadata>;
+}
+
+export class RecoverableSpawnPreSpawnCleanupError extends Error {
+  constructor(
+    readonly preSpawnError: unknown,
+    readonly cleanupError: unknown
+  ) {
+    const preSpawnMessage = preSpawnError instanceof Error
+      ? preSpawnError.message
+      : String(preSpawnError);
+    const cleanupMessage = cleanupError instanceof Error
+      ? cleanupError.message
+      : String(cleanupError);
+    super(
+      `Pre-spawn validation failed (${preSpawnMessage}), and durable pre_spawn ` +
+        `journal retirement could not be proven (${cleanupMessage}).`,
+      { cause: cleanupError instanceof Error ? cleanupError : undefined }
+    );
+    this.name = "RecoverableSpawnPreSpawnCleanupError";
+  }
 }
 
 function positivePid(value: number | null | undefined): number {
@@ -160,6 +192,21 @@ export async function runRecoverableSpawn<
   record = await options.journal.persist(null, record);
 
   await assertFenceActive(fence);
+  if (options.beforeSpawn) {
+    try {
+      options.beforeSpawn();
+    } catch (error) {
+      try {
+        if (!options.journal.discardPreSpawn) {
+          throw new Error("the recoverable spawn journal does not support exact pre_spawn retirement");
+        }
+        await options.journal.discardPreSpawn(record);
+      } catch (cleanupError) {
+        throw new RecoverableSpawnPreSpawnCleanupError(error, cleanupError);
+      }
+      throw error;
+    }
+  }
   const child = options.spawn();
   // Attach spawn/error observation before the journal's asynchronous CAS can
   // yield. Some ChildProcess implementations emit `spawn` in the next

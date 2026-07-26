@@ -1,20 +1,21 @@
 import { describe, expect, it, vi } from "vitest";
 import type { Config } from "../../src/config.js";
 import {
+  assertSteamClientReady,
+  assertWorkbenchStateOwnerReady,
   executeWorkbenchRunnerCli,
   receiptExitCode,
   type WorkbenchRunnerCliDependencies,
 } from "../../src/workbench/runner-cli.js";
 import type {
-  WorkbenchEditorRunnerReceipt,
+  WorkbenchEditorReceipt,
   WorkbenchRunnerExitStatus,
 } from "../../src/workbench/runner.js";
 
 const CLI_ARGUMENTS = ["editor", "--gproj", "C:\\target\\project.gproj", "--foreground"];
 
-function receipt(exitStatus: WorkbenchRunnerExitStatus): WorkbenchEditorRunnerReceipt {
+function receipt(exitStatus: WorkbenchRunnerExitStatus): WorkbenchEditorReceipt {
   return {
-    version: 2,
     intent: "editor",
     pid: 42,
     target: "<target.gproj>",
@@ -47,13 +48,15 @@ function status(
 }
 
 function dependencies(
-  value: WorkbenchEditorRunnerReceipt,
+  value: WorkbenchEditorReceipt,
   stdout: string[],
   stderr: string[]
 ): WorkbenchRunnerCliDependencies {
   return {
     loadConfiguration: () => ({} as Config),
     runIntent: vi.fn(async () => value) as NonNullable<WorkbenchRunnerCliDependencies["runIntent"]>,
+    assertSteamReady: () => undefined,
+    assertStateOwnerReady: () => undefined,
     stdout: { write: (line) => stdout.push(line) },
     stderr: { write: (line) => stderr.push(line) },
   };
@@ -83,6 +86,8 @@ describe("Workbench runner CLI contract", () => {
       loadConfiguration,
       setDebug,
       runIntent,
+      assertSteamReady: () => undefined,
+      assertStateOwnerReady: () => undefined,
       stdout: { write: (line) => stdout.push(line) },
       stderr: { write: (line) => stderr.push(line) },
     })).resolves.toBe(0);
@@ -155,6 +160,8 @@ describe("Workbench runner CLI contract", () => {
     await expect(executeWorkbenchRunnerCli(CLI_ARGUMENTS, {
       loadConfiguration: () => ({} as Config),
       runIntent,
+      assertSteamReady: () => undefined,
+      assertStateOwnerReady: () => undefined,
       stdout: { write: (line) => stdout.push(line) },
       stderr: { write: (line) => stderr.push(line) },
     })).resolves.toBe(1);
@@ -167,5 +174,92 @@ describe("Workbench runner CLI contract", () => {
       code: "SPAWN_FAILED",
       message: expect.stringContaining("[redacted]"),
     });
+  });
+
+  it("emits one prerequisite error and never invokes the runner when Steam is absent", async () => {
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    const runIntent = vi.fn();
+
+    await expect(executeWorkbenchRunnerCli(CLI_ARGUMENTS, {
+      loadConfiguration: () => ({} as Config),
+      runIntent,
+      assertSteamReady: () => assertSteamClientReady({
+        platform: "win32",
+        listProcesses: () => "",
+      }),
+      assertStateOwnerReady: () => undefined,
+      stdout: { write: (line) => stdout.push(line) },
+      stderr: { write: (line) => stderr.push(line) },
+    })).resolves.toBe(1);
+
+    expect(runIntent).not.toHaveBeenCalled();
+    expect(stdout).toEqual([]);
+    expect(stderr).toHaveLength(1);
+    expect(JSON.parse(stderr[0])).toMatchObject({
+      ok: false,
+      code: "STEAM_CLIENT_NOT_RUNNING",
+      message: expect.stringMatching(/Start Steam.*No Workbench process was launched/i),
+    });
+  });
+
+  it("accepts an exact PowerShell Steam process name as prerequisite evidence", () => {
+    expect(() => assertSteamClientReady({
+      platform: "win32",
+      listProcesses: () => "steam\r\n",
+    })).not.toThrow();
+  });
+
+  it("emits one prerequisite error before the runner opens another identity's state", async () => {
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    const runIntent = vi.fn();
+
+    await expect(executeWorkbenchRunnerCli(CLI_ARGUMENTS, {
+      loadConfiguration: () => ({} as Config),
+      runIntent,
+      assertSteamReady: () => undefined,
+      assertStateOwnerReady: () => assertWorkbenchStateOwnerReady({
+        platform: "win32",
+        inspectOwnership: () => ({
+          currentSid: "S-1-5-21-1005",
+          stateDirectoryExists: true,
+          stateOwnerSid: "S-1-5-21-1002",
+        }),
+      }),
+      stdout: { write: (line) => stdout.push(line) },
+      stderr: { write: (line) => stderr.push(line) },
+    })).resolves.toBe(1);
+
+    expect(runIntent).not.toHaveBeenCalled();
+    expect(stdout).toEqual([]);
+    expect(stderr).toHaveLength(1);
+    expect(JSON.parse(stderr[0])).toMatchObject({
+      ok: false,
+      code: "WORKBENCH_STATE_OWNER_MISMATCH",
+      message: expect.stringMatching(
+        /owned by a different Windows identity.*No Workbench process was launched/i
+      ),
+    });
+  });
+
+  it("accepts absent state or state owned by the current Windows identity", () => {
+    expect(() => assertWorkbenchStateOwnerReady({
+      platform: "win32",
+      inspectOwnership: () => ({
+        currentSid: "S-1-5-21-1002",
+        stateDirectoryExists: false,
+        stateOwnerSid: null,
+      }),
+    })).not.toThrow();
+
+    expect(() => assertWorkbenchStateOwnerReady({
+      platform: "win32",
+      inspectOwnership: () => ({
+        currentSid: "S-1-5-21-1002",
+        stateDirectoryExists: true,
+        stateOwnerSid: "s-1-5-21-1002",
+      }),
+    })).not.toThrow();
   });
 });

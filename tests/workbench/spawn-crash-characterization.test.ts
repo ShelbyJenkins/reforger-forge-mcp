@@ -20,6 +20,7 @@ import {
   runWorkbenchIntent,
   type WorkbenchRunnerDependencies,
 } from "../../src/workbench/runner.js";
+import { canonicalizeGproj } from "../../src/workbench/project-identity.js";
 import { encodeDurableKey, jsonDurableRecordCodec } from "../../src/foundation/durable-kv.js";
 import { LmdbCasStore } from "../../src/foundation/lmdb-cas-store.js";
 import {
@@ -145,7 +146,13 @@ function createHarness(label: string): WorkbenchCrashHarness {
   mkdirSync(join(toolsRoot, "Workbench"), { recursive: true });
   mkdirSync(join(gamePath, "addons"), { recursive: true });
   mkdirSync(logRoot, { recursive: true });
-  writeFileSync(projectPath, "project\n");
+  writeFileSync(projectPath, [
+    "GameProject {",
+    ' ID "ExampleMod"',
+    ' GUID "1122334455667788"',
+    "}",
+    "",
+  ].join("\n"));
   writeFileSync(executablePath, "fake Workbench\n");
   const config: Config = {
     workbenchPath: toolsRoot,
@@ -475,6 +482,64 @@ describe("F8 Workbench spawn crash characterization", () => {
       }
     }
   );
+
+  it("reconciles an absent exact unpublished PID before fencing a stale journal target", async () => {
+    const captured = await captureClientCut("before_durable_publication");
+    const replacementProjectDirectory = join(captured.harness.root, "projects", "ReplacementMod");
+    const replacementProjectPath = join(replacementProjectDirectory, "ReplacementMod.gproj");
+    mkdirSync(replacementProjectDirectory, { recursive: true });
+    writeFileSync(replacementProjectPath, [
+      "GameProject {",
+      ' ID "ReplacementMod"',
+      ' GUID "8877665544332211"',
+      "}",
+      "",
+    ].join("\n"));
+    const replacementTarget = canonicalizeGproj(replacementProjectPath);
+    const staleVacantState: CapturedWorkbenchCut = {
+      ...captured,
+      state: {
+        ...captured.state,
+        phase: "vacant",
+        target: {
+          path: replacementTarget.displayPath,
+          comparisonKey: replacementTarget.comparisonKey,
+        },
+        workbench: null,
+        operation: null,
+      },
+    };
+    const replacement = await createReplacement(staleVacantState, "absent-stale-target");
+    const stalePid = captured.process!.identity.pid;
+    replacement.backend.workbenchPids.delete(stalePid);
+    replacement.backend.processes.delete(stalePid);
+    replacement.backend.ownerArguments.delete(stalePid);
+    const spawnProcess = vi.fn(() => {
+      throw new Error("replacement launch intentionally stopped at spawn");
+    });
+    const client = new WorkbenchClient(
+      captured.harness.config.workbenchHost,
+      captured.harness.config.workbenchPort,
+      captured.harness.config,
+      "f8-absent-stale-target",
+      replacement.guard,
+      {
+        companionProvider: fakeCompanionProvider(captured.harness.companion),
+        spawnProcess,
+        launchTimeoutMs: 20,
+        launchPollIntervalMs: 1,
+      }
+    );
+    vi.spyOn(client, "ping").mockResolvedValue(false);
+
+    await expect(client.ensureRunning(replacementProjectPath)).rejects.toMatchObject({
+      code: "LAUNCH_FAILED",
+    });
+
+    expect(spawnProcess).toHaveBeenCalledOnce();
+    expect(replacement.backend.terminationCalls).toEqual([]);
+    expect(replacement.backend.workbenchPids).toHaveLength(0);
+  });
 
   it.each(CRASH_CUTS)(
     "standalone runner replacement preserves $cut for attended/MCP recovery",

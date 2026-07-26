@@ -619,21 +619,17 @@ signature/structure and dimensions, computes SHA-256, and exposes those exact
 bytes in the same one-image plus metadata MCP result as the runtime backend.
 
 For project launch/build wrappers, use the packaged
-`reforger-forge-workbench` foreground editor or bounded build command. It shares
-the lifecycle and companion staging, so a project does not need its own
-Workbench process guard. The target-build plan itself is helper-free, uses a
-dedicated profile, and makes no NET call. At this pre-removal boundary, the
-public build still holds one machine lock and absolute deadline across two exact
-children: a managed-companion editor preflight proves endpoint/Ping identity and
-post-termination endpoint vacancy before the distinct target-only child starts.
-Its version-3 receipt keeps the preflight and build PIDs, generations, and
-attributed log directories distinct and requires a fresh nonempty
-`resourceDatabase.rdb` for success from a caller-exclusive unique empty output
-root. It also binds the project and output-database SHA-256 values. Timeout,
-nonzero exit, and output-attestation failure remain machine-readable without
-being promoted to success. Removing the preflight and changing the public
-receipt to version 4 remain gated on two consecutive controlled target-only
-Workbench acceptance runs and green hermetic contracts.
+`reforger-forge-workbench` foreground editor or bounded build command. The
+editor uses the shared lifecycle and managed companion staging; the build is a
+single direct helper-free target-only child, so a project does not need its own
+Workbench process guard or a companion preflight. The build uses a dedicated
+profile, makes no NET call, and requires a caller-exclusive unique empty output
+root. It proves process ownership and endpoint vacancy, re-attests the project
+identity, and accepts only fresh nonempty output containing one hashed
+`resourceDatabase.rdb`. Timeout, nonzero exit, and output-attestation failure
+remain machine-readable without being promoted to success. For the exact
+unversioned receipt fields, exit-code mapping, and caller-side target-identity
+recipe, see the [standalone runner CLI reference](../docs/runner-cli.md).
 
 Installed Workbench 1.7.0.54 successfully dispatches the guarded build with the
 exact sequence

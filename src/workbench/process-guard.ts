@@ -1106,6 +1106,70 @@ export class WorkbenchProcessGuard {
           },
         });
       },
+      discardPreSpawn: async (record) => {
+        if (record.phase !== "pre_spawn" || typeof expectedGeneration !== "string") {
+          throw new LifecycleGuardError(
+            "RECOVERY_REQUIRED: exact pre_spawn journal retirement lacks its committed generation.",
+            "RECOVERY_REQUIRED"
+          );
+        }
+        try {
+          await this.backend.withMachineMutex({
+            name: this.mutexName,
+            timeoutMs: this.currentLockTimeoutMs(),
+            action: async () => {
+              const lifecycle = await this.readLifecycleState();
+              const current = lifecycle.kind === "valid" ? lifecycle.state : null;
+              const sameOwner = current?.mcpOwner && lifecycleAuthority.mcpOwner &&
+                processMatches(current.mcpOwner, lifecycleAuthority.mcpOwner) &&
+                current.mcpOwner.instanceId === lifecycleAuthority.mcpOwner.instanceId &&
+                current.mcpOwner.leaseId === lifecycleAuthority.mcpOwner.leaseId &&
+                current.mcpOwner.userSid === lifecycleAuthority.mcpOwner.userSid;
+              const sameTarget =
+                current?.target?.comparisonKey === record.metadata.targetKey &&
+                lifecycleAuthority.target?.comparisonKey === record.metadata.targetKey;
+              const sameReservation =
+                current?.generation === lifecycleAuthority.generation &&
+                record.metadata.lifecycleGeneration === lifecycleAuthority.generation;
+              if (!sameOwner || !sameTarget || !sameReservation) {
+                throw new LifecycleGuardError(
+                  "RECOVERY_REQUIRED: pre_spawn journal retirement lost exact lifecycle authority.",
+                  "RECOVERY_REQUIRED"
+                );
+              }
+
+              const journal = await this.readSpawnJournal();
+              if (journal.kind !== "valid" ||
+                  journal.generation !== expectedGeneration ||
+                  journal.record.phase !== "pre_spawn" ||
+                  journal.record.transactionId !== record.transactionId) {
+                throw new LifecycleGuardError(
+                  "RECOVERY_REQUIRED: pre_spawn journal changed before exact retirement.",
+                  "RECOVERY_REQUIRED"
+                );
+              }
+              const removed = await this.spawnStore().compareAndRemove(expectedGeneration);
+              if (removed.kind === "conflict") {
+                throw new LifecycleGuardError(
+                  "RECOVERY_REQUIRED: pre_spawn journal changed during exact retirement.",
+                  "RECOVERY_REQUIRED"
+                );
+              }
+              expectedGeneration = undefined;
+            },
+          });
+        } catch (error) {
+          if (error instanceof LifecycleGuardError &&
+              error.code === "RECOVERY_REQUIRED") {
+            throw error;
+          }
+          throw new LifecycleGuardError(
+            `RECOVERY_REQUIRED: exact pre_spawn journal retirement failed ` +
+              `(${error instanceof Error ? error.message : String(error)}).`,
+            "RECOVERY_REQUIRED"
+          );
+        }
+      },
     };
   }
 

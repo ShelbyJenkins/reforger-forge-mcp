@@ -12,6 +12,19 @@ import {
   runWorkbenchIntent,
   type WorkbenchRunnerReceipt,
 } from "./runner.js";
+import {
+  assertSteamClientReady,
+  assertWorkbenchStateOwnerReady,
+} from "./runner-prerequisites.js";
+export {
+  assertSteamClientReady,
+  assertWorkbenchStateOwnerReady,
+  WorkbenchRunnerPrerequisiteError,
+  type SteamClientReadinessDependencies,
+  type WorkbenchRunnerPrerequisiteErrorCode,
+  type WorkbenchStateOwnership,
+  type WorkbenchStateReadinessDependencies,
+} from "./runner-prerequisites.js";
 
 export function receiptExitCode(receipt: WorkbenchRunnerReceipt): number {
   if (receipt.intent === "build" && receipt.validationFailure) return 1;
@@ -45,6 +58,8 @@ export interface WorkbenchRunnerCliDependencies {
   readonly stdout?: WorkbenchRunnerCliOutput;
   readonly stderr?: WorkbenchRunnerCliOutput;
   readonly signal?: AbortSignal;
+  readonly assertSteamReady?: () => void;
+  readonly assertStateOwnerReady?: () => void;
 }
 
 /**
@@ -70,6 +85,8 @@ export async function executeWorkbenchRunnerCli(
       partitioned.configurationArguments
     );
     (dependencies.setDebug ?? setDebugEnabled)(config.debug === true);
+    (dependencies.assertSteamReady ?? assertSteamClientReady)();
+    (dependencies.assertStateOwnerReady ?? assertWorkbenchStateOwnerReady)();
     const receipt = await (dependencies.runIntent ?? runWorkbenchIntent)(
       config,
       intent,

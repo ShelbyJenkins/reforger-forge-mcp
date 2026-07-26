@@ -399,7 +399,13 @@ async function createRunningHarness(activityGate?: WorkbenchActivityGate): Promi
   mkdirSync(modDirectory, { recursive: true });
   mkdirSync(toolsRoot, { recursive: true });
   mkdirSync(join(gameRoot, "addons"), { recursive: true });
-  writeFileSync(projectPath, "project");
+  writeFileSync(projectPath, [
+    "GameProject {",
+    ' ID "ExampleMod"',
+    ' GUID "1122334455667788"',
+    "}",
+    "",
+  ].join("\n"));
   const config: Config = {
     workbenchPath: toolsRoot,
     projectPath: projectRoot,

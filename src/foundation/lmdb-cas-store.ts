@@ -14,6 +14,10 @@ export type LmdbCasResult<T> =
   | { kind: "replaced"; current: { value: T; generation: string } }
   | { kind: "conflict"; actualGeneration: string | null };
 
+export type LmdbCasRemoveResult =
+  | { kind: "removed" }
+  | { kind: "conflict"; actualGeneration: string | null };
+
 export type LmdbCasStoreErrorCode = "CORRUPT_RECORD" | "ARCHIVE_MISMATCH" | "ARCHIVE_CONFLICT";
 
 export class LmdbCasStoreError extends Error {
@@ -134,6 +138,27 @@ export class LmdbCasStore<T> {
     const generation = this.generationOf(next);
     this.afterCompareAndSwap?.({ generation, next });
     return { kind: "replaced", current: { value: next, generation } };
+  }
+
+  /** Remove only the exact generation inspected by the caller. */
+  async compareAndRemove(expected: string): Promise<LmdbCasRemoveResult> {
+    const current = await this.store.inspect(this.key);
+    if (current.kind === "corrupt") {
+      throw new LmdbCasStoreError(
+        "CORRUPT_RECORD",
+        `LMDB record is corrupt and cannot be removed: ${current.message}`,
+      );
+    }
+    const actualGeneration = current.kind === "missing" ? null : this.generationOf(current.value);
+    if (actualGeneration !== expected || current.kind === "missing") {
+      return { kind: "conflict", actualGeneration };
+    }
+    const removed = await this.store.remove(this.key, current.version);
+    if (removed) return { kind: "removed" };
+
+    const fresh = await this.store.inspect(this.key);
+    const freshGeneration = fresh.kind === "valid" ? this.generationOf(fresh.value) : null;
+    return { kind: "conflict", actualGeneration: freshGeneration };
   }
 
   /** Archive raw corrupt bytes as an external evidence file, then remove the LMDB entry. */

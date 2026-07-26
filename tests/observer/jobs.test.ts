@@ -116,6 +116,16 @@ function manifest(value: ReturnType<typeof setup>, job: JobRecord, artifactId = 
 }
 
 describe("observer jobs", () => {
+  scopedIt("classifies an absent or session-mismatched job as JOB_NOT_FOUND", (root) => {
+    const value = setup(root);
+    expect(() => value.jobs.require(value.registration.sessionId, "missing-job"))
+      .toThrowError(expect.objectContaining({ code: "JOB_NOT_FOUND", httpStatus: 404 }));
+
+    const job = submitCurrent(value);
+    expect(() => value.jobs.require("different-session", job.request.jobId))
+      .toThrowError(expect.objectContaining({ code: "JOB_NOT_FOUND", httpStatus: 404 }));
+  });
+
   scopedIt("returns the original job for one session idempotency key", async (root) => {
     const value = setup(root);
     const input = {

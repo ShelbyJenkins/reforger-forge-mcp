@@ -155,6 +155,11 @@ export interface RuntimeStopPreflight {
   sessionKnown: boolean;
   ready: boolean;
   reserved: boolean;
+  /**
+   * False only after exact vacancy has already released the child-side
+   * lifecycle authority, leaving no live runtime for a reservation to seal.
+   */
+  reservationRequired?: boolean;
   activeJobIds: string[];
   cameraLeaseJobIds: string[];
   restorationPendingJobIds: string[];
@@ -1494,6 +1499,14 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
         ),
         wallDeadline
       );
+      // Natural-exit reconciliation releases the lifecycle before a later
+      // explicit stop. Its exact-generation release tombstone is bounded and
+      // may already have been swept. Once preparation has re-proved exact
+      // vacancy, idempotently recreate that authority before asking the agent
+      // for the reservation-free stop preflight.
+      if (preparation.allowUnknownVacantSession) {
+        await this.releaseRuntimeLifecycle(preparation.receipt, wallDeadline);
+      }
       // Camera/restoration readiness can legitimately take minutes. It is an
       // observer-side wait, not a machine-wide lifecycle mutation, so never
       // retain the global mutex while polling it.
@@ -1529,6 +1542,10 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
       // Observer session revocation is bounded IPC, not a machine lifecycle
       // mutation. Keep the global mutex free while it is pending, then CAS the
       // durable completion against the exact immutable authority.
+      // The literal exact-vacancy stop receipt also makes lifecycle release
+      // safe. Re-acknowledge its exact generation immediately before
+      // completion so a retry remains valid after bounded tombstone expiry.
+      await this.releaseRuntimeLifecycle(transition.authority.receipt, wallDeadline);
       const ack = await this.requestStopCompletionUnlocked(transition.authority, wallDeadline);
       return await this.withFencedMachineMutex(async (fence) => {
         fence.assertActive();
@@ -2379,6 +2396,8 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
             priorProof.managerInstanceId !== receipt.mcpOwner.managerInstanceId)) {
           throw new OwnedRuntimeError("STORAGE_UNVERIFIABLE", "Runtime restoration proof belongs to another lifecycle");
         }
+        const restorationProofKind = priorProof?.kind ??
+          (reservation === null ? "exact_runtime_vacancy" : "process_already_exited");
         this.publishStop(
           root,
           receipt,
@@ -2386,7 +2405,7 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
           mcpActor,
           "already_exited",
           "pid_absent",
-          priorProof?.kind ?? "process_already_exited",
+          restorationProofKind,
           priorProof?.sealedAt ?? nowIso(this.clock),
           priorProof?.reservationId
         );
@@ -2796,6 +2815,16 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
               "SESSION_UNVERIFIABLE",
               "Observer session state is unavailable, so camera restoration cannot be proven"
             );
+          }
+          if (preflight.reservationRequired === false) {
+            if (!exactRuntimeVacant || !preflight.ready || preflight.reserved ||
+                preflight.reservationId !== undefined) {
+              throw new OwnedRuntimeError(
+                "SESSION_UNVERIFIABLE",
+                "Observer runtime returned an invalid reservation-free stop preflight"
+              );
+            }
+            return { kind: "acquired" as const, value: null };
           }
           if (preflight.ready && preflight.reserved) {
             const reservationId = this.requireReservationId(preflight);
@@ -3271,7 +3300,7 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
         this.options.observerGate.completeRuntimeStop(
           authority.receipt.sessionId,
           authority.reservationId,
-          authority.stopped.restorationProofKind === "exact_runtime_vacancy",
+          authority.stopped.identityVacant,
           {
             runtimeId: authority.receipt.runtimeId,
             generation: runtimeLifecycleGeneration(authority.receipt),

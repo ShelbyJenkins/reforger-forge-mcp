@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { ObserverCoordinatorError } from "../../src/observer/errors.js";
 import { registerObserverTools } from "../../src/observer/tools.js";
 import {
   captureToolInput,
@@ -237,6 +238,27 @@ describe("observer MCP tools", () => {
     expect(ambiguous.isError).toBe(true);
     expect(ambiguous.content[0].text).toContain("multiple evidence roots");
     expect(coordinator.finalizeRun).not.toHaveBeenCalled();
+  });
+
+  it("preserves a specific run failure at the public observer_run boundary", async () => {
+    const coordinator = toolApplication({
+      runStatus: vi.fn(async () => {
+        throw new ObserverCoordinatorError(
+          "ARTIFACT_INVALID",
+          "The retained capture no longer verifies",
+        );
+      }),
+    });
+    const tools = toolRegistry(coordinator);
+
+    const result = await tools.get("observer_run")!.handler({
+      action: "status",
+      runId: "20260726T022925Z-d7867722",
+    }, { signal: new AbortController().signal });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("ARTIFACT_INVALID");
+    expect(result.content[0].text).not.toContain("INTERNAL_ERROR");
   });
 
   it("preserves an explicit finalize root when multiple roots are configured", async () => {

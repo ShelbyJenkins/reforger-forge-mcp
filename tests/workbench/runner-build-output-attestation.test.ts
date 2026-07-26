@@ -12,7 +12,7 @@ import {
 afterEach(cleanupRunnerHarnesses);
 
 describe("standalone Workbench lifecycle runner", () => {
-  it("refuses a nonempty output root before spawning either Workbench phase", async () => {
+  it("refuses a nonempty output root before spawning the target build", async () => {
     const harness = createHarness();
     writeResourceDatabase(harness.outputPath, "stale database");
     const spawnProcess = vi.fn();
@@ -23,7 +23,7 @@ describe("standalone Workbench lifecycle runner", () => {
     expect(spawnProcess).not.toHaveBeenCalled();
   });
 
-  it("rejects build output that overlaps the target mod or managed companion roots", async () => {
+  it("rejects build output that overlaps the target mod or managed runner root", async () => {
     const targetHarness = createHarness();
     const targetOutput = join(targetHarness.root, "addons", "ExampleMod", "build-output");
     await expect(runBuild(targetHarness, vi.fn(), {
@@ -31,7 +31,13 @@ describe("standalone Workbench lifecycle runner", () => {
     })).rejects.toMatchObject({ code: "INVALID_INTENT" });
 
     const managedHarness = createHarness();
-    const managedOutput = join(managedHarness.companion.workbenchProfilePath, "build-output");
+    const managedOutput = join(
+      managedHarness.root,
+      "managed",
+      "workbench-build",
+      "profile",
+      "build-output"
+    );
     await expect(runBuild(managedHarness, vi.fn(), {
       intent: { outputPath: managedOutput },
     })).rejects.toMatchObject({ code: "INVALID_INTENT" });
@@ -54,7 +60,6 @@ describe("standalone Workbench lifecycle runner", () => {
     const receipt = await runBuild(harness, spawner.spawnProcess);
 
     expect(receipt).toMatchObject({
-      version: 3,
       logDirectory: join(harness.logRoot, "build-22400"),
       output: null,
       validationFailure: {
@@ -133,9 +138,8 @@ describe("standalone Workbench lifecycle runner", () => {
     expect(JSON.stringify(receipt)).toContain("[redacted]");
   });
 
-  it("attributes preflight and target build under their dedicated managed log roots", async () => {
+  it("attributes the target build under its managed build log root", async () => {
     const harness = createHarness();
-    const preflightLogRoot = join(harness.companion.workbenchProfilePath, "logs");
     const buildLogRoot = join(
       harness.root,
       "managed",
@@ -145,7 +149,6 @@ describe("standalone Workbench lifecycle runner", () => {
     );
     const spawner = createBuildSpawner(harness, {
       pidBase: 22_700,
-      preflightLogRoot,
       buildLogRoot,
       onBuildBeforeExit: () => {
         writeResourceDatabase(harness.outputPath, "managed build");
@@ -157,8 +160,6 @@ describe("standalone Workbench lifecycle runner", () => {
     });
 
     expect(receipt).toMatchObject({
-      version: 3,
-      preflight: { logDirectory: join(preflightLogRoot, "preflight-22700") },
       logDirectory: join(buildLogRoot, "build-22700"),
       validationFailure: null,
     });

@@ -46,6 +46,35 @@ describe("observer launch preparation", () => {
     });
   });
 
+  it("retains the approved root internally and provides the doctor recovery action", async () => {
+    await withTemporaryDirectory(async (root) => {
+      const profiles = join(root, "approved-profiles");
+      const outside = join(root, "operating-system-temp-profile");
+      mkdirSync(profiles, { recursive: true });
+      mkdirSync(outside, { recursive: true });
+      const control = new ObserverControlApi({
+        root: join(root, "managed"),
+        profileRoot: profiles,
+        sourceDirectory: observerAddonSource,
+      });
+      control.setEndpoint("127.0.0.1", 47831);
+      const rejected = control.prepareLaunch({
+        runtimeKind: "client",
+        arguments: ["-addons", "36374155AAC14289"],
+        profilePath: outside,
+        sessionTtlMs: 60_000,
+        transportPreference: ["rest"],
+        forceUpdate: false,
+      });
+
+      await expect(rejected).rejects.toMatchObject({
+        code: "PROFILE_CONFLICT",
+        message: expect.stringContaining(profiles),
+      });
+      await expect(rejected).rejects.toThrow(/observer_setup.*doctor.*profileRoot/);
+    });
+  });
+
   it("prepares idempotently and writes the session contract last", async () => {
     await withTemporaryDirectory(async (root) => {
     const profiles = join(root, "profiles");

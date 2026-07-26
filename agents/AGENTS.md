@@ -41,11 +41,14 @@ ReforgerForge requires Node.js 20 or newer. Arma Reforger Tools is required for
 builds, resource registration, and live editor-control operations, and the Arma
 Reforger game installation is required for base-game asset browsing.
 
-1. From the ReforgerForge repository, run `.\scripts\setup.ps1`. It installs,
+1. From the ReforgerForge repository, run
+   `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup.ps1`.
+   It installs,
    builds, verifies config-free startup, and attempts registration in every
    detected supported MCP client.
 2. Confirm the client can see the `reforger-forge` tools.
-3. Let normal startup discover the Steam installations and base addon root.
+3. Let normal startup discover the Steam installations, base-game add-on root,
+   and (when it exists) the standard Workshop add-on root.
 4. If this workspace needs project-scoped defaults or nonstandard paths, copy
    `reforger-forge.config.example.json` to an ignored local path, keep only the
    required overrides, and manually register the server with
@@ -53,11 +56,14 @@ Reforger game installation is required for base-game asset browsing.
 5. Restart the MCP process after changing values in an explicit config. Rerun
    the manual installer only if the selected file path changes.
 
-Use `.\scripts\setup.ps1 -Doctor` for a read-only installation and registration
+Use
+`powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup.ps1 -Doctor`
+for a read-only installation and registration
 inspection. It is valid for the receipt to show no config and no project;
 Workbench NET API and observer capture remain `not tested`. If an already
 running Workbench should be checked, use
-`.\scripts\setup.ps1 -Doctor -CheckWorkbench`; this makes exactly one read-only
+`powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup.ps1 -Doctor -CheckWorkbench`;
+this makes exactly one read-only
 `EMCP_WB_Ping` and never launches or terminates Workbench or the game. Add
 `-Json` to setup or Doctor for one machine-readable receipt on stdout.
 Registration success proves only that the client entry is current, not that the
@@ -86,8 +92,7 @@ committed documentation:
   "gamePath": "<ARMA_REFORGER_GAME_DIRECTORY>",
   "projectPath": "<ABSOLUTE_WORKSPACE_PATH>/addons",
   "workbenchAddonDirs": [
-    "<ARMA_REFORGER_GAME_DIRECTORY>/addons",
-    "<USER_OR_WORKSHOP_ADDONS_DIRECTORY>"
+    "<ADDITIONAL_NONSTANDARD_ADDON_ROOT>"
   ],
   "workbenchScriptAuthorizeAll": false,
   "workbenchHost": "127.0.0.1",
@@ -102,15 +107,23 @@ inside one addon require the target addon root explicitly: pass
 `projectPath: "<ABSOLUTE_WORKSPACE_PATH>/addons/<MOD_NAME>"` to `project`, `prefab`,
 `script_create`, `layout_create`, `config_create`, `server_config`,
 `scenario_create_conflict`, and `animation_graph`, and to `mod` when
-validating. Generic `mod(action=build)` is retired because it cannot guarantee
-bounded, attributable, modal-free execution; use the target project's reviewed
-build wrapper. Pass an explicit target `outputDir` to `building_setup`.
+validating. Generic `mod(action=build)` is retired. While the MCP is active,
+use `wb_build` with an explicit `.gproj` and caller-exclusive empty output
+directory. Project scripts and CI may use the packaged standalone runner only
+when no live MCP owns the Workbench lifecycle lease. Pass an explicit target
+`outputDir` to `building_setup`.
 
-`workbenchAddonDirs` must include the base-game addon root and every local or
-Workshop root needed to resolve the target project's direct and transitive
-dependencies. ReforgerForge passes them to Workbench as one ordered,
-comma-separated `-addonsDir` value. When launching manually, keep that entire
-value quoted because paths commonly contain spaces.
+ReforgerForge automatically adds the discovered base-game add-on root and,
+when present, the standard Workshop add-on root. A nonempty explicit
+`workbenchAddonDirs` list is additive: those discovered roots are prepended
+unless they are already present. Add only any other local or nonstandard
+Workshop roots needed to resolve the target project's direct and transitive
+dependencies. `--no-workbench-addon-dirs` remains an explicit opt-out. Use
+`node dist/index.js check-addon-dirs --gproj <path>` for a read-only report of
+which candidate root resolves each dependency GUID. ReforgerForge passes the
+effective roots to Workbench as one ordered, comma-separated `-addonsDir`
+value. When launching manually, keep that entire value quoted because paths
+commonly contain spaces.
 
 Leave `workbenchScriptAuthorizeAll` disabled unless the active project and all
 of its dependencies are trusted. Enabling it suppresses authorization prompts
@@ -185,16 +198,16 @@ reforger-forge-workbench --config <config> editor --gproj <path> --foreground
 reforger-forge-workbench --config <config> build --gproj <path> --platform PC --output <path> --timeout-ms <n>
 ```
 
-Editor ownership is foreground-only. The canonical target-build plan is
-helper-free, uses a dedicated profile, and has no NET-readiness step. Until the
-controlled target-only live acceptance gate passes, the public build command
-continues to run a companion-qualification editor preflight followed by that
-distinct target-only child under the same machine lock. Its version-3 JSON
-receipt keeps their exact PIDs, lifecycle generations, and attributed log
-directories separate, records preflight endpoint/Ping ownership, and requires
-fresh nonempty output containing one hashed `resourceDatabase.rdb` after a zero
-build exit. Do not describe or expect a public version-4 receipt yet. Supply a
-caller-exclusive unique empty output directory for every run.
+Editor ownership is foreground-only. A build is one direct helper-free
+target-only child under the same guarded lifecycle, using a dedicated profile
+and no NET-readiness or companion-preflight step. Supply a caller-exclusive
+unique empty output directory for every run. A zero build exit means the runner
+has re-attested the target and accepted fresh nonempty output with one hashed
+`resourceDatabase.rdb`; it does not need a caller-side replay of process,
+endpoint, source-hash, or output checks. The [standalone runner CLI
+reference](../docs/runner-cli.md) owns the unversioned receipt shapes,
+exit-code mapping, and the one target-identity check a fixed-project wrapper
+should retain.
 
 Installed Workbench 1.7.0.54 requires the exact target sequence
 `-wbModule=ResourceManager -builddata PC <fresh-output> <AddonName>`, with the
@@ -212,36 +225,11 @@ diagnostics, supervision, and managed-profile creation have separate modules.
 The session controller keeps lifecycle/gate ordering local because reservation,
 spawn publication, exact cleanup, and vacancy form one fail-closed transaction.
 The runner keeps CLI/build evidence policy local because log attribution, output
-reservation, output proof, exit mapping, and V3 receipt shaping must agree. The
+reservation, output proof, exit mapping, and single-receipt shaping must agree. The
 launch-plan module keeps the three-plan validation and final argument ordering
 together so no caller can assemble a partial policy. Extract another module only
 when it owns an independently testable invariant, not merely to reduce line
 count.
-
-`scripts/run-workbench-build-acceptance.ts` is also an intentional cohesion
-exception. It is a repository-only, one-shot evidence evaluator rather than a
-production orchestration owner: production lifecycle, process execution,
-launch-plan, state, and readiness logic remain in the modules above. Keeping its
-dual live-run gate, two-run protocol, normalized evidence schema, sanitizer, and
-schema validator in one auditable source prevents the recorded evaluator policy
-from drifting across loosely versioned helpers. Its exported seams are covered
-hermetically, and its complete runtime source closure is hash-bound in every
-artifact. Split it only if the extracted evaluator component gains its own
-versioned schema and independently enforced source-closure contract.
-
-The repository-only target-build acceptance harness exercises the helper-free
-controller path without changing the public build command:
-
-```powershell
-$env:RFO_RUN_LIVE_WORKBENCH_BUILD_ACCEPTANCE = '1'
-npm run dev:workbench:acceptance:build -- --config <CONFIG_PATH> --confirm-live-run --gproj <ABSOLUTE_TARGET_GPROJ> --output-root <EXTERNAL_OUTPUT_PARENT>
-```
-
-It creates two distinct exclusive output directories and writes sanitized
-pre-removal evidence beneath `docs/validation`. Merely adding or running the
-harness does not satisfy the removal gate: retain two successful controlled
-runs, keep all hermetic contracts green, and remember that the public command
-still uses the helper preflight and V3 receipt until that evidence is reviewed.
 
 ## Observer Runtime Lifecycle (Windows)
 
@@ -347,6 +335,7 @@ name below.
 | Place Scenario Framework entities in the open world | `scenario_create` (live) |
 | Generate Conflict scenario files | `scenario_create_conflict` (offline) |
 | Create or validate an addon | `mod` (`action=build` is retired) |
+| Build one exact addon while MCP is active | `wb_build` |
 | Stage or diagnose the observer companion addon | `observer_setup` |
 | Begin, inspect, finalize, or discard a managed evidence run | `observer_run` |
 | Prepare an instrumented runtime argument array without launching it | `observer_prepare_launch` |

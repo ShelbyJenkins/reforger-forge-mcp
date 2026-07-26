@@ -189,6 +189,7 @@ describe("PakVirtualFS", () => {
   it("checks file existence", () => {
     const vfs = PakVirtualFS.get(GAME_DIR)!;
     expect(vfs.exists("Scripts/Game/player.c")).toBe(true);
+    expect(vfs.exists("scripts/game/PLAYER.c")).toBe(true);
     expect(vfs.exists("Scripts/Game/vehicle.c")).toBe(true);
     expect(vfs.exists("nope.c")).toBe(false);
   });
@@ -197,13 +198,15 @@ describe("PakVirtualFS", () => {
     const vfs = PakVirtualFS.get(GAME_DIR)!;
     expect(vfs.exists("Scripts")).toBe(true);
     expect(vfs.exists("Scripts/Game")).toBe(true);
+    expect(vfs.exists("scripts/game")).toBe(true);
     expect(vfs.exists("Nonexistent")).toBe(false);
   });
 
   it("reads uncompressed file", () => {
     const vfs = PakVirtualFS.get(GAME_DIR)!;
-    const content = vfs.readTextFile("Scripts/Game/player.c");
+    const content = vfs.readTextFile("scripts/game/PLAYER.c");
     expect(content).toBe("class Player {}");
+    expect(vfs.canonicalFilePath("scripts/game/PLAYER.c")).toBe("Scripts/Game/player.c");
   });
 
   it("reads compressed file", () => {

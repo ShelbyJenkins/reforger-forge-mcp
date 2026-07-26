@@ -224,6 +224,38 @@ export class ObserverApplicationOperations {
       const proposedReservationId = requiredUuid(payload, "reservationId");
       if (payload.exactRuntimeVacant !== undefined && typeof payload.exactRuntimeVacant !== "boolean") throw new ObserverError("INVALID_REQUEST", "exactRuntimeVacant must be boolean");
       const exactRuntimeVacant = payload.exactRuntimeVacant === true;
+      const lifecycleRetained = app.server.assertOwnedRuntimeLifecycle(
+        sessionId,
+        runtimeId,
+        generation
+      );
+      if (!lifecycleRetained) {
+        if (!exactRuntimeVacant) {
+          throw new ObserverError(
+            "SESSION_MISMATCH",
+            "Owned runtime lifecycle reservation lacks exact retained authority",
+            409
+          );
+        }
+        app.server.assertReleasedOwnedRuntimeLifecycle(
+          sessionId,
+          runtimeId,
+          generation
+        );
+        const sessionKnown = app.control.sessions.diagnostics()
+          .some((session) => session.sessionId === sessionId);
+        const jobs = app.jobs.diagnostics(sessionId);
+        const instances = app.registry.diagnostics()
+          .filter((instance) => instance.sessionId === sessionId);
+        return {
+          sessionKnown,
+          ready: true,
+          reserved: false,
+          reservationRequired: false,
+          ...runtimeStopObligations(jobs, instances, app.jobs.obligationJobIds()),
+          reason: "exact_runtime_vacancy_has_no_retained_lifecycle",
+        };
+      }
       const existing = app.server.ownedRuntimeStopReservation(sessionId, runtimeId, generation);
       if (existing) {
         const claim = app.server.claimOwnedRuntimeStopReservation(sessionId, runtimeId, generation, proposedReservationId);
@@ -259,9 +291,29 @@ export class ObserverApplicationOperations {
       if (payload.exactRuntimeVacant !== undefined && typeof payload.exactRuntimeVacant !== "boolean") throw new ObserverError("INVALID_REQUEST", "exactRuntimeVacant must be boolean");
       const exactRuntimeVacant = payload.exactRuntimeVacant === true;
       const reservationId = typeof payload.reservationId === "string" ? requiredUuid(payload, "reservationId") : null;
-      const current = app.server.ownedRuntimeStopReservation(sessionId, runtimeId, generation);
+      const lifecycleRetained = app.server.assertOwnedRuntimeLifecycle(
+        sessionId,
+        runtimeId,
+        generation
+      );
+      if (!lifecycleRetained) {
+        if (!exactRuntimeVacant) {
+          throw new ObserverError(
+            "SESSION_MISMATCH",
+            "Released runtime lifecycle completion requires exact vacancy",
+            409
+          );
+        }
+        app.server.assertReleasedOwnedRuntimeLifecycle(
+          sessionId,
+          runtimeId,
+          generation
+        );
+      }
+      const current = lifecycleRetained
+        ? app.server.ownedRuntimeStopReservation(sessionId, runtimeId, generation)
+        : null;
       if (current && current !== reservationId) throw new ObserverError("SESSION_MISMATCH", "Observer runtime stop completion reservation is stale", 409);
-      app.server.assertOwnedRuntimeLifecycle(sessionId, runtimeId, generation);
       const vacancyDisposedJobIds = exactRuntimeVacant ? app.jobs.vacateSession(sessionId) : [];
       const vacancyRemovedInstances = exactRuntimeVacant ? app.registry.vacateSession(sessionId) : 0;
       const revoked = app.control.revokeSession(sessionId);

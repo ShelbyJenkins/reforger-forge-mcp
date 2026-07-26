@@ -280,7 +280,9 @@ export class FakeGate implements OwnedRuntimeObserverGate {
 
   async reserveRuntimeStop(
     _sessionId: string,
-    proposedReservationId: string
+    proposedReservationId: string,
+    _exactRuntimeVacant?: boolean,
+    _lifecycle?: { runtimeId: string; generation: string }
   ): Promise<RuntimeStopPreflight> {
     const result: RuntimeStopPreflight = this.preflights.shift() ?? {
       sessionKnown: true,
@@ -348,6 +350,29 @@ export class AgentBackedGate extends FakeGate {
     lifecycle?: { runtimeId: string; generation: string }
   ): Promise<RuntimeStopPreflight> {
     if (!lifecycle) throw new Error("fixture exact lifecycle is required");
+    const lifecycleRetained = this.agent.server.assertOwnedRuntimeLifecycle(
+      sessionId,
+      lifecycle.runtimeId,
+      lifecycle.generation
+    );
+    if (!lifecycleRetained) {
+      if (!exactRuntimeVacant) throw new Error("fixture lifecycle authority is not retained");
+      this.agent.server.assertReleasedOwnedRuntimeLifecycle(
+        sessionId,
+        lifecycle.runtimeId,
+        lifecycle.generation
+      );
+      return {
+        sessionKnown: this.agent.control.sessions.peek(sessionId) !== undefined,
+        ready: true,
+        reserved: false,
+        reservationRequired: false,
+        activeJobIds: [],
+        cameraLeaseJobIds: [],
+        restorationPendingJobIds: [],
+        reason: "exact_runtime_vacancy_has_no_retained_lifecycle",
+      };
+    }
     const existingReservationId = this.agent.server.ownedRuntimeStopReservation(
       sessionId,
       lifecycle.runtimeId,
@@ -397,22 +422,50 @@ export class AgentBackedGate extends FakeGate {
   override async completeRuntimeStop(
     sessionId: string,
     _reservationId?: string,
-    _exactRuntimeVacant = false,
+    exactRuntimeVacant = false,
     lifecycle?: { runtimeId: string; generation: string }
   ): Promise<unknown> {
+    if (this.completeFailures > 0) {
+      this.completeFailures -= 1;
+      throw new Error("fixture completion failure");
+    }
     if (!lifecycle) throw new Error("fixture exact lifecycle is required");
-    this.agent.server.assertOwnedRuntimeLifecycle(
+    const lifecycleRetained = this.agent.server.assertOwnedRuntimeLifecycle(
       sessionId,
       lifecycle.runtimeId,
       lifecycle.generation
     );
+    if (!lifecycleRetained) {
+      if (!exactRuntimeVacant) {
+        throw new Error(
+          "released fixture lifecycle completion requires exact vacancy"
+        );
+      }
+      this.agent.server.assertReleasedOwnedRuntimeLifecycle(
+        sessionId,
+        lifecycle.runtimeId,
+        lifecycle.generation
+      );
+    }
+    const vacancyDisposedJobIds = exactRuntimeVacant
+      ? this.agent.jobs.vacateSession(sessionId)
+      : [];
+    const vacancyRemovedInstances = exactRuntimeVacant
+      ? this.agent.registry.vacateSession(sessionId)
+      : 0;
     const revoked = this.agent.control.revokeSession(sessionId);
     const released = this.agent.server.releaseOwnedRuntimeLifecycle(
       sessionId,
       lifecycle.runtimeId,
       lifecycle.generation
     );
-    return { completed: true, revoked, lifecycleReleased: released.released };
+    return {
+      completed: true,
+      revoked,
+      lifecycleReleased: released.released,
+      vacancyDisposedJobIds,
+      vacancyRemovedInstances,
+    };
   }
 }
 

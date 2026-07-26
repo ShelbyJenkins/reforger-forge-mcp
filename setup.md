@@ -23,7 +23,7 @@ Run commands from the ReforgerForge repository root.
 Normal onboarding uses the parameterless setup command:
 
 ```powershell
-.\scripts\setup.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup.ps1
 ```
 
 Setup installs dependencies, builds the server, verifies config-free startup
@@ -38,8 +38,9 @@ It does not:
 - guess a package or mod workspace; or
 - launch Workbench or the game.
 
-Normal server startup discovers Arma Reforger, Arma Reforger Tools, and the
-base addon directory from the user's Steam libraries.
+Normal server startup discovers Arma Reforger, Arma Reforger Tools, the
+base-game add-on directory from the user's Steam libraries, and (when it
+exists) the standard Workshop add-on directory.
 
 The supported automatic clients are Codex, Cursor, Google Antigravity, Claude
 Desktop, Claude Code, Windsurf, VS Code, Continue.dev, and Kiro. Setup attempts
@@ -96,7 +97,7 @@ Inspect the built installation without installing dependencies, rebuilding,
 or changing client registrations:
 
 ```powershell
-.\scripts\setup.ps1 -Doctor
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup.ps1 -Doctor
 ```
 
 Doctor reports these levels separately:
@@ -117,7 +118,7 @@ neither command performs an observer capture.
 To test an already-running Workbench, add `-CheckWorkbench`:
 
 ```powershell
-.\scripts\setup.ps1 -Doctor -CheckWorkbench
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup.ps1 -Doctor -CheckWorkbench
 ```
 
 This performs exactly one read-only `EMCP_WB_Ping` against the resolved
@@ -127,8 +128,8 @@ Use `-Json` with normal setup or Doctor to emit the canonical receipt as one
 JSON document on stdout. Operational messages remain on stderr:
 
 ```powershell
-.\scripts\setup.ps1 -Json
-.\scripts\setup.ps1 -Doctor -Json
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup.ps1 -Json
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup.ps1 -Doctor -Json
 ```
 
 You can also verify compiled MCP startup and all required tool registrations
@@ -143,8 +144,8 @@ The second form is only for an explicitly selected override file.
 
 ## PowerShell execution policy
 
-If local PowerShell policy blocks direct `.ps1` execution, use a process-local
-bypass for this invocation:
+The setup and Doctor examples above use a process-local bypass so they work
+when local PowerShell policy blocks direct `.ps1` execution:
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup.ps1
@@ -179,6 +180,31 @@ node dist/index.js discover-steam
 
 Explicit `workbenchPath` and `gamePath` values are fallbacks or overrides for
 nonstandard installations; they are not normally required.
+
+## Add-on root discovery
+
+Workbench needs an add-on root for the base game and for every local or
+Workshop dependency used by the target project. ReforgerForge automatically
+uses the discovered base-game add-on root and, when it exists, the standard
+Workshop root beneath Documents. If `workbenchAddonDirs` or repeated
+`--workbench-addon-dir` values add one or more explicit roots, the automatic
+roots are prepended unless already present. This means a launcher normally adds
+only nonstandard or repository-specific roots.
+
+`--no-workbench-addon-dirs` is the explicit exception: it leaves the effective
+root list empty and suppresses automatic injection. Use it only when that is
+intentional.
+
+To see how a target's declared dependency GUIDs resolve without starting
+Workbench or changing configuration, run:
+
+```powershell
+node dist/index.js check-addon-dirs --gproj C:\path\to\Addon\Addon.gproj
+```
+
+The report identifies dependencies resolved by the base-game, standard
+Workshop, and target-sibling add-on candidates, then lists missing and
+ambiguous GUIDs separately. It is diagnostic only.
 
 ## Optional project path
 
@@ -227,8 +253,10 @@ never inferred from that working directory.
 
 CLI flags can make small per-client adjustments to a shared file. Repeated
 `--workbench-addon-dir`, `--observer-evidence-root`, and
-`--observer-supporting-log-root` flags replace their corresponding arrays in
-the file while preserving command-line order.
+`--observer-supporting-log-root` flags replace their corresponding explicit
+arrays in the file while preserving command-line order. A nonempty effective
+`workbenchAddonDirs` array then receives the automatic base-game and standard
+Workshop roots described above.
 
 Boolean settings use paired flags such as `--debug` / `--no-debug` and
 `--workbench-script-authorize-all` /
@@ -245,7 +273,7 @@ array with `[]`. A clear flag cannot be combined with its repeated value flag.
 | `workbenchPath` | `--workbench-path` | Discovered Tools installation; explicit fallback or override |
 | `gamePath` | `--game-path` | Discovered game installation; explicit fallback or override |
 | `projectPath` | `--project-path` | Optional existing addons-container directory |
-| `workbenchAddonDirs` | repeat `--workbench-addon-dir` | Defaults to `<gamePath>\addons`; explicit arrays replace it |
+| `workbenchAddonDirs` | repeat `--workbench-addon-dir` | Discovered base-game root plus standard Workshop root when present; nonempty explicit arrays are additive, while `--no-workbench-addon-dirs` is an explicit empty opt-out |
 | `extractedPath` | `--extracted-path` | Optional existing directory |
 | `workbenchHost` | `--workbench-host` | `127.0.0.1` |
 | `workbenchPort` | `--workbench-port` | `5775` |

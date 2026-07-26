@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { ExactProcessBackend } from "../../src/foundation/exact-process-backend.js";
 import {
   hasRecoverableExactIdentity,
+  RecoverableSpawnPreSpawnCleanupError,
   runRecoverableSpawn,
   type RecoverableSpawnRecord,
 } from "../../src/foundation/recoverable-spawn.js";
@@ -156,6 +157,60 @@ describe("runRecoverableSpawn", () => {
     releaseFence();
     await run;
     expect(spawn).toHaveBeenCalledTimes(1);
+  });
+
+  it("retires pre_spawn when final validation refuses before process creation", async () => {
+    const refusal = new Error("dependency disappeared");
+    const spawn = vi.fn(() => ({ pid: 42 }));
+    const discardPreSpawn = vi.fn(async () => undefined);
+    const persisted: RecoverableSpawnRecord<TestIdentity, null>[] = [];
+
+    await expect(runRecoverableSpawn({
+      transactionId: "transaction-pre-spawn-refusal",
+      metadata: null,
+      backend,
+      journal: {
+        persist: async (_previous, next) => {
+          persisted.push(next);
+          return next;
+        },
+        discardPreSpawn,
+      },
+      beforeSpawn: () => { throw refusal; },
+      spawn,
+      childPid: (child) => child.pid,
+      inspect: async () => identity,
+      publish: async () => undefined,
+    })).rejects.toBe(refusal);
+
+    expect(persisted.map((record) => record.phase)).toEqual(["pre_spawn"]);
+    expect(discardPreSpawn).toHaveBeenCalledWith(persisted[0]);
+    expect(spawn).not.toHaveBeenCalled();
+  });
+
+  it("surfaces journal-retirement failure without attempting process creation", async () => {
+    const spawn = vi.fn(() => ({ pid: 42 }));
+
+    await expect(runRecoverableSpawn({
+      transactionId: "transaction-pre-spawn-cleanup-failure",
+      metadata: null,
+      backend,
+      journal: {
+        persist: async (_previous, next) => next,
+        discardPreSpawn: async () => { throw new Error("durable removal failed"); },
+      },
+      beforeSpawn: () => { throw new Error("dependency disappeared"); },
+      spawn,
+      childPid: (child) => child.pid,
+      inspect: async () => identity,
+      publish: async () => undefined,
+    })).rejects.toMatchObject({
+      name: RecoverableSpawnPreSpawnCleanupError.name,
+      preSpawnError: expect.objectContaining({ message: "dependency disappeared" }),
+      cleanupError: expect.objectContaining({ message: "durable removal failed" }),
+    });
+
+    expect(spawn).not.toHaveBeenCalled();
   });
 
   it("refuses PID drift before publishing exact authority", async () => {

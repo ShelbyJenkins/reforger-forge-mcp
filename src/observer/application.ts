@@ -249,6 +249,9 @@ class DefaultObserverApplication implements ObserverApplication {
       activeJobIds: strings(value.activeJobIds),
       cameraLeaseJobIds: strings(value.cameraLeaseJobIds),
       restorationPendingJobIds: strings(value.restorationPendingJobIds),
+      ...(typeof value.reservationRequired === "boolean"
+        ? { reservationRequired: value.reservationRequired }
+        : {}),
       ...(typeof value.reservationId === "string" ? { reservationId: value.reservationId } : {}),
       ...(typeof value.reason === "string" ? { reason: value.reason } : {}),
     };
@@ -273,10 +276,18 @@ class DefaultObserverApplication implements ObserverApplication {
       return await this.captureService.capture({ ...captureInput, ...(expectedWorldRevision ? { expectedWorldRevision } : {}) }) as CaptureResult;
     } catch (error) { throw this.mapError(error); }
   }
-  beginRun(input: Record<string, unknown>): Promise<Record<string, unknown>> { return this.evidenceRuns.begin(input); }
-  runStatus(runId: string): Promise<Record<string, unknown>> { return this.evidenceRuns.status(runId); }
-  finalizeRun(input: Record<string, unknown>): Promise<Record<string, unknown>> { return this.evidenceRuns.finalize(input); }
-  discardRun(runId: string): Promise<Record<string, unknown>> { return this.evidenceRuns.discard(runId); }
+  async beginRun(input: Record<string, unknown>): Promise<Record<string, unknown>> {
+    try { return await this.evidenceRuns.begin(input); } catch (error) { throw this.mapError(error); }
+  }
+  async runStatus(runId: string): Promise<Record<string, unknown>> {
+    try { return await this.evidenceRuns.status(runId); } catch (error) { throw this.mapError(error); }
+  }
+  async finalizeRun(input: Record<string, unknown>): Promise<Record<string, unknown>> {
+    try { return await this.evidenceRuns.finalize(input); } catch (error) { throw this.mapError(error); }
+  }
+  async discardRun(runId: string): Promise<Record<string, unknown>> {
+    try { return await this.evidenceRuns.discard(runId); } catch (error) { throw this.mapError(error); }
+  }
   async jobStatus(sessionId: string | undefined, jobId: string): Promise<Record<string, unknown>> {
     try { return await this.captureService.status(sessionId, jobId); } catch (error) { throw this.mapError(error); }
   }

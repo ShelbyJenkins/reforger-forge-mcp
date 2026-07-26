@@ -7,7 +7,7 @@ Thanks for helping improve ReforgerForge MCP!
 Use the parameterless quick start:
 
 ```powershell
-.\scripts\setup.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup.ps1
 ```
 
 See [setup.md](setup.md) for installation, verification, and optional

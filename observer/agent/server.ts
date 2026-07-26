@@ -450,6 +450,50 @@ export class ObserverAgentServer {
     return true;
   }
 
+  /**
+   * Prove that this exact lifecycle generation was durably released.
+   * Absence is not proof: reservation-free terminal cleanup may proceed only
+   * from a matching release acknowledgement/tombstone.
+   */
+  assertReleasedOwnedRuntimeLifecycle(
+    sessionId: string,
+    runtimeId: string,
+    generation: string
+  ): void {
+    this.assertOwnedRuntimeLifecycleIdentity(sessionId, runtimeId, generation);
+    const pinned = this.ownedRuntimeLifecyclePins.get(runtimeId);
+    if (pinned) {
+      throw new ObserverError(
+        "SESSION_UNVERIFIABLE",
+        "Owned runtime lifecycle is still retained and cannot use released authority",
+        409
+      );
+    }
+    const durable = this.ownedRuntimeAuthorities.read(runtimeId);
+    if (!durable) {
+      throw new ObserverError(
+        "SESSION_MISMATCH",
+        "Owned runtime lifecycle has no exact release acknowledgement",
+        409
+      );
+    }
+    if (durable.authority.sessionId !== sessionId ||
+        durable.authority.generation !== generation) {
+      throw new ObserverError(
+        "SESSION_MISMATCH",
+        "Owned runtime lifecycle release belongs to another exact generation",
+        409
+      );
+    }
+    if (durable.state !== "release_acknowledged") {
+      throw new ObserverError(
+        "SESSION_UNVERIFIABLE",
+        "Owned runtime lifecycle release has not been acknowledged",
+        409
+      );
+    }
+  }
+
   releaseOwnedRuntimeLifecycle(
     sessionId: string,
     runtimeId: string,

@@ -106,6 +106,62 @@ describe("OwnedRuntimeManager", () => {
     expect(value.gate.completedExactVacancies).toEqual([true]);
   });
 
+  it("completes when a live-reserved runtime exits and releases authority before stop publication", async () => {
+    const value = makeHarness();
+    const started = await value.start("reserved-direct-exit-start");
+    const reserve = value.gate.reserveRuntimeStop.bind(value.gate);
+    value.gate.reserveRuntimeStop = vi.fn(async (
+      sessionId,
+      proposedReservationId,
+      exactRuntimeVacant,
+      lifecycle
+    ) => {
+      expect(exactRuntimeVacant).toBe(false);
+      const preflight = await reserve(
+        sessionId,
+        proposedReservationId,
+        exactRuntimeVacant,
+        lifecycle
+      );
+      value.backend.processes.delete(started.pid);
+      const child = value.spawnCalls[0].child;
+      child.exitCode = 0;
+      child.emit("exit", 0, null);
+      await vi.waitFor(() => {
+        expect(value.gate.releasedLifecycles).toEqual(expect.arrayContaining([
+          expect.objectContaining({ runtimeId: started.runtimeId }),
+        ]));
+      });
+      return preflight;
+    });
+
+    await expect(value.stop(started.runtimeId, "reserved-direct-exit-stop"))
+      .resolves.toMatchObject({
+        state: "exited",
+        termination: "already_exited",
+        identityVacant: true,
+        terminationComplete: true,
+        observerCleanupPending: false,
+      });
+    const proof = readRecord(
+      value.manager,
+      "restoration-proofs",
+      started.runtimeId
+    );
+    expect(proof).toMatchObject({
+      kind: "live_stop_reservation",
+      reservationId: expect.any(String),
+    });
+    expect(readRecord(value.manager, "stops", started.runtimeId)).toMatchObject({
+      restorationProofKind: "live_stop_reservation",
+      restorationReservationId: proof.reservationId,
+      identityVacant: true,
+    });
+    expect(value.gate.completedExactVacancies).toEqual([true]);
+    expect(value.gate.completedReservations).toEqual([proof.reservationId]);
+    expect(value.backend.terminateCalls).toEqual([]);
+  });
+
   it("does not hold the machine mutex while waiting for restoration readiness", async () => {
     const backend = createSerialBackend();
     const value = makeHarness({ backend });

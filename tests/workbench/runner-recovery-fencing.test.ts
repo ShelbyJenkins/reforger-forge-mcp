@@ -1,6 +1,8 @@
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { WorkbenchLifecycleExecution } from "../../src/workbench/lifecycle-execution.js";
+import type { WorkbenchSpawnRecord } from "../../src/workbench/process-guard.js";
 import {
   cleanupRunnerHarnesses,
   closeRunnerChild,
@@ -56,7 +58,7 @@ describe("standalone Workbench lifecycle runner", () => {
     });
   });
 
-  it("revalidates output after lifecycle reservation and before companion preflight spawn", async () => {
+  it("revalidates output after lifecycle reservation and before target-build spawn", async () => {
     const harness = createHarness();
     harness.backend.afterReplace = ({ next }) => {
       if (next.phase === "starting" && next.workbench === null) {
@@ -82,7 +84,7 @@ describe("standalone Workbench lifecycle runner", () => {
     let vacancyIndex = 0;
     harness.backend.verifyEndpointVacant = vi.fn(async (endpoint) => {
       const result = await originalVacancy(endpoint);
-      if (vacancyIndex++ === 3) {
+      if (vacancyIndex++ === 1) {
         writeFileSync(join(harness.outputPath, "raced-during-final-endpoint-check.txt"), "occupied");
       }
       return result;
@@ -93,14 +95,67 @@ describe("standalone Workbench lifecycle runner", () => {
       code: "OUTPUT_ATTESTATION_FAILED",
     });
 
-    expect(spawner.spawnCount()).toBe(1);
+    expect(spawner.spawnCount()).toBe(0);
     expect(await harness.guard.readLifecycleState()).toMatchObject({
       kind: "valid",
       state: { phase: "vacant", workbench: null, operation: null },
     });
   });
 
-  it("reserves a shared empty output immediately after the mutex and blocks loser preflight", async () => {
+  it("fails closed when a refused pre-spawn check cannot retire its exact journal", async () => {
+    const harness = createHarness();
+    const spawnProcess = vi.fn();
+    const execution = new WorkbenchLifecycleExecution({
+      processGuard: harness.guard,
+      spawnProcess,
+    });
+    const endpoint = { host: "127.0.0.1", port: 5775 };
+    const lifecycle = await execution.reserve({
+      endpoint,
+      target: {
+        path: harness.projectPath,
+        comparisonKey: harness.projectPath.toLowerCase(),
+      },
+      companion: null,
+    });
+    let durableRecord: WorkbenchSpawnRecord | null = null;
+    vi.spyOn(harness.guard, "createSpawnJournal").mockImplementation((authority) => {
+      expect(authority.generation).toBe(lifecycle.generation);
+      return {
+        persist: async (_previous, next) => {
+          durableRecord = next;
+          return next;
+        },
+        discardPreSpawn: async () => {
+          throw new Error("injected exact journal retirement failure");
+        },
+      };
+    });
+
+    await expect(execution.spawnRecoverable({
+      lifecycle,
+      purpose: "target_build",
+      executablePath: harness.executablePath,
+      launchArguments: [],
+      spawnOptions: { cwd: harness.root },
+      ownerArgument: "-reforgerForgeOwnerToken=test",
+      launchedAtMs: Date.now(),
+      beforeSpawn: () => {
+        throw new Error("dependency disappeared");
+      },
+    })).rejects.toMatchObject({
+      code: "RECOVERY_REQUIRED",
+      message: expect.stringContaining("journal retirement could not be proven"),
+    });
+
+    expect(spawnProcess).not.toHaveBeenCalled();
+    expect(durableRecord).toMatchObject({
+      phase: "pre_spawn",
+      metadata: { purpose: "target_build" },
+    });
+  });
+
+  it("reserves a shared empty output immediately after the mutex and blocks a losing target build", async () => {
     const harness = createHarness();
     let spawnCount = 0;
     let releaseBuild!: () => void;
@@ -113,7 +168,7 @@ describe("standalone Workbench lifecycle runner", () => {
         pid: 23_000 + index,
         logName: `reservation-${index}`,
       });
-      if (index === 1) {
+      if (index === 0) {
         targetSpawned();
         void buildRelease.then(() => {
           writeResourceDatabase(harness.outputPath, "reserved output");
@@ -136,24 +191,24 @@ describe("standalone Workbench lifecycle runner", () => {
     const second = runBuild(harness, spawnProcess);
 
     await expect(second).rejects.toMatchObject({ code: "LIFECYCLE_CONFLICT" });
-    expect(spawnCount).toBe(2);
+    expect(spawnCount).toBe(1);
     releaseBuild();
     await expect(first).resolves.toMatchObject({ intent: "build", output: expect.any(Object) });
   });
 
-  it("distinguishes sequential children by creation time even when Windows reuses the PID", async () => {
+  it("reports the exact target child creation time", async () => {
     const harness = createHarness();
     let spawnIndex = 0;
-    const reusedPid = 22_900;
+    const targetPid = 22_900;
     const onBuildExit = exitAfterDurablePublication(harness);
     const receipt = await runBuild(harness, (command, args) => {
       const current = spawnIndex++;
       const { child } = createOwnedRunnerChild(harness, command, args, {
-        pid: reusedPid,
-        creationTime: current === 0 ? "133900000000022900" : "133900000000022901",
-        logName: current === 0 ? "reused-preflight" : "reused-build",
+        pid: targetPid,
+        creationTime: "133900000000022900",
+        logName: "target-build",
       });
-      if (current === 1) {
+      if (current === 0) {
         onBuildExit(() => {
           writeResourceDatabase(harness.outputPath, "reused pid database");
           closeRunnerChild(harness, child, 0);
@@ -163,37 +218,33 @@ describe("standalone Workbench lifecycle runner", () => {
     });
 
     expect(receipt).toMatchObject({
-      pid: reusedPid,
-      creationTime: "133900000000022901",
-      preflight: { pid: reusedPid, creationTime: "133900000000022900" },
+      pid: targetPid,
+      creationTime: "133900000000022900",
     });
+    expect(spawnIndex).toBe(1);
   });
 
   it("releases the mutex during exact-child recovery while durable state stays stopping", async () => {
     const harness = createHarness();
     let targetChild!: RunnerChild;
-    let spawnIndex = 0;
     const run = runBuild(harness, (command, args) => {
-      const current = spawnIndex++;
       const { child } = createOwnedRunnerChild(harness, command, args, {
-        pid: current === 0 ? 21_005 : 21_015,
-        logName: current === 0 ? "refusal-preflight" : "refusal-build",
+        pid: 21_015,
+        logName: "refusal-build",
       });
-      if (current === 1) {
-        targetChild = child;
-        harness.backend.terminationResult = {
-          kind: "refused",
-          reason: "creation_time_mismatch",
-          message: "identity changed",
-        };
-      }
+      targetChild = child;
+      harness.backend.terminationResult = {
+        kind: "refused",
+        reason: "creation_time_mismatch",
+        message: "identity changed",
+      };
       return child;
     });
     const rejection = run.then(
       () => { throw new Error("expected exact termination refusal"); },
       (error: unknown) => error
     );
-    while (harness.backend.terminationCalls.length < 2) {
+    while (harness.backend.terminationCalls.length < 1) {
       await new Promise((resolvePromise) => setTimeout(resolvePromise, 1));
     }
 
@@ -219,7 +270,6 @@ describe("standalone Workbench lifecycle runner", () => {
 
   it("returns RECOVERY_REQUIRED within the hard recovery bound and preserves stopping identity", async () => {
     const harness = createHarness();
-    let spawnIndex = 0;
     let targetPid = 0;
     let recoveryStartedAt = 0;
     harness.backend.beforeTerminate = () => {
@@ -228,23 +278,20 @@ describe("standalone Workbench lifecycle runner", () => {
       }
     };
     const run = runBuild(harness, (command, args) => {
-      const current = spawnIndex++;
       const { child } = createOwnedRunnerChild(harness, command, args, {
-        pid: current === 0 ? 21_105 : 21_115,
-        logName: `bounded-recovery-${current}`,
+        pid: 21_115,
+        logName: "bounded-recovery",
       });
-      if (current === 1) {
-        targetPid = child.pid;
-        harness.backend.terminationResult = {
-          kind: "refused",
-          reason: "access_denied",
-          message: "fixture refuses exact termination",
-        };
-      }
+      targetPid = child.pid;
+      harness.backend.terminationResult = {
+        kind: "refused",
+        reason: "access_denied",
+        message: "fixture refuses exact termination",
+      };
       return child;
     }, { dependencies: { recoveryTimeoutMs: 100 } });
 
-    while (harness.backend.terminationCalls.length < 2) {
+    while (harness.backend.terminationCalls.length < 1) {
       await new Promise((resolvePromise) => setTimeout(resolvePromise, 1));
     }
     const observedDuringRecovery = await harness.guard.withLifecycleLock(() =>

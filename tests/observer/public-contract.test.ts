@@ -110,6 +110,26 @@ describe("public observer error projection", () => {
     expect(text.length).toBeLessThanOrEqual(PUBLIC_OBSERVER_ERROR_TEXT_MAXIMUM);
   });
 
+  it("redacts profile paths but preserves the exact doctor recovery action", () => {
+    const approvedRoot =
+      "C:\\Users\\approved-owner\\AppData\\Local\\ReforgerForge\\Observer\\v1\\profiles";
+    const rejectedProfile = "C:\\Temp\\outside-observer-profile";
+    const text = project(candidate(
+      "PROFILE_CONFLICT",
+      `Observer profile ${rejectedProfile} must be beneath the approved profile root: ` +
+        `${approvedRoot}. Call observer_setup with action="doctor" to inspect profileRoot.`,
+      { approvedRoot, rejectedProfile },
+    ));
+
+    expect(text).toContain("Observer error (PROFILE_CONFLICT):");
+    expect(text).toContain("<absolute-path>");
+    expect(text).toContain("observer_setup");
+    expect(text).toContain('action="doctor"');
+    expect(text).toContain("profileRoot");
+    expect(text).not.toContain(approvedRoot);
+    expect(text).not.toContain(rejectedProfile);
+  });
+
   it("handles false, null, and empty-string details without a truthiness gate", () => {
     for (const details of [false, null, ""]) {
       const text = project(candidate("INVALID_REQUEST", "diagnostic", details));

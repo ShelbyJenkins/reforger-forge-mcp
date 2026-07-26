@@ -41,10 +41,31 @@ export function registerServerConfig(
           .describe("Maximum players (default 32)"),
         port: z
           .number()
+          .int()
+          .min(1)
+          .max(65_535)
           .optional()
-          .describe("Game host port (default 2001)"),
+          .describe("Local UDP bind port (default 2001)"),
+        bindAddress: z
+          .string()
+          .optional()
+          .describe("Local address to bind. Empty uses all interfaces."),
+        publicAddress: z
+          .string()
+          .optional()
+          .describe("Public address advertised to the backend. Empty enables automatic detection."),
+        publicPort: z
+          .number()
+          .int()
+          .min(1)
+          .max(65_535)
+          .optional()
+          .describe("Public UDP port advertised to the backend (defaults to port)"),
         a2sPort: z
           .number()
+          .int()
+          .min(1)
+          .max(65_535)
           .optional()
           .describe("A2S query port (default 17777)"),
         visible: z
@@ -68,6 +89,9 @@ export function registerServerConfig(
       scenarioId,
       maxPlayers,
       port,
+      bindAddress,
+      publicAddress,
+      publicPort,
       a2sPort,
       visible,
       password,
@@ -83,6 +107,9 @@ export function registerServerConfig(
           scenarioId,
           maxPlayers,
           port,
+          bindAddress,
+          publicAddress,
+          publicPort,
           a2sPort,
           visible,
           password,

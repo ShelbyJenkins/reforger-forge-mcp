@@ -16,6 +16,7 @@ import {
   type SteamDiscoveryResult,
   WORKBENCH_EXECUTABLE_RELATIVE_PATHS,
 } from "./platform/windows/steam-discovery.js";
+import { discoverStandardWorkshopAddonRoot } from "./platform/windows/workshop-discovery.js";
 
 /** Bump whenever native JavaScript harnesses must reject an older compiled loader. */
 export const EXPLICIT_CONFIGURATION_CONTRACT_VERSION = 2;
@@ -156,6 +157,8 @@ export interface LoadConfigOptions {
   cwd?: string;
   /** Override Steam discovery for hermetic tests and embedders. */
   discoverSteam?: () => SteamDiscoveryResult;
+  /** Override best-effort Workshop-root discovery for hermetic tests and embedders. */
+  discoverWorkshopAddonRoot?: () => string | undefined;
 }
 
 const INTERNAL_OBSERVER_DEFAULTS: ObserverConfig = {
@@ -225,8 +228,8 @@ export const CONFIGURATION_USAGE = [
   "  --workbench-path <directory>            Override workbenchPath.",
   "  --game-path <directory>                 Override gamePath.",
   "  --project-path <directory>              Override projectPath.",
-  "  --workbench-addon-dir <directory>       Replace workbenchAddonDirs; repeat for each root.",
-  "  --no-workbench-addon-dirs               Replace workbenchAddonDirs with an empty array.",
+  "  --workbench-addon-dir <directory>       Add an explicit root; repeat for each root.",
+  "  --no-workbench-addon-dirs               Disable automatic and explicit workbenchAddonDirs.",
   "  --workbench-host <host>                 Override the NET API host.",
   "  --workbench-port <1..65535>             Override the NET API port.",
   "  --workbench-script-authorize-all        Enable protected Workbench script operations.",
@@ -821,8 +824,41 @@ export function loadConfig(
     ...fileConfig,
     ...parsed.overrides,
   };
-  if (merged.workbenchAddonDirs === undefined && merged.gamePath) {
-    merged.workbenchAddonDirs = [join(merged.gamePath, "addons")];
+  const baseGameAddonsRoot = merged.gamePath
+    ? join(merged.gamePath, "addons")
+    : undefined;
+  let workshopAddonRoot: string | undefined;
+  try {
+    workshopAddonRoot = (
+      options.discoverWorkshopAddonRoot ?? discoverStandardWorkshopAddonRoot
+    )();
+  } catch {
+    // Workshop content is optional. Discovery must not prevent the server
+    // from starting when the user's Documents location is unavailable.
+  }
+  const defaultAddonRoots: string[] = [];
+  for (const root of [baseGameAddonsRoot, workshopAddonRoot]) {
+    if (!root || defaultAddonRoots.some((current) =>
+      pathComparisonKey(current) === pathComparisonKey(root)
+    )) {
+      continue;
+    }
+    defaultAddonRoots.push(root);
+  }
+  if (merged.workbenchAddonDirs === undefined) {
+    merged.workbenchAddonDirs = defaultAddonRoots.length > 0
+      ? defaultAddonRoots
+      : undefined;
+  } else if (merged.workbenchAddonDirs.length > 0) {
+    const defaultRootKeys = new Set(
+      defaultAddonRoots.map((root) => pathComparisonKey(root))
+    );
+    merged.workbenchAddonDirs = [
+      ...defaultAddonRoots,
+      ...merged.workbenchAddonDirs.filter((root) =>
+        !defaultRootKeys.has(pathComparisonKey(root))
+      ),
+    ];
   }
   const evidenceRoots =
     cliObserver.evidenceRoots ??

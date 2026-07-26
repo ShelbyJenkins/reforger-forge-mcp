@@ -90,6 +90,109 @@ describe("observer application", () => {
     expect(coordinator.diagnosticPrivateChildCount()).toBe(0);
   });
 
+  it("reattaches a completed runtime capture when a replacement child no longer retains its job", async () => {
+    const child = new FakeChild();
+    const runId = "20260726T022925Z-d7867722";
+    const capture = {
+      captureLabel: "opzo-runtime-proof",
+      state: "completed",
+      backend: "runtime",
+      sessionId: "runtime-session-1",
+      jobId: "runtime-job-1",
+      instanceId: "runtime-instance-1",
+      worldId: "opzo-world",
+      worldEpoch: 4,
+      artifactAvailable: true,
+      missingArtifact: false,
+    };
+    child.responders.set("runStatus", () => ({
+      runId,
+      state: "open",
+      captures: [capture],
+    }));
+    child.responders.set("jobStatus", () => {
+      throw codedError("JOB_NOT_FOUND", "terminal runtime job is no longer retained");
+    });
+    const coordinator = createChildBackedApplication(child);
+
+    await expect(coordinator.runStatus(runId)).resolves.toMatchObject({
+      runId,
+      captures: [expect.objectContaining({ state: "completed", artifactAvailable: true })],
+    });
+    await expect(coordinator.jobStatus(capture.sessionId, capture.jobId)).resolves.toMatchObject({
+      state: "completed",
+      managedArtifactAvailable: true,
+      recoveredFromManagedArtifact: true,
+    });
+    await coordinator.close();
+  });
+
+  it("maps run-convergence failures through the public observer error boundary", async () => {
+    const child = new FakeChild();
+    const runId = "20260726T022925Z-d7867722";
+    child.responders.set("runStatus", () => ({
+      runId,
+      state: "open",
+      captures: [{
+        captureLabel: "opzo-runtime-proof",
+        state: "completed",
+        backend: "runtime",
+        sessionId: "runtime-session-1",
+        jobId: "runtime-job-1",
+        instanceId: "runtime-instance-1",
+        worldId: "opzo-world",
+        worldEpoch: 4,
+        artifactAvailable: true,
+        missingArtifact: false,
+      }],
+    }));
+    child.responders.set("jobStatus", () => {
+      throw codedError("ARTIFACT_INVALID", "retained capture no longer verifies");
+    });
+    const coordinator = createChildBackedApplication(child);
+
+    await expect(coordinator.runStatus(runId)).rejects.toEqual(
+      expect.objectContaining<Partial<ObserverCoordinatorError>>({
+        name: "ObserverCoordinatorError",
+        code: "ARTIFACT_INVALID",
+      }),
+    );
+    await coordinator.close();
+  });
+
+  it("preserves a reservation-free exact-vacancy stop preflight from the private child", async () => {
+    const child = new FakeChild();
+    child.responders.set("runtimeStopPreflight", () => ({
+      sessionKnown: true,
+      ready: true,
+      reserved: false,
+      reservationRequired: false,
+      activeJobIds: [],
+      cameraLeaseJobIds: [],
+      restorationPendingJobIds: [],
+      reason: "exact_runtime_vacancy_has_no_retained_lifecycle",
+    }));
+    const coordinator = createChildBackedApplication(child);
+    try {
+      await expect(coordinator.reserveRuntimeStop(
+        "session-direct-exit",
+        "00000000-0000-4000-8000-000000000001",
+        true,
+        {
+          runtimeId: "rt-00000000-0000-4000-8000-000000000002",
+          generation: "a".repeat(64),
+        }
+      )).resolves.toMatchObject({
+        sessionKnown: true,
+        ready: true,
+        reserved: false,
+        reservationRequired: false,
+      });
+    } finally {
+      await coordinator.close();
+    }
+  });
+
   it("keeps a timed-out private child counted until its actual exit", async () => {
     const { child, coordinator } = createChildHarness();
     await coordinator.ensureSetup();
@@ -163,6 +266,7 @@ describe("observer application", () => {
         diagnostic: "doctor",
         agentState: "idle",
         running: false,
+        profileRoot: join(managedRoot, "profiles"),
       });
       expect(count.value).toBe(0);
       expect(existsSync(managedRoot)).toBe(false);

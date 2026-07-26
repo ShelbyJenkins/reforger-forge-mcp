@@ -19,7 +19,8 @@ describe("generateServerConfig", () => {
     const result = JSON.parse(
       generateServerConfig({ name: "Test" })
     );
-    expect(result.gameHostBindPort).toBe(2001);
+    expect(result.bindPort).toBe(2001);
+    expect(result.publicPort).toBe(2001);
   });
 
   it("defaults maxPlayers to 32", () => {
@@ -40,8 +41,32 @@ describe("generateServerConfig", () => {
     const result = JSON.parse(
       generateServerConfig({ name: "Test", port: 3000 })
     );
-    expect(result.gameHostBindPort).toBe(3000);
-    expect(result.gameHostRegisterPort).toBe(3000);
+    expect(result.bindPort).toBe(3000);
+    expect(result.publicPort).toBe(3000);
+  });
+
+  it("emits the current case-sensitive root address schema", () => {
+    const result = JSON.parse(
+      generateServerConfig({
+        name: "Test",
+        bindAddress: "0.0.0.0",
+        publicAddress: "203.0.113.10",
+        publicPort: 3001,
+      })
+    );
+
+    expect(result).toMatchObject({
+      bindAddress: "0.0.0.0",
+      bindPort: 2001,
+      publicAddress: "203.0.113.10",
+      publicPort: 3001,
+    });
+    expect(result).not.toHaveProperty("gameHostBindAddress");
+    expect(result).not.toHaveProperty("gameHostBindPort");
+    expect(result).not.toHaveProperty("gameHostRegisterBindAddress");
+    expect(result).not.toHaveProperty("gameHostRegisterPort");
+    expect(result).not.toHaveProperty("dedicatedServerId");
+    expect(result).not.toHaveProperty("region");
   });
 
   it("uses custom maxPlayers", () => {
@@ -96,5 +121,17 @@ describe("generateServerConfig", () => {
       generateServerConfig({ name: "Test", a2sPort: 18888 })
     );
     expect(result.a2s.port).toBe(18888);
+  });
+
+  it("always emits the concrete IPv4 A2S address required by Reforger 1.7", () => {
+    const defaultAddress = JSON.parse(
+      generateServerConfig({ name: "Default A2S" })
+    );
+    const loopbackAddress = JSON.parse(
+      generateServerConfig({ name: "Loopback A2S", bindAddress: "127.0.0.1" })
+    );
+
+    expect(defaultAddress.a2s.address).toBe("0.0.0.0");
+    expect(loopbackAddress.a2s.address).toBe("127.0.0.1");
   });
 });

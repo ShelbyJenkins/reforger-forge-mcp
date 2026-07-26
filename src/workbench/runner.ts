@@ -29,6 +29,11 @@ import {
 } from "../foundation/managed-path.js";
 import { getProperty, parse as parseEnfusionText } from "../formats/enfusion-text.js";
 import {
+  assertWorkbenchAddonDependenciesAvailable,
+  WorkbenchAddonDependencyPreflightError,
+  type WorkbenchAddonDependencyPreflightOptions,
+} from "./addon-dependencies.js";
+import {
   defaultWorkbenchHelperManagedRoot,
   WORKBENCH_HELPER_ADDON_GUID,
   WORKBENCH_HELPER_ADDON_ID,
@@ -72,7 +77,6 @@ import {
 import {
   WorkbenchRunError,
   WorkbenchSessionController,
-  type WorkbenchTargetBuildHandoff,
 } from "./session-controller.js";
 
 const WORKBENCH_SUBDIRECTORY = "Workbench";
@@ -174,8 +178,7 @@ export interface WorkbenchRunnerExitStatus {
   timedOut: boolean;
 }
 
-export interface WorkbenchEditorRunnerReceipt {
-  version: 2;
+export interface WorkbenchEditorReceipt {
   intent: "editor";
   pid: number;
   target: string;
@@ -184,16 +187,6 @@ export interface WorkbenchEditorRunnerReceipt {
   companionIdentity: WorkbenchRunnerCompanionIdentity;
   logDirectory: string;
   exitStatus: WorkbenchRunnerExitStatus;
-}
-
-export interface WorkbenchBuildPreflightProof {
-  pid: number;
-  executablePath: string;
-  creationTime: string;
-  lifecycleGeneration: string;
-  endpointOwnership: "verified";
-  endpointVacancy: "verified";
-  logDirectory: string;
 }
 
 export interface WorkbenchBuildOutputProof {
@@ -210,14 +203,8 @@ export interface WorkbenchBuildValidationFailure {
   message: string;
 }
 
-/**
- * @deprecated Currently emitted until the target-only live evidence gate
- * passes; retained readable/exported through Stage 6.
- */
-export interface WorkbenchBuildRunnerReceiptV3 {
-  version: 3;
+export interface WorkbenchBuildReceipt {
   intent: "build";
-  /** Exact target-only build child, never the companion preflight child. */
   pid: number;
   executablePath: string;
   creationTime: string;
@@ -226,8 +213,6 @@ export interface WorkbenchBuildRunnerReceiptV3 {
   lifecycleGeneration: string;
   processOwnership: "verified";
   endpointVacancy: "verified";
-  companionIdentity: WorkbenchRunnerCompanionIdentity;
-  preflight: WorkbenchBuildPreflightProof;
   logDirectory: string;
   output: WorkbenchBuildOutputProof | null;
   /** Present only when an exit-0 build failed post-exit output attestation. */
@@ -235,28 +220,7 @@ export interface WorkbenchBuildRunnerReceiptV3 {
   exitStatus: WorkbenchRunnerExitStatus;
 }
 
-/** Pre-encoded post-gate contract. Stage 3 does not emit this shape yet. */
-export interface WorkbenchBuildRunnerReceiptV4 {
-  version: 4;
-  intent: "build";
-  pid: number;
-  executablePath: string;
-  creationTime: string;
-  target: string;
-  targetAddon: { addonId: string; addonGuid: string; sourceSha256: string };
-  lifecycleGeneration: string;
-  processOwnership: "verified";
-  endpointVacancy: "verified";
-  logDirectory: string;
-  output: WorkbenchBuildOutputProof | null;
-  validationFailure: WorkbenchBuildValidationFailure | null;
-  exitStatus: WorkbenchRunnerExitStatus;
-}
-
-/** Compatibility name for the currently emitted version-3 receipt. */
-export type WorkbenchBuildRunnerReceipt = WorkbenchBuildRunnerReceiptV3;
-
-export type WorkbenchRunnerReceipt = WorkbenchEditorRunnerReceipt | WorkbenchBuildRunnerReceipt;
+export type WorkbenchRunnerReceipt = WorkbenchEditorReceipt | WorkbenchBuildReceipt;
 
 export interface WorkbenchRunnerCompanionIdentity {
   addonId: string;
@@ -275,6 +239,11 @@ export type WorkbenchRunnerCompanionProbe = (
 
 export interface WorkbenchRunnerDependencies {
   processGuard?: WorkbenchLifecycleGuard;
+  /**
+   * Test/embedding factory for a runner-owned guard. Unlike `processGuard`,
+   * the returned guard is closed before `runWorkbenchIntent` settles.
+   */
+  processGuardFactory?: () => WorkbenchLifecycleGuard;
   companionProvider?: WorkbenchCompanionProvider;
   /** Explicit shared managed root for embedded/custom companion providers. */
   managedRoot?: string;
@@ -298,6 +267,14 @@ export interface WorkbenchRunnerDependencies {
   childSupervisor?: WorkbenchLifecycleChildSupervisor;
   /** Precomposed controller-owned lifecycle boundary for embedding and tests. */
   lifecycleExecution?: WorkbenchLifecycleExecutionPort;
+  /** Concrete guard reused by an embedded runner controller; no ownership is transferred. */
+  runnerProcessGuard?: WorkbenchLifecycleGuard;
+  /**
+   * The default standalone entry preserves attended recovery for every
+   * pre_spawn journal. owner_scoped is reserved for an active MCP controller
+   * that has already claimed and reconciled exact-vacant lifecycle state.
+   */
+  lifecycleEntry?: "standalone" | "owner_scoped";
 }
 
 interface CandidateLogDirectory {
@@ -384,6 +361,19 @@ export function validateWorkbenchAddonDirectories(
     canonical.push(directory);
   }
   return canonical;
+}
+
+function assertRunnerAddonDependenciesAvailable(
+  options: WorkbenchAddonDependencyPreflightOptions
+): void {
+  try {
+    assertWorkbenchAddonDependenciesAvailable(options);
+  } catch (error) {
+    if (error instanceof WorkbenchAddonDependencyPreflightError) {
+      throw new WorkbenchRunnerError(error.message, error.code);
+    }
+    throw error;
+  }
 }
 
 function logRootCandidates(addonDirectories: readonly string[]): string[] {
@@ -719,43 +709,6 @@ function validateCompanionLaunch(
   };
 }
 
-function commonProfileArguments(
-  config: Pick<Config, "workbenchScriptAuthorizeAll">,
-  addonDirectories: readonly string[],
-  profilePath: string
-): string[] {
-  const args: string[] = [];
-  if (addonDirectories.length > 0) args.push("-addonsDir", addonDirectories.join(","));
-  args.push("-profile", profilePath);
-  args.push("-noThrow");
-  if (config.workbenchScriptAuthorizeAll === true) args.push("-scriptAuthorizeAll");
-  return args;
-}
-
-function buildPreflightArguments(
-  config: Pick<Config, "workbenchScriptAuthorizeAll">,
-  target: string,
-  addonDirectories: readonly string[],
-  companion: WorkbenchCompanionLaunch,
-  ownerArgument: string
-): string[] {
-  const args = commonProfileArguments(
-    config,
-    addonDirectories,
-    companion.workbenchProfilePath
-  );
-  args.push(
-    "-addons",
-    companion.addonGuid,
-    "-gproj",
-    target,
-    ownerArgument,
-    "-wbModule=ResourceManager",
-    "-run"
-  );
-  return args;
-}
-
 function runnerCompanionPing(
   endpoint: Readonly<WorkbenchLaunchEndpoint>,
   timeoutMs: number
@@ -865,174 +818,46 @@ async function attributeLogDirectory(args: {
   ownerToken: string;
   deadline: Deadline;
   pollMs: number;
+  signal?: AbortSignal;
 }): Promise<string> {
-  const result = await pollUntil<string>({
-    clock: systemClock,
-    sleeper: systemSleeper,
-    deadline: args.deadline,
-    intervalMs: args.pollMs,
-    probe: async (): Promise<string | undefined> => {
-      const matches: string[] = [];
-      const candidates = candidateLogDirectories(args.logRoot, args.before, args.launchedAtMs);
-      for (const candidate of candidates) {
-        if (await logDirectoryContainsOwner(candidate, args.ownerToken)) matches.push(candidate.path);
-      }
-      if (matches.length > 1) {
-        throw new WorkbenchRunnerError(
-          `The exact private owner token appeared in ${matches.length} Workbench log directories.`,
-          "LOG_ATTRIBUTION_FAILED"
-        );
-      }
-      return matches.length === 1 ? matches[0] : undefined;
-    },
-  });
+  let result;
+  try {
+    result = await pollUntil<string>({
+      clock: systemClock,
+      sleeper: systemSleeper,
+      deadline: args.deadline,
+      intervalMs: args.pollMs,
+      signal: args.signal,
+      probe: async (): Promise<string | undefined> => {
+        const matches: string[] = [];
+        const candidates = candidateLogDirectories(args.logRoot, args.before, args.launchedAtMs);
+        for (const candidate of candidates) {
+          if (await logDirectoryContainsOwner(candidate, args.ownerToken)) matches.push(candidate.path);
+        }
+        if (matches.length > 1) {
+          throw new WorkbenchRunnerError(
+            `The exact private owner token appeared in ${matches.length} Workbench log directories.`,
+            "LOG_ATTRIBUTION_FAILED"
+          );
+        }
+        return matches.length === 1 ? matches[0] : undefined;
+      },
+    });
+  } catch (error) {
+    if (args.signal?.aborted) {
+      throw new WorkbenchRunnerError(
+        "Workbench build was aborted while attributing its exact log directory.",
+        "BUILD_ABORTED"
+      );
+    }
+    throw error;
+  }
   if (result.kind === "value") return result.value;
   throw new WorkbenchRunnerError(
     "No Workbench log directory contained the exact private owner token before the attribution deadline.",
     "LOG_ATTRIBUTION_FAILED"
   );
 }
-
-interface BuildCompanionPreflightArgs {
-  controller: WorkbenchSessionController;
-  config: Config;
-  executablePath: string;
-  target: WorkbenchLifecycleTarget;
-  companion: WorkbenchCompanionLaunch;
-  companionProvider: WorkbenchCompanionProvider;
-  reattestCompanion: () => WorkbenchCompanionLaunch;
-  reattestTarget: () => WorkbenchBuildProjectMetadata;
-  addonDirectories: readonly string[];
-  endpoint: WorkbenchLaunchEndpoint;
-  logRoot: string;
-  outputReservation: WorkbenchBuildOutputReservation;
-  endpointProbeTimeoutMs: number;
-  endpointPollMs: number;
-  companionProbe: WorkbenchRunnerCompanionProbe;
-  logAttributionTimeoutMs: number;
-  logPollMs: number;
-  terminationTimeoutMs: number;
-  recoveryTimeoutMs: number;
-  deadlineMs: number;
-  signal?: AbortSignal;
-}
-
-interface BuildCompanionPreflightResult {
-  proof: WorkbenchBuildPreflightProof;
-  companionIdentity: WorkbenchRunnerCompanionIdentity;
-  handoff: WorkbenchTargetBuildHandoff;
-}
-
-async function runBuildCompanionPreflight(
-  args: BuildCompanionPreflightArgs
-): Promise<BuildCompanionPreflightResult> {
-  if (args.signal?.aborted) {
-    throw new WorkbenchRunnerError(
-      "Workbench build was aborted before companion preflight spawn.",
-      "BUILD_ABORTED"
-    );
-  }
-  if (Date.now() >= args.deadlineMs) {
-    throw new WorkbenchRunnerError(
-      "Workbench build deadline expired before companion preflight spawn.",
-      "BUILD_DEADLINE_EXCEEDED"
-    );
-  }
-  args.reattestTarget();
-  args.reattestCompanion();
-  args.companionProvider.applyRetention?.({ protectedDigests: [args.companion.bundleDigest] });
-  const beforeLogs = snapshotLogDirectories(args.logRoot);
-  const owner = args.controller.createPlanOwnerCredential();
-  const launchArguments = buildPreflightArguments(
-    args.config,
-    args.target.path,
-    args.addonDirectories,
-    args.companion,
-    owner.argument
-  );
-  let logDirectory: string | null = null;
-  try {
-    const result = await args.controller.runTemporaryCompanionPreflight({
-      kind: "temporary_companion_preflight",
-      executablePath: args.executablePath,
-      lifecycleTarget: args.target,
-      helper: args.companion,
-      endpoint: args.endpoint,
-      ownerArgument: owner.argument,
-      argv: launchArguments,
-      spawnOptions: {
-        cwd: dirname(args.executablePath),
-        detached: false,
-        stdio: "ignore",
-        windowsHide: true,
-      },
-    }, {
-      deadlineMs: args.deadlineMs,
-      signal: args.signal,
-      terminationTimeoutMs: args.terminationTimeoutMs,
-      recoveryTimeoutMs: args.recoveryTimeoutMs,
-      beforeClaim: () => { args.outputReservation.revalidateAndSnapshot(); },
-      afterClaim: () => { args.outputReservation.revalidateAndSnapshot(); },
-      beforeFinalVacancyCheck: () => {
-        args.reattestTarget();
-        args.reattestCompanion();
-      },
-      beforeSpawn: () => {
-        args.reattestTarget();
-        args.reattestCompanion();
-      },
-      qualify: (context) => args.controller.qualifyCompanion(context, {
-        netApi: companionProbePort(args.endpoint, args.companionProbe),
-        attestCompanion: args.reattestCompanion,
-        deadlineMs: deriveDeadline(
-          systemClock,
-          deadlineAt(args.deadlineMs),
-          args.endpointProbeTimeoutMs
-        ).atMs,
-        pollIntervalMs: args.endpointPollMs,
-        signal: args.signal,
-      }),
-      beforeHandoff: async (proof) => {
-        args.reattestTarget();
-        args.reattestCompanion();
-        logDirectory = await attributeLogDirectory({
-          logRoot: args.logRoot,
-          before: beforeLogs,
-          launchedAtMs: proof.process.launchedAtMs,
-          ownerToken: owner.token,
-          deadline: deriveDeadline(
-            systemClock,
-            deadlineAt(args.deadlineMs),
-            args.logAttributionTimeoutMs
-          ),
-          pollMs: args.logPollMs,
-        });
-      },
-    });
-    if (!logDirectory) {
-      throw new WorkbenchRunnerError(
-        "Workbench companion preflight completed without an attributed log directory.",
-        "LOG_ATTRIBUTION_FAILED"
-      );
-    }
-    return {
-      proof: {
-        pid: result.process.pid,
-        lifecycleGeneration: result.lifecycleGeneration,
-        endpointOwnership: result.endpointOwnership,
-        endpointVacancy: result.endpointVacancy,
-        executablePath: result.process.executablePath,
-        creationTime: result.process.creationTime,
-        logDirectory,
-      },
-      companionIdentity: result.qualification,
-      handoff: result.handoff,
-    };
-  } catch (error) {
-    throw mapControllerRunError(error, "build");
-  }
-}
-
 
 interface TargetBuildStageArgs {
   controller: WorkbenchSessionController;
@@ -1042,13 +867,10 @@ interface TargetBuildStageArgs {
   target: WorkbenchLifecycleTarget;
   buildProject: WorkbenchBuildProjectMetadata;
   managedProfile: Readonly<WorkbenchManagedBuildProfile>;
-  companion: WorkbenchCompanionLaunch;
-  companionProvider: WorkbenchCompanionProvider;
-  reattestCompanion: () => WorkbenchCompanionLaunch;
   reattestTarget: () => WorkbenchBuildProjectMetadata;
+  reattestDependencies: () => void;
   logRoot: string;
   outputReservation: WorkbenchBuildOutputReservation;
-  preflight: BuildCompanionPreflightResult;
   logAttributionTimeoutMs: number;
   logPollMs: number;
   terminationTimeoutMs: number;
@@ -1057,37 +879,21 @@ interface TargetBuildStageArgs {
   signal?: AbortSignal;
 }
 
-async function runTargetBuildStage(args: TargetBuildStageArgs): Promise<WorkbenchBuildRunnerReceipt> {
-  try {
-    return await runTargetBuildStageWithHandoff(args);
-  } catch (error) {
-    try {
-      await args.controller.cancelTargetBuildHandoff(args.preflight.handoff, args.target);
-    } catch (cleanupError) {
-      throw mapControllerRunError(cleanupError, "build");
-    }
-    throw mapControllerRunError(error, "build");
-  }
-}
-
-async function runTargetBuildStageWithHandoff(
-  args: TargetBuildStageArgs
-): Promise<WorkbenchBuildRunnerReceipt> {
+async function runTargetBuildStage(args: TargetBuildStageArgs): Promise<WorkbenchBuildReceipt> {
   if (args.signal?.aborted) {
     throw new WorkbenchRunnerError(
-      "Workbench build was aborted after companion preflight and before target spawn.",
+      "Workbench build was aborted before target spawn.",
       "BUILD_ABORTED"
     );
   }
   if (Date.now() >= args.deadlineMs) {
     throw new WorkbenchRunnerError(
-      "Workbench build deadline expired after companion preflight and before target spawn.",
+      "Workbench build deadline expired before target spawn.",
       "BUILD_DEADLINE_EXCEEDED"
     );
   }
   const revalidatedTarget = args.reattestTarget();
-  args.reattestCompanion();
-  args.companionProvider.applyRetention?.({ protectedDigests: [args.companion.bundleDigest] });
+  args.reattestDependencies();
   const beforeLogs = snapshotLogDirectories(args.logRoot);
   args.outputReservation.revalidateAndSnapshot();
   const owner = args.controller.createPlanOwnerCredential();
@@ -1126,14 +932,13 @@ async function runTargetBuildStageWithHandoff(
       signal: args.signal,
       terminationTimeoutMs: args.terminationTimeoutMs,
       recoveryTimeoutMs: args.recoveryTimeoutMs,
-      handoff: args.preflight.handoff,
       beforeFinalVacancyCheck: () => {
         args.reattestTarget();
-        args.reattestCompanion();
+        args.reattestDependencies();
       },
       beforeSpawn: () => {
         args.reattestTarget();
-        args.reattestCompanion();
+        args.reattestDependencies();
       },
     });
   } catch (error) {
@@ -1160,7 +965,6 @@ async function runTargetBuildStageWithHandoff(
     }
   }
   args.reattestTarget();
-  args.reattestCompanion();
   const logDirectory = await attributeLogDirectory({
     logRoot: args.logRoot,
     before: beforeLogs,
@@ -1172,9 +976,9 @@ async function runTargetBuildStageWithHandoff(
       args.logAttributionTimeoutMs
     ),
     pollMs: args.logPollMs,
+    signal: args.signal,
   });
   return {
-    version: 3,
     intent: "build",
     pid: run.process.pid,
     executablePath: run.process.executablePath,
@@ -1188,8 +992,6 @@ async function runTargetBuildStageWithHandoff(
     lifecycleGeneration: run.lifecycleGeneration,
     processOwnership: "verified",
     endpointVacancy: run.endpointVacancy,
-    companionIdentity: args.preflight.companionIdentity,
-    preflight: args.preflight.proof,
     logDirectory,
     output,
     validationFailure,
@@ -1199,7 +1001,7 @@ async function runTargetBuildStageWithHandoff(
 
 
 /**
- * Run a structured Workbench purpose under a durable version-3 reservation.
+ * Run a structured Workbench purpose under a durable lifecycle reservation.
  *
  * The machine mutex is held only to reserve or CAS lifecycle state. Readiness,
  * foreground lifetime, and bounded recovery run without the mutex; each later
@@ -1214,35 +1016,187 @@ export async function runWorkbenchIntent(
   if (!intent || (intent.kind !== "editor" && intent.kind !== "build")) {
     throw new WorkbenchRunnerError("Workbench runner intent is unsupported.", "INVALID_INTENT");
   }
-  const lifecycleExecution = dependencies.lifecycleExecution ??
-    WorkbenchSessionController.composeLifecycleExecution({
-      processGuard: dependencies.processGuard,
-      childSupervisor: dependencies.childSupervisor,
-      spawnProcess: dependencies.spawnProcess,
-      failure: (message, code) => new WorkbenchRunnerError(message, code),
+  const suppliedExecution = dependencies.lifecycleExecution;
+  if (suppliedExecution) {
+    return runWorkbenchIntentWithExecution(config, intent, dependencies, suppliedExecution);
+  }
+  const lifecycleExecution = WorkbenchSessionController.composeLifecycleExecution({
+    processGuard: dependencies.processGuard,
+    processGuardFactory: dependencies.processGuardFactory,
+    childSupervisor: dependencies.childSupervisor,
+    spawnProcess: dependencies.spawnProcess,
+    failure: (message, code) => new WorkbenchRunnerError(message, code),
   });
   try {
-    await WorkbenchSessionController.assertStandaloneEntryReady(lifecycleExecution);
+    return await runWorkbenchIntentWithExecution(
+      config,
+      intent,
+      dependencies,
+      lifecycleExecution
+    );
+  } finally {
+    await lifecycleExecution.close();
+  }
+}
+
+async function runWorkbenchIntentWithExecution(
+  config: Config,
+  intent: WorkbenchRunnerIntent,
+  dependencies: WorkbenchRunnerDependencies,
+  lifecycleExecution: WorkbenchLifecycleExecutionPort
+): Promise<WorkbenchRunnerReceipt> {
+  const lifecycleEntry = dependencies.lifecycleEntry ?? "standalone";
+  if (lifecycleEntry === "owner_scoped" && intent.kind !== "build") {
+    throw new WorkbenchRunnerError(
+      "Owner-scoped runner entry is supported only for bounded target builds.",
+      "INVALID_INTENT"
+    );
+  }
+  if (lifecycleEntry === "owner_scoped" && !dependencies.lifecycleExecution) {
+    throw new WorkbenchRunnerError(
+      "Owner-scoped runner entry requires the active MCP lifecycle execution boundary.",
+      "INVALID_CONFIG"
+    );
+  }
+  try {
+    if (lifecycleEntry === "owner_scoped") {
+      await lifecycleExecution.assertSpawnJournalReplaceable();
+    } else {
+      await WorkbenchSessionController.assertStandaloneEntryReady(lifecycleExecution);
+    }
   } catch (error) {
     throw new WorkbenchRunnerError(
-      `Standalone Workbench launch is refused while durable spawn recovery is unresolved: ` +
+      `${lifecycleEntry === "owner_scoped"
+        ? "Owner-scoped Workbench build"
+        : "Standalone Workbench launch"} is refused while durable spawn recovery is unresolved: ` +
         `${error instanceof Error ? error.message : String(error)}`,
       "LIFECYCLE_CONFLICT"
     );
   }
   const project = canonicalizeGproj(intent.gprojPath);
-  const buildProject = intent.kind === "build"
-    ? resolveBuildProjectMetadata(project.displayPath)
-    : null;
-  const executablePath = intent.kind === "build"
-    ? resolveWorkbenchExecutable(config)
-    : null;
-  const configuredAddonDirectories = intent.kind === "build"
-    ? validateWorkbenchAddonDirectories(config.workbenchAddonDirs)
-    : [];
   const managedRootPath = dependencies.managedRoot ??
     config.observer?.managedRoot ??
     defaultWorkbenchHelperManagedRoot();
+  const endpoint = validateEndpoint(config);
+  if (intent.kind === "editor" && intent.foreground !== true) {
+    throw new WorkbenchRunnerError(
+      "Editor intent must be foreground; detached mode has no persistent guardian.",
+      "INVALID_INTENT"
+    );
+  }
+
+  const endpointProbeTimeoutMs = positiveInteger(
+    dependencies.endpointProbeTimeoutMs ?? DEFAULT_ENDPOINT_PROBE_TIMEOUT_MS,
+    "Endpoint probe timeout"
+  );
+  const endpointPollMs = positiveInteger(
+    dependencies.endpointPollMs ?? DEFAULT_ENDPOINT_POLL_MS,
+    "Endpoint poll interval"
+  );
+  const logAttributionTimeoutMs = positiveInteger(
+    dependencies.logAttributionTimeoutMs ?? DEFAULT_LOG_ATTRIBUTION_TIMEOUT_MS,
+    "Log attribution timeout"
+  );
+  const logPollMs = positiveInteger(
+    dependencies.logPollMs ?? DEFAULT_LOG_POLL_MS,
+    "Log poll interval"
+  );
+  const terminationTimeoutMs = positiveInteger(
+    dependencies.terminationTimeoutMs ?? DEFAULT_TERMINATION_TIMEOUT_MS,
+    "Termination timeout"
+  );
+  const recoveryTimeoutMs = positiveInteger(
+    dependencies.recoveryTimeoutMs ?? DEFAULT_RECOVERY_TIMEOUT_MS,
+    "Recovery timeout"
+  );
+  const controller = WorkbenchSessionController.composeRunner(
+    endpoint.host,
+    endpoint.port,
+    lifecycleExecution,
+    dependencies.runnerProcessGuard
+  );
+
+  const target: WorkbenchLifecycleTarget = toLifecycleTarget(project);
+  if (intent.kind === "build") {
+    const buildProject = resolveBuildProjectMetadata(project.displayPath);
+    let managedBuildProfile: Readonly<WorkbenchManagedBuildProfile>;
+    try {
+      managedBuildProfile = ensureWorkbenchManagedBuildProfile(managedRootPath, project);
+    } catch (error) {
+      rethrowLaunchPlanError(error);
+    }
+    const targetAddonSearchRoot = canonicalDirectory(
+      dirname(project.modDirectory),
+      "Workbench target add-on search root"
+    );
+    const targetAddonDirectories = validateWorkbenchAddonDirectories([
+      ...validateWorkbenchAddonDirectories(config.workbenchAddonDirs),
+      targetAddonSearchRoot,
+    ]);
+    assertRunnerAddonDependenciesAvailable({
+      targetGprojPath: project.displayPath,
+      addonRoots: targetAddonDirectories,
+      launchStatus: "No Workbench process was launched.",
+    });
+    const reattestBuildDependencies = (): void => {
+      assertRunnerAddonDependenciesAvailable({
+        targetGprojPath: project.displayPath,
+        addonRoots: targetAddonDirectories,
+      });
+    };
+    const reattestBuildTarget = (): WorkbenchBuildProjectMetadata => {
+      let current: WorkbenchBuildProjectMetadata;
+      try {
+        const identity = revalidateProjectIdentity(project);
+        current = resolveBuildProjectMetadata(identity.displayPath);
+      } catch (error) {
+        if (error instanceof WorkbenchRunnerError) throw error;
+        throw new WorkbenchRunnerError(
+          `Workbench build target identity could not be revalidated: ` +
+            `${error instanceof Error ? error.message : String(error)}`,
+          "INVALID_TARGET"
+        );
+      }
+      if (current.addonId !== buildProject.addonId ||
+          current.addonGuid !== buildProject.addonGuid ||
+          current.sourceSha256 !== buildProject.sourceSha256) {
+        throw new WorkbenchRunnerError(
+          "Workbench build target path, add-on ID/GUID, or project content changed after validation.",
+          "INVALID_TARGET"
+        );
+      }
+      return current;
+    };
+    const buildLogRoot = dependencies.logRoot
+      ? canonicalDirectory(dependencies.logRoot, "Workbench log root")
+      : managedBuildProfile.logRoot;
+    const outputPath = validateBuildOutput(intent, [
+      { label: "the target mod", path: project.modDirectory },
+      { label: "the observer managed root", path: managedBuildProfile.managedRoot },
+    ]);
+    const outputReservation = reserveBuildOutput(outputPath);
+    const deadlineMs = Date.now() + intent.timeoutMs;
+    return runTargetBuildStage({
+      controller,
+      config,
+      intent,
+      project,
+      target,
+      buildProject,
+      managedProfile: managedBuildProfile,
+      reattestTarget: reattestBuildTarget,
+      reattestDependencies: reattestBuildDependencies,
+      logRoot: buildLogRoot,
+      outputReservation,
+      logAttributionTimeoutMs,
+      logPollMs,
+      terminationTimeoutMs,
+      recoveryTimeoutMs,
+      deadlineMs,
+      signal: dependencies.signal,
+    });
+  }
+
   const companionProvider = dependencies.companionProvider ?? new WorkbenchHelperStager({
     managedRoot: managedRootPath,
   });
@@ -1296,177 +1250,13 @@ export async function runWorkbenchIntent(
     companion = attested;
     return companion;
   };
-  const reattestBuildTarget = (): WorkbenchBuildProjectMetadata => {
-    if (!buildProject) {
-      throw new WorkbenchRunnerError(
-        "Workbench build target metadata was not prepared.",
-        "INVALID_TARGET"
-      );
-    }
-    let current: WorkbenchBuildProjectMetadata;
-    try {
-      const identity = revalidateProjectIdentity(project);
-      current = resolveBuildProjectMetadata(identity.displayPath);
-    } catch (error) {
-      if (error instanceof WorkbenchRunnerError) throw error;
-      throw new WorkbenchRunnerError(
-        `Workbench build target identity could not be revalidated: ` +
-          `${error instanceof Error ? error.message : String(error)}`,
-        "INVALID_TARGET"
-      );
-    }
-    if (current.addonId !== buildProject.addonId ||
-        current.addonGuid !== buildProject.addonGuid ||
-        current.sourceSha256 !== buildProject.sourceSha256) {
-      throw new WorkbenchRunnerError(
-        "Workbench build target path, add-on ID/GUID, or project content changed after validation.",
-        "INVALID_TARGET"
-      );
-    }
-    return current;
-  };
   reattestCompanion();
-  let managedBuildProfile: Readonly<WorkbenchManagedBuildProfile> | null = null;
-  if (intent.kind === "build") {
-    try {
-      managedBuildProfile = ensureWorkbenchManagedBuildProfile(managedRootPath, project);
-    } catch (error) {
-      rethrowLaunchPlanError(error);
-    }
-  }
-  const targetAddonSearchRoot = intent.kind === "build"
-    ? canonicalDirectory(dirname(project.modDirectory), "Workbench target add-on search root")
-    : null;
-  const targetAddonDirectories = targetAddonSearchRoot
-    ? validateWorkbenchAddonDirectories([
-        ...configuredAddonDirectories,
-        targetAddonSearchRoot,
-      ])
-    : [];
-  const preflightAddonDirectories = intent.kind === "build"
-    ? validateWorkbenchAddonDirectories([
-        ...targetAddonDirectories,
-        companion.addonSearchRoot,
-      ])
-    : [];
-  const endpoint = validateEndpoint(config);
+  companionProvider.applyRetention?.({ protectedDigests: [companion.bundleDigest] });
   const managedLogRoot = join(companion.workbenchProfilePath, "logs");
   if (!dependencies.logRoot) mkdirSync(managedLogRoot, { recursive: true });
   const logRoot = dependencies.logRoot
     ? canonicalDirectory(dependencies.logRoot, "Workbench log root")
     : canonicalDirectory(managedLogRoot, "Workbench log root");
-  const buildLogRoot = dependencies.logRoot
-    ? logRoot
-    : managedBuildProfile?.logRoot ?? logRoot;
-  const protectedOutputRoots = [
-    { label: "the target mod", path: project.modDirectory },
-    { label: "the companion add-on search root", path: companion.addonSearchRoot },
-    { label: "the companion profile", path: companion.workbenchProfilePath },
-  ];
-  if (intent.kind === "build") {
-    protectedOutputRoots.push({
-      label: "the observer managed root",
-      path: canonicalDirectory(managedRootPath, "Observer managed root"),
-    });
-  }
-  const outputPath = intent.kind === "build"
-    ? validateBuildOutput(intent, protectedOutputRoots)
-    : null;
-  const outputReservation = outputPath ? reserveBuildOutput(outputPath) : null;
-  if (intent.kind === "editor" && intent.foreground !== true) {
-    throw new WorkbenchRunnerError(
-      "Editor intent must be foreground; detached mode has no persistent guardian.",
-      "INVALID_INTENT"
-    );
-  }
-
-  const endpointProbeTimeoutMs = positiveInteger(
-    dependencies.endpointProbeTimeoutMs ?? DEFAULT_ENDPOINT_PROBE_TIMEOUT_MS,
-    "Endpoint probe timeout"
-  );
-  const endpointPollMs = positiveInteger(
-    dependencies.endpointPollMs ?? DEFAULT_ENDPOINT_POLL_MS,
-    "Endpoint poll interval"
-  );
-  const logAttributionTimeoutMs = positiveInteger(
-    dependencies.logAttributionTimeoutMs ?? DEFAULT_LOG_ATTRIBUTION_TIMEOUT_MS,
-    "Log attribution timeout"
-  );
-  const logPollMs = positiveInteger(
-    dependencies.logPollMs ?? DEFAULT_LOG_POLL_MS,
-    "Log poll interval"
-  );
-  const terminationTimeoutMs = positiveInteger(
-    dependencies.terminationTimeoutMs ?? DEFAULT_TERMINATION_TIMEOUT_MS,
-    "Termination timeout"
-  );
-  const recoveryTimeoutMs = positiveInteger(
-    dependencies.recoveryTimeoutMs ?? DEFAULT_RECOVERY_TIMEOUT_MS,
-    "Recovery timeout"
-  );
-  const controller = WorkbenchSessionController.composeRunner(
-    endpoint.host,
-    endpoint.port,
-    lifecycleExecution
-  );
-
-  const target: WorkbenchLifecycleTarget = toLifecycleTarget(project);
-  if (intent.kind === "build") {
-    if (!buildProject || !outputReservation || !executablePath || !managedBuildProfile) {
-      throw new WorkbenchRunnerError(
-        "Workbench build project metadata, profile, executable, or output was not prepared.",
-        "INVALID_INTENT"
-      );
-    }
-    const deadlineMs = Date.now() + intent.timeoutMs;
-    const preflight = await runBuildCompanionPreflight({
-      controller,
-      config,
-      executablePath,
-      target,
-      companion,
-      companionProvider,
-      reattestCompanion,
-      reattestTarget: reattestBuildTarget,
-      addonDirectories: preflightAddonDirectories,
-      endpoint,
-      logRoot,
-      outputReservation,
-      endpointProbeTimeoutMs,
-      endpointPollMs,
-      companionProbe: dependencies.companionProbe ?? runnerCompanionPing,
-      logAttributionTimeoutMs,
-      logPollMs,
-      terminationTimeoutMs,
-      recoveryTimeoutMs,
-      deadlineMs,
-      signal: dependencies.signal,
-    });
-    return runTargetBuildStage({
-      controller,
-      config,
-      intent,
-      project,
-      target,
-      buildProject,
-      managedProfile: managedBuildProfile,
-      companion,
-      companionProvider,
-      reattestCompanion,
-      reattestTarget: reattestBuildTarget,
-      logRoot: buildLogRoot,
-      outputReservation,
-      preflight,
-      logAttributionTimeoutMs,
-      logPollMs,
-      terminationTimeoutMs,
-      recoveryTimeoutMs,
-      deadlineMs,
-      signal: dependencies.signal,
-    });
-  }
-  reattestCompanion();
-  companionProvider.applyRetention?.({ protectedDigests: [companion.bundleDigest] });
   const beforeLogs = snapshotLogDirectories(logRoot);
   const owner = controller.createPlanOwnerCredential();
   let launchPlan: ReturnType<typeof buildCliEditorLaunchPlan>;
@@ -1513,7 +1303,6 @@ export async function runWorkbenchIntent(
     pollMs: logPollMs,
   });
   return {
-    version: 2,
     intent: "editor",
     pid: run.process.pid,
     target: project.displayPath,

@@ -89,6 +89,7 @@ function discoveryResult(
 
 beforeEach(() => {
   temporaryRoot = mkdtempSync(join(tmpdir(), "reforger-forge-config-test-"));
+  vi.stubEnv("OneDrive", join(temporaryRoot, "missing-onedrive"));
   configurationDirectory = createDirectory("configuration");
   fixturePaths = {
     workbench: createWorkbenchInstallation("configuration", "workbench"),
@@ -155,6 +156,56 @@ describe("effective configuration contract", () => {
     });
     expect(config.projectPath).toBeUndefined();
     expect(config.observer!.evidenceRoots).toBeUndefined();
+  });
+
+  it("adds base-game and standard Workshop roots around explicit roots while preserving opt-out", () => {
+    const workshopRoot = createDirectory("workshop-addons");
+    const explicitRoot = createDirectory("explicit-addons");
+    const options = {
+      discoverWorkshopAddonRoot: () => workshopRoot,
+    };
+
+    const unspecified = loadConfig([
+      "--workbench-path", fixturePaths.workbench,
+      "--game-path", fixturePaths.game,
+    ], options);
+    expect(unspecified.workbenchAddonDirs).toEqual([
+      join(fixturePaths.game, "addons"),
+      workshopRoot,
+    ]);
+
+    const explicit = loadConfig([
+      "--workbench-path", fixturePaths.workbench,
+      "--game-path", fixturePaths.game,
+      "--workbench-addon-dir", explicitRoot,
+    ], options);
+    expect(explicit.workbenchAddonDirs).toEqual([
+      join(fixturePaths.game, "addons"),
+      workshopRoot,
+      explicitRoot,
+    ]);
+
+    const optedOut = loadConfig([
+      "--workbench-path", fixturePaths.workbench,
+      "--game-path", fixturePaths.game,
+      "--no-workbench-addon-dirs",
+    ], options);
+    expect(optedOut.workbenchAddonDirs).toEqual([]);
+  });
+
+  it("does not duplicate a base-game root the caller already supplied", () => {
+    const workshopRoot = createDirectory("workshop-addons");
+    const baseGameRoot = join(fixturePaths.game, "addons");
+
+    const config = loadConfig([
+      "--workbench-path", fixturePaths.workbench,
+      "--game-path", fixturePaths.game,
+      "--workbench-addon-dir", baseGameRoot,
+    ], {
+      discoverWorkshopAddonRoot: () => workshopRoot,
+    });
+
+    expect(config.workbenchAddonDirs).toEqual([baseGameRoot, workshopRoot]);
   });
 
   it("loads exactly the requested partial file and retains safe internal defaults", () => {
@@ -228,7 +279,11 @@ describe("effective configuration contract", () => {
       { cwd: temporaryRoot }
     );
 
-    expect(config.workbenchAddonDirs).toEqual([addonOne, addonTwo]);
+    expect(config.workbenchAddonDirs).toEqual([
+      join(fixturePaths.game, "addons"),
+      addonOne,
+      addonTwo,
+    ]);
     expect(config.extractedPath).toBe(extracted);
     expect(config.observer).toMatchObject({
       managedRoot,
@@ -276,7 +331,11 @@ describe("effective configuration contract", () => {
     ], { cwd: temporaryRoot });
 
     expect(config.workbenchPath).toBe(cliWorkbench);
-    expect(config.workbenchAddonDirs).toEqual([cliAddonOne, cliAddonTwo]);
+    expect(config.workbenchAddonDirs).toEqual([
+      join(fixturePaths.game, "addons"),
+      cliAddonOne,
+      cliAddonTwo,
+    ]);
     expect(config.workbenchHost).toBe("cli-host");
     expect(config.workbenchPort).toBe(7000);
     expect(config.workbenchScriptAuthorizeAll).toBe(false);
@@ -364,7 +423,7 @@ describe("effective configuration contract", () => {
       workbenchPath: workbench,
       gamePath: game,
       projectPath: project,
-      workbenchAddonDirs: [addon],
+      workbenchAddonDirs: [join(game, "addons"), addon],
       workbenchScriptAuthorizeAll: true,
       workbenchHost: "cli-host",
       workbenchPort: 6001,
@@ -544,7 +603,7 @@ describe("effective configuration contract", () => {
     ["workbenchPath", { workbenchPath: "./missing-workbench" }, "directory"],
     ["gamePath", { gamePath: "./missing-game" }, "directory"],
     ["projectPath", { projectPath: "./missing-project" }, "directory"],
-    ["workbenchAddonDirs entry 1", { workbenchAddonDirs: ["./missing-addon"] }, "directory"],
+    ["workbenchAddonDirs entry 2", { workbenchAddonDirs: ["./missing-addon"] }, "directory"],
     ["extractedPath", { extractedPath: "./missing-extracted" }, "directory"],
     ["observer.agentPath", { observer: { agentPath: "./missing-agent.js" } }, "file"],
     [

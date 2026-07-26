@@ -278,6 +278,54 @@ describe("WorkbenchProcessGuard v3 lifecycle state", () => {
     ).rejects.toMatchObject({ code: "GENERATION_MISMATCH" });
   });
 
+  it("retires only its exact pre_spawn journal generation", async () => {
+    const stateDir = root();
+    const backend = createFakeLifecycleBackend();
+    const guard = new WorkbenchProcessGuard({ stateDir, backend });
+    const authority = await guard.withLifecycleLock(async (session) => {
+      const claim = await session.validateAndClaim({
+        endpoint: { host: "127.0.0.1", port: 5775 }, target: target(),
+      });
+      if (claim.kind !== "claimed") throw new Error("claim failed");
+      return session.transition(
+        { generation: claim.state.generation, leaseId: claim.state.mcpOwner!.leaseId },
+        {
+          ...claim.state,
+          phase: "starting",
+          operation: { kind: "launch", operationId: "spawn-retirement" },
+        }
+      );
+    });
+    const preSpawn = (transactionId: string) => ({
+      transactionId,
+      phase: "pre_spawn" as const,
+      pid: null,
+      identity: null,
+      createdAtMs: 1,
+      updatedAtMs: 1,
+      metadata: {
+        purpose: "mcp_editor" as const,
+        lifecycleGeneration: authority.generation,
+        targetKey: authority.target!.comparisonKey,
+      },
+    });
+    const first = guard.createSpawnJournal(authority);
+    const firstRecord = await first.persist(null, preSpawn("transaction-a"));
+    const replacement = guard.createSpawnJournal(authority);
+    const replacementRecord = await replacement.persist(null, preSpawn("transaction-b"));
+
+    await expect(first.discardPreSpawn!(firstRecord)).rejects.toMatchObject({
+      code: "RECOVERY_REQUIRED",
+    });
+    await expect(guard.readSpawnJournal()).resolves.toMatchObject({
+      kind: "valid",
+      record: { transactionId: "transaction-b", phase: "pre_spawn" },
+    });
+
+    await replacement.discardPreSpawn!(replacementRecord);
+    await expect(guard.readSpawnJournal()).resolves.toEqual({ kind: "missing" });
+  });
+
   it("archives malformed state only after proving Workbench absence", async () => {
     const stateDir = root();
     const backend = createFakeLifecycleBackend();

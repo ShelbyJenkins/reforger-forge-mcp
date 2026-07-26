@@ -15,8 +15,7 @@ import { buildCliEditorLaunchPlan } from "../../src/workbench/launch-plan.js";
 import type { CompanionReadinessOptions } from "../../src/workbench/readiness.js";
 import { WORKBENCH_OWNER_ARG_PREFIX } from "../../src/workbench/process-guard.js";
 import type {
-  WorkbenchBuildRunnerReceipt,
-  WorkbenchBuildRunnerReceiptV4,
+  WorkbenchBuildReceipt,
 } from "../../src/workbench/runner.js";
 import { WorkbenchSessionController } from "../../src/workbench/session-controller.js";
 import {
@@ -125,14 +124,11 @@ describe("hermetic target-build acceptance", () => {
     expect(fixture.supervisor.counts()).toEqual({ active: 0, reconciling: 0, total: 0 });
   });
 
-  it("keeps legacy V3 preflight evidence out of the target plan and binds receipt PID to target", async () => {
+  it("uses one helper-free build receipt that binds the target process", async () => {
     const fixture = createFixture();
     const plan = fixture.targetPlan();
     const evidence = await exerciseHermeticTargetPlan(fixture, plan);
-    const preflightPid = evidence.process.pid + 10_000;
-    const companion = fixture.companion;
     const receipt = {
-      version: 3,
       intent: "build",
       pid: evidence.process.pid,
       executablePath: evidence.process.executablePath,
@@ -142,24 +138,6 @@ describe("hermetic target-build acceptance", () => {
       lifecycleGeneration: "target-generation",
       processOwnership: "verified",
       endpointVacancy: "verified",
-      companionIdentity: {
-        addonId: companion.addonId,
-        addonGuid: companion.addonGuid,
-        addonVersion: companion.addonVersion,
-        protocolVersion: companion.protocolVersion,
-        workbenchProtocol: companion.protocolVersion,
-        buildIdentity: companion.buildIdentity,
-        bundleDigest: companion.bundleDigest,
-      },
-      preflight: {
-        pid: preflightPid,
-        executablePath: evidence.process.executablePath,
-        creationTime: "133900000000041000",
-        lifecycleGeneration: "preflight-generation",
-        endpointOwnership: "verified",
-        endpointVacancy: "verified",
-        logDirectory: "redacted-preflight-log",
-      },
       logDirectory: "redacted-target-log",
       output: {
         root: fixture.outputPath,
@@ -176,54 +154,21 @@ describe("hermetic target-build acceptance", () => {
         signal: null,
         timedOut: false,
       },
-    } satisfies WorkbenchBuildRunnerReceipt;
+    } satisfies WorkbenchBuildReceipt;
 
     expect(receipt.pid).toBe(evidence.process.pid);
-    expect(receipt.pid).not.toBe(receipt.preflight.pid);
     expect(receipt.targetAddon).toEqual(plan.targetAddon);
     for (const receiptOnlyField of [
-      "version",
       "intent",
       "pid",
-      "preflight",
-      "companionIdentity",
       "output",
       "exitStatus",
     ]) {
       expect(plan).not.toHaveProperty(receiptOnlyField);
     }
-  });
-
-  it("pre-encodes the honest post-gate V4 receipt without helper or preflight evidence", () => {
-    const receipt = {
-      version: 4,
-      intent: "build",
-      pid: 42,
-      executablePath: "<redacted-workbench>",
-      creationTime: "<exact-creation-identity>",
-      target: "<target.gproj>",
-      targetAddon: {
-        addonId: "ExampleMod",
-        addonGuid: "0123456789ABCDEF",
-        sourceSha256: "a".repeat(64),
-      },
-      lifecycleGeneration: "generation-v4",
-      processOwnership: "verified",
-      endpointVacancy: "verified",
-      logDirectory: "<attributed-log>",
-      output: null,
-      validationFailure: null,
-      exitStatus: {
-        reason: "exited",
-        exitCode: 1,
-        signal: null,
-        timedOut: false,
-      },
-    } satisfies WorkbenchBuildRunnerReceiptV4;
-
-    expect(receipt.version).toBe(4);
     expect(receipt).not.toHaveProperty("preflight");
     expect(receipt).not.toHaveProperty("companionIdentity");
+    expect(receipt).not.toHaveProperty("version");
   });
 });
 

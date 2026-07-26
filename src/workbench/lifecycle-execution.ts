@@ -7,7 +7,10 @@ import {
   type SupervisedChildExit,
   type SupervisedChildHandle,
 } from "../foundation/child-supervisor.js";
-import { runRecoverableSpawn } from "../foundation/recoverable-spawn.js";
+import {
+  RecoverableSpawnPreSpawnCleanupError,
+  runRecoverableSpawn,
+} from "../foundation/recoverable-spawn.js";
 import type { WorkbenchCompanionLaunch } from "./helper-addon.js";
 import {
   WorkbenchProcessGuard,
@@ -74,6 +77,8 @@ export interface WorkbenchLifecycleOwnerCredential {
 
 export interface WorkbenchLifecycleExecutionDependencies {
   processGuard?: WorkbenchProcessGuard;
+  /** Factory for a lifecycle-execution-owned guard, primarily for tests and embedders. */
+  processGuardFactory?: () => WorkbenchProcessGuard;
   childSupervisor?: ChildSupervisor;
   spawnProcess?: (
     command: string,
@@ -117,6 +122,8 @@ export type WorkbenchLifecycleCompletion =
   | { reason: "timed_out" | "aborted" };
 
 export interface WorkbenchLifecycleExecutionPort {
+  /** Release only resources created and owned by this execution boundary. */
+  close(): Promise<void>;
   assertStandaloneEntryReady(): Promise<void>;
   assertSpawnJournalReplaceable(): Promise<void>;
   assertNoWorkbenchProcesses(): Promise<void>;
@@ -184,17 +191,25 @@ function endpointVacancyDetail(
  */
 export class WorkbenchLifecycleExecution implements WorkbenchLifecycleExecutionPort {
   private readonly guard: WorkbenchProcessGuard;
+  private readonly ownsGuard: boolean;
   private readonly childSupervisor: ChildSupervisor;
   private readonly spawnProcess: NonNullable<WorkbenchLifecycleExecutionDependencies["spawnProcess"]>;
   private readonly makeFailure: WorkbenchLifecycleExecutionFailureFactory;
 
   constructor(dependencies: WorkbenchLifecycleExecutionDependencies = {}) {
-    this.guard = dependencies.processGuard ?? new WorkbenchProcessGuard();
+    this.ownsGuard = dependencies.processGuard === undefined;
+    this.guard = dependencies.processGuard ??
+      dependencies.processGuardFactory?.() ??
+      new WorkbenchProcessGuard();
     this.childSupervisor = dependencies.childSupervisor ?? new ChildSupervisor();
     this.spawnProcess = dependencies.spawnProcess ?? ((command, args, options) =>
       spawnChild(command, [...args], options));
     this.makeFailure = dependencies.failure ?? ((message, code) =>
       new WorkbenchLifecycleExecutionError(message, code));
+  }
+
+  async close(): Promise<void> {
+    if (this.ownsGuard) await this.guard.close();
   }
 
   assertSpawnJournalReplaceable(): Promise<void> {
@@ -372,14 +387,12 @@ export class WorkbenchLifecycleExecution implements WorkbenchLifecycleExecutionP
       fence: {
         assertActive: () => this.guard.assertLifecycleAuthority(request.lifecycle),
       },
-      spawn: () => {
-        request.beforeSpawn?.();
-        return this.safeSpawn(
-          request.executablePath,
-          request.launchArguments,
-          request.spawnOptions
-        );
-      },
+      beforeSpawn: request.beforeSpawn,
+      spawn: () => this.safeSpawn(
+        request.executablePath,
+        request.launchArguments,
+        request.spawnOptions
+      ),
       childPid: (child) => {
         if (!child.pid) {
           throw this.failure(
@@ -409,6 +422,14 @@ export class WorkbenchLifecycleExecution implements WorkbenchLifecycleExecutionP
         phase: "starting",
         workbench: identity,
       }),
+    }).catch((error: unknown) => {
+      if (error instanceof RecoverableSpawnPreSpawnCleanupError) {
+        throw this.failure(
+          `RECOVERY_REQUIRED: ${error.message}`,
+          "RECOVERY_REQUIRED"
+        );
+      }
+      throw error;
     });
     if (!supervisedHandle) {
       throw this.failure(

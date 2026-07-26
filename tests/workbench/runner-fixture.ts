@@ -343,7 +343,6 @@ export function createBuildSpawner(
   harness: RunnerHarness,
   options: {
     logRoot?: string;
-    preflightLogRoot?: string;
     buildLogRoot?: string;
     buildExitCode?: number;
     onSpawn?: (index: number, args: readonly string[]) => void;
@@ -363,12 +362,10 @@ export function createBuildSpawner(
       options.onSpawn?.(index, args);
       const { child } = createOwnedRunnerChild(harness, command, args, {
         pid: pidBase + index,
-        logName: index === 0 ? `preflight-${pidBase}` : `build-${pidBase}`,
-        logRoot: index === 0
-          ? options.preflightLogRoot ?? options.logRoot
-          : options.buildLogRoot ?? options.logRoot,
+        logName: `build-${pidBase + index}`,
+        logRoot: options.buildLogRoot ?? options.logRoot,
       });
-      if (index === 1) {
+      if (index === 0) {
         onBuildExit(() => {
           options.onBuildBeforeExit?.(args);
           closeRunnerChild(harness, child, options.buildExitCode ?? 0);
