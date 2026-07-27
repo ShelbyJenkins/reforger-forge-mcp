@@ -24,11 +24,13 @@ describe("observer launch preparation", () => {
       addonSearchRoot: search,
       stagedAddonPath: addon,
       forceUpdate: false,
+      noFocus: false,
     });
     expect(result.slice(0, 3)).toEqual(["-client", "-someFlag", "value"]);
     expect(result.filter((value) => value.toLowerCase() === "-addonsdir")).toHaveLength(1);
     expect(result.filter((value) => value.toLowerCase() === "-profile")).toHaveLength(1);
     expect(result).not.toContain("-forceUpdate");
+    expect(result).not.toContain("-noFocus");
     expect(result.some((value) => value.startsWith('"'))).toBe(false);
       expect(result[result.indexOf("-addons") + 1].split(",")).toEqual(["TargetAddon", ADDON_GUID]);
     }, { prefix: "rfo space test-" });
@@ -41,8 +43,48 @@ describe("observer launch preparation", () => {
     const search = join(root, "search");
     const addon = join(search, "ReforgerForgeObserver");
     [profile, otherProfile, addon].forEach((path) => mkdirSync(path, { recursive: true }));
-    expect(() => mergeLaunchArguments({ arguments: ["-profile", otherProfile], profilePath: profile, addonSearchRoot: search, stagedAddonPath: addon, forceUpdate: false }))
+    expect(() => mergeLaunchArguments({ arguments: ["-profile", otherProfile], profilePath: profile, addonSearchRoot: search, stagedAddonPath: addon, forceUpdate: false, noFocus: false }))
       .toThrowError(expect.objectContaining({ code: "PROFILE_CONFLICT" }));
+    });
+  });
+
+  it("defaults to appending both -forceUpdate and -noFocus when requested", async () => {
+    await withTemporaryDirectory((root) => {
+      const profile = join(root, "profiles", "run");
+      const search = join(root, "staged");
+      const addon = join(search, "ReforgerForgeObserver");
+      mkdirSync(profile, { recursive: true });
+      mkdirSync(addon, { recursive: true });
+      const result = mergeLaunchArguments({
+        arguments: [],
+        profilePath: profile,
+        addonSearchRoot: search,
+        stagedAddonPath: addon,
+        forceUpdate: true,
+        noFocus: true,
+      });
+      expect(result).toContain("-forceUpdate");
+      expect(result).toContain("-noFocus");
+    });
+  });
+
+  it("dedupes manually supplied -forceUpdate and -noFocus instead of doubling them", async () => {
+    await withTemporaryDirectory((root) => {
+      const profile = join(root, "profiles", "run");
+      const search = join(root, "staged");
+      const addon = join(search, "ReforgerForgeObserver");
+      mkdirSync(profile, { recursive: true });
+      mkdirSync(addon, { recursive: true });
+      const result = mergeLaunchArguments({
+        arguments: ["-forceUpdate", "-noFocus"],
+        profilePath: profile,
+        addonSearchRoot: search,
+        stagedAddonPath: addon,
+        forceUpdate: false,
+        noFocus: false,
+      });
+      expect(result.filter((value) => value === "-forceUpdate")).toHaveLength(1);
+      expect(result.filter((value) => value === "-noFocus")).toHaveLength(1);
     });
   });
 

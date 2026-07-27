@@ -200,7 +200,16 @@ class DefaultObserverApplication implements ObserverApplication {
     });
     this.diagnostics = new ObserverHostDiagnostics(this.agentClient, managedRoot, profileRoot, sourceAddon, this.requestTimeoutMs);
     this.workbenchAdapter = options.workbenchAdapter;
-    const backends = [new RuntimeCaptureBackend(this.agentClient, { maxInlineImageBytes: this.maxInlineImageBytes })];
+    // Deliberately not `this.maxInlineImageBytes`: that governs only whether an
+    // already-fetched artifact is small enough to return directly in a
+    // synchronous MCP response (enforced separately below, after fetch). The
+    // backend's own transport read must stay at its default ceiling (matching
+    // the observer protocol's actual production limit) so a legitimately
+    // large-but-valid capture can still be fetched and persisted into the run;
+    // capping it at the smaller inline limit here made status/finalize/discard
+    // fail identically to the original inline read forever, since the
+    // artifact was never actually retrieved in the first place.
+    const backends = [new RuntimeCaptureBackend(this.agentClient)];
     if (options.workbenchAdapter) backends.push(new WorkbenchCaptureBackend(options.workbenchAdapter) as never);
     let captureService!: CaptureService;
     this.evidenceRuns = new EvidenceRunService(this.agentClient, async (run) => captureService.convergeRun(run));

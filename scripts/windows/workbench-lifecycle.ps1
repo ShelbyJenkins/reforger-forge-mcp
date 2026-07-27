@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
 	[Parameter(Mandatory = $true)]
-	[ValidateSet('HoldMutex', 'InspectCurrent', 'InspectProcess', 'ListWorkbench', 'VerifyEndpointOwner', 'VerifyEndpointVacant', 'VerifyTerminate')]
+	[ValidateSet('HoldMutex', 'InspectCurrent', 'InspectProcess', 'ListWorkbench', 'MinimizeWindow', 'VerifyEndpointOwner', 'VerifyEndpointVacant', 'VerifyTerminate')]
 	[string]$Mode,
 
 	[long]$DeadlineUnixMs = 0
@@ -503,6 +503,95 @@ public static class LifecycleTcpTable
         throw new LifecycleProcessException("helper_failure", "Listener-owner resolution failed.");
     }
 }
+
+public static class LifecycleWindowVisibility
+{
+    private const int SW_SHOWMINNOACTIVE = 7;
+    private const uint GW_OWNER = 4;
+
+    private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+    [DllImport("user32.dll")]
+    private static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+
+    [DllImport("user32.dll")]
+    private static extern bool IsWindowVisible(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetWindow(IntPtr hWnd, uint uCmd);
+
+    [DllImport("user32.dll")]
+    private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+
+    [DllImport("user32.dll")]
+    private static extern bool IsIconic(IntPtr hWnd);
+
+    private static IntPtr FindVisibleTopLevelWindow(int processId)
+    {
+        IntPtr found = IntPtr.Zero;
+        EnumWindows(delegate (IntPtr hWnd, IntPtr lParam)
+        {
+            uint windowProcessId;
+            GetWindowThreadProcessId(hWnd, out windowProcessId);
+            if ((int)windowProcessId != processId) return true;
+            if (!IsWindowVisible(hWnd)) return true;
+            // Only top-level windows (no owner window) are the process's main window.
+            if (GetWindow(hWnd, GW_OWNER) != IntPtr.Zero) return true;
+            found = hWnd;
+            return false;
+        }, IntPtr.Zero);
+        return found;
+    }
+
+    private static bool IsProcessAlive(int processId)
+    {
+        try
+        {
+            return !System.Diagnostics.Process.GetProcessById(processId).HasExited;
+        }
+        catch (ArgumentException)
+        {
+            return false;
+        }
+        catch (InvalidOperationException)
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Best-effort: repeatedly polls for the process's visible top-level window
+    /// for the whole timeout window and (re-)minimizes it without activating
+    /// (no SetForegroundWindow call) whenever it is not already minimized. A
+    /// slow-starting app can replace an early splash window with its real main
+    /// window, or re-show itself during init, well after the first poll; this
+    /// keeps suppressing that instead of minimizing once and stopping. Exits
+    /// early once the process is gone. Never throws.
+    /// </summary>
+    public static bool TryMinimizeProcessWindow(int processId, int timeoutMilliseconds)
+    {
+        DateTime deadline = DateTime.UtcNow.AddMilliseconds(timeoutMilliseconds);
+        bool handledAtLeastOnce = false;
+        while (DateTime.UtcNow < deadline)
+        {
+            if (!IsProcessAlive(processId)) break;
+            IntPtr hWnd = FindVisibleTopLevelWindow(processId);
+            if (hWnd != IntPtr.Zero)
+            {
+                if (!IsIconic(hWnd))
+                {
+                    ShowWindow(hWnd, SW_SHOWMINNOACTIVE);
+                }
+                handledAtLeastOnce = true;
+            }
+            System.Threading.Thread.Sleep(200);
+        }
+        return handledAtLeastOnce;
+    }
+}
 '@
 
 function ConvertTo-LifecycleIdentity
@@ -706,6 +795,34 @@ function Invoke-ListWorkbench
 		processes = @($processes | ForEach-Object { $_ })
 		unverifiable = @($unverifiable | ForEach-Object { $_ })
 	})
+}
+
+function Invoke-MinimizeWindow
+{
+	$request = Read-LifecycleRequest
+	$processId = [int](Get-LifecycleProperty -Object $request -Name 'pid' -Default 0)
+	try
+	{
+		if ($processId -le 0)
+		{
+			throw [LifecycleProcessException]::new('helper_failure', 'The target process ID is invalid.')
+		}
+		$remainingMs = 120000
+		if ($DeadlineUnixMs -gt 0)
+		{
+			$remainingMs = [Math]::Max(1, [Math]::Min($remainingMs, [int]($DeadlineUnixMs - (Get-LifecycleUnixMilliseconds))))
+		}
+		$minimized = [LifecycleWindowVisibility]::TryMinimizeProcessWindow($processId, $remainingMs)
+		Write-LifecycleProtocol ([ordered]@{
+			ok = $true
+			status = $(if ($minimized) { 'minimized' } else { 'window_not_found' })
+		})
+	}
+	catch [LifecycleProcessException]
+	{
+		$processException = Resolve-LifecycleProcessException -ErrorRecord $_
+		Write-LifecycleProcessRefusal -Exception $processException
+	}
 }
 
 function Invoke-VerifyEndpointOwner
@@ -968,6 +1085,7 @@ try
 		'InspectCurrent' { Invoke-InspectCurrent }
 		'InspectProcess' { Invoke-InspectProcess }
 		'ListWorkbench' { Invoke-ListWorkbench }
+		'MinimizeWindow' { Invoke-MinimizeWindow }
 		'VerifyEndpointOwner' { Invoke-VerifyEndpointOwner }
 		'VerifyEndpointVacant' { Invoke-VerifyEndpointVacant }
 		'VerifyTerminate' { Invoke-VerifyTerminate }

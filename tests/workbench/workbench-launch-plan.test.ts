@@ -135,6 +135,7 @@ describe("canonical Workbench launch-plan policy", () => {
         stdio: "ignore",
         windowsHide: false,
         shell: false,
+        showWindow: "minimizedNoActivate",
       },
       readiness: {
         kind: "companion_net_api",
@@ -189,6 +190,7 @@ describe("canonical Workbench launch-plan policy", () => {
       stdio: "ignore",
       windowsHide: false,
       shell: false,
+      showWindow: "normal",
     });
     expect(plan.lifetime).toEqual({ kind: "wait_for_exit_or_abort", supervised: true });
     expect(plan.argv).toEqual([
@@ -246,6 +248,7 @@ describe("canonical Workbench launch-plan policy", () => {
         stdio: "ignore",
         windowsHide: true,
         shell: false,
+        showWindow: "normal",
       },
     });
     expect(plan.argv).toEqual([

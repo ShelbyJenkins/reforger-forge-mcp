@@ -388,6 +388,7 @@ async function captureOwnedCut(cut: OwnedSpawnCrashCut): Promise<OwnedCrashSnaps
     sessionTtlMs: 60_000,
     transportPreference: ["rest", "mailbox"],
     forceUpdate: false,
+    noFocus: false,
   };
   const prepared: ObserverPreparedLaunch = {
     arguments: [...input.arguments],

@@ -30,6 +30,7 @@ describe("observer MCP tools", () => {
       runtimeKind: "client", arguments: [], profilePath: "C:/profiles/run-1", sessionTtlMs: 60_000,
       transportPreference: ["rest"] as const,
       forceUpdate: false,
+      noFocus: false,
     };
     const result = await prepareObserverLaunch(coordinator, launchInput, recorder);
 

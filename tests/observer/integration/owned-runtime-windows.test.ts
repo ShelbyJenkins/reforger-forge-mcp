@@ -68,6 +68,7 @@ describe("owned runtime native Windows integration", () => {
       sessionTtlMs: 60_000,
       transportPreference: ["rest"],
       forceUpdate: false,
+      noFocus: false,
       idempotencyKey: "native-prepare",
     };
     const prepared: ObserverPreparedLaunch = {

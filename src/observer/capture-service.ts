@@ -271,8 +271,9 @@ export class CaptureService {
       if (terminal.state !== "completed") throw this.terminalError(terminal);
       const artifact = await this.readArtifact(this.store.getById(jobId)!, deadlineAtMs, input.signal);
       await this.completeArtifact(this.store.getById(jobId)!, terminal, artifact);
-      if (artifact.image.length > this.maxInlineImageBytes) throw new CaptureError("ARTIFACT_TOO_LARGE", "Validated capture exceeds the configured inline limit", { job: publicJob(terminal) });
-      return { asynchronous: false, job: this.store.getById(jobId)!.lastProjection, image: artifact.image, metadata: artifact.metadata };
+      if (artifact.image.length <= this.maxInlineImageBytes) {
+        return { asynchronous: false, job: this.store.getById(jobId)!.lastProjection, image: artifact.image, metadata: artifact.metadata };
+      }
     } catch (error) {
       const mapped = asCaptureError(error);
       const retainedJob = this.store.getById(jobId);
@@ -285,6 +286,12 @@ export class CaptureService {
       }
       throw mapped;
     }
+    // Only reached once the artifact has already been successfully fetched
+    // and durably completed above (every other path in the try block above
+    // returns or throws). Being too large to return inline is not a capture
+    // failure: it must not flow through the catch block above, which would
+    // otherwise incorrectly re-mark an already completed run capture as failed.
+    throw new CaptureError("ARTIFACT_TOO_LARGE", "Validated capture exceeds the configured inline limit", { job: this.store.getById(jobId)!.lastProjection });
   }
 
   async status(sessionId: string | undefined, jobId: string): Promise<PublicCaptureJob> {

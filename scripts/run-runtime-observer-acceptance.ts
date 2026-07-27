@@ -690,6 +690,7 @@ export async function runRuntimeObserverAcceptance(
       sessionTtlMs: Math.min(24 * 60 * 60_000, timeoutMs + 120_000),
       transportPreference: ["rest", "mailbox"],
       forceUpdate: true,
+      noFocus: true,
       idempotencyKey: `runtime-launch-${randomUUID()}`,
     }, runtimeManager);
     sessionId = prepared.sessionId;

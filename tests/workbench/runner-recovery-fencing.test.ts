@@ -1,3 +1,4 @@
+import type { SpawnOptions } from "node:child_process";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -153,6 +154,97 @@ describe("standalone Workbench lifecycle runner", () => {
       phase: "pre_spawn",
       metadata: { purpose: "target_build" },
     });
+  });
+
+  it("minimizes the spawned window without activating when the plan requests it", async () => {
+    const harness = createHarness();
+    const ownerArgument = "-reforgerForgeOwnerToken=minimize-test";
+    const execution = new WorkbenchLifecycleExecution({
+      processGuard: harness.guard,
+      spawnProcess: (command, args) =>
+        createOwnedRunnerChild(harness, command, args, { pid: 24_001 }).child,
+    });
+    const lifecycle = await execution.reserve({
+      endpoint: { host: "127.0.0.1", port: 5775 },
+      target: {
+        path: harness.projectPath,
+        comparisonKey: harness.projectPath.toLowerCase(),
+      },
+      companion: null,
+    });
+
+    await execution.spawnRecoverable({
+      lifecycle,
+      purpose: "target_build",
+      executablePath: harness.executablePath,
+      launchArguments: [ownerArgument],
+      spawnOptions: { cwd: harness.root, showWindow: "minimizedNoActivate" } as SpawnOptions,
+      ownerArgument,
+      launchedAtMs: Date.now(),
+    });
+
+    expect(harness.backend.minimizeWindowCalls).toEqual([{ pid: 24_001, timeoutMs: 120_000 }]);
+  });
+
+  it("does not minimize the window when the plan does not request it", async () => {
+    const harness = createHarness();
+    const ownerArgument = "-reforgerForgeOwnerToken=no-minimize-test";
+    const execution = new WorkbenchLifecycleExecution({
+      processGuard: harness.guard,
+      spawnProcess: (command, args) =>
+        createOwnedRunnerChild(harness, command, args, { pid: 24_002 }).child,
+    });
+    const lifecycle = await execution.reserve({
+      endpoint: { host: "127.0.0.1", port: 5775 },
+      target: {
+        path: harness.projectPath,
+        comparisonKey: harness.projectPath.toLowerCase(),
+      },
+      companion: null,
+    });
+
+    await execution.spawnRecoverable({
+      lifecycle,
+      purpose: "target_build",
+      executablePath: harness.executablePath,
+      launchArguments: [ownerArgument],
+      spawnOptions: { cwd: harness.root, showWindow: "normal" } as SpawnOptions,
+      ownerArgument,
+      launchedAtMs: Date.now(),
+    });
+
+    expect(harness.backend.minimizeWindowCalls).toEqual([]);
+  });
+
+  it("does not fail the spawn transaction when the best-effort minimize call rejects", async () => {
+    const harness = createHarness();
+    harness.backend.minimizeWindow = async () => {
+      throw new Error("injected minimize failure");
+    };
+    const ownerArgument = "-reforgerForgeOwnerToken=minimize-failure-test";
+    const execution = new WorkbenchLifecycleExecution({
+      processGuard: harness.guard,
+      spawnProcess: (command, args) =>
+        createOwnedRunnerChild(harness, command, args, { pid: 24_003 }).child,
+    });
+    const lifecycle = await execution.reserve({
+      endpoint: { host: "127.0.0.1", port: 5775 },
+      target: {
+        path: harness.projectPath,
+        comparisonKey: harness.projectPath.toLowerCase(),
+      },
+      companion: null,
+    });
+
+    await expect(execution.spawnRecoverable({
+      lifecycle,
+      purpose: "target_build",
+      executablePath: harness.executablePath,
+      launchArguments: [ownerArgument],
+      spawnOptions: { cwd: harness.root, showWindow: "minimizedNoActivate" } as SpawnOptions,
+      ownerArgument,
+      launchedAtMs: Date.now(),
+    })).resolves.toMatchObject({ identity: { pid: 24_003 } });
   });
 
   it("reserves a shared empty output immediately after the mutex and blocks a losing target build", async () => {

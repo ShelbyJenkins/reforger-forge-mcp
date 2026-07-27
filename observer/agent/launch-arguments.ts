@@ -5,7 +5,7 @@ import { ObserverError } from "./errors.js";
 import { canonicalizeExistingDirectory } from "./paths.js";
 
 const VALUE_FLAGS = new Set(["-profile", "-addonsdir", "-addons"]);
-const OBSERVER_FLAGS = new Set([...VALUE_FLAGS, "-forceupdate"]);
+const OBSERVER_FLAGS = new Set([...VALUE_FLAGS, "-forceupdate", "-nofocus"]);
 
 function key(path: string): string {
   const resolved = resolve(path);
@@ -37,6 +37,7 @@ export interface MergeLaunchArgumentsInput {
   addonSearchRoot: string;
   stagedAddonPath: string;
   forceUpdate: boolean;
+  noFocus: boolean;
 }
 
 export function mergeLaunchArguments(input: MergeLaunchArgumentsInput): string[] {
@@ -52,6 +53,7 @@ export function mergeLaunchArguments(input: MergeLaunchArgumentsInput): string[]
   const addonRoots: string[] = [];
   const addonIds: string[] = [];
   let forceUpdateSeen = false;
+  let noFocusSeen = false;
   for (let index = 0; index < input.arguments.length; index += 1) {
     const token = input.arguments[index];
     const flag = token.toLowerCase();
@@ -61,6 +63,10 @@ export function mergeLaunchArguments(input: MergeLaunchArgumentsInput): string[]
     }
     if (flag === "-forceupdate") {
       forceUpdateSeen = true;
+      continue;
+    }
+    if (flag === "-nofocus") {
+      noFocusSeen = true;
       continue;
     }
     if (index + 1 >= input.arguments.length || input.arguments[index + 1].startsWith("-")) {
@@ -106,5 +112,6 @@ export function mergeLaunchArguments(input: MergeLaunchArgumentsInput): string[]
 
   const result = [...unrelated, "-addonsDir", canonicalRoots.join(","), "-addons", uniqueAddonIds.join(","), "-profile", profilePath];
   if (input.forceUpdate || forceUpdateSeen) result.push("-forceUpdate");
+  if (input.noFocus || noFocusSeen) result.push("-noFocus");
   return result;
 }

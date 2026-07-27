@@ -254,6 +254,7 @@ function makeHarness(): ExitHarness {
         sessionTtlMs: 60_000,
         transportPreference: ["rest", "mailbox"],
         forceUpdate: false,
+        noFocus: false,
       };
       const prepared: ObserverPreparedLaunch = {
         arguments: input.arguments,

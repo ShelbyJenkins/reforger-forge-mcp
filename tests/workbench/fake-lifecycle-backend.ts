@@ -30,6 +30,8 @@ interface FakeLifecycleControls {
   unverifiable: WorkbenchProcessScan["unverifiable"];
   endpointOwnershipResult: VerifyEndpointOwnerResult | null;
   endpointVacancyResult: VerifyEndpointVacantResult | null;
+  minimizeWindowCalls: Array<{ pid: number; timeoutMs: number }>;
+  minimizeWindowResult: { minimized: boolean } | null;
   replaceFailure: ((args: {
     expectedGeneration: string | null;
     next: WorkbenchLifecycleStateV3;
@@ -65,6 +67,8 @@ export function createFakeLifecycleBackend(
   backend.unverifiable = [];
   backend.endpointOwnershipResult = null;
   backend.endpointVacancyResult = null;
+  backend.minimizeWindowCalls = [];
+  backend.minimizeWindowResult = null;
   backend.replaceFailure = null;
   backend.afterReplace = null;
   backend.spawnJournalReplaceFailure = null;
@@ -98,6 +102,11 @@ export function createFakeLifecycleBackend(
       };
     }
     return { kind: "owned", listenerPid: expected.pid };
+  };
+
+  backend.minimizeWindow = async (pid, timeoutMs) => {
+    backend.minimizeWindowCalls.push({ pid, timeoutMs });
+    return backend.minimizeWindowResult ?? { minimized: true };
   };
 
   backend.verifyEndpointVacant = async (endpoint) => {

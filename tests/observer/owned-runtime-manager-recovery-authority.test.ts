@@ -51,6 +51,7 @@ describe("OwnedRuntimeManager", () => {
       sessionTtlMs: 60_000,
       transportPreference: ["rest", "mailbox"],
       forceUpdate: false,
+      noFocus: false,
     }, {
       arguments: ["-window"],
       sessionId: "session-oversized-profile",

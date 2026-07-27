@@ -174,6 +174,25 @@ function delay(ms: number): Promise<void> {
   });
 }
 
+/**
+ * Workbench can take well over a minute to create its real main window (past
+ * any splash/loading window) on a cold start with asset-heavy projects. The
+ * PowerShell helper keeps re-suppressing activation for this whole window
+ * rather than minimizing once and stopping, so it stays generous.
+ */
+const MINIMIZE_WINDOW_TIMEOUT_MS = 120_000;
+
+/**
+ * `spawnOptions` is typed as Node's `SpawnOptions` for `child_process.spawn`,
+ * but launch plans (see `WorkbenchSpawnPolicy`) attach one extra,
+ * Node-ignored `showWindow` key that only this best-effort minimize step
+ * reads back out.
+ */
+function requestedShowWindow(spawnOptions: SpawnOptions): "normal" | "minimizedNoActivate" | undefined {
+  const value = (spawnOptions as { showWindow?: unknown }).showWindow;
+  return value === "minimizedNoActivate" ? "minimizedNoActivate" : undefined;
+}
+
 function endpointVacancyDetail(
   result: Exclude<VerifyEndpointVacantResult, { kind: "vacant" }>
 ): string {
@@ -409,6 +428,13 @@ export class WorkbenchLifecycleExecution implements WorkbenchLifecycleExecutionP
           request.supervisionCallbacks
         );
         request.onSupervisedChild?.({ key: supervisionKey, handle: supervisedHandle });
+        if (child.pid && requestedShowWindow(request.spawnOptions) === "minimizedNoActivate") {
+          // Best-effort and non-blocking: a failure here must never affect
+          // spawn, identity verification, or supervision.
+          void this.guard.backend
+            .minimizeWindow(child.pid, MINIMIZE_WINDOW_TIMEOUT_MS)
+            .catch(() => undefined);
+        }
         return Promise.resolve();
       },
       inspect: (child) => this.inspectSpawnedIdentity(

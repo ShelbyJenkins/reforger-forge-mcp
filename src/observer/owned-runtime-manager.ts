@@ -86,17 +86,17 @@ const WINDOWS_PATH_MAX_CHARS = 32_768;
 const WINDOWS_SID_MAX_CHARS = 256;
 const DECIMAL_IDENTITY_MAX_CHARS = 32;
 const PREPARED_SESSION_ID_MAX_UTF16_UNITS = 96;
-const PREPARED_ARGUMENT_MAX_COUNT = 519;
+const PREPARED_ARGUMENT_MAX_COUNT = 520;
 const JSON_STRING_MAX_UTF8_BYTES_PER_UTF16_UNIT = 6;
 const PREPARED_ARGUMENT_JSON_OVERHEAD_MAX_BYTES = PREPARED_ARGUMENT_MAX_COUNT * 8;
 const PREPARED_FIXED_JSON_ENVELOPE_MAX_BYTES = 4 * 1024;
 // A launchable argument vector contributes at most 32,767 UTF-16 units. JSON
 // can encode one UTF-16 unit as six UTF-8 bytes (for example, "\u0000"), and
 // the separately persisted profile path and session id have bounded lengths.
-// Each of the 519 pretty-printed array entries needs at most eight structural
+// Each of the 520 pretty-printed array entries needs at most eight structural
 // bytes; 4 KiB covers the remaining production-generated keys, fixed metadata,
 // braces, indentation, and trailing newline:
-//   (32,767 + 32,768 + 96) * 6 + 519 * 8 + 4,096 = 402,034 bytes.
+//   (32,767 + 32,768 + 96) * 6 + 520 * 8 + 4,096 = 402,042 bytes.
 const MAX_REALISTIC_PREPARED_DESCRIPTOR_BYTES =
   (WINDOWS_COMMAND_LINE_MAX_UTF16_UNITS + WINDOWS_PATH_MAX_CHARS +
     PREPARED_SESSION_ID_MAX_UTF16_UNITS) * JSON_STRING_MAX_UTF8_BYTES_PER_UTF16_UNIT +
@@ -314,8 +314,8 @@ const preparedDescriptorSchema = z.object({
   preparedLaunchId: preparedLaunchIdSchema,
   sessionId: z.string().min(1).max(PREPARED_SESSION_ID_MAX_UTF16_UNITS),
   // observer_prepare_launch accepts 512 input tokens. Normalization can append
-  // six required observer tokens plus -forceUpdate, so preserve that existing
-  // boundary in the persisted descriptor.
+  // six required observer tokens plus -forceUpdate and -noFocus, so preserve
+  // that existing boundary in the persisted descriptor.
   arguments: z.array(z.string().max(32_768)).max(PREPARED_ARGUMENT_MAX_COUNT),
   profilePath: z.string().min(1).max(WINDOWS_PATH_MAX_CHARS),
   runtimeKind: z.enum(["client", "listenServer", "dedicated", "testRunner"]),

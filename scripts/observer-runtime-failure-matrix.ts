@@ -806,6 +806,7 @@ export async function runRuntimeFailureMatrix(
         sessionTtlMs: CASE_TIMEOUT_MS + 120_000,
         transportPreference: ["rest", "mailbox"],
         forceUpdate: true,
+        noFocus: true,
         idempotencyKey: `runtime-matrix-launch-${randomUUID()}`,
       }, runtimeManager),
       "matrix prepared launch"

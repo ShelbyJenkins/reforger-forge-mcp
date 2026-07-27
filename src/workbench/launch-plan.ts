@@ -91,6 +91,12 @@ export interface WorkbenchSpawnPolicy {
   readonly windowsHide: boolean;
   /** Managed Workbench is always spawned directly, never through a shell. */
   readonly shell: false;
+  /**
+   * "minimizedNoActivate" launches Workbench without stealing window focus
+   * (best-effort: a native helper minimizes its window after spawn without
+   * calling SetForegroundWindow). "normal" leaves default OS activation.
+   */
+  readonly showWindow: "normal" | "minimizedNoActivate";
 }
 
 export interface WorkbenchCompanionReadinessPolicy {
@@ -479,7 +485,8 @@ function resolveMcpWorkingDirectory(config: WorkbenchLaunchConfiguration): strin
 function spawnPolicy(
   cwd: string,
   detached: boolean,
-  windowsHide: boolean
+  windowsHide: boolean,
+  showWindow: "normal" | "minimizedNoActivate"
 ): Readonly<WorkbenchSpawnPolicy> {
   return Object.freeze({
     cwd,
@@ -487,6 +494,7 @@ function spawnPolicy(
     stdio: "ignore",
     windowsHide,
     shell: false,
+    showWindow,
   });
 }
 
@@ -710,7 +718,8 @@ export function buildMcpEditorLaunchPlan(
     spawnOptions: spawnPolicy(
       resolveMcpWorkingDirectory(input.config),
       true,
-      false
+      false,
+      "minimizedNoActivate"
     ),
     helper: prepared.companion,
     readiness: prepared.readiness,
@@ -740,7 +749,7 @@ export function buildCliEditorLaunchPlan(
       input.config.workbenchScriptAuthorizeAll === true,
       prepared.ownerArgument
     ),
-    spawnOptions: spawnPolicy(dirname(prepared.executablePath), false, false),
+    spawnOptions: spawnPolicy(dirname(prepared.executablePath), false, false, "normal"),
     helper: prepared.companion,
     readiness: prepared.readiness,
     lifetime: Object.freeze({ kind: "wait_for_exit_or_abort", supervised: true }),
@@ -910,7 +919,7 @@ export function buildTargetBuildLaunchPlan(
     addonDirectories,
     ownerArgument,
     argv,
-    spawnOptions: spawnPolicy(dirname(executablePath), false, true),
+    spawnOptions: spawnPolicy(dirname(executablePath), false, true, "normal"),
     helper: null,
     readiness: Object.freeze({ kind: "none" }),
     lifetime: Object.freeze({

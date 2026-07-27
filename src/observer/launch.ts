@@ -7,6 +7,7 @@ export interface ObserverLaunchInput {
   sessionTtlMs: number;
   transportPreference: Array<"rest" | "mailbox">;
   forceUpdate: boolean;
+  noFocus: boolean;
   idempotencyKey?: string;
 }
 

@@ -253,6 +253,7 @@ function makeBoundaryHarness(
         sessionTtlMs,
         transportPreference: ["rest"],
         forceUpdate: false,
+        noFocus: false,
       };
       const raw = await application.prepareLaunch(input as unknown as Record<string, unknown>);
       const session = raw.session as Record<string, unknown>;

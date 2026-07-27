@@ -176,7 +176,7 @@ export function registerObserverTools(
     "observer_prepare_launch",
     {
       description:
-        "Prepare an existing Arma Reforger argument array for the staged observer addon and an exclusive profile session. Returns tokens as a structured array and session metadata; never starts the game. Conflicting profile/addon arguments are refused.",
+        "Prepare an existing Arma Reforger argument array for the staged observer addon and an exclusive profile session. Returns tokens as a structured array and session metadata; never starts the game. Conflicting profile/addon arguments are refused. Defaults to launching fullscreen in the background (-noFocus -forceUpdate) so the game never steals window focus; pass noFocus: false / forceUpdate: false or include -window in arguments to opt out.",
       inputSchema: {
         runtimeKind: z.enum(["client", "listenServer", "dedicated", "testRunner"]),
         arguments: z.array(z.string().max(32_768)).max(512).default([]),
@@ -184,7 +184,8 @@ export function registerObserverTools(
         sessionTtlMs: z.number().int().min(1_000).max(24 * 60 * 60 * 1_000)
           .default(sessionTtlMs),
         transportPreference: z.array(z.enum(["rest", "mailbox"])).min(1).max(2).default(["rest", "mailbox"]),
-        forceUpdate: z.boolean().default(false),
+        forceUpdate: z.boolean().default(true),
+        noFocus: z.boolean().default(true),
         idempotencyKey: z.string().min(1).max(128).optional(),
       },
     },

@@ -42,7 +42,8 @@ Profiles must be beneath the configured observer profile root. The returned
 mounts `$profile:` at its physical `<profilePath>/profile` child
 (`<profilePath>\profile` on Windows). A prepared argument array contains one
 merged `-addonsDir`, one merged `-addons`, one matching `-profile`, and
-`-forceUpdate` only when requested.
+`-forceUpdate`/`-noFocus` unless explicitly disabled (both default to `true`,
+launching fullscreen in the background without stealing window focus).
 
 ## MCP integration
 
@@ -723,7 +724,7 @@ implemented paths; it is not a substitute for recording a successful live run.
 |---|---|---|---|
 | Graphical runtime client/listen host | REST and mailbox delivery, current/pose/look-at PNG capture, camera lease and exact transform/FOV restoration | `render.capture` and `camera.runtime` only after graphical renderer/camera initialization | Five-capture v2 automation passed against Reforger 1.7.0.54 stock `MpTest`; formal bundle review remains pending |
 | Dedicated/headless server | Registration, health, authority facts, coordination, and diagnostics without camera/render claims | Never advertises `render.capture` or a camera capability | Pending non-render qualification |
-| Minimized/out-of-focus client | Same transaction path; `-forceUpdate` remains an explicit launch-preparation option | Same initialized graphical gates | Pending |
+| Minimized/out-of-focus client | Same transaction path; `-forceUpdate`/`-noFocus` default on so the client renders fullscreen in the background | Same initialized graphical gates | Pending |
 | World unload or agent loss during a lease | World epochs invalidate stale work; cancellation/watchdog restoration must reach a terminal state; the Workbench harness has generated-world and handler-loss cases | Renderer is withheld when restoration or world identity is uncertain | Runtime failure injection remains pending; Workbench cases are implemented and hermetically covered but have no retained native matrix result |
 | Workbench editor | Externally staged helper, exact Ping identity, dedicated profile, version-3 lifecycle, confined native-PNG validation, activity gating, exact `BaseWorld` slot/matrix/FOV restoration, and a repository-only 69-case failure harness | `render.capture` when current capture is initialized; `camera.editor` only after a current-view restoration proof in that exact process | Five-capture v3 positive-path automation and hash-bound formal image review passed on Workbench 1.7.0.54; the 69-case failure matrix and its manual review remain outstanding |
 

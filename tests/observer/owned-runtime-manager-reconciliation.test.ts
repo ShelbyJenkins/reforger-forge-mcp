@@ -307,6 +307,7 @@ describe("OwnedRuntimeManager", () => {
       sessionTtlMs: 1_000,
       transportPreference: ["rest"],
       forceUpdate: false,
+      noFocus: false,
     };
     const naturalPrepared: ObserverPreparedLaunch = {
       arguments: onePointZeroOneArguments,

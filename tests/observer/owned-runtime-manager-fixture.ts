@@ -632,6 +632,7 @@ export function makeHarness(options: {
       sessionTtlMs: 60_000,
       transportPreference: ["rest", "mailbox"],
       forceUpdate: false,
+      noFocus: false,
       ...(idempotencyKey ? { idempotencyKey } : {}),
     };
     const prepared: ObserverPreparedLaunch = {

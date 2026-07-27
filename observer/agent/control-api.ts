@@ -30,7 +30,8 @@ const prepareLaunchSchema = z.object({
   profilePath: z.string().min(1).max(32_768),
   sessionTtlMs: z.number().int().min(1_000).max(24 * 60 * 60 * 1000).default(20 * 60 * 1000),
   transportPreference: z.array(z.enum(TRANSPORTS)).min(1).max(2).default(["rest", "mailbox"]),
-  forceUpdate: z.boolean().default(false),
+  forceUpdate: z.boolean().default(true),
+  noFocus: z.boolean().default(true),
   idempotencyKey: z.string().min(1).max(128).optional(),
 });
 
@@ -232,6 +233,7 @@ export class ObserverControlApi {
       addonSearchRoot: staged.addonSearchRoot,
       stagedAddonPath: staged.addonDirectory,
       forceUpdate: request.forceUpdate,
+      noFocus: request.noFocus,
     });
     const created = this.sessions.create({
       bundleDigest: staged.bundleDigest,

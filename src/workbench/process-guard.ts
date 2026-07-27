@@ -236,6 +236,12 @@ export interface WorkbenchLifecycleBackend extends ExactProcessBackend, MachineM
     expected: WorkbenchIdentity
   ): Promise<VerifyEndpointOwnerResult>;
   verifyEndpointVacant(endpoint: LifecycleEndpoint): Promise<VerifyEndpointVacantResult>;
+  /**
+   * Best-effort, non-identity cosmetic action: polls briefly for the process's
+   * visible top-level window and minimizes it without activating. Never
+   * throws for a merely absent or not-yet-created window.
+   */
+  minimizeWindow(pid: number, timeoutMs: number): Promise<{ minimized: boolean }>;
 }
 
 export interface WorkbenchProcessGuardOptions {
@@ -562,6 +568,11 @@ export class WindowsLifecycleBackend extends WindowsExactProcessBackend
       };
     });
     return { processes, unverifiable };
+  }
+
+  async minimizeWindow(pid: number, timeoutMs: number): Promise<{ minimized: boolean }> {
+    const response = await this.invoke("MinimizeWindow", { pid }, timeoutMs);
+    return { minimized: response.ok === true && response.status === "minimized" };
   }
 
   async verifyEndpointOwner(
