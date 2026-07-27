@@ -121,14 +121,14 @@ any job or runtime camera lease still requires terminal restoration. It also
 refuses while Workbench or its lifecycle is active; retry after `observer_job`
 is terminal and `wb_shutdown` has made the lifecycle vacant.
 
-Repository maintainers can exercise all three supported camera views on both
-backends with double-gated five-capture harnesses: `initial-current`,
-`explicit-pose`, `post-pose-restoration-current`, `explicit-look-at`, and
-`post-look-at-restoration-current`. Use the
+Repository maintainers can exercise all three camera views through the
+five-capture harness on Workbench and on a qualifying graphical runtime. A
+runtime advertises `camera.runtime` only after it can prove a leaseable camera;
+unqualified sessions retain safe `current` capture and can be checked with the
+separate current-only containment procedure. See the
 [Workbench screenshot harness](observer/README.md#opt-in-workbench-screenshot-acceptance)
-for the editor path and the
-[graphical runtime screenshot harness](observer/README.md#opt-in-graphical-runtime-screenshot-acceptance)
-for an installed graphical Diag executable.
+and the
+[graphical runtime screenshot harness](observer/README.md#opt-in-graphical-runtime-screenshot-acceptance).
 
 ---
 
@@ -205,7 +205,7 @@ a distinct, explicit `observer_runtime` action.
 | `observer_prepare_launch` | Merge the staged observer and exclusive profile into an existing structured argument array without spawning Enfusion; also return an opaque, expiring, one-shot `preparedLaunchId` for an optional managed start. |
 | `observer_runtime` | On Windows, explicitly start, inspect, or stop an exact-owned graphical runtime. Start and stop are idempotent side effects; status is read-only, and stop waits for terminal camera restoration before exact-identity termination. |
 | `observer_instances` | List live and stale runtime instances, capabilities, transport, world epoch, active job, and health; optionally wait for compatible renderers. |
-| `observer_capture` | Submit current-view, explicit-pose, or look-at capture. Sync mode returns one validated PNG plus metadata; async mode returns a job ID. |
+| `observer_capture` | Submit current-view, explicit-pose, or look-at capture when the selected backend advertises the required capability. A qualifying runtime advertises `camera.runtime`; an unqualified runtime safely returns `CAPABILITY_UNAVAILABLE` for explicit views. Sync mode returns one validated PNG plus metadata; async mode returns a job ID. |
 | `observer_job` | Inspect, read, cancel, or release a capture. Inline reads return a completed validated PNG; oversized captures remain available to run finalization. |
 | `observer_run` | Begin, inspect, finalize, or discard a bounded managed evidence run. Finalize exports a standardized reviewed bundle beneath an allowlisted evidence root. |
 
@@ -492,6 +492,9 @@ command-line confirmation from a source checkout with dev dependencies:
 $env:RFO_RUN_LIVE_RUNTIME_OBSERVER_ACCEPTANCE = "1"
 npm run dev:observer:acceptance:runtime -- --config <CONFIG_PATH> --confirm-live-run
 
+# Optional containment check for a deliberately unqualified runtime
+npm run dev:observer:acceptance:runtime -- --config <CONFIG_PATH> --confirm-live-run --expect-current-only
+
 $env:RFO_RUN_LIVE_WORKBENCH_OBSERVER_ACCEPTANCE = "1"
 npm run dev:observer:acceptance:workbench -- --config <CONFIG_PATH> --confirm-live-run
 ```
@@ -501,7 +504,13 @@ are not configuration inputs for either the harnesses or an installed MCP
 server. Paths and optional harness adjustments come only from `--config` and
 explicit CLI flags.
 
-Those no-selector commands retain the established positive-path acceptances.
+The no-selector Workbench and runtime commands run the five-view positive
+path. Runtime explicit-camera capture remains capability-gated: only a
+leaseable detached player camera or the exact scoped GameMaster camera path
+advertises `camera.runtime`. `--expect-current-only` verifies the complementary
+safe-refusal behavior for an unqualified runtime.
+Use `--runtime-kind client` to exercise that same live five-view flow through a
+direct graphical-client `-world` launch; the default is a graphical listen host.
 The Workbench failure harness has separate read-only, full, and selected modes:
 
 ```powershell
@@ -529,25 +538,17 @@ directory. The runner does not mark those images reviewed or remove that review
 directory automatically.
 
 The runtime command defaults to Reforger's installed stock
-`{96A8AF57260A7392}worlds/MP/MpTest/MpTest.ent`. It uses an explicit
-normalized-quaternion pose at `[96, 90, -5]` with a 58-degree FOV, then a
-separate look-at view from `[64, 121, -40]` toward `[64, 10, 100]` at 70
-degrees. It loads no project add-on and keeps all managed, profile, diagnostic,
-and evidence data under an external temporary root. It launches the fixture as
-a visible graphical listen host and can optionally override it with `--world`,
-load a fixture add-on with `--addon-dir`, append
-bounded launch tokens with repeated `--launch-arg`, override the
-executable, pose, or look-at view, require a color marker, and select an external
-artifact root or timeout. It launches only after proving all Arma and Workbench
-processes are absent; captures current, explicit pose, current-after-pose,
-explicit look-at, and current-after-look-at views; validates PNG material,
-camera/world binding, the exact requested pose matrix/position/FOV, look-at
-position/FOV, material visual displacement, and independent lease restoration
-and release from both explicit views while allowing natural current-camera
-movement or rotation; verifies bundle hashes; and terminates only its exact
-child process. The
-external finalized bundle is marked `Unreviewed` and must be visually reviewed
-before it can qualify the runtime screenshot path.
+`{96A8AF57260A7392}worlds/MP/MpTest/MpTest.ent`. A qualifying runtime advertises
+`camera.runtime` after a read-only leaseability proof, and the default harness
+then validates `current`, `pose`, restoration, `lookAt`, and restoration again.
+Use `--expect-current-only` (and optionally `--world` / `--addon-dir` for an
+add-on fixture) to validate a deliberately unqualified runtime: one material
+`current` PNG, an explicit `camera.runtime` refusal, no acquired camera lease,
+continued renderer health, bundle hashes, and exact-child shutdown/vacancy.
+Use `--runtime-kind client` for the same positive flow through a direct
+graphical-client `-world` session; the default remains `listenServer`.
+The harness can append bounded launch tokens with repeated `--launch-arg`,
+override the executable, or select an external artifact root or timeout.
 
 The runtime harness also exposes a read-only case list and a single-case fault
 pilot:
@@ -559,7 +560,8 @@ $env:RFO_RUN_LIVE_RUNTIME_OBSERVER_ACCEPTANCE = "1"
 npm run dev:observer:acceptance:runtime -- --config <CONFIG_PATH> --only runtime.cancel_capture.lease_acquired.pose --confirm-live-run
 ```
 
-`--only` runs one validated runtime fault case and records partial coverage.
+`--only` runs one validated runtime fault case and records partial coverage; it
+does not replace the no-selector five-view positive-path acceptance.
 `--keep-profile` is legal only with `--only` and preserves scratch only after a
 failed selected case. There is no implicit or full-matrix runtime selector.
 
@@ -571,15 +573,13 @@ already running. It creates a run-specific disposable
 `{853E92315D1D9EFE}worlds/Eden/Eden.ent` and exercises the same five-view
 sequence without writing helper files into the target.
 
-**Runtime live validation status:** five-capture v2 automation passed on July
-17, 2026 local (July 18 UTC) against Reforger 1.7.0.54 and stock
-`{96A8AF57260A7392}worlds/MP/MpTest/MpTest.ent`. Harness run `run-kUN6is`
-finalized managed run `20260718T015727Z-cbe43230` after validating current,
-explicit pose, restored current, explicit look-at, and restored current PNGs;
-the exact requested matrices and FOVs; independent camera-lease restoration;
-and final process vacancy. All five images were visually inspected during
-implementation. The exported bundle deliberately remains `Unreviewed` with
-`imagesReviewed=false`, so formal evidence review is still pending.
+**Runtime live validation status:** the current implementation passed the
+five-capture flow on stock `MpTest` and on July 27, 2026 UTC in the
+RoadblockRunners `KolguyevVehicleSandbox` GameMaster fixture. The RR run
+validated material explicit pose and look-at images, independent lease
+restoration, released post-restoration current views, finalized five artifacts,
+and exact-owned shutdown/vacancy. Unrecognized manager owners remain
+capability-gated rather than being treated as detached cameras.
 
 **Workbench live validation status:** five-capture v3 automation passed on July
 17, 2026 local (July 18 UTC) with Workbench engine 1.7.0.54. Harness run

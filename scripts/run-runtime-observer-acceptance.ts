@@ -146,6 +146,11 @@ export interface RuntimeObserverAcceptanceOptions {
   confirmed: boolean;
   configPath: string;
   environment?: NodeJS.ProcessEnv;
+  runtimeKind?: RuntimeAcceptanceKind;
+  /** Verify the detached-camera containment path: current capture succeeds,
+   * an explicit look-at is refused before a lease is acquired, and exact-owned
+   * shutdown remains available. */
+  expectCurrentOnly?: boolean;
   artifactRoot?: string;
   /** Defaults to the repository's docs/validation directory. */
   validationRoot?: string;
@@ -166,6 +171,8 @@ export interface RuntimeObserverAcceptanceOptions {
    *  --only CLI flag (scripts/observer-runtime-failure-matrix.ts). */
   only?: string;
 }
+
+type RuntimeAcceptanceKind = "listenServer" | "client";
 
 export interface RuntimeObserverAcceptanceResult {
   runDirectory: string;
@@ -315,6 +322,53 @@ async function captureIntoRun(
   );
 }
 
+async function expectExplicitCameraUnavailable(
+  application: ObserverApplication,
+  input: {
+    runId: string;
+    sessionId: string;
+    instanceId: string;
+    worldId: string;
+    worldEpoch: number;
+    view: Extract<ObserverCaptureView, { kind: "lookAt" }>;
+    timeoutMs: number;
+  }
+): Promise<Record<string, unknown>> {
+  try {
+    await application.capture({
+      // Deliberately do not attach this refusal probe to the durable run. A
+      // capability refusal must occur before a runtime job or artifact exists.
+      sessionId: input.sessionId,
+      instanceId: input.instanceId,
+      expectedWorldId: input.worldId,
+      expectedWorldEpoch: input.worldEpoch,
+      idempotencyKey: `${input.runId}-expected-current-only-look-at-refusal`,
+      view: input.view,
+      settleFrames: 3,
+      performancePolicy: "evidence",
+      asynchronous: false,
+      timeoutMs: input.timeoutMs,
+    });
+  } catch (error) {
+    const rejected = error && typeof error === "object"
+      ? error as { code?: unknown; message?: unknown; details?: unknown }
+      : null;
+    if (!rejected || rejected.code !== "CAPABILITY_UNAVAILABLE") throw error;
+    const details = rejected.details && typeof rejected.details === "object"
+      ? rejected.details as Record<string, unknown>
+      : {};
+    if (details.requiredCapability !== "camera.runtime") {
+      throw new Error("Explicit look-at refusal did not identify camera.runtime as unavailable");
+    }
+    return {
+      code: "CAPABILITY_UNAVAILABLE",
+      message: typeof rejected.message === "string" ? rejected.message : "",
+      requiredCapability: "camera.runtime",
+    };
+  }
+  throw new Error("Detached runtime unexpectedly accepted an explicit look-at capture");
+}
+
 function retainDiagnosticCapture(root: string, capture: RetainedCapture): Record<string, unknown> {
   const captureRoot = join(root, "captures");
   const metadataRoot = join(root, "metadata");
@@ -381,7 +435,8 @@ function verifyEvidenceBundle(
   evidenceRoot: string,
   runId: string,
   finalizeResult: Record<string, unknown>,
-  captures: RetainedCapture[]
+  captures: RetainedCapture[],
+  expectedConfigurationId: string
 ): { evidenceDirectory: string; manifestSha256: string; files: string[] } {
   const receipt = record(finalizeResult.receipt, "Observer finalize receipt");
   const finalizedRun = record(finalizeResult.run, "Finalized observer run");
@@ -463,7 +518,7 @@ function verifyEvidenceBundle(
     JSON.parse(readFileSync(join(evidenceDirectory, "runtime-config.json"), "utf8")),
     "Evidence runtime-config.json"
   );
-  if (runtimeConfigValue.configurationId !== "runtime-observer-acceptance-v2") {
+  if (runtimeConfigValue.configurationId !== expectedConfigurationId) {
     throw new Error("Evidence runtime-config.json has an unexpected configuration identity");
   }
   const captureByLabel = new Map(captures.map((capture) => [capture.label, capture]));
@@ -505,7 +560,7 @@ function verifyEvidenceBundle(
       throw new Error(`Exported capture differs from its validated inline image: ${label}`);
     }
   }
-  if (CAPTURE_LABELS.some((label) => !seenCaptureLabels.has(label))) {
+  if (captures.some((capture) => !seenCaptureLabels.has(capture.label))) {
     throw new Error("Evidence manifest does not contain every required acceptance capture label");
   }
   return { evidenceDirectory, manifestSha256, files };
@@ -546,10 +601,20 @@ export async function runRuntimeObserverAcceptance(
   options: RuntimeObserverAcceptanceOptions
 ): Promise<RuntimeObserverAcceptanceResult> {
   assertLiveRuntimeObserverAuthorized(options.confirmed, options.environment);
+  const runtimeKind = options.runtimeKind ?? "listenServer";
+  if (options.expectCurrentOnly && options.only) {
+    throw new Error("Current-only containment acceptance cannot be combined with a fault-matrix case");
+  }
   const phaseOneFaultCases = resolveFaultMatrixCases(OBSERVER_FAULT_MATRIX, options.only);
   if (phaseOneFaultCases.length > 0) {
     throw new Error("Runtime fault-matrix execution is not enabled until the Phase 2 fixture bridge is installed");
   }
+  const procedureRevision = options.expectCurrentOnly
+    ? "runtime-observer-current-only-containment-v1"
+    : "runtime-observer-acceptance-v2";
+  const acceptanceCaptureLabels = options.expectCurrentOnly
+    ? [CAPTURE_LABELS[0]]
+    : [...CAPTURE_LABELS];
   const timeoutMs = options.timeoutMs ?? 300_000;
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 60_000 || timeoutMs > 900_000) {
     throw new Error("Live runtime observer timeout must be 60000..900000 ms");
@@ -563,7 +628,12 @@ export async function runRuntimeObserverAcceptance(
   const lookAtView = validateLookAt(options);
   const fixture = inspectAddonFixture(options.addonDirectory);
   const executable = findRuntimeExecutable(options.executablePath, options.configPath);
-  const baseArguments = launchArguments(worldResource, fixture, options.launchArguments);
+  const baseArguments = launchArguments(
+    worldResource,
+    fixture,
+    options.launchArguments,
+    runtimeKind
+  );
   let baselineLaunchArguments = operationalBaselineLaunchArgumentIdentity(baseArguments, false);
   const baselineFixtureContent = fixture
     ? operationalBaselineDirectoryIdentity(fixture.addonDirectory, RUNTIME_FIXTURE_SOURCE_EXTENSIONS)
@@ -651,6 +721,8 @@ export async function runRuntimeObserverAcceptance(
   const summary: Record<string, unknown> = {
     version: 1,
     status: "running",
+    mode: options.expectCurrentOnly ? "current-only-containment" : "five-view",
+    runtimeKind,
     startedAt: baseline.startedAt,
     runDirectory,
     worldResource,
@@ -674,9 +746,11 @@ export async function runRuntimeObserverAcceptance(
   try {
     summary.setup = await application.ensureSetup();
     const begun = await application.beginRun({
-      title: "Live graphical runtime observer screenshot acceptance",
+      title: options.expectCurrentOnly
+        ? "Live graphical runtime observer current-only containment acceptance"
+        : `Live graphical ${runtimeKind} observer screenshot acceptance`,
       caseIds: [ACCEPTANCE_CASE_ID],
-      procedureRevision: "runtime-observer-acceptance-v2",
+      procedureRevision,
       idempotencyKey: `runtime-acceptance-${randomUUID()}`,
     });
     if (typeof begun.runId !== "string") throw new Error("Observer run begin returned no run ID");
@@ -684,7 +758,7 @@ export async function runRuntimeObserverAcceptance(
     summary.observerRunId = managedRunId;
 
     const prepared = await prepareObserverLaunch(application, {
-      runtimeKind: "listenServer",
+      runtimeKind,
       arguments: baseArguments,
       profilePath: join(profileRoot, "graphical-runtime"),
       sessionTtlMs: Math.min(24 * 60 * 60_000, timeoutMs + 120_000),
@@ -779,28 +853,51 @@ export async function runRuntimeObserverAcceptance(
     });
     summary.faultMatrixControl = { configured: true, declaredCaseCount: phaseOneFaultCases.length };
     const remainingForInventory = Math.max(1_000, deadline - Date.now());
+    // GameMaster publishes its manual camera just after the observer registers.
+    // A positive explicit-view run must wait for that same camera.runtime
+    // readiness condition that normal pose/lookAt admission waits for. The
+    // containment mode intentionally asks only for current capture so it can
+    // prove an explicit-view refusal on an unqualified runtime.
+    const requiredInventoryCapabilities = options.expectCurrentOnly
+      ? ["render.capture"]
+      : ["render.capture", "camera.runtime"];
     const inventory = await baseline.measure(
       "managed_call",
       "ObserverApplication.instances(renderersOnly)",
       () => application.instances({
         sessionId: sessionId ?? undefined,
-        requiredCapabilities: ["render.capture", "camera.runtime"],
+        requiredCapabilities: requiredInventoryCapabilities,
         renderersOnly: true,
         waitMs: remainingForInventory,
       }),
       "representative_observer_api"
     );
-    const compatible = inventory.instances.filter((instance) =>
+    const graphical = inventory.instances.filter((instance) =>
       instance.backend !== "workbench" && instance.sessionId === sessionId &&
-      instance.runtimeKind === "listenServer" &&
+      instance.runtimeKind === runtimeKind &&
       instance.stale !== true && instance.transportHealthy !== false && instance.headless === false &&
-      Array.isArray(instance.capabilities) &&
+      Array.isArray(instance.capabilities) && (instance.capabilities as unknown[]).includes("render.capture"));
+    const compatible = graphical.filter((instance) =>
       ["render.capture", "camera.runtime"].every((capability) =>
         (instance.capabilities as unknown[]).includes(capability)));
-    if (compatible.length !== 1 || inventory.timedOut) {
+    const currentOnly = graphical.filter((instance) =>
+      !(instance.capabilities as unknown[]).includes("camera.runtime"));
+    if (options.expectCurrentOnly) {
+      if (inventory.timedOut || currentOnly.length !== 1) {
+        throw new Error(
+          `Expected exactly one current-only graphical runtime observer, found ${currentOnly.length}`
+        );
+      }
+    } else if (compatible.length !== 1 || inventory.timedOut) {
+      if (!inventory.timedOut && compatible.length === 0 && currentOnly.length === 1) {
+        throw new Error(
+          "The graphical runtime supports current capture but not a manager-owned camera lease; " +
+          "pose/lookAt acceptance requires camera.runtime and was not attempted"
+        );
+      }
       throw new Error(`Expected exactly one graphical runtime observer, found ${compatible.length}`);
     }
-    const selected = compatible[0];
+    const selected = options.expectCurrentOnly ? currentOnly[0] : compatible[0];
     const instanceId = String(selected.instanceId ?? "");
     const worldId = typeof selected.worldId === "string" ? selected.worldId : "";
     const worldEpoch = selected.worldEpoch;
@@ -828,6 +925,95 @@ export async function runRuntimeObserverAcceptance(
     const diagnosticCaptures: Record<string, unknown>[] = [];
     diagnosticCaptures.push(retainDiagnosticCapture(diagnosticsRoot, initial));
     summary.diagnosticCaptures = diagnosticCaptures;
+    if (options.expectCurrentOnly) {
+      const currentLease = record(initial.job.cameraLease, "Current-only camera lease");
+      if (currentLease.everHeld === true || currentLease.held === true) {
+        throw new Error("Current capture unexpectedly acquired an observer camera lease");
+      }
+      const explicitRejection = await baseline.measure(
+        "capture",
+        "ObserverApplication.capture(expected camera.runtime refusal)",
+        () => expectExplicitCameraUnavailable(application, {
+          ...common,
+          view: lookAtView,
+        }),
+        "explicit-look-at-refusal"
+      );
+      const postRejectionInventory = await baseline.measure(
+        "managed_call",
+        "ObserverApplication.instances(after explicit refusal)",
+        () => application.instances({
+          sessionId: sessionId ?? undefined,
+          requiredCapabilities: ["render.capture"],
+          renderersOnly: true,
+          waitMs: Math.max(1_000, Math.min(10_000, deadline - Date.now())),
+        }),
+        "post_refusal_inventory"
+      );
+      const surviving = postRejectionInventory.instances.filter((instance) =>
+        instance.instanceId === instanceId && instance.backend !== "workbench" &&
+        instance.sessionId === sessionId && instance.runtimeKind === runtimeKind &&
+        instance.stale !== true && instance.transportHealthy !== false && instance.headless === false &&
+        Array.isArray(instance.capabilities) &&
+        (instance.capabilities as unknown[]).includes("render.capture") &&
+        !(instance.capabilities as unknown[]).includes("camera.runtime"));
+      if (postRejectionInventory.timedOut || surviving.length !== 1) {
+        throw new Error("Current-only runtime did not remain healthy after explicit-view refusal");
+      }
+      const captures = [initial];
+      summary.capabilityContainment = {
+        currentCaptureLease: {
+          everHeld: currentLease.everHeld === true,
+          held: currentLease.held === true,
+        },
+        explicitRejection,
+        postRejectionInstanceHealthy: true,
+        postRejectionCapabilities: surviving[0].capabilities,
+      };
+      summary.captureValidation = {
+        captures: captures.map((capture) => ({ label: capture.label, png: capture.png })),
+      };
+      const finalizedResult = await application.finalizeRun({
+        runId: managedRunId,
+        evidenceRoot,
+        includeCaptureLabels: acceptanceCaptureLabels,
+        review: {
+          imagesReviewed: false,
+          outcome: "Unreviewed",
+          summary: "Automation validated a material current-view PNG, a pre-dispatch camera.runtime capability refusal, continued renderer health, and exact-owned shutdown readiness.",
+          limitations: [
+            "No image-capable human reviewed this automated acceptance bundle.",
+            "This is a detached-camera containment test, not a manager-backed explicit-view qualification.",
+          ],
+        },
+        runtimeConfig: {
+          configurationId: procedureRevision,
+          values: {
+            worldResource,
+            fixtureAddonId: fixture?.addonId ?? null,
+            fixtureAddonGuid: fixture?.addonGuid ?? null,
+            executable: basename(executable),
+            captureSequence: acceptanceCaptureLabels,
+            expectedMissingCapability: "camera.runtime",
+            explicitRejectionCode: explicitRejection.code,
+            explicitRejectionRequiredCapability: explicitRejection.requiredCapability,
+          },
+        },
+        releaseManagedArtifacts: true,
+      });
+      finalized = true;
+      const verified = verifyEvidenceBundle(
+        evidenceRoot,
+        managedRunId,
+        finalizedResult,
+        captures,
+        procedureRevision
+      );
+      evidenceDirectory = verified.evidenceDirectory;
+      summary.finalize = finalizedResult;
+      summary.bundleVerification = verified;
+      summary.status = "passed";
+    } else {
     const pose = await captureIntoRun(application, {
       ...common,
       label: "explicit-pose",
@@ -992,13 +1178,13 @@ export async function runRuntimeObserverAcceptance(
         ],
       },
       runtimeConfig: {
-        configurationId: "runtime-observer-acceptance-v2",
+        configurationId: procedureRevision,
         values: {
           worldResource,
           fixtureAddonId: fixture?.addonId ?? null,
           fixtureAddonGuid: fixture?.addonGuid ?? null,
           executable: basename(executable),
-          captureSequence: [...CAPTURE_LABELS],
+          captureSequence: acceptanceCaptureLabels,
           poseView,
           lookAtView,
           markerConfigured: options.marker !== undefined,
@@ -1018,11 +1204,18 @@ export async function runRuntimeObserverAcceptance(
     // The managed run is immutable once finalize returns, even if this
     // harness's independent bundle verification subsequently finds a defect.
     finalized = true;
-    const verified = verifyEvidenceBundle(evidenceRoot, managedRunId, finalizedResult, captures);
+    const verified = verifyEvidenceBundle(
+      evidenceRoot,
+      managedRunId,
+      finalizedResult,
+      captures,
+      procedureRevision
+    );
     evidenceDirectory = verified.evidenceDirectory;
     summary.finalize = finalizedResult;
     summary.bundleVerification = verified;
     summary.status = "passed";
+    }
   } catch (error) {
     failure = error;
     summary.status = "failed";
@@ -1249,8 +1442,8 @@ export async function runRuntimeObserverAcceptance(
         result: baselineFailed ? "failed" : "passed",
         environment: baselineEnvironment,
         workload: {
-          procedureRevision: "runtime-observer-acceptance-v2",
-          runtimeKind: "listenServer",
+          procedureRevision,
+          runtimeKind,
           overallTimeoutMs: timeoutMs,
           worldResource,
           fixture: fixture && baselineFixtureContent ? {
@@ -1261,7 +1454,7 @@ export async function runRuntimeObserverAcceptance(
             sourceSha256: baselineFixtureContent.sha256,
           } : null,
           capture: {
-            labels: [...CAPTURE_LABELS],
+            labels: acceptanceCaptureLabels,
             settleFrames: 3,
             performancePolicy: "evidence",
             asynchronous: false,
@@ -1302,13 +1495,14 @@ export async function runRuntimeObserverAcceptance(
 }
 
 const RUNTIME_SINGLETON_CLI_FLAGS = new Set<string>([
-  "--help", "-h", "--list-cases", "--confirm-live-run", "--keep-profile",
+  "--help", "-h", "--list-cases", "--confirm-live-run", "--keep-profile", "--expect-current-only",
 ]);
 
 const RUNTIME_SINGLETON_CLI_VALUE_OPTIONS = new Set<string>([
   "--config", "--only", "--world", "--addon-dir", "--executable", "--artifact-root",
   "--validation-root", "--timeout-ms", "--pose-position", "--pose-orientation",
   "--pose-fov", "--look-at-position", "--look-at-target", "--look-at-fov",
+  "--runtime-kind",
   "--marker-rgb", "--marker-roi",
 ]);
 
@@ -1412,6 +1606,8 @@ function usage(): string {
     "Usage: npm run dev:observer:acceptance:runtime -- --config <file> --confirm-live-run [--world <resource>]",
     "       [--addon-dir <directory>] [--executable <file>] [--artifact-root <directory>]",
     "       [--validation-root <directory>]",
+    "       [--runtime-kind <listenServer|client>]",
+    "       [--expect-current-only]",
     "       [--timeout-ms <60000..900000>] [--launch-arg <token>]...",
     "       [--pose-position <x,y,z>] [--pose-orientation <x,y,z,w>] [--pose-fov <degrees>]",
     "       [--look-at-position <x,y,z>] [--look-at-target <x,y,z>] [--look-at-fov <degrees>]",
@@ -1423,6 +1619,8 @@ function usage(): string {
     "  npm run dev:observer:acceptance:runtime -- --list-cases",
     "Matrix mode always creates and validates its own disposable fixture; it rejects --addon-dir.",
     "--keep-profile is valid only together with --only, and only preserves scratch on a failed case.",
+    "--expect-current-only proves current capture plus safe explicit-view refusal; it cannot be combined with --only.",
+    "--runtime-kind client launches a direct graphical -world session; listenServer is the default.",
     "",
     `Required environment: ${LIVE_RUNTIME_OBSERVER_ENVIRONMENT}=1`,
     `Default world: ${DEFAULT_RUNTIME_OBSERVER_WORLD}`,
@@ -1454,9 +1652,21 @@ async function runCli(): Promise<void> {
     throw new Error("Live runtime observer acceptance requires --config <file>");
   }
   const only = readOption("--only");
+  const expectCurrentOnly = readFlag("--expect-current-only");
+  const rawRuntimeKind = readOption("--runtime-kind") ?? "listenServer";
+  if (rawRuntimeKind !== "listenServer" && rawRuntimeKind !== "client") {
+    throw new Error("--runtime-kind must be listenServer or client");
+  }
+  const runtimeKind = rawRuntimeKind as RuntimeAcceptanceKind;
   const keepProfile = readFlag("--keep-profile");
   if (keepProfile && !only) {
     throw new Error("--keep-profile is valid only together with --only");
+  }
+  if (expectCurrentOnly && only) {
+    throw new Error("--expect-current-only cannot be combined with --only");
+  }
+  if (only && runtimeKind !== "listenServer") {
+    throw new Error("--runtime-kind client cannot be combined with --only");
   }
   if (only !== undefined) {
     const addonDir = readOption("--addon-dir");
@@ -1510,9 +1720,11 @@ async function runCli(): Promise<void> {
     lookAtTarget: lookAtTarget ? parseVector3(lookAtTarget, "Look-at target") : undefined,
     lookAtFov: lookAtFov ? Number(lookAtFov) : undefined,
     marker: parseMarker(readOption("--marker-rgb"), readOption("--marker-roi")),
+    expectCurrentOnly,
+    runtimeKind,
   });
   process.stdout.write(
-    `Runtime observer acceptance passed.\n` +
+    `${expectCurrentOnly ? "Runtime observer current-only containment passed" : "Runtime observer acceptance passed"}.\n` +
     `RFO_RUNTIME_OBSERVER_ACCEPTANCE_RESULT=${result.summaryPath}\n` +
     `RFO_RUNTIME_OBSERVER_EVIDENCE=${result.evidenceDirectory}\n` +
     `RFO_RUNTIME_OPERATIONAL_BASELINE=${result.baselinePath}\n`

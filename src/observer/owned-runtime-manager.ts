@@ -1542,10 +1542,12 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
       // Observer session revocation is bounded IPC, not a machine lifecycle
       // mutation. Keep the global mutex free while it is pending, then CAS the
       // durable completion against the exact immutable authority.
-      // The literal exact-vacancy stop receipt also makes lifecycle release
-      // safe. Re-acknowledge its exact generation immediately before
-      // completion so a retry remains valid after bounded tombstone expiry.
-      await this.releaseRuntimeLifecycle(transition.authority.receipt, wallDeadline);
+      // Keep the exact retained authority through this completion request.
+      // Releasing it first turns the hand-off into a sweepable tombstone, so a
+      // private-child retention tick can erase the acknowledgement between
+      // exact termination and observer completion. The child completes and
+      // releases this same generation atomically; a lost completion response
+      // remains retryable from the durable exact-vacancy receipt.
       const ack = await this.requestStopCompletionUnlocked(transition.authority, wallDeadline);
       return await this.withFencedMachineMutex(async (fence) => {
         fence.assertActive();

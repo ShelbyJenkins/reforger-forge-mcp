@@ -151,7 +151,7 @@ export interface OperationalBaselineFixtureIdentity {
 
 export interface OperationalBaselineWorkload {
   procedureRevision: string;
-  runtimeKind: "workbench" | "listenServer";
+  runtimeKind: "workbench" | "listenServer" | "client";
   overallTimeoutMs: number;
   worldResource: string;
   fixture: OperationalBaselineFixtureIdentity | null;
@@ -495,7 +495,8 @@ function validateWorkload(
     throw new Error("Operational baseline workload identity is invalid");
   }
   if ((backend === "workbench" && workload.runtimeKind !== "workbench") ||
-      (backend === "runtime" && workload.runtimeKind !== "listenServer")) {
+      (backend === "runtime" &&
+        workload.runtimeKind !== "listenServer" && workload.runtimeKind !== "client")) {
     throw new Error("Operational baseline workload runtime kind disagrees with its backend");
   }
   if (workload.fixture === null) {

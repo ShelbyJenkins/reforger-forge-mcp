@@ -451,6 +451,69 @@ export class ObserverAgentServer {
   }
 
   /**
+   * A terminal stop has already proved the exact graphical process vacant.
+   * If the private observer child was replaced in the narrow interval after
+   * that proof and before completion, reconstruct the retained durable
+   * lifecycle before revoking its session. A released tombstone deliberately
+   * remains a separate reservation-free completion path.
+   */
+  recoverOwnedRuntimeLifecycleForStopCompletion(
+    sessionId: string,
+    runtimeId: string,
+    generation: string
+  ): boolean {
+    this.assertOwnedRuntimeLifecycleIdentity(sessionId, runtimeId, generation);
+    const existing = this.ownedRuntimeLifecyclePins.get(runtimeId);
+    if (existing) {
+      if (existing.sessionId !== sessionId || existing.generation !== generation) {
+        throw new ObserverError(
+          "SESSION_MISMATCH",
+          "Owned runtime lifecycle completion belongs to another exact runtime generation",
+          409
+        );
+      }
+      return true;
+    }
+    const durable = this.ownedRuntimeAuthorities.read(runtimeId);
+    if (!durable) return false;
+    if (durable.authority.sessionId !== sessionId || durable.authority.generation !== generation) {
+      throw new ObserverError(
+        "SESSION_MISMATCH",
+        "Owned runtime lifecycle completion belongs to another exact runtime generation",
+        409
+      );
+    }
+    if (durable.state === "release_acknowledged") return false;
+    if (!("preparedLaunchId" in durable.authority)) {
+      throw new ObserverError(
+        "SESSION_UNVERIFIABLE",
+        "Retained owned runtime lifecycle has no exact recovery authority",
+        409
+      );
+    }
+    const {
+      sessionId: _sessionId,
+      runtimeId: _runtimeId,
+      generation: _generation,
+      ...authority
+    } = durable.authority;
+    const retained = this.retainOwnedRuntimeLifecycle(
+      sessionId,
+      runtimeId,
+      generation,
+      authority
+    );
+    if (retained.retained !== true) {
+      throw new ObserverError(
+        "SESSION_UNVERIFIABLE",
+        "Owned runtime lifecycle recovery could not retain the exact terminal session",
+        409
+      );
+    }
+    return true;
+  }
+
+  /**
    * Prove that this exact lifecycle generation was durably released.
    * Absence is not proof: reservation-free terminal cleanup may proceed only
    * from a matching release acknowledgement/tombstone.

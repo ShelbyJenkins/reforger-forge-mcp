@@ -51,7 +51,7 @@ export function registerWbLayers(server: McpServer, client: WorkbenchClient): vo
     },
     async ({ action, subScene, layerPath, name, parentPath, visible }) => {
       if (MUTATING_LAYER_ACTIONS.has(action)) {
-        const modeErr = requireEditMode(client, `${action} layer`);
+        const modeErr = await requireEditMode(client, `${action} layer`);
         if (modeErr) {
           return { content: [{ type: "text" as const, text: modeErr + formatConnectionStatus(client) }] };
         }

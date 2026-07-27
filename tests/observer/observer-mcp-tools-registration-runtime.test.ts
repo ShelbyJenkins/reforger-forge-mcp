@@ -5,9 +5,51 @@ import {
   OwnedRuntimeError,
   type OwnedRuntimeManager,
 } from "../../src/observer/owned-runtime-manager.js";
-import { createToolHarness, toolApplication } from "./application-diagnostics-fixture.js";
+import { createToolHarness, toolApplication, toolRegistry } from "./application-diagnostics-fixture.js";
 
 describe("observer MCP tools", () => {
+  it("passes configured Workbench addon roots into launch preparation before caller arguments", async () => {
+    const prepareLaunch = vi.fn(async (input: Record<string, unknown>) => ({
+      arguments: input.arguments,
+      session: {
+        sessionId: "session-configured-addons",
+        launchNonce: "secret-launch-nonce",
+        expiresAt: "2026-07-15T12:30:00.000Z",
+        bundleDigest: "a".repeat(64),
+        profilePath: "C:/profiles/run-configured-addons",
+        contractPath: "C:/profiles/run-configured-addons/profile/ReforgerForgeObserver/session.json",
+      },
+      stagedAddon: { reused: true },
+    }));
+    const coordinator = toolApplication({ prepareLaunch, revokeSession: vi.fn() });
+    const manager = {
+      recordPreparedLaunch: vi.fn(async () => "pl-00000000-0000-4000-8000-000000000002"),
+    } as unknown as OwnedRuntimeManager;
+    const registry = toolRegistry(
+      coordinator,
+      manager,
+      { workbenchAddonDirs: ["C:/game/addons", "C:/workshop/addons"] },
+    );
+
+    const result = await registry.get("observer_prepare_launch")!.handler({
+      runtimeKind: "listenServer",
+      arguments: ["-server", "-addonsDir", "C:/caller/addons"],
+      profilePath: "C:/profiles/run-configured-addons",
+      sessionTtlMs: 60_000,
+      transportPreference: ["rest"],
+      forceUpdate: false,
+      noFocus: false,
+    }, { signal: new AbortController().signal });
+
+    expect(result.isError).not.toBe(true);
+    expect(prepareLaunch).toHaveBeenCalledWith(expect.objectContaining({
+      arguments: [
+        "-addonsDir", "C:/game/addons,C:/workshop/addons",
+        "-server", "-addonsDir", "C:/caller/addons",
+      ],
+    }));
+  });
+
   it("returns only the public launch descriptor and does not expose launch credentials", async () => {
     const coordinator = toolApplication({
       prepareLaunch: vi.fn(async () => ({

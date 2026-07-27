@@ -473,6 +473,10 @@ describe("live observer acceptance support", () => {
     ]);
     expect(() => buildOperationalBaselineArtifact({
       ...input,
+      workload: { ...input.workload, runtimeKind: "client" },
+    })).not.toThrow();
+    expect(() => buildOperationalBaselineArtifact({
+      ...input,
       measurements: input.measurements.filter((item) =>
         item.operation !== "OwnedRuntimeManager.stop" || item.phase !== "observer_cleanup"),
     })).toThrow(/lifecycle\/cleanup evidence/);

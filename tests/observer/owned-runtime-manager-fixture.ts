@@ -430,11 +430,17 @@ export class AgentBackedGate extends FakeGate {
       throw new Error("fixture completion failure");
     }
     if (!lifecycle) throw new Error("fixture exact lifecycle is required");
-    const lifecycleRetained = this.agent.server.assertOwnedRuntimeLifecycle(
-      sessionId,
-      lifecycle.runtimeId,
-      lifecycle.generation
-    );
+    const lifecycleRetained = exactRuntimeVacant
+      ? this.agent.server.recoverOwnedRuntimeLifecycleForStopCompletion(
+        sessionId,
+        lifecycle.runtimeId,
+        lifecycle.generation
+      )
+      : this.agent.server.assertOwnedRuntimeLifecycle(
+        sessionId,
+        lifecycle.runtimeId,
+        lifecycle.generation
+      );
     if (!lifecycleRetained) {
       if (!exactRuntimeVacant) {
         throw new Error(

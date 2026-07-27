@@ -16,10 +16,10 @@ import { captureServiceContract } from "./capture-service-contract.js";
 captureServiceContract("runtime");
 captureServiceContract("workbench");
 
-function backend(): { backend: CaptureBackend; calls: string[] } {
+function backend(capabilities: string[] = ["render.capture", "camera.runtime"]): { backend: CaptureBackend; calls: string[] } {
   const calls: string[] = [];
   const instance: CaptureInstance = {
-    backend: "runtime", instanceId: "runtime-1", sessionId: "session-1", capabilities: ["render.capture", "camera.runtime"],
+    backend: "runtime", instanceId: "runtime-1", sessionId: "session-1", capabilities,
     worldRevision: runtimeWorldRevision(null, 0), worldId: null, legacyWorldEpoch: 0, recoveryBinding: { nonce: "n" },
   };
   const jobs = new Map<string, BackendJob>();
@@ -47,6 +47,35 @@ function backend(): { backend: CaptureBackend; calls: string[] } {
 }
 
 describe("CaptureService", () => {
+  it("keeps current capture available while refusing explicit views without camera.runtime", async () => {
+    const currentOnly = backend(["render.capture"]);
+    const service = new CaptureService({ backends: [currentOnly.backend], createJobId: () => "job-current-only" });
+
+    try {
+      await expect(service.capture({
+        sessionId: "session-1",
+        instanceId: "runtime-1",
+        idempotencyKey: "detached-look-at",
+        view: { kind: "lookAt", position: [0, 1, 0], target: [1, 1, 0], fov: 60 },
+        asynchronous: true,
+        timeoutMs: 1_000,
+      })).rejects.toMatchObject({ code: "CAPABILITY_UNAVAILABLE" });
+      expect(currentOnly.calls).not.toContain("submit");
+
+      await expect(service.capture({
+        sessionId: "session-1",
+        instanceId: "runtime-1",
+        idempotencyKey: "detached-current",
+        view: { kind: "current" },
+        asynchronous: true,
+        timeoutMs: 1_000,
+      })).resolves.toMatchObject({ asynchronous: true });
+      expect(currentOnly.calls).toContain("submit");
+    } finally {
+      await service.close();
+    }
+  });
+
   it("preserves a selected Workbench Ping transport failure during instance selection", async () => {
     const calls: string[] = [];
     const adapter = new WorkbenchObserverAdapter({

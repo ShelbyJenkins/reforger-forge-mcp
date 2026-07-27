@@ -13,6 +13,9 @@ class RFO_ObserverCameraLease
 	protected float m_RFO_OriginalFarPlane;
 	protected vector m_RFO_ActualMatrix[4];
 	protected float m_RFO_ActualFovDegrees;
+	// MpTest's player camera is intentionally detached from CameraManager. Its
+	// render slot can still be transactionally borrowed when the exact
+	// CameraBase and BaseWorld publication are both proved on restoration.
 	protected bool m_RFO_UsesDetachedPlayerCamera;
 	protected int m_RFO_WorldCameraId;
 	protected int m_RFO_LastPostFrameCommit;
@@ -22,6 +25,10 @@ class RFO_ObserverCameraLease
 	protected bool m_RFO_RestoreTargetSelected;
 	protected bool m_RFO_RestorationPostFrameConfirmed;
 	protected string m_RFO_LastLeaseabilityReason;
+	// Kept separately from leaseability because heartbeat probes deliberately
+	// refresh leaseability while a failed restoration still needs its first
+	// concrete failure reason preserved for terminal diagnostics.
+	protected string m_RFO_LastCameraFailureReason;
 
 	// Read-only readiness probe shared by capability advertisement and the
 	// per-job resolving state. It deliberately stops before spawning or
@@ -39,6 +46,11 @@ class RFO_ObserverCameraLease
 	string GetLastLeaseabilityReason()
 	{
 		return m_RFO_LastLeaseabilityReason;
+	}
+
+	string GetLastCameraFailureReason()
+	{
+		return m_RFO_LastCameraFailureReason;
 	}
 
 	bool Acquire(string jobId, BaseWorld world, int worldEpoch, vector requestedMatrix[4], float fovDegrees)
@@ -61,16 +73,21 @@ class RFO_ObserverCameraLease
 			return false;
 		}
 
-		// A manager-owned original can be replaced deterministically only when both
-		// cameras are registered. MpTest instead exposes a detached player camera;
-		// that path deliberately leaves CameraManager untouched and commits the
-		// observer entity to the already-active BaseWorld slot in POSTFRAME.
+		// A manager-owned camera is switched by CameraManager. MpTest's detached
+		// player camera instead keeps CameraManager untouched and publishes the
+		// observer entity into its already-active BaseWorld slot in POSTFRAME.
+		// Both paths must prove their exact restore target before release.
 		if (!detachedPlayerCamera)
 		{
+			bool editorCameraInterlock = RFO_ObserverEditorCameraArbitration.CanBeginManagerLease(manager, original);
+			if (editorCameraInterlock)
+				RFO_ObserverEditorCameraArbitration.BeginManagerLease(manager, original);
 			if (manager && CameraRegistered(manager, original) && CameraRegistered(manager, observer) && manager.CurrentCamera() == original)
 				manager.SetCamera(observer);
 			if (!manager || manager.CurrentCamera() != observer)
 			{
+				if (editorCameraInterlock)
+					RFO_ObserverEditorCameraArbitration.EndManagerLease();
 				DestroyObserverCamera(observer);
 				m_RFO_LastLeaseabilityReason = "manager_selection_failed";
 				return false;
@@ -79,19 +96,16 @@ class RFO_ObserverCameraLease
 		else if (manager && manager.CurrentCamera() && manager.CurrentCamera() != observer)
 		{
 			DestroyObserverCamera(observer);
-			m_RFO_LastLeaseabilityReason = "camera_owner_changed";
+			m_RFO_LastLeaseabilityReason = "detached_camera_owner_changed";
 			return false;
 		}
 		else if (manager && manager.CurrentCamera() == observer)
 		{
-			// Some runtimes auto-select the first newly registered camera. Continue
-			// only if the detached original is also registered and can be restored.
+			// Some runtimes auto-select the newly spawned camera. Continue only if
+			// the original is registered and can be selected during restoration.
 			if (!CameraRegistered(manager, original))
 			{
-				original.SetWorldTransform(m_RFO_OriginalMatrix);
-				original.SetVerticalFOV(m_RFO_OriginalFov);
-				original.SetNearPlane(m_RFO_OriginalNearPlane);
-				original.SetFarPlane(m_RFO_OriginalFarPlane);
+				ApplyOriginalState(original);
 				original.ApplyTransform(0.0);
 				DestroyObserverCamera(observer);
 				m_RFO_LastLeaseabilityReason = "restore_target_unregistered";
@@ -100,8 +114,7 @@ class RFO_ObserverCameraLease
 			detachedPlayerCamera = false;
 		}
 
-		Initialize(jobId, world, worldEpoch, manager, original, observer, cameraId, requestedMatrix, fovDegrees);
-		m_RFO_UsesDetachedPlayerCamera = detachedPlayerCamera;
+		Initialize(jobId, world, worldEpoch, manager, original, observer, detachedPlayerCamera, cameraId, requestedMatrix, fovDegrees);
 		observer.Arm();
 		m_RFO_LastLeaseabilityReason = string.Empty;
 		return true;
@@ -114,7 +127,10 @@ class RFO_ObserverCameraLease
 		if (world != m_RFO_World || currentWorldEpoch != m_RFO_WorldEpoch || world.GetCurrentCameraId() != m_RFO_WorldCameraId)
 			return false;
 		if (!m_RFO_UsesDetachedPlayerCamera && (!m_RFO_CameraManager || m_RFO_CameraManager.CurrentCamera() != camera))
+		{
+			SetCameraFailureReason("camera_manager_owner_changed");
 			return false;
+		}
 
 		ApplyRequestedState(camera);
 		camera.ApplyTransform(timeSlice);
@@ -142,21 +158,27 @@ class RFO_ObserverCameraLease
 		if (m_RFO_RestorationPostFrameConfirmed)
 		{
 			if (!RestorationCleanupBindingStillCurrent(world, currentWorldEpoch))
+			{
+				SetCameraFailureReason("restore_cleanup_binding_changed");
 				return false;
+			}
 			DestroyObserverCamera(m_RFO_ObserverCamera);
 			Clear(true);
 			return true;
 		}
 		if (m_RFO_UsesDetachedPlayerCamera)
 			return RestoreDetachedPlayerCamera(world, currentWorldEpoch);
-
 		if (world != m_RFO_World || currentWorldEpoch != m_RFO_WorldEpoch)
 			return RetireOldWorldObserver();
 		if (!m_RFO_CameraManager)
+		{
+			SetCameraFailureReason("restore_camera_manager_unavailable");
 			return false;
+		}
 		CameraBase current = m_RFO_CameraManager.CurrentCamera();
 		if (!m_RFO_ObserverCamera || m_RFO_ObserverCamera.IsDeleted())
 		{
+			SetCameraFailureReason("restore_observer_camera_unavailable");
 			if (current && !current.IsDeleted() && current != m_RFO_ObserverCamera)
 				Clear(false);
 			return false;
@@ -166,17 +188,24 @@ class RFO_ObserverCameraLease
 		if (current != m_RFO_ObserverCamera)
 		{
 			// Another camera owner won. Never switch away from it during cleanup.
+			SetCameraFailureReason("restore_manager_owner_changed");
 			DestroyObserverCamera(m_RFO_ObserverCamera);
 			Clear(false);
 			return false;
 		}
 		if (!m_RFO_OriginalCamera || m_RFO_OriginalCamera.IsDeleted() || !CameraRegistered(m_RFO_CameraManager, m_RFO_OriginalCamera))
+		{
+			SetCameraFailureReason("restore_target_unavailable");
 			return false;
+		}
 
 		ApplyOriginalState(m_RFO_OriginalCamera);
 		m_RFO_CameraManager.SetCamera(m_RFO_OriginalCamera);
 		if (m_RFO_CameraManager.CurrentCamera() != m_RFO_OriginalCamera)
+		{
+			SetCameraFailureReason("restore_target_selection_failed");
 			return false;
+		}
 		m_RFO_RestoreTargetSelected = true;
 		return false;
 	}
@@ -191,21 +220,36 @@ class RFO_ObserverCameraLease
 		if (!m_RFO_Acquired || !m_RFO_Restoring || !m_RFO_RestoreTargetSelected || m_RFO_RestorationPostFrameConfirmed)
 			return false;
 		if (camera != m_RFO_ObserverCamera || !camera || !camera.IsArmed() || camera.IsDeleted())
+		{
+			SetCameraFailureReason("restore_postframe_observer_unavailable");
 			return false;
+		}
 		if (world != m_RFO_World || currentWorldEpoch != m_RFO_WorldEpoch || !m_RFO_OriginalCamera || m_RFO_OriginalCamera.IsDeleted())
+		{
+			SetCameraFailureReason("restore_postframe_world_or_target_changed");
 			return false;
+		}
 		if (m_RFO_UsesDetachedPlayerCamera)
 		{
 			if (world.GetCurrentCameraId() != m_RFO_WorldCameraId)
+			{
+				SetCameraFailureReason("restore_postframe_world_camera_changed");
 				return false;
+			}
 		}
 		else if (!m_RFO_CameraManager || m_RFO_CameraManager.CurrentCamera() != m_RFO_OriginalCamera)
+		{
+			SetCameraFailureReason("restore_postframe_manager_owner_changed");
 			return false;
+		}
 
 		ApplyOriginalState(m_RFO_OriginalCamera);
 		m_RFO_OriginalCamera.ApplyTransform(timeSlice);
 		if (!OriginalCameraMatches() || !PublishedCameraMatches(m_RFO_OriginalCamera, m_RFO_OriginalMatrix, m_RFO_OriginalFov))
+		{
+			SetCameraFailureReason("restore_postframe_state_unpublished");
 			return false;
+		}
 		m_RFO_RestorationPostFrameConfirmed = true;
 		m_RFO_ObserverCamera.Disarm();
 		return true;
@@ -213,13 +257,31 @@ class RFO_ObserverCameraLease
 
 	bool IsHeld()
 	{
-		if (!m_RFO_Acquired || !m_RFO_ObserverCamera || m_RFO_ObserverCamera.IsDeleted() || !m_RFO_ObserverCamera.IsArmed())
+		if (!m_RFO_Acquired)
 			return false;
+		// During restoration the original camera is intentionally selected and
+		// the observer may be disarmed after POSTFRAME proof. That is not an
+		// ownership loss; restoration-specific checks record any real failure.
+		if (m_RFO_Restoring)
+			return false;
+		if (!m_RFO_ObserverCamera || m_RFO_ObserverCamera.IsDeleted() || !m_RFO_ObserverCamera.IsArmed())
+		{
+			SetCameraFailureReason("observer_camera_unavailable");
+			return false;
+		}
 		if (!m_RFO_World || m_RFO_World.GetCurrentCameraId() != m_RFO_WorldCameraId)
+		{
+			SetCameraFailureReason("world_camera_slot_changed");
 			return false;
+		}
 		if (m_RFO_UsesDetachedPlayerCamera)
 			return true;
-		return m_RFO_CameraManager && m_RFO_CameraManager.CurrentCamera() == m_RFO_ObserverCamera;
+		if (!m_RFO_CameraManager || m_RFO_CameraManager.CurrentCamera() != m_RFO_ObserverCamera)
+		{
+			SetCameraFailureReason("camera_manager_owner_changed");
+			return false;
+		}
+		return true;
 	}
 
 	bool HasOutstandingLease()
@@ -247,7 +309,10 @@ class RFO_ObserverCameraLease
 		if (m_RFO_JobId != jobId || !IsHeld() || m_RFO_LastPostFrameCommit <= 0)
 			return false;
 		int frame = m_RFO_World.GetFrameNumber();
-		return frame - m_RFO_LastPostFrameCommit <= 2;
+		if (frame - m_RFO_LastPostFrameCommit <= 2)
+			return true;
+		SetCameraFailureReason("observer_postframe_stalled");
+		return false;
 	}
 
 	bool AwaitingFirstPostFrameCommit(string jobId)
@@ -276,7 +341,7 @@ class RFO_ObserverCameraLease
 		return m_RFO_ActualFovDegrees;
 	}
 
-	protected void Initialize(string jobId, BaseWorld world, int worldEpoch, CameraManager manager, CameraBase original, RFO_ObserverCamera observer, int cameraId, vector requestedMatrix[4], float fovDegrees)
+	protected void Initialize(string jobId, BaseWorld world, int worldEpoch, CameraManager manager, CameraBase original, RFO_ObserverCamera observer, bool detachedPlayerCamera, int cameraId, vector requestedMatrix[4], float fovDegrees)
 	{
 		m_RFO_JobId = jobId;
 		m_RFO_LeaseId = "lease-" + jobId;
@@ -295,7 +360,8 @@ class RFO_ObserverCameraLease
 		m_RFO_RestorationConfirmed = false;
 		m_RFO_RestoreTargetSelected = false;
 		m_RFO_RestorationPostFrameConfirmed = false;
-		m_RFO_UsesDetachedPlayerCamera = false;
+		m_RFO_UsesDetachedPlayerCamera = detachedPlayerCamera;
+		m_RFO_LastCameraFailureReason = string.Empty;
 	}
 
 	protected bool ResolveLeaseableCamera(BaseWorld world, out ArmaReforgerScripted game, out CameraManager manager, out CameraBase original, out bool detachedPlayerCamera, out int cameraId)
@@ -338,12 +404,16 @@ class RFO_ObserverCameraLease
 			original = manager.CurrentCamera();
 		if (!original || original.IsDeleted())
 		{
-			original = FindPlayerCamera();
-			detachedPlayerCamera = original && !original.IsDeleted();
+			CameraBase playerCamera = FindPlayerCamera();
+			if (playerCamera && !playerCamera.IsDeleted())
+			{
+				original = playerCamera;
+				detachedPlayerCamera = true;
+			}
 		}
 		// Exact restoration requires a CameraBase snapshot, including the near
-		// plane. Reforger 1.7 exposes no BaseWorld near-plane getter, so a raw
-		// world-slot-only camera cannot be leased without inventing state.
+		// plane. Reforger exposes no BaseWorld near-plane getter, so a raw
+		// world-slot-only camera cannot be borrowed without inventing state.
 		if (!original || original.IsDeleted())
 		{
 			m_RFO_LastLeaseabilityReason = "camera_unavailable";
@@ -411,15 +481,23 @@ class RFO_ObserverCameraLease
 		{
 			if (!m_RFO_World || m_RFO_World.GetCurrentCameraId() != m_RFO_WorldCameraId)
 			{
+				SetCameraFailureReason("restore_detached_world_camera_changed");
 				DestroyObserverCamera(m_RFO_ObserverCamera);
 				Clear(false);
 			}
 			return false;
 		}
 		if (!m_RFO_OriginalCamera || m_RFO_OriginalCamera.IsDeleted())
+		{
+			SetCameraFailureReason("restore_detached_target_unavailable");
 			return false;
+		}
+		// Do not overwrite a player/Game Master camera that has changed while the
+		// observer was active. The requested projection must still be the one
+		// currently published by the slot we borrowed.
 		if (!WorldCameraMatches(m_RFO_ActualMatrix, m_RFO_ActualFovDegrees))
 		{
+			SetCameraFailureReason("restore_detached_view_changed");
 			DestroyObserverCamera(m_RFO_ObserverCamera);
 			Clear(false);
 			return false;
@@ -448,13 +526,15 @@ class RFO_ObserverCameraLease
 		// A reselected observer must never be deleted from stale POSTFRAME proof.
 		if (m_RFO_CameraManager && m_RFO_CameraManager.CurrentCamera() == m_RFO_ObserverCamera)
 			return false;
-		if (!m_RFO_UsesDetachedPlayerCamera)
-			return m_RFO_CameraManager && m_RFO_CameraManager.CurrentCamera() == m_RFO_OriginalCamera;
-		// A detached player camera normally has no manager owner. If a manager
-		// acquired one before cleanup, accept only the exact stored original.
-		if (m_RFO_CameraManager && m_RFO_CameraManager.CurrentCamera() && m_RFO_CameraManager.CurrentCamera() != m_RFO_OriginalCamera)
-			return false;
-		return true;
+		if (m_RFO_UsesDetachedPlayerCamera)
+		{
+			// A detached player camera normally has no manager owner. If one appears
+			// during cleanup, accept only the exact snapshot target.
+			if (m_RFO_CameraManager && m_RFO_CameraManager.CurrentCamera() && m_RFO_CameraManager.CurrentCamera() != m_RFO_OriginalCamera)
+				return false;
+			return true;
+		}
+		return m_RFO_CameraManager && m_RFO_CameraManager.CurrentCamera() == m_RFO_OriginalCamera;
 	}
 
 	protected bool RetireOldWorldObserver()
@@ -465,10 +545,16 @@ class RFO_ObserverCameraLease
 			if (!replacement || replacement.IsDeleted() || !CameraRegistered(m_RFO_CameraManager, replacement))
 				replacement = FindPlayerCamera();
 			if (!replacement || replacement.IsDeleted() || !CameraRegistered(m_RFO_CameraManager, replacement))
+			{
+				SetCameraFailureReason("retire_restore_target_unavailable");
 				return false;
+			}
 			m_RFO_CameraManager.SetCamera(replacement);
 			if (m_RFO_CameraManager.CurrentCamera() != replacement)
+			{
+				SetCameraFailureReason("retire_target_selection_failed");
 				return false;
+			}
 		}
 		DestroyObserverCamera(m_RFO_ObserverCamera);
 		Clear(true);
@@ -534,6 +620,12 @@ class RFO_ObserverCameraLease
 		return playerController.GetPlayerCamera();
 	}
 
+	protected void SetCameraFailureReason(string reason)
+	{
+		if (m_RFO_LastCameraFailureReason.IsEmpty())
+			m_RFO_LastCameraFailureReason = reason;
+	}
+
 	protected void DestroyObserverCamera(RFO_ObserverCamera camera)
 	{
 		if (!camera || camera.IsDeleted())
@@ -557,6 +649,7 @@ class RFO_ObserverCameraLease
 		m_RFO_RestoreTargetSelected = false;
 		m_RFO_RestorationPostFrameConfirmed = false;
 		m_RFO_UsesDetachedPlayerCamera = false;
+		RFO_ObserverEditorCameraArbitration.EndManagerLease();
 		m_RFO_WorldCameraId = 0;
 		m_RFO_LastPostFrameCommit = 0;
 		m_RFO_LastLeaseabilityReason = string.Empty;

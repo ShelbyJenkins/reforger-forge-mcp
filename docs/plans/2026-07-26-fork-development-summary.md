@@ -1,4 +1,4 @@
-# Fork development summary — 2026-07-22
+# Fork development summary — 2026-07-26
 
 **Status:** Implemented and integrated into `main`  
 **Implementation range:** upstream fork point `5e52376` through `75add57`  
@@ -145,6 +145,14 @@ certification step.
   acceptance plans.
 - Removed repository-local editor/MCP configuration files that should remain
   user-specific and documented safe local configuration instead.
+
+### 6. 2026-07-26 Workbench refinements
+
+- Made base-game and standard Workshop add-on roots additive defaults, and added `check-addon-dirs` to report resolved, missing, and ambiguous dependency GUIDs.
+- Simplified target builds to one helper-free path with fresh-output reservation, removing the companion preflight/handoff and obsolete build-acceptance gate.
+- Folded fork-only build/editor receipt-version cleanup into the helper-free path, while retaining the independently versioned durable lifecycle-state schema.
+- Published a standalone runner CLI reference covering invocation, exit-0 receipt guarantees, and the sole caller-side target-identity check.
+- Added bounded, redacted `wb_log_query` filtering for attributed Workbench logs by add-on, severity, channel, and text.
 
 ## Result
 

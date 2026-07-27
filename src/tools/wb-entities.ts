@@ -86,7 +86,7 @@ export function registerWbEntityTools(server: McpServer, client: WorkbenchClient
       },
     },
     async ({ prefab, position, rotation, name, layerPath }) => {
-      const modeErr = requireEditMode(client, "create entity");
+      const modeErr = await requireEditMode(client, "create entity");
       if (modeErr) {
         return { content: [{ type: "text" as const, text: modeErr + formatConnectionStatus(client) }] };
       }
@@ -128,7 +128,7 @@ export function registerWbEntityTools(server: McpServer, client: WorkbenchClient
       },
     },
     async ({ name }) => {
-      const modeErr = requireEditMode(client, "delete entity");
+      const modeErr = await requireEditMode(client, "delete entity");
       if (modeErr) {
         return { content: [{ type: "text" as const, text: modeErr + formatConnectionStatus(client) }] };
       }
@@ -292,7 +292,7 @@ export function registerWbEntityTools(server: McpServer, client: WorkbenchClient
       // Only require edit mode for mutating actions, not read-only ones
       const READ_ONLY_ACTIONS = ["getProperty", "listProperties", "listArrayItems", "getWorldTransform", "makeVisible"];
       if (!READ_ONLY_ACTIONS.includes(action)) {
-        const modeErr = requireEditMode(client, "modify entity");
+        const modeErr = await requireEditMode(client, "modify entity");
         if (modeErr) {
           return { content: [{ type: "text" as const, text: modeErr + formatConnectionStatus(client) }] };
         }

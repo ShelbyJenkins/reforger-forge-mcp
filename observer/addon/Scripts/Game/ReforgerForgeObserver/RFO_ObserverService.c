@@ -197,27 +197,28 @@ class RFO_ObserverService
 		RFO_ObserverJob job = new RFO_ObserverJob();
 		if (!job.Initialize(command, m_RFO_Session, m_RFO_World))
 			return RejectCommand(command, RFO_ObserverProtocol.ERROR_CAPTURE_REJECTED, "Runtime capture validation rejected the command", false);
+		if (!m_RFO_Capture.IsReady())
+			return RejectCommand(command, RFO_ObserverProtocol.ERROR_CAPABILITY_UNAVAILABLE, "This runtime has no proven screenshot capability", false);
+		if (job.IsCameraView())
+		{
+			if (!RFO_ObserverCapabilities.CAMERA_RESTORE_PROVEN)
+				return RejectCommand(command, RFO_ObserverProtocol.ERROR_CAPABILITY_UNAVAILABLE, "This runtime has no proven camera restoration capability", false);
+			if (!m_RFO_CameraLease || !m_RFO_CameraLease.CanAcquire(m_RFO_World.GetObject()))
+			{
+				string leaseabilityReason = "camera_manager_lease_unavailable";
+				if (m_RFO_CameraLease && !m_RFO_CameraLease.GetLastLeaseabilityReason().IsEmpty())
+					leaseabilityReason = m_RFO_CameraLease.GetLastLeaseabilityReason();
+				return RejectCommand(command, RFO_ObserverProtocol.ERROR_CAPABILITY_UNAVAILABLE, ExplicitCameraCapabilityMessage(leaseabilityReason), false);
+			}
+		}
+		if (!CaptureRateAvailable())
+			return RejectCommand(command, RFO_ObserverProtocol.ERROR_CAPTURE_REJECTED, "Runtime session capture rate limit was reached", false);
 		m_RFO_ActiveJob = job;
 		m_RFO_PostFrameCaptureArmed = false;
 		m_RFO_PostFrameCaptureFailed = false;
 		m_RFO_PostFrameCaptureDiagnostic = string.Empty;
 		Print(string.Format("ReforgerForge Observer: job accepted jobId=%1 view=%2", job.jobId, job.viewKind));
-		if (!CaptureRateAvailable())
-		{
-			RecordFailure(RFO_ObserverProtocol.ERROR_CAPTURE_REJECTED, "Runtime session capture rate limit was reached", false);
-			return true;
-		}
 		m_RFO_CaptureTimes.Insert(System.GetUnixTime());
-		if (!m_RFO_Capture.IsReady())
-		{
-			RecordFailure(RFO_ObserverProtocol.ERROR_CAPABILITY_UNAVAILABLE, "This runtime has no proven screenshot capability", false);
-			return true;
-		}
-		if (job.IsCameraView() && !RFO_ObserverCapabilities.CAMERA_RESTORE_PROVEN)
-		{
-			RecordFailure(RFO_ObserverProtocol.ERROR_CAPABILITY_UNAVAILABLE, "This runtime has no proven camera restoration capability", false);
-			return true;
-		}
 		PublishStatus();
 		return true;
 	}
@@ -540,7 +541,14 @@ class RFO_ObserverService
 				break;
 			case RFO_ObserverJobState.RESOLVING:
 				if (!m_RFO_CameraLease.CanAcquire(world))
+				{
+					string leaseabilityReason = m_RFO_CameraLease.GetLastLeaseabilityReason();
+					if (leaseabilityReason.IsEmpty())
+						leaseabilityReason = "camera_manager_lease_unavailable";
+					RecordFailure(RFO_ObserverProtocol.ERROR_CAPABILITY_UNAVAILABLE, ExplicitCameraCapabilityMessage(leaseabilityReason), false);
+					BeginTerminalTransition();
 					break;
+				}
 				AcquireCamera(world);
 				break;
 			case RFO_ObserverJobState.ACQUIRING_CAMERA:
@@ -737,8 +745,14 @@ class RFO_ObserverService
 				m_RFO_CameraSubsystemSafe = false;
 			if (!job.restorationConfirmed)
 			{
+				string priorErrorCode = job.terminalErrorCode;
+				string failureReason = m_RFO_CameraLease.GetLastCameraFailureReason();
+				if (failureReason.IsEmpty())
+					failureReason = "restoration_proof_unavailable";
 				job.terminalErrorCode = RFO_ObserverProtocol.ERROR_RESTORATION_UNCONFIRMED;
-				job.terminalMessage = "Observer camera ownership or exact restoration could not be confirmed";
+				job.terminalMessage = "Observer camera restoration could not be confirmed reason=" + failureReason;
+				if (!priorErrorCode.IsEmpty() && priorErrorCode != RFO_ObserverProtocol.ERROR_RESTORATION_UNCONFIRMED)
+					job.terminalMessage += " priorError=" + priorErrorCode;
 				m_RFO_LastErrorCode = job.terminalErrorCode;
 			}
 			if (!job.restorationLogged)
@@ -934,6 +948,13 @@ class RFO_ObserverService
 		m_RFO_LastErrorCode = code;
 		PublishStatus();
 		return true;
+	}
+
+	protected string ExplicitCameraCapabilityMessage(string reason)
+	{
+		if (reason.IsEmpty())
+			reason = "camera_lease_unavailable";
+		return "Explicit pose/lookAt requires a leaseable runtime camera; current capture remains available reason=" + reason;
 	}
 
 	protected bool CaptureRateAvailable()

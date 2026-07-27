@@ -56,6 +56,15 @@ describe("live graphical runtime observer acceptance contract", () => {
     expect(() => parseRuntimeCliArguments(
       ["--keep-profile", "--keep-profile"]
     )).toThrow(/only once/);
+    expect(parseRuntimeCliArguments(
+      ["--expect-current-only"]
+    ).flags.has("--expect-current-only")).toBe(true);
+    expect(parseRuntimeCliArguments(
+      ["--runtime-kind", "client"]
+    ).values.get("--runtime-kind")).toBe("client");
+    expect(() => parseRuntimeCliArguments(
+      ["--expect-current-only", "--expect-current-only"]
+    )).toThrow(/only once/);
     expect(() => parseRuntimeCliArguments([
       "--list-cases", "--only", "case-a", "--only", "case-b",
     ])).toThrow(/--only may be specified only once/);
@@ -239,9 +248,24 @@ describe("live graphical runtime observer acceptance contract", () => {
     expect(source).toContain("closeObserverRuntimeLifecycle(runtimeManager, application)");
     expect(source).toContain("stoppedRuntime.identityVacant !== true");
     expect(source).toContain("vacantRuntime.identityVacant !== true");
-    expect(source).toContain('runtimeKind: "listenServer"');
+    expect(source).toContain('type RuntimeAcceptanceKind = "listenServer" | "client"');
+    expect(source).toContain('const runtimeKind = options.runtimeKind ?? "listenServer"');
+    expect(source).toContain('instance.runtimeKind === runtimeKind');
     expect(source).toContain("await application.beginRun(");
     expect(source).toContain("application.instances({");
+    expect(source).toContain("const requiredInventoryCapabilities = options.expectCurrentOnly");
+    expect(source).toContain('? ["render.capture"]');
+    expect(source).toContain(': ["render.capture", "camera.runtime"]');
+    expect(source).toContain("requiredCapabilities: requiredInventoryCapabilities");
+    expect(source).toContain("supports current capture but not a manager-owned camera lease");
+    expect(source).toContain("pose/lookAt acceptance requires camera.runtime and was not attempted");
+    expect(source).toContain("expectCurrentOnly?: boolean");
+    expect(source).toContain("expectExplicitCameraUnavailable(");
+    expect(source).toContain("Expected exactly one current-only graphical runtime observer");
+    expect(source).toContain("Current capture unexpectedly acquired an observer camera lease");
+    expect(source).toContain("Current-only runtime did not remain healthy after explicit-view refusal");
+    expect(source).toContain("runtime-observer-current-only-containment-v1");
+    expect(source).toContain("--expect-current-only cannot be combined with --only");
     expect(source).toContain("await application.capture(");
     expect(source).toContain("await application.finalizeRun(");
     const stopIndex = source.indexOf("await runtimeManager.stop({");
@@ -270,7 +294,7 @@ describe("live graphical runtime observer acceptance contract", () => {
     expect(source).toContain('"post-pose-restoration-current"');
     expect(source).toContain('"explicit-look-at"');
     expect(source).toContain('"post-look-at-restoration-current"');
-    expect(source).toContain('configurationId: "runtime-observer-acceptance-v2"');
+    expect(source).toContain("configurationId: procedureRevision");
     expect(source).toContain("assertRequestedPoseRendered(pose.metadata, poseView)");
     expect(source).toContain("postPoseDistanceMeters");
     expect(source).toContain("postLookAtDistanceMeters");
@@ -296,7 +320,8 @@ describe("live graphical runtime observer acceptance contract", () => {
     expect(scratchCleanupIndex).toBeGreaterThan(exitSettleIndex);
     expect(restAfterShutdownIndex).toBeGreaterThan(scratchCleanupIndex);
     expect(source).toContain("writeOperationalBaselineArtifact(validationRoot, artifact)");
-    expect(source).toContain('procedureRevision: "runtime-observer-acceptance-v2"');
+    expect(source).toContain('"runtime-observer-acceptance-v2"');
+    expect(source).toContain("procedureRevision,");
     expect(source).toContain("operationalBaselineDirectoryIdentity(fixture.addonDirectory");
     expect(source).toContain("operationalBaselineLaunchArgumentIdentity([");
     expect(source).toContain("configurationSha256: baselineCaptureConfigurationSha256");
@@ -316,7 +341,7 @@ describe("live graphical runtime observer acceptance contract", () => {
 
   it("builds launch arguments and validates external roots in the shared launch-support module", () => {
     const source = readFileSync(resolve("scripts/observer-runtime-launch-support.ts"), "utf8");
-    expect(source).toContain('"-server", worldResource');
+    expect(source).toContain('runtimeKind === "listenServer" ? "-server" : "-world", worldResource');
     expect(source).toContain("assertExternalRoot(root, label)");
     expect(source).toContain('loadConfig(["--config", configPath])');
     expect(source).not.toContain("loadConfig()");
@@ -331,6 +356,8 @@ describe("live graphical runtime observer acceptance contract", () => {
     expect(source).toContain('"--keep-profile is valid only together with --only"');
     expect(source).toContain('"--only (fault-matrix mode) rejects a user-selected --addon-dir');
     expect(source).toContain("parseRuntimeCliArguments(process.argv.slice(2))");
+    expect(source).toContain('"--runtime-kind"');
+    expect(source).toContain('"--runtime-kind must be listenServer or client"');
     expect(source).not.toMatch(/environment\.RFO_RUNTIME_OBSERVER_(?!ACCEPTANCE_RESULT|EVIDENCE)/);
     expect(source).toContain('readFlag("--list-cases")');
     const listCasesIndex = source.indexOf('readFlag("--list-cases")');

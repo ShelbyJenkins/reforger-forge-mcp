@@ -186,6 +186,7 @@ export function registerTools(server: McpServer, config: Config): RegisteredTool
     defaultCaptureTimeoutMs: observerConfig?.defaultCaptureTimeoutMs,
     workbenchClient: wbClient,
     projectPath: config.projectPath,
+    workbenchAddonDirs: config.workbenchAddonDirs,
     evidenceRoots: observerConfig?.evidenceRoots,
     ownedRuntimeManager,
   });

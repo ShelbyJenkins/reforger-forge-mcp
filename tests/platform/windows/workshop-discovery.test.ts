@@ -21,6 +21,18 @@ describe("standard Workshop add-on root discovery", () => {
     }, { prefix: "rfo-workshop-discovery-onedrive-" });
   });
 
+  it("uses the profile OneDrive Documents convention when a child omits OneDrive", async () => {
+    await withTemporaryDirectory((root) => {
+      const homeDirectory = join(root, "home");
+      const candidate = workshopAddonsPath(join(homeDirectory, "OneDrive", "Documents"));
+      mkdirSync(candidate, { recursive: true });
+
+      expect(discoverStandardWorkshopAddonRoot({}, () => homeDirectory)).toBe(
+        candidate
+      );
+    }, { prefix: "rfo-workshop-discovery-profile-onedrive-" });
+  });
+
   it("falls back to the home Documents convention when OneDrive is unset", async () => {
     await withTemporaryDirectory((root) => {
       const homeDirectory = join(root, "home");
@@ -37,12 +49,15 @@ describe("standard Workshop add-on root discovery", () => {
     await withTemporaryDirectory((root) => {
       const oneDriveRoot = join(root, "OneDrive");
       const candidate = workshopAddonsPath(join(oneDriveRoot, "Documents"));
+      const homeDirectory = join(root, "home");
 
-      expect(discoverStandardWorkshopAddonRoot({ OneDrive: oneDriveRoot })).toBeUndefined();
+      expect(discoverStandardWorkshopAddonRoot({ OneDrive: oneDriveRoot }, () => homeDirectory))
+        .toBeUndefined();
 
       mkdirSync(dirname(candidate), { recursive: true });
       writeFileSync(candidate, "not a directory", "utf8");
-      expect(discoverStandardWorkshopAddonRoot({ OneDrive: oneDriveRoot })).toBeUndefined();
+      expect(discoverStandardWorkshopAddonRoot({ OneDrive: oneDriveRoot }, () => homeDirectory))
+        .toBeUndefined();
     }, { prefix: "rfo-workshop-discovery-missing-" });
   });
 });

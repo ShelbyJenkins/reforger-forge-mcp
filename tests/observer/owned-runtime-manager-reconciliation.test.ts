@@ -165,7 +165,7 @@ describe("OwnedRuntimeManager", () => {
       .toEqual([]);
   });
 
-  it("re-acknowledges a swept release before resuming exact-vacancy stop completion", async () => {
+  it("retains exact authority while a terminal completion retry is pending", async () => {
     const { agent, backend, clock, gate, value } =
       makeAgentBackedRuntimeHarness("rfo-owned-runtime-completion-expiry-");
     const started = await value.start("completion-expiry-start", onePointZeroOneArguments);
@@ -178,15 +178,18 @@ describe("OwnedRuntimeManager", () => {
     expect(recordExists(value.manager, "stops", started.runtimeId)).toBe(true);
     expect(recordExists(value.manager, "stop-completions", started.runtimeId)).toBe(false);
     expect(agent.server.storeDiagnostics()).toMatchObject({
-      ownedRuntimeLifecyclePins: { records: 0 },
-      ownedRuntimeAuthorities: { records: 1, releaseAcknowledged: 1 },
+      ownedRuntimeLifecyclePins: { records: 1 },
+      ownedRuntimeAuthorities: { records: 1, releaseAcknowledged: 0 },
     });
 
     clock.advance(1_001);
     value.setClock(clock.now());
     agent.server.sweep(clock.now());
     expect(agent.server.storeDiagnostics()).toMatchObject({
-      ownedRuntimeAuthorities: { records: 0, releaseAcknowledged: 0 },
+      // A completion response that never arrived must not turn the exact
+      // recovery authority into a sweepable tombstone before its retry.
+      ownedRuntimeLifecyclePins: { records: 1 },
+      ownedRuntimeAuthorities: { records: 1, retained: 1, releaseAcknowledged: 0 },
     });
 
     await expect(value.stop(started.runtimeId, "completion-expiry-stop")).resolves.toMatchObject({

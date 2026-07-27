@@ -23,6 +23,7 @@ describe("runtime observer camera restoration contract", () => {
   it("waits on a read-only leaseability proof before one mutating acquisition", () => {
     const lease = runtimeSource("RFO_ObserverCameraLease.c");
     const service = runtimeSource("RFO_ObserverService.c");
+    const arbitration = runtimeSource("RFO_ObserverEditorCameraArbitration.c");
     const resolver = between(
       lease,
       "protected bool ResolveLeaseableCamera(",
@@ -30,6 +31,7 @@ describe("runtime observer camera restoration contract", () => {
     );
     const acquire = between(lease, "bool Acquire(", "bool CommitPostFrame(");
     const process = between(service, "protected void ProcessActiveJob(", "protected void AcquireCamera(");
+    const command = between(service, "bool OnRuntimeCommand(", "bool OnTransportSuccess(");
     const resolving = between(
       process,
       "case RFO_ObserverJobState.RESOLVING:",
@@ -43,8 +45,13 @@ describe("runtime observer camera restoration contract", () => {
 
     expect(lease).toContain("bool CanAcquire(BaseWorld world)");
     expect(lease).toContain("string GetLastLeaseabilityReason()");
+    expect(lease).toContain("string GetLastCameraFailureReason()");
     expect(resolver).toContain("game.GetWorld() != world");
-    expect(resolver).toContain("original = FindPlayerCamera()");
+    expect(resolver).toContain("manager = game.GetCameraManager()");
+    expect(resolver).toContain("CameraBase playerCamera = FindPlayerCamera()");
+    expect(resolver).toContain("bool detachedPlayerCamera");
+    expect(resolver).toContain("original = playerCamera");
+    expect(resolver).toContain("detachedPlayerCamera = true");
     expect(resolver).toContain("world.GetCurrentCameraId() != cameraId");
     expect(resolver).toContain("CameraRegistered(manager, original)");
     expect(resolver).not.toContain("SpawnObserverCamera(");
@@ -54,6 +61,23 @@ describe("runtime observer camera restoration contract", () => {
 
     expect(acquire.match(/ResolveLeaseableCamera\(/g)).toHaveLength(1);
     expect(acquire.match(/SpawnObserverCamera\(/g)).toHaveLength(1);
+    expect(acquire).toContain("CameraRegistered(manager, observer)");
+    expect(acquire).toContain("manager.SetCamera(observer)");
+    expect(acquire).toContain("if (!detachedPlayerCamera)");
+    expect(acquire).toContain("RFO_ObserverEditorCameraArbitration.CanBeginManagerLease(manager, original)");
+    expect(acquire).toContain("RFO_ObserverEditorCameraArbitration.BeginManagerLease(manager, original)");
+    expect(acquire).toContain("RFO_ObserverEditorCameraArbitration.EndManagerLease()");
+    expect(acquire).toContain("Initialize(jobId, world, worldEpoch, manager, original, observer, detachedPlayerCamera");
+    expect(arbitration).toContain("modded class SCR_CameraEditorComponent");
+    expect(arbitration).toContain("SCR_CameraEditorComponent.GetCameraInstance()");
+    expect(arbitration).toContain("RFO_ObserverEditorCameraArbitration.IsManagerLeaseActive(m_CameraManager, m_Camera)");
+    expect(arbitration).toContain("override protected bool TryForceCamera()");
+    expect(arbitration).toContain("override protected void OnCameraDectivate()");
+    expect(arbitration).toContain("super.TryForceCamera()");
+    expect(arbitration).toContain("super.OnCameraDectivate()");
+    expect(arbitration).toContain("manager == s_RFO_LeaseManager");
+    expect(arbitration).toContain("camera == s_RFO_LeaseOriginalCamera");
+    expect(arbitration).not.toContain("override void EOnFrame(");
     expect(process.indexOf("job.cancellationRequested")).toBeLessThan(
       process.indexOf("switch (job.state)")
     );
@@ -65,7 +89,15 @@ describe("runtime observer camera restoration contract", () => {
     expect(resolving.indexOf("m_RFO_CameraLease.CanAcquire(world)")).toBeLessThan(
       resolving.indexOf("AcquireCamera(world)")
     );
+    expect(resolving).toContain("RFO_ObserverProtocol.ERROR_CAPABILITY_UNAVAILABLE");
+    expect(resolving).toContain("ExplicitCameraCapabilityMessage(leaseabilityReason)");
+    expect(resolving).toContain("BeginTerminalTransition()");
     expect(resolving).not.toContain("m_RFO_CameraLease.Acquire(");
+    expect(command.indexOf("m_RFO_CameraLease.CanAcquire(m_RFO_World.GetObject())")).toBeLessThan(
+      command.indexOf("m_RFO_ActiveJob = job")
+    );
+    expect(command).toContain("ExplicitCameraCapabilityMessage(leaseabilityReason)");
+    expect(command).toContain("RFO_ObserverProtocol.ERROR_CAPABILITY_UNAVAILABLE");
     expect(capabilities).toContain("m_RFO_CameraLease.CanAcquire(m_RFO_World.GetObject())");
   });
 
@@ -149,9 +181,10 @@ describe("runtime observer camera restoration contract", () => {
     expect(callback).toContain("m_RFO_CameraLease.CommitRestorationPostFrame(");
     expect(callback.indexOf("CommitRestorationPostFrame("))
       .toBeLessThan(callback.indexOf("CommitPostFrame("));
-    expect(lease).toContain("WorldCameraMatches(m_RFO_ActualMatrix, m_RFO_ActualFovDegrees)");
     expect(lease).toContain("PublishedCameraMatches(m_RFO_OriginalCamera");
     expect(lease).toContain("Clear(false)");
+    expect(lease).toContain("WorldCameraMatches(");
+    expect(lease).toContain("RestoreDetachedPlayerCamera");
     expect(lease).not.toContain("FinishDetachedRestoration");
     expect(lease).not.toContain("FinishOriginalRestoration");
   });
@@ -170,7 +203,27 @@ describe("runtime observer camera restoration contract", () => {
     expect(cleanup).toContain("world.GetCurrentCameraId() != m_RFO_WorldCameraId");
     expect(cleanup).toContain("m_RFO_CameraManager.CurrentCamera() == m_RFO_ObserverCamera");
     expect(cleanup).toContain("m_RFO_CameraManager.CurrentCamera() == m_RFO_OriginalCamera");
+    expect(cleanup).toContain("m_RFO_UsesDetachedPlayerCamera");
     expect(cleanup).not.toContain("Clear(true)");
     expect(cleanup).not.toContain("DestroyObserverCamera(");
+  });
+
+  it("keeps a concrete manager-path failure reason when restoration fails closed", () => {
+    const lease = runtimeSource("RFO_ObserverCameraLease.c");
+    const service = runtimeSource("RFO_ObserverService.c");
+    const restore = between(
+      lease,
+      "bool Restore(string jobId",
+      "bool CommitRestorationPostFrame("
+    );
+    const restoration = between(service, "protected void AdvanceRestoration(", "protected void RecordFailure(");
+
+    expect(lease).toContain("protected void SetCameraFailureReason(string reason)");
+    expect(restore).toContain('SetCameraFailureReason("restore_manager_owner_changed")');
+    expect(restore).toContain('SetCameraFailureReason("restore_target_selection_failed")');
+    expect(restore).toContain('SetCameraFailureReason("restore_cleanup_binding_changed")');
+    expect(restoration).toContain("m_RFO_CameraLease.GetLastCameraFailureReason()");
+    expect(restoration).toContain('"Observer camera restoration could not be confirmed reason=" + failureReason');
+    expect(restoration).toContain('job.terminalMessage += " priorError=" + priorErrorCode');
   });
 });

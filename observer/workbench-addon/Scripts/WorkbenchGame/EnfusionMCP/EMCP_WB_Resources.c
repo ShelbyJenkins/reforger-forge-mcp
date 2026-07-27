@@ -97,11 +97,16 @@ class EMCP_WB_Resources : NetApiHandler
 		if (req.action == "register")
 		{
 			bool result = resMgr.RegisterResourceFile(req.path, req.buildRuntime);
-			resp.status = "ok";
 			if (result)
+			{
+				resp.status = "ok";
 				resp.message = "Resource registered: " + req.path;
+			}
 			else
+			{
+				resp.status = "error";
 				resp.message = "RegisterResourceFile returned false for: " + req.path;
+			}
 		}
 		else if (req.action == "rebuild")
 		{
@@ -111,12 +116,28 @@ class EMCP_WB_Resources : NetApiHandler
 		}
 		else if (req.action == "open")
 		{
+			// ResourceManager validates virtual project paths without assuming they
+			// are directly addressable filesystem paths. This blocks the native
+			// SetOpenedResource false-success behavior for missing resources.
+			MetaFile metaFile = resMgr.GetMetaFile(req.path);
+			if (!metaFile)
+			{
+				resp.status = "error";
+				resp.message = "Resource metadata not found for: " + req.path;
+				return resp;
+			}
+
 			bool result = resMgr.SetOpenedResource(req.path);
-			resp.status = "ok";
 			if (result)
+			{
+				resp.status = "ok";
 				resp.message = "Opened resource: " + req.path;
+			}
 			else
+			{
+				resp.status = "error";
 				resp.message = "SetOpenedResource returned false for: " + req.path;
+			}
 		}
 		else if (req.action == "browse")
 		{

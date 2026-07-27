@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 import { ObserverControlApi } from "../../observer/agent/control-api.js";
 import { mergeLaunchArguments } from "../../observer/agent/launch-arguments.js";
 import { MailboxTransport } from "../../observer/agent/mailbox.js";
+import { mergeConfiguredAddonDirectories } from "../../src/observer/tools.js";
 import { ADDON_GUID, SESSION_CONTRACT_NAME, SESSION_DIRECTORY_NAME } from "../../observer/protocol/index.js";
 import { observerAddonSource } from "../support/observer-fixtures.js";
 import { withTemporaryDirectory } from "../support/temporary-directory.js";
@@ -86,6 +87,73 @@ describe("observer launch preparation", () => {
       expect(result.filter((value) => value === "-forceUpdate")).toHaveLength(1);
       expect(result.filter((value) => value === "-noFocus")).toHaveLength(1);
     });
+  });
+
+  it("keeps configured game and Workshop roots before caller roots and normalizes duplicates once", async () => {
+    await withTemporaryDirectory((root) => {
+      const profile = join(root, "profiles", "run");
+      const gameAddons = join(root, "game-addons");
+      const workshopAddons = join(root, "workshop-addons");
+      const callerAddons = join(root, "caller-addons");
+      const observerRoot = join(root, "staged");
+      const observerAddon = join(observerRoot, "ReforgerForgeObserver");
+      [profile, gameAddons, workshopAddons, callerAddons, observerAddon]
+        .forEach((path) => mkdirSync(path, { recursive: true }));
+
+      const argumentsArray = mergeConfiguredAddonDirectories(
+        ["-server", "-addonsDir", `${callerAddons},${workshopAddons}`],
+        [gameAddons, workshopAddons, gameAddons],
+      );
+      expect(argumentsArray).toEqual([
+        "-addonsDir", `${gameAddons},${workshopAddons},${gameAddons}`,
+        "-server", "-addonsDir", `${callerAddons},${workshopAddons}`,
+      ]);
+
+      const merged = mergeLaunchArguments({
+        arguments: argumentsArray,
+        profilePath: profile,
+        addonSearchRoot: observerRoot,
+        stagedAddonPath: observerAddon,
+        forceUpdate: false,
+        noFocus: false,
+      });
+      expect(merged[merged.indexOf("-addonsDir") + 1].split(",")).toEqual([
+        gameAddons,
+        workshopAddons,
+        callerAddons,
+        observerRoot,
+      ]);
+    }, { prefix: "rfo-configured-addon-roots-" });
+  });
+
+  it("accepts the public caller-token limit plus the internally configured addon pair", async () => {
+    await withTemporaryDirectory(async (root) => {
+      const profiles = join(root, "profiles");
+      const configuredAddons = join(root, "configured-addons");
+      mkdirSync(profiles, { recursive: true });
+      mkdirSync(configuredAddons, { recursive: true });
+      const control = new ObserverControlApi({
+        root: join(root, "managed"),
+        profileRoot: profiles,
+        sourceDirectory: observerAddonSource,
+      });
+      control.setEndpoint("127.0.0.1", 47831);
+      const callerArguments = Array.from({ length: 512 }, (_, index) => `-caller-${index}`);
+
+      const prepared = await control.prepareLaunch({
+        runtimeKind: "client",
+        arguments: ["-addonsDir", configuredAddons, ...callerArguments],
+        profilePath: join(profiles, "run-max-caller-arguments"),
+        sessionTtlMs: 60_000,
+        transportPreference: ["rest"],
+        forceUpdate: false,
+        noFocus: false,
+      });
+
+      expect(prepared.arguments).toContain("-caller-511");
+      expect(prepared.arguments[prepared.arguments.indexOf("-addonsDir") + 1])
+        .toContain(configuredAddons);
+    }, { prefix: "rfo-configured-addon-limit-" });
   });
 
   it("retains the approved root internally and provides the doctor recovery action", async () => {

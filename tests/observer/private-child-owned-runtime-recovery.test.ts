@@ -31,6 +31,7 @@ interface FixtureProcess {
 class BoundaryBackend implements OwnedRuntimeProcessBackend {
   readonly platform = "test" as const;
   readonly processes = new Map<number, FixtureProcess>();
+  afterVerifiedTermination: (() => Promise<void>) | undefined;
 
   async withMachineMutex<T>(args: { action: () => Promise<T> }): Promise<T> {
     return args.action();
@@ -72,6 +73,7 @@ class BoundaryBackend implements OwnedRuntimeProcessBackend {
       return { kind: "refused" as const, reason: "token_mismatch" as const, message: "owner changed" };
     }
     this.processes.delete(expected.pid);
+    await this.afterVerifiedTermination?.();
     return { kind: "terminated" as const };
   }
 }
@@ -543,6 +545,40 @@ describe("actual private-child owned-runtime recovery boundary", () => {
       { records: 0, bytes: 0 },
     ]);
   }), 30_000);
+
+  it("reconstructs retained authority when the private child is replaced after exact termination", async () => withBoundaryHarness(async (value) => {
+    const prepared = await value.prepare("completion-child-replacement", 3_000);
+    const started = await value.manager.start({
+      preparedLaunchId: prepared.preparedLaunchId,
+      idempotencyKey: "start-completion-child-replacement",
+    });
+
+    // Make the hand-off deterministic: the exact graphical identity is already
+    // vacant, then the private observer child dies before final completion can
+    // revoke its retained session. The replacement must reconstruct the exact
+    // durable lifecycle rather than require a sweepable release tombstone.
+    value.backend.afterVerifiedTermination = async () => {
+      await forceUnexpectedPrivateChildLoss(value.application);
+    };
+
+    await expect(value.manager.stop({
+      runtimeId: started.runtimeId,
+      waitForRestorationMs: 0,
+      idempotencyKey: "stop-completion-child-replacement",
+    })).resolves.toMatchObject({
+      runtimeId: started.runtimeId,
+      state: "exited",
+      terminationComplete: true,
+      observerCleanupPending: false,
+    });
+
+    await value.manager.sweep();
+    await waitFor(async () => (await authorityStats(value)).records === 0);
+    expect(value.manager.diagnosticStorageStats()).toMatchObject({
+      records: 0,
+      activeOrRecoverableRuntimes: 0,
+    });
+  }), 15_000);
 
   it("keeps release-required authority pinned past retention when release is lost before delivery", async () => withBoundaryHarness(async (value) => {
     // The child durably acknowledges release before its IPC reply. Keep that

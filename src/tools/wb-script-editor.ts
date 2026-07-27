@@ -34,7 +34,7 @@ export function registerWbScriptEditor(server: McpServer, client: WorkbenchClien
         // Mutating actions require edit mode
         const MUTATING_ACTIONS = ["setLine", "insertLine", "removeLine"];
         if (MUTATING_ACTIONS.includes(action)) {
-          const modeErr = requireEditMode(client, `${action} in script editor`);
+          const modeErr = await requireEditMode(client, `${action} in script editor`);
           if (modeErr) {
             return { content: [{ type: "text" as const, text: modeErr + formatConnectionStatus(client) }] };
           }

@@ -26,7 +26,7 @@ export function registerWbComponent(server: McpServer, client: WorkbenchClient):
     },
     async ({ entityName, action, componentClass, componentIndex }) => {
       if (action === "add" || action === "remove") {
-        const modeErr = requireEditMode(client, `${action} component`);
+        const modeErr = await requireEditMode(client, `${action} component`);
         if (modeErr) {
           return { content: [{ type: "text" as const, text: modeErr + formatConnectionStatus(client) }] };
         }

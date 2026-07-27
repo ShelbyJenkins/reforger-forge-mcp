@@ -1,7 +1,16 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { WorkbenchClient } from "../workbench/client.js";
-import { formatConnectionStatus, requirePlayMode } from "../workbench/status.js";
+import { formatConnectionStatus, getAuthoritativeWorkbenchMode } from "../workbench/status.js";
+
+function throwIfEditorHelperFailed(result: Record<string, unknown>, action: string): void {
+  if (result.status !== "error") return;
+
+  const message = typeof result.message === "string" && result.message.trim()
+    ? result.message
+    : `Workbench editor ${action} failed.`;
+  throw new Error(message);
+}
 
 export function registerWbEditorTools(server: McpServer, client: WorkbenchClient): void {
   // wb_stop — Switch to edit mode
@@ -14,20 +23,11 @@ export function registerWbEditorTools(server: McpServer, client: WorkbenchClient
       inputSchema: {},
     },
     async () => {
-      if (client.state.mode === "unknown" && client.state.connected) {
-        try {
-          await client.call<Record<string, unknown>>(
-            "EMCP_WB_GetState",
-            {},
-            { skipAutoLaunch: true }
-          );
-        } catch {
-          // The mode remains unknown and the guarded response below explains
-          // how to confirm state without attempting a stop blindly.
-        }
-      }
-
-      if (client.state.mode === "edit") {
+      // The cached edit state can become stale if a person enters Play between
+      // MCP calls. Every successful stop response must begin with this fresh
+      // helper-state observation.
+      const initialState = await getAuthoritativeWorkbenchMode(client);
+      if (initialState.mode === "edit") {
         return {
           content: [{
             type: "text" as const,
@@ -36,10 +36,12 @@ export function registerWbEditorTools(server: McpServer, client: WorkbenchClient
         };
       }
 
-      const modeErr = requirePlayMode(client, "stop play mode");
-      if (modeErr) {
+      if (initialState.mode !== "play") {
         return {
-          content: [{ type: "text" as const, text: modeErr + formatConnectionStatus(client) }],
+          content: [{
+            type: "text" as const,
+            text: "Cannot stop play mode: Workbench mode is unknown. Call `wb_state` first to confirm play mode." + formatConnectionStatus(client),
+          }],
           isError: true,
         };
       }
@@ -47,6 +49,24 @@ export function registerWbEditorTools(server: McpServer, client: WorkbenchClient
         const result = await client.call<Record<string, unknown>>("EMCP_WB_EditorControl", {
           action: "stop",
         });
+
+        // SwitchToEditMode() acknowledging the command is not proof that
+        // Workbench actually left game mode. Refresh from the authoritative
+        // state handler before telling a caller that edit-only operations are
+        // safe to perform.
+        const state = await getAuthoritativeWorkbenchMode(client);
+        if (state.mode !== "edit") {
+          const stateMessage = state.message
+            ? `\n${state.message}`
+            : "";
+          return {
+            content: [{
+              type: "text" as const,
+              text: `**Edit Mode Not Confirmed**\n\nWorkbench acknowledged the stop request, but its post-command state is \`${state.reportedMode}\`. Edit-only operations remain blocked.${stateMessage}${formatConnectionStatus(client)}`,
+            }],
+            isError: true,
+          };
+        }
 
         return {
           content: [
@@ -120,6 +140,7 @@ export function registerWbEditorTools(server: McpServer, client: WorkbenchClient
           action: "openResource",
           path,
         });
+        throwIfEditorHelperFailed(result, "open resource");
 
         return {
           content: [

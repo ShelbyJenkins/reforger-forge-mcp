@@ -457,6 +457,32 @@ describe("observer jobs", () => {
     });
   });
 
+  scopedIt("accepts a pre-acquisition camera-capability refusal without pinning restoration", (root) => {
+    const value = setup(root);
+    const rejected = submitCamera(value, "detached-camera-rejected");
+    const command = dispatch(value, rejected);
+    value.jobs.update(status(value, rejected.request.jobId, 1, "failed", {
+      deliveryToken: command.deliveryToken,
+      errorCode: "CAPABILITY_UNAVAILABLE",
+      message: "Explicit pose/lookAt requires a CameraManager-owned current camera; current capture remains available reason=detached_player_camera_unsupported",
+    }), value.created.contract.sessionToken);
+
+    expect(rejected).toMatchObject({
+      state: "failed",
+      terminalErrorCode: "CAPABILITY_UNAVAILABLE",
+      cameraWasAcquired: false,
+      cameraLease: { everHeld: false, held: false, restorationConfirmed: false },
+    });
+    expect(value.jobs.stats()).toMatchObject({ restorationObligations: 0 });
+
+    const successor = submitCurrent(value, "current-after-detached-rejection");
+    expect(value.jobs.nextCommand(
+      value.registration.sessionId,
+      value.registration.instanceId,
+      value.registration.instanceNonce
+    )).toMatchObject({ jobId: successor.request.jobId, commandKind: "capture" });
+  });
+
   scopedIt("pins an unresolved restoration obligation past normal terminal retention", (root) => {
     const value = setup(root, { terminalJobRetentionMs: 1, idempotencyReceiptRetentionMs: 1 });
     const job = submitCamera(value, "restoration-unconfirmed");

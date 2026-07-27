@@ -1,8 +1,10 @@
 class RFO_ObserverCapabilities
 {
 	// The observer advertises these capabilities only on a graphical runtime.
-	// System.MakeScreenshot and the transactionally restored CameraManager path
-	// are exercised by the gated live acceptance before release.
+	// Screenshot capture and the detached-player-camera transaction are
+	// live-qualified on the stock MpTest fixture. The exact GameMaster camera
+	// transaction is separately qualified on the RoadblockRunners sandbox; all
+	// other manager-owned targets remain capability-gated by the lease proof.
 	static const bool RENDER_CAPTURE_PROVEN = true;
 	static const bool CAMERA_RESTORE_PROVEN = true;
 

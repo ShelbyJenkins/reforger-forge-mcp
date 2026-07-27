@@ -73,8 +73,25 @@ export interface ObserverToolDefaults {
   defaultCaptureTimeoutMs?: number;
   workbenchClient?: WorkbenchClient;
   projectPath?: string;
+  /** Ordered add-on roots resolved from the active MCP configuration. */
+  workbenchAddonDirs?: readonly string[];
   evidenceRoots?: readonly string[];
   ownedRuntimeManager?: OwnedRuntimeManager;
+}
+
+/**
+ * Put configuration-owned roots ahead of caller roots, then let the private
+ * observer agent perform the single canonical `-addonsDir` normalization. Its
+ * merger preserves this order and removes duplicates after resolving paths.
+ */
+export function mergeConfiguredAddonDirectories(
+  argumentsArray: readonly string[],
+  configuredAddonDirs: readonly string[] | undefined,
+): string[] {
+  if (!configuredAddonDirs || configuredAddonDirs.length === 0) {
+    return [...argumentsArray];
+  }
+  return ["-addonsDir", configuredAddonDirs.join(","), ...argumentsArray];
 }
 
 function jsonText(heading: string, value: unknown): string {
@@ -193,7 +210,13 @@ export function registerObserverTools(
       try {
         const prepared = await prepareObserverLaunch(
           application,
-          input,
+          {
+            ...input,
+            arguments: mergeConfiguredAddonDirectories(
+              input.arguments,
+              defaults.workbenchAddonDirs,
+            ),
+          },
           defaults.ownedRuntimeManager
         );
         return { content: [{ type: "text" as const, text: jsonText("Observer launch arguments prepared; no process was started.", prepared) }] };

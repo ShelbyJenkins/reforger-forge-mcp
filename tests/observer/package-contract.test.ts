@@ -379,7 +379,7 @@ describe("observer package and source contracts", () => {
     expect(integrationSource).not.toMatch(/WorkbenchProcessGuard|wb_launch|wb_restart|wb_shutdown|wb_cleanup/);
   });
 
-  it("enforces dormant, headless, restoration, and no-Workbench implementation source invariants", () => {
+  it("enforces graphical, headless, restoration, and no-Workbench implementation source invariants", () => {
     const addonFiles = filesRecursively(observerAddonSource);
     const source = addonFiles.filter((path) => path.endsWith(".c")).map((path) => readFileSync(path, "utf8")).join("\n");
     const bootstrap = readFileSync(join(observerAddonSource, "Scripts", "Game", "ReforgerForgeObserver", "RFO_ObserverBootstrap.c"), "utf8");
@@ -403,13 +403,24 @@ describe("observer package and source contracts", () => {
     expect(cameraLease).toContain("CommitPostFrame");
     expect(cameraLease).toContain("CommitRestorationPostFrame");
     expect(cameraLease).toContain("CameraRegistered(manager, original)");
-    expect(cameraLease).toContain("m_RFO_UsesDetachedPlayerCamera = detachedPlayerCamera");
+    expect(cameraLease).toContain("bool detachedPlayerCamera");
+    expect(cameraLease).toContain("original = playerCamera");
+    expect(cameraLease).toContain("detachedPlayerCamera = true");
+    expect(cameraLease).toContain("CameraRegistered(manager, observer)");
+    expect(cameraLease).toContain("manager.SetCamera(observer)");
     expect(cameraLease).toContain("MaintainRequestedView");
     expect(cameraLease).toContain("AwaitingFirstPostFrameCommit");
+    expect(cameraLease).toContain("GetLastCameraFailureReason");
+    expect(cameraLease).toContain("m_RFO_UsesDetachedPlayerCamera");
     expect(cameraLease).toContain("RestoreDetachedPlayerCamera");
+    expect(cameraLease).toContain("WorldCameraMatches");
+    expect(source).toContain("modded class SCR_CameraEditorComponent");
+    expect(source).toContain("RFO_ObserverEditorCameraArbitration.CanBeginManagerLease(manager, original)");
+    expect(source).toContain("override protected bool TryForceCamera()");
+    expect(source).toContain("override protected void OnCameraDectivate()");
     expect(cameraLease).not.toContain("GetCameraNearPlane");
     expect(cameraLease).not.toContain("AcquireWorldCamera");
-    expect(cameraLease).toContain("FindPlayerCamera()");
+    expect(cameraLease).toContain("CameraBase playerCamera = FindPlayerCamera()");
     expect(cameraLease).toContain("camera.SetVerticalFOV(fovDegrees)");
     expect(cameraLease).toContain("camera.ApplyTransform(timeSlice)");
     expect(cameraLease).toContain("PublishedCameraMatches");
@@ -443,6 +454,8 @@ describe("observer package and source contracts", () => {
     expect(service).toContain("m_RFO_CameraLease.CommitPostFrame(");
     expect(service).toContain("m_RFO_Capture.IssueCommitted(");
     expect(service).toContain("m_RFO_PostFrameCaptureArmed = true");
+    expect(service).toContain("Explicit pose/lookAt requires a leaseable runtime camera");
+    expect(service).toContain("RFO_ObserverProtocol.ERROR_CAPABILITY_UNAVAILABLE");
     expect(service).toContain("RFO_ObserverJobState.PRELOADING");
     expect(service).not.toContain("m_RFO_Capture.IsReady() && m_RFO_Capture.RuntimeReady()");
     const job = readFileSync(join(observerAddonSource, "Scripts", "Game", "ReforgerForgeObserver", "RFO_ObserverJob.c"), "utf8");

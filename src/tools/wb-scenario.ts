@@ -199,7 +199,7 @@ export function registerScenarioTools(server: McpServer, client: WorkbenchClient
       if (type === "objective") {
         const { taskType, taskName, description, position, targetPrefab, aiGroupPrefab, triggerRadius, faction } = args;
 
-        const modeErr = requireEditMode(client, "create scenario objective");
+        const modeErr = await requireEditMode(client, "create scenario objective");
         if (modeErr) {
           return { content: [{ type: "text" as const, text: modeErr + formatConnectionStatus(client) }] };
         }
@@ -339,7 +339,7 @@ export function registerScenarioTools(server: McpServer, client: WorkbenchClient
       if (type === "base") {
         const { baseName, position, baseFaction, baseType, patrolCount } = args;
 
-        const modeErr = requireEditMode(client, "create conflict base");
+        const modeErr = await requireEditMode(client, "create conflict base");
         if (modeErr) {
           return { content: [{ type: "text" as const, text: modeErr + formatConnectionStatus(client) }] };
         }

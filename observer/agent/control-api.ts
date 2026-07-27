@@ -24,9 +24,15 @@ import {
 } from "./sessions.js";
 import { StagingManager, verifySourceBundle } from "./staging.js";
 
+// The public MCP tool accepts at most 512 caller tokens. The host prepends one
+// `-addonsDir <configured roots>` pair before this private API normalizes the
+// launch, while the persisted prepared descriptor already allows the resulting
+// 520-token normalized maximum.
+const MAX_PREPARE_LAUNCH_ARGUMENTS = 512 + 2;
+
 const prepareLaunchSchema = z.object({
   runtimeKind: z.enum(["client", "listenServer", "dedicated", "testRunner"]),
-  arguments: z.array(z.string().max(32_768)).max(512),
+  arguments: z.array(z.string().max(32_768)).max(MAX_PREPARE_LAUNCH_ARGUMENTS),
   profilePath: z.string().min(1).max(32_768),
   sessionTtlMs: z.number().int().min(1_000).max(24 * 60 * 60 * 1000).default(20 * 60 * 1000),
   transportPreference: z.array(z.enum(TRANSPORTS)).min(1).max(2).default(["rest", "mailbox"]),

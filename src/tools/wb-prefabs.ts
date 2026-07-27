@@ -5,6 +5,15 @@ import { formatConnectionStatus, requireEditMode } from "../workbench/status.js"
 
 const MUTATING_PREFAB_ACTIONS = new Set(["createTemplate", "save"]);
 
+function throwIfPrefabHelperFailed(result: Record<string, unknown>, action: string): void {
+  if (result.status !== "error") return;
+
+  const message = typeof result.message === "string" && result.message.trim()
+    ? result.message
+    : `Workbench prefab ${action} failed.`;
+  throw new Error(message);
+}
+
 export function registerWbPrefabs(server: McpServer, client: WorkbenchClient): void {
   server.registerTool(
     "wb_prefabs",
@@ -33,7 +42,7 @@ export function registerWbPrefabs(server: McpServer, client: WorkbenchClient): v
     },
     async ({ action, entityName, templatePath, searchPath }) => {
       if (MUTATING_PREFAB_ACTIONS.has(action)) {
-        const modeErr = requireEditMode(client, `${action === "createTemplate" ? "create template" : "save prefab"}`);
+        const modeErr = await requireEditMode(client, `${action === "createTemplate" ? "create template" : "save prefab"}`);
         if (modeErr) {
           return { content: [{ type: "text" as const, text: modeErr + formatConnectionStatus(client) }] };
         }
@@ -114,6 +123,7 @@ export function registerWbPrefabs(server: McpServer, client: WorkbenchClient): v
           const result = await client.call<{ status: string; ancestorPath?: string; message?: string }>(
             "EMCP_WB_Prefabs", { action: "getAncestor", entityName }
           );
+          throwIfPrefabHelperFailed(result, action);
           return {
             content: [{
               type: "text" as const,
@@ -139,6 +149,7 @@ export function registerWbPrefabs(server: McpServer, client: WorkbenchClient): v
         if (templatePath) params.templatePath = templatePath;
 
         const result = await client.call<Record<string, unknown>>("EMCP_WB_Prefabs", params);
+        throwIfPrefabHelperFailed(result, action);
 
         if (action === "createTemplate") {
           return {

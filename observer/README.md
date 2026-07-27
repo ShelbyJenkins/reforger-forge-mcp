@@ -343,6 +343,11 @@ Choose the view by what the image must prove:
 | `lookAt` | A reproducible world overview using an explicit position, target, and FOV |
 | `pose` | Replaying a known transform with a normalized quaternion |
 
+`pose` and `lookAt` are capability-dependent. They are available on Workbench
+after `camera.editor` qualification and on a graphical runtime only after that
+runtime advertises `camera.runtime`; otherwise the runtime safely exposes
+`current` capture only.
+
 For Workbench, take one successful `current` capture after each restart before
 requesting `pose` or `lookAt`; that restoration proof enables
 `camera.editor`. A settle value can reduce capture-time movement, but it does
@@ -437,10 +442,33 @@ job and wait for terminal restoration before stopping an owned process.
 
 ## Opt-in graphical runtime screenshot acceptance
 
+### Runtime explicit-camera safety policy
+
+`current` capture reads the active render view and remains available whenever
+`render.capture` is advertised. Runtime `pose` and `lookAt` additionally
+require `camera.runtime`, which is advertised only after the read-only camera
+leaseability proof succeeds.
+
+Two runtime paths are live-qualified: the detached player-camera transaction
+on stock `MpTest`, and the stock GameMaster camera in RoadblockRunners'
+`KolguyevVehicleSandbox`. The latter uses an MCP companion-only, identity-bound
+interlock for that exact `CameraManager` and editor camera. It suppresses only
+the editor's competing `TryForceCamera` and synchronous
+`OnCameraDectivate` reselection writes while the observer transaction is
+active; normal editor-frame behavior, exact post-frame restoration proof, and
+all RoadblockRunners source remain unchanged.
+
+This remains fail-closed for every other manager owner. A graphical runtime
+that exposes `render.capture` but not `camera.runtime` is healthy for
+`current` capture and deliberately ineligible for `pose` and `lookAt`; it is
+never reclassified as detached merely to force an explicit capture.
+
 The Windows-only runtime harness performs an end-to-end screenshot transaction
-against an installed graphical Diag executable. It maps the requested fixture
-world to Reforger's `-server <world>` launch form and prepares the matching
-`listenServer` observer contract, producing a visible graphical listen host.
+against an installed graphical Diag executable. By default it maps the
+requested fixture world to Reforger's `-server <world>` launch form and
+prepares the matching `listenServer` observer contract, producing a visible
+graphical listen host. `--runtime-kind client` instead uses `-world <world>`
+and prepares the matching direct graphical-client contract.
 It exercises the shared exact-owned lifecycle service and may stop only the
 runtime whose full receipt identity it verified. It refuses to start while any
 Arma Reforger or Workbench process exists. A direct live run requires both an
@@ -452,24 +480,27 @@ npm run dev:observer:acceptance:runtime -- --config <CONFIG_PATH> --confirm-live
 ```
 
 By default the harness uses the installed stock world
-`{96A8AF57260A7392}worlds/MP/MpTest/MpTest.ent`. Its explicit pose uses position
-`[96, 90, -5]`, a normalized quaternion aimed into the fixture, and a 58-degree
-FOV. Its separate look-at view looks from `[64, 121, -40]` toward
-`[64, 10, 100]` at 70 degrees. It loads no project add-on and creates every
-managed, profile, diagnostic, and evidence root under an external temporary
-artifact root. This keeps acceptance isolated from the current project. The
-harness also finds a graphical Diag executable beneath the configured
-`gamePath`. Confirmed optional settings include:
+`{96A8AF57260A7392}worlds/MP/MpTest/MpTest.ent` and performs the five-view
+positive flow. `--expect-current-only` instead selects the explicit
+containment procedure. Both modes create every managed, profile, diagnostic,
+and evidence root under an external temporary artifact root. This keeps
+acceptance isolated from the current project. The harness also finds a
+graphical Diag executable beneath the configured `gamePath`. Confirmed optional
+settings include:
 
 - `--addon-dir <directory>` for a fixture add-on containing exactly one
   `.gproj`; the harness derives its parent search root and add-on GUID for the
   launch.
 - Repeated `--launch-arg <token>` arguments for additional launcher tokens, or
   `--executable <file>` to select the installed executable explicitly.
+- `--runtime-kind <listenServer|client>` to select the graphical listen host
+  (default) or direct graphical-client launch path.
+- `--expect-current-only` for the live containment procedure: one material
+  current capture plus a safe explicit-camera refusal.
 - `--pose-position`, `--pose-orientation`, and `--pose-fov` to override the
-  normalized-quaternion pose for another fixture.
+  normalized-quaternion pose.
 - `--look-at-position`, `--look-at-target`, and `--look-at-fov` to bind the
-  look-at view to the fixture.
+  look-at view.
 - `--marker-rgb` and optional normalized `--marker-roi` to require a
   deterministic color marker in the look-at capture.
 - `--artifact-root` and `--timeout-ms` to select the external retained run root
@@ -486,38 +517,36 @@ npm run dev:observer:acceptance:runtime -- --config <CONFIG_PATH> --only runtime
 
 `--only` executes one validated fault case and records partial coverage.
 `--keep-profile` is accepted only with `--only` and only retains a failed
-selected-case directory. No selector remains the five-view positive path; there
-is no implicit or full-matrix runtime mode.
+selected-case directory. Without `--only`, the harness runs the five-view
+positive path when the selected runtime advertises `camera.runtime`.
 
-The harness stages managed and profile data beneath an external temporary run
-root, begins a managed observer run, prepares the launch, and selects exactly
-one healthy non-Workbench renderer advertising `render.capture` and
-`camera.runtime`. It captures `initial-current`, `explicit-pose`,
-`post-pose-restoration-current`, `explicit-look-at`, and
-`post-look-at-restoration-current`, then validates:
+The current-only containment procedure stages managed and profile data beneath
+an external temporary run root, begins a managed observer run, prepares the
+launch, and selects exactly one healthy non-Workbench renderer advertising
+`render.capture` without `camera.runtime`. It then:
 
-- PNG structure, dimensions, digest, material variation, and exact
-  instance/world/epoch binding for every image.
-- The exact pose quaternion matrix, position, and FOV; the look-at position and
-  FOV; and an independently acquired, released, and restoration-confirmed
-  camera lease for each explicit mode.
-- Proof after each explicit capture that the following current camera is no
-  longer at that mode's displaced position. This intentionally permits normal
-  player-camera motion between captures.
-- Material image change from each mode's preceding current view and the
-  configured look-at color marker when present. Each before/after-restoration
-  pixel comparison is retained as diagnostic evidence but is not a pass/fail
-  oracle: a restored live gameplay camera may legitimately rotate or move.
-- Every finalized manifest member, byte count, SHA-256 attestation, capture
-  label, and exported PNG against the already validated inline result.
+- captures one material `initial-current` PNG and validates its dimensions,
+  digest, and exact instance/world/epoch binding;
+- sends a direct `lookAt` refusal probe and requires
+  `CAPABILITY_UNAVAILABLE` with `requiredCapability: "camera.runtime"`;
+- proves that the current capture acquired no camera lease and that the same
+  renderer remains healthy without `camera.runtime`; and
+- finalizes the one-capture evidence bundle, then stops only the exact-owned
+  runtime and proves its identity vacant.
 
-Successful automation exports
+Successful containment automation exports
 `<artifact-root>/<run-directory>/evidence/<run-id>/` with `RESULT.md`,
-`manifest.json`, `runtime-config.json`, and the five capture PNG/JSON pairs.
-The manifest is deliberately finalized as `Unreviewed` with
-`imagesReviewed=false`; automation cannot promote visual evidence to `Passed`.
-Review the images and manifest and record the engine version before using the
-bundle as qualification evidence.
+`manifest.json`, `runtime-config.json`, and the one capture PNG/JSON pair. The
+manifest is deliberately finalized as `Unreviewed` with
+`imagesReviewed=false`; it is safety-containment evidence, not a positive
+runtime camera qualification.
+
+The default five-view path captures `initial-current`, `explicit-pose`,
+`post-pose-restoration-current`, `explicit-look-at`, and
+`post-look-at-restoration-current`; it validates exact pose/look-at transforms
+and FOVs, independently acquired/released/restored leases, material image
+changes, and every finalized bundle member. Merely observing an arbitrary
+manager-owned camera in inventory remains insufficient for qualification.
 
 On failure, the harness cancels unfinished jobs and requires terminal camera
 restoration before discarding the managed run. If restoration cannot be
@@ -529,14 +558,12 @@ its `screenshots` directory. A successful run removes its exact owned managed,
 profile, and diagnostic scratch, leaving only the summary and finalized
 evidence.
 
-Five-capture v2 automation passed on July 17, 2026 local (July 18 UTC) against
-Reforger 1.7.0.54 and stock
-`{96A8AF57260A7392}worlds/MP/MpTest/MpTest.ent`. Harness run `run-kUN6is`
-finalized managed run `20260718T015727Z-cbe43230` with all five labels, exact
-pose and look-at matrices/FOVs, independent lease restoration, material image
-difference, and final process vacancy. All five images were visually inspected
-during implementation. The finalized bundle deliberately remains `Unreviewed`
-with `imagesReviewed=false`, so formal evidence review remains pending.
+The current implementation passed five-capture automation on stock `MpTest`
+and on July 27, 2026 UTC against RoadblockRunners'
+`{B11D252EB5D4887F}Worlds/Testing/KolguyevVehicleSandbox/KolguyevVehicleSandbox.ent`.
+The latter run finalized five evidence artifacts after exact pose/look-at
+matrix/FOV validation, independent restoration proof, and exact-owned runtime
+vacancy.
 
 ## Workbench adapter
 
@@ -574,15 +601,17 @@ the base-game settings project, so the handler does not equate those values: the
 host proves the canonical target and the handler immutably binds it while also
 tracking the nonempty base-project and editor world/subscene identities.
 
-Every camera-changing transaction snapshots the native `BaseWorld` current
-camera slot, full matrix, measured vertical FOV, read-only far plane, and
-viewport dimensions. `BaseWorld` exposes no near-plane getter and the observer
-does not mutate the near plane. Completion, cancellation, failure, release,
-restart and shutdown must converge on exact slot/matrix/FOV
+Every reachable camera-changing transaction snapshots the native `BaseWorld`
+current camera slot, full matrix, measured vertical FOV, read-only far plane,
+and viewport dimensions. `BaseWorld` exposes no near-plane getter and the
+observer does not mutate the near plane. Completion, cancellation, failure,
+release, restart and shutdown must converge on exact slot/matrix/FOV
 restoration. If the active slot, world, lifecycle, or requested camera state
-changes unexpectedly, the adapter returns `RESTORATION_UNCONFIRMED`. The shared
-controller's local writer gate blocks new managed reads and requires active
-reads and capture restoration to drain before a lifecycle mutation proceeds.
+changes unexpectedly, the adapter returns `RESTORATION_UNCONFIRMED`. The same
+restoration contract applies to a qualifying runtime camera transaction; an
+unqualified runtime never acquires a camera lease. The shared controller's
+local writer gate blocks new managed reads and requires active reads and capture
+restoration to drain before a lifecycle mutation proceeds.
 
 The helper also contains five protected, default-inert acceptance hooks for
 `before_lease`, `lease_acquired`, `capture_in_progress`,
@@ -715,24 +744,26 @@ editor path is live-qualified for this reviewed procedure.
 ## Capability status
 
 The host protocol, staging, launch preparation, registration, transports, jobs,
-artifact validation, runtime camera transaction, and Workbench adapter all have
-hermetic regression coverage. Runtime compile gates
-`RENDER_CAPTURE_PROVEN` and `CAMERA_RESTORE_PROVEN` are enabled. That enables the
-implemented paths; it is not a substitute for recording a successful live run.
+artifact validation, runtime camera transaction, and Workbench adapter all
+have hermetic regression coverage. Runtime `RENDER_CAPTURE_PROVEN` and
+`CAMERA_RESTORE_PROVEN` are enabled; `camera.runtime` remains dynamically
+withheld unless the exact leaseability proof succeeds.
 
 | Case | Implemented behavior | Capability advertisement | Live validation |
 |---|---|---|---|
-| Graphical runtime client/listen host | REST and mailbox delivery, current/pose/look-at PNG capture, camera lease and exact transform/FOV restoration | `render.capture` and `camera.runtime` only after graphical renderer/camera initialization | Five-capture v2 automation passed against Reforger 1.7.0.54 stock `MpTest`; formal bundle review remains pending |
+| Graphical runtime client/listen host | REST and mailbox delivery; material `current` PNG capture in any healthy graphical session; transactional pose/look-at on a qualified detached or exact GameMaster camera. | `render.capture` after graphical renderer initialization; `camera.runtime` only after the dynamic lease proof succeeds | Stock MpTest and the RoadblockRunners GameMaster sandbox passed the five-capture positive flow on July 27, 2026 UTC: material explicit images, independent restoration proof, and exact-owned vacancy. |
 | Dedicated/headless server | Registration, health, authority facts, coordination, and diagnostics without camera/render claims | Never advertises `render.capture` or a camera capability | Pending non-render qualification |
 | Minimized/out-of-focus client | Same transaction path; `-forceUpdate`/`-noFocus` default on so the client renders fullscreen in the background | Same initialized graphical gates | Pending |
 | World unload or agent loss during a lease | World epochs invalidate stale work; cancellation/watchdog restoration must reach a terminal state; the Workbench harness has generated-world and handler-loss cases | Renderer is withheld when restoration or world identity is uncertain | Runtime failure injection remains pending; Workbench cases are implemented and hermetically covered but have no retained native matrix result |
 | Workbench editor | Externally staged helper, exact Ping identity, dedicated profile, version-3 lifecycle, confined native-PNG validation, activity gating, exact `BaseWorld` slot/matrix/FOV restoration, and a repository-only 69-case failure harness | `render.capture` when current capture is initialized; `camera.editor` only after a current-view restoration proof in that exact process | Five-capture v3 positive-path automation and hash-bound formal image review passed on Workbench 1.7.0.54; the 69-case failure matrix and its manual review remain outstanding |
 
-**Live validation status:** fresh five-capture automation passed for both the
-graphical stock-`MpTest` listen host and the companion-based Workbench editor as
-recorded above. The Workbench positive-path export has a hash-bound formal
-`Passed` image review; the graphical runtime export remains pending formal
-review. Both source manifests retain their finalized `Unreviewed` metadata.
+**Live validation status:** the current graphical runtime implementation passed
+five-capture automation on stock `MpTest` and on the RoadblockRunners
+GameMaster sandbox on July 27, 2026 UTC. The RR run proved material explicit
+images, exact requested pose/look-at matrices and FOVs, independent lease
+restoration, and exact-owned vacancy. The Workbench positive-path export has a
+hash-bound formal `Passed` image review; the graphical runtime export remains
+`Unreviewed`/`imagesReviewed=false` pending a separate formal image review.
 No Workbench failure-matrix run or matrix image review is recorded for the
 current 69-case implementation. Dedicated/headless non-render behavior,
 minimized/out-of-focus rendering, native fault injection, and remote/delegated

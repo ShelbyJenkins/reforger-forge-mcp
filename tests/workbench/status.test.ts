@@ -92,9 +92,9 @@ describe("requireEditMode", () => {
     if (mock) await mock.close();
   });
 
-  it("returns warning when mode is unknown", () => {
+  it("returns warning when mode is unknown", async () => {
     client = new WorkbenchClient("127.0.0.1", 1);
-    const result = requireEditMode(client, "create entity");
+    const result = await requireEditMode(client, "create entity");
     expect(result).not.toBeNull();
     expect(result).toContain("mode is unknown");
     expect(result).toContain("wb_state");
@@ -104,17 +104,33 @@ describe("requireEditMode", () => {
     mock = createMockWorkbench(() => ({ ...WORKBENCH_HELPER_PING_RESPONSE, mode: "edit" }));
     client = new WorkbenchClient("127.0.0.1", mock.port);
     await client.call("EMCP_WB_Ping");
-    expect(requireEditMode(client, "create entity")).toBeNull();
+    await expect(requireEditMode(client, "create entity")).resolves.toBeNull();
   });
 
   it("returns warning when mode is play", async () => {
     mock = createMockWorkbench(() => ({ ...WORKBENCH_HELPER_PING_RESPONSE, mode: "play" }));
     client = new WorkbenchClient("127.0.0.1", mock.port);
     await client.call("EMCP_WB_Ping");
-    const result = requireEditMode(client, "create entity");
+    const result = await requireEditMode(client, "create entity");
     expect(result).not.toBeNull();
     expect(result).toContain("play mode");
     expect(result).toContain("wb_stop");
+  });
+
+  it("refuses a stale cached edit state when the helper reports game mode", async () => {
+    mock = createMockWorkbench((apiFunc) => ({
+      ...WORKBENCH_HELPER_PING_RESPONSE,
+      mode: apiFunc === "EMCP_WB_GetState" ? "game" : "edit",
+    }));
+    client = new WorkbenchClient("127.0.0.1", mock.port);
+    await client.call("EMCP_WB_Ping");
+    expect(client.state.mode).toBe("edit");
+
+    const result = await requireEditMode(client, "register resource");
+
+    expect(result).toContain("play mode");
+    expect(result).toContain("wb_stop");
+    expect(client.state.mode).toBe("play");
   });
 });
 

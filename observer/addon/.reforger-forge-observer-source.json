@@ -5,7 +5,7 @@
   "addonId": "ReforgerForgeObserver",
   "addonGuid": "7F3A91C2E40B6D58",
   "buildIdentity": "000cec19226673ce911c68dca027dca7449ff58a604fe0cef6509afbc4d7ec22",
-  "bundleDigest": "28a16559acad2249c941d746bc83c7ddd48a603aaacb75456b5080766c31e7c9",
+  "bundleDigest": "7bce2ff3ec4f1e1b95a4f461d92edde385ead28674e81d0ae8cb300d660d5453",
   "files": [
     {
       "path": "addon.gproj",
@@ -25,7 +25,7 @@
     },
     {
       "path": "Scripts/Game/ReforgerForgeObserver/RFO_ObserverCameraLease.c",
-      "sha256": "f0ce6dbe28d42dee29a9c5f1860791b1ed8ed5b283170ef8c7c9902236c658d4"
+      "sha256": "08ec028b02393b4f5abba83628fd02ff044afeca0d8200864796718ff5aa72ba"
     },
     {
       "path": "Scripts/Game/ReforgerForgeObserver/RFO_ObserverCameraProjection.c",
@@ -33,11 +33,15 @@
     },
     {
       "path": "Scripts/Game/ReforgerForgeObserver/RFO_ObserverCapabilities.c",
-      "sha256": "f996c1930605f821a7f0a9ec45241f7249bd19e9f7f35f27d7288e3ba9b031fb"
+      "sha256": "716af0e1da72789a386b0ea1ec0b3c559f2b9f74b94b359efaa64709a6b1b474"
     },
     {
       "path": "Scripts/Game/ReforgerForgeObserver/RFO_ObserverCapture.c",
       "sha256": "24702033236d0c7b78e56b7c394cb3bb668cbea180217219dbe18a5ecb64b20e"
+    },
+    {
+      "path": "Scripts/Game/ReforgerForgeObserver/RFO_ObserverEditorCameraArbitration.c",
+      "sha256": "0d2f1a40824e27f95b3fd0c0141cb1b4c33487a8292561390c36356ecf2582a9"
     },
     {
       "path": "Scripts/Game/ReforgerForgeObserver/RFO_ObserverJob.c",
@@ -61,7 +65,7 @@
     },
     {
       "path": "Scripts/Game/ReforgerForgeObserver/RFO_ObserverService.c",
-      "sha256": "ab9101430e3121dd7e890d1c409361e18de941c06bfd5cb9858d716861b26b6f"
+      "sha256": "d08921488b1efd9c6dc0adb9b3fd5fc4806fbaf362f08310221cf20b05a774cc"
     },
     {
       "path": "Scripts/Game/ReforgerForgeObserver/RFO_ObserverSession.c",

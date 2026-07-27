@@ -291,11 +291,17 @@ export class ObserverApplicationOperations {
       if (payload.exactRuntimeVacant !== undefined && typeof payload.exactRuntimeVacant !== "boolean") throw new ObserverError("INVALID_REQUEST", "exactRuntimeVacant must be boolean");
       const exactRuntimeVacant = payload.exactRuntimeVacant === true;
       const reservationId = typeof payload.reservationId === "string" ? requiredUuid(payload, "reservationId") : null;
-      const lifecycleRetained = app.server.assertOwnedRuntimeLifecycle(
-        sessionId,
-        runtimeId,
-        generation
-      );
+      const lifecycleRetained = exactRuntimeVacant
+        ? app.server.recoverOwnedRuntimeLifecycleForStopCompletion(
+          sessionId,
+          runtimeId,
+          generation
+        )
+        : app.server.assertOwnedRuntimeLifecycle(
+          sessionId,
+          runtimeId,
+          generation
+        );
       if (!lifecycleRetained) {
         if (!exactRuntimeVacant) {
           throw new ObserverError(

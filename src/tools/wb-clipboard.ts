@@ -21,7 +21,7 @@ export function registerWbClipboard(server: McpServer, client: WorkbenchClient):
     },
     async ({ action }) => {
       if (MUTATING_CLIPBOARD_ACTIONS.has(action)) {
-        const modeErr = requireEditMode(client, `${action}`);
+        const modeErr = await requireEditMode(client, `${action}`);
         if (modeErr) {
           return { content: [{ type: "text" as const, text: modeErr + formatConnectionStatus(client) }] };
         }

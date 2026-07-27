@@ -538,14 +538,45 @@ export class CaptureService {
     });
     if (eligible.length !== 1) {
       if (request.instanceId && eligible.length === 0) {
-        const selectedWasObserved = candidates.some((instance) => instance.instanceId === request.instanceId);
+        const selected = candidates.find((instance) => instance.instanceId === request.instanceId);
+        const selectedWasObserved = selected !== undefined;
         // An explicit instance can be declared stale only after the relevant
         // inventories answered. If selection itself lost transport, absence
         // from the partial inventory is not evidence that the instance left.
         if (!selectedWasObserved && failures.length > 0) throw failures[0];
+        if (selected && selected.stale !== true && selected.transportHealthy !== false &&
+            (!request.sessionId || selected.backend !== "runtime" || selected.sessionId === request.sessionId)) {
+          const requiredCapability = request.view.kind === "current"
+            ? "render.capture"
+            : selected.backend === "workbench" ? "camera.editor" : "camera.runtime";
+          if (!selected.capabilities.includes(requiredCapability)) {
+            throw new CaptureError(
+              "CAPABILITY_UNAVAILABLE",
+              `Selected observer cannot prove required capability: ${requiredCapability}`,
+              { instanceId: selected.instanceId, requiredCapability }
+            );
+          }
+        }
         throw new CaptureError("STALE_INSTANCE", "Selected observer instance is unavailable");
       }
       if (eligible.length > 1) throw new CaptureError("AMBIGUOUS_INSTANCE", "Multiple compatible observer instances are available", { instanceIds: eligible.map((entry) => entry.instanceId) });
+      if (request.view.kind !== "current") {
+        const capability = candidates.find((instance) => {
+          if (instance.stale === true || instance.transportHealthy === false || !instance.capabilities.includes("render.capture")) return false;
+          if (request.sessionId && instance.backend === "runtime" && instance.sessionId !== request.sessionId) return false;
+          if (!request.sessionId && instance.backend !== "workbench") return false;
+          const required = instance.backend === "workbench" ? "camera.editor" : "camera.runtime";
+          return !instance.capabilities.includes(required);
+        });
+        if (capability) {
+          const requiredCapability = capability.backend === "workbench" ? "camera.editor" : "camera.runtime";
+          throw new CaptureError(
+            "CAPABILITY_UNAVAILABLE",
+            `No eligible observer can prove required capability: ${requiredCapability}`,
+            { requiredCapability }
+          );
+        }
+      }
       throw new CaptureError("NO_RENDER_ENDPOINT", errors[0] ?? "No compatible observer renderer is available");
     }
     return eligible[0];

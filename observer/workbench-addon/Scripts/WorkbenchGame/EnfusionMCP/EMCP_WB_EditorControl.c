@@ -113,12 +113,36 @@ class EMCP_WB_EditorControl : NetApiHandler
 			}
 			else
 			{
+				// SetOpenedResource can report success after changing context even when
+				// the requested logical resource does not exist. ResourceManager owns
+				// virtual project paths, so check its registered metadata instead of
+				// trying to convert the path to a filesystem path.
+				ResourceManager resourceManager = Workbench.GetModule(ResourceManager);
+				if (!resourceManager)
+				{
+					resp.status = "error";
+					resp.message = "ResourceManager module not available";
+					return resp;
+				}
+				MetaFile metaFile = resourceManager.GetMetaFile(req.path);
+				if (!metaFile)
+				{
+					resp.status = "error";
+					resp.message = "Resource metadata not found for: " + req.path;
+					return resp;
+				}
+
 				bool opened = worldEditor.SetOpenedResource(req.path);
-				resp.status = "ok";
 				if (opened)
+				{
+					resp.status = "ok";
 					resp.message = "Opened resource: " + req.path;
+				}
 				else
+				{
+					resp.status = "error";
 					resp.message = "SetOpenedResource returned false for: " + req.path;
+				}
 			}
 		}
 		else

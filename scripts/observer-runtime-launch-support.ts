@@ -256,7 +256,8 @@ export function findRuntimeExecutable(
 export function launchArguments(
   worldResource: string,
   fixture: AddonFixture | null,
-  additional: string[] | undefined
+  additional: string[] | undefined,
+  runtimeKind: "listenServer" | "client" = "listenServer"
 ): string[] {
   const result = [
     "-window",
@@ -265,7 +266,7 @@ export function launchArguments(
     "-noSplash",
     "-noThrow",
     "-disableCrashReporter",
-    "-server", worldResource,
+    runtimeKind === "listenServer" ? "-server" : "-world", worldResource,
   ];
   if (fixture) {
     result.push("-addonsDir", fixture.addonSearchRoot, "-addons", fixture.addonGuid);

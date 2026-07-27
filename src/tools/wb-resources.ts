@@ -3,6 +3,15 @@ import { z } from "zod";
 import type { WorkbenchClient } from "../workbench/client.js";
 import { formatConnectionStatus, requireEditMode } from "../workbench/status.js";
 
+function throwIfResourceHelperFailed(result: Record<string, unknown>, action: string): void {
+  if (result.status !== "error") return;
+
+  const message = typeof result.message === "string" && result.message.trim()
+    ? result.message
+    : `Workbench resource ${action} failed.`;
+  throw new Error(message);
+}
+
 export function registerWbResources(server: McpServer, client: WorkbenchClient): void {
   server.registerTool(
     "wb_resources",
@@ -30,7 +39,7 @@ export function registerWbResources(server: McpServer, client: WorkbenchClient):
       try {
         // Mutating actions require edit mode
         if (action === "register" || action === "rebuild") {
-          const modeErr = requireEditMode(client, `${action} resource`);
+          const modeErr = await requireEditMode(client, `${action} resource`);
           if (modeErr) {
             return { content: [{ type: "text" as const, text: modeErr + formatConnectionStatus(client) }] };
           }
@@ -38,6 +47,7 @@ export function registerWbResources(server: McpServer, client: WorkbenchClient):
 
         if (action === "browse") {
           const result = await client.call<Record<string, unknown>>("EMCP_WB_Resources", { action, path });
+          throwIfResourceHelperFailed(result, action);
           const entries = Array.isArray(result.entries) ? result.entries : [];
           const total = typeof result.entryCount === "number" ? result.entryCount : entries.length;
 
@@ -92,6 +102,7 @@ export function registerWbResources(server: McpServer, client: WorkbenchClient):
         if (buildRuntime !== undefined) params.buildRuntime = buildRuntime;
 
         const result = await client.call<Record<string, unknown>>("EMCP_WB_Resources", params);
+        throwIfResourceHelperFailed(result, action);
 
         const actionLabels: Record<string, string> = {
           register: `Registered resource: ${path}`,
