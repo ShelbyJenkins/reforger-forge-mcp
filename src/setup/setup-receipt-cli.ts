@@ -133,7 +133,7 @@ function verificationActions(report: ServerVerificationReport): string[] {
   }
   if (report.toolRegistration.status === "failed") {
     actions.push(
-      "Rebuild the package and reconcile the runtime tool surface with README.md."
+        "Rebuild the package and reconcile the registered runtime tool surface."
     );
   }
   if (actions.length === 0) {

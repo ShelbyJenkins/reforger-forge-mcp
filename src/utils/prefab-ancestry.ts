@@ -1,5 +1,5 @@
 // src/utils/prefab-ancestry.ts
-import { readFileSync, existsSync, readdirSync } from "node:fs";
+import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import type { Config } from "../config.js";
 import { PakVirtualFS } from "../pak/vfs.js";
@@ -85,25 +85,15 @@ export function parseComponents(content: string): Map<string, ParsedComponent> {
   return result;
 }
 
-export function readEtFile(path: string, config: Config, projectPath?: string): string | null {
+export function readEtFile(path: string, config: Config, addonRoot?: string): string | null {
   const bare = stripGuid(path);
 
-  // 1. Mod project — check direct path and all addon subdirs
-  const base = projectPath || config.projectPath;
-  if (base) {
-    const direct = join(base, bare);
+  // 1. Selected mod project only. Never probe sibling addons from a container.
+  if (addonRoot) {
+    const direct = join(addonRoot, bare);
     if (existsSync(direct)) {
       try { return readFileSync(direct, "utf-8"); } catch (e) { logger.debug(`Failed to read ${direct}: ${e}`); }
     }
-    try {
-      for (const entry of readdirSync(base, { withFileTypes: true })) {
-        if (!entry.isDirectory()) continue;
-        const candidate = join(base, entry.name, bare);
-        if (existsSync(candidate)) {
-          try { return readFileSync(candidate, "utf-8"); } catch (e) { logger.debug(`Failed to read ${candidate}: ${e}`); }
-        }
-      }
-    } catch (e) { logger.debug(`Cannot read addon dir ${base}: ${e}`); }
   }
 
   // 2. Extracted files
@@ -139,7 +129,7 @@ const MAX_DEPTH = 20;
 export function walkChain(
   startPath: string,
   config: Config,
-  projectPath?: string
+  addonRoot?: string
 ): { levels: AncestorLevel[]; warnings: string[] } {
   const levels: AncestorLevel[] = [];
   const warnings: string[] = [];
@@ -158,7 +148,7 @@ export function walkChain(
     }
     visited.add(key);
 
-    const content = readEtFile(bare, config, projectPath);
+    const content = readEtFile(bare, config, addonRoot);
     if (!content) {
       warnings.push(`Could not read: ${bare}`);
       return;

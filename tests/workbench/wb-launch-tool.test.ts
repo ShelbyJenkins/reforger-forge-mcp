@@ -1,6 +1,5 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { describe, expect, it, vi } from "vitest";
-import type { Config } from "../../src/config.js";
 import { registerWbLaunch } from "../../src/tools/wb-launch.js";
 import {
   WorkbenchError,
@@ -16,18 +15,7 @@ type ToolHandler = (
   input: { readonly gprojPath?: string; readonly resourcePath?: string }
 ) => Promise<ToolResult>;
 
-function config(): Config {
-  return {
-    workbenchPath: "C:\\Arma Reforger Tools",
-    gamePath: "C:\\Arma Reforger",
-    dataDir: "C:\\ReforgerForge\\data",
-    patternsDir: "C:\\ReforgerForge\\data\\patterns",
-    workbenchHost: "127.0.0.1",
-    workbenchPort: 5775,
-  };
-}
-
-function register(client: WorkbenchClient, effectiveConfig: Config): ToolHandler {
+function register(client: WorkbenchClient): ToolHandler {
   let handler: ToolHandler | undefined;
   const server = {
     registerTool(
@@ -39,7 +27,7 @@ function register(client: WorkbenchClient, effectiveConfig: Config): ToolHandler
       handler = candidate;
     },
   } as unknown as McpServer;
-  registerWbLaunch(server, effectiveConfig, client);
+  registerWbLaunch(server, client);
   expect(handler).toBeDefined();
   return handler!;
 }
@@ -56,12 +44,11 @@ describe("wb_launch MCP tool", () => {
     const ensureRunning = vi.fn(async () => {
       throw new WorkbenchError(message, "INVALID_CONFIG");
     });
-    const effectiveConfig = config();
     const client = {
       ensureRunning,
       state: { connected: false, mode: "unknown", lastUpdated: 0 },
     } as unknown as WorkbenchClient;
-    const tool = register(client, effectiveConfig);
+    const tool = register(client);
     const gprojPath =
       "C:\\mods\\OnePointZeroOne\\TestContent\\OnePointZeroOneTestContent.gproj";
 
@@ -78,7 +65,6 @@ describe("wb_launch MCP tool", () => {
     expect(text).toContain("`Workbench: disconnected`");
     expect(ensureRunning).toHaveBeenCalledOnce();
     expect(ensureRunning).toHaveBeenCalledWith(gprojPath);
-    expect(effectiveConfig.defaultMod).toBeUndefined();
   });
 
   it("requires an explicit project and uses the target-bound launch path for a resource", async () => {
@@ -96,7 +82,7 @@ describe("wb_launch MCP tool", () => {
       ensureTargetResourceRunning,
       state: { connected: false, mode: "unknown", lastUpdated: 0 },
     } as unknown as WorkbenchClient;
-    const tool = register(client, config());
+    const tool = register(client);
 
     const missingProject = await tool({ resourcePath: "Worlds/Target.ent" });
     expect(missingProject.isError).toBe(true);

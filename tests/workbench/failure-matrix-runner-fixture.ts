@@ -11,6 +11,7 @@ import type {
   WorkbenchMatrixCaseScheduler,
 } from "../../scripts/run-workbench-observer-acceptance.js";
 import type { ObserverCaptureView } from "../../src/observer/application.js";
+import { workbenchWorldRevision } from "../../src/observer/world-revision.js";
 import {
   workbenchCameraMatrix,
   type WorkbenchCameraMatrix,
@@ -375,6 +376,7 @@ export function fakeHarness(matrixCase: WorkbenchFaultMatrixCase): FakeHarness {
       matrixCase,
       runId: "run-1",
       instanceId: "instance-1",
+      expectedWorldRevision: workbenchWorldRevision("world-1"),
       expectedWorldId: "world-1",
       baselineCurrent: BASELINE_CURRENT,
       captureView,

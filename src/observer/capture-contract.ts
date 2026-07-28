@@ -102,9 +102,7 @@ export interface CanonicalCaptureRequest {
   settleFrames: number;
   performancePolicy: "evidence" | "instrumented";
   timeoutMs: number;
-  expectedWorldRevision?: WorldRevision;
-  expectedWorldId?: string | null;
-  expectedWorldEpoch?: number;
+  expectedWorldRevision: WorldRevision;
   runId?: string;
   captureLabel?: string;
   purpose?: string;
@@ -120,9 +118,7 @@ export interface CaptureInput {
   settleFrames?: number;
   performancePolicy?: "evidence" | "instrumented" | "performance";
   timeoutMs?: number;
-  expectedWorldRevision?: WorldRevision;
-  expectedWorldId?: string | null;
-  expectedWorldEpoch?: number;
+  expectedWorldRevision: WorldRevision;
   runId?: string;
   captureLabel?: string;
   purpose?: string;

@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { assertWorldRevision, legacyWorldFields, runtimeWorldRevision, type WorldRevision } from "./world-revision.js";
+import { assertWorldRevision, type WorldRevision } from "./world-revision.js";
 import { CaptureError, type CaptureInput, type CanonicalCaptureRequest, type CaptureView } from "./capture-contract.js";
 
 function number(value: number, label: string): number {
@@ -31,21 +31,19 @@ function boundedString(value: string | undefined, label: string, max: number): s
   return value;
 }
 
-function expectedRevision(input: CaptureInput): WorldRevision | undefined {
-  if (input.expectedWorldRevision !== undefined) {
-    assertWorldRevision(input.expectedWorldRevision, "expectedWorldRevision");
-    if (input.expectedWorldId !== undefined && input.expectedWorldEpoch !== undefined) {
-      const legacy = legacyWorldFields(input.expectedWorldRevision);
-      if (legacy.worldId !== input.expectedWorldId || legacy.worldEpoch !== input.expectedWorldEpoch) {
-        throw new CaptureError("WORLD_CHANGED", "Legacy and opaque world expectations identify different revisions");
-      }
-    }
-    return input.expectedWorldRevision;
+export interface ExpectedWorldBindingInput {
+  expectedWorldRevision?: unknown;
+}
+
+export function resolveExpectedWorldRevision(input: ExpectedWorldBindingInput): WorldRevision {
+  try {
+    return assertWorldRevision(input.expectedWorldRevision, "expectedWorldRevision");
+  } catch {
+    throw new CaptureError(
+      "INVALID_REQUEST",
+      "observer_capture requires the expectedWorldRevision from the immediately preceding observer_instances result"
+    );
   }
-  if (input.expectedWorldId !== undefined && input.expectedWorldEpoch !== undefined) {
-    return runtimeWorldRevision(input.expectedWorldId, input.expectedWorldEpoch);
-  }
-  return undefined;
 }
 
 /** Normalize all semantic input before routing or idempotency lookup. */
@@ -69,10 +67,7 @@ export function normalizeCaptureRequest(input: CaptureInput, defaultTimeoutMs = 
   if ((runId === undefined) !== (captureLabel === undefined)) {
     throw new CaptureError("INVALID_REQUEST", "runId and captureLabel must be supplied together");
   }
-  if (input.expectedWorldEpoch !== undefined &&
-      (!Number.isSafeInteger(input.expectedWorldEpoch) || input.expectedWorldEpoch < 0)) {
-    throw new CaptureError("INVALID_REQUEST", "expectedWorldEpoch is invalid");
-  }
+  const expectedWorldRevision = resolveExpectedWorldRevision(input);
   const normalized: Omit<CanonicalCaptureRequest, "fingerprint"> = {
     ...(input.sessionId !== undefined ? { sessionId: boundedString(input.sessionId, "sessionId", 96) } : {}),
     ...(input.instanceId !== undefined ? { instanceId: boundedString(input.instanceId, "instanceId", 96) } : {}),
@@ -80,9 +75,7 @@ export function normalizeCaptureRequest(input: CaptureInput, defaultTimeoutMs = 
     settleFrames,
     performancePolicy: input.performancePolicy ?? "evidence",
     timeoutMs,
-    ...(expectedRevision(input) ? { expectedWorldRevision: expectedRevision(input) } : {}),
-    ...(input.expectedWorldId !== undefined ? { expectedWorldId: input.expectedWorldId } : {}),
-    ...(input.expectedWorldEpoch !== undefined ? { expectedWorldEpoch: input.expectedWorldEpoch } : {}),
+    expectedWorldRevision,
     ...(runId ? { runId } : {}),
     ...(captureLabel ? { captureLabel } : {}),
     ...(input.purpose !== undefined ? { purpose: boundedString(input.purpose, "purpose", 512) } : {}),

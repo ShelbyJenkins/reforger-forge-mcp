@@ -50,7 +50,6 @@ function canonicalReceiptJson(
     },
     settings: {
       configPath: null,
-      projectPath: null,
       gamePath: "fixture-game",
       workbenchPath: "fixture-tools",
       workbenchAddonDirs: [],

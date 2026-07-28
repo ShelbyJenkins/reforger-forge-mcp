@@ -7,9 +7,9 @@ export function registerWikiRead(server: McpServer, searchEngine: SearchEngine):
     "wiki_read",
     {
       description:
-        "Read the full content of a specific wiki page by title. Use wiki_search first to find page titles, " +
-        "then use this tool to retrieve the complete text including code examples and tutorials. " +
-        "Returns the full page without truncation (up to 100,000 characters).",
+        "Read up to 100,000 characters of a specific wiki page by title. Use wiki_search first to find page titles, " +
+        "then use this tool to retrieve code examples and tutorials. If a page is longer, the response ends with a " +
+        "truncation notice and its total character count.",
       inputSchema: {
         title: z
           .string()

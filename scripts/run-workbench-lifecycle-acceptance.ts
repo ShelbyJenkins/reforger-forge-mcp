@@ -181,7 +181,6 @@ export async function runWorkbenchLifecycleAcceptance(
     });
     const config: Config = {
       ...baseConfig,
-      projectPath: root,
       workbenchAddonDirs: [...(baseConfig.workbenchAddonDirs ?? []), root],
     };
     client = new WorkbenchClient(

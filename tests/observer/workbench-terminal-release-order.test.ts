@@ -9,6 +9,7 @@ import type {
 } from "../../src/observer/capture-contract.js";
 import { CaptureService } from "../../src/observer/capture-service.js";
 import { WorkbenchCaptureBackend } from "../../src/observer/workbench-capture-backend.js";
+import { workbenchWorldRevision } from "../../src/observer/world-revision.js";
 import type {
   WorkbenchCallOptions,
   WorkbenchCaptureActivityLease,
@@ -244,6 +245,7 @@ describe("Workbench terminal-release owner shutdown ordering", () => {
           view: { kind: "current" },
           asynchronous: true,
           timeoutMs: 5_000,
+          expectedWorldRevision: workbenchWorldRevision(instance!.worldIdentity),
         });
         expect(submitted.job).toMatchObject({ state: "settling" });
         const jobId = submitted.job.jobId;

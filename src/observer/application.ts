@@ -3,14 +3,14 @@ import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { boundedOption, type BoundedOptionErrorFactory } from "../foundation/bounded-option.js";
-import { canonicalizePotentialPath, isPathContained } from "../foundation/managed-path.js";
 import { redactDiagnostic, redactText } from "../foundation/redact.js";
 import { logger } from "../utils/logger.js";
 import type { WorkbenchObserverAdapter } from "../workbench/observer-adapter.js";
 import { ObserverAgentClient, type ObserverAgentClientOptions, type ObserverChildDescriptor, redactChildLine } from "./agent-client.js";
 import type { CaptureInput, CaptureResult } from "./capture-contract.js";
+import { resolveExpectedWorldRevision } from "./capture-request.js";
 import { CaptureService } from "./capture-service.js";
-import { ObserverCoordinatorError } from "./errors.js";
+import { ObserverApplicationError } from "./errors.js";
 import { EvidenceRunService } from "./evidence-run-service.js";
 import { ObserverHostDiagnostics } from "./host-diagnostics.js";
 import {
@@ -22,7 +22,6 @@ import {
 } from "./owned-runtime-manager.js";
 import { RuntimeCaptureBackend } from "./runtime-capture-backend.js";
 import { WorkbenchCaptureBackend } from "./workbench-capture-backend.js";
-import { assertWorldRevision } from "./world-revision.js";
 
 export interface ObserverInstanceQuery {
   sessionId?: string;
@@ -43,7 +42,7 @@ export interface ObserverInstanceList {
 export type ObserverCaptureView = CaptureInput["view"];
 
 export interface ObserverCaptureInput extends Omit<CaptureInput, "expectedWorldRevision"> {
-  expectedWorldRevision?: string;
+  expectedWorldRevision: string;
 }
 
 export type ObserverCaptureResult =
@@ -55,7 +54,6 @@ export interface CreateObserverApplicationOptions {
   agentPath?: string;
   managedRoot?: string;
   profileRoot?: string;
-  projectPath?: string;
   gamePath?: string;
   sourceAddon?: string;
   startupTimeoutMs?: number;
@@ -113,11 +111,11 @@ export interface ObserverApplication {
   close(): Promise<void>;
 }
 
-const optionError: BoundedOptionErrorFactory = ({ message }) => new ObserverCoordinatorError("INVALID_REQUEST", message);
+const optionError: BoundedOptionErrorFactory = ({ message }) => new ObserverApplicationError("INVALID_REQUEST", message);
 
 function asRecord(value: unknown, label: string): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new ObserverCoordinatorError("TRANSPORT_UNAVAILABLE", `${label} returned an invalid response`);
+    throw new ObserverApplicationError("TRANSPORT_UNAVAILABLE", `${label} returned an invalid response`);
   }
   return value as Record<string, unknown>;
 }
@@ -138,21 +136,10 @@ export function defaultObserverManagedRoot(): string {
   return join(localAppData, "ReforgerForge", "Observer", "v1");
 }
 
-function assertPaths(projectPath: string | undefined, managedRoot: string, profileRoot: string): void {
-  if (!projectPath) return;
-  const project = canonicalizePotentialPath(projectPath, { linkPolicy: "follow-existing", existingAncestor: "any", label: "Project path" });
-  for (const [label, path] of [["managed root", managedRoot], ["profile root", profileRoot]] as const) {
-    const candidate = canonicalizePotentialPath(path, { linkPolicy: "follow-existing", existingAncestor: "any", label: `Observer ${label}` });
-    if (isPathContained(project, candidate) || isPathContained(candidate, project)) {
-      throw new ObserverCoordinatorError("INVALID_REQUEST", `Observer ${label} must not overlap the configured project path`);
-    }
-  }
-}
-
 function validateRoots(label: string, roots: string[] | undefined): void {
   if (roots === undefined) return;
   if (!Array.isArray(roots) || roots.length > 64 || roots.some((root) => typeof root !== "string" || root.length < 1 || root.length > 32_768)) {
-    throw new ObserverCoordinatorError("INVALID_REQUEST", `Observer ${label} configuration is invalid`);
+    throw new ObserverApplicationError("INVALID_REQUEST", `Observer ${label} configuration is invalid`);
   }
 }
 
@@ -173,7 +160,6 @@ class DefaultObserverApplication implements ObserverApplication {
   constructor(options: CreateObserverApplicationOptions) {
     const managedRoot = resolve(options.managedRoot ?? options.defaultManagedRoot ?? defaultObserverManagedRoot());
     const profileRoot = resolve(options.profileRoot ?? join(managedRoot, "profiles"));
-    assertPaths(options.projectPath, managedRoot, profileRoot);
     validateRoots("evidence root", options.evidenceRoots);
     validateRoots("supporting log root", options.supportingLogRoots);
     this.requestTimeoutMs = boundedOption(options.requestTimeoutMs, 30_000, 1_000, 5 * 60_000, "Observer request timeout", optionError);
@@ -233,7 +219,6 @@ class DefaultObserverApplication implements ObserverApplication {
       this.ownedRuntimeManager = new OwnedRuntimeManager({
         managedRoot,
         gamePath: options.gamePath,
-        ...(options.projectPath ? { projectPath: options.projectPath } : {}),
         observerGate: this,
       });
     }
@@ -256,7 +241,7 @@ class DefaultObserverApplication implements ObserverApplication {
     return asRecord(await this.request("runtimeLifecycleRelease", { sessionId, runtimeId, generation }), "Observer runtime lifecycle release");
   }
   async reserveRuntimeStop(sessionId: string, reservationId: string, exactRuntimeVacant = false, lifecycle?: OwnedRuntimeLifecycleIdentity): Promise<RuntimeStopPreflight> {
-    if (!lifecycle) throw new ObserverCoordinatorError("INVALID_REQUEST", "Observer runtime stop reservation requires an exact lifecycle generation");
+    if (!lifecycle) throw new ObserverApplicationError("INVALID_REQUEST", "Observer runtime stop reservation requires an exact lifecycle generation");
     const value = asRecord(await this.request("runtimeStopPreflight", { sessionId, reservationId, exactRuntimeVacant, runtimeId: lifecycle.runtimeId, generation: lifecycle.generation }), "Observer runtime stop preflight");
     const strings = (input: unknown): string[] => Array.isArray(input) ? input.filter((entry): entry is string => typeof entry === "string") : [];
     return {
@@ -274,11 +259,11 @@ class DefaultObserverApplication implements ObserverApplication {
     };
   }
   async releaseRuntimeStop(sessionId: string, reservationId: string, lifecycle?: OwnedRuntimeLifecycleIdentity): Promise<Record<string, unknown>> {
-    if (!lifecycle) throw new ObserverCoordinatorError("INVALID_REQUEST", "Observer runtime stop release requires an exact lifecycle generation");
+    if (!lifecycle) throw new ObserverApplicationError("INVALID_REQUEST", "Observer runtime stop release requires an exact lifecycle generation");
     return asRecord(await this.request("runtimeStopRelease", { sessionId, reservationId, runtimeId: lifecycle.runtimeId, generation: lifecycle.generation }), "Observer runtime stop release");
   }
   async completeRuntimeStop(sessionId: string, reservationId?: string, exactRuntimeVacant = false, lifecycle?: OwnedRuntimeLifecycleIdentity): Promise<Record<string, unknown>> {
-    if (!lifecycle) throw new ObserverCoordinatorError("INVALID_REQUEST", "Observer runtime stop completion requires an exact lifecycle generation");
+    if (!lifecycle) throw new ObserverApplicationError("INVALID_REQUEST", "Observer runtime stop completion requires an exact lifecycle generation");
     return asRecord(await this.request("runtimeStopComplete", { sessionId, ...(reservationId ? { reservationId } : {}), exactRuntimeVacant, runtimeId: lifecycle.runtimeId, generation: lifecycle.generation }), "Observer runtime stop completion");
   }
 
@@ -289,8 +274,8 @@ class DefaultObserverApplication implements ObserverApplication {
   async capture(input: ObserverCaptureInput): Promise<ObserverCaptureResult> {
     try {
       const { expectedWorldRevision: rawRevision, ...captureInput } = input;
-      const expectedWorldRevision = rawRevision === undefined ? undefined : assertWorldRevision(rawRevision);
-      return await this.captureService.capture({ ...captureInput, ...(expectedWorldRevision ? { expectedWorldRevision } : {}) }) as CaptureResult;
+      const expectedWorldRevision = resolveExpectedWorldRevision({ expectedWorldRevision: rawRevision });
+      return await this.captureService.capture({ ...captureInput, expectedWorldRevision }) as CaptureResult;
     } catch (error) { throw this.mapError(error); }
   }
   async beginRun(input: Record<string, unknown>): Promise<Record<string, unknown>> {
@@ -354,18 +339,18 @@ class DefaultObserverApplication implements ObserverApplication {
   }
 
   private async request(operation: string, payload: Record<string, unknown>, timeoutMs = this.requestTimeoutMs): Promise<unknown> {
-    if (this.closing || this.closed) throw new ObserverCoordinatorError("TRANSPORT_UNAVAILABLE", "Observer application is unavailable");
+    if (this.closing || this.closed) throw new ObserverApplicationError("TRANSPORT_UNAVAILABLE", "Observer application is unavailable");
     await this.ensureStarted();
     return this.agentClient.request(operation, payload, { timeoutMs });
   }
 
-  private mapError(error: unknown): ObserverCoordinatorError {
-    if (error instanceof ObserverCoordinatorError) return error;
+  private mapError(error: unknown): ObserverApplicationError {
+    if (error instanceof ObserverApplicationError) return error;
     const value = error as { code?: unknown; details?: Record<string, unknown> };
     const details = value?.details === undefined
       ? undefined
       : redactDiagnostic(value.details, { profile: "diagnostic" }) as Record<string, unknown>;
-    return new ObserverCoordinatorError(
+    return new ObserverApplicationError(
       typeof value?.code === "string" ? value.code : "INTERNAL_ERROR",
       error instanceof Error ? redactText(error.message, { profile: "diagnostic", maxLength: 1_024 }) : "Observer operation failed",
       details

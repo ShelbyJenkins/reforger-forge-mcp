@@ -10,7 +10,7 @@ Use the parameterless quick start:
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup.ps1
 ```
 
-See [setup.md](setup.md) for installation, verification, and optional
+See [SETUP.md](SETUP.md) for installation, verification, and optional
 configuration. See [MCP client notes](agents/README.md) for behavior specific
 to each supported client.
 
@@ -23,6 +23,9 @@ to each supported client.
 5. Verify the MCP server: `npm run mcp:verify` (add `-- --config <path>` only
    when testing an explicit override)
 6. Open a pull request
+
+For Observer architecture, maintainer validation, and technical
+troubleshooting, see [observer/README.md](observer/README.md).
 
 ## Code Style
 

@@ -135,28 +135,28 @@ export function createWorkbenchServerComposition(config: Config): WorkbenchServe
 export function registerTools(server: McpServer, config: Config): RegisteredToolsDisposer {
   const searchEngine = new SearchEngine(config.dataDir);
   const patterns = new PatternLibrary(config.patternsDir);
+  const observerConfig = config.observer;
+  const workbenchComposition = createWorkbenchServerComposition(config);
+  const wbClient = workbenchComposition.client;
 
   // Phase 0 tools
   registerApiSearch(server, searchEngine);
   registerComponentSearch(server, searchEngine);
   registerWikiSearch(server, searchEngine);
   registerWikiRead(server, searchEngine);
-  registerProject(server, config);
+  registerProject(server, wbClient);
 
   // Phase 1 tools
-  registerMod(server, config, searchEngine, patterns);
-  registerScriptCreate(server, config, searchEngine);
-  registerPrefab(server, config);
+  registerMod(server, config, searchEngine, patterns, wbClient);
+  registerScriptCreate(server, config, searchEngine, wbClient);
+  registerPrefab(server, config, wbClient);
 
   // Phase 3 tools
-  registerConfigCreate(server, config);
-  registerServerConfig(server, config);
-  registerLayoutCreate(server, config);
+  registerConfigCreate(server, config, wbClient);
+  registerServerConfig(server, config, wbClient);
+  registerLayoutCreate(server, config, wbClient);
 
   // Workbench Live Control tools (Phase 4)
-  const observerConfig = config.observer;
-  const workbenchComposition = createWorkbenchServerComposition(config);
-  const wbClient = workbenchComposition.client;
   // The observer adapter deliberately shares the one Workbench client and its
   // lifecycle/activity gate with every other Workbench tool. It never owns an
   // independent connection or auto-launch path.
@@ -168,7 +168,6 @@ export function registerTools(server: McpServer, config: Config): RegisteredTool
     agentPath: observerConfig?.agentPath,
     managedRoot: observerConfig?.managedRoot,
     profileRoot: observerConfig?.profileRoot,
-    projectPath: config.projectPath,
     gamePath: config.gamePath,
     startupTimeoutMs: observerConfig?.startupTimeoutMs,
     requestTimeoutMs: observerConfig?.requestTimeoutMs,
@@ -186,7 +185,6 @@ export function registerTools(server: McpServer, config: Config): RegisteredTool
     sessionTtlMs: observerConfig?.sessionTtlMs,
     defaultCaptureTimeoutMs: observerConfig?.defaultCaptureTimeoutMs,
     workbenchClient: wbClient,
-    projectPath: config.projectPath,
     workbenchAddonDirs: config.workbenchAddonDirs,
     evidenceRoots: observerConfig?.evidenceRoots,
     ownedRuntimeManager,
@@ -207,7 +205,7 @@ export function registerTools(server: McpServer, config: Config): RegisteredTool
     })();
     return observerShutdown;
   };
-  registerWbLaunch(server, config, wbClient);
+  registerWbLaunch(server, wbClient);
   registerWbBuild(server, config, wbClient, {
     companionProvider: workbenchComposition.companionProvider,
     managedRoot: observerConfig?.managedRoot ?? defaultWorkbenchHelperManagedRoot(),
@@ -234,7 +232,7 @@ export function registerTools(server: McpServer, config: Config): RegisteredTool
   registerWbValidate(server, wbClient);
   registerWbState(server, wbClient);
   registerScenarioTools(server, wbClient);
-  registerScenarioCreate(server, config);
+  registerScenarioCreate(server, config, wbClient);
 
   // Base game access tools
   registerGameBrowse(server, config);
@@ -242,10 +240,10 @@ export function registerTools(server: McpServer, config: Config): RegisteredTool
   registerAssetSearch(server, config);
   registerGameDuplicate(server, config, wbClient);
   registerWbEntityDuplicate(server, config, wbClient);
-  registerWorkshopInfo(server, config);
-  registerAnimationGraph(server, config);
+  registerWorkshopInfo(server, wbClient);
+  registerAnimationGraph(server, config, wbClient);
   registerWbKnowledge(server);
-  registerBuildingSetup(server, config);
+  registerBuildingSetup(server, config, wbClient);
 
   // MCP Prompts
   registerCreateModPrompt(server, patterns);

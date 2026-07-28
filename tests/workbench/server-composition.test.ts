@@ -15,7 +15,6 @@ import { diagnoseWorkbench } from "../../src/workbench/diagnostics.js";
 function config(): Config {
   return {
     workbenchPath: process.cwd(),
-    projectPath: process.cwd(),
     gamePath: process.cwd(),
     dataDir: process.cwd(),
     patternsDir: process.cwd(),

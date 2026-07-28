@@ -34,7 +34,6 @@ function collectRuntimeRegistry(): RuntimeRegistry {
   const packageRoot = fileURLToPath(new URL("../../", import.meta.url));
   const config: Config = {
     workbenchPath: packageRoot,
-    projectPath: packageRoot,
     gamePath: packageRoot,
     dataDir: join(packageRoot, "data"),
     patternsDir: join(packageRoot, "data", "patterns"),
@@ -94,20 +93,26 @@ describe("prompt/tool contracts", () => {
   it("create-mod uses registered merged tools and an attended manual Play checkpoint", () => {
     const handler = registry.prompts.get("create-mod");
     expect(handler).toBeDefined();
-    const text = promptText(handler?.({ description: "A small test mod" }) as PromptResult);
+    const text = promptText(handler?.({
+      outputDir: "C:/mods",
+      description: "A small test mod",
+    }) as PromptResult);
 
     assertExecutableContract(text, registry.tools);
     expect(text).toContain('**mod** with `action: "create"`');
     expect(text).toContain('**mod** with `action: "validate"`');
     expect(text).toContain('**prefab** with `action: "create"`');
     expect(text).toContain('**project** with `action: "write"`');
+    expect(text).toContain('outputDir: "C:/mods"');
+    expect(text).toContain("gprojPath");
+    expect(text).toContain("workbenchAddonDirs");
   });
 
   it("modify-mod uses registered merged tools and an attended manual Play checkpoint", () => {
     const handler = registry.prompts.get("modify-mod");
     expect(handler).toBeDefined();
     const text = promptText(handler?.({
-      projectPath: "C:/mods/TestMod",
+      gprojPath: "C:/mods/TestMod/TestMod.gproj",
       task: "Change one script",
     }) as PromptResult);
 
@@ -117,5 +122,7 @@ describe("prompt/tool contracts", () => {
     expect(text).toContain('**project** with `action: "browse"`');
     expect(text).toContain('`action: "read"`');
     expect(text).toContain('`action: "write"`');
+    expect(text).toContain('gprojPath: "C:/mods/TestMod/TestMod.gproj"');
+    expect(text).toContain("derive their write root from the lifecycle");
   });
 });

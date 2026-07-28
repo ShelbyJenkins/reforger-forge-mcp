@@ -55,7 +55,6 @@ export interface SteamCandidateReceipt {
 
 export interface SetupSettingsReceipt {
   readonly configPath: string | null;
-  readonly projectPath: string | null;
   readonly gamePath: string | null;
   readonly workbenchPath: string | null;
   readonly workbenchAddonDirs: readonly string[];
@@ -337,7 +336,6 @@ export function composeSetupReceiptFromReports(
     },
     settings: {
       configPath: report.configPath ?? null,
-      projectPath: report.effectiveSettings.projectPath ?? null,
       gamePath: report.effectiveSettings.gamePath ?? null,
       workbenchPath: report.effectiveSettings.workbenchPath ?? null,
       workbenchAddonDirs: [
@@ -411,7 +409,6 @@ export function createSetupFailureReceipt(
     },
     settings: {
       configPath: null,
-      projectPath: null,
       gamePath: null,
       workbenchPath: null,
       workbenchAddonDirs: [],
@@ -541,12 +538,6 @@ export function formatSetupReceipt(receipt: SetupReceipt): string {
       settings.configPath ??
       (settingsResolved
         ? "none (automatic discovery and internal defaults)"
-        : "not resolved")
-    }`,
-    `Project:        ${
-      settings.projectPath ??
-      (settingsResolved
-        ? "none (project-independent mode)"
         : "not resolved")
     }`,
     `Game:           ${formatPath(

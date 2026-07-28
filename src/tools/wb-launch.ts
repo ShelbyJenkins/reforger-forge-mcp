@@ -1,7 +1,5 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { basename, dirname } from "node:path";
-import type { Config } from "../config.js";
 import { WorkbenchError, type WorkbenchClient } from "../workbench/client.js";
 import { formatConnectionStatus } from "../workbench/status.js";
 
@@ -12,7 +10,6 @@ function errorText(error: unknown): string {
 
 export function registerWbLaunch(
   server: McpServer,
-  config: Config,
   client: WorkbenchClient
 ): void {
   server.registerTool(
@@ -47,7 +44,6 @@ export function registerWbLaunch(
         const result = resourcePath === undefined
           ? await client.ensureRunning(gprojPath)
           : await client.ensureTargetResourceRunning(gprojPath!, resourcePath);
-        config.defaultMod = basename(dirname(result.gprojPath));
         const label = result.action === "launched"
           ? "Workbench Ready"
           : "Workbench Already Running";

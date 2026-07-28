@@ -176,7 +176,6 @@ export function acceptanceConfig(
 ): Config {
   return {
     ...baseConfig,
-    projectPath: projectRoot,
     workbenchAddonDirs: [...(baseConfig.workbenchAddonDirs ?? []), projectRoot],
     workbenchScriptAuthorizeAll: false,
     observer: {
@@ -406,7 +405,6 @@ export class WorkbenchObserverAcceptanceRuntime<
       agentPath: observerAgentPath,
       managedRoot: this.managedRoot,
       profileRoot: join(this.managedRoot, "profiles"),
-      projectPath: this.projectRoot,
       sourceAddon,
       requestTimeoutMs: 60_000,
       ...(options.applicationRequestDeadlineAtMs

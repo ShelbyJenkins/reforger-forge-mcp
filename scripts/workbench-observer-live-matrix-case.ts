@@ -103,7 +103,7 @@ export interface WorkbenchLiveMatrixCaseServices {
     label: string,
     runId: string,
     instanceId: string,
-    expectedWorldId: string,
+    expectedWorldRevision: string,
     deadline: number
   ) => Promise<WorkbenchLiveRetainedCapture>;
   readonly validateFinalizedBundle: (
@@ -474,6 +474,7 @@ class WorkbenchLiveMatrixCaseExecution {
   private lifecycleGeneration: string | null = null;
   private instanceId: string | null = null;
   private expectedWorldId: string | null = null;
+  private expectedWorldRevision: string | null = null;
   private captureView: ObserverCaptureView | null = null;
   private baselineCapture: WorkbenchLiveRetainedCapture | null = null;
   private caseEntry: MatrixCaseEntry | null = null;
@@ -679,6 +680,10 @@ class WorkbenchLiveMatrixCaseExecution {
       selected.worldId,
       "Selected Workbench matrix world ID"
     );
+    this.expectedWorldRevision = requiredString(
+      selected.worldRevision,
+      "Selected Workbench matrix world revision"
+    );
     this.rememberSecret(this.instanceId);
 
     this.baselineCapture = await baseline.measure(
@@ -690,7 +695,7 @@ class WorkbenchLiveMatrixCaseExecution {
         "matrix-baseline-current",
         this.requireRunId(),
         this.requireInstanceId(),
-        this.requireExpectedWorldId(),
+        this.requireExpectedWorldRevision(),
         this.caseDeadline
       ),
       "baseline_current"
@@ -754,6 +759,7 @@ class WorkbenchLiveMatrixCaseExecution {
         matrixCase: this.matrixCase,
         runId: this.requireRunId(),
         instanceId: this.requireInstanceId(),
+        expectedWorldRevision: this.requireExpectedWorldRevision(),
         expectedWorldId: this.requireExpectedWorldId(),
         baselineCurrent: this.requireBaselineCapture().completed,
         captureView: this.requireCaptureView(),
@@ -1238,6 +1244,13 @@ class WorkbenchLiveMatrixCaseExecution {
 
   private requireExpectedWorldId(): string {
     return requiredString(this.expectedWorldId, "Active Workbench matrix world ID");
+  }
+
+  private requireExpectedWorldRevision(): string {
+    return requiredString(
+      this.expectedWorldRevision,
+      "Active Workbench matrix world revision"
+    );
   }
 
   private requireCaptureView(): ObserverCaptureView {

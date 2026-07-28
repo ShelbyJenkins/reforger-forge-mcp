@@ -8,6 +8,10 @@ import {
   KNOWN_WORLDS,
   type ConflictBaseSpec,
 } from "../templates/scenario.js";
+import {
+  resolveOptionalAddonRoot,
+  type ActiveProjectProvider,
+} from "../utils/game-paths.js";
 import { validateFilename } from "../utils/safe-path.js";
 
 const BASE_SPEC_SCHEMA = z.object({
@@ -47,7 +51,11 @@ const BASE_SPEC_SCHEMA = z.object({
     .describe("Number of ambient patrol spawnpoints around this base (0-6, default 2)."),
 });
 
-export function registerScenarioCreate(server: McpServer, config: Config): void {
+export function registerScenarioCreate(
+  server: McpServer,
+  _config: Config,
+  projectProvider?: ActiveProjectProvider
+): void {
   server.registerTool(
     "scenario_create_conflict",
     {
@@ -118,10 +126,10 @@ export function registerScenarioCreate(server: McpServer, config: Config): void 
           .max(50)
           .optional()
           .describe("Number of civilian ambient vehicle spawnpoints to place (default 0). Generates AmbientVehicles.layer when > 0."),
-        projectPath: z
+        gprojPath: z
           .string()
           .optional()
-          .describe("Addon root path. Uses configured default if omitted."),
+          .describe("Exact .gproj to write under. Uses the running Workbench project if omitted."),
       },
     },
     async ({
@@ -136,7 +144,7 @@ export function registerScenarioCreate(server: McpServer, config: Config): void 
       description,
       author,
       civVehicleCount,
-      projectPath,
+      gprojPath,
     }) => {
       try {
         validateFilename(scenarioName);
@@ -154,7 +162,10 @@ export function registerScenarioCreate(server: McpServer, config: Config): void 
           civVehicleCount,
         });
 
-        const basePath = projectPath || config.projectPath;
+        const basePath = await resolveOptionalAddonRoot(projectProvider, {
+          operation: "scenario_create_conflict",
+          gprojPath,
+        });
 
         if (basePath) {
           const missionsDir = resolve(basePath, "Missions");
@@ -250,9 +261,9 @@ export function registerScenarioCreate(server: McpServer, config: Config): void 
           };
         }
 
-        // No project path — return generated content only
+        // No addon target — return generated content only
         const parts: string[] = [
-          `Generated conflict scenario (no project path configured — not written to disk):`,
+          `Generated conflict scenario (no addon target selected — not written to disk):`,
           ``,
           `**Missions/${scenarioName}.conf**`,
           `\`\`\``,
@@ -285,7 +296,7 @@ export function registerScenarioCreate(server: McpServer, config: Config): void 
         if (output.ambientVehiclesLayer) {
           parts.push(``, `**Worlds/${scenarioName}_Layers/AmbientVehicles.layer**`, `\`\`\``, output.ambientVehiclesLayer, `\`\`\``);
         }
-        parts.push(``, `Use --config/--project-path to write files automatically.`);
+        parts.push(``, `Pass the exact gprojPath or launch the project with wb_launch to write these files.`);
         return {
           content: [{ type: "text" as const, text: parts.join("\n") }],
         };

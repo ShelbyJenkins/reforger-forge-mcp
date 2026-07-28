@@ -1,13 +1,16 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { existsSync, mkdirSync, writeFileSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { resolve, join, extname, relative } from "node:path";
 import type { Config } from "../config.js";
-import { projectPathRequiredMessage } from "../utils/project-path.js";
+import {
+  resolveAddonRoot,
+  type ActiveProjectProvider,
+} from "../utils/game-paths.js";
 import { generateGproj } from "../templates/gproj.js";
 import { generateScript } from "../templates/script.js";
 import type { PatternLibrary } from "../patterns/loader.js";
-import { validateFilename, validateProjectPath } from "../utils/safe-path.js";
+import { validateFilename } from "../utils/safe-path.js";
 import type { SearchEngine } from "../index/search-engine.js";
 import { indexDeclaredProjectClasses } from "../index/project-script-classes.js";
 import { parse, getProperty } from "../formats/enfusion-text.js";
@@ -69,11 +72,11 @@ function findFiles(dir: string, ext: string): string[] {
   return results;
 }
 
-function checkStructure(projectPath: string): ValidationIssue[] {
+function checkStructure(addonRoot: string): ValidationIssue[] {
   const issues: ValidationIssue[] = [];
 
   // Check for .gproj file
-  const gprojFiles = readdirSync(projectPath).filter(
+  const gprojFiles = readdirSync(addonRoot).filter(
     (f) => extname(f).toLowerCase() === ".gproj"
   );
   if (gprojFiles.length === 0) {
@@ -85,7 +88,7 @@ function checkStructure(projectPath: string): ValidationIssue[] {
   // Check standard directories
   const expectedDirs = ["Scripts/Game"];
   for (const dir of expectedDirs) {
-    if (!existsSync(resolve(projectPath, dir))) {
+    if (!existsSync(resolve(addonRoot, dir))) {
       issues.push({ level: "warning", message: `Missing expected directory: ${dir}` });
     }
   }
@@ -93,16 +96,16 @@ function checkStructure(projectPath: string): ValidationIssue[] {
   return issues;
 }
 
-function checkGproj(projectPath: string): ValidationIssue[] {
+function checkGproj(addonRoot: string): ValidationIssue[] {
   const issues: ValidationIssue[] = [];
 
-  const gprojFiles = readdirSync(projectPath).filter(
+  const gprojFiles = readdirSync(addonRoot).filter(
     (f) => extname(f).toLowerCase() === ".gproj"
   );
   if (gprojFiles.length === 0) return issues;
 
   for (const filename of gprojFiles) {
-    const filepath = resolve(projectPath, filename);
+    const filepath = resolve(addonRoot, filename);
     try {
       const content = readFileSync(filepath, "utf-8");
       const node = parse(content);
@@ -138,14 +141,14 @@ function checkGproj(projectPath: string): ValidationIssue[] {
   return issues;
 }
 
-function checkScripts(projectPath: string): ValidationIssue[] {
+function checkScripts(addonRoot: string): ValidationIssue[] {
   const issues: ValidationIssue[] = [];
 
   // Find all .c files in the project
-  const allScripts = findFiles(projectPath, ".c");
+  const allScripts = findFiles(addonRoot, ".c");
 
   for (const scriptPath of allScripts) {
-    const rel = relative(projectPath, scriptPath).replace(/\\/g, "/");
+    const rel = relative(addonRoot, scriptPath).replace(/\\/g, "/");
 
     // Check if script is in a valid module folder
     if (!rel.startsWith("Scripts/Game/") && !rel.startsWith("Scripts/GameLib/") && !rel.startsWith("Scripts/WorkbenchGame/")) {
@@ -177,13 +180,13 @@ function checkScripts(projectPath: string): ValidationIssue[] {
   return issues;
 }
 
-function checkPrefabs(projectPath: string): ValidationIssue[] {
+function checkPrefabs(addonRoot: string): ValidationIssue[] {
   const issues: ValidationIssue[] = [];
 
-  const allPrefabs = findFiles(projectPath, ".et");
+  const allPrefabs = findFiles(addonRoot, ".et");
 
   for (const prefabPath of allPrefabs) {
-    const rel = relative(projectPath, prefabPath).replace(/\\/g, "/");
+    const rel = relative(addonRoot, prefabPath).replace(/\\/g, "/");
 
     try {
       const content = readFileSync(prefabPath, "utf-8");
@@ -200,12 +203,12 @@ function checkPrefabs(projectPath: string): ValidationIssue[] {
   return issues;
 }
 
-function checkConfigs(projectPath: string, classLookup?: ClassLookup): ValidationIssue[] {
+function checkConfigs(addonRoot: string, classLookup?: ClassLookup): ValidationIssue[] {
   const issues: ValidationIssue[] = [];
-  const allConfigs = findFiles(projectPath, ".conf");
+  const allConfigs = findFiles(addonRoot, ".conf");
 
   for (const configPath of allConfigs) {
-    const rel = relative(projectPath, configPath).replace(/\\/g, "/");
+    const rel = relative(addonRoot, configPath).replace(/\\/g, "/");
     try {
       const content = readFileSync(configPath, "utf-8");
       const root = parse(content);
@@ -246,13 +249,13 @@ function checkConfigs(projectPath: string, classLookup?: ClassLookup): Validatio
   return issues;
 }
 
-function checkReferences(projectPath: string, classLookup: ClassLookup): ValidationIssue[] {
+function checkReferences(addonRoot: string, classLookup: ClassLookup): ValidationIssue[] {
   const issues: ValidationIssue[] = [];
 
-  const allScripts = findFiles(projectPath, ".c");
+  const allScripts = findFiles(addonRoot, ".c");
 
   for (const scriptPath of allScripts) {
-    const rel = relative(projectPath, scriptPath).replace(/\\/g, "/");
+    const rel = relative(addonRoot, scriptPath).replace(/\\/g, "/");
 
     try {
       const content = readFileSync(scriptPath, "utf-8");
@@ -276,10 +279,10 @@ function checkReferences(projectPath: string, classLookup: ClassLookup): Validat
   return issues;
 }
 
-function checkNaming(projectPath: string): ValidationIssue[] {
+function checkNaming(addonRoot: string): ValidationIssue[] {
   const issues: ValidationIssue[] = [];
 
-  const allScripts = findFiles(projectPath, ".c");
+  const allScripts = findFiles(addonRoot, ".c");
   const prefixes: Map<string, number> = new Map();
 
   for (const scriptPath of allScripts) {
@@ -330,7 +333,8 @@ export function registerMod(
   server: McpServer,
   config: Config,
   searchEngine: SearchEngine,
-  patterns: PatternLibrary
+  patterns: PatternLibrary,
+  projectProvider?: ActiveProjectProvider
 ): void {
   server.registerTool(
     "mod",
@@ -363,10 +367,14 @@ export function registerMod(
           .string()
           .optional()
           .describe("(create) Mod pattern to apply (e.g., 'custom-faction', 'game-mode'). Use without this to get a bare scaffold."),
-        projectPath: z
+        outputDir: z
           .string()
           .optional()
-          .describe("(create/validate) Parent directory where the addon folder will be created (create), or addon root directory (validate). Uses configured default if omitted."),
+          .describe("(create) Existing directory where the new addon folder will be created."),
+        gprojPath: z
+          .string()
+          .optional()
+          .describe("(validate) Exact .gproj to validate. Uses the running Workbench project if omitted."),
 
         // ── validate params ───────────────────────────────────────────────────
         checks: z
@@ -375,7 +383,7 @@ export function registerMod(
           .describe("(validate) Specific checks to run. Runs all checks if omitted."),
       },
     },
-    async ({ action, name, description: _description, prefix, pattern: patternName, projectPath, checks }) => {
+    async ({ action, name, description: _description, prefix, pattern: patternName, outputDir, gprojPath, checks }) => {
 
       // ── create ─────────────────────────────────────────────────────────────
       if (action === "create") {
@@ -386,16 +394,21 @@ export function registerMod(
           };
         }
 
-        const basePath = projectPath || config.projectPath;
-
-        if (!basePath) {
+        if (!outputDir) {
           return {
             content: [
               {
                 type: "text",
-                text: projectPathRequiredMessage("mod create", "projectPath"),
+                text: "mod create requires outputDir naming the existing directory where the addon folder will be created.",
               },
             ],
+            isError: true,
+          };
+        }
+        const basePath = resolve(outputDir);
+        if (!existsSync(basePath) || !statSync(basePath).isDirectory()) {
+          return {
+            content: [{ type: "text", text: `outputDir must be an existing directory: ${basePath}` }],
             isError: true,
           };
         }
@@ -543,6 +556,7 @@ export function registerMod(
           const lines: string[] = [];
           lines.push(`## Addon Created: ${name}`);
           lines.push(`Path: ${addonDir}`);
+          lines.push(`gprojPath: ${gprojFilePath}`);
           lines.push(`Class prefix: ${classPrefix}`);
           lines.push("");
           lines.push("### Created Files");
@@ -601,38 +615,19 @@ export function registerMod(
       // ── validate ───────────────────────────────────────────────────────────
       // action === "validate"
       let basePath: string;
-      if (projectPath) {
-        if (config.projectPath) {
-          // Keep the existing configured-container boundary when one exists.
-          try {
-            basePath = validateProjectPath(config.projectPath, projectPath);
-          } catch {
-            return {
-              content: [
-                {
-                  type: "text",
-                  text: `Invalid project path: "${projectPath}". Path must be within the configured project directory (${config.projectPath}).`,
-                },
-              ],
-            };
-          }
-        } else {
-          // A complete explicit target is sufficient for this read-only action.
-          basePath = resolve(projectPath);
-        }
-      } else {
-        if (!config.projectPath) {
-          return {
-            content: [
-              {
-                type: "text",
-                text: projectPathRequiredMessage("mod validate", "projectPath"),
-              },
-            ],
-            isError: true,
-          };
-        }
-        basePath = config.projectPath;
+      try {
+        basePath = await resolveAddonRoot(projectProvider, {
+          operation: "mod validate",
+          gprojPath,
+        });
+      } catch (error) {
+        return {
+          content: [{
+            type: "text",
+            text: error instanceof Error ? error.message : String(error),
+          }],
+          isError: true,
+        };
       }
 
       if (!existsSync(basePath)) {
@@ -651,10 +646,7 @@ export function registerMod(
       const projectClasses = needsClassLookup
         ? indexDeclaredProjectClasses({
             targetProjectPath: basePath,
-            searchRoots: [
-              ...(config.projectPath ? [config.projectPath] : []),
-              ...(config.workbenchAddonDirs ?? []),
-            ],
+            searchRoots: [...(config.workbenchAddonDirs ?? [])],
           })
         : new Set<string>();
       const classLookup: ClassLookup = {

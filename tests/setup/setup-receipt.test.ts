@@ -27,7 +27,6 @@ function options(
     },
     settings: {
       configPath: null,
-      projectPath: null,
       gamePath: "D:\\Arma Reforger",
       workbenchPath: "D:\\Arma Reforger Tools",
       workbenchAddonDirs: ["D:\\Arma Reforger\\addons"],
@@ -82,7 +81,6 @@ describe("canonical setup receipt", () => {
     expect(receipt.overallStatus).toBe("passed");
     expect(receipt.verification.workbenchNetApi.status).toBe("not_tested");
     expect(receipt.verification.observerCapture.status).toBe("not_tested");
-    expect(receipt.settings.projectPath).toBeNull();
     expect(receipt.settings.configPath).toBeNull();
   });
 
@@ -252,7 +250,6 @@ describe("canonical setup receipt", () => {
     const human = formatSetupReceipt(receipt);
     expect(human).toContain("Failed layer:   build");
     expect(human).toContain("Config:         not resolved");
-    expect(human).toContain("Project:        not resolved");
     expect(human).not.toContain("automatic discovery and internal defaults");
     expect(human).not.toContain("project-independent mode");
   });

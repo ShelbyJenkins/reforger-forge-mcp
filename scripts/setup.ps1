@@ -113,7 +113,6 @@ function New-CoreSetupFailureReceipt {
         }
         settings = [ordered]@{
             configPath = $null
-            projectPath = $null
             gamePath = $null
             workbenchPath = $null
             workbenchAddonDirs = @()
@@ -284,15 +283,6 @@ function Write-HumanSetupReceipt {
     else {
         "not resolved"
     }
-    $project = if ($null -ne $Receipt.settings.projectPath) {
-        [string]$Receipt.settings.projectPath
-    }
-    elseif ($settingsResolved) {
-        "none (project-independent mode)"
-    }
-    else {
-        "not resolved"
-    }
     $game = if ($null -ne $Receipt.settings.gamePath) {
         [string]$Receipt.settings.gamePath
     }
@@ -336,7 +326,6 @@ function Write-HumanSetupReceipt {
     [Console]::Out.WriteLine("Version:        $serverVersion")
     [Console]::Out.WriteLine("Transport:      $($Receipt.runtime.transport)")
     [Console]::Out.WriteLine("Config:         $config")
-    [Console]::Out.WriteLine("Project:        $project")
     [Console]::Out.WriteLine("Game:           $game")
     [Console]::Out.WriteLine("Tools:          $workbench")
     [Console]::Out.WriteLine(
@@ -494,7 +483,6 @@ function Test-CanonicalSetupReceipt {
 
     $requiredSettings = @(
         "configPath",
-        "projectPath",
         "gamePath",
         "workbenchPath",
         "workbenchAddonDirs",

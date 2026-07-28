@@ -19,10 +19,7 @@ export function registerWbDiagnose(server: McpServer, client: WorkbenchClient): 
       lines.push(report.workbenchExe
         ? `- **Workbench executable:** ${report.workbenchExe.exists ? "FOUND" : "NOT FOUND"} — \`${report.workbenchExe.path}\``
         : "- **Workbench executable:** config not loaded");
-      lines.push(report.projectPath
-        ? `- **Project path:** ${report.projectPath.exists ? "EXISTS" : "NOT FOUND"} — \`${report.projectPath.path}\``
-        : "- **Project path:** not configured");
-      lines.push(`- **Default mod:** ${report.defaultMod ?? "(not set)"}`);
+      lines.push("- **Project target:** exact gprojPath or the running lifecycle");
 
       lines.push("\n### Managed Workbench Companion");
       if (report.companionAddon) {

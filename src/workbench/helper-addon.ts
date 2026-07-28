@@ -43,8 +43,15 @@ export const WORKBENCH_HELPER_PROTOCOL_VERSION = "2.0" as const;
 export const WORKBENCH_HELPER_BUILD_IDENTITY =
   "bc03d671ed4c867472383c41048fcb40abb784dd287a4928c0588e5d5be9013d" as const;
 export const WORKBENCH_HELPER_HANDLER_FILES = generatedWorkbenchHelperHandlerFiles;
-/** Workbench creates this cache beside addon.gproj after loading a staged add-on. */
-const WORKBENCH_GENERATED_STAGED_FILES = new Set(["resourceDatabase.rdb"]);
+/**
+ * Workbench writes these local derived files beside addon.gproj after loading a
+ * staged add-on. They are not helper payload and must be accepted only for an
+ * already staged, hash-verified bundle.
+ */
+const WORKBENCH_GENERATED_STAGED_FILES = new Set([
+  "resourceDatabase.rdb",
+  "UserMaps.desc",
+]);
 
 export interface WorkbenchHelperDescriptor {
   readonly role: "workbench-helper";

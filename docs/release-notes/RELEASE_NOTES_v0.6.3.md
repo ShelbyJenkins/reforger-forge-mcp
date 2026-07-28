@@ -1,5 +1,8 @@
 ## v0.6.3 — Upstream Merge + Internal Refactoring
 
+> Historical release record. It describes the v0.6.3 surface at publication;
+> use the connected MCP tool schemas and current guides for present behavior.
+
 ### New Features (from upstream)
 - **`component_search` tool** — Search ScriptComponent descendants, filter by category (character, vehicle, weapon, damage, inventory, ai, ui) and event handlers
 - **`wiki_read` tool** — Read full wiki page content by title, no truncation

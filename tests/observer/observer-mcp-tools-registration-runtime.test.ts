@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { ObserverCoordinatorError } from "../../src/observer/errors.js";
+import { ObserverApplicationError } from "../../src/observer/errors.js";
 import { prepareObserverLaunch } from "../../src/observer/launch.js";
 import {
   OwnedRuntimeError,
@@ -154,7 +154,7 @@ describe("observer MCP tools", () => {
     } as unknown as OwnedRuntimeManager;
     const { call } = createToolHarness({
       instances: vi.fn(async () => {
-        throw new ObserverCoordinatorError("UNAUTHORIZED",
+        throw new ObserverApplicationError("UNAUTHORIZED",
           `private authorization diagnostic: ${secret}`, { originalDiagnostic: secret });
       }),
     }, manager);

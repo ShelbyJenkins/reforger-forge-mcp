@@ -89,13 +89,7 @@ export class WorkbenchCaptureBackend implements CaptureBackend {
   }
 
   async submit(input: BackendSubmitInput, context: BackendCallContext): Promise<BackendJob> {
-    const legacy = legacyWorldFields(input.instance.worldRevision);
-    const opaqueMismatch = input.request.expectedWorldRevision !== undefined &&
-      !sameWorldRevision(input.request.expectedWorldRevision, input.instance.worldRevision) &&
-      !(input.request.expectedWorldId === legacy.worldId && input.request.expectedWorldEpoch === legacy.worldEpoch);
-    if (opaqueMismatch ||
-        (input.request.expectedWorldId !== undefined && input.request.expectedWorldId !== legacy.worldId) ||
-        (input.request.expectedWorldEpoch !== undefined && input.request.expectedWorldEpoch !== legacy.worldEpoch)) {
+    if (!sameWorldRevision(input.request.expectedWorldRevision, input.instance.worldRevision)) {
       throw new CaptureError("WORLD_CHANGED", "Selected Workbench instance no longer matches the expected world revision");
     }
     try {

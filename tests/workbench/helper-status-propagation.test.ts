@@ -47,7 +47,6 @@ describe("Workbench helper status propagation", () => {
   it.each([
     ["register", "RegisterResourceFile returned false for: Prefabs/Failed.et"],
     ["open", "SetOpenedResource returned false for: Prefabs/Failed.et"],
-    ["browse", "browse action not yet implemented"],
   ])("wb_resources exposes a helper %s failure", async (action, message) => {
     const { client } = helperErrorClient(message);
     const handler = registeredTools(registerWbResources, client).get("wb_resources");

@@ -33,7 +33,6 @@ function handler(): ToolHandler {
   const config: Config = {
     workbenchPath: "C:\\Arma Reforger Tools",
     gamePath: "C:\\Arma Reforger",
-    projectPath: addonsRoot,
     dataDir: "C:\\ReforgerForge\\data",
     patternsDir: "C:\\ReforgerForge\\patterns",
     workbenchHost: "127.0.0.1",
@@ -54,7 +53,7 @@ describe("mod validate declared dependency classes", () => {
   it("recognizes Core config classes used by OnePointZeroOne DefaultContent", async () => {
     const result = await handler()({
       action: "validate",
-      projectPath: resolve(addonsRoot, "OnePointZeroOne", "DefaultContent"),
+      gprojPath: resolve(addonsRoot, "OnePointZeroOne", "DefaultContent", "OnePointZeroOneDefaultContent.gproj"),
       checks: ["configs"],
     });
     const report = text(result);
@@ -67,7 +66,7 @@ describe("mod validate declared dependency classes", () => {
   it("recognizes Core parents used by OnePointZeroOne TestContent", async () => {
     const result = await handler()({
       action: "validate",
-      projectPath: resolve(addonsRoot, "OnePointZeroOne", "TestContent"),
+      gprojPath: resolve(addonsRoot, "OnePointZeroOne", "TestContent", "OnePointZeroOneTestContent.gproj"),
       checks: ["references"],
     });
     const report = text(result);

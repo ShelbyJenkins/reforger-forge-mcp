@@ -299,8 +299,11 @@ try {
 const requiredFiles = [
   "LICENSE",
   "README.md",
-  "setup.md",
+  "SETUP.md",
+  "contributing.md",
+  "docs/observer.md",
   "docs/release-notes/RELEASE_NOTES_v1.1.0.md",
+  "docs/runner-cli.md",
   "dist/index.js",
   "dist/observer/agent/artifacts.js",
   "dist/observer/agent/application.js",
@@ -522,7 +525,6 @@ if (missingFiles.length || missingPrefixes.length || legacyPackagedHandlers.leng
   const binRuntimeRoot = join(temporaryRoot, "bin-runtime");
   const workbenchRoot = join(binRuntimeRoot, "workbench");
   const gameRoot = join(binRuntimeRoot, "game");
-  const projectRoot = join(binRuntimeRoot, "project");
   const observerRoot = join(binRuntimeRoot, "observer");
   const observerProfileRoot = join(observerRoot, "profiles");
   const evidenceRoot = join(binRuntimeRoot, "evidence");
@@ -532,7 +534,6 @@ if (missingFiles.length || missingPrefixes.length || legacyPackagedHandlers.leng
     join(workbenchRoot, "Workbench"),
     gameRoot,
     join(gameRoot, "addons"),
-    projectRoot,
     observerRoot,
     observerProfileRoot,
     evidenceRoot,
@@ -552,7 +553,6 @@ if (missingFiles.length || missingPrefixes.length || legacyPackagedHandlers.leng
     `${JSON.stringify({
       workbenchPath: workbenchRoot,
       gamePath: gameRoot,
-      projectPath: projectRoot,
       observer: {
         managedRoot: observerRoot,
         profileRoot: observerProfileRoot,

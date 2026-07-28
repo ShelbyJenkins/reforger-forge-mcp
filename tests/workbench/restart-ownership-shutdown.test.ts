@@ -51,15 +51,15 @@ describe("shutdown ownership", () => {
     expect(harness.backend.workbenchPids.has(launched.pid)).toBe(true);
   });
 
-  it("fails closed when this MCP has no exact running owner", async () => {
+  it("requires an exact target when this MCP has no running or prior owner", async () => {
     const harness = createHarness();
     try {
       await harness.client.restartOwnedWorkbench();
       throw new Error("expected restart refusal");
     } catch (error) {
       expect(error).toBeInstanceOf(WorkbenchError);
-      expect((error as WorkbenchError).code).toBe("LAUNCH_FAILED");
-      expect((error as Error).message).toMatch(/no exact owned Workbench/i);
+      expect((error as WorkbenchError).code).toBe("TARGET_REQUIRED");
+      expect((error as Error).message).toMatch(/explicit gprojPath/i);
     }
     expect(harness.backend.terminationCalls).toHaveLength(0);
   });

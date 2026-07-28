@@ -1,7 +1,6 @@
 {
   "workbenchPath": "C:\\path\\to\\Arma Reforger Tools",
   "gamePath": "C:\\path\\to\\Arma Reforger",
-  "projectPath": "..\\arma-projects\\addons",
   "workbenchAddonDirs": [
     "C:\\path\\to\\Arma Reforger\\addons"
   ],
@@ -10,7 +9,7 @@
   "workbenchPort": 5775,
   "observer": {
     "evidenceRoots": [
-      "C:\\path\\to\\repository\\addons\\YourMod\\docs\\validation\\screenshots"
+      "C:\\path\\to\\arma-projects\\addons\\.reforger-forge-screenshots"
     ]
   }
 }

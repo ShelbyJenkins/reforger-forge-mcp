@@ -6,13 +6,20 @@ import {
   mkdirSync,
   existsSync,
 } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, extname } from "node:path";
 import type { Config } from "../config.js";
-import { projectPathRequiredMessage } from "../utils/project-path.js";
 import type { WorkbenchClient } from "../workbench/client.js";
 import { validateProjectPath } from "../utils/safe-path.js";
-import { resolveGameDataPath, findLooseFile, resolveAddonDir } from "../utils/game-paths.js";
+import {
+  resolveGameDataPath,
+  findLooseFile,
+  resolveProjectGprojPath,
+} from "../utils/game-paths.js";
 import { generateGuid } from "../formats/guid.js";
+import {
+  canonicalizeGproj,
+  sameProjectIdentity,
+} from "../workbench/project-identity.js";
 import {
   walkChain,
   mergeAncestryComponents,
@@ -28,32 +35,31 @@ export function registerGameDuplicate(
     "game_duplicate",
     {
       description:
-        "Duplicate a base game prefab (.et) or config (.conf) into your mod folder for editing. " +
-        "Reads the file from game data or .pak archives, resolves the full ancestor chain, and injects " +
+        "Duplicate a base-game prefab (.et) from configured extracted or loose game data into an explicitly selected addon for editing. " +
+        "Resolves the full ancestor chain and injects " +
         "inherited components so the duplicate is a complete representation of what the entity provides. " +
-        "Writes the file to your mod's directory, then registers it with Workbench so it gets a new resource GUID. " +
-        "Mirrors the Workbench right-click → Duplicate workflow. " +
+        "Writes the file to your addon directory, then can register it with an already-running compatible Workbench so it gets a new resource GUID; it never launches Workbench. " +
+        "Mirrors the Workbench right-click Duplicate workflow. " +
         "Set flatten=true to bake all ancestor components into a standalone prefab with no parent reference. " +
         "Use asset_search to find the source path (with GUID) first.",
       inputSchema: {
         sourcePath: z
           .string()
           .describe(
-            "Source prefab path — either a GUID reference like '{657590C1EC9E27D3}Prefabs/Groups/OPFOR/Group_USSR_LightFireTeam.et' " +
+            "Source .et prefab path — either a GUID reference like '{657590C1EC9E27D3}Prefabs/Groups/OPFOR/Group_USSR_LightFireTeam.et' " +
             "or a bare relative path like 'Prefabs/Groups/OPFOR/Group_USSR_LightFireTeam.et'"
           ),
         destPath: z
           .string()
           .describe(
             "Destination path within your mod folder, relative to the addon root " +
-            "(e.g., 'Prefabs/Groups/MyCustomGroup.et'). Must end in .et"
+            "(e.g., 'Prefabs/Groups/MyCustomGroup.et'). Must end in .et."
           ),
-        modName: z
+        gprojPath: z
           .string()
           .optional()
           .describe(
-            "Addon folder name under the configured projectPath (e.g., 'MyMod'). " +
-            "If omitted, the first addon found in the project path is used."
+            "Exact destination .gproj. Uses the running Workbench project if omitted."
           ),
         flatten: z
           .boolean()
@@ -68,25 +74,74 @@ export function registerGameDuplicate(
           .boolean()
           .default(true)
           .describe(
-            "Register the duplicated file with Workbench after writing (assigns a new GUID). " +
-            "Requires Workbench to be running. Set false to write the file without registering."
+            "Register the duplicated file with an already-running compatible Workbench after writing (assigns a new GUID). " +
+            "This tool never launches Workbench. Set false to write the file without registering."
           ),
       },
     },
-    async ({ sourcePath, destPath, modName, flatten, register }) => {
-      if (!config.projectPath) {
+    async ({ sourcePath, destPath, gprojPath, flatten, register }) => {
+      // Strip GUID prefix from sourcePath if present: {GUID}path → path
+      const bareSourcePath = sourcePath.replace(/^\{[0-9A-Fa-f]{16}\}/, "");
+      if (extname(bareSourcePath).toLowerCase() !== ".et") {
         return {
-          content: [{
-            type: "text",
-            text: projectPathRequiredMessage("game_duplicate"),
-          }],
+          content: [{ type: "text", text: "game_duplicate currently supports only .et prefab sources." }],
           isError: true,
         };
       }
-      // Strip GUID prefix from sourcePath if present: {GUID}path → path
-      const bareSourcePath = sourcePath.replace(/^\{[0-9A-Fa-f]{16}\}/, "");
+      if (extname(destPath).toLowerCase() !== ".et") {
+        return {
+          content: [{ type: "text", text: "game_duplicate destinations must end in .et." }],
+          isError: true,
+        };
+      }
 
-      // Locate the source file — extracted library first, then pak loose files
+      // Locate the source file — extracted library first, then loose game data.
+      let targetGprojPath: string;
+      try {
+        targetGprojPath = await resolveProjectGprojPath(client, {
+          operation: "game_duplicate",
+          gprojPath,
+        });
+      } catch (error) {
+        return {
+          content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }],
+          isError: true,
+        };
+      }
+      const addonDir = dirname(targetGprojPath);
+
+      if (register) {
+        try {
+          const activeGprojPath = await client.activeProjectGprojPath();
+          if (
+            !activeGprojPath ||
+            !sameProjectIdentity(
+              canonicalizeGproj(targetGprojPath),
+              canonicalizeGproj(activeGprojPath)
+            )
+          ) {
+            return {
+              content: [{
+                type: "text",
+                text:
+                  "game_duplicate registration requires the target gprojPath to be the exact project in the running Workbench lifecycle. No file was written.",
+              }],
+              isError: true,
+            };
+          }
+        } catch (error) {
+          return {
+            content: [{
+              type: "text",
+              text:
+                "game_duplicate could not verify a compatible running Workbench lifecycle. " +
+                `No file was written. ${error instanceof Error ? error.message : String(error)}`,
+            }],
+            isError: true,
+          };
+        }
+      }
+
       let sourceFile: string | null = null;
       let sourceLabel = "";
 
@@ -104,7 +159,7 @@ export function registerGameDuplicate(
           };
         }
         sourceFile = findLooseFile(gameDataPath, bareSourcePath);
-        if (sourceFile) sourceLabel = "(pak loose files)";
+        if (sourceFile) sourceLabel = "(loose game data)";
       }
 
       if (!sourceFile) {
@@ -114,26 +169,8 @@ export function registerGameDuplicate(
               type: "text",
               text: `Source file not found: ${bareSourcePath}\n` +
                 (config.extractedPath ? `Searched extracted library: ${config.extractedPath}\n` : "") +
-                `Searched pak loose files under: ${config.gamePath}\n` +
+                `Searched loose game data under: ${config.gamePath}\n` +
                 `Use asset_search to verify the path exists.`,
-            },
-          ],
-          isError: true,
-        };
-      }
-
-      // Resolve destination addon directory
-      const addonDir = resolveAddonDir(config.projectPath, modName ?? config.defaultMod);
-      if (!addonDir) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: `Could not find addon directory. ` +
-                (modName
-                  ? `'${modName}' not found under ${config.projectPath}`
-                  : `No addons found under ${config.projectPath}`) +
-                `. Provide modName matching the addon folder name.`,
             },
           ],
           isError: true,
@@ -174,8 +211,9 @@ export function registerGameDuplicate(
       let ancestryNote = "";
       let finalContent = rawContent;
 
-      // Only apply ancestry for .et prefab files, not .conf
-      if (bareSourcePath.endsWith(".et")) {
+      // This tool accepts only .et prefabs. Resolve ancestry against game data,
+      // never an identically named file in another configured addon.
+      if (bareSourcePath.toLowerCase().endsWith(".et")) {
         const { levels, warnings } = walkChain(bareSourcePath, config);
 
         if (levels.length > 1) {
@@ -280,12 +318,27 @@ export function registerGameDuplicate(
           const regResp = await client.call<{ status: string; message?: string }>(
             "EMCP_WB_Resources",
             { action: "register", path: absDestPath, buildRuntime: false },
-            { timeout: 30000 }
+            { timeout: 30000, skipAutoLaunch: true }
           );
 
-          const guidNote = regResp.status === "ok"
-            ? `Registered with Workbench — a new GUID has been assigned.`
-            : `Warning: registration returned: ${regResp.message ?? JSON.stringify(regResp)}`;
+          if (regResp.status !== "ok") {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: [
+                    `**Prefab copied but Workbench registration failed**`,
+                    `- Saved to: ${absDestPath}`,
+                    `- Registration response: ${regResp.message ?? JSON.stringify(regResp)}`,
+                    "",
+                    "A compatible Workbench must already be running; game_duplicate did not launch one.",
+                    `To register the existing copy later, use wb_resources with action: "register" and path: ${absDestPath}.`,
+                  ].join("\n") + ancestryNote,
+                },
+              ],
+              isError: true,
+            };
+          }
 
           return {
             content: [
@@ -297,7 +350,7 @@ export function registerGameDuplicate(
                   `- Copied from: ${sourceFile} ${sourceLabel}`,
                   `- Saved to: ${absDestPath}`,
                   ``,
-                  guidNote,
+                  `Registered with Workbench — a new GUID has been assigned.`,
                   `Use wb_resources getInfo or wb_prefabs getGuid to look up the new GUID.`,
                   ``,
                   `**Next steps:**`,
@@ -318,7 +371,8 @@ export function registerGameDuplicate(
                   `- Saved to: ${absDestPath}`,
                   `- Registration error: ${msg}`,
                   ``,
-                  `To assign a GUID manually: in Workbench Resource Browser, right-click the file and register it.`,
+                  `A compatible Workbench must already be running; game_duplicate did not launch one.`,
+                  `To register the existing copy later, use wb_resources with action: "register" and path: ${absDestPath}.`,
                 ].join("\n") + ancestryNote,
               },
             ],
@@ -336,7 +390,7 @@ export function registerGameDuplicate(
               `- Source: ${sourcePath}`,
               `- Saved to: ${absDestPath}`,
               ``,
-              `To assign a GUID: call again with register=true, or register manually in Workbench.`,
+              `To assign a GUID later, use wb_resources with action: "register" and path: ${absDestPath}.`,
             ].join("\n") + ancestryNote,
           },
         ],

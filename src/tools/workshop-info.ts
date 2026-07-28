@@ -1,12 +1,16 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { readFileSync, existsSync, readdirSync } from "node:fs";
-import { resolve, join } from "node:path";
-import type { Config } from "../config.js";
+import { readFileSync } from "node:fs";
 import { parse, type EnfusionNode } from "../formats/enfusion-text.js";
-import { projectPathRequiredMessage } from "../utils/project-path.js";
+import {
+  resolveProjectGprojPath,
+  type ActiveProjectProvider,
+} from "../utils/game-paths.js";
 
-export function registerWorkshopInfo(server: McpServer, config: Config): void {
+export function registerWorkshopInfo(
+  server: McpServer,
+  projectProvider?: ActiveProjectProvider
+): void {
   server.registerTool(
     "workshop_info",
     {
@@ -14,52 +18,22 @@ export function registerWorkshopInfo(server: McpServer, config: Config): void {
         "Read Workshop metadata from a mod's .gproj file. Shows mod ID, GUID, title, " +
         "dependencies, and configurations. Useful for checking publish state before releasing.",
       inputSchema: {
-        projectPath: z
+        gprojPath: z
           .string()
           .optional()
           .describe(
-            "Absolute path to the mod directory (containing the .gproj). Uses configured default if omitted."
-          ),
-        modName: z
-          .string()
-          .optional()
-          .describe(
-            "Mod/addon name to look up. Used to find the .gproj if projectPath points to the addons directory."
+            "Exact .gproj to inspect. Uses the running Workbench project if omitted."
           ),
       },
     },
-    async ({ projectPath, modName }) => {
+    async ({ gprojPath }) => {
       try {
-        const basePath = projectPath || config.projectPath;
-        if (!basePath) {
-          return {
-            content: [
-              { type: "text", text: projectPathRequiredMessage("workshop_info", "projectPath") },
-            ],
-            isError: true,
-          };
-        }
-        let gprojPath: string | null = null;
+        const targetGprojPath = await resolveProjectGprojPath(projectProvider, {
+          operation: "workshop_info",
+          gprojPath,
+        });
 
-        if (modName) {
-          gprojPath = resolve(basePath, modName, `${modName}.gproj`);
-        } else {
-          const candidates = findGprojFiles(basePath);
-          gprojPath = candidates[0] || null;
-        }
-
-        if (!gprojPath || !existsSync(gprojPath)) {
-          return {
-            content: [
-              {
-                type: "text",
-                text: `No .gproj found. ${gprojPath ? `Checked: ${gprojPath}` : "Provide projectPath or modName."}`,
-              },
-            ],
-          };
-        }
-
-        const raw = readFileSync(gprojPath, "utf-8");
+        const raw = readFileSync(targetGprojPath, "utf-8");
         const root = parse(raw);
 
         const id = getProperty(root, "ID") || "(unknown)";
@@ -90,7 +64,7 @@ export function registerWorkshopInfo(server: McpServer, config: Config): void {
         lines.push(`- **ID:** ${id}`);
         lines.push(`- **GUID:** ${guid}`);
         lines.push(`- **Title:** ${title}`);
-        lines.push(`- **File:** ${gprojPath}`);
+        lines.push(`- **File:** ${targetGprojPath}`);
 
         if (deps.length > 0) {
           lines.push(`\n### Dependencies (${deps.length})`);
@@ -127,29 +101,6 @@ export function registerWorkshopInfo(server: McpServer, config: Config): void {
       }
     }
   );
-}
-
-function findGprojFiles(dirPath: string): string[] {
-  try {
-    const entries = readdirSync(dirPath, { withFileTypes: true });
-    const results: string[] = [];
-    for (const entry of entries) {
-      if (!entry.isDirectory()) {
-        if (entry.name.endsWith(".gproj")) {
-          results.push(join(dirPath, entry.name));
-        }
-      } else {
-        // Check for the conventional <addonName>/<addonName>.gproj layout one level deep.
-        const nested = join(dirPath, entry.name, `${entry.name}.gproj`);
-        if (existsSync(nested)) {
-          results.push(nested);
-        }
-      }
-    }
-    return results;
-  } catch {
-    return [];
-  }
 }
 
 function getProperty(node: EnfusionNode, key: string): string {

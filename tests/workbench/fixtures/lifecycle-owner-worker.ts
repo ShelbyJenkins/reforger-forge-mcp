@@ -1,5 +1,5 @@
 import { once } from "node:events";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Config } from "../../../src/config.js";
 import { WorkbenchClient, WorkbenchError } from "../../../src/workbench/client.js";
@@ -28,7 +28,6 @@ const target = { path: project.displayPath, comparisonKey: project.comparisonKey
 const packageRoot = fileURLToPath(new URL("../../../", import.meta.url));
 const config: Config = {
   workbenchPath: packageRoot,
-  projectPath: dirname(gprojPath),
   gamePath: packageRoot,
   dataDir: join(packageRoot, "data"),
   patternsDir: join(packageRoot, "data", "patterns"),

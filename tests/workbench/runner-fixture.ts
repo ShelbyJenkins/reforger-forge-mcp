@@ -103,7 +103,6 @@ export function createHarness(): RunnerHarness {
   writeFileSync(executablePath, "fake Workbench");
   const config: Config = {
     workbenchPath: toolsRoot,
-    projectPath: join(root, "addons"),
     gamePath: join(root, "Arma Reforger"),
     workbenchAddonDirs: [addonRoot, addonRoot],
     workbenchScriptAuthorizeAll: true,

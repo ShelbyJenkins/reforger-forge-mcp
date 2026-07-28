@@ -51,7 +51,6 @@ const discovery: SteamDiscoveryResult = {
 const config: Config = {
   workbenchPath: discovery.workbenchPath!,
   gamePath: discovery.gamePath!,
-  projectPath: "C:\\Projects\\Addons",
   workbenchAddonDirs: [
     "C:\\Steam\\Arma Reforger\\addons",
     "C:\\Projects\\Addons",
@@ -75,9 +74,10 @@ const observerNames = [
 ] as const;
 
 const validTools = [
-  ...observerNames.map((name) => ({ name })),
+  ...observerNames.map((name) => ({ name, description: `${name} description` })),
   {
     name: "mod",
+    description: "mod description",
     inputSchema: {
       properties: {
         action: { enum: ["inspect"] },
@@ -86,6 +86,7 @@ const validTools = [
   },
   {
     name: "wb_reload",
+    description: "wb_reload description",
     inputSchema: {
       properties: {
         target: { enum: ["plugins"], default: "plugins" },
@@ -93,16 +94,6 @@ const validTools = [
     },
   },
 ];
-
-const validReadme = [
-  "## Complete Tool Reference",
-  "",
-  "| Tool | Purpose |",
-  "| --- | --- |",
-  ...validTools.map((tool) => `| \`${tool.name}\` | test |`),
-  "",
-  "## Next Section",
-].join("\n");
 
 interface Harness {
   dependencies: ServerVerificationDependencies;
@@ -129,7 +120,6 @@ function harness(): Harness {
       loadConfiguration,
       createSession,
       probeCompiledServer: vi.fn(async () => ({ version: "1.1.0" })),
-      readTextFile: vi.fn(async () => validReadme),
       now: () => new Date("2026-07-24T12:00:00.000Z"),
       nodeCommand: "C:\\Node\\node.exe",
     },
@@ -188,7 +178,6 @@ describe("server verification core", () => {
         status: "passed",
         workbenchPath: config.workbenchPath,
         gamePath: config.gamePath,
-        projectPath: config.projectPath,
         workbenchAddonDirs: config.workbenchAddonDirs,
         workbenchHost: "127.0.0.1",
         workbenchPort: 5775,
@@ -348,7 +337,7 @@ describe("tool surface inspection", () => {
       ...validTools,
       { name: "wb_play" },
       { name: "undocumented_tool" },
-    ], validReadme);
+    ]);
 
     expect(result.status).toBe("failed");
     expect(result.names).toEqual([...result.names].sort((a, b) => a.localeCompare(b)));
@@ -356,7 +345,7 @@ describe("tool surface inspection", () => {
       "Removed refusal-only tools still registered: wb_play"
     );
     expect(result.issues).toContain(
-      "Runtime tools missing from README: undocumented_tool, wb_play"
+      "Runtime tools missing descriptions: undocumented_tool, wb_play"
     );
   });
 });

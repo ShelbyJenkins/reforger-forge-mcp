@@ -156,7 +156,6 @@ function createHarness(label: string): WorkbenchCrashHarness {
   writeFileSync(executablePath, "fake Workbench\n");
   const config: Config = {
     workbenchPath: toolsRoot,
-    projectPath: projectRoot,
     gamePath,
     dataDir: join(root, "data"),
     patternsDir: join(root, "patterns"),

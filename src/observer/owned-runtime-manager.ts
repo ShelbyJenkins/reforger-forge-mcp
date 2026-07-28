@@ -224,7 +224,6 @@ export interface OwnedRuntimeManagerOptions {
   managedRoot: string;
   gamePath: string;
   observerGate: OwnedRuntimeObserverGate;
-  projectPath?: string;
   backend?: ExactProcessBackend;
   /** Required when backend does not also implement the legacy combined adapter. */
   machineMutex?: MachineMutex;
@@ -639,10 +638,6 @@ function isContained(root: string, candidate: string): boolean {
   return isPathContained(root, candidate);
 }
 
-function pathsOverlap(left: string, right: string): boolean {
-  return isContained(left, right) || isContained(right, left);
-}
-
 function assertNoLinkedDirectorySegments(directoryPath: string): void {
   const absolute = resolve(directoryPath);
   try {
@@ -825,16 +820,7 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
       throw new OwnedRuntimeError("INVALID_REQUEST", "Owned runtime record byte budget exceeds the store budget");
     }
     const requestedManagedRoot = resolve(options.managedRoot);
-    if (options.projectPath && pathsOverlap(resolve(options.projectPath), requestedManagedRoot)) {
-      throw new OwnedRuntimeError("INVALID_REQUEST", "Owned-runtime storage must not overlap the configured project path");
-    }
     this.managedRoot = canonicalDirectoryTarget(requestedManagedRoot, true);
-    if (options.projectPath) {
-      const projectTarget = canonicalDirectoryTarget(options.projectPath, false);
-      if (pathsOverlap(projectTarget, this.managedRoot)) {
-        throw new OwnedRuntimeError("INVALID_REQUEST", "Owned-runtime storage must not resolve into the configured project path");
-      }
-    }
     this.storageRoot = join(this.managedRoot, "state", "owned-runtimes-v1");
     const installationRoot = canonicalDirectory(
       options.installationRoot ?? resolve(dirname(fileURLToPath(import.meta.url)), "..", ".."),

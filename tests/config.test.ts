@@ -1,6 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
-  existsSync,
   mkdirSync,
   mkdtempSync,
   rmSync,
@@ -65,7 +64,6 @@ function requiredFileValues(
   return {
     workbenchPath: "./workbench",
     gamePath: "./game",
-    projectPath: "./project",
     ...overrides,
   };
 }
@@ -141,7 +139,7 @@ describe("effective configuration contract", () => {
     expect(discoverSteam).toHaveBeenCalledOnce();
   });
 
-  it("starts from Steam discovery with no config and no project path", () => {
+  it("starts from Steam discovery without project configuration", () => {
     const config = loadConfig([], {
       cwd: temporaryRoot,
       discoverSteam: () => discoveryResult(),
@@ -154,7 +152,6 @@ describe("effective configuration contract", () => {
       workbenchHost: "127.0.0.1",
       workbenchPort: 5775,
     });
-    expect(config.projectPath).toBeUndefined();
     expect(config.observer!.evidenceRoots).toBeUndefined();
   });
 
@@ -218,7 +215,6 @@ describe("effective configuration contract", () => {
     expect(config).toMatchObject({
       workbenchPath: fixturePaths.workbench,
       gamePath: fixturePaths.game,
-      projectPath: fixturePaths.project,
       workbenchHost: "127.0.0.1",
       workbenchPort: 5775,
       workbenchScriptAuthorizeAll: false,
@@ -230,12 +226,7 @@ describe("effective configuration contract", () => {
         maxInlineImageBytes: 8 * 1024 * 1024,
       },
     });
-    const derivedEvidenceRoot = join(
-      fixturePaths.project,
-      ".reforger-forge-screenshots"
-    );
-    expect(config.observer!.evidenceRoots).toEqual([derivedEvidenceRoot]);
-    expect(existsSync(derivedEvidenceRoot)).toBe(false);
+    expect(config.observer!.evidenceRoots).toBeUndefined();
   });
 
   it("ignores configuration environment variables even when an explicit file is loaded", () => {
@@ -247,7 +238,7 @@ describe("effective configuration contract", () => {
 
     const config = loadConfig(["--config", configPath]);
 
-    expect(config.projectPath).toBe(fixturePaths.project);
+    expect(config).not.toHaveProperty("projectPath");
     expect(config.workbenchHost).toBe("127.0.0.1");
     expect(config.observer!.requestTimeoutMs).toBe(30_000);
   });
@@ -366,24 +357,18 @@ describe("effective configuration contract", () => {
   it("supports a CLI-only configuration", () => {
     const workbench = createWorkbenchInstallation("cli-only", "workbench");
     const game = createGameInstallation("cli-only", "game");
-    const project = createDirectory("cli-only", "project");
-
     const config = loadConfig([
       "--workbench-path", workbench,
       "--game-path", game,
-      "--project-path", project,
     ]);
 
-    expect(config).toMatchObject({ workbenchPath: workbench, gamePath: game, projectPath: project });
-    expect(config.observer!.evidenceRoots).toEqual([
-      join(project, ".reforger-forge-screenshots"),
-    ]);
+    expect(config).toMatchObject({ workbenchPath: workbench, gamePath: game });
+    expect(config.observer!.evidenceRoots).toBeUndefined();
   });
 
   it("maps every JSON-configurable scalar and array setting to CLI", () => {
     const workbench = createWorkbenchInstallation("all-cli", "workbench");
     const game = createGameInstallation("all-cli", "game");
-    const project = createDirectory("all-cli", "project");
     const addon = createDirectory("all-cli", "addon");
     const extracted = createDirectory("all-cli", "extracted");
     const managedRoot = createDirectory("all-cli", "managed");
@@ -396,13 +381,11 @@ describe("effective configuration contract", () => {
     const config = loadConfig([
       "--workbench-path", workbench,
       "--game-path", game,
-      "--project-path", project,
       "--workbench-addon-dir", addon,
       "--workbench-script-authorize-all",
       "--workbench-host", "cli-host",
       "--workbench-port", "6001",
       "--extracted-path", extracted,
-      "--default-mod", "CliMod",
       "--observer-managed-root", managedRoot,
       "--observer-profile-root", profileRoot,
       "--observer-agent-path", agentPath,
@@ -422,13 +405,11 @@ describe("effective configuration contract", () => {
     expect(config).toMatchObject({
       workbenchPath: workbench,
       gamePath: game,
-      projectPath: project,
       workbenchAddonDirs: [join(game, "addons"), addon],
       workbenchScriptAuthorizeAll: true,
       workbenchHost: "cli-host",
       workbenchPort: 6001,
       extractedPath: extracted,
-      defaultMod: "CliMod",
       debug: true,
       observer: {
         managedRoot,
@@ -455,7 +436,6 @@ describe("effective configuration contract", () => {
     );
     const configPath = writeConfig({
       workbenchPath: "./explicit-workbench",
-      projectPath: "./project",
     });
     const discoveredWorkbench = createWorkbenchInstallation(
       "discovered",
@@ -531,7 +511,7 @@ describe("effective configuration contract", () => {
     expect(config.workbenchHost).toBe("cli-host");
   });
 
-  it("lets an explicit empty evidence allowlist suppress the project-derived default", () => {
+  it("preserves an explicit empty evidence allowlist", () => {
     const configPath = writeConfig(requiredFileValues({
       observer: { evidenceRoots: [] },
     }));
@@ -571,21 +551,10 @@ describe("effective configuration contract", () => {
     ])).toThrowError(/cannot be combined/);
   });
 
-  it("derives evidence from the final CLI project path", () => {
-    const fileProject = fixturePaths.project;
-    const cliProject = createDirectory("cli-project");
-    const configPath = writeConfig(requiredFileValues());
-
-    const config = loadConfig([
-      "--config", configPath,
-      "--project-path", cliProject,
-    ]);
-
-    expect(config.projectPath).toBe(cliProject);
-    expect(config.projectPath).not.toBe(fileProject);
-    expect(config.observer!.evidenceRoots).toEqual([
-      join(cliProject, ".reforger-forge-screenshots"),
-    ]);
+  it("rejects the retired project-path CLI setting", () => {
+    expect(() => loadConfig([
+      "--project-path", fixturePaths.project,
+    ])).toThrowError(/Unknown configuration argument/);
   });
 
   it("rejects an add-on root that cannot be represented in Workbench's -addonsDir argument", () => {
@@ -602,7 +571,6 @@ describe("effective configuration contract", () => {
   it.each([
     ["workbenchPath", { workbenchPath: "./missing-workbench" }, "directory"],
     ["gamePath", { gamePath: "./missing-game" }, "directory"],
-    ["projectPath", { projectPath: "./missing-project" }, "directory"],
     ["workbenchAddonDirs entry 2", { workbenchAddonDirs: ["./missing-addon"] }, "directory"],
     ["extractedPath", { extractedPath: "./missing-extracted" }, "directory"],
     ["observer.agentPath", { observer: { agentPath: "./missing-agent.js" } }, "file"],
@@ -672,14 +640,9 @@ describe("effective configuration contract", () => {
     ])).toThrowError(/gamePath\/addons must resolve beneath gamePath/);
   });
 
-  it("rejects project roots that overlap an installation", () => {
-    const configPath = writeConfig(requiredFileValues({
-      projectPath: "./game/addons",
-    }));
-
-    expect(() => loadConfig(["--config", configPath])).toThrowError(
-      /projectPath must not overlap/
-    );
+  it.each(["projectPath", "defaultMod"])("rejects the retired %s config setting", (field) => {
+    const configPath = writeConfig(requiredFileValues({ [field]: "retired" }));
+    expect(() => loadConfig(["--config", configPath])).toThrowError(/Unrecognized key/);
   });
 
   it("rejects observer managed or profile roots that resolve through files", () => {
@@ -696,21 +659,13 @@ describe("effective configuration contract", () => {
     }
   });
 
-  it("rejects observer private roots that overlap projectPath", () => {
+  it("rejects observer private roots that overlap gamePath", () => {
     const configPath = writeConfig(requiredFileValues({
-      observer: { managedRoot: "./project/observer-state" },
+      observer: { managedRoot: "./game/observer-state" },
     }));
 
     expect(() => loadConfig(["--config", configPath])).toThrowError(
-      /observer\.managedRoot must not overlap projectPath/
-    );
-  });
-
-  it("rejects an invalid direct-folder defaultMod", () => {
-    const configPath = writeConfig(requiredFileValues({ defaultMod: "../other" }));
-
-    expect(() => loadConfig(["--config", configPath])).toThrowError(
-      /defaultMod must name one direct project folder/
+      /observer\.managedRoot must not overlap gamePath/
     );
   });
 
@@ -789,11 +744,11 @@ describe("partitionConfigurationArguments", () => {
 
   it("rejects empty path flags instead of inferring the working directory", () => {
     expect(() => loadConfig([
-      "--project-path", "   ",
+      "--workbench-path", "   ",
       "--workbench-path", fixturePaths.workbench,
       "--game-path", fixturePaths.game,
     ], { cwd: fixturePaths.project })).toThrowError(
-      /--project-path requires a non-empty path/
+      /--workbench-path requires a non-empty path/
     );
   });
 });

@@ -412,6 +412,7 @@ export class CaptureService {
           settleFrames: 0,
           performancePolicy: "evidence" as const,
           timeoutMs: this.defaultTimeoutMs,
+          expectedWorldRevision: worldRevision,
           runId,
           ...(typeof capture.captureLabel === "string" ? { captureLabel: capture.captureLabel } : {}),
           asynchronous: true,
@@ -583,11 +584,9 @@ export class CaptureService {
   }
 
   private assertExpectedWorld(input: CaptureInput, instance: CaptureInstance): void {
-    if (input.expectedWorldRevision !== undefined && !sameWorldRevision(input.expectedWorldRevision, instance.worldRevision)) {
+    if (!sameWorldRevision(input.expectedWorldRevision, instance.worldRevision)) {
       throw new CaptureError("WORLD_CHANGED", "Selected observer no longer matches the expected world revision", { expectedWorldRevision: input.expectedWorldRevision, actualWorldRevision: instance.worldRevision });
     }
-    if (input.expectedWorldId !== undefined && input.expectedWorldId !== instance.worldId) throw new CaptureError("WORLD_CHANGED", "Selected observer no longer matches the expected world ID");
-    if (input.expectedWorldEpoch !== undefined && input.expectedWorldEpoch !== (instance.legacyWorldEpoch ?? legacyWorldFields(instance.worldRevision).worldEpoch)) throw new CaptureError("WORLD_CHANGED", "Selected observer no longer matches the expected world epoch");
     if (instance.worldId === null && input.view.kind !== "current") throw new CaptureError("WORLD_UNAVAILABLE", "Camera views require an active world");
   }
 

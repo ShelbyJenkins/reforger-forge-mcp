@@ -103,4 +103,40 @@ describe("asset_search resource GUIDs", () => {
       );
     }, { prefix: "rfo-asset-guid-" });
   });
+
+  it("returns a model with its GUID from resourceDatabase.rdb", async () => {
+    await withTemporaryDirectory(async (root) => {
+      const gamePath = join(root, "game");
+      const dataPath = join(gamePath, "addons", "data");
+      const modelPath = "Assets/Props/Military/Barrels/BarrelGreen_01.xob";
+      mkdirSync(join(dataPath, "Assets", "Props", "Military", "Barrels"), {
+        recursive: true,
+      });
+      writeFileSync(join(dataPath, ...modelPath.split("/")), "model data");
+      writeFileSync(
+        join(dataPath, "resourceDatabase.rdb"),
+        oneEntryResourceDatabase(modelPath, "5F4C4181F065B447")
+      );
+
+      const handler = register({
+        workbenchPath: join(root, "tools"),
+        gamePath,
+        dataDir: join(root, "index"),
+        patternsDir: join(root, "patterns"),
+        workbenchHost: "127.0.0.1",
+        workbenchPort: 5775,
+      });
+      const result = await handler({
+        query: "BarrelGreen_01",
+        type: "model",
+        limit: 5,
+        refresh: false,
+      });
+      const text = result.content.map((item) => item.text ?? "").join("\n");
+
+      expect(text).toContain(
+        "{5F4C4181F065B447}Assets/Props/Military/Barrels/BarrelGreen_01.xob"
+      );
+    }, { prefix: "rfo-asset-model-guid-" });
+  });
 });

@@ -16,7 +16,7 @@ reforger-forge-workbench --config <file> build --gproj <path> --platform PC --ou
 `editor` is deliberately foreground-only. `build` requires a caller-exclusive,
 new, empty output directory. `--config` is optional; the runner also accepts
 the normal shared configuration flags, including repeated
-`--workbench-addon-dir` values. See the [setup guide](../setup.md#optional-configuration)
+`--workbench-addon-dir` values. See the [setup guide](../SETUP.md#optional-configuration)
 for configuration precedence, add-on-root discovery, and the full flag
 reference.
 

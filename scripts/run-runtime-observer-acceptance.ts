@@ -152,7 +152,7 @@ export interface RuntimeObserverAcceptanceOptions {
    * shutdown remains available. */
   expectCurrentOnly?: boolean;
   artifactRoot?: string;
-  /** Defaults to the repository's docs/validation directory. */
+  /** Defaults beneath the external acceptance artifact root. */
   validationRoot?: string;
   timeoutMs?: number;
   worldResource?: string;
@@ -275,6 +275,7 @@ async function captureIntoRunUnmeasured(
     purpose: string;
     sessionId: string;
     instanceId: string;
+    worldRevision: string;
     worldId: string;
     worldEpoch: number;
     view: ObserverCaptureView;
@@ -287,8 +288,7 @@ async function captureIntoRunUnmeasured(
     purpose: input.purpose,
     sessionId: input.sessionId,
     instanceId: input.instanceId,
-    expectedWorldId: input.worldId,
-    expectedWorldEpoch: input.worldEpoch,
+    expectedWorldRevision: input.worldRevision,
     idempotencyKey: `${input.runId}-${input.label}`,
     view: input.view,
     settleFrames: 3,
@@ -307,6 +307,7 @@ async function captureIntoRun(
     purpose: string;
     sessionId: string;
     instanceId: string;
+    worldRevision: string;
     worldId: string;
     worldEpoch: number;
     view: ObserverCaptureView;
@@ -328,6 +329,7 @@ async function expectExplicitCameraUnavailable(
     runId: string;
     sessionId: string;
     instanceId: string;
+    worldRevision: string;
     worldId: string;
     worldEpoch: number;
     view: Extract<ObserverCaptureView, { kind: "lookAt" }>;
@@ -340,8 +342,7 @@ async function expectExplicitCameraUnavailable(
       // capability refusal must occur before a runtime job or artifact exists.
       sessionId: input.sessionId,
       instanceId: input.instanceId,
-      expectedWorldId: input.worldId,
-      expectedWorldEpoch: input.worldEpoch,
+      expectedWorldRevision: input.worldRevision,
       idempotencyKey: `${input.runId}-expected-current-only-look-at-refusal`,
       view: input.view,
       settleFrames: 3,
@@ -673,15 +674,12 @@ export async function runRuntimeObserverAcceptance(
   const diagnosticsRoot = join(runDirectory, "diagnostics");
   for (const directory of [managedRoot, profileRoot, evidenceRoot]) mkdirSync(directory);
   const summaryPath = join(runDirectory, "acceptance-summary.json");
-  const validationRoot = resolve(
-    options.validationRoot ?? join(REPOSITORY_ROOT, "docs", "validation")
-  );
+  const validationRoot = resolve(options.validationRoot ?? join(artifactRoot, "validation"));
   const deadline = Date.now() + timeoutMs;
   const application = createObserverApplication({
     agentPath: PRIVATE_CHILD_PATH,
     managedRoot,
     profileRoot,
-    projectPath: fixture?.addonDirectory,
     sourceAddon: OBSERVER_SOURCE_PATH,
     evidenceRoots: [evidenceRoot],
     startupTimeoutMs: 20_000,
@@ -692,7 +690,6 @@ export async function runRuntimeObserverAcceptance(
   const runtimeManager = new OwnedRuntimeManager({
     managedRoot,
     gamePath: dirname(executable),
-    projectPath: fixture?.addonDirectory,
     observerGate: application,
     executableResolver: () => executable,
   });
@@ -899,9 +896,11 @@ export async function runRuntimeObserverAcceptance(
     }
     const selected = options.expectCurrentOnly ? currentOnly[0] : compatible[0];
     const instanceId = String(selected.instanceId ?? "");
+    const worldRevision = String(selected.worldRevision ?? "");
     const worldId = typeof selected.worldId === "string" ? selected.worldId : "";
     const worldEpoch = selected.worldEpoch;
-    if (!/^[A-Za-z0-9_-]{1,96}$/.test(instanceId) || !worldId ||
+    if (!/^[A-Za-z0-9_-]{1,96}$/.test(instanceId) ||
+        !/^wr1\.runtime\.[A-Za-z0-9_-]+$/.test(worldRevision) || !worldId ||
         !Number.isSafeInteger(worldEpoch) || (worldEpoch as number) < 0) {
       throw new Error("Selected graphical runtime has invalid instance/world identity");
     }
@@ -912,6 +911,7 @@ export async function runRuntimeObserverAcceptance(
       runId: managedRunId,
       sessionId,
       instanceId,
+      worldRevision,
       worldId,
       worldEpoch: worldEpoch as number,
       timeoutMs: captureTimeoutMs,

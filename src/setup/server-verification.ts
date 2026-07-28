@@ -53,7 +53,6 @@ export interface SteamDiscoveryVerification extends VerificationStage {
 export interface EffectiveSettingsVerification extends VerificationStage {
   workbenchPath?: string;
   gamePath?: string;
-  projectPath?: string;
   workbenchAddonDirs?: string[];
   workbenchHost?: string;
   workbenchPort?: number;
@@ -85,12 +84,12 @@ export interface ServerVerificationOptions {
   packageVersion: string;
   startupArguments?: readonly string[];
   serverPath?: string;
-  readmePath?: string;
   nodeVersion?: string;
 }
 
 interface AdvertisedTool {
   name: string;
+  description?: string;
   inputSchema?: {
     properties?: Record<string, unknown>;
   };
@@ -128,7 +127,6 @@ export interface ServerVerificationDependencies {
     serverPath: string,
     cwd: string
   ) => Promise<CompiledServerProbeResult>;
-  readTextFile?: (path: string) => Promise<string>;
   now?: () => Date;
   nodeCommand?: string;
 }
@@ -261,8 +259,7 @@ const REQUIRED_OBSERVER_TOOLS = [
 ] as const;
 
 export function inspectToolRegistration(
-  tools: readonly AdvertisedTool[],
-  readme: string
+  tools: readonly AdvertisedTool[]
 ): ToolRegistrationVerification {
   const sorted = [...tools].sort((left, right) =>
     left.name.localeCompare(right.name)
@@ -270,17 +267,6 @@ export function inspectToolRegistration(
   const names = sorted.map((tool) => tool.name);
   const registeredNames = new Set(names);
   const issues: string[] = [];
-  const toolReference =
-    readme.split("## Complete Tool Reference")[1]?.split(/^## /m)[0] ?? "";
-  const documentedNames = new Set(
-    [...toolReference.matchAll(/^\|\s*`([a-z0-9_]+)`\s*\|/gm)]
-      .map((match) => match[1])
-  );
-
-  if (documentedNames.size === 0) {
-    issues.push("README tool reference could not be parsed.");
-  }
-
   const duplicateNames = names.filter(
     (name, index) => names.indexOf(name) !== index
   );
@@ -288,6 +274,13 @@ export function inspectToolRegistration(
     issues.push(
       `Duplicate runtime tools: ${[...new Set(duplicateNames)].join(", ")}`
     );
+  }
+
+  const missingDescriptions = sorted
+    .filter((tool) => !tool.description || tool.description.trim().length === 0)
+    .map((tool) => tool.name);
+  if (missingDescriptions.length > 0) {
+    issues.push(`Runtime tools missing descriptions: ${missingDescriptions.join(", ")}`);
   }
 
   const removedTools = ["wb_play", "wb_save", "wb_execute_action"]
@@ -341,21 +334,6 @@ export function inspectToolRegistration(
     issues.push(
       `Required observer tools missing at runtime: ${missingObserverTools.join(", ")}`
     );
-  }
-
-  if (documentedNames.size > 0) {
-    const missingDocumented = [...documentedNames]
-      .filter((name) => !registeredNames.has(name));
-    if (missingDocumented.length > 0) {
-      issues.push(
-        `Documented tools missing at runtime: ${missingDocumented.join(", ")}`
-      );
-    }
-    const undocumented = [...registeredNames]
-      .filter((name) => !documentedNames.has(name));
-    if (undocumented.length > 0) {
-      issues.push(`Runtime tools missing from README: ${undocumented.join(", ")}`);
-    }
   }
 
   return {
@@ -513,7 +491,6 @@ export function parseServerVerificationReport(
   for (const field of [
     "workbenchPath",
     "gamePath",
-    "projectPath",
     "workbenchHost",
   ] as const) {
     const fieldValue = effectiveSettingsRecord[field];
@@ -622,11 +599,6 @@ export async function verifyMcpServer(
     : isAbsolute(options.serverPath)
       ? resolve(options.serverPath)
       : resolve(packageRoot, options.serverPath);
-  const readmePath = options.readmePath === undefined
-    ? join(packageRoot, "README.md")
-    : isAbsolute(options.readmePath)
-      ? resolve(options.readmePath)
-      : resolve(packageRoot, options.readmePath);
   const startupArguments = [...(options.startupArguments ?? [])];
   const discoverSteam =
     dependencies.discoverSteam ?? discoverSteamInstallations;
@@ -634,9 +606,6 @@ export async function verifyMcpServer(
   const createSession = dependencies.createSession ?? defaultCreateSession;
   const probeCompiledServer =
     dependencies.probeCompiledServer ?? defaultProbeCompiledServer;
-  const readTextFile =
-    dependencies.readTextFile ??
-    ((path: string) => readFile(path, "utf8"));
 
   const compiledProbe = await probeCompiledServer(serverPath, packageRoot);
   const compiledIssues: string[] = [];
@@ -699,9 +668,6 @@ export async function verifyMcpServer(
       status: "passed",
       workbenchPath: effectiveConfig.workbenchPath,
       gamePath: effectiveConfig.gamePath,
-      ...(effectiveConfig.projectPath === undefined
-        ? {}
-        : { projectPath: effectiveConfig.projectPath }),
       workbenchAddonDirs: [...(effectiveConfig.workbenchAddonDirs ?? [])],
       workbenchHost: effectiveConfig.workbenchHost,
       workbenchPort: effectiveConfig.workbenchPort,
@@ -769,27 +735,7 @@ export async function verifyMcpServer(
         serverHandshake = { status: "passed", issues: [] };
         try {
           const { tools } = await session.listTools();
-          let readme = "";
-          let readmeFailure: unknown;
-          try {
-            readme = await readTextFile(readmePath);
-          } catch (error) {
-            readmeFailure = error;
-          }
-          if (readmeFailure !== undefined) {
-            toolRegistration = {
-              status: "failed",
-              count: tools.length,
-              names: tools
-                .map((tool) => tool.name)
-                .sort((left, right) => left.localeCompare(right)),
-              issues: [
-                `README tool contract could not be read: ${errorMessage(readmeFailure)}`,
-              ],
-            };
-          } else {
-            toolRegistration = inspectToolRegistration(tools, readme);
-          }
+          toolRegistration = inspectToolRegistration(tools);
         } catch (error) {
           toolRegistration = {
             status: "failed",
@@ -875,7 +821,6 @@ export function formatServerVerificationReport(
       "",
       `Tools path: ${report.effectiveSettings.workbenchPath}`,
       `Game path:  ${report.effectiveSettings.gamePath}`,
-      `Project:    ${report.effectiveSettings.projectPath ?? "none (project-independent mode)"}`,
       `Addons:     ${(report.effectiveSettings.workbenchAddonDirs ?? []).join(", ") || "none"}`
     );
   }

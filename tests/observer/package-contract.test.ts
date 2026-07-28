@@ -138,7 +138,10 @@ describe("observer package and source contracts", () => {
       "observer/workbench-addon",
       "observer/protocol",
       "observer/README.md",
-      "setup.md",
+      "SETUP.md",
+      "docs/observer.md",
+      "docs/runner-cli.md",
+      "contributing.md",
     ]));
     expect(packageJson.files).not.toContain("mod");
     const observerReleaseAssets = [
@@ -266,7 +269,7 @@ describe("observer package and source contracts", () => {
     }
   });
 
-  it("publishes and documents the exact seven-tool observer surface", () => {
+  it("publishes the exact seven-tool observer surface and keeps current operator guidance aligned", () => {
     const expected = [
       "observer_capture",
       "observer_instances",
@@ -295,23 +298,20 @@ describe("observer package and source contracts", () => {
       .sort();
     expect(discovered).toEqual(expected);
 
-    const readme = readFileSync(join(repositoryRoot, "README.md"), "utf8");
-    const toolReference = readme.split("## Complete Tool Reference")[1]?.split(/^## /m)[0] ?? "";
-    const documented = [...toolReference.matchAll(/^\|\s*`(observer_[a-z_]+)`\s*\|/gm)]
-      .map((match) => match[1])
-      .sort();
-    expect(documented).toEqual(expected);
-    expect(readme).toContain("preparedLaunchId");
-    expect(readme).toContain("identity_mismatch");
+    const observerGuide = readFileSync(join(repositoryRoot, "docs", "observer.md"), "utf8");
+    for (const name of expected) expect(observerGuide).toContain(`\`${name}\``);
+    expect(observerGuide).toContain("expectedWorldRevision");
+    expect(observerGuide).not.toContain("expectedWorldId");
+    expect(observerGuide).not.toContain("expectedWorldEpoch");
 
     const observerReadme = readFileSync(join(repositoryRoot, "observer", "README.md"), "utf8");
-    expect(observerReadme).toContain("exactly seven MCP");
+    expect(observerReadme).toContain("Observer exposes seven related MCP tools");
     expect(observerReadme).toContain("observer_runtime");
     expect(observerReadme).toContain("terminal restoration");
-    expect(observerReadme).toContain("lifecycle recovery");
+    expect(observerReadme).toContain("exact matching persisted receipt");
 
     const agentInstructions = readFileSync(join(repositoryRoot, "agents", "AGENTS.md"), "utf8");
-    expect(agentInstructions).toContain("`observer_runtime`");
+    expect(agentInstructions).toContain("observer_runtime");
     expect(agentInstructions).toContain("preparedLaunchId");
   });
 

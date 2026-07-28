@@ -11,8 +11,17 @@ import {
   type ScriptType,
 } from "../templates/script.js";
 import { validateFilename, validateEnforceIdentifier } from "../utils/safe-path.js";
+import {
+  resolveOptionalAddonRoot,
+  type ActiveProjectProvider,
+} from "../utils/game-paths.js";
 
-export function registerScriptCreate(server: McpServer, config: Config, searchEngine?: SearchEngine): void {
+export function registerScriptCreate(
+  server: McpServer,
+  _config: Config,
+  searchEngine?: SearchEngine,
+  projectProvider?: ActiveProjectProvider
+): void {
   server.registerTool(
     "script_create",
     {
@@ -46,16 +55,18 @@ export function registerScriptCreate(server: McpServer, config: Config, searchEn
           .string()
           .optional()
           .describe("Description comment at the top of the file"),
-        projectPath: z
+        gprojPath: z
           .string()
           .optional()
-          .describe("Addon root path. Uses configured default if omitted."),
+          .describe("Exact .gproj to write under. Uses the running Workbench project if omitted."),
       },
     },
-    async ({ className, scriptType, parentClass, methods, description, projectPath }) => {
-      const basePath = projectPath || config.projectPath;
-
+    async ({ className, scriptType, parentClass, methods, description, gprojPath }) => {
       try {
+        const basePath = await resolveOptionalAddonRoot(projectProvider, {
+          operation: "script_create",
+          gprojPath,
+        });
         validateFilename(className);
         validateEnforceIdentifier(className);
 
@@ -124,7 +135,7 @@ export function registerScriptCreate(server: McpServer, config: Config, searchEn
           content: [
             {
               type: "text",
-              text: `Generated script (no project path configured — not written to disk):\n\n\`\`\`c\n${code}\`\`\`\n\nUse --config/--project-path to write files automatically.`,
+              text: `Generated script (no project target selected — not written to disk):\n\n\`\`\`c\n${code}\`\`\`\n\nPass the exact gprojPath or launch the project with wb_launch to write it.`,
             },
           ],
         };

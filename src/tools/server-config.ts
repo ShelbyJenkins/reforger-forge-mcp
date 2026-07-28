@@ -4,10 +4,15 @@ import { writeFileSync, existsSync } from "node:fs";
 import { resolve } from "node:path";
 import type { Config } from "../config.js";
 import { generateServerConfig } from "../templates/server-config.js";
+import {
+  resolveOptionalAddonRoot,
+  type ActiveProjectProvider,
+} from "../utils/game-paths.js";
 
 export function registerServerConfig(
   server: McpServer,
-  config: Config
+  _config: Config,
+  projectProvider?: ActiveProjectProvider
 ): void {
   server.registerTool(
     "server_config",
@@ -76,10 +81,10 @@ export function registerServerConfig(
           .string()
           .optional()
           .describe("Server password (empty = no password)"),
-        projectPath: z
+        gprojPath: z
           .string()
           .optional()
-          .describe("Project root to write server.json. Uses configured default if omitted."),
+          .describe("Exact .gproj to write server.json beside. Uses the running Workbench project if omitted."),
       },
     },
     async ({
@@ -95,11 +100,13 @@ export function registerServerConfig(
       a2sPort,
       visible,
       password,
-      projectPath,
+      gprojPath,
     }) => {
-      const basePath = projectPath || config.projectPath;
-
       try {
+        const basePath = await resolveOptionalAddonRoot(projectProvider, {
+          operation: "server_config",
+          gprojPath,
+        });
         const content = generateServerConfig({
           name,
           modName,
@@ -145,7 +152,7 @@ export function registerServerConfig(
           content: [
             {
               type: "text",
-              text: `Generated server config (no project path — not written to disk):\n\n\`\`\`json\n${content}\n\`\`\`\n\nUse --config/--project-path to write files automatically.`,
+              text: `Generated server config (no project target selected — not written to disk):\n\n\`\`\`json\n${content}\n\`\`\`\n\nPass the exact gprojPath or launch the project with wb_launch to write it.`,
             },
           ],
         };

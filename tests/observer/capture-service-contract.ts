@@ -54,6 +54,7 @@ function serviceHarness(kind: CaptureBackendKind) {
     view: { kind: "current" } as const,
     asynchronous: true,
     timeoutMs: 1_000,
+    expectedWorldRevision: instance.worldRevision,
   };
   return {
     service, input, events, deadlines,

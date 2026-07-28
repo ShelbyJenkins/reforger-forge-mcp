@@ -93,11 +93,12 @@ describe("MCP-managed Workbench helper add-on", () => {
     }, { prefix: "reforger-forge-helper-" });
   });
 
-  it("allows Workbench's generated resource database only in an existing staged bundle", async () => {
+  it("allows Workbench's generated local files only in an existing staged bundle", async () => {
     await withTemporaryDirectory((root) => {
     const stager = new WorkbenchHelperStager({ managedRoot: join(root, "managed") });
     const staged = stager.ensureStaged();
     writeFileSync(join(staged.addonDirectory, "resourceDatabase.rdb"), "generated", "utf8");
+    writeFileSync(join(staged.addonDirectory, "UserMaps.desc"), "generated", "utf8");
 
     expect(stager.verifyStaged(staged)).toMatchObject({
       addonDirectory: staged.addonDirectory,

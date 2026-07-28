@@ -11,8 +11,16 @@ import {
   type WidgetDef,
 } from "../templates/layout.js";
 import { validateFilename } from "../utils/safe-path.js";
+import {
+  resolveOptionalAddonRoot,
+  type ActiveProjectProvider,
+} from "../utils/game-paths.js";
 
-export function registerLayoutCreate(server: McpServer, config: Config): void {
+export function registerLayoutCreate(
+  server: McpServer,
+  _config: Config,
+  projectProvider?: ActiveProjectProvider
+): void {
   server.registerTool(
     "layout_create",
     {
@@ -79,16 +87,18 @@ export function registerLayoutCreate(server: McpServer, config: Config): void {
           .string()
           .optional()
           .describe("Description comment for the layout"),
-        projectPath: z
+        gprojPath: z
           .string()
           .optional()
-          .describe("Addon root path. Uses configured default if omitted."),
+          .describe("Exact .gproj to write under. Uses the running Workbench project if omitted."),
       },
     },
-    async ({ name, layoutType, rootWidgetType, anchor, offset, widgets, description, projectPath }) => {
-      const basePath = projectPath || config.projectPath;
-
+    async ({ name, layoutType, rootWidgetType, anchor, offset, widgets, description, gprojPath }) => {
       try {
+        const basePath = await resolveOptionalAddonRoot(projectProvider, {
+          operation: "layout_create",
+          gprojPath,
+        });
         validateFilename(name);
 
         const content = generateLayout({
@@ -136,7 +146,7 @@ export function registerLayoutCreate(server: McpServer, config: Config): void {
           content: [
             {
               type: "text",
-              text: `Generated layout (no project path configured — not written to disk):\n\n\`\`\`\n${content}\n\`\`\`\n\nUse --config/--project-path to write files automatically.`,
+              text: `Generated layout (no project target selected — not written to disk):\n\n\`\`\`\n${content}\n\`\`\`\n\nPass the exact gprojPath or launch the project with wb_launch to write it.`,
             },
           ],
         };

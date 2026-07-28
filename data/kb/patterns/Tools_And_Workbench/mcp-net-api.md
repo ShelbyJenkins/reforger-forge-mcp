@@ -293,16 +293,43 @@ Requires Claude Code restart to pick up new tool schemas.
 
 **Never use `wb_open_resource` on a `.et` file when a world is open** — it switches Workbench to prefab edit mode and closes the world.
 
-**DO NOT file-copy prefabs from the extracted library into your mod folder without registering.**
-File-copied prefabs have no GUID registered in Workbench's resource DB → `{0000000000000000}` errors at runtime → slot fails to spawn.
+An unregistered prefab is valid as an offline editing artifact, but it is not
+yet a usable Workbench resource. Referencing it before registration can produce
+`{0000000000000000}` errors at runtime and prevent the prefab from spawning.
 
-**Correct MCP workflow (game_duplicate tool — confirmed working):**
-1. Read the loose `.et` through `game_read`/`game_duplicate`; those tools use the explicitly configured `gamePath` and its `addons/data/DataXXX/` tree
-2. Write copy to mod folder
-3. Call `ResourceManager.RegisterResourceFile(absPath, false)` → Workbench creates a `.meta` file with a new GUID
-4. Reference the duplicate using the GUID from the `.meta` file: `{METAGUID}Prefabs/path/to/copy.et`
+Two identifiers are involved:
 
-Key: the GUID that matters is in the `.meta` file (`Name "{GUID}path"`), NOT the `ID` field inside the `.et`.
+- The `ID` field inside the `.et` identifies prefab content.
+  `game_duplicate` gives the copy a fresh internal ID even when
+  `register=false`.
+- The resource GUID identifies the file in Workbench's resource database. It
+  does not exist until registration and is stored in the Workbench-created
+  `.meta` file.
+
+Registration takes the copied file's path, not a pre-existing GUID.
+
+**Immediate-registration workflow:**
+1. Open the exact destination `.gproj` in Workbench.
+2. Call `game_duplicate` with `register=true`; the tool writes the `.et` and
+   calls `ResourceManager.RegisterResourceFile(absPath, false)`.
+3. Workbench creates the companion `.meta` file and assigns its resource GUID.
+4. Verify the GUID with `wb_resources(action: "getInfo")` or
+   `wb_prefabs(action: "getGuid")`.
+5. Reference the duplicate as `{METAGUID}Prefabs/path/to/copy.et`.
+
+**Deferred-registration workflow:**
+1. Call `game_duplicate` with `register=false` to create the offline `.et`.
+2. Later, open the exact destination `.gproj` in Workbench.
+3. Call `wb_resources(action: "register", path: "<absolute path to copied .et>")`.
+4. Verify the new `.meta` GUID before referencing the prefab.
+
+If `game_duplicate(register=true)` writes the file but registration fails, keep
+the copied `.et` and use the deferred registration steps. Do not call
+`game_duplicate` again at the same destination because it refuses to overwrite
+the existing file.
+
+Key: the resource GUID that references the file is in the `.meta` file
+(`Name "{GUID}path"`), not the `ID` field inside the `.et`.
 `CreateEntityTemplate` on a placed scene entity produces a thin scene override — do NOT use it for duplication.
 
 **Manual Workbench workflow:**

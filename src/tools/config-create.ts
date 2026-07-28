@@ -10,10 +10,15 @@ import {
   type ConfigType,
 } from "../templates/config.js";
 import { validateFilename } from "../utils/safe-path.js";
+import {
+  resolveOptionalAddonRoot,
+  type ActiveProjectProvider,
+} from "../utils/game-paths.js";
 
 export function registerConfigCreate(
   server: McpServer,
-  config: Config
+  _config: Config,
+  projectProvider?: ActiveProjectProvider
 ): void {
   server.registerTool(
     "config_create",
@@ -86,10 +91,10 @@ export function registerConfigCreate(
           .string()
           .optional()
           .describe("Category name (entity-catalog, editor-placeables types)"),
-        projectPath: z
+        gprojPath: z
           .string()
           .optional()
-          .describe("Addon root path. Uses configured default if omitted."),
+          .describe("Exact .gproj to write under. Uses the running Workbench project if omitted."),
       },
     },
     async ({
@@ -108,11 +113,13 @@ export function registerConfigCreate(
       xpMultiplier,
       prefabRefs,
       categoryName,
-      projectPath,
+      gprojPath,
     }) => {
-      const basePath = projectPath || config.projectPath;
-
       try {
+        const basePath = await resolveOptionalAddonRoot(projectProvider, {
+          operation: "config_create",
+          gprojPath,
+        });
         validateFilename(name);
 
         const content = generateConfig({
@@ -168,7 +175,7 @@ export function registerConfigCreate(
           content: [
             {
               type: "text",
-              text: `Generated config (no project path configured — not written to disk):\n\n\`\`\`\n${content}\n\`\`\`\n\nUse --config/--project-path to write files automatically.`,
+              text: `Generated config (no project target selected — not written to disk):\n\n\`\`\`\n${content}\n\`\`\`\n\nPass the exact gprojPath or launch the project with wb_launch to write it.`,
             },
           ],
         };

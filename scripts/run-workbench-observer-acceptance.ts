@@ -187,7 +187,7 @@ export interface WorkbenchObserverAcceptanceOptions {
   configPath: string;
   environment?: NodeJS.ProcessEnv;
   artifactRoot?: string;
-  /** Defaults to the repository's docs/validation directory. */
+  /** Defaults beneath the external acceptance artifact root. */
   validationRoot?: string;
   timeoutMs?: number;
   /** Phase 1 recognizes only declared matrix IDs and intentionally executes none. */
@@ -465,7 +465,7 @@ async function captureAndRetainUnmeasured(
   label: string,
   runId: string,
   instanceId: string,
-  expectedWorldId: string,
+  expectedWorldRevision: string,
   deadline: number
 ): Promise<RetainedCapture> {
   const capture = await application.capture({
@@ -473,8 +473,7 @@ async function captureAndRetainUnmeasured(
     captureLabel: label,
     purpose: `Live Workbench acceptance capture: ${label}`,
     instanceId,
-    expectedWorldId,
-    expectedWorldEpoch: 0,
+    expectedWorldRevision,
     idempotencyKey: `${runId}:${label}`,
     view,
     settleFrames: 3,
@@ -521,7 +520,7 @@ async function captureAndRetain(
   label: string,
   runId: string,
   instanceId: string,
-  expectedWorldId: string,
+  expectedWorldRevision: string,
   deadline: number,
   baseline: OperationalBaselineRecorder
 ): Promise<RetainedCapture> {
@@ -534,7 +533,7 @@ async function captureAndRetain(
       label,
       runId,
       instanceId,
-      expectedWorldId,
+      expectedWorldRevision,
       deadline
     ),
     label
@@ -699,9 +698,7 @@ export async function runWorkbenchObserverAcceptance(
   assertEvidenceOutsideRepository(artifactRoot);
   const runDirectory = mkdtempSync(join(artifactRoot, "run-"));
   const summaryPath = join(runDirectory, "summary.json");
-  const validationRoot = resolve(
-    options.validationRoot ?? join(REPOSITORY_ROOT, "docs", "validation")
-  );
+  const validationRoot = resolve(options.validationRoot ?? join(artifactRoot, "validation"));
   let runtime: WorkbenchObserverAcceptanceRuntime<WorkbenchObserverAdapter>;
   try {
     runtime = new WorkbenchObserverAcceptanceRuntime({
@@ -833,6 +830,7 @@ export async function runWorkbenchObserverAcceptance(
     }
     const selected = await waitForCaptureCapability(application, deadline);
     const instanceId = requiredString(selected.instanceId, "Selected Workbench observer instance ID");
+    const expectedWorldRevision = requiredString(selected.worldRevision, "Selected Workbench observer world revision");
     const expectedWorldId = requiredString(selected.worldId, "Selected Workbench observer world ID");
 
     const initial = await captureAndRetain(
@@ -841,7 +839,7 @@ export async function runWorkbenchObserverAcceptance(
       "initial-current",
       observerRunId,
       instanceId,
-      expectedWorldId,
+      expectedWorldRevision,
       deadline,
       baseline
     );
@@ -883,7 +881,7 @@ export async function runWorkbenchObserverAcceptance(
       "explicit-pose",
       observerRunId,
       instanceId,
-      expectedWorldId,
+      expectedWorldRevision,
       deadline,
       baseline
     );
@@ -912,7 +910,7 @@ export async function runWorkbenchObserverAcceptance(
       "post-pose-restoration-current",
       observerRunId,
       instanceId,
-      expectedWorldId,
+      expectedWorldRevision,
       deadline,
       baseline
     );
@@ -944,7 +942,7 @@ export async function runWorkbenchObserverAcceptance(
       "explicit-look-at",
       observerRunId,
       instanceId,
-      expectedWorldId,
+      expectedWorldRevision,
       deadline,
       baseline
     );
@@ -968,7 +966,7 @@ export async function runWorkbenchObserverAcceptance(
       "post-look-at-restoration-current",
       observerRunId,
       instanceId,
-      expectedWorldId,
+      expectedWorldRevision,
       deadline,
       baseline
     );
@@ -1007,7 +1005,7 @@ export async function runWorkbenchObserverAcceptance(
           worldResource: project.worldResource,
           captureSequence: captures.map((capture) => capture.label).join(","),
           settleFrames: 3,
-          expectedWorldEpoch: 0,
+          expectedWorldRevision,
         },
       },
       releaseManagedArtifacts: true,
@@ -1367,7 +1365,7 @@ export async function runWorkbenchFailureMatrix(
     "Workbench matrix evidence root"
   );
   assertEvidenceOutsideRepository(artifactRoot);
-  const validationRoot = resolve(options.validationRoot ?? join(REPOSITORY_ROOT, "docs", "validation"));
+  const validationRoot = resolve(options.validationRoot ?? join(artifactRoot, "validation"));
   const aggregateRunDirectory = mkdtempSync(join(artifactRoot, "matrix-run-"));
   const startedAtMs = Date.now();
   const startedAt = new Date(startedAtMs).toISOString();

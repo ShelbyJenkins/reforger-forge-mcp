@@ -113,8 +113,6 @@ describe("Workbench diagnostics", () => {
       host: "127.0.0.1",
       port: 5775,
       workbenchExe: null,
-      projectPath: null,
-      defaultMod: null,
       netApi: "up_with_companion",
       lifecycle: { state: "missing", lease: "vacant" },
     });

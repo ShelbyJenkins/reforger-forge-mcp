@@ -1,174 +1,237 @@
-# MCP Client Notes
+# AI Client Setup and Troubleshooting
 
-For prerequisites, default setup behavior, Doctor, receipts, Steam discovery,
-configuration overrides, and manual installation, see the
-[complete setup guide](../setup.md).
+This guide covers first-use MCP registration, client refresh, and recovery
+steps. It is for connecting an AI client to ReforgerForge; it is not the
+coding-agent workflow guide.
 
-This page contains only registration targets, commands, migration caveats, and
-refresh steps specific to each MCP client.
+For prerequisites, default setup, Doctor, Steam discovery, configuration
+settings, and path validation, read the [complete setup guide](../SETUP.md).
+For how an agent should use the available tools after registration, read
+[AGENTS.md](AGENTS.md).
 
-## Codex
+## First Use
 
-Automatic setup uses the Codex MCP CLI and its default user/global scope. The
-registration is named `reforger-forge`.
+From the ReforgerForge repository root, run:
 
-The equivalent config-free manual commands are:
+~~~powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup.ps1
+~~~
 
-```powershell
-$ServerPath = (Resolve-Path .\dist\index.js).Path
-codex mcp add reforger-forge -- node $ServerPath
-codex mcp list
-```
+The default setup installs dependencies, builds the server, checks its MCP
+handshake, and attempts the standard user/global registration for each detected
+supported client. It uses a config-free server entry and does not launch
+Workbench or the game.
 
-If a registration with that name already exists, remove or replace it through
-the Codex CLI. To register an explicit ReforgerForge override, follow
-[Registering an explicit override](../setup.md#registering-an-explicit-override).
+Then:
 
-## Google Antigravity
+1. Restart the AI client, or use its MCP-server refresh command.
+2. Confirm that a server named reforger-forge is running and its tools appear.
+3. If it does not, run the read-only diagnostic:
 
-Automatic setup uses one user target. Fresh registrations use
-`%USERPROFILE%\.gemini\config\mcp_config.json`. If Antigravity is positively
-detected and the alternate
-`%USERPROFILE%\.gemini\antigravity\mcp_config.json` already exists while the
-canonical file does not, setup updates that alternate file instead. It never
-writes both.
+~~~powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup.ps1 -Doctor
+~~~
 
-A shared `.gemini\config` file by itself is not positive Antigravity detection
-evidence.
+Setup success confirms that the registration was written or already current; it
+cannot prove the client has reloaded it.
 
-The explicit-config manual installer always writes the canonical
-`.gemini\config\mcp_config.json` target. It does not retain an existing
-alternate `.gemini\antigravity\mcp_config.json`, so review both files before
-using `install-agents.ps1 -All`.
+## Registration Model
 
-After setup, open Antigravity → **Settings** → **Customizations** →
-**Open MCP Config**, confirm `reforger-forge` appears, and refresh Installed MCP
-Servers if necessary.
+A normal registration starts the built server with:
 
-The config-free entry has this shape:
+~~~text
+node <absolute-package-path>\dist\index.js
+~~~
 
-```json
-{
-  "mcpServers": {
-    "reforger-forge": {
-      "command": "node",
-      "args": [
-        "C:\\full\\path\\to\\reforger-forge-mcp\\dist\\index.js"
-      ]
-    }
-  }
-}
-```
+Do not create a ReforgerForge configuration file for ordinary discovery. Use an
+explicit configuration only for nonstandard paths or settings. The full
+procedure, including the manual installer, is in
+[Registering an explicit override](../SETUP.md#registering-an-explicit-override).
 
-## Cursor
+When manually adding a configured server, append:
 
-Automatic setup updates the user registration at
-`%USERPROFILE%\.cursor\mcp.json` under `mcpServers`.
+~~~text
+--config <absolute-config-path>
+~~~
 
-For a manual config-free install, merge
-[cursor-global.json](configs/cursor-global.json). To intentionally create a
-workspace-only registration instead, copy
-[stdio-template.json](configs/stdio-template.json) to `.cursor/mcp.json` and
-replace the absolute server-path placeholder.
+Keep that machine-local file out of source control. Restart the client after
+changing its registration or its selected configuration path.
 
-After changing the registration, run **MCP: Restart Servers**.
+## Client-Specific Registration
 
-## Claude Desktop
+### Codex
 
-Automatic setup writes only the user target
-`%APPDATA%\Claude\claude_desktop_config.json` under `mcpServers` when Claude
-Desktop is detected.
-
-For a manual config-free install, merge
-[claude-desktop.json](configs/claude-desktop.json) into the client's
-`mcpServers` object, then restart Claude Desktop.
-
-## Claude Code
-
-Automatic setup uses a named `reforger-forge` registration with
-`--scope user`. It inspects the entry through `claude mcp get` and reads the
-exact user state from `%USERPROFILE%\.claude.json`, or
-`%CLAUDE_CONFIG_DIR%\.claude.json` when that override is set.
-
-A same-named local/project entry takes precedence over user scope. Setup leaves
-that entry unchanged and reports the conflict for manual attention.
-
-Command discovery prefers `claude` on `PATH`. When it is absent, setup checks
-the standard VS Code and VS Code Insiders extension installations for
-`anthropic.claude-code-*`, ignores obsolete versions, and selects the newest
-validated bundled native CLI. Invalid, incomplete, or symbolic-link-backed
-extension candidates are never executed. Custom VS Code `--extensions-dir`
-locations remain manual.
+Automatic setup uses the Codex MCP CLI at its default user/global scope. The
+registration name is reforger-forge.
 
 The config-free manual equivalent is:
 
-```powershell
+~~~powershell
+$ServerPath = (Resolve-Path .\dist\index.js).Path
+codex mcp add reforger-forge -- node $ServerPath
+codex mcp list
+~~~
+
+If the name already exists, use the Codex CLI to remove or replace that entry.
+For an explicit ReforgerForge configuration, add the config argument described
+above.
+
+### Google Antigravity
+
+Automatic setup normally updates:
+
+~~~text
+%USERPROFILE%\.gemini\config\mcp_config.json
+~~~
+
+If Antigravity is positively detected and only its existing alternate file is
+present, setup instead updates:
+
+~~~text
+%USERPROFILE%\.gemini\antigravity\mcp_config.json
+~~~
+
+It never writes both. A shared .gemini\config folder by itself is not proof of
+an Antigravity installation. After registration, open Settings, Customizations,
+Open MCP Config, verify the reforger-forge entry, and refresh Installed MCP
+Servers if necessary.
+
+The explicit-config manual installer always targets the canonical config path.
+Review both locations before running its all-client mode.
+
+### Cursor
+
+Automatic setup updates the user entry at:
+
+~~~text
+%USERPROFILE%\.cursor\mcp.json
+~~~
+
+For a config-free manual install, merge
+[cursor-global.json](configs/cursor-global.json). To use a workspace-only
+registration, copy [stdio-template.json](configs/stdio-template.json) to
+.cursor/mcp.json and replace the absolute server-path placeholder.
+
+After changing the entry, run MCP: Restart Servers.
+
+### Claude Desktop
+
+Automatic setup updates the detected user configuration:
+
+~~~text
+%APPDATA%\Claude\claude_desktop_config.json
+~~~
+
+For a config-free manual registration, merge
+[claude-desktop.json](configs/claude-desktop.json) into mcpServers, then
+restart Claude Desktop.
+
+### Claude Code
+
+Automatic setup creates a reforger-forge entry at user scope. A same-named
+local or project entry takes precedence; setup preserves it and reports the
+conflict for manual review.
+
+The config-free manual equivalent is:
+
+~~~powershell
 claude mcp add --scope user reforger-forge -- node "FULL_PATH\reforger-forge-mcp\dist\index.js"
-```
+~~~
 
-To add an explicit ReforgerForge config, append
-`--config "FULL_PATH\reforger-forge.config.json"` after the server path.
+To use an explicit configuration, append:
 
-## VS Code (GitHub Copilot)
+~~~text
+--config "FULL_PATH\reforger-forge.config.json"
+~~~
 
-VS Code uses the `servers` key rather than `mcpServers`. Automatic setup updates
-only the user target `%APPDATA%\Code\User\mcp.json`; it does not also write the
-workspace target `.vscode\mcp.json`.
+Setup prefers claude on PATH. When it is unavailable, it can use a validated
+bundled native CLI from a standard Claude Code VS Code installation. A custom
+VS Code extensions directory remains a manual setup case.
 
-The explicit-config manual installer is intentionally different: it writes
-both `%APPDATA%\Code\User\mcp.json` and the ReforgerForge repository's
-`.vscode\mcp.json`. Use its `-All` mode only when that workspace registration
-is also wanted.
+### VS Code (GitHub Copilot)
 
-For manual config-free registration, merge
-[vscode-template.json](configs/vscode-template.json) into the selected
-`mcp.json`.
+VS Code uses the servers key, rather than mcpServers. Automatic setup updates:
 
-Open **MCP: List Servers** from the command palette and verify that
-`reforger-forge` is running.
+~~~text
+%APPDATA%\Code\User\mcp.json
+~~~
 
-## Windsurf
+For a manual config-free registration, merge
+[vscode-template.json](configs/vscode-template.json) into the selected mcp.json.
+Use the Command Palette command MCP: List Servers to verify that
+reforger-forge is running.
 
-Automatic setup uses the user target
-`%USERPROFILE%\.codeium\windsurf\mcp_config.json` under `mcpServers`.
+The explicit-config manual installer can also write this repository's
+.vscode/mcp.json. Use that workspace registration only when it is intentional.
 
-Refresh the MCP list in the Cascade panel after registration if Windsurf does
-not reload it automatically.
+### Windsurf
 
-## Continue.dev
+Automatic setup updates:
 
-Automatic setup updates the `mcpServers` sequence in the user target
-`%USERPROFILE%\.continue\config.yaml`. It preserves unrelated YAML content.
+~~~text
+%USERPROFILE%\.codeium\windsurf\mcp_config.json
+~~~
 
-Continue's legacy `config.json` and `config.yml` formats are not migrated
-automatically. If one exists without the current `config.yaml`, setup reports a
-manual migration instead of creating a competing file.
+Refresh the Cascade MCP list if it does not reload automatically.
 
-The explicit-config manual installer targets the legacy
-`%USERPROFILE%\.continue\config.json` file rather than current
-`config.yaml`. Review or migrate the Continue configuration before including
-Continue in `install-agents.ps1 -All`.
+### Continue.dev
 
-## Kiro
+Automatic setup updates the mcpServers sequence in:
 
-Automatic setup uses the user target
-`%USERPROFILE%\.kiro\settings\mcp.json`, or
-`%KIRO_HOME%\settings\mcp.json` when `KIRO_HOME` is set.
+~~~text
+%USERPROFILE%\.continue\config.yaml
+~~~
 
-Parameterless setup never infers or writes a workspace
-`.kiro\settings\mcp.json`.
+Legacy config.json and config.yml files are not migrated automatically. If a
+legacy file exists without current config.yaml, migrate or review the
+configuration manually before adding ReforgerForge.
 
-The explicit-config manual installer instead writes the ReforgerForge
-repository's `.kiro\settings\mcp.json`. Use its `-All` mode only when that
-workspace registration is wanted.
+The explicit-config manual installer uses the legacy config.json target, so
+review the current Continue configuration before including Continue in its
+all-client mode.
 
-## Other MCP clients
+### Kiro
 
-Use [stdio-template.json](configs/stdio-template.json), replace the absolute
-server-path placeholder, and merge the entry into the client's MCP
-configuration.
+Automatic setup updates:
 
-If the client uses a `servers` key rather than `mcpServers`, adapt the outer
-container to that client's schema. To opt into a custom ReforgerForge config,
-follow [Registering an explicit override](../setup.md#registering-an-explicit-override)
-and add the `--config` arguments to the client's server entry.
+~~~text
+%USERPROFILE%\.kiro\settings\mcp.json
+~~~
+
+When KIRO_HOME is set, its settings directory is used instead. Parameterless
+setup never infers a workspace .kiro\settings\mcp.json. The explicit-config
+manual installer can target the repository workspace file; use that only when
+the workspace-level registration is desired.
+
+### Other MCP Clients
+
+Copy [stdio-template.json](configs/stdio-template.json), replace the absolute
+server-path placeholder, and merge the entry into the client configuration.
+If that client uses servers instead of mcpServers, adapt the outer container to
+its documented schema. Add an explicit --config argument only when using a
+deliberately selected ReforgerForge configuration file.
+
+## Troubleshooting
+
+| Problem | Recovery |
+|---|---|
+| The client does not list reforger-forge | Restart or refresh the client, then run setup.ps1 -Doctor to inspect the registration without changing it. |
+| The client starts the server but no tools appear | Run npm run mcp:verify from the repository root. Check the client log for its server-start error and verify its entry points to the built dist\index.js. |
+| The registration points at an old checkout | Replace the entry through the client CLI or its configuration file with the current absolute dist\index.js path, then restart the client. |
+| A custom path or setting is required | Follow the explicit override procedure in [SETUP.md](../SETUP.md#registering-an-explicit-override); do not edit a shared or committed config. |
+| A duplicate name behaves unexpectedly | Check user, workspace, local, and project registrations. In particular, Claude Code local/project entries override user scope. Keep one intentional entry for each scope. |
+| Setup reports manual attention | Read the client-specific section above and the setup receipt. It deliberately preserves malformed, unsafe, or ambiguous client configuration instead of overwriting it. |
+| Workbench or Observer is shown as not tested by Doctor | This is expected for normal Doctor. Add -CheckWorkbench only to ping an already-running Workbench; it never launches Workbench or captures the game. |
+
+## Configuration Templates
+
+The config-free templates are provided for manual registration:
+
+- [stdio-template.json](configs/stdio-template.json)
+- [cursor-global.json](configs/cursor-global.json)
+- [claude-desktop.json](configs/claude-desktop.json)
+- [vscode-template.json](configs/vscode-template.json)
+
+Use the [complete setup guide](../SETUP.md) for the ReforgerForge configuration
+file itself, discovery defaults, settings reference, and recovery from path or
+validation errors.

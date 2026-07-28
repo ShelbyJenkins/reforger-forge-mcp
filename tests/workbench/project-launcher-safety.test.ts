@@ -65,6 +65,8 @@ describe("bundled Windows Workbench lifecycle helper", () => {
     expect(helper).toContain("function Invoke-VerifyEndpointVacant");
     expect(helper).toContain("reason = 'listener_present'");
     expect(helper).toContain("status = 'vacant'");
+    expect(helper).toContain("[LifecycleProcessHandle]::Open($listenerPid, $false)");
+    expect(helper).toContain("$listenerException.Reason -eq 'pid_not_found'");
   });
 
   it.runIf(platform() === "win32")(

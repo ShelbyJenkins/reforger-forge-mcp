@@ -151,7 +151,7 @@ function verificationNextActions(
     }
     if (report.toolRegistration.status === "failed") {
       actions.push(
-        "Rebuild the package and reconcile the runtime tool surface with README.md."
+        "Rebuild the package and reconcile the registered runtime tool surface."
       );
     }
   }
@@ -318,7 +318,6 @@ export async function runDoctor(
     },
     settings: {
       configPath: report?.configPath ?? null,
-      projectPath: report?.effectiveSettings.projectPath ?? null,
       gamePath: report?.effectiveSettings.gamePath ?? null,
       workbenchPath: report?.effectiveSettings.workbenchPath ?? null,
       workbenchAddonDirs: [

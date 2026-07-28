@@ -10,7 +10,7 @@ import {
 import { redactForDiagnostics } from "../../observer/agent/logger.js";
 import { redactChildLine } from "../../src/observer/agent-client.js";
 import type { ObserverApplication } from "../../src/observer/application.js";
-import { ObserverCoordinatorError } from "../../src/observer/errors.js";
+import { ObserverApplicationError } from "../../src/observer/errors.js";
 import {
   OwnedRuntimeError,
   type OwnedRuntimeManager,
@@ -112,7 +112,7 @@ function deterministicTiming(now: { value: number }, waits: number[]): Workbench
   };
 }
 
-describe("cross-cutting coordinator baseline characterization", () => {
+describe("cross-cutting ObserverApplication baseline characterization", () => {
   it("keeps known secret sentinels out of diagnostic and evidence sinks", async () => {
     const diagnostic = JSON.stringify(redactForDiagnostics({
       token: "token-sentinel",
@@ -190,7 +190,7 @@ describe("cross-cutting coordinator baseline characterization", () => {
       defaultCaptureTimeoutMs: 30_000,
       maxInlineImageBytes: 1_024,
       async instances(): Promise<never> {
-        throw new ObserverCoordinatorError("UNAUTHORIZED", "authorization-sentinel");
+        throw new ObserverApplicationError("UNAUTHORIZED", "authorization-sentinel");
       },
     } as unknown as ObserverApplication;
     const ownedRuntimeManager = {
@@ -238,7 +238,7 @@ describe("cross-cutting coordinator baseline characterization", () => {
       defaultCaptureTimeoutMs: 30_000,
       maxInlineImageBytes: 1_024,
       async instances(): Promise<never> {
-        throw new ObserverCoordinatorError("INVALID_REQUEST", message, diagnostics);
+        throw new ObserverApplicationError("INVALID_REQUEST", message, diagnostics);
       },
     } as unknown as ObserverApplication;
     const ownedRuntimeManager = {

@@ -16,6 +16,10 @@ import {
   mergeAncestryComponents,
   type AncestorLevel,
 } from "../utils/prefab-ancestry.js";
+import {
+  resolveOptionalAddonRoot,
+  type ActiveProjectProvider,
+} from "../utils/game-paths.js";
 import { validateFilename } from "../utils/safe-path.js";
 
 // ── Inspect helpers ────────────────────────────────────────────────────────────
@@ -70,7 +74,11 @@ function formatReport(
 
 // ── Registration ──────────────────────────────────────────────────────────────
 
-export function registerPrefab(server: McpServer, config: Config): void {
+export function registerPrefab(
+  server: McpServer,
+  config: Config,
+  projectProvider?: ActiveProjectProvider
+): void {
   server.registerTool(
     "prefab",
     {
@@ -78,7 +86,7 @@ export function registerPrefab(server: McpServer, config: Config): void {
         "Create or inspect Arma Reforger prefab (.et) files.\n\n" +
         "action=create: Create a new Entity Template (.et) prefab file for an Arma Reforger mod. Generates a properly structured prefab with components in valid Enfusion text serialization format. " +
         "When parentPrefab is provided, automatically resolves the full ancestor chain and pre-populates inherited components (set includeAncestry=false to skip). " +
-        "IMPORTANT: For 'interactive' and other visible prefabs, the MeshObject component MUST have its 'Object' property set to a base game .xob model path (e.g., '{5F4C4181F065B447}Assets/Props/Military/Barrels/BarrelGreen_01.xob') or the entity will be invisible in-game. Use api_search to find model paths.\n\n" +
+        "IMPORTANT: For 'interactive' and other visible prefabs, the MeshObject component MUST have its 'Object' property set to a base game .xob model path (e.g., '{5F4C4181F065B447}Assets/Props/Military/Barrels/BarrelGreen_01.xob') or the entity will be invisible in-game. Use asset_search with type='model' to find model paths and indexed GUIDs.\n\n" +
         "action=inspect: Inspect an Arma Reforger prefab (.et file) and its full inheritance chain. " +
         "Reads each ancestor prefab, parses all components, and returns a fully merged view " +
         "showing which ancestor each component comes from. " +
@@ -161,20 +169,23 @@ export function registerPrefab(server: McpServer, config: Config): void {
           "(inspect) Include the full raw .et text for each ancestor at the bottom of the report."
         ),
         // shared params
-        projectPath: z
+        gprojPath: z
           .string()
           .optional()
-          .describe("Addon root path / mod project root. Uses configured default if omitted."),
+          .describe("Exact .gproj to inspect or write under. Uses the running Workbench project if omitted."),
       },
     },
     async (params) => {
       const { action } = params;
 
       if (action === "create") {
-        const { name, prefabType, variant, parentPrefab, components, description, includeAncestry, projectPath } = params;
-        const basePath = projectPath || config.projectPath;
+        const { name, prefabType, variant, parentPrefab, components, description, includeAncestry, gprojPath } = params;
 
         try {
+          const basePath = await resolveOptionalAddonRoot(projectProvider, {
+            operation: "prefab create",
+            gprojPath,
+          });
           if (!name) {
             return {
               content: [{ type: "text", text: "Error creating prefab: 'name' is required for action=create" }],
@@ -207,7 +218,7 @@ export function registerPrefab(server: McpServer, config: Config): void {
           let ancestryNote = "";
 
           if (parentPrefab && includeAncestry) {
-            const { levels, warnings } = walkChain(parentPrefab, config, projectPath);
+            const { levels, warnings } = walkChain(parentPrefab, config, basePath ?? undefined);
             if (levels.length > 0) {
               const merged = mergeAncestryComponents(levels);
               ancestorComponents = Array.from(merged.values()).map(({ comp }) => ({
@@ -280,7 +291,7 @@ export function registerPrefab(server: McpServer, config: Config): void {
             content: [
               {
                 type: "text",
-                text: `Generated prefab (no project path configured — not written to disk):\n\n\`\`\`\n${content}\n\`\`\`${checklist}\n\nUse --config/--project-path to write files automatically.${ancestryNote}`,
+                text: `Generated prefab (no project target selected — not written to disk):\n\n\`\`\`\n${content}\n\`\`\`${checklist}\n\nPass the exact gprojPath or launch the project with wb_launch to write it.${ancestryNote}`,
               },
             ],
           };
@@ -294,7 +305,7 @@ export function registerPrefab(server: McpServer, config: Config): void {
       }
 
       // action === "inspect"
-      const { path: inputPath, include_raw, projectPath } = params;
+      const { path: inputPath, include_raw, gprojPath } = params;
 
       try {
         if (!inputPath) {
@@ -304,7 +315,11 @@ export function registerPrefab(server: McpServer, config: Config): void {
           };
         }
 
-        const { levels, warnings } = walkChain(inputPath, config, projectPath);
+        const addonRoot = await resolveOptionalAddonRoot(projectProvider, {
+          operation: "prefab inspect",
+          gprojPath,
+        });
+        const { levels, warnings } = walkChain(inputPath, config, addonRoot ?? undefined);
 
         if (levels.length === 0) {
           return {

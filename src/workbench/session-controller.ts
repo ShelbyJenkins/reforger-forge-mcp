@@ -1541,6 +1541,29 @@ export class WorkbenchSessionController {
     });
   }
 
+  /**
+   * Return the exact project of the currently running owned Workbench.
+   *
+   * Add-on authoring tools use this as their implicit target. A remembered
+   * target in a vacant lifecycle is intentionally not treated as active.
+   */
+  async activeProjectGprojPath(): Promise<string | null> {
+    const read = await this.processGuard.readLifecycleState();
+    if (
+      read.kind !== "valid" ||
+      read.state.phase !== "running" ||
+      !read.state.workbench ||
+      !read.state.target
+    ) {
+      return null;
+    }
+    try {
+      return canonicalizeGproj(read.state.target.path).displayPath;
+    } catch (error) {
+      throw this.mapLifecycleError(error);
+    }
+  }
+
   async ensureRunning(gprojPath?: string): Promise<WorkbenchLaunchResult> {
     this.requireConfig("auto-launch");
     const project = await this.resolveLifecycleProject(gprojPath);
@@ -2473,8 +2496,6 @@ export class WorkbenchSessionController {
       return resolveProjectIdentity({
         gprojPath,
         priorTarget,
-        projectRoot: this.config?.projectPath,
-        defaultMod: this.config?.defaultMod,
       });
     } catch (error) {
       throw this.mapLifecycleError(error);
@@ -3307,7 +3328,7 @@ export class WorkbenchSessionController {
     getSpawnError: () => Error | null,
     companion: WorkbenchCompanionLaunch,
     identity?: WorkbenchIdentity,
-    projectPath?: string
+    gprojPath?: string
   ): Promise<void> {
     const spawnError = getSpawnError();
     if (spawnError) {
@@ -3348,7 +3369,7 @@ export class WorkbenchSessionController {
           }
           return this.companionProvider.verifyStaged(
             companion,
-            projectPath
+            gprojPath
           );
         },
         deadlineMs: Date.now() + launchTimeoutMs,

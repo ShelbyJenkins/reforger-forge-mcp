@@ -9,23 +9,25 @@ export function registerModifyModPrompt(server: McpServer): void {
       description:
         "Guided workflow to modify, extend, or fix an existing mod. Reads the project, understands it, then makes changes.",
       argsSchema: {
-        projectPath: z
+        gprojPath: z
           .string()
-          .describe("Path to the addon root directory (the folder containing the .gproj file)"),
+          .describe("Exact path to the addon's .gproj file"),
         task: z
           .string()
           .describe("Describe what you want to change (e.g., 'Add a stamina system', 'Fix the damage calculation', 'Add a new vehicle prefab')"),
       },
     },
-    ({ projectPath, task }) => ({
+    ({ gprojPath, task }) => ({
       messages: [
         {
           role: "user" as const,
           content: {
             type: "text" as const,
-            text: `I have an existing Arma Reforger mod at: ${projectPath}
+            text: `I have an existing Arma Reforger project at: ${gprojPath}
 
 I want to: ${task}
+
+PROJECT TARGET CONTRACT: \`${gprojPath}\` is the exact project identity. Launch it with **wb_launch** before addon-scoped work. While that exact project is running, addon-scoped tools derive their write root from the lifecycle; otherwise pass \`gprojPath: "${gprojPath}"\` explicitly. Use \`workbenchAddonDirs\` only for dependency search.
 
 YOU ARE AUTONOMOUS FOR EVERY SAFE, AUTOMATABLE STEP. The one required attended exception is Play mode: no automated Play tool exists, so when runtime testing is needed you must ask the user to enter Play mode manually, pause until they confirm, and then verify the mode with **wb_state**. Do not ask the user to perform builds, edit files, or handle any other step that the available tools can complete safely.
 
@@ -40,7 +42,7 @@ Follow this workflow — every step is mandatory:
    - Read existing scripts, prefabs, configs, and layouts
    - Identify the class prefix convention in use
 
-3. **Research the API** — **NEVER try to browse the game install directory directly or access the Bohemia Interactive Wiki via the web.** Use **asset_search** to find assets by name, **game_browse**/**game_read** to browse and read game files (reads .pak archives transparently), and **api_search** for class/method lookups. Use **component_search** to find components to attach to entities — filter by category (character, vehicle, weapon, damage, inventory, ai, ui) or by event handlers they implement. Wiki content is pre-downloaded — always use **wiki_search** instead of trying to fetch wiki pages from the web. When you need the full page (especially code examples), use **wiki_read** with the page title.
+3. **Research the API** — **NEVER try to browse the game install directory directly or access the Bohemia Interactive Wiki via the web.** Use **asset_search** to find assets by name, **game_browse**/**game_read** to browse and read game files (reads .pak archives transparently), and **api_search** for class/method lookups. Use **component_search** to find components to attach to entities — filter by category (character, vehicle, weapon, damage, inventory, ai, ui) or by event handlers they implement. Wiki content is pre-downloaded — always use **wiki_search** instead of trying to fetch wiki pages from the web. When you need the full page (especially code examples), use **wiki_read** with the page title; it returns up to 100,000 characters and reports truncation when the page is longer.
 
    Use **api_search** to find relevant classes and methods. **CRITICAL: NEVER guess or assume Enfusion API method names.** The API is non-standard — methods that seem obvious often don't exist (e.g., \`HitZone.SetHealth()\`, \`IEntity.GetVelocity()\`). You MUST search every class you plan to call methods on and verify the methods exist in the search results — inherited methods from parent classes are included automatically, so one lookup is usually enough. Check the **Related Classes** section for sibling classes in the same API group. For enums/constants, use \`api_search(type: "enum")\` which detects enum-like constant classes. If a method isn't listed, it does not exist — find an alternative.
 
@@ -82,7 +84,7 @@ Enfusion rules:
 - All scripts go in Scripts/Game/ (other folders are silently ignored)
 - modded classes affect ALL instances globally
 - Always call super.MethodName() in overrides unless intentionally replacing
-- VISIBLE ENTITIES NEED A MESH: Any entity placed in the world MUST have a MeshObject component with its \`Object\` property set to a base game \`.xob\` model path. Without this, the entity is invisible. You don't need custom models — just pick any existing base game model that roughly fits (e.g., a medical box for a healing station, a radio for a terminal). After creating a prefab, always set the MeshObject Object property to a real path like \`{5F4C4181F065B447}Assets/Props/Military/Barrels/BarrelGreen_01.xob\`.
+- VISIBLE ENTITIES NEED A MESH: Any entity placed in the world MUST have a MeshObject component with its \`Object\` property set to a base game \`.xob\` model path. Without this, the entity is invisible. Use **asset_search** with \`type: "model"\` to choose an indexed model reference; do not use **api_search** for game assets. You don't need custom models — just pick any existing base game model that roughly fits (e.g., a medical box for a healing station, a radio for a terminal). After creating a prefab, always set the MeshObject Object property to a real path like \`{5F4C4181F065B447}Assets/Props/Military/Barrels/BarrelGreen_01.xob\`.
 
 YOUR FINAL SUMMARY MUST ONLY contain:
 - What files were changed/added and what each change does

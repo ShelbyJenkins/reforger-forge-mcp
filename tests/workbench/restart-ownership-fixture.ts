@@ -112,7 +112,6 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 
   const config: Config = {
     workbenchPath: toolsRoot,
-    projectPath: projectRoot,
     gamePath,
     dataDir: join(root, "data"),
     patternsDir: join(root, "patterns"),

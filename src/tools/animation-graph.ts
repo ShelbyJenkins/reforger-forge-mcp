@@ -15,7 +15,10 @@ import {
 } from "../animation/formatter.js";
 import { generateSuggestions, formatSuggestions } from "../animation/suggestions.js";
 import { generateGuide } from "../animation/guides.js";
-import { projectPathRequiredMessage } from "../utils/project-path.js";
+import {
+  resolveAddonRoot,
+  type ActiveProjectProvider,
+} from "../utils/game-paths.js";
 
 // ── Shared interface ──────────────────────────────────────────────────────────
 
@@ -481,14 +484,13 @@ function generateAstAuthor(cfg: VehicleConfig): string {
 function readFileForTool(
   filePath: string,
   source: "mod" | "game",
-  projectPath: string | undefined,
+  addonRoot: string | undefined,
   config: Config,
 ): string | null {
   try {
     if (source === "mod") {
-      const basePath = projectPath || config.projectPath;
-      if (!basePath) return null;
-      const fullPath = validateProjectPath(basePath, filePath);
+      if (!addonRoot) return null;
+      const fullPath = validateProjectPath(addonRoot, filePath);
       if (!existsSync(fullPath)) return null;
       return readFileSync(fullPath, "utf-8");
     } else {
@@ -738,7 +740,11 @@ function generateChecklist(cfg: VehicleConfig): string {
 
 // ── Merged tool registration ──────────────────────────────────────────────────
 
-export function registerAnimationGraph(server: McpServer, config: Config): void {
+export function registerAnimationGraph(
+  server: McpServer,
+  config: Config,
+  projectProvider?: ActiveProjectProvider
+): void {
   server.registerTool(
     "animation_graph",
     {
@@ -764,8 +770,7 @@ export function registerAnimationGraph(server: McpServer, config: Config): void 
         seatTypes: z.array(z.enum(["driver", "gunner", "commander", "passenger"])).default(["driver"]).describe("(author/setup) Seat types for the vehicle."),
         dialList: z.array(z.string()).default([]).describe("(author/setup) Variable names to use as dials (e.g. ['Engine_RPM', 'SPEED'])."),
         outputPath: z.string().optional().describe("(author/setup) Destination folder within mod project (e.g. 'Assets/Vehicles/MyTruck/workspaces')."),
-        modName: z.string().optional().describe("(author/setup) Addon folder name. Uses default if omitted."),
-        projectPath: z.string().optional().describe("(author/inspect/setup) Mod project root. Uses default if omitted."),
+        gprojPath: z.string().optional().describe("(author/inspect/setup) Exact .gproj. Uses the running Workbench project if omitted."),
 
         // ── inspect params ──
         path: z.string().optional().describe(
@@ -777,7 +782,7 @@ export function registerAnimationGraph(server: McpServer, config: Config): void 
         source: z.enum(["mod", "game"]).default("mod")
           .describe("(inspect/setup) Read from the mod project directory (mod) or base game data (game)."),
         agrPath: z.string().optional()
-          .describe("(inspect/setup) AGR file path for cross-reference during validate or suggest. Same source/projectPath resolution."),
+          .describe("(inspect/setup) AGR file path for cross-reference during validate or suggest. Uses the same source/gprojPath resolution."),
         asiPath: z.string().optional()
           .describe("(inspect) ASI file path for cross-reference during validate."),
 
@@ -797,12 +802,17 @@ export function registerAnimationGraph(server: McpServer, config: Config): void 
     async (opts) => {
       // ── author handler ──────────────────────────────────────────────────────
       if (opts.action === "author") {
-        const basePath = opts.projectPath || config.projectPath;
-        if (!basePath) {
+        let basePath: string;
+        try {
+          basePath = await resolveAddonRoot(projectProvider, {
+            operation: "animation_graph author",
+            gprojPath: opts.gprojPath,
+          });
+        } catch (error) {
           return {
             content: [{
               type: "text",
-              text: projectPathRequiredMessage("animation_graph author", "projectPath"),
+              text: error instanceof Error ? error.message : String(error),
             }],
             isError: true,
           };
@@ -865,12 +875,25 @@ export function registerAnimationGraph(server: McpServer, config: Config): void 
         const filePath = opts.path;
         const subAction = opts.inspectAction;
         const source = opts.source;
-        const projectPath = opts.projectPath;
+        let addonRoot: string | undefined;
         const agrPath = opts.agrPath;
         const asiPath = opts.asiPath;
 
         if (!filePath) {
           return { content: [{ type: "text", text: "path is required for inspect action." }], isError: true };
+        }
+        if (source === "mod") {
+          try {
+            addonRoot = await resolveAddonRoot(projectProvider, {
+              operation: "animation_graph inspect",
+              gprojPath: opts.gprojPath,
+            });
+          } catch (error) {
+            return {
+              content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }],
+              isError: true,
+            };
+          }
         }
 
         const ext = extname(filePath).toLowerCase();
@@ -889,19 +912,7 @@ export function registerAnimationGraph(server: McpServer, config: Config): void 
         let content: string;
         try {
           if (source === "mod") {
-            const basePath = projectPath || config.projectPath;
-            if (!basePath) {
-              return {
-                content: [
-                  {
-                    type: "text",
-                    text: projectPathRequiredMessage("animation_graph inspect", "projectPath"),
-                  },
-                ],
-                isError: true,
-              };
-            }
-            const fullPath = validateProjectPath(basePath, filePath);
+            const fullPath = validateProjectPath(addonRoot!, filePath);
             if (!existsSync(fullPath)) {
               return {
                 content: [{ type: "text", text: `File not found: ${filePath}` }],
@@ -957,13 +968,13 @@ export function registerAnimationGraph(server: McpServer, config: Config): void 
 
           let agr;
           if (agrPath) {
-            const agrContent = readFileForTool(agrPath, source, projectPath, config);
+            const agrContent = readFileForTool(agrPath, source, addonRoot, config);
             if (agrContent) agr = parseAgrToStruct(agrContent);
           }
 
           let asi;
           if (asiPath) {
-            const asiContent = readFileForTool(asiPath, source, projectPath, config);
+            const asiContent = readFileForTool(asiPath, source, addonRoot, config);
             if (asiContent) asi = parseAsiToStruct(asiContent);
           }
 
@@ -998,26 +1009,28 @@ export function registerAnimationGraph(server: McpServer, config: Config): void 
           if (!opts.agfPath) {
             return { content: [{ type: "text", text: "agfPath is required for suggest sub-action." }], isError: true };
           }
-          if (opts.source === "mod" && !opts.projectPath && !config.projectPath) {
-            return {
-              content: [{
-                type: "text",
-                text: projectPathRequiredMessage(
-                  "animation_graph setup suggest",
-                  "projectPath"
-                ),
-              }],
-              isError: true,
-            };
+          let suggestRoot: string | undefined;
+          if (opts.source === "mod") {
+            try {
+              suggestRoot = await resolveAddonRoot(projectProvider, {
+                operation: "animation_graph setup suggest",
+                gprojPath: opts.gprojPath,
+              });
+            } catch (error) {
+              return {
+                content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }],
+                isError: true,
+              };
+            }
           }
-          const agfContent = readFileForTool(opts.agfPath, opts.source, opts.projectPath, config);
+          const agfContent = readFileForTool(opts.agfPath, opts.source, suggestRoot, config);
           if (!agfContent) {
             return { content: [{ type: "text", text: `Could not read AGF file: ${opts.agfPath}` }], isError: true };
           }
           const agf = parseAgfToStruct(agfContent);
           let agr;
           if (opts.agrPath) {
-            const agrContent = readFileForTool(opts.agrPath, opts.source, opts.projectPath, config);
+            const agrContent = readFileForTool(opts.agrPath, opts.source, suggestRoot, config);
             if (agrContent) agr = parseAgrToStruct(agrContent);
           }
           const suggestions = generateSuggestions(agf, agr);
@@ -1028,19 +1041,22 @@ export function registerAnimationGraph(server: McpServer, config: Config): void 
         if (!opts.vehicleName) {
           return { content: [{ type: "text", text: "vehicleName is required for setup action." }], isError: true };
         }
-        if ((opts.step === "all" || opts.step === "agr")
-            && !opts.projectPath
-            && !config.projectPath) {
-          return {
-            content: [{
-              type: "text",
-              text: projectPathRequiredMessage(
-                "animation_graph setup AGR generation",
-                "projectPath"
-              ),
-            }],
-            isError: true,
-          };
+        let addonRoot: string | null = null;
+        if (opts.step === "all" || opts.step === "agr") {
+          try {
+            addonRoot = await resolveAddonRoot(projectProvider, {
+              operation: "animation_graph setup AGR generation",
+              gprojPath: opts.gprojPath,
+            });
+          } catch (error) {
+            return {
+              content: [{
+                type: "text",
+                text: error instanceof Error ? error.message : String(error),
+              }],
+              isError: true,
+            };
+          }
         }
 
         const cfg: VehicleConfig = {
@@ -1058,33 +1074,27 @@ export function registerAnimationGraph(server: McpServer, config: Config): void 
         const parts: string[] = [];
 
         if (opts.step === "all" || opts.step === "agr") {
-          const basePath = opts.projectPath || config.projectPath;
-          if (basePath) {
-            try {
-              const agrContent = generateAgrAuthor(cfg);
-              const astContent = generateAstAuthor(cfg);
-              const agrFilePath = validateProjectPath(
-                basePath,
-                `${opts.outputPath}/${opts.vehicleName}.agr`
-              );
-              const astFilePath = validateProjectPath(
-                basePath,
-                `${opts.outputPath}/${opts.vehicleName}.ast`
-              );
-              mkdirSync(dirname(agrFilePath), { recursive: true });
-              writeFileSync(agrFilePath, agrContent, "utf-8");
-              writeFileSync(astFilePath, astContent, "utf-8");
-              parts.push(
-                `## Step 1: AGR + AST Files Generated\n- ${opts.outputPath}/${opts.vehicleName}.agr\n- ${opts.outputPath}/${opts.vehicleName}.ast\nRegister both files in Workbench to assign GUIDs.`
-              );
-            } catch (e) {
-              const msg = e instanceof Error ? e.message : String(e);
-              parts.push(`## Step 1: AGR + AST — Error\n${msg}`);
-            }
-          } else {
-            parts.push(
-              `## Step 1: AGR + AST — Skipped\n${projectPathRequiredMessage("animation_graph setup AGR generation", "projectPath")}`
+          const basePath = addonRoot!;
+          try {
+            const agrContent = generateAgrAuthor(cfg);
+            const astContent = generateAstAuthor(cfg);
+            const agrFilePath = validateProjectPath(
+              basePath,
+              `${opts.outputPath}/${opts.vehicleName}.agr`
             );
+            const astFilePath = validateProjectPath(
+              basePath,
+              `${opts.outputPath}/${opts.vehicleName}.ast`
+            );
+            mkdirSync(dirname(agrFilePath), { recursive: true });
+            writeFileSync(agrFilePath, agrContent, "utf-8");
+            writeFileSync(astFilePath, astContent, "utf-8");
+            parts.push(
+              `## Step 1: AGR + AST Files Generated\n- ${opts.outputPath}/${opts.vehicleName}.agr\n- ${opts.outputPath}/${opts.vehicleName}.ast\nRegister both files in Workbench to assign GUIDs.`
+            );
+          } catch (e) {
+            const msg = e instanceof Error ? e.message : String(e);
+            parts.push(`## Step 1: AGR + AST — Error\n${msg}`);
           }
         }
 

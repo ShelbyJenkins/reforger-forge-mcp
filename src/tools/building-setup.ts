@@ -4,7 +4,10 @@ import { randomBytes } from "node:crypto";
 import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { resolve, join } from "node:path";
 import type { Config } from "../config.js";
-import { projectPathRequiredMessage } from "../utils/project-path.js";
+import {
+  resolveAddonRoot,
+  type ActiveProjectProvider,
+} from "../utils/game-paths.js";
 
 // ── Manifest schema ──────────────────────────────────────────────────────────
 
@@ -143,7 +146,11 @@ ${slotComponents.join("\n")}
 
 // ── Tool registration ────────────────────────────────────────────────────────
 
-export function registerBuildingSetup(server: McpServer, config: Config): void {
+export function registerBuildingSetup(
+  server: McpServer,
+  _config: Config,
+  projectProvider?: ActiveProjectProvider
+): void {
   server.registerTool(
     "building_setup",
     {
@@ -161,22 +168,33 @@ export function registerBuildingSetup(server: McpServer, config: Config): void {
           "Mod resource prefix path (e.g., 'MyMod/Assets/Buildings/'). Prepended to FBX-derived .xob paths."
         ),
         outputDir: z.string().optional().describe(
-          "Output directory for generated .et prefab files. Defaults to mod prefabs directory from config."
+          "Output directory for generated .et prefab files. When omitted, writes under the selected addon root."
+        ),
+        gprojPath: z.string().optional().describe(
+          "Exact .gproj to write under when outputDir is omitted. Uses the running Workbench project if omitted."
         ),
         dryRun: z.boolean().default(false).describe(
           "If true, return what would be created without writing files"
         ),
       },
     },
-    async ({ manifestPath, modPrefix, outputDir, dryRun }) => {
-      if (!outputDir && !config.projectPath) {
-        return {
-          content: [{
-            type: "text" as const,
-            text: projectPathRequiredMessage("building_setup", "outputDir"),
-          }],
-          isError: true,
-        };
+    async ({ manifestPath, modPrefix, outputDir, gprojPath, dryRun }) => {
+      let addonRoot: string | null = null;
+      if (!outputDir) {
+        try {
+          addonRoot = await resolveAddonRoot(projectProvider, {
+            operation: "building_setup",
+            gprojPath,
+          });
+        } catch (error) {
+          return {
+            content: [{
+              type: "text" as const,
+              text: error instanceof Error ? error.message : String(error),
+            }],
+            isError: true,
+          };
+        }
       }
       // Read and parse manifest
       let rawManifest: string;
@@ -195,7 +213,7 @@ export function registerBuildingSetup(server: McpServer, config: Config): void {
 
       const outDir = outputDir
         ? resolve(outputDir)
-        : resolve(config.projectPath!, "Prefabs", "Structures", manifest.building_name);
+        : resolve(addonRoot!, "Prefabs", "Structures", manifest.building_name);
 
       const lines: string[] = [];
       lines.push(`=== Building Setup: ${manifest.building_name} ===`);

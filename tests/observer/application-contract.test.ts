@@ -3,7 +3,7 @@ import { join, resolve } from "node:path";
 import type { ChildProcess, fork } from "node:child_process";
 import { describe, expect, it, vi } from "vitest";
 import { createObserverApplication } from "../../src/observer/application.js";
-import { ObserverCoordinatorError } from "../../src/observer/errors.js";
+import { ObserverApplicationError } from "../../src/observer/errors.js";
 import { withTemporaryDirectory } from "../support/temporary-directory.js";
 import { uninstallManagedObserver } from "../../observer/agent/private-child.js";
 import { ObserverError } from "../../observer/agent/errors.js";
@@ -11,6 +11,7 @@ import {
   captureRequestFingerprint,
   type SubmitJobInput,
 } from "../../observer/agent/jobs.js";
+import { runtimeWorldRevision } from "../../src/observer/world-revision.js";
 import {
   FakeChild,
   codedError,
@@ -43,17 +44,6 @@ describe("observer application", () => {
     expect(cleanup).not.toHaveBeenCalled();
   });
 
-  it("refuses managed or profile roots that overlap the configured project", () => {
-    for (const overlappingRoot of [
-      { managedRoot: join(process.cwd(), "observer-managed") },
-      { profileRoot: join(process.cwd(), "observer-profiles") },
-      { defaultManagedRoot: join(process.cwd(), "observer-default-managed") },
-    ]) {
-      expect(() => createObserverApplication({ projectPath: process.cwd(), ...overlappingRoot }))
-        .toThrowError(expect.objectContaining<Partial<ObserverCoordinatorError>>({ code: "INVALID_REQUEST" }));
-    }
-  });
-
   it("always passes the confined platform-default roots to its private child", async () => {
     const child = new FakeChild();
     const managedRoot = resolve(process.cwd(), "..", ".observer-default-test");
@@ -62,7 +52,7 @@ describe("observer application", () => {
       forkArguments = argumentsArray ?? [];
       return child as unknown as ChildProcess;
     }) as typeof fork;
-    const coordinator = createObserverApplication({ projectPath: process.cwd(), defaultManagedRoot: managedRoot,
+    const coordinator = createObserverApplication({ defaultManagedRoot: managedRoot,
       agentPath: "private-child.js", forkChild, startupTimeoutMs: 1_000, requestTimeoutMs: 1_000 });
 
     await coordinator.ensureSetup();
@@ -152,8 +142,8 @@ describe("observer application", () => {
     const coordinator = createChildBackedApplication(child);
 
     await expect(coordinator.runStatus(runId)).rejects.toEqual(
-      expect.objectContaining<Partial<ObserverCoordinatorError>>({
-        name: "ObserverCoordinatorError",
+      expect.objectContaining<Partial<ObserverApplicationError>>({
+        name: "ObserverApplicationError",
         code: "ARTIFACT_INVALID",
       }),
     );
@@ -224,7 +214,7 @@ describe("observer application", () => {
     const status = coordinator.status();
     await vi.waitFor(() => expect(child.operations).toContain("status"));
     child.exit(17);
-    await expect(status).rejects.toEqual(expect.objectContaining<Partial<ObserverCoordinatorError>>({
+    await expect(status).rejects.toEqual(expect.objectContaining<Partial<ObserverApplicationError>>({
       code: "TRANSPORT_UNAVAILABLE",
     }));
     await expect(coordinator.status()).resolves.toMatchObject({
@@ -333,8 +323,6 @@ describe("observer application", () => {
     const { adapter, coordinator } = createWorkbenchHarness();
     await coordinator.ensureSetup();
     const request = workbenchCaptureInput("raw-user-key-must-not-become-a-job-path", {
-      expectedWorldId: "world-editor-1",
-      expectedWorldEpoch: 0,
       asynchronous: true,
     });
 
@@ -389,7 +377,8 @@ describe("observer application", () => {
     const coordinator = createChildBackedApplication(child);
     await coordinator.ensureSetup();
     const request = { sessionId: "runtime-session-1", idempotencyKey: "runtime-relative-deadline",
-      view: { kind: "current" } as const, asynchronous: true, timeoutMs: 1_000 };
+      view: { kind: "current" } as const, asynchronous: true, timeoutMs: 1_000,
+      expectedWorldRevision: runtimeWorldRevision(null, 0) };
 
     const first = await coordinator.capture(request);
     expect(first).toMatchObject({ asynchronous: true, job: { jobId: expect.stringMatching(/^[0-9a-f-]{36}$/) } });

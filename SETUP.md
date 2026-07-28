@@ -34,7 +34,7 @@ It does not:
 - create a ReforgerForge config file;
 - require or infer a project path;
 - ask which clients to update;
-- add `--config` or `--project-path` to standard registrations;
+- add `--config` or other override flags to standard registrations;
 - guess a package or mod workspace; or
 - launch Workbench or the game.
 
@@ -110,10 +110,10 @@ Doctor reports these levels separately:
 - Workbench NET API; and
 - observer capture.
 
-No explicit config or project is required. Their receipt fields may validly
-report automatic defaults and project-independent mode. Normal setup and
-default Doctor report Workbench NET API and observer capture as `not tested`;
-neither command performs an observer capture.
+No explicit config or project is required. The receipt reports the effective
+automatic and explicit settings. Normal setup and default Doctor report
+Workbench NET API and observer capture as `not tested`; neither command
+performs an observer capture.
 
 To test an already-running Workbench, add `-CheckWorkbench`:
 
@@ -141,6 +141,28 @@ npm run mcp:verify -- --config C:\path\to\overrides.json
 ```
 
 The second form is only for an explicitly selected override file.
+
+## Observer first use and recovery
+
+Observer is optional. Normal setup and the setup-script Doctor do not stage an
+Observer companion, start Workbench or the game, or take a capture.
+
+Before a first capture, use the live MCP tool `observer_setup` with
+`action: "doctor"` to inspect the Observer configuration and staging state.
+It is inspection-only. When its result is healthy, use
+`observer_setup` with `action: "ensure"` to stage the required companions, then
+follow the [Observer usage guide](docs/observer.md) for beginning a run,
+selecting a renderer, capturing, reviewing, and finishing it.
+
+An evidence root is required only to finalize a reviewed run. Beginning a run,
+inspecting a runtime, and taking or discarding captures do not require one.
+Configure `observer.evidenceRoots` or pass `--observer-evidence-root` before
+finalizing.
+
+After changing an explicit Observer setting, restart the MCP process and rerun
+`observer_setup` with `action: "doctor"`. For a capture-workflow issue, use
+the [Observer usage guide](docs/observer.md); for implementation and technical
+troubleshooting, use [observer/README.md](observer/README.md).
 
 ## PowerShell execution policy
 
@@ -206,23 +228,19 @@ The report identifies dependencies resolved by the base-game, standard
 Workshop, and target-sibling add-on candidates, then lists missing and
 ambiguous GUIDs separately. It is diagnostic only.
 
-## Optional project path
+## Add-on targeting
 
-`projectPath` is optional. Supply it when project-scoped tools should discover
-or create addons beneath an explicit addons-container directory:
+Addon-scoped tools identify one exact project through a `gprojPath` input.
+When a supported tool omits that input, it may use the verified target of the
+currently running Workbench lifecycle. Otherwise, mutations return
+`ADDON_TARGET_REQUIRED`; preview-capable generators may return content without
+writing.
 
-```powershell
-node dist/index.js --project-path "C:\path\to\arma-projects\addons"
-```
-
-Without `projectPath`, project-independent tools remain available. An
-operation that needs an implicit addons container returns
-`PROJECT_PATH_REQUIRED`; a tool that accepts a complete explicit target can
-continue to use that target.
-
-When a project path exists, the default finalized observer-evidence location
-is `<projectPath>\.reforger-forge-screenshots`. It is allowlisted without being
-created during startup and is created only when finalization first needs it.
+The server does not scan an addons container to choose a target, and
+`projectPath`, `defaultMod`, `modName` targeting, `--project-path`, and
+`--default-mod` are not configuration surfaces. Keep the exact `.gproj` path
+returned when creating a mod and pass it to later operations or launch it with
+`wb_launch`.
 
 ## Optional configuration
 
@@ -246,8 +264,7 @@ safe internal constants < automatic Steam discovery < explicit --config file < e
 ```
 
 Relative paths in the JSON file resolve from that file's directory. Relative
-CLI paths resolve from the MCP process working directory. `projectPath` is
-never inferred from that working directory.
+CLI paths resolve from the MCP process working directory.
 
 ### CLI override behavior
 
@@ -272,18 +289,16 @@ array with `[]`. A clear flag cannot be combined with its repeated value flag.
 |--------------|----------|------------------------|
 | `workbenchPath` | `--workbench-path` | Discovered Tools installation; explicit fallback or override |
 | `gamePath` | `--game-path` | Discovered game installation; explicit fallback or override |
-| `projectPath` | `--project-path` | Optional existing addons-container directory |
 | `workbenchAddonDirs` | repeat `--workbench-addon-dir` | Discovered base-game root plus standard Workshop root when present; nonempty explicit arrays are additive, while `--no-workbench-addon-dirs` is an explicit empty opt-out |
 | `extractedPath` | `--extracted-path` | Optional existing directory |
 | `workbenchHost` | `--workbench-host` | `127.0.0.1` |
 | `workbenchPort` | `--workbench-port` | `5775` |
 | `workbenchScriptAuthorizeAll` | paired authorize flags above | `false` |
-| `defaultMod` | `--default-mod` | none |
 | `debug` | `--debug` / `--no-debug` | `false` |
 | `observer.managedRoot` | `--observer-managed-root` | Platform-local application/state directory |
 | `observer.profileRoot` | `--observer-profile-root` | `<managed root>/profiles` |
 | `observer.agentPath` | `--observer-agent-path` | Packaged private child, or an existing regular file |
-| `observer.evidenceRoots` | repeat `--observer-evidence-root` | `<projectPath>\.reforger-forge-screenshots` when a project path exists; otherwise finalization needs an explicit root |
+| `observer.evidenceRoots` | repeat `--observer-evidence-root` | Explicit allowlisted finalization roots; finalization requires at least one |
 | `observer.supportingLogRoots` | repeat `--observer-supporting-log-root` | Existing directories; defaults to the managed observer log root |
 | `observer.startupTimeoutMs` | `--observer-startup-timeout-ms` | `10000` |
 | `observer.requestTimeoutMs` | `--observer-request-timeout-ms` | `30000` |
@@ -315,9 +330,8 @@ Startup fails when:
   fallback is supplied;
 - a configured path is invalid;
 - the strict JSON shape is invalid;
-- required installation and project roots overlap;
-- an observer managed/profile root overlaps the project or either
-  installation; or
+- required installation roots overlap;
+- an observer managed/profile root overlaps either installation; or
 - a Workbench addon root contains a comma, because `-addonsDir` is
   comma-delimited.
 

@@ -9,6 +9,7 @@ import { dirname, join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { createObserverApplication, type ObserverApplication } from "../../src/observer/application.js";
 import type { ObserverChildDescriptor } from "../../src/observer/agent-client.js";
+import { runtimeWorldRevision } from "../../src/observer/world-revision.js";
 import {
   OwnedRuntimeManager,
   type OwnedRuntimeExactIdentity,
@@ -416,6 +417,7 @@ async function putCameraJobIntoRestoring(
     view: { kind: "lookAt", position: [0, 1, 0], target: [1, 1, 0], fov: 60 },
     asynchronous: true,
     timeoutMs: 1_000,
+    expectedWorldRevision: runtimeWorldRevision("world-private-child", 1),
   });
   if (!capture.asynchronous) throw new Error("Expected asynchronous camera fixture job");
   const jobId = String(capture.job.jobId);

@@ -13,7 +13,7 @@ interface AssetEntry {
   path: string;
   /** File extension without dot */
   ext: string;
-  /** Resource GUID from entity catalog, if available (e.g., "657590C1EC9E27D3") */
+  /** Resource GUID from an entity catalog or resource database, if available. */
   guid?: string;
 }
 
@@ -192,10 +192,11 @@ function buildIndex(basePath: string, gamePath: string): AssetEntry[] {
     logger.warn(`Failed to index pak files: ${e}`);
   }
 
-  // 4. Attach GUIDs to prefab entries
+  // 4. Attach indexed resource GUIDs to prefabs and models. Entity catalogs
+  // normally cover prefabs, while resourceDatabase.rdb can also map models.
   if (guidMap && guidMap.size > 0) {
     for (const entry of entries) {
-      if (entry.ext !== "et") continue;
+      if (entry.ext !== "et" && entry.ext !== "xob") continue;
       // VFS paths include the DataXXX prefix, catalog paths don't — try stripping it
       const pathLower = entry.path.toLowerCase();
       if (guidMap.has(pathLower)) {
@@ -241,7 +242,7 @@ export function registerAssetSearch(server: McpServer, config: Config): void {
       description:
         "Search for base game assets (prefabs, models, textures, scripts, configs) by name. " +
         "Searches both unpacked files and .pak archives transparently. " +
-        "Returns file paths and GUIDs (for prefabs) that can be used in prefab references. " +
+        "Returns file paths and GUID-prefixed references for indexed prefabs and models. " +
         "The first search may take a few seconds to build the file index.",
       inputSchema: {
         query: z

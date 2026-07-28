@@ -20,6 +20,7 @@ import type {
   WorkbenchObserverRecoverInput,
   WorkbenchObserverSubmitInput,
 } from "../../src/workbench/observer-adapter.js";
+import { workbenchWorldRevision } from "../../src/observer/world-revision.js";
 
 const CHILD_PROTOCOL = "rfo-observer-child-v1";
 
@@ -264,7 +265,13 @@ export function workbenchCaptureInput(
   idempotencyKey: string,
   overrides: Partial<ObserverCaptureInput> = {},
 ): ObserverCaptureInput {
-  return { idempotencyKey, view: { kind: "current" }, timeoutMs: 1_000, ...overrides };
+  return {
+    idempotencyKey,
+    view: { kind: "current" },
+    timeoutMs: 1_000,
+    expectedWorldRevision: workbenchWorldRevision(WORKBENCH_WORLD_ID),
+    ...overrides,
+  };
 }
 
 export function managedWorkbenchCaptureInput(
@@ -276,8 +283,6 @@ export function managedWorkbenchCaptureInput(
     runId,
     captureLabel,
     instanceId: WORKBENCH_INSTANCE_ID,
-    expectedWorldId: WORKBENCH_WORLD_ID,
-    expectedWorldEpoch: 0,
     asynchronous: true,
     ...overrides,
   });

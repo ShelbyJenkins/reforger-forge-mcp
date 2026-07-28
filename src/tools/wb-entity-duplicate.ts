@@ -8,9 +8,12 @@ import {
 } from "node:fs";
 import { dirname } from "node:path";
 import type { Config } from "../config.js";
-import { projectPathRequiredMessage } from "../utils/project-path.js";
 import type { WorkbenchClient } from "../workbench/client.js";
-import { resolveGameDataPath, findLooseFile, resolveAddonDir } from "../utils/game-paths.js";
+import {
+  resolveGameDataPath,
+  findLooseFile,
+  resolveAddonRoot,
+} from "../utils/game-paths.js";
 import { validateProjectPath } from "../utils/safe-path.js";
 import { requireEditMode, formatConnectionStatus } from "../workbench/status.js";
 
@@ -47,13 +50,6 @@ export function registerWbEntityDuplicate(
             "Destination path within your mod folder, relative to the addon root " +
             "(e.g. 'Prefabs/Vehicles/MyCustomM998.et'). Must end in .et"
           ),
-        modName: z
-          .string()
-          .optional()
-          .describe(
-            "Addon folder name under the configured projectPath (e.g. 'MyMod'). " +
-            "If omitted, the first addon found in the project path is used."
-          ),
         replaceInScene: z
           .boolean()
           .default(true)
@@ -63,35 +59,20 @@ export function registerWbEntityDuplicate(
           ),
       },
     },
-    async ({ entityName, destPath, modName, replaceInScene }) => {
-      if (!config.projectPath) {
-        return {
-          content: [{
-            type: "text",
-            text: projectPathRequiredMessage("wb_entity_duplicate"),
-          }],
-          isError: true,
-        };
-      }
+    async ({ entityName, destPath, replaceInScene }) => {
       const modeErr = await requireEditMode(client, "duplicate entity");
       if (modeErr) {
         return { content: [{ type: "text" as const, text: modeErr + formatConnectionStatus(client) }] };
       }
 
-      // Resolve addon directory
-      const addonDir = resolveAddonDir(config.projectPath, modName ?? config.defaultMod);
-      if (!addonDir) {
+      let addonDir: string;
+      try {
+        addonDir = await resolveAddonRoot(client, {
+          operation: "wb_entity_duplicate",
+        });
+      } catch (error) {
         return {
-          content: [
-            {
-              type: "text",
-              text: `Could not find addon directory. ` +
-                (modName
-                  ? `'${modName}' not found under ${config.projectPath}`
-                  : `No addons found under ${config.projectPath}`) +
-                `. Provide modName matching the addon folder name.`,
-            },
-          ],
+          content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }],
           isError: true,
         };
       }

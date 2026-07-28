@@ -8,6 +8,7 @@ import {
   type RunPilotCancellationCaseInput,
 } from "../../scripts/observer-runtime-failure-matrix.js";
 import type { ObserverCaptureResult } from "../../src/observer/application.js";
+import { runtimeWorldRevision } from "../../src/observer/world-revision.js";
 import type { FaultControlAcknowledgement } from "../../scripts/observer-fault-matrix-support.js";
 import type { OperationalBaselineBoundary } from "../../scripts/observer-live-acceptance-support.js";
 
@@ -140,6 +141,7 @@ function baseInput(overrides: Partial<RunPilotCancellationCaseInput> = {}): Omit
     managedRunId: "run-1",
     sessionId: "session-1",
     instanceId: "instance-1",
+    worldRevision: runtimeWorldRevision("world-1", 0),
     worldId: "world-1",
     worldEpoch: 0,
     caseStartedAt: Date.now(),

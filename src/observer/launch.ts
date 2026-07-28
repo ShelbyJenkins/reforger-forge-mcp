@@ -1,4 +1,4 @@
-import { ObserverCoordinatorError } from "./errors.js";
+import { ObserverApplicationError } from "./errors.js";
 
 export interface ObserverLaunchInput {
   runtimeKind: "client" | "listenServer" | "dedicated" | "testRunner";
@@ -45,13 +45,13 @@ function record(value: unknown): Record<string, unknown> | null {
  * only its public session descriptor. This function never starts Enfusion.
  */
 export async function prepareObserverLaunch(
-  coordinator: ObserverLaunchPort,
+  application: ObserverLaunchPort,
   input: ObserverLaunchInput,
   recorder?: ObserverPreparedLaunchRecorder
 ): Promise<ObserverPreparedLaunch> {
   let sessionId: string | null = null;
   try {
-    const response = await coordinator.prepareLaunch(input as unknown as Record<string, unknown>);
+    const response = await application.prepareLaunch(input as unknown as Record<string, unknown>);
     const session = record(response.session);
     const stagedAddon = record(response.stagedAddon);
     sessionId = typeof session?.sessionId === "string" ? session.sessionId : null;
@@ -60,7 +60,7 @@ export async function prepareObserverLaunch(
         !sessionId || typeof session.launchNonce !== "string" ||
         typeof session.expiresAt !== "string" || typeof session.bundleDigest !== "string" ||
         typeof session.profilePath !== "string" || typeof session.contractPath !== "string") {
-      throw new ObserverCoordinatorError("TRANSPORT_UNAVAILABLE", "Observer agent returned an invalid prepared-launch descriptor");
+      throw new ObserverApplicationError("TRANSPORT_UNAVAILABLE", "Observer agent returned an invalid prepared-launch descriptor");
     }
     const prepared: ObserverPreparedLaunch = {
       arguments: response.arguments as string[],
@@ -76,7 +76,7 @@ export async function prepareObserverLaunch(
     const preparedLaunchId = await recorder.recordPreparedLaunch(input, prepared);
     return { ...prepared, preparedLaunchId };
   } catch (error) {
-    if (sessionId) await coordinator.revokeSession(sessionId).catch(() => undefined);
+    if (sessionId) await application.revokeSession(sessionId).catch(() => undefined);
     throw error;
   }
 }

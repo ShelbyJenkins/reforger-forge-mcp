@@ -18,6 +18,7 @@ import {
   type ObserverCaptureResult,
   type ObserverCaptureView,
 } from "../src/observer/application.js";
+import { workbenchWorldRevision } from "../src/observer/world-revision.js";
 import {
   WorkbenchObserverAdapter,
   workbenchCameraMatrix,
@@ -92,6 +93,7 @@ export interface RunWorkbenchMatrixCaseInput {
   readonly matrixCase: WorkbenchFaultMatrixCase;
   readonly runId: string;
   readonly instanceId: string;
+  readonly expectedWorldRevision: string;
   readonly expectedWorldId: string;
   readonly baselineCurrent: Pick<
     WorkbenchObserverJobStatus, "actualCamera" | "ownerCameraId" | "worldIdentity"
@@ -354,7 +356,7 @@ function matrixCaptureInput(input: RunWorkbenchMatrixCaseInput, options: {
   readonly label: string;
   readonly view: ObserverCaptureView;
   readonly managed: boolean;
-  readonly expectedWorldId?: string;
+  readonly expectedWorldRevision?: string;
 }): Parameters<WorkbenchMatrixCaseApplication["capture"]>[0] {
   return {
     ...(options.managed ? {
@@ -363,8 +365,7 @@ function matrixCaptureInput(input: RunWorkbenchMatrixCaseInput, options: {
       purpose: "Workbench observer failure-matrix capture",
     } : {}),
     instanceId: input.instanceId,
-    expectedWorldId: options.expectedWorldId ?? input.expectedWorldId,
-    expectedWorldEpoch: 0,
+    expectedWorldRevision: options.expectedWorldRevision ?? input.expectedWorldRevision,
     idempotencyKey: `${input.runId}-${options.label}`,
     view: options.view,
     settleFrames: 3,
@@ -450,6 +451,7 @@ class WorkbenchMatrixCaseExecution {
   private cancellationStatus: Record<string, unknown> | null = null;
   private exactOwnerVacant = false;
   private currentWorldId: string;
+  private currentWorldRevision: string;
   private decoy: MatrixCaseEntry<true>["decoy"] = {
     category: "not_applicable",
     identityUnchanged: null,
@@ -465,6 +467,7 @@ class WorkbenchMatrixCaseExecution {
 
   constructor(private readonly input: RunWorkbenchMatrixCaseInput) {
     this.currentWorldId = input.expectedWorldId;
+    this.currentWorldRevision = input.expectedWorldRevision;
   }
 
   async run(): Promise<MatrixCaseEntry> {
@@ -618,6 +621,7 @@ class WorkbenchMatrixCaseExecution {
       "replace_fixture_world:confirm"
     )();
     this.currentWorldId = replacement.currentWorldId;
+    this.currentWorldRevision = workbenchWorldRevision(replacement.currentWorldId);
   }
 
   private async releaseDeclaredBarrier(): Promise<void> {
@@ -941,7 +945,7 @@ class WorkbenchMatrixCaseExecution {
       label: "matrix-followup-current",
       view: { kind: "current" },
       managed: false,
-      expectedWorldId: this.currentWorldId,
+      expectedWorldRevision: this.currentWorldRevision,
     }));
     if (!followUp.asynchronous) {
       throw new Error("Workbench matrix follow-up capture unexpectedly completed synchronously");

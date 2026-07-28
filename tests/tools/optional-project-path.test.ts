@@ -1,4 +1,6 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import type { Config } from "../../src/config.js";
 import { registerAnimationGraph } from "../../src/tools/animation-graph.js";
@@ -50,7 +52,7 @@ function text(result: ToolResult): string {
 }
 
 describe("project-neutral server tool behavior", () => {
-  it("returns PROJECT_PATH_REQUIRED only when an operation needs an implicit root", async () => {
+  it("returns ADDON_TARGET_REQUIRED when an operation needs a project target", async () => {
     const cases: Array<{
       name: string;
       handlers: Map<string, ToolHandler>;
@@ -64,7 +66,7 @@ describe("project-neutral server tool behavior", () => {
       {
         name: "game_duplicate",
         handlers: registry((server, config) =>
-          registerGameDuplicate(server, config, {} as never)
+          registerGameDuplicate(server, config, { activeProjectGprojPath: async () => null } as never)
         ),
         input: {
           sourcePath: "Prefabs/Test.et",
@@ -76,7 +78,11 @@ describe("project-neutral server tool behavior", () => {
       {
         name: "wb_entity_duplicate",
         handlers: registry((server, config) =>
-          registerWbEntityDuplicate(server, config, {} as never)
+          registerWbEntityDuplicate(server, config, {
+            state: { connected: true, mode: "edit" },
+            call: async () => ({ mode: "edit" }),
+            activeProjectGprojPath: async () => null,
+          } as never)
         ),
         input: {
           entityName: "Entity",
@@ -86,12 +92,12 @@ describe("project-neutral server tool behavior", () => {
       },
       {
         name: "project",
-        handlers: registry(registerProject),
+        handlers: registry((server) => registerProject(server)),
         input: { action: "browse", path: ".", createDirectories: true },
       },
       {
         name: "workshop_info",
-        handlers: registry(registerWorkshopInfo),
+        handlers: registry((server) => registerWorkshopInfo(server)),
         input: {},
       },
       {
@@ -126,28 +132,29 @@ describe("project-neutral server tool behavior", () => {
     for (const testCase of cases) {
       const result = await testCase.handlers.get(testCase.name)!(testCase.input);
       expect(result.isError, testCase.name).toBe(true);
-      expect(text(result), testCase.name).toContain("PROJECT_PATH_REQUIRED");
+      expect(text(result), testCase.name).toContain("ADDON_TARGET_REQUIRED");
     }
   });
 
-  it("allows mod validation with a complete explicit target and no global projectPath", async () => {
+  it("allows mod validation with an exact gprojPath and no running Workbench", async () => {
     await withTemporaryDirectory(async (root) => {
+      writeFileSync(join(root, "Target.gproj"), "GameProject {}\n", "utf-8");
       const handlers = registry((server, config) =>
         registerMod(server, config, {} as never, {} as never)
       );
 
       const result = await handlers.get("mod")!({
         action: "validate",
-        projectPath: root,
+        gprojPath: join(root, "Target.gproj"),
         checks: ["structure"],
       });
 
-      expect(text(result)).not.toContain("PROJECT_PATH_REQUIRED");
+      expect(text(result)).not.toContain("ADDON_TARGET_REQUIRED");
       expect(text(result)).toContain("Validation");
     }, { prefix: "rfo-optional-project-" });
   });
 
-  it("accepts an explicit building output without a global projectPath", async () => {
+  it("accepts an explicit building output without a project target", async () => {
     const handlers = registry(registerBuildingSetup);
 
     const result = await handlers.get("building_setup")!({
@@ -157,7 +164,7 @@ describe("project-neutral server tool behavior", () => {
       dryRun: true,
     });
 
-    expect(text(result)).not.toContain("PROJECT_PATH_REQUIRED");
+    expect(text(result)).not.toContain("ADDON_TARGET_REQUIRED");
     expect(text(result)).toContain("Error reading manifest");
   });
 });

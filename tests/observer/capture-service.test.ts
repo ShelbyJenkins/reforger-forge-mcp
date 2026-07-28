@@ -16,6 +16,8 @@ import { captureServiceContract } from "./capture-service-contract.js";
 captureServiceContract("runtime");
 captureServiceContract("workbench");
 
+const nullRuntimeRevision = runtimeWorldRevision(null, 0);
+
 function backend(capabilities: string[] = ["render.capture", "camera.runtime"]): { backend: CaptureBackend; calls: string[] } {
   const calls: string[] = [];
   const instance: CaptureInstance = {
@@ -59,6 +61,7 @@ describe("CaptureService", () => {
         view: { kind: "lookAt", position: [0, 1, 0], target: [1, 1, 0], fov: 60 },
         asynchronous: true,
         timeoutMs: 1_000,
+        expectedWorldRevision: nullRuntimeRevision,
       })).rejects.toMatchObject({ code: "CAPABILITY_UNAVAILABLE" });
       expect(currentOnly.calls).not.toContain("submit");
 
@@ -69,6 +72,7 @@ describe("CaptureService", () => {
         view: { kind: "current" },
         asynchronous: true,
         timeoutMs: 1_000,
+        expectedWorldRevision: nullRuntimeRevision,
       })).resolves.toMatchObject({ asynchronous: true });
       expect(currentOnly.calls).toContain("submit");
     } finally {
@@ -109,6 +113,7 @@ describe("CaptureService", () => {
         view: { kind: "current" },
         asynchronous: true,
         timeoutMs: 1_000,
+        expectedWorldRevision: nullRuntimeRevision,
       })).rejects.toMatchObject({ code: "TRANSPORT_UNAVAILABLE" });
       expect(calls).toEqual(["EMCP_WB_ObserverPing"]);
     } finally {
@@ -131,6 +136,7 @@ describe("CaptureService", () => {
         view: { kind: "current" },
         asynchronous: true,
         timeoutMs: 1_000,
+        expectedWorldRevision: nullRuntimeRevision,
       })).rejects.toMatchObject({ code: "STALE_INSTANCE" });
     } finally {
       await service.close();
@@ -140,7 +146,7 @@ describe("CaptureService", () => {
   it("deduplicates concurrent identical admissions and replays the retained job", async () => {
     const fake = backend();
     const service = new CaptureService({ backends: [fake.backend], pollIntervalMs: 1, sleep: async () => undefined, createJobId: () => "job-1" });
-    const input = { sessionId: "session-1", idempotencyKey: "same", view: { kind: "current" } as const, asynchronous: true, timeoutMs: 1_000 };
+    const input = { sessionId: "session-1", idempotencyKey: "same", view: { kind: "current" } as const, asynchronous: true, timeoutMs: 1_000, expectedWorldRevision: nullRuntimeRevision };
     const [first, retry] = await Promise.all([service.capture(input), service.capture(input)]);
     expect(first).toEqual(retry);
     expect(fake.calls.filter((call) => call === "submit")).toHaveLength(1);
@@ -149,7 +155,7 @@ describe("CaptureService", () => {
   it("polls synchronously, reads only after completion, and replays a release receipt", async () => {
     const fake = backend();
     const service = new CaptureService({ backends: [fake.backend], pollIntervalMs: 1, sleep: async () => undefined, createJobId: () => "job-2" });
-    const result = await service.capture({ sessionId: "session-1", idempotencyKey: "sync", view: { kind: "current" }, timeoutMs: 1_000 });
+    const result = await service.capture({ sessionId: "session-1", idempotencyKey: "sync", view: { kind: "current" }, timeoutMs: 1_000, expectedWorldRevision: nullRuntimeRevision });
     expect(result.asynchronous).toBe(false);
     if (!result.asynchronous) expect(result.image).toEqual(Buffer.from("png"));
     const receipt = await service.release("session-1", "job-2");
@@ -160,8 +166,8 @@ describe("CaptureService", () => {
   it("rejects a changed semantic retry before routing", async () => {
     const fake = backend();
     const service = new CaptureService({ backends: [fake.backend], createJobId: () => "job-3" });
-    await service.capture({ sessionId: "session-1", idempotencyKey: "conflict", view: { kind: "current" }, asynchronous: true, timeoutMs: 1_000 });
-    await expect(service.capture({ sessionId: "session-1", idempotencyKey: "conflict", view: { kind: "lookAt", position: [0, 0, 0], target: [1, 0, 0], fov: 60 }, asynchronous: true, timeoutMs: 1_000 }))
+    await service.capture({ sessionId: "session-1", idempotencyKey: "conflict", view: { kind: "current" }, asynchronous: true, timeoutMs: 1_000, expectedWorldRevision: nullRuntimeRevision });
+    await expect(service.capture({ sessionId: "session-1", idempotencyKey: "conflict", view: { kind: "lookAt", position: [0, 0, 0], target: [1, 0, 0], fov: 60 }, asynchronous: true, timeoutMs: 1_000, expectedWorldRevision: nullRuntimeRevision }))
       .rejects.toMatchObject({ code: "IDEMPOTENCY_CONFLICT" });
   });
 
@@ -205,6 +211,7 @@ describe("CaptureService", () => {
         idempotencyKey: "run-owned",
         view: { kind: "current" },
         timeoutMs: 1_000,
+        expectedWorldRevision: nullRuntimeRevision,
       });
 
       await service.convergeRun({ runId: "run-1", state: "open", captures: [capture] });
@@ -276,6 +283,7 @@ describe("CaptureService", () => {
         idempotencyKey: "large-capture",
         view: { kind: "current" },
         timeoutMs: 1_000,
+        expectedWorldRevision: nullRuntimeRevision,
       })).rejects.toMatchObject({ code: "ARTIFACT_TOO_LARGE" });
 
       // The artifact was still fetched and persisted into the run

@@ -3,7 +3,9 @@ import { randomUUID } from "node:crypto";
 import { resolve } from "node:path";
 import { z } from "zod";
 import type { ObserverApplication, ObserverCaptureResult } from "./application.js";
-import { ObserverCoordinatorError } from "./errors.js";
+import { CaptureError } from "./capture-contract.js";
+import { resolveExpectedWorldRevision } from "./capture-request.js";
+import { ObserverApplicationError } from "./errors.js";
 import { prepareObserverLaunch } from "./launch.js";
 import { runObserverSetup } from "./setup.js";
 import type { WorkbenchClient } from "../workbench/client.js";
@@ -72,7 +74,6 @@ export interface ObserverToolDefaults {
   sessionTtlMs?: number;
   defaultCaptureTimeoutMs?: number;
   workbenchClient?: WorkbenchClient;
-  projectPath?: string;
   /** Ordered add-on roots resolved from the active MCP configuration. */
   workbenchAddonDirs?: readonly string[];
   evidenceRoots?: readonly string[];
@@ -98,8 +99,8 @@ function jsonText(heading: string, value: unknown): string {
   return `${heading}\n\n\`\`\`json\n${JSON.stringify(value, null, 2)}\n\`\`\``;
 }
 
-function extractObserverCoordinatorError(error: unknown): PublicObserverErrorCandidate | undefined {
-  if (!(error instanceof ObserverCoordinatorError)) return undefined;
+function extractObserverApplicationError(error: unknown): PublicObserverErrorCandidate | undefined {
+  if (!(error instanceof ObserverApplicationError)) return undefined;
   return {
     code: error.code,
     readDiagnosticMessage: () => error.message,
@@ -113,11 +114,29 @@ function toolError(error: unknown) {
       type: "text" as const,
       text: projectPublicObserverToolError(error, {
         subject: "Observer error",
-        extract: extractObserverCoordinatorError,
+        extract: extractObserverApplicationError,
       }),
     }],
     isError: true,
   };
+}
+
+/**
+ * The MCP schema rejects a missing field; this boundary also validates the
+ * opaque token payload. Keep direct handler calls aligned with the application
+ * boundary and preserve the projected Observer error shape.
+ */
+function assertCaptureWorldBinding(input: {
+  expectedWorldRevision: string;
+}): void {
+  try {
+    resolveExpectedWorldRevision(input);
+  } catch (error) {
+    if (error instanceof CaptureError) {
+      throw new ObserverApplicationError(error.code, error.message, error.details);
+    }
+    throw error;
+  }
 }
 
 function capturePresentation(result: Extract<ObserverCaptureResult, { asynchronous: false }>): Record<string, unknown> {
@@ -155,7 +174,7 @@ export function registerObserverTools(
 ): void {
   const sessionTtlMs = defaults.sessionTtlMs ?? 20 * 60 * 1_000;
   if (!Number.isSafeInteger(sessionTtlMs) || sessionTtlMs < 1_000 || sessionTtlMs > 24 * 60 * 60 * 1_000) {
-    throw new ObserverCoordinatorError("INVALID_REQUEST", "Observer session TTL must be from 1000 through 86400000 milliseconds");
+    throw new ObserverApplicationError("INVALID_REQUEST", "Observer session TTL must be from 1000 through 86400000 milliseconds");
   }
   server.registerTool(
     "observer_setup",
@@ -177,7 +196,7 @@ export function registerObserverTools(
                 application,
                 action,
                 defaults.workbenchClient
-                  ? { client: defaults.workbenchClient, projectPath: defaults.projectPath }
+                  ? { client: defaults.workbenchClient }
                   : undefined
               )
             ),
@@ -230,7 +249,7 @@ export function registerObserverTools(
     "observer_instances",
     {
       description:
-        "List live and stale observer runtime instances with capabilities, transport, world epoch, active job, and health. Optionally wait for compatible live instances. Headless runtimes are excluded whenever renderersOnly is true.",
+        "List live and stale observer runtime instances with capabilities, transport, required opaque world revision, diagnostic world ID/epoch projections, active job, and health. Optionally wait for compatible live instances. Headless runtimes are excluded whenever renderersOnly is true.",
       inputSchema: {
         sessionId: z.string().min(1).max(96).optional(),
         requiredCapabilities: z.array(z.enum(PUBLIC_OBSERVER_CAPABILITIES)).max(PUBLIC_OBSERVER_CAPABILITIES.length).default([]),
@@ -252,7 +271,7 @@ export function registerObserverTools(
     "observer_capture",
     {
       description:
-        "Capture reviewed evidence into an open managed observer run. runId and a unique normalized captureLabel are required. sessionId is required for a runtime renderer and optional for an explicitly selected already-running Workbench renderer. expectedWorldId/expectedWorldEpoch close the inventory-to-submit race. Synchronous mode returns one validated PNG; asynchronous mode returns a job ID that observer_job read can retrieve after completion.",
+        "Capture candidate evidence into an open managed observer run. runId and a unique normalized captureLabel are required. sessionId is required for a runtime renderer and optional for an explicitly selected already-running Workbench renderer. Bind the selected renderer to the immediately preceding observer_instances inventory with its opaque expectedWorldRevision. Synchronous mode returns one validated PNG; asynchronous mode returns a job ID that observer_job read can retrieve after completion.",
       inputSchema: {
         runId: z.string().regex(/^\d{8}T\d{6}Z-[a-f0-9]{8}$/),
         captureLabel: z.string().min(1).max(128),
@@ -265,20 +284,15 @@ export function registerObserverTools(
         timeoutMs: z.number().int().min(1_000).max(5 * 60 * 1_000)
           .default(defaults.defaultCaptureTimeoutMs ?? application.defaultCaptureTimeoutMs),
         settleFrames: z.number().int().min(0).max(30).default(0),
-        expectedWorldId: z.string().min(1).max(512).nullable().optional().describe(
-          "Exact world ID returned by the immediately preceding observer_instances inventory."
-        ),
-        expectedWorldEpoch: z.number().int().nonnegative().describe(
-          "Exact world epoch returned by the immediately preceding observer_instances inventory."
-        ),
-        expectedWorldRevision: z.string().regex(/^wr1\.(?:runtime|workbench)\.[A-Za-z0-9_-]+$/).optional().describe(
-          "Opaque exact world revision returned by the immediately preceding observer_instances inventory."
+        expectedWorldRevision: z.string().regex(/^wr1\.(?:runtime|workbench)\.[A-Za-z0-9_-]+$/).describe(
+          "Required opaque exact world revision from the immediately preceding observer_instances inventory."
         ),
         performancePolicy: z.enum(["evidence", "instrumented"]).default("evidence"),
       },
     },
     async (input, extra) => {
       try {
+        assertCaptureWorldBinding(input);
         const result = await application.capture({
           ...input,
           idempotencyKey: input.idempotencyKey ?? `mcp-${randomUUID()}`,
@@ -288,14 +302,14 @@ export function registerObserverTools(
           return { content: [{ type: "text" as const, text: jsonText("Observer capture queued.", result.job) }] };
         }
         if (result.image.length > application.maxInlineImageBytes) {
-          throw new ObserverCoordinatorError(
+          throw new ObserverApplicationError(
             "ARTIFACT_TOO_LARGE",
             "Validated PNG exceeds the configured MCP inline limit",
             { job: result.job }
           );
         }
         if (!isPng(result.image)) {
-          throw new ObserverCoordinatorError("ARTIFACT_INVALID", "Observer agent did not return a validated PNG");
+          throw new ObserverApplicationError("ARTIFACT_INVALID", "Observer agent did not return a validated PNG");
         }
         return {
           content: [
@@ -324,7 +338,7 @@ export function registerObserverTools(
       try {
         if (action === "read") {
           const result = await application.readJob(sessionId, jobId);
-          if (!isPng(result.image)) throw new ObserverCoordinatorError("ARTIFACT_INVALID", "Observer agent did not return a validated PNG");
+          if (!isPng(result.image)) throw new ObserverApplicationError("ARTIFACT_INVALID", "Observer agent did not return a validated PNG");
           return {
             content: [
               { type: "image" as const, data: result.image.toString("base64"), mimeType: "image/png" },
@@ -386,7 +400,7 @@ export function registerObserverTools(
       try {
         let result: Record<string, unknown>;
         if (input.action === "begin") {
-          if (!input.title) throw new ObserverCoordinatorError("INVALID_REQUEST", "title is required for observer_run begin");
+          if (!input.title) throw new ObserverApplicationError("INVALID_REQUEST", "title is required for observer_run begin");
           result = await application.beginRun({
             title: input.title,
             ...(input.caseIds ? { caseIds: input.caseIds } : {}),
@@ -395,23 +409,23 @@ export function registerObserverTools(
             ...(input.idempotencyKey ? { idempotencyKey: input.idempotencyKey } : {}),
           });
         } else if (input.action === "status") {
-          if (!input.runId) throw new ObserverCoordinatorError("INVALID_REQUEST", "runId is required for observer_run status");
+          if (!input.runId) throw new ObserverApplicationError("INVALID_REQUEST", "runId is required for observer_run status");
           result = await application.runStatus(input.runId);
         } else if (input.action === "discard") {
-          if (!input.runId) throw new ObserverCoordinatorError("INVALID_REQUEST", "runId is required for observer_run discard");
+          if (!input.runId) throw new ObserverApplicationError("INVALID_REQUEST", "runId is required for observer_run discard");
           result = await application.discardRun(input.runId);
         } else {
           if (!input.runId || !input.includeCaptureLabels || !input.review) {
-            throw new ObserverCoordinatorError(
+            throw new ObserverApplicationError(
               "INVALID_REQUEST",
               "runId, includeCaptureLabels, and review are required for observer_run finalize"
             );
           }
           const evidenceRoots = uniqueEvidenceRoots(defaults.evidenceRoots);
           if (evidenceRoots.length === 0) {
-            throw new ObserverCoordinatorError(
+            throw new ObserverApplicationError(
               "CAPABILITY_UNAVAILABLE",
-              "observer_run finalize requires an evidence destination; supply --project-path, --observer-evidence-root, or observer.evidenceRoots in an optional --config file"
+              "observer_run finalize requires an evidence destination; supply --observer-evidence-root or observer.evidenceRoots in an optional --config file"
             );
           }
           const evidenceRoot = input.evidenceRoot ??
@@ -419,7 +433,7 @@ export function registerObserverTools(
               ? evidenceRoots[0]
               : undefined);
           if (!evidenceRoot) {
-            throw new ObserverCoordinatorError(
+            throw new ObserverApplicationError(
               "INVALID_REQUEST",
               "observer_run finalize is ambiguous because multiple evidence roots are configured; provide evidenceRoot explicitly"
             );

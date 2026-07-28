@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { cpSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import {
   caseForId,
   isCanonicalFaultMatrixTerminal,
@@ -127,6 +127,7 @@ export interface RunPilotCancellationCaseInput {
   readonly managedRunId: string;
   readonly sessionId: string;
   readonly instanceId: string;
+  readonly worldRevision: string;
   readonly worldId: string;
   readonly worldEpoch: number;
   readonly caseStartedAt: number;
@@ -353,7 +354,7 @@ export async function runPilotCancellationCase(
 ): Promise<MatrixCaseEntry> {
   const {
     application, scheduler, matrixCase, managedRunId, sessionId,
-    instanceId, worldId, worldEpoch, caseStartedAt, caseDeadlineMs, caseBudgetMs,
+    instanceId, worldRevision, worldId, worldEpoch, caseStartedAt, caseDeadlineMs, caseBudgetMs,
   } = input;
   const diagnostics: string[] = [];
   const poseView = pilotPoseView();
@@ -382,8 +383,7 @@ export async function runPilotCancellationCase(
     purpose: `Fault-matrix pilot case ${matrixCase.id}`,
     sessionId,
     instanceId,
-    expectedWorldId: worldId,
-    expectedWorldEpoch: worldEpoch,
+    expectedWorldRevision: worldRevision,
     idempotencyKey: `${managedRunId}-${matrixCase.id}`,
     view: poseView,
     settleFrames: 3,
@@ -544,8 +544,7 @@ export async function runPilotCancellationCase(
       const followUp = await application.capture({
         sessionId,
         instanceId,
-        expectedWorldId: worldId,
-        expectedWorldEpoch: worldEpoch,
+        expectedWorldRevision: worldRevision,
         idempotencyKey: `${managedRunId}-${matrixCase.id}-followup`,
         view: { kind: "current" },
         settleFrames: 3,
@@ -692,10 +691,10 @@ export async function runRuntimeFailureMatrix(
     1_024
   );
   const executable = findRuntimeExecutable(options.executablePath, options.configPath);
-  const validationRoot = options.validationRoot ?? join(REPOSITORY_ROOT, "docs", "validation");
 
   assertArmaVacant("Runtime failure-matrix preflight");
   const artifactRoot = resolveRuntimeAcceptanceArtifactRoot(options.artifactRoot);
+  const validationRoot = resolve(options.validationRoot ?? join(artifactRoot, "validation"));
   const runDirectory = mkdtempSync(join(artifactRoot, "matrix-run-"));
   try {
   const managedRoot = join(runDirectory, "managed");
@@ -726,7 +725,6 @@ export async function runRuntimeFailureMatrix(
     agentPath: PRIVATE_CHILD_PATH,
     managedRoot,
     profileRoot,
-    projectPath: fixture.addonDirectory,
     sourceAddon: OBSERVER_SOURCE_PATH,
     evidenceRoots: [evidenceRoot],
     startupTimeoutMs: 20_000,
@@ -737,7 +735,6 @@ export async function runRuntimeFailureMatrix(
   const runtimeManager = new OwnedRuntimeManager({
     managedRoot,
     gamePath: join(executable, ".."),
-    projectPath: fixture.addonDirectory,
     observerGate: application,
     executableResolver: () => executable,
   });
@@ -919,9 +916,11 @@ export async function runRuntimeFailureMatrix(
     }
     const selected = compatible[0]!;
     const instanceId = String(selected.instanceId ?? "");
+    const worldRevision = String(selected.worldRevision ?? "");
     const worldId = typeof selected.worldId === "string" ? selected.worldId : "";
     const worldEpoch = selected.worldEpoch as number;
-    if (!/^[A-Za-z0-9_-]{1,96}$/.test(instanceId) || !worldId ||
+    if (!/^[A-Za-z0-9_-]{1,96}$/.test(instanceId) ||
+        !/^wr1\.runtime\.[A-Za-z0-9_-]+$/.test(worldRevision) || !worldId ||
         !Number.isSafeInteger(worldEpoch) || worldEpoch < 0) {
       throw new Error("Selected graphical runtime has invalid instance/world identity for the matrix pilot");
     }
@@ -943,6 +942,7 @@ export async function runRuntimeFailureMatrix(
         managedRunId: managedRunId!,
         sessionId: sessionId!,
         instanceId,
+        worldRevision,
         worldId,
         worldEpoch,
         caseStartedAt,

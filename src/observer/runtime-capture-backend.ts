@@ -13,7 +13,7 @@ import {
   type ListInstancesInput,
 } from "./capture-contract.js";
 import { canonicalPublicObserverErrorCode } from "./public-contract.js";
-import { assertWorldRevision, legacyWorldFields, runtimeWorldFields, runtimeWorldRevision, sameWorldRevision, type WorldRevision } from "./world-revision.js";
+import { assertWorldRevision, runtimeWorldFields, runtimeWorldRevision, sameWorldRevision, type WorldRevision } from "./world-revision.js";
 
 function record(value: unknown, label: string): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new CaptureError("TRANSPORT_UNAVAILABLE", `${label} returned an invalid response`);
@@ -72,14 +72,11 @@ export class RuntimeCaptureBackend implements CaptureBackend {
 
   async submit(input: BackendSubmitInput, context: BackendCallContext): Promise<BackendJob> {
     if (!input.request.sessionId) throw new CaptureError("INVALID_REQUEST", "sessionId is required for runtime capture");
-    const legacy = legacyWorldFields(input.instance.worldRevision);
-    if ((input.request.expectedWorldRevision && !sameWorldRevision(input.request.expectedWorldRevision, input.instance.worldRevision)) ||
-        (input.request.expectedWorldId !== undefined && input.request.expectedWorldId !== legacy.worldId) ||
-        (input.request.expectedWorldEpoch !== undefined && input.request.expectedWorldEpoch !== legacy.worldEpoch)) {
+    if (!sameWorldRevision(input.request.expectedWorldRevision, input.instance.worldRevision)) {
       throw new CaptureError("WORLD_CHANGED", "Selected runtime no longer matches the expected world revision");
     }
     try {
-      const expected = input.request.expectedWorldRevision && runtimeWorldFields(input.request.expectedWorldRevision);
+      const expected = runtimeWorldFields(input.request.expectedWorldRevision);
       const response = record(await this.agent.request("submitJob", {
         sessionId: input.request.sessionId,
         idempotencyKey: input.idempotencyKey,
@@ -90,7 +87,8 @@ export class RuntimeCaptureBackend implements CaptureBackend {
         view: input.request.view,
         settleFrames: input.request.settleFrames,
         performancePolicy: input.request.performancePolicy,
-        ...(expected ? { expectedWorldId: expected.worldId, expectedWorldEpoch: expected.worldEpoch } : {}),
+        expectedWorldId: expected.worldId,
+        expectedWorldEpoch: expected.worldEpoch,
       }, { deadlineAtMs: context.deadlineAtMs, signal: context.signal }), "Runtime job submission");
       return this.job(response, input.instance);
     } catch (error) { throw mapError(error); }

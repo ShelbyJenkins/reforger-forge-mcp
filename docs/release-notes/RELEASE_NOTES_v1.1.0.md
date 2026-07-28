@@ -1,5 +1,8 @@
 # Reforger Forge MCP 1.1.0
 
+> Historical release record. It describes the v1.1.0 surface at publication;
+> use the connected MCP tool schemas and current guides for present behavior.
+
 This release adds the transactional ReforgerForge observer platform and replaces
 the previous best-effort Workbench launch/restart path with a Windows-only,
 exact-owner lifecycle coordinator.

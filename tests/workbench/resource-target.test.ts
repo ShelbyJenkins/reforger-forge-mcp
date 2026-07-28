@@ -1,5 +1,5 @@
 import { mkdirSync, realpathSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
-import { join, relative } from "node:path";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { canonicalizeGproj } from "../../src/workbench/project-identity.js";
 import {
@@ -40,10 +40,10 @@ function captureResourceError(action: () => unknown): ResourceTargetError {
 }
 
 describe("canonical explicit Workbench resource target", () => {
-  scopedIt("canonicalizes an existing .ent and required .meta below the selected project", (root) => {
+  scopedIt("resolves a project-relative .ent and required .meta below the selected project", (root) => {
     const { projectPath, modDirectory } = createProject(root);
     const resourcePath = createEntity(modDirectory);
-    const target = canonicalizeResourceTarget(`  ${relative(process.cwd(), resourcePath)}  `, canonicalizeGproj(projectPath));
+    const target = canonicalizeResourceTarget("  Worlds/Example.ent  ", canonicalizeGproj(projectPath));
 
     expect(target.displayPath).toBe(realpathSync.native(resourcePath));
     expect(target.comparisonKey).toBe(realpathSync.native(resourcePath).toLowerCase());
@@ -54,7 +54,7 @@ describe("canonical explicit Workbench resource target", () => {
   it("requires a nonempty explicit resource path", () => {
     const error = captureResourceError(() => canonicalizeResourceTarget("  ", {} as never));
     expect(error.code).toBe("RESOURCE_REQUIRED");
-    expect(error.message).toContain("nonempty .ent path");
+    expect(error.message).toContain("nonempty .ent or .et path");
   });
 
   scopedIt("rejects missing paths, non-entities, directories, and a missing sidecar", (root) => {
@@ -71,7 +71,7 @@ describe("canonical explicit Workbench resource target", () => {
     expect(captureResourceError(() => canonicalizeResourceTarget(join(modDirectory, "missing.ent"), project)).code)
       .toBe("INVALID_RESOURCE_TARGET");
     expect(captureResourceError(() => canonicalizeResourceTarget(textPath, project)).message)
-      .toContain("must have a .ent extension");
+      .toContain("must have a .ent or .et extension");
     expect(captureResourceError(() => canonicalizeResourceTarget(directoryPath, project)).message)
       .toContain("not a regular file");
     expect(captureResourceError(() => canonicalizeResourceTarget(missingMeta, project)).message)

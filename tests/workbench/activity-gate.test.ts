@@ -408,7 +408,6 @@ async function createRunningHarness(activityGate?: WorkbenchActivityGate): Promi
   ].join("\n"));
   const config: Config = {
     workbenchPath: toolsRoot,
-    projectPath: projectRoot,
     gamePath: gameRoot,
     dataDir: join(root, "data"),
     patternsDir: join(root, "patterns"),

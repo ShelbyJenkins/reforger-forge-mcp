@@ -204,7 +204,6 @@ describe("OwnedRuntimeManager", () => {
     expect(() => new OwnedRuntimeManager({
       managedRoot: linkedManagedRoot,
       gamePath: root,
-      projectPath: project,
       observerGate: new FakeGate(),
       backend: createFakeBackend(),
       executableResolver: () => join(root, "unused.exe"),

@@ -25,7 +25,7 @@ function matchingLines(source: string, pattern: RegExp): string[] {
 
 describe("one-command setup orchestration contract", () => {
   it("documents policy-independent setup and Doctor entry points", () => {
-    const setupGuide = read("setup.md");
+    const setupGuide = read("SETUP.md");
     const policyIndependentPrefix =
       "powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\\scripts\\setup.ps1";
 

@@ -237,7 +237,6 @@ export function createWorkbenchPolicyFixture(): WorkbenchPolicyFixture {
   const buildProfile = ensureWorkbenchManagedBuildProfile(managedRoot, project);
   const config: Config = Object.freeze({
     workbenchPath: toolsRoot,
-    projectPath: targetAddonRoot,
     gamePath: gameRoot,
     workbenchAddonDirs: [gameAddonRoot],
     workbenchScriptAuthorizeAll: true,

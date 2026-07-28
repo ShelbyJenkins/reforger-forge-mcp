@@ -2,7 +2,8 @@ import { describe, expect, it, vi } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { ObserverCoordinatorError } from "../../src/observer/errors.js";
+import { ObserverApplicationError } from "../../src/observer/errors.js";
+import { runtimeWorldRevision } from "../../src/observer/world-revision.js";
 import { registerObserverTools } from "../../src/observer/tools.js";
 import {
   captureToolInput,
@@ -25,6 +26,11 @@ describe("observer MCP tools", () => {
       const listed = await client.listTools();
       const capture = listed.tools.find((tool) => tool.name === "observer_capture");
       expect(capture).toBeDefined();
+      expect(capture!.inputSchema.required).toContain("expectedWorldRevision");
+      expect(capture!.inputSchema.properties).toHaveProperty("expectedWorldRevision");
+      expect(capture!.inputSchema.properties).not.toHaveProperty("expectedWorldId");
+      expect(capture!.inputSchema.properties).not.toHaveProperty("expectedWorldEpoch");
+      expect(capture!.inputSchema.additionalProperties).toBe(false);
 
       const visit = (value: unknown): void => {
         if (Array.isArray(value)) {
@@ -66,10 +72,12 @@ describe("observer MCP tools", () => {
   });
 
   it("accepts an inventory-null world for current-view capture through the public tool", async () => {
-    const { coordinator, tools, call } = createToolHarness({
+    const revision = runtimeWorldRevision(null, 7);
+    const { coordinator, call } = createToolHarness({
       instances: vi.fn(async () => ({
         instances: [{
           instanceId: "runtime-null-world", sessionId: "session-1", worldId: null, worldEpoch: 7,
+          worldRevision: revision,
           capabilities: ["render.capture"],
         }],
         compatibleCount: 1, waitedMs: 0, timedOut: false,
@@ -88,24 +96,58 @@ describe("observer MCP tools", () => {
     expect(inventory.isError).not.toBe(true);
     expect(inventory.content[0].text).toContain('"worldId": null');
 
-    const expectedWorldId = tools.get("observer_capture")!.definition.inputSchema!.expectedWorldId;
-    expect(expectedWorldId.safeParse(null).success).toBe(true);
-    expect(expectedWorldId.safeParse(undefined).success).toBe(true);
     const capture = await call("observer_capture", captureToolInput({
       runId: "20260717T184233Z-a1b2c3d4",
       captureLabel: "null-world-current",
       instanceId: "runtime-null-world",
       idempotencyKey: "null-world-current",
       asynchronous: true,
-      expectedWorldId: null,
-      expectedWorldEpoch: 7,
+      expectedWorldRevision: revision,
     }));
     expect(capture.isError).not.toBe(true);
     expect(coordinator.capture).toHaveBeenCalledWith(expect.objectContaining({
-      expectedWorldId: null,
-      expectedWorldEpoch: 7,
+      expectedWorldRevision: revision,
       view: { kind: "current" },
     }));
+  });
+
+  it("requires the sole canonical world binding and rejects legacy-only input", async () => {
+    const capture = vi.fn(async () => ({
+      asynchronous: true,
+      job: { jobId: "job-world-binding", state: "queued" },
+    }));
+    const { coordinator, tools, call } = createToolHarness({ capture });
+    const definition = tools.get("observer_capture")!.definition.inputSchema!;
+    const revision = runtimeWorldRevision("world-1", 7);
+    const base = captureToolInput({
+      runId: "20260717T184233Z-a1b2c3d4",
+      captureLabel: "world-binding",
+      instanceId: "runtime-instance-1",
+      idempotencyKey: "world-binding",
+      asynchronous: true,
+    });
+
+    expect(definition).not.toHaveProperty("expectedWorldId");
+    expect(definition).not.toHaveProperty("expectedWorldEpoch");
+    expect(definition.expectedWorldRevision.safeParse(undefined).success).toBe(false);
+    expect(definition.expectedWorldRevision.safeParse(revision).success).toBe(true);
+
+    const accepted = await call("observer_capture", { ...base, expectedWorldRevision: revision });
+    expect(accepted.isError).not.toBe(true);
+    expect(capture).toHaveBeenCalledOnce();
+    expect(coordinator.capture).toHaveBeenCalledWith(expect.objectContaining({
+      expectedWorldRevision: revision,
+    }));
+
+    for (const input of [
+      base,
+      { ...base, expectedWorldId: "world-1", expectedWorldEpoch: 7 },
+    ]) {
+      const result = await call("observer_capture", input);
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("INVALID_REQUEST");
+    }
+    expect(capture).toHaveBeenCalledOnce();
   });
 
   it("formats one validated PNG image and one concise text metadata item", async () => {
@@ -126,7 +168,9 @@ describe("observer MCP tools", () => {
         },
       })),
     });
-    const result = await call("observer_capture", captureToolInput());
+    const result = await call("observer_capture", captureToolInput({
+      expectedWorldRevision: runtimeWorldRevision("world-1", 4),
+    }));
 
     expect(result.isError).not.toBe(true);
     expect(result.content).toHaveLength(2);
@@ -147,7 +191,9 @@ describe("observer MCP tools", () => {
         metadata: {},
       })),
     });
-    const result = await call("observer_capture", captureToolInput());
+    const result = await call("observer_capture", captureToolInput({
+      expectedWorldRevision: runtimeWorldRevision("world-2", 5),
+    }));
 
     expect(result.isError).toBe(true);
     expect(result.content).toHaveLength(1);
@@ -226,7 +272,7 @@ describe("observer MCP tools", () => {
     );
     expect(noRoot.isError).toBe(true);
     expect(noRoot.content[0].text).toContain("CAPABILITY_UNAVAILABLE");
-    expect(noRoot.content[0].text).toContain("--project-path");
+    expect(noRoot.content[0].text).toContain("--observer-evidence-root");
 
     const withMultiple = toolRegistry(coordinator, {} as never, {
       evidenceRoots: ["C:\\first", "C:\\second"],
@@ -243,7 +289,7 @@ describe("observer MCP tools", () => {
   it("preserves a specific run failure at the public observer_run boundary", async () => {
     const coordinator = toolApplication({
       runStatus: vi.fn(async () => {
-        throw new ObserverCoordinatorError(
+        throw new ObserverApplicationError(
           "ARTIFACT_INVALID",
           "The retained capture no longer verifies",
         );

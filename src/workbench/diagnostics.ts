@@ -40,8 +40,6 @@ export interface DiagnosticReport {
   host: string;
   port: number;
   workbenchExe: { path: string; exists: boolean } | null;
-  projectPath: { path: string; exists: boolean } | null;
-  defaultMod: string | null;
   companionAddon: {
     addonId: string;
     addonGuid: string;
@@ -153,10 +151,6 @@ export async function diagnoseWorkbench(
   options: WorkbenchDiagnosticOptions
 ): Promise<DiagnosticReport> {
   const workbenchExePath = options.config ? workbenchExecutable(options.config) : null;
-  const projectPath = options.config?.projectPath
-    ? { path: options.config.projectPath, exists: existsSync(options.config.projectPath) }
-    : null;
-
   let companionAddon: DiagnosticReport["companionAddon"] = null;
   try {
     const verified = verifyWorkbenchHelperSource(defaultWorkbenchHelperSource());
@@ -216,8 +210,6 @@ export async function diagnoseWorkbench(
     workbenchExe: workbenchExePath
       ? { path: workbenchExePath, exists: existsSync(workbenchExePath) }
       : null,
-    projectPath,
-    defaultMod: options.config?.defaultMod ?? null,
     companionAddon,
     netApi,
     netApiError,

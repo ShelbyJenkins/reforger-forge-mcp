@@ -283,6 +283,8 @@ describe("live graphical runtime observer acceptance contract", () => {
     expect(source).toContain('imagesReviewed: false');
     expect(source).toContain('outcome: "Unreviewed"');
     expect(source).toContain("resolveRuntimeAcceptanceArtifactRoot(options.artifactRoot)");
+    expect(source).toContain('join(artifactRoot, "validation")');
+    expect(source).not.toContain('join(REPOSITORY_ROOT, "docs", "validation")');
     expect(source).toContain("verifyEvidenceBundle(");
     expect(source).toContain("retainDiagnosticCapture(diagnosticsRoot");
     expect(source).toContain("recordRestorationImageSimilarity(\n      poseRestorationSimilarity");
@@ -360,6 +362,9 @@ describe("live graphical runtime observer acceptance contract", () => {
     expect(source).toContain('"--runtime-kind must be listenServer or client"');
     expect(source).not.toMatch(/environment\.RFO_RUNTIME_OBSERVER_(?!ACCEPTANCE_RESULT|EVIDENCE)/);
     expect(source).toContain('readFlag("--list-cases")');
+    const matrixSource = readFileSync(resolve("scripts/observer-runtime-failure-matrix.ts"), "utf8");
+    expect(matrixSource).toContain('join(artifactRoot, "validation")');
+    expect(matrixSource).not.toContain('join(REPOSITORY_ROOT, "docs", "validation")');
     const listCasesIndex = source.indexOf('readFlag("--list-cases")');
     const helpIndex = source.indexOf('readFlag("--help")');
     const onlyIndex = source.indexOf('const only = readOption("--only")');

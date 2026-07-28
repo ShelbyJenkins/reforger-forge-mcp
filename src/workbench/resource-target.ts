@@ -59,8 +59,10 @@ function isContainedBy(path: string, directory: string): boolean {
   return child.length > 0 && child !== ".." && !child.startsWith(`..${sep}`) && !isAbsolute(child);
 }
 
-function resolveRegularFile(requestedPath: string, label: string): string {
-  const absolutePath = resolve(requestedPath);
+function resolveRegularFile(requestedPath: string, label: string, baseDirectory?: string): string {
+  const absolutePath = isAbsolute(requestedPath)
+    ? resolve(requestedPath)
+    : resolve(baseDirectory ?? ".", requestedPath);
   let canonicalPath: string;
   try {
     canonicalPath = realpathSync.native(absolutePath);
@@ -83,7 +85,14 @@ function resolveCanonicalResourceTarget(
   resourcePath: string,
   project: CanonicalProjectIdentity
 ): CanonicalResourceTarget {
-  const displayPath = resolveRegularFile(resourcePath, "Workbench resource target");
+  // Target-bound launch paths are project-relative. Resolving them from the
+  // MCP host's working directory made a valid target in a non-default project
+  // appear to be missing beneath the repository root.
+  const displayPath = resolveRegularFile(
+    resourcePath,
+    "Workbench resource target",
+    project.modDirectory
+  );
   const extension = extname(displayPath).toLowerCase();
   if (!SUPPORTED_TARGET_EXTENSIONS.has(extension)) {
     throw invalidResource(

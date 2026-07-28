@@ -118,6 +118,8 @@ describe("live Workbench observer acceptance contract", () => {
     expect(exitSettleIndex).toBeGreaterThan(-1);
     expect(restAfterShutdownIndex).toBeGreaterThan(exitSettleIndex);
     expect(source).toContain("writeOperationalBaselineArtifact(validationRoot, artifact)");
+    expect(source).toContain('join(artifactRoot, "validation")');
+    expect(source).not.toContain('join(REPOSITORY_ROOT, "docs", "validation")');
     expect(source).not.toMatch(/taskkill|Stop-Process|KillProcess|\.kill\s*\(/i);
   });
 

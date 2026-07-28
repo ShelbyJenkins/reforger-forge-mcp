@@ -3,12 +3,17 @@ import { z } from "zod";
 import { relative } from "node:path";
 import { readFileSync, existsSync, writeFileSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
-import type { Config } from "../config.js";
 import { validateProjectPath } from "../utils/safe-path.js";
 import { listDirectory, formatSize } from "../utils/dir-listing.js";
-import { projectPathRequiredMessage } from "../utils/project-path.js";
+import {
+  resolveAddonRoot,
+  type ActiveProjectProvider,
+} from "../utils/game-paths.js";
 
-export function registerProject(server: McpServer, config: Config): void {
+export function registerProject(
+  server: McpServer,
+  projectProvider?: ActiveProjectProvider
+): void {
   server.registerTool(
     "project",
     {
@@ -40,25 +45,27 @@ export function registerProject(server: McpServer, config: Config): void {
           .describe(
             "(write) Create parent directories if they don't exist. Default: true."
           ),
-        projectPath: z
+        gprojPath: z
           .string()
           .optional()
           .describe(
-            "Absolute path to the project directory. Uses configured default if omitted."
+            "Exact .gproj whose addon should be browsed, read, or written. Uses the running Workbench project if omitted."
           ),
       },
     },
-    async ({ action, path: inputPath, pattern, content, createDirectories, projectPath }) => {
-      const basePath = projectPath || config.projectPath;
-
-      if (!basePath) {
+    async ({ action, path: inputPath, pattern, content, createDirectories, gprojPath }) => {
+      let basePath: string;
+      try {
+        basePath = await resolveAddonRoot(projectProvider, {
+          operation: `project ${action}`,
+          gprojPath,
+        });
+      } catch (error) {
         return {
-          content: [
-            {
-              type: "text",
-              text: projectPathRequiredMessage("project", "projectPath"),
-            },
-          ],
+          content: [{
+            type: "text",
+            text: error instanceof Error ? error.message : String(error),
+          }],
           isError: true,
         };
       }

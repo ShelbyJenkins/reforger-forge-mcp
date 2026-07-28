@@ -12,12 +12,15 @@ export function registerCreateModPrompt(server: McpServer, patterns: PatternLibr
       description:
         "Guided workflow to scaffold a complete mod from a description. Creates the addon structure, scripts, and prefabs.",
       argsSchema: {
+        outputDir: z
+          .string()
+          .describe("Existing directory where the new addon folder should be created"),
         description: z
           .string()
           .describe("Describe what the mod should do (e.g., 'A zombie survival game mode with waves of AI enemies')"),
       },
     },
-    ({ description }) => ({
+    ({ outputDir, description }) => ({
       messages: [
         {
           role: "user" as const,
@@ -26,6 +29,10 @@ export function registerCreateModPrompt(server: McpServer, patterns: PatternLibr
             text: `I want to create an Arma Reforger mod: ${description}
 
 YOU ARE AUTONOMOUS FOR EVERY SAFE, AUTOMATABLE STEP. The one required attended exception is Play mode: no automated Play tool exists, so when runtime testing is needed you must ask the user to enter Play mode manually, pause until they confirm, and then verify the mode with **wb_state**. Do not ask the user to perform builds, edit files, or handle any other step that the available tools can complete safely.
+
+## PROJECT TARGET CONTRACT
+
+Create the addon beneath \`${outputDir}\`. After **mod** with \`action: "create"\` returns its \`Path\`, identify the exact new \`.gproj\` as \`gprojPath\`. Pass that exact \`gprojPath\` to **wb_launch**. Later addon-scoped tools may omit it while that exact project is running; otherwise pass \`gprojPath\` explicitly. Dependency search is controlled only by \`workbenchAddonDirs\`.
 
 ## STEP 0: ASSESS COMPLEXITY
 
@@ -85,7 +92,7 @@ This file is the handoff document. A future Claude instance with zero context wi
   - Use **api_search** to look up class definitions, methods, and properties
   - Use **component_search** to find components to attach to entities — filter by category (character, vehicle, weapon, damage, inventory, ai, ui) or by event handlers they implement
 
-- **Wiki content is pre-downloaded** and available via the **wiki_search** tool. Do NOT try to fetch wiki pages from the web or reference URLs on the Bohemia Interactive Wiki. Use **wiki_search** for all tutorial and guide content about Enfusion engine concepts, scripting patterns, and Arma Reforger modding topics. When you need the full page content (especially code examples), use **wiki_read** with the page title from the search results.
+- **Wiki content is pre-downloaded** and available via the **wiki_search** tool. Do NOT try to fetch wiki pages from the web or reference URLs on the Bohemia Interactive Wiki. Use **wiki_search** for all tutorial and guide content about Enfusion engine concepts, scripting patterns, and Arma Reforger modding topics. When you need the full page content (especially code examples), use **wiki_read** with the page title from the search results; it returns up to 100,000 characters and reports truncation when the page is longer.
 
 ## CRITICAL: API VERIFICATION RULE
 
@@ -121,7 +128,7 @@ This applies to ALL physical in-game objects: interactive props, spawn points wi
 
 1. Use **api_search** to find the relevant Enfusion API classes AND verify that the methods you plan to use actually exist. Search every class you intend to call methods on. Do this BEFORE writing any scripts.
 
-2. Use **mod** with \`action: "create"\` to scaffold the addon project. Pick a good name, class prefix, and pattern based on the description.
+2. Use **mod** with \`action: "create"\` and \`outputDir: "${outputDir}"\` to scaffold the addon project. Pick a good name, class prefix, and pattern based on the description. Retain the exact generated \`.gproj\` path as \`gprojPath\`.
 
 3. Use **script_create** for each script:
    - Correct scriptType (component, gamemode, action, modded, etc.)

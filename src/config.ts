@@ -22,7 +22,7 @@ import { discoverStandardWorkshopAddonRoot } from "./platform/windows/workshop-d
 export const EXPLICIT_CONFIGURATION_CONTRACT_VERSION = 2;
 
 export interface ObserverConfig {
-  /** Optional managed observer root. The agent default is outside projectPath. */
+  /** Optional managed observer root. */
   managedRoot?: string;
   /** Optional approved root for observer-exclusive runtime profiles. */
   profileRoot?: string;
@@ -45,8 +45,6 @@ export interface ObserverConfig {
 export interface Config {
   /** Path to the Arma Reforger Tools installation. */
   workbenchPath: string;
-  /** Optional addons container used as the default project/tool root. */
-  projectPath?: string;
   /** Path to the Arma Reforger game installation. */
   gamePath: string;
   /** Optional ordered addon roots passed to Workbench as one -addonsDir value. */
@@ -65,8 +63,6 @@ export interface Config {
   workbenchPort: number;
   /** Optional observer overrides plus bounded MCP/agent defaults. */
   observer?: ObserverConfig;
-  /** Optional default addon folder used before wb_launch establishes one. */
-  defaultMod?: string;
   /** Enable diagnostic logging for the MCP and private observer child. */
   debug?: boolean;
 }
@@ -124,7 +120,6 @@ const observerFileSchema = z.object({
 
 const configFileSchema = z.object({
   workbenchPath: pathValue.optional(),
-  projectPath: pathValue.optional(),
   gamePath: pathValue.optional(),
   workbenchAddonDirs: z.array(pathValue).max(128).optional(),
   workbenchScriptAuthorizeAll: z.boolean().optional(),
@@ -132,7 +127,6 @@ const configFileSchema = z.object({
   workbenchHost: z.string().trim().min(1).max(255).optional(),
   workbenchPort: z.number().int().min(1).max(65_535).optional(),
   observer: observerFileSchema.optional(),
-  defaultMod: z.string().trim().min(1).max(128).optional(),
   debug: z.boolean().optional(),
 }).strict();
 
@@ -176,12 +170,10 @@ const VALUE_FLAGS = new Set([
   "--config",
   "--workbench-path",
   "--game-path",
-  "--project-path",
   "--workbench-addon-dir",
   "--extracted-path",
   "--workbench-host",
   "--workbench-port",
-  "--default-mod",
   "--observer-managed-root",
   "--observer-profile-root",
   "--observer-agent-path",
@@ -227,7 +219,6 @@ export const CONFIGURATION_USAGE = [
   "  --config <file>                         Load exactly this JSON file.",
   "  --workbench-path <directory>            Override workbenchPath.",
   "  --game-path <directory>                 Override gamePath.",
-  "  --project-path <directory>              Override projectPath.",
   "  --workbench-addon-dir <directory>       Add an explicit root; repeat for each root.",
   "  --no-workbench-addon-dirs               Disable automatic and explicit workbenchAddonDirs.",
   "  --workbench-host <host>                 Override the NET API host.",
@@ -235,7 +226,6 @@ export const CONFIGURATION_USAGE = [
   "  --workbench-script-authorize-all        Enable protected Workbench script operations.",
   "  --no-workbench-script-authorize-all     Disable protected Workbench script operations.",
   "  --extracted-path <directory>            Override the optional extracted-data root.",
-  "  --default-mod <name>                    Override the initial default addon.",
   "  --observer-managed-root <directory>     Override the observer managed root.",
   "  --observer-profile-root <directory>     Override the observer profile root.",
   "  --observer-agent-path <file>            Override the private observer child.",
@@ -345,9 +335,6 @@ function parseConfigurationArguments(
       case "--game-path":
         overrides.gamePath = resolveCliPath(cwd, raw!, flag);
         break;
-      case "--project-path":
-        overrides.projectPath = resolveCliPath(cwd, raw!, flag);
-        break;
       case "--workbench-addon-dir":
         workbenchAddonDirs.push(resolveCliPath(cwd, raw!, flag));
         break;
@@ -359,9 +346,6 @@ function parseConfigurationArguments(
         break;
       case "--workbench-port":
         overrides.workbenchPort = numericFlag(flag, raw!, 1, 65_535);
-        break;
-      case "--default-mod":
-        overrides.defaultMod = raw!;
         break;
       case "--workbench-script-authorize-all":
       case "--no-workbench-script-authorize-all":
@@ -494,9 +478,6 @@ function resolveFileConfigPaths(config: ConfigFile, configPath: string): ConfigO
     ...(config.workbenchPath
       ? { workbenchPath: resolveFilePath(base, config.workbenchPath) }
       : {}),
-    ...(config.projectPath
-      ? { projectPath: resolveFilePath(base, config.projectPath) }
-      : {}),
     ...(config.gamePath
       ? { gamePath: resolveFilePath(base, config.gamePath) }
       : {}),
@@ -511,7 +492,6 @@ function resolveFileConfigPaths(config: ConfigFile, configPath: string): ConfigO
       : {}),
     ...(config.workbenchHost !== undefined ? { workbenchHost: config.workbenchHost } : {}),
     ...(config.workbenchPort !== undefined ? { workbenchPort: config.workbenchPort } : {}),
-    ...(config.defaultMod !== undefined ? { defaultMod: config.defaultMod } : {}),
     ...(config.debug !== undefined ? { debug: config.debug } : {}),
     ...(observer ? { observer } : {}),
   };
@@ -639,21 +619,9 @@ function validateConfig(config: Config): Config {
     GAME_EXECUTABLE_RELATIVE_PATHS,
     "gamePath"
   );
-  if (config.projectPath) {
-    config.projectPath = requireDirectory(config.projectPath, "projectPath");
-  }
   if (isPathContained(config.workbenchPath, config.gamePath)
       || isPathContained(config.gamePath, config.workbenchPath)) {
     throw new ConfigurationError("workbenchPath and gamePath must not overlap.");
-  }
-  if (config.projectPath
-      && (isPathContained(config.workbenchPath, config.projectPath)
-        || isPathContained(config.projectPath, config.workbenchPath)
-        || isPathContained(config.gamePath, config.projectPath)
-        || isPathContained(config.projectPath, config.gamePath))) {
-    throw new ConfigurationError(
-      "projectPath must not overlap the Workbench or Arma Reforger installation."
-    );
   }
   if ((config.workbenchAddonDirs?.length ?? 0) > 128) {
     throw new ConfigurationError("workbenchAddonDirs may contain at most 128 entries.");
@@ -693,9 +661,6 @@ function validateConfig(config: Config): Config {
   ] as const) {
     if (!path) continue;
     const protectedRoot = [
-      ...(config.projectPath
-        ? [["projectPath", config.projectPath] as const]
-        : []),
       ["workbenchPath", config.workbenchPath],
       ["gamePath", config.gamePath],
     ] as const;
@@ -733,19 +698,6 @@ function validateConfig(config: Config): Config {
       || config.workbenchPort < 1
       || config.workbenchPort > 65_535) {
     throw new ConfigurationError("workbenchPort must be an integer from 1 through 65535.");
-  }
-  if (config.defaultMod !== undefined) {
-    config.defaultMod = config.defaultMod.trim();
-    if (!config.defaultMod
-        || config.defaultMod.length > 128
-        || config.defaultMod === "."
-        || config.defaultMod === ".."
-        || config.defaultMod.includes("/")
-        || config.defaultMod.includes("\\")) {
-      throw new ConfigurationError(
-        "defaultMod must name one direct project folder using 1 through 128 characters."
-      );
-    }
   }
   return config;
 }
@@ -872,20 +824,5 @@ export function loadConfig(
       ...(evidenceRoots !== undefined ? { evidenceRoots } : {}),
     },
   } as Config;
-  const validated = validateConfig(config);
-  if (validated.projectPath
-      && validated.observer
-      && validated.observer.evidenceRoots === undefined) {
-    const evidenceRoot = requireProspectiveDirectory(
-      join(validated.projectPath, ".reforger-forge-screenshots"),
-      "derived observer evidence root"
-    );
-    if (!isPathContained(validated.projectPath, evidenceRoot)) {
-      throw new ConfigurationError(
-        "Derived observer evidence root must remain beneath projectPath."
-      );
-    }
-    validated.observer.evidenceRoots = [evidenceRoot];
-  }
-  return validated;
+  return validateConfig(config);
 }

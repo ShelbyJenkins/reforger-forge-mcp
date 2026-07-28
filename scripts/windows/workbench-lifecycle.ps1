@@ -1311,6 +1311,33 @@ function Invoke-VerifyEndpointVacant
 		}
 		Assert-LifecycleDeadline
 		$listenerPid = [LifecycleTcpTable]::ResolveLoopbackListenerOwner($hostName, $portNumber)
+		# The TCP owner table can briefly retain a row after its owning process
+		# has exited. Treat that row as vacant only after a native process handle
+		# proves the PID is gone; a live or unverifiable PID remains fail-closed.
+		$listenerHandle = $null
+		try
+		{
+			$listenerHandle = [LifecycleProcessHandle]::Open($listenerPid, $false)
+			if ($listenerHandle.HasExited())
+			{
+				Write-LifecycleProtocol ([ordered]@{ ok = $true; status = 'vacant' })
+				return
+			}
+		}
+		catch [LifecycleProcessException]
+		{
+			$listenerException = Resolve-LifecycleProcessException -ErrorRecord $_
+			if ($listenerException.Reason -eq 'pid_not_found')
+			{
+				Write-LifecycleProtocol ([ordered]@{ ok = $true; status = 'vacant' })
+				return
+			}
+			throw
+		}
+		finally
+		{
+			if ($null -ne $listenerHandle) { $listenerHandle.Dispose() }
+		}
 		Write-LifecycleProtocol ([ordered]@{
 			ok = $false
 			status = 'refused'

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { WorkbenchObserverRecoverInput, WorkbenchObserverSubmitInput } from "../../src/workbench/observer-adapter.js";
+import { workbenchWorldRevision } from "../../src/observer/world-revision.js";
 import {
   codedError,
   createWorkbenchHarness,
@@ -18,8 +19,7 @@ describe("observer MCP tools", () => {
     const { adapter, coordinator } = createWorkbenchHarness();
     await expect(coordinator.capture(workbenchCaptureInput("stale-workbench-world", {
       instanceId: "workbench-generation-1",
-      expectedWorldId: "world-editor-previous",
-      expectedWorldEpoch: 0,
+      expectedWorldRevision: workbenchWorldRevision("world-editor-previous"),
       asynchronous: true,
     }))).rejects.toMatchObject({ code: "WORLD_CHANGED" });
     expect(adapter.submit).not.toHaveBeenCalled();

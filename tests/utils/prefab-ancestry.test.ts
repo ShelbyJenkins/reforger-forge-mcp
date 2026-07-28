@@ -199,7 +199,6 @@ describe("walkChain with real PAC1 absolute offsets", () => {
   const workshopDir = join(gameDir, "addons", "WCS_Armaments_fixture");
   const config: Config = {
     workbenchPath: "",
-    projectPath: join(testDir, "no-project"),
     gamePath: gameDir,
     dataDir: "",
     patternsDir: "",
