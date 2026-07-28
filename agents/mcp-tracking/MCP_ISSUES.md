@@ -139,3 +139,37 @@ require a GUID as input. Re-running `game_duplicate` is not the retry path
 because the tool refuses to overwrite the existing destination.
 Do not treat MCP-012 or MCP-013 as product approval until this review is
 complete.
+
+### MCP-035 - decide whether exact-owned runtime profile logs are supporting evidence
+
+**Status:** Open
+
+**Priority:** P1
+
+**Observed:** 2026-07-28
+
+Observer created exclusive client profiles through `observer_prepare_launch`,
+and their correlated `script.log` files were required by the validation
+procedure. `observer_run finalize` refused those files because the prepared
+profile directories were outside the configured `supportingLogRoots`, even
+though the sessions and exact-owned processes were known to Observer.
+
+**Decision required:** Decide whether finalization should automatically permit
+logs beneath the exact prepared profile of a capture included in the same run,
+or whether setup/launch guidance must require callers to preconfigure a common
+profile-log root. The automatic option must remain fail-closed to unrelated
+profiles and private files.
+
+**Affected areas:** Observer supporting-file allowlists,
+`observer_prepare_launch`, `observer_run finalize`, setup defaults, and
+operator guidance.
+
+**Evidence:** All captures finalized successfully, but the relevant logs had
+to be copied beside each reviewed bundle afterward. Those copies are not
+members of the MCP-generated manifest, so the manifest receipt covers the
+captures and review files but not the correlated runtime log.
+
+**Workaround:** Configure `--observer-supporting-log-root` for the intended
+profile parent before launching the MCP, or copy the correlated logs into the
+retained bundle after finalization and document that they are outside the
+managed manifest.
