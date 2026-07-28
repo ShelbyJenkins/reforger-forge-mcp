@@ -38,6 +38,7 @@ import { registerWbDiagnose } from "./tools/wb-diagnose.js";
 import { registerWbReload } from "./tools/wb-reload.js";
 import { registerWbRestart } from "./tools/wb-restart.js";
 import { registerWbShutdown } from "./tools/wb-shutdown.js";
+import { registerWbSaveResource } from "./tools/wb-save-resource.js";
 import { registerWbEditorTools } from "./tools/wb-editor.js";
 import { registerWbEntityTools } from "./tools/wb-entities.js";
 import { registerWbComponent } from "./tools/wb-components.js";
@@ -218,6 +219,7 @@ export function registerTools(server: McpServer, config: Config): RegisteredTool
   registerWbReload(server, wbClient);
   registerWbRestart(server, wbClient);
   registerWbShutdown(server, wbClient);
+  registerWbSaveResource(server, config, wbClient);
   registerWbEditorTools(server, wbClient);
   registerWbEntityTools(server, wbClient);
   registerWbComponent(server, wbClient);

@@ -7,9 +7,16 @@
  * owner evidence after that mutex is released.
  */
 
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { spawn, type ChildProcess, type SpawnOptions } from "node:child_process";
-import { join, resolve } from "node:path";
+import {
+  accessSync,
+  constants as fsConstants,
+  readdirSync,
+  readFileSync,
+  statSync,
+} from "node:fs";
+import { basename, dirname, extname, join, relative, resolve } from "node:path";
 import type { Config } from "../config.js";
 import { redactArguments } from "../foundation/redact.js";
 import { logger } from "../utils/logger.js";
@@ -68,10 +75,16 @@ import {
   type McpOwnerIdentity,
   type WorkbenchCompanionLifecycleState,
   type WorkbenchIdentity,
+  type WorkbenchWindow,
   type WorkbenchLifecycleSession,
   type WorkbenchLifecycleStateV3,
   type WorkbenchSpawnRecord,
 } from "./process-guard.js";
+import {
+  WorkbenchModalWatchdog,
+  findOwnedNativeDialog,
+  type WorkbenchModalEvidence,
+} from "./modal-watchdog.js";
 import {
   diagnoseWorkbench,
   type DiagnosticReport,
@@ -104,10 +117,18 @@ import {
   WorkbenchLaunchPlanError,
   buildLegacyWorkbenchLaunchArguments,
   buildMcpEditorLaunchPlan,
+  buildMcpTargetResourceLaunchPlan,
   type CliEditorLaunchPlan,
   type McpEditorLaunchPlan,
+  type McpTargetResourceLaunchPlan,
   type TargetBuildLaunchPlan,
 } from "./launch-plan.js";
+import {
+  ResourceTargetError,
+  canonicalizeResourceTarget,
+  revalidateResourceTarget,
+  type CanonicalResourceTarget,
+} from "./resource-target.js";
 
 const DEFAULT_CLIENT_ID = "EnfusionMCP";
 const LAUNCH_POLL_INTERVAL_MS = 3_000;
@@ -116,6 +137,7 @@ const OWNED_PROCESS_EXIT_TIMEOUT_MS = 15_000;
 const PORT_RELEASE_TIMEOUT_MS = 15_000;
 const PORT_RELEASE_POLL_MS = 200;
 const DEFAULT_QUALIFICATION_INTERVAL_MS = 2_000;
+const EXPLICIT_SAVE_MODAL_SETTLE_MS = 5_000;
 
 export type WorkbenchMode = "edit" | "play" | "unknown";
 
@@ -135,6 +157,19 @@ export interface WorkbenchLaunchResult {
   pid: number;
   gprojPath: string;
   generation: string;
+}
+
+/** A running fresh Workbench whose initial World Editor resource is immutable by launch contract. */
+export interface WorkbenchTargetResourceLaunchResult extends WorkbenchLaunchResult {
+  readonly resourcePath: string;
+  readonly targetBound: true;
+}
+
+export interface WorkbenchSaveResourceResult {
+  readonly resourcePath: string;
+  readonly startupLoadPath: string;
+  readonly outcome: "changed" | "no_change";
+  readonly changedPaths: readonly string[];
 }
 
 export interface WorkbenchRestartResult {
@@ -285,7 +320,11 @@ export type WorkbenchErrorCode =
   | "UNSUPPORTED_PLATFORM"
   | "LIFECYCLE_BUSY"
   | "ACTIVE_CAPTURE"
-  | "CAPTURE_INVALIDATED";
+  | "CAPTURE_INVALIDATED"
+  | "UNATTENDED_SAVE_UNSUPPORTED"
+  | "TARGET_SESSION_REQUIRED"
+  | "TARGET_SESSION_TAINTED"
+  | "SAVE_OUTCOME_UNCERTAIN";
 
 export class WorkbenchError extends Error {
   constructor(
@@ -325,7 +364,15 @@ export function buildWorkbenchLaunchArgs(
   }
 }
 
-type LaunchPreflight = McpEditorLaunchPlan;
+type LaunchPreflight = McpEditorLaunchPlan | McpTargetResourceLaunchPlan;
+
+interface ExplicitResourceSessionBinding {
+  readonly project: CanonicalProjectIdentity;
+  readonly resource: CanonicalResourceTarget;
+  readonly generation: string;
+  readonly process: WorkbenchIdentity;
+  taintedReason: string | null;
+}
 
 interface OwnedChildObservation {
   child: ChildProcess;
@@ -377,6 +424,8 @@ export interface WorkbenchClientDependencies {
   activityGateTiming?: WorkbenchActivityGateTiming;
   qualificationIntervalMs?: number;
   now?: () => number;
+  /** Test-only observation hook for a native dialog detected during explicit save. */
+  onExplicitSaveModal?: (evidence: WorkbenchModalEvidence) => void;
 }
 
 function pathKey(path: string): string {
@@ -410,12 +459,43 @@ function captureBindingMatchesLifecycle(
     pathKey(workbench.executablePath) === pathKey(binding.process.executablePath);
 }
 
+function changedBundlePaths(
+  before: ReadonlyMap<string, { readonly sha256: string; readonly size: number; readonly mtimeMs: number }>,
+  after: ReadonlyMap<string, { readonly sha256: string; readonly size: number; readonly mtimeMs: number }>
+): string[] {
+  const paths = new Set([...before.keys(), ...after.keys()]);
+  return [...paths].filter((path) => {
+    const left = before.get(path);
+    const right = after.get(path);
+    return !left || !right || left.sha256 !== right.sha256 || left.size !== right.size ||
+      left.mtimeMs !== right.mtimeMs;
+  }).sort((left, right) => left.localeCompare(right));
+}
+
+function explicitResourceLaunchArguments(resource: CanonicalResourceTarget): readonly string[] {
+  const args = [
+    "-wbModule=WorldEditor",
+    "-run",
+  ];
+  if (extname(resource.displayPath).toLowerCase() !== ".et") {
+    args.push("-load", resource.displayPath);
+  }
+  args.push("-reforgerForgeExplicitTarget", resource.displayPath);
+  return Object.freeze(args);
+}
+
 export class WorkbenchSessionController {
   private activeLifecycle: ActiveLifecycleOperation | null = null;
   private activeTargetBuildAbort: AbortController | null = null;
   private activeTargetBuildPromise: Promise<unknown> | null = null;
   private targetBuildClosing = false;
   private ownedChild: OwnedChildObservation | null = null;
+  /**
+   * Deliberately process-local. If this MCP restarts, it cannot prove a
+   * previously spawned Workbench was launched with the target resource, so
+   * save is refused rather than reconstructing mutable editor state.
+   */
+  private explicitResourceSession: ExplicitResourceSessionBinding | null = null;
   private readonly childSupervisor: ChildSupervisor;
   private readonly runnerLifecycleExecution: WorkbenchLifecycleExecutionPort;
   private _state: WorkbenchState = { connected: false, mode: "unknown", lastUpdated: 0 };
@@ -432,6 +512,7 @@ export class WorkbenchSessionController {
   private readonly diagnosticsService: typeof diagnoseWorkbench;
   private readonly qualificationIntervalMs: number;
   private readonly now: () => number;
+  private readonly onExplicitSaveModal: WorkbenchClientDependencies["onExplicitSaveModal"];
   private companionAttestationKey: string | null = null;
   private qualificationCache: {
     authority: ManagedRunningAuthority;
@@ -666,6 +747,7 @@ export class WorkbenchSessionController {
       throw new TypeError("Workbench qualification interval must be finite and non-negative.");
     }
     this.now = dependencies.now ?? Date.now;
+    this.onExplicitSaveModal = dependencies.onExplicitSaveModal;
   }
 
   createPlanOwnerCredential(): ReturnType<WorkbenchLifecycleExecutionPort["createOwnerCredential"]> {
@@ -1128,6 +1210,7 @@ export class WorkbenchSessionController {
     params: Record<string, unknown> = {},
     options: WorkbenchCallOptions = {}
   ): Promise<T> {
+    this.assertCallDoesNotBreakExplicitResourceBinding(apiFunc, params);
     const invoke = (): Promise<T> => this.config
       ? this.callManagedAndCache<T>(apiFunc, params, options)
       : this.callAndCache<T>(apiFunc, params, options);
@@ -1152,6 +1235,183 @@ export class WorkbenchSessionController {
         }
       }
       throw error;
+    }
+  }
+
+  /**
+   * Save only the exact .ent or .et supplied at fresh Workbench startup. This never
+   * falls back to a generic session or auto-launches after a transport error.
+   */
+  async saveResource(expectedPath: string): Promise<WorkbenchSaveResourceResult> {
+    let binding: ExplicitResourceSessionBinding;
+    try {
+      binding = await this.requireExplicitResourceSession(expectedPath);
+      this.assertExplicitResourceWritable(binding.resource);
+      revalidateProjectIdentity(binding.project);
+      revalidateResourceTarget(binding.resource, binding.project);
+      await this.processGuard.verifyExactProcessArguments(
+        binding.process,
+        explicitResourceLaunchArguments(binding.resource)
+      );
+    } catch (error) {
+      throw this.mapLifecycleError(error);
+    }
+
+    const before = this.snapshotExplicitResourceBundle(binding.resource);
+    const watchdog = new WorkbenchModalWatchdog({
+      inspect: () => this.processGuard.inspectExactWindows(binding.process),
+      close: (window) => this.processGuard.closeExactWindow(binding.process, window),
+    });
+    let baseline: readonly WorkbenchWindow[];
+    try {
+      baseline = await watchdog.snapshot();
+      const existingDialog = findOwnedNativeDialog(baseline);
+      const disabledMain = baseline.find((window) => window.ownerHandle === "0" && !window.enabled);
+      if (existingDialog || disabledMain) {
+        throw new WorkbenchError(
+          "Explicit save refused because the target-bound Workbench already has a native dialog or disabled main window.",
+          "SAVE_OUTCOME_UNCERTAIN"
+        );
+      }
+    } catch (error) {
+      this.taintExplicitResourceSession(
+        `The native-dialog preflight could not prove an interactive-free save state: ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      );
+      throw this.mapLifecycleError(error);
+    }
+
+    const watchAbort = new AbortController();
+    // Start native-dialog observation before the NET request is dispatched.
+    // The async watchdog immediately begins exact-process inspection before its
+    // first await, while the subsequent managed call performs the dispatch.
+    const modalOutcome = watchdog.waitForNewModal(baseline, watchAbort.signal).then(
+      (evidence) => ({ kind: "modal" as const, evidence }),
+      (error: unknown) => ({ kind: "watchdog_error" as const, error })
+    );
+    const saveResult = this.callManagedAndCache<Record<string, unknown>>(
+      "EMCP_WB_ExplicitResourceSave",
+      { action: "save", expectedPath: binding.resource.displayPath },
+      { timeout: 45_000, skipAutoLaunch: true }
+    );
+    const saveOutcome = saveResult.then(
+      (result) => ({ kind: "save_result" as const, result }),
+      (error: unknown) => ({ kind: "save_error" as const, error })
+    );
+    let firstOutcome = await Promise.race([saveOutcome, modalOutcome]);
+    watchAbort.abort();
+    if (firstOutcome.kind === "save_result" || firstOutcome.kind === "save_error") {
+      const watcherAfterSave = await modalOutcome;
+      // Promise.race may choose a save response when a native-dialog result is
+      // already queued in the same turn. Never discard that evidence.
+      if (watcherAfterSave.kind === "watchdog_error" ||
+          (watcherAfterSave.kind === "modal" && watcherAfterSave.evidence !== null)) {
+        firstOutcome = watcherAfterSave;
+      }
+    }
+
+    if (firstOutcome.kind === "watchdog_error") {
+      await Promise.race([
+        saveOutcome,
+        new Promise<null>((resolve) => setTimeout(() => resolve(null), EXPLICIT_SAVE_MODAL_SETTLE_MS)),
+      ]);
+      await watchdog.snapshot().catch(() => []);
+      this.taintExplicitResourceSession(
+        `Native-dialog monitoring failed while the save request was in flight: ${
+          firstOutcome.error instanceof Error ? firstOutcome.error.message : String(firstOutcome.error)
+        }`
+      );
+      throw new WorkbenchError(
+        "Explicit save outcome is uncertain because native-dialog monitoring failed. Shut down and relaunch the target.",
+        "SAVE_OUTCOME_UNCERTAIN"
+      );
+    }
+    if (firstOutcome.kind === "modal") {
+      // A posted WM_CLOSE is asynchronous. Give the NET handler a short,
+      // bounded opportunity to unwind, then inspect again before returning an
+      // uncertainty. This does not turn a later "ok" response into success.
+      await Promise.race([
+        saveOutcome,
+        new Promise<null>((resolve) => setTimeout(() => resolve(null), EXPLICIT_SAVE_MODAL_SETTLE_MS)),
+      ]);
+      await watchdog.snapshot().catch(() => []);
+      const evidence = firstOutcome.evidence;
+      if (evidence !== null) {
+        try {
+          this.onExplicitSaveModal?.(evidence);
+        } catch (error) {
+          logger.warn(
+            "Explicit-save native-dialog observation hook failed:",
+            error instanceof Error ? error.message : String(error)
+          );
+        }
+      }
+      const detail = evidence === null
+        ? "the monitor stopped before the save response completed"
+        : this.describeNativeDialogEvidence(evidence);
+      this.taintExplicitResourceSession(`Native dialog evidence was observed during explicit save: ${detail}`);
+      throw new WorkbenchError(
+        "Explicit save outcome is uncertain because Workbench requested native user feedback (" + detail + "). " +
+          "The target session is tainted; shut it down and relaunch the explicit target before any further save.",
+        "SAVE_OUTCOME_UNCERTAIN"
+      );
+    }
+    if (firstOutcome.kind === "save_error") {
+      const cause = firstOutcome.error instanceof Error
+        ? firstOutcome.error.message
+        : String(firstOutcome.error);
+      this.taintExplicitResourceSession(
+        `The save request did not complete with a trusted result: ${cause}`
+      );
+      throw new WorkbenchError(
+        "Explicit save outcome is uncertain because Workbench did not return a trusted completion result. " +
+          `Cause: ${cause}. Shut down and relaunch the target before any further save.`,
+        "SAVE_OUTCOME_UNCERTAIN"
+      );
+    }
+
+    try {
+      const result = firstOutcome.result;
+      if (result.status !== "ok") {
+        this.taintExplicitResourceSession("The explicit resource save handler did not confirm a completed save.");
+        throw new WorkbenchError(
+          typeof result.message === "string" && result.message.length > 0
+            ? result.message
+            : "Workbench did not confirm the explicit resource save.",
+          "SAVE_OUTCOME_UNCERTAIN"
+        );
+      }
+      if (result.startupLoadPath !== binding.resource.displayPath) {
+        this.taintExplicitResourceSession("The helper startup target attestation changed during save.");
+        throw new WorkbenchError(
+          "Explicit resource save refused because Workbench no longer attested the expected startup target.",
+          "SAVE_OUTCOME_UNCERTAIN"
+        );
+      }
+    } catch (error) {
+      this.taintExplicitResourceSession(
+        `The save request did not complete with a trusted result: ${error instanceof Error ? error.message : String(error)}`
+      );
+      throw this.mapLifecycleError(error);
+    }
+
+    try {
+      revalidateProjectIdentity(binding.project);
+      const current = revalidateResourceTarget(binding.resource, binding.project);
+      const after = this.snapshotExplicitResourceBundle(current);
+      const changedPaths = changedBundlePaths(before, after);
+      return Object.freeze({
+        resourcePath: current.displayPath,
+        startupLoadPath: binding.resource.displayPath,
+        outcome: changedPaths.length > 0 ? "changed" : "no_change",
+        changedPaths: Object.freeze(changedPaths),
+      });
+    } catch (error) {
+      this.taintExplicitResourceSession(
+        `The target bundle could not be revalidated after save: ${error instanceof Error ? error.message : String(error)}`
+      );
+      throw this.mapLifecycleError(error);
     }
   }
 
@@ -1295,8 +1555,42 @@ export class WorkbenchSessionController {
     }
   }
 
+  /**
+   * Start a fresh MCP-owned Workbench directly on one .ent resource. A running
+   * generic or differently-bound editor is intentionally never adopted: there
+   * is no active-document API with which to prove a safe transition.
+   */
+  async ensureTargetResourceRunning(
+    gprojPath: string,
+    resourcePath: string
+  ): Promise<WorkbenchTargetResourceLaunchResult> {
+    this.requireConfig("target-bound launch");
+    let project: CanonicalProjectIdentity;
+    let resource: CanonicalResourceTarget;
+    try {
+      project = canonicalizeGproj(gprojPath);
+      resource = canonicalizeResourceTarget(resourcePath, project);
+    } catch (error) {
+      throw this.mapLifecycleError(error);
+    }
+    try {
+      return await this.coordinateLifecycle("launch", project.comparisonKey, (operationId) =>
+        this.activityGate.runLifecycle("target-bound launch", async () =>
+          this.ensureTargetResourceRunningCoordinated(
+            revalidateProjectIdentity(project),
+            revalidateResourceTarget(resource, project),
+            operationId
+          )
+        )
+      );
+    } catch (error) {
+      throw this.mapLifecycleError(error);
+    }
+  }
+
   async restartOwnedWorkbench(): Promise<WorkbenchRestartResult> {
     this.requireConfig("restart");
+    this.clearExplicitResourceSession();
     const project = await this.resolveLifecycleProject();
     try {
       return await this.coordinateLifecycle("restart", project.comparisonKey, (operationId) =>
@@ -1311,6 +1605,7 @@ export class WorkbenchSessionController {
 
   async shutdownOwnedWorkbench(): Promise<WorkbenchShutdownResult> {
     this.requireConfig("shutdown");
+    this.clearExplicitResourceSession();
     try {
       const read = await this.processGuard.readLifecycleState();
       const targetKey = read.kind === "valid" ? read.state.target?.comparisonKey ?? null : null;
@@ -1931,6 +2226,189 @@ export class WorkbenchSessionController {
   private resetConnectionState(): void {
     this._state = { connected: false, mode: "unknown", lastUpdated: Date.now() };
     this.invalidateQualification();
+    this.clearExplicitResourceSession();
+  }
+
+  private clearExplicitResourceSession(): void {
+    this.explicitResourceSession = null;
+  }
+
+  private taintExplicitResourceSession(reason: string): void {
+    if (this.explicitResourceSession) this.explicitResourceSession.taintedReason = reason;
+  }
+
+  private assertCallDoesNotBreakExplicitResourceBinding(
+    apiFunc: string,
+    params: Record<string, unknown>
+  ): void {
+    const binding = this.explicitResourceSession;
+    if (!binding) return;
+    if (apiFunc === "EMCP_WB_ExplicitResourceSave") {
+      throw new WorkbenchError(
+        "Target-bound save requests must use wb_save_resource so the startup binding and disk evidence are verified.",
+        "TARGET_SESSION_REQUIRED"
+      );
+    }
+    const documentSwitch = (apiFunc === "EMCP_WB_EditorControl" && params.action === "openResource") ||
+      (apiFunc === "EMCP_WB_Resources" && params.action === "open") ||
+      (apiFunc === "EMCP_WB_ScriptEditor" && params.action === "openFile");
+    if (!documentSwitch) return;
+    this.taintExplicitResourceSession(
+      "A programmatic resource-open request was attempted after the explicit target session was created."
+    );
+    throw new WorkbenchError(
+      "TARGET_SESSION_TAINTED: resource-opening tools are unavailable in a target-bound save session because they could " +
+        "switch the document away from the startup target. Shut down and launch the desired explicit .ent instead.",
+      "TARGET_SESSION_TAINTED"
+    );
+  }
+
+  private describeNativeDialogEvidence(evidence: WorkbenchModalEvidence): string {
+    if (evidence.kind === "disabled_main_window") {
+      return "the target Workbench main window became disabled without a safely closable owned dialog";
+    }
+    const dialogKind = evidence.kind === "standalone_modal"
+      ? "newly visible standalone native dialog"
+      : "newly visible owned native dialog";
+    if (evidence.dismissed) {
+      return `a ${dialogKind} was detected, its close request was posted, and the dialog disappeared`;
+    }
+    return evidence.closeError
+      ? `a ${dialogKind} was detected but its close request failed`
+      : evidence.closePosted
+        ? `a ${dialogKind} was detected and its close request was posted, but dismissal was not confirmed`
+        : `a ${dialogKind} was detected but its close request could not be posted`;
+  }
+
+  private async requireExplicitResourceSession(
+    expectedPath: string
+  ): Promise<ExplicitResourceSessionBinding> {
+    const binding = this.explicitResourceSession;
+    if (!binding) {
+      throw new WorkbenchError(
+        "TARGET_SESSION_REQUIRED: start a fresh Workbench with wb_launch { gprojPath, resourcePath } before saving.",
+        "TARGET_SESSION_REQUIRED"
+      );
+    }
+    if (binding.taintedReason) {
+      throw new WorkbenchError(
+        `TARGET_SESSION_TAINTED: ${binding.taintedReason} Shut down and relaunch the explicit target before saving.`,
+        "TARGET_SESSION_TAINTED"
+      );
+    }
+    const expected = canonicalizeResourceTarget(expectedPath, binding.project);
+    if (expected.comparisonKey !== binding.resource.comparisonKey ||
+        expected.metaComparisonKey !== binding.resource.metaComparisonKey) {
+      throw new WorkbenchError(
+        "TARGET_SESSION_REQUIRED: the requested save path does not match the resource supplied at Workbench startup.",
+        "TARGET_SESSION_REQUIRED"
+      );
+    }
+    const authority = await this.readManagedRunningAuthoritySnapshot(
+      "explicit resource save qualification",
+      true
+    );
+    if (!authority.state.workbench || authority.state.generation !== binding.generation ||
+        authority.state.target?.comparisonKey !== binding.project.comparisonKey ||
+        !sameWorkbenchIdentity(authority.state.workbench, binding.process)) {
+      this.clearExplicitResourceSession();
+      throw new WorkbenchError(
+        "TARGET_SESSION_REQUIRED: the exact target-bound Workbench process or lifecycle generation changed.",
+        "TARGET_SESSION_REQUIRED"
+      );
+    }
+    return binding;
+  }
+
+  private assertExplicitResourceWritable(resource: CanonicalResourceTarget): void {
+    const assertWritable = (path: string, label: string): void => {
+      let info;
+      try {
+        info = statSync(path);
+        if ((info.mode & 0o222) === 0) {
+          throw new Error("read-only mode bits");
+        }
+        accessSync(path, fsConstants.W_OK);
+      } catch (error) {
+        throw new WorkbenchError(
+          `Explicit save refused because ${label} is not writable: ${path} ` +
+            `(${error instanceof Error ? error.message : String(error)}).`,
+          "INVALID_TARGET"
+        );
+      }
+    };
+    assertWritable(resource.displayPath, "the target resource");
+    assertWritable(dirname(resource.displayPath), "the target resource directory");
+    this.visitExplicitResourceBundle(resource, (path) => {
+      if (path !== resource.displayPath && path !== resource.metaPath) {
+        assertWritable(path, "a target resource layer");
+      }
+    });
+  }
+
+  private snapshotExplicitResourceBundle(
+    resource: CanonicalResourceTarget
+  ): Map<string, { readonly sha256: string; readonly size: number; readonly mtimeMs: number }> {
+    const snapshot = new Map<string, { readonly sha256: string; readonly size: number; readonly mtimeMs: number }>();
+    const add = (path: string): void => {
+      const info = statSync(path);
+      if (!info.isFile()) return;
+      const relativePath = relative(resource.project.modDirectory, path).replace(/\\/g, "/");
+      snapshot.set(relativePath, Object.freeze({
+        sha256: createHash("sha256").update(readFileSync(path)).digest("hex"),
+        size: info.size,
+        mtimeMs: info.mtimeMs,
+      }));
+    };
+    this.visitExplicitResourceBundle(resource, add);
+    return snapshot;
+  }
+
+  /**
+   * Workbench stores a .ent SubScene's owned layers in either a sibling
+   * `<Target>_default.layer` form or a `<Target>_Layers` directory depending
+   * on the resource layout. Both are part of the one explicit target bundle.
+   */
+  private visitExplicitResourceBundle(
+    resource: CanonicalResourceTarget,
+    visit: (path: string) => void
+  ): void {
+    visit(resource.displayPath);
+    visit(resource.metaPath);
+    if (extname(resource.displayPath).toLowerCase() !== ".ent") return;
+    const directory = dirname(resource.displayPath);
+    const stem = basename(resource.displayPath, extname(resource.displayPath));
+    let entries;
+    try {
+      entries = readdirSync(directory, { withFileTypes: true, encoding: "utf8" });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const path = join(directory, entry.name);
+      if (entry.isFile() && entry.name.startsWith(`${stem}_`) && entry.name.endsWith(".layer")) {
+        visit(path);
+      }
+      if (entry.isDirectory() && entry.name === `${stem}_Layers`) {
+        this.walkRegularFiles(path, visit);
+      }
+    }
+  }
+
+  private walkRegularFiles(directory: string, visit: (path: string) => void): void {
+    let entries;
+    try {
+      entries = readdirSync(directory, { withFileTypes: true, encoding: "utf8" });
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "ENOENT" || code === "ENOTDIR") return;
+      throw error;
+    }
+    for (const entry of entries) {
+      const path = join(directory, entry.name);
+      if (entry.isDirectory()) this.walkRegularFiles(path, visit);
+      else if (entry.isFile()) visit(path);
+    }
   }
 
   private invalidateQualification(): void {
@@ -2346,6 +2824,92 @@ export class WorkbenchSessionController {
     };
   }
 
+  private async ensureTargetResourceRunningCoordinated(
+    project: CanonicalProjectIdentity,
+    resource: CanonicalResourceTarget,
+    operationId: string
+  ): Promise<WorkbenchTargetResourceLaunchResult> {
+    let state = await this.processGuard.withLifecycleLock((session) =>
+      this.claimState(session, project));
+    const reconciled = await this.reconcileForEnsure(state, project);
+    state = reconciled.state;
+    if (reconciled.live) {
+      const binding = this.explicitResourceSession;
+      if (binding && !binding.taintedReason &&
+          binding.project.comparisonKey === project.comparisonKey &&
+          binding.resource.comparisonKey === resource.comparisonKey &&
+          binding.generation === state.generation && state.workbench &&
+          sameWorkbenchIdentity(binding.process, state.workbench)) {
+        return {
+          action: "reused",
+          pid: state.workbench.pid,
+          gprojPath: project.displayPath,
+          generation: state.generation,
+          resourcePath: resource.displayPath,
+          targetBound: true,
+        };
+      }
+      throw new WorkbenchError(
+        "TARGET_SESSION_REQUIRED: a Workbench process is already running, but this MCP cannot prove it is " +
+          "the requested fresh target-bound resource session. Shut it down before launching an explicit target.",
+        "TARGET_SESSION_REQUIRED"
+      );
+    }
+
+    const preflight = this.preflightTargetResourceLaunch(project, resource);
+    this.companionProvider?.applyRetention?.({
+      protectedDigests: [preflight.helper.bundleDigest],
+    });
+    state = await this.processGuard.withLifecycleLock(async (session) => {
+      const current = await this.requireReservedLifecycle(session, state);
+      await this.assertNoWorkbenchProcesses(session, "Target-bound launch");
+      const vacancy = await session.verifyEndpointVacant({ host: this.host, port: this.port });
+      if (vacancy.kind === "occupied") {
+        throw new WorkbenchError(
+          `UNOWNED_WORKBENCH: NET API endpoint ${this.host}:${this.port} is occupied without the exact ` +
+            `recorded Workbench identity (listener PID ${vacancy.listenerPid}).`,
+          "UNOWNED_WORKBENCH"
+        );
+      }
+      if (vacancy.kind === "unverifiable") {
+        throw new WorkbenchError(
+          `IDENTITY_UNVERIFIABLE: NET API endpoint ${this.host}:${this.port} vacancy could not be ` +
+            `proved (${vacancy.reason}): ${vacancy.message}`,
+          "IDENTITY_UNVERIFIABLE"
+        );
+      }
+      return session.transition(stateExpected(current), stateDraft(current, {
+        phase: "starting",
+        target: toLifecycleTarget(preflight.project),
+        workbench: null,
+        companion: companionLifecycleState(preflight.helper),
+        operation: { kind: "launch", operationId },
+      }));
+    });
+    const started = await this.startReserved(state, preflight);
+    if (!started.workbench) {
+      throw new WorkbenchError(
+        "Target-bound Workbench reached readiness without an exact process identity.",
+        "IDENTITY_UNVERIFIABLE"
+      );
+    }
+    this.explicitResourceSession = {
+      project: preflight.project,
+      resource: preflight.resource,
+      generation: started.generation,
+      process: started.workbench,
+      taintedReason: null,
+    };
+    return {
+      action: "launched",
+      pid: started.workbench.pid,
+      gprojPath: preflight.project.displayPath,
+      generation: started.generation,
+      resourcePath: preflight.resource.displayPath,
+      targetBound: true,
+    };
+  }
+
   private async restartCoordinated(
     project: CanonicalProjectIdentity,
     operationId: string
@@ -2535,6 +3099,56 @@ export class WorkbenchSessionController {
     }
   }
 
+  private preflightTargetResourceLaunch(
+    project: CanonicalProjectIdentity,
+    resource: CanonicalResourceTarget
+  ): McpTargetResourceLaunchPlan {
+    const config = this.requireConfig("target-bound launch");
+    const currentProject = revalidateProjectIdentity(project);
+    const currentResource = revalidateResourceTarget(resource, currentProject);
+    if (!this.companionProvider) {
+      throw new WorkbenchError(
+        "Workbench target-bound launch requires an MCP-managed companion add-on provider.",
+        "LAUNCH_FAILED"
+      );
+    }
+    let companion: WorkbenchCompanionLaunch;
+    try {
+      companion = this.companionProvider.ensureStaged(currentProject.displayPath);
+      if (!this.companionProvider.verifyStaged) {
+        throw new Error("companion provider cannot re-attest staged payload hashes");
+      }
+      companion = this.companionProvider.verifyStaged(companion, currentProject.displayPath);
+    } catch (error) {
+      throw new WorkbenchError(
+        `Workbench companion add-on could not be staged: ${error instanceof Error ? error.message : String(error)}`,
+        "LAUNCH_FAILED"
+      );
+    }
+    try {
+      const plan = buildMcpTargetResourceLaunchPlan({
+        kind: "mcp_target_resource",
+        config,
+        project: currentProject,
+        resource: currentResource,
+        companion,
+        endpoint: { host: this.host, port: this.port },
+        ownerArgument: this.processGuard.ownerArgument(this.processGuard.createOwnerToken()),
+        ...(config.observer?.managedRoot
+          ? { managedRoot: config.observer.managedRoot }
+          : {}),
+      });
+      assertWorkbenchAddonDependenciesAvailable({
+        targetGprojPath: plan.project.displayPath,
+        addonRoots: plan.addonDirectories,
+        launchStatus: "No Workbench process was launched.",
+      });
+      return plan;
+    } catch (error) {
+      throw this.mapLifecycleError(error);
+    }
+  }
+
   private async startReserved(
     initialState: WorkbenchLifecycleStateV3,
     preflight: LaunchPreflight
@@ -2572,6 +3186,9 @@ export class WorkbenchSessionController {
       await this.processGuard.withLifecycleLock((session) =>
         this.requireReservedLifecycle(session, state));
       revalidateProjectIdentity(preflight.project);
+      if (preflight.kind === "mcp_target_resource") {
+        revalidateResourceTarget(preflight.resource, preflight.project);
+      }
       if (!this.companionProvider?.verifyStaged) {
         throw new WorkbenchError(
           "Workbench companion provider cannot re-attest the launched payload.",
@@ -2590,6 +3207,9 @@ export class WorkbenchSessionController {
         launchedAtMs,
         beforeSpawn: () => {
           revalidateProjectIdentity(preflight.project);
+          if (preflight.kind === "mcp_target_resource") {
+            revalidateResourceTarget(preflight.resource, preflight.project);
+          }
           if (!this.companionProvider?.verifyStaged) {
             throw new WorkbenchError(
               "Workbench companion provider cannot re-attest the launched payload.",
@@ -2655,6 +3275,9 @@ export class WorkbenchSessionController {
         identity,
         preflight.project.displayPath
       );
+      if (preflight.kind === "mcp_target_resource") {
+        await this.verifyExplicitResourceStartup(preflight, identity);
+      }
       state = await this.transitionReservedLifecycle(state, {
         phase: "running",
         operation: null,
@@ -2730,8 +3353,39 @@ export class WorkbenchSessionController {
         },
         deadlineMs: Date.now() + launchTimeoutMs,
         pollIntervalMs: this.launchPollIntervalMs,
-        child: observation.handle,
-      });
+      child: observation.handle,
+    });
+  }
+
+  /**
+   * The helper checks the immutable -load argument before the session is ever
+   * exposed to normal MCP calls.  A failure here is still inside the launch
+   * transaction, so startReserved rolls the exact disposable child back.
+   */
+  private async verifyExplicitResourceStartup(
+    preflight: McpTargetResourceLaunchPlan,
+    identity: WorkbenchIdentity
+  ): Promise<void> {
+    await this.processGuard.verifyExactProcessArguments(
+      identity,
+      explicitResourceLaunchArguments(preflight.resource)
+    );
+    const action = extname(preflight.resource.displayPath).toLowerCase() === ".et"
+      ? "openPrefab"
+      : "probe";
+    const result = await this.rawCall<Record<string, unknown>>(
+      "EMCP_WB_ExplicitResourceSave",
+      { action, expectedPath: preflight.resource.displayPath },
+      { timeout: 15_000, skipAutoLaunch: true }
+    );
+    if (result.status !== "ok" || result.startupLoadPath !== preflight.resource.displayPath) {
+      throw new WorkbenchError(
+        typeof result.message === "string" && result.message.length > 0
+          ? `Target-bound startup was not attested: ${result.message}`
+          : "Target-bound startup was not attested by the Workbench helper.",
+        "IDENTITY_UNVERIFIABLE"
+      );
+    }
   }
 
   private async rollbackFailedLaunch(
@@ -2911,6 +3565,14 @@ export class WorkbenchSessionController {
     }
     if (error instanceof ProjectIdentityError) {
       return new WorkbenchError(error.message, error.code);
+    }
+    if (error instanceof ResourceTargetError) {
+      const code: WorkbenchErrorCode = error.code === "RESOURCE_REQUIRED"
+        ? "TARGET_REQUIRED"
+        : error.code === "RESOURCE_TARGET_CHANGED"
+          ? "TARGET_CHANGED"
+          : "INVALID_TARGET";
+      return new WorkbenchError(error.message, code);
     }
     if (error instanceof WorkbenchSessionStateError) {
       return new WorkbenchError(`RECOVERY_REQUIRED: ${error.message}`, "RECOVERY_REQUIRED");

@@ -373,8 +373,8 @@ For live editor work:
    changing it.
 5. Make the smallest scoped change and inspect the result.
 6. Save intentional editor changes manually while a person is attending the
-   editor; no automated Save/Save As tool is advertised because the operation
-   may open modal UI.
+   editor. `wb_save_resource` is a compatibility surface that always refuses
+   until Workbench exposes a live-validated authoritative active-resource API.
 7. After script changes, use verified owner-scoped `wb_restart` for a clean
    compile. Never use `wb_reload` or a generic menu action for scripts.
 8. Prefer a bounded standalone diagnostic/autotest launcher for gameplay

@@ -5,8 +5,8 @@
   "protocolVersion": "2.0",
   "addonId": "ReforgerForgeWorkbenchHelper",
   "addonGuid": "4D74249D90703F46",
-  "buildIdentity": "0c75643ec6438462a1a40dad54bb51f2c7192ef292a07e997ad4eb1fec93589e",
-  "bundleDigest": "62b07906a8e04959490d79278a0e960c9cbddbac8d02d6beea5b1d933973c649",
+  "buildIdentity": "bc03d671ed4c867472383c41048fcb40abb784dd287a4928c0588e5d5be9013d",
+  "bundleDigest": "2bfbf9020ce37cd4cff4db1bb9dbf944260260a9a7b0f485a5fd7d6cef9eac62",
   "files": [
     {
       "path": "addon.gproj",
@@ -37,6 +37,10 @@
       "sha256": "3010554c45c0941e0f06ce3d4cb49e7b8053bc0596e8adec531d6fb29c88af3e"
     },
     {
+      "path": "Scripts/WorkbenchGame/EnfusionMCP/EMCP_WB_ExplicitResourceSave.c",
+      "sha256": "9df9945c750a3111cc31844c91028ac03b71843884d6105b78aa3a6a1b58e57f"
+    },
+    {
       "path": "Scripts/WorkbenchGame/EnfusionMCP/EMCP_WB_GetCameraPos.c",
       "sha256": "3aeb6c7fc8a51b6cc03e957a6b88f67f6cd7f4b420405e16a6f3c003cfcf5610"
     },
@@ -62,7 +66,7 @@
     },
     {
       "path": "Scripts/WorkbenchGame/EnfusionMCP/EMCP_WB_ModifyEntity.c",
-      "sha256": "d86fa75c6368087b240a676b730ab00c7a94f7295f0ef61542eeb2024f4f1b3a"
+      "sha256": "9645e7bd159282cb502e0678d38ed29b1a2ac87b4e8e92c772a9bd3e52da2403"
     },
     {
       "path": "Scripts/WorkbenchGame/EnfusionMCP/EMCP_WB_ObserverCancel.c",
@@ -121,8 +125,12 @@
       "sha256": "b862eaa7a80e96d9e79fe781a08bf56297e0b71d56c1bd43c55fd236262860c4"
     },
     {
+      "path": "Scripts/WorkbenchGame/EnfusionMCP/EMCP_WB_ValidateResource.c",
+      "sha256": "5a17b4d17e85c4ca6c1f67d02ac7f5ff6b087797d7a89179904aba615fc0afe4"
+    },
+    {
       "path": "Scripts/WorkbenchGame/EnfusionMCP/RFWB_HelperBuild.c",
-      "sha256": "ef36ec4cff42b5a489b6df6260f61446f5654b1223fc6d0d97c0e39527ab1509"
+      "sha256": "b68b7d3e4b5808c72ae2827bef4c14309bf46bd494bfa3ab4481518a1361db2e"
     }
   ]
 }

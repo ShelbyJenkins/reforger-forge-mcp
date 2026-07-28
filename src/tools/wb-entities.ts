@@ -326,6 +326,18 @@ export function registerWbEntityTools(server: McpServer, client: WorkbenchClient
         }
 
         const result = await client.call<Record<string, unknown>>("EMCP_WB_ModifyEntity", params);
+        if (result.status !== "ok") {
+          const message = typeof result.message === "string" && result.message.trim()
+            ? result.message
+            : `Workbench could not ${action} on entity "${name}".`;
+          return {
+            content: [{
+              type: "text" as const,
+              text: `Error modifying entity "${name}": ${message}${formatConnectionStatus(client)}`,
+            }],
+            isError: true,
+          };
+        }
 
         // Special output for getWorldTransform
         if (action === "getWorldTransform") {

@@ -229,6 +229,31 @@ export type VerifyEndpointVacantResult =
       message: string;
     };
 
+/** A visible top-level window belonging to an already exact-owned Workbench. */
+export interface WorkbenchWindow {
+  readonly handle: string;
+  readonly ownerHandle: string;
+  readonly className: string;
+  readonly title: string;
+  readonly visible: boolean;
+  readonly enabled: boolean;
+  readonly iconic: boolean;
+}
+
+/**
+ * A close request is derived from one exact-process window snapshot and is
+ * revalidated natively immediately before WM_CLOSE is posted.
+ */
+export interface WorkbenchWindowCloseRequest extends Pick<
+  WorkbenchWindow,
+  "handle" | "ownerHandle" | "className" | "title"
+> {
+  /** An owned child, or the sole new top-level dialog that disabled a known main window. */
+  readonly kind: "owned_child" | "disabled_main_new_top_level";
+  /** Required only for the conservative unowned-top-level modal pattern. */
+  readonly disabledMainHandle?: string;
+}
+
 export interface WorkbenchLifecycleBackend extends ExactProcessBackend, MachineMutex {
   scanWorkbenchProcesses(): Promise<WorkbenchProcessScan>;
   verifyEndpointOwner(
@@ -242,6 +267,19 @@ export interface WorkbenchLifecycleBackend extends ExactProcessBackend, MachineM
    * throws for a merely absent or not-yet-created window.
    */
   minimizeWindow(pid: number, timeoutMs: number): Promise<{ minimized: boolean }>;
+  /**
+   * Re-read an exact owned Workbench command line and attest a small set of
+   * immutable launch arguments without returning the command line itself.
+   */
+  verifyProcessArguments?(
+    expected: WorkbenchIdentity,
+    expectedArguments: readonly string[]
+  ): Promise<boolean>;
+  inspectWindows?(expected: WorkbenchIdentity): Promise<readonly WorkbenchWindow[]>;
+  closeWindow?(
+    expected: WorkbenchIdentity,
+    window: WorkbenchWindowCloseRequest
+  ): Promise<boolean>;
 }
 
 export interface WorkbenchProcessGuardOptions {
@@ -573,6 +611,62 @@ export class WindowsLifecycleBackend extends WindowsExactProcessBackend
   async minimizeWindow(pid: number, timeoutMs: number): Promise<{ minimized: boolean }> {
     const response = await this.invoke("MinimizeWindow", { pid }, timeoutMs);
     return { minimized: response.ok === true && response.status === "minimized" };
+  }
+
+  async verifyProcessArguments(
+    expected: WorkbenchIdentity,
+    expectedArguments: readonly string[]
+  ): Promise<boolean> {
+    const response = await this.invoke("InspectProcess", {
+      pid: expected.pid,
+      expectedOwnerTokenArgument: expected.ownerTokenArgument,
+      expectedArguments: [...expectedArguments],
+    });
+    const identity = parseExactIdentity(response.identity);
+    return response.ok === true && response.status === "found" && identity !== null &&
+      processMatches(identity, expected) && response.ownerArgumentMatched === true &&
+      response.expectedArgumentsMatched === true;
+  }
+
+  async inspectWindows(expected: WorkbenchIdentity): Promise<readonly WorkbenchWindow[]> {
+    const response = await this.invoke("InspectWindows", { expected });
+    if (response.ok !== true || response.status !== "complete" || !Array.isArray(response.windows)) {
+      throw new LifecycleGuardError(
+        `Exact Workbench window inspection failed: ${response.message ?? response.reason ?? "invalid helper response"}`,
+        "IDENTITY_UNVERIFIABLE"
+      );
+    }
+    const windows: WorkbenchWindow[] = [];
+    for (const value of response.windows) {
+      if (!value || typeof value !== "object") {
+        throw new LifecycleGuardError("Exact Workbench window inspection returned an invalid window.", "IDENTITY_UNVERIFIABLE");
+      }
+      const record = value as Record<string, unknown>;
+      if (typeof record.handle !== "string" || typeof record.ownerHandle !== "string" ||
+          typeof record.className !== "string" || typeof record.title !== "string" ||
+          typeof record.visible !== "boolean" || typeof record.enabled !== "boolean" ||
+          typeof record.iconic !== "boolean") {
+        throw new LifecycleGuardError("Exact Workbench window inspection returned malformed window metadata.", "IDENTITY_UNVERIFIABLE");
+      }
+      windows.push(Object.freeze({
+        handle: record.handle,
+        ownerHandle: record.ownerHandle,
+        className: record.className,
+        title: record.title,
+        visible: record.visible,
+        enabled: record.enabled,
+        iconic: record.iconic,
+      }));
+    }
+    return Object.freeze(windows);
+  }
+
+  async closeWindow(
+    expected: WorkbenchIdentity,
+    window: WorkbenchWindowCloseRequest
+  ): Promise<boolean> {
+    const response = await this.invoke("CloseWindow", { expected, window });
+    return response.ok === true && response.status === "closed";
   }
 
   async verifyEndpointOwner(
@@ -1211,6 +1305,109 @@ export class WorkbenchProcessGuard {
 
   async listWorkbenchProcesses(): Promise<ExactProcessIdentity[]> {
     return this.scanStrict();
+  }
+
+  /**
+   * Verify immutable launch intent for an already exact-owned Workbench.
+   * This intentionally exposes only a boolean so target paths and owner
+   * tokens never leave the process-lifecycle trust boundary.
+   */
+  async verifyExactProcessArguments(
+    expected: WorkbenchIdentity,
+    expectedArguments: readonly string[]
+  ): Promise<void> {
+    if (!Array.isArray(expectedArguments) || expectedArguments.length === 0 ||
+        expectedArguments.some((argument) => typeof argument !== "string" || argument.length === 0)) {
+      throw new LifecycleGuardError("Expected Workbench command-line arguments are invalid.", "STATE_INVALID");
+    }
+    if (!this.backend.verifyProcessArguments) {
+      throw new LifecycleGuardError(
+        "The exact-process backend cannot attest target-bound Workbench launch arguments.",
+        "IDENTITY_UNVERIFIABLE"
+      );
+    }
+    const matched = await this.backend.verifyProcessArguments(expected, expectedArguments);
+    if (!matched) {
+      throw new LifecycleGuardError(
+        "The exact owned Workbench command line no longer attests every required target-bound launch argument.",
+        "IDENTITY_UNVERIFIABLE"
+      );
+    }
+  }
+
+  /**
+   * Inspect visible windows only after the backend has re-attested the exact
+   * owned process identity. This exists for fail-closed native-dialog
+   * detection; it deliberately does not expose process-wide window control.
+   */
+  async inspectExactWindows(expected: WorkbenchIdentity): Promise<readonly WorkbenchWindow[]> {
+    if (!this.backend.inspectWindows) {
+      throw new LifecycleGuardError(
+        "The exact-process backend cannot inspect windows for the owned Workbench.",
+        "IDENTITY_UNVERIFIABLE"
+      );
+    }
+    const windows = await this.backend.inspectWindows(expected);
+    for (const window of windows) {
+      if (typeof window.handle !== "string" || window.handle.length === 0 ||
+          typeof window.ownerHandle !== "string" || window.ownerHandle.length === 0 ||
+          typeof window.className !== "string" || typeof window.title !== "string" ||
+          typeof window.visible !== "boolean" || typeof window.enabled !== "boolean" ||
+          typeof window.iconic !== "boolean") {
+        throw new LifecycleGuardError(
+          "Exact Workbench window inspection returned malformed window metadata.",
+          "IDENTITY_UNVERIFIABLE"
+        );
+      }
+    }
+    return Object.freeze(windows.map((window) => Object.freeze({ ...window })));
+  }
+
+  /**
+   * Post WM_CLOSE only to a just-inspected native modal of the already
+   * exact-owned Workbench. Besides an owned child, this permits exactly one
+   * newly visible unowned top-level window only when a previously enabled
+   * exact-Workbench top-level window is now disabled. The backend revalidates
+   * identity and every supplied window attribute immediately before posting.
+   */
+  async closeExactWindow(
+    expected: WorkbenchIdentity,
+    window: WorkbenchWindowCloseRequest
+  ): Promise<boolean> {
+    if (!this.backend.closeWindow) {
+      throw new LifecycleGuardError(
+        "The exact-process backend cannot close a native dialog for the owned Workbench.",
+        "IDENTITY_UNVERIFIABLE"
+      );
+    }
+    if (!window.handle || !window.ownerHandle || !window.className || !window.title) {
+      throw new LifecycleGuardError(
+        "The native dialog close request is missing exact window identity metadata.",
+        "STATE_INVALID"
+      );
+    }
+    if (window.kind === "owned_child") {
+      if (window.ownerHandle === "0") {
+        throw new LifecycleGuardError(
+          "The native dialog close request is not a visible owned Workbench child window.",
+          "STATE_INVALID"
+        );
+      }
+    } else if (window.kind === "disabled_main_new_top_level") {
+      if (window.ownerHandle !== "0" || !window.disabledMainHandle ||
+          window.disabledMainHandle === window.handle) {
+        throw new LifecycleGuardError(
+          "The unowned native-dialog close request lacks its disabled exact Workbench main window.",
+          "STATE_INVALID"
+        );
+      }
+    } else {
+      throw new LifecycleGuardError(
+        "The native dialog close request has an unsupported close mode.",
+        "STATE_INVALID"
+      );
+    }
+    return this.backend.closeWindow(expected, window);
   }
 
   /**

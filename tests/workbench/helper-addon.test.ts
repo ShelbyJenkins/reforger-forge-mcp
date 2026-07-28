@@ -1,5 +1,6 @@
 import { cpSync, existsSync, mkdirSync, readFileSync, utimesSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import {
   WORKBENCH_HELPER_ADDON_GUID,
@@ -12,6 +13,8 @@ import {
   verifyWorkbenchHelperSource,
 } from "../../src/workbench/helper-addon.js";
 import { withTemporaryDirectory } from "../support/temporary-directory.js";
+
+const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 
 describe("MCP-managed Workbench helper add-on", () => {
   it("verifies, stages, and reuses the fixed companion with a deterministic external profile", async () => {
@@ -164,6 +167,43 @@ describe("MCP-managed Workbench helper add-on", () => {
       manifest.files.filter((file) =>
         file.path !== "Scripts/WorkbenchGame/EnfusionMCP/RFWB_HelperBuild.c")
     ));
+  });
+
+  it("keeps the generic save handler absent while packaging the target-bound save handler", () => {
+    const source = defaultWorkbenchHelperSource();
+    const manifest = verifyWorkbenchHelperSource(source).manifest;
+    const payload = readFileSync(
+      join(packageRoot, "src", "workbench", "helper-addon-payload.generated.ts"),
+      "utf8"
+    );
+
+    expect(existsSync(join(
+      source,
+      "Scripts",
+      "WorkbenchGame",
+      "EnfusionMCP",
+      "EMCP_WB_SaveResource.c"
+    ))).toBe(false);
+    expect(manifest.files.map((file) => file.path)).not.toContain(
+      "Scripts/WorkbenchGame/EnfusionMCP/EMCP_WB_SaveResource.c"
+    );
+    expect(payload).not.toContain("EMCP_WB_SaveResource.c");
+    expect(manifest.files.map((file) => file.path)).toContain(
+      "Scripts/WorkbenchGame/EnfusionMCP/EMCP_WB_ExplicitResourceSave.c"
+    );
+    expect(payload).toContain("EMCP_WB_ExplicitResourceSave.c");
+    const explicitHandler = readFileSync(join(
+      source,
+      "Scripts",
+      "WorkbenchGame",
+      "EnfusionMCP",
+      "EMCP_WB_ExplicitResourceSave.c"
+    ), "utf8");
+    expect(explicitHandler).toContain("exact owned process");
+    expect(explicitHandler).toContain("resp.startupLoadPath = req.expectedPath");
+    expect(explicitHandler).toContain("Resource metadata not found for the explicit target");
+    expect(explicitHandler).toContain("worldEditor.Save()");
+    expect(explicitHandler).not.toContain("GetContainer(");
   });
 
   it("expires old digest roots and orphaned profile captures without touching the current bundle", async () => {

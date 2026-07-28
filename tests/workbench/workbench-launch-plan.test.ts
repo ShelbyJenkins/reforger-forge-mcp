@@ -9,6 +9,7 @@ import type { Config } from "../../src/config.js";
 import {
   buildCliEditorLaunchPlan,
   buildMcpEditorLaunchPlan,
+  buildMcpTargetResourceLaunchPlan,
   buildTargetBuildLaunchPlan,
   buildWorkbenchLaunchPlan,
   canonicalizeWorkbenchAddonDirectories,
@@ -22,6 +23,7 @@ import {
   WORKBENCH_HELPER_ADDON_ID,
 } from "../../src/workbench/helper-addon.js";
 import { canonicalizeGproj } from "../../src/workbench/project-identity.js";
+import { canonicalizeResourceTarget } from "../../src/workbench/resource-target.js";
 import {
   WORKBENCH_OWNER_ARG_PREFIX,
   WORKBENCH_PROCESS_NAME,
@@ -166,6 +168,49 @@ describe("canonical Workbench launch-plan policy", () => {
     expect(plan.argv.filter((arg) => arg.startsWith(WORKBENCH_OWNER_ARG_PREFIX))).toEqual([
       OWNER_ARGUMENT,
     ]);
+  });
+
+  scopedIt("binds a fresh MCP editor to one canonical .ent through the Workbench -load argument", (root) => {
+    const harness = createHarness(root);
+    const resourcePath = join(harness.project.modDirectory, "Worlds", "Target.ent");
+    mkdirSync(dirname(resourcePath), { recursive: true });
+    writeFileSync(resourcePath, "SubScene {}\n");
+    writeFileSync(`${resourcePath}.meta`, "MetaFileClass {}\n");
+    const resource = canonicalizeResourceTarget(resourcePath, harness.project);
+
+    const plan = buildMcpTargetResourceLaunchPlan({
+      kind: "mcp_target_resource",
+      config: harness.config,
+      project: harness.project,
+      resource,
+      companion: harness.companion,
+      endpoint: { host: "127.0.0.1", port: 5775 },
+      ownerArgument: OWNER_ARGUMENT,
+      managedRoot: harness.managedRoot,
+    });
+
+    expect(plan.kind).toBe("mcp_target_resource");
+    expect(plan.resource.displayPath).toBe(realpathSync.native(resourcePath));
+    expect(plan.argv).toEqual([
+      "-addonsDir",
+      `${harness.baseAddonRoot},${realpathSync.native(harness.companion.addonSearchRoot)}`,
+      "-addons",
+      WORKBENCH_HELPER_ADDON_GUID,
+      "-profile",
+      realpathSync.native(harness.companion.workbenchProfilePath),
+      "-gproj",
+      harness.projectPath,
+      "-scriptAuthorizeAll",
+      "-noThrow",
+      OWNER_ARGUMENT,
+      "-wbModule=WorldEditor",
+      "-run",
+      "-load",
+      realpathSync.native(resourcePath),
+      "-reforgerForgeExplicitTarget",
+      realpathSync.native(resourcePath),
+    ]);
+    expect(plan.argv).not.toContain("-forceSaveAll");
   });
 
   scopedIt("builds the visible foreground CLI editor plan with World Editor lifetime policy", (root) => {

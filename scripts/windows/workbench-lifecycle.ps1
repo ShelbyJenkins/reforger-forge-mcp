@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
 	[Parameter(Mandatory = $true)]
-	[ValidateSet('HoldMutex', 'InspectCurrent', 'InspectProcess', 'ListWorkbench', 'MinimizeWindow', 'VerifyEndpointOwner', 'VerifyEndpointVacant', 'VerifyTerminate')]
+	[ValidateSet('HoldMutex', 'InspectCurrent', 'InspectProcess', 'ListWorkbench', 'MinimizeWindow', 'InspectWindows', 'CloseWindow', 'VerifyEndpointOwner', 'VerifyEndpointVacant', 'VerifyTerminate')]
 	[string]$Mode,
 
 	[long]$DeadlineUnixMs = 0
@@ -251,10 +251,8 @@ public sealed class LifecycleProcessHandle : IDisposable
         }
     }
 
-    public bool HasExactArgument(string expectedArgument)
+    private string[] GetCommandLineArguments()
     {
-        if (String.IsNullOrWhiteSpace(expectedArgument))
-            throw new LifecycleProcessException("token_mismatch", "The expected owner argument is empty.");
         string commandLine = GetCommandLine();
         int argc;
         IntPtr argv = CommandLineToArgvW(commandLine, out argc);
@@ -262,18 +260,61 @@ public sealed class LifecycleProcessHandle : IDisposable
             throw new LifecycleProcessException("command_line_unverifiable", "Windows could not parse the process command line.");
         try
         {
+            string[] arguments = new string[argc];
             for (int index = 0; index < argc; index++)
             {
                 IntPtr argumentPointer = Marshal.ReadIntPtr(argv, index * IntPtr.Size);
-                string argument = Marshal.PtrToStringUni(argumentPointer);
-                if (String.Equals(argument, expectedArgument, StringComparison.Ordinal)) return true;
+                arguments[index] = Marshal.PtrToStringUni(argumentPointer) ?? String.Empty;
             }
-            return false;
+            return arguments;
         }
         finally
         {
             LocalFree(argv);
         }
+    }
+
+    public bool HasExactArgument(string expectedArgument)
+    {
+        if (String.IsNullOrWhiteSpace(expectedArgument))
+            throw new LifecycleProcessException("token_mismatch", "The expected owner argument is empty.");
+        foreach (string argument in GetCommandLineArguments())
+        {
+            if (String.Equals(argument, expectedArgument, StringComparison.Ordinal)) return true;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Attest an ordered, contiguous argv sequence, rather than merely testing
+    /// whether each token occurs somewhere in the command line. This binds a
+    /// switch such as -load to its immediately following target path.
+    /// </summary>
+    public bool HasExactArgumentSequence(string[] expectedArguments)
+    {
+        if (expectedArguments == null || expectedArguments.Length == 0)
+            throw new LifecycleProcessException("token_mismatch", "The expected argument sequence is empty.");
+        foreach (string expected in expectedArguments)
+        {
+            if (String.IsNullOrWhiteSpace(expected))
+                throw new LifecycleProcessException("token_mismatch", "The expected argument sequence contains an empty token.");
+        }
+        string[] actualArguments = GetCommandLineArguments();
+        if (expectedArguments.Length > actualArguments.Length) return false;
+        for (int start = 0; start <= actualArguments.Length - expectedArguments.Length; start++)
+        {
+            bool matches = true;
+            for (int offset = 0; offset < expectedArguments.Length; offset++)
+            {
+                if (!String.Equals(actualArguments[start + offset], expectedArguments[offset], StringComparison.Ordinal))
+                {
+                    matches = false;
+                    break;
+                }
+            }
+            if (matches) return true;
+        }
+        return false;
     }
 
     public bool HasExited()
@@ -592,6 +633,173 @@ public static class LifecycleWindowVisibility
         return handledAtLeastOnce;
     }
 }
+
+public sealed class LifecycleWindowRecord
+{
+    public string handle { get; set; }
+    public string ownerHandle { get; set; }
+    public string className { get; set; }
+    public string title { get; set; }
+    public bool visible { get; set; }
+    public bool enabled { get; set; }
+    public bool iconic { get; set; }
+}
+
+public static class LifecycleWindowInspection
+{
+    private const uint GW_OWNER = 4;
+    private const uint WM_CLOSE = 0x0010;
+
+    private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+    [DllImport("user32.dll")]
+    private static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+
+    [DllImport("user32.dll")]
+    private static extern bool IsWindowVisible(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    private static extern bool IsWindowEnabled(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    private static extern bool IsIconic(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetWindow(IntPtr hWnd, uint uCmd);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern int GetClassName(IntPtr hWnd, StringBuilder className, int maxCount);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int maxCount);
+
+    [DllImport("user32.dll")]
+    private static extern bool PostMessage(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
+
+    private static string HandleString(IntPtr handle)
+    {
+        return handle.ToInt64().ToString(CultureInfo.InvariantCulture);
+    }
+
+    private static string WindowClass(IntPtr handle)
+    {
+        StringBuilder value = new StringBuilder(256);
+        GetClassName(handle, value, value.Capacity);
+        return value.ToString();
+    }
+
+    private static string WindowTitle(IntPtr handle)
+    {
+        StringBuilder value = new StringBuilder(1024);
+        GetWindowText(handle, value, value.Capacity);
+        return value.ToString();
+    }
+
+    /// <summary>
+    /// Some common dialogs are hosted by a helper process rather than the
+    /// caller's PID. They are still safely attributable only when walking
+    /// GW_OWNER reaches a top-level window owned by the exact target process.
+    /// </summary>
+    private static bool OwnerChainContainsProcess(IntPtr handle, int processId)
+    {
+        HashSet<long> seen = new HashSet<long>();
+        IntPtr owner = GetWindow(handle, GW_OWNER);
+        while (owner != IntPtr.Zero)
+        {
+            long key = owner.ToInt64();
+            if (!seen.Add(key)) return false;
+            uint ownerProcessId;
+            GetWindowThreadProcessId(owner, out ownerProcessId);
+            if ((int)ownerProcessId == processId) return true;
+            owner = GetWindow(owner, GW_OWNER);
+        }
+        return false;
+    }
+
+    public static List<LifecycleWindowRecord> ListVisibleProcessWindows(int processId)
+    {
+        List<LifecycleWindowRecord> result = new List<LifecycleWindowRecord>();
+        EnumWindows(delegate (IntPtr hWnd, IntPtr lParam)
+        {
+            uint windowProcessId;
+            GetWindowThreadProcessId(hWnd, out windowProcessId);
+            if (!IsWindowVisible(hWnd)) return true;
+            if ((int)windowProcessId != processId && !OwnerChainContainsProcess(hWnd, processId)) return true;
+            IntPtr owner = GetWindow(hWnd, GW_OWNER);
+            result.Add(new LifecycleWindowRecord {
+                handle = HandleString(hWnd),
+                ownerHandle = HandleString(owner),
+                className = WindowClass(hWnd),
+                title = WindowTitle(hWnd),
+                visible = true,
+                enabled = IsWindowEnabled(hWnd),
+                iconic = IsIconic(hWnd),
+            });
+            return true;
+        }, IntPtr.Zero);
+        return result;
+    }
+
+    /// <summary>
+    /// Close only a just-inspected exact-Workbench modal. Ordinary dialogs
+    /// must be owned children. A narrow Qt compatibility case permits an
+    /// unowned top-level dialog only when it is in the exact target process
+    /// and the separately attested top-level main window is disabled.
+    /// </summary>
+    public static bool CloseVisibleModalWindow(
+        int processId,
+        string expectedHandle,
+        string expectedClassName,
+        string expectedTitle,
+        string expectedOwnerHandle,
+        string closeKind,
+        string expectedDisabledMainHandle)
+    {
+        long handleValue;
+        long ownerValue;
+        if (!Int64.TryParse(expectedHandle, NumberStyles.Integer, CultureInfo.InvariantCulture, out handleValue))
+            return false;
+        if (!Int64.TryParse(expectedOwnerHandle, NumberStyles.Integer, CultureInfo.InvariantCulture, out ownerValue))
+            return false;
+        IntPtr handle = new IntPtr(handleValue);
+        uint windowProcessId;
+        GetWindowThreadProcessId(handle, out windowProcessId);
+        if (windowProcessId == 0 || !IsWindowVisible(handle)) return false;
+        if (!String.Equals(WindowClass(handle), expectedClassName ?? String.Empty, StringComparison.Ordinal)) return false;
+        if (!String.Equals(WindowTitle(handle), expectedTitle ?? String.Empty, StringComparison.Ordinal)) return false;
+        if (GetWindow(handle, GW_OWNER).ToInt64() != ownerValue) return false;
+        if ((int)windowProcessId != processId && !OwnerChainContainsProcess(handle, processId)) return false;
+
+        if (String.Equals(closeKind, "owned_child", StringComparison.Ordinal))
+        {
+            if (ownerValue == 0) return false;
+        }
+        else if (String.Equals(closeKind, "disabled_main_new_top_level", StringComparison.Ordinal))
+        {
+            // An unowned dialog cannot be tied to another process through an
+            // owner chain. Require it to be a direct exact-Workbench window,
+            // and prove that the separately snapshotted top-level main window
+            // is still disabled immediately before posting WM_CLOSE.
+            if (ownerValue != 0 || (int)windowProcessId != processId) return false;
+            long mainHandleValue;
+            if (!Int64.TryParse(expectedDisabledMainHandle, NumberStyles.Integer, CultureInfo.InvariantCulture, out mainHandleValue))
+                return false;
+            IntPtr mainHandle = new IntPtr(mainHandleValue);
+            if (mainHandle == handle || !IsWindowVisible(mainHandle) || IsWindowEnabled(mainHandle)) return false;
+            uint mainProcessId;
+            GetWindowThreadProcessId(mainHandle, out mainProcessId);
+            if ((int)mainProcessId != processId || GetWindow(mainHandle, GW_OWNER) != IntPtr.Zero) return false;
+        }
+        else
+        {
+            return false;
+        }
+        return PostMessage(handle, WM_CLOSE, IntPtr.Zero, IntPtr.Zero);
+    }
+}
 '@
 
 function ConvertTo-LifecycleIdentity
@@ -719,6 +927,7 @@ function Invoke-InspectProcess
 	$request = Read-LifecycleRequest
 	$processId = [int](Get-LifecycleProperty -Object $request -Name 'pid' -Default 0)
 	$expectedArgument = [string](Get-LifecycleProperty -Object $request -Name 'expectedOwnerTokenArgument' -Default '')
+	$expectedArguments = @(Get-LifecycleProperty -Object $request -Name 'expectedArguments' -Default @())
 	$handle = $null
 	try
 	{
@@ -730,12 +939,28 @@ function Invoke-InspectProcess
 		{
 			$argumentMatched = $handle.HasExactArgument($expectedArgument)
 		}
+		$expectedArgumentsMatched = $null
+		if ($expectedArguments.Count -gt 0)
+		{
+			$sequence = New-Object 'System.Collections.Generic.List[string]'
+			foreach ($expected in $expectedArguments)
+			{
+				$value = [string]$expected
+				if ([string]::IsNullOrWhiteSpace($value))
+				{
+					throw [LifecycleProcessException]::new('token_mismatch', 'The expected command-line argument sequence contains an empty token.')
+				}
+				$sequence.Add($value)
+			}
+			$expectedArgumentsMatched = $handle.HasExactArgumentSequence($sequence.ToArray())
+		}
 		Assert-LifecycleDeadline
 		Write-LifecycleProtocol ([ordered]@{
 			ok = $true
 			status = 'found'
 			identity = $identity
 			ownerArgumentMatched = $argumentMatched
+			expectedArgumentsMatched = $expectedArgumentsMatched
 		})
 	}
 	catch [LifecycleProcessException]
@@ -822,6 +1047,102 @@ function Invoke-MinimizeWindow
 	{
 		$processException = Resolve-LifecycleProcessException -ErrorRecord $_
 		Write-LifecycleProcessRefusal -Exception $processException
+	}
+}
+
+function Assert-ExactWindowProcess
+{
+	param(
+		[Parameter(Mandatory = $true)][object]$Expected,
+		[Parameter(Mandatory = $true)][LifecycleProcessHandle]$Handle
+	)
+	$expectedPath = [string](Get-LifecycleProperty -Object $Expected -Name 'executablePath' -Default '')
+	$expectedCreation = [string](Get-LifecycleProperty -Object $Expected -Name 'creationTime' -Default '')
+	$expectedArgument = [string](Get-LifecycleProperty -Object $Expected -Name 'ownerTokenArgument' -Default '')
+	if ([string]::IsNullOrWhiteSpace($expectedPath) -or [string]::IsNullOrWhiteSpace($expectedCreation) -or
+		[string]::IsNullOrWhiteSpace($expectedArgument))
+	{
+		throw [LifecycleProcessException]::new('helper_failure', 'The expected owned Workbench identity is incomplete.')
+	}
+	if (-not [StringComparer]::OrdinalIgnoreCase.Equals(
+		[IO.Path]::GetFullPath($expectedPath), [IO.Path]::GetFullPath($Handle.GetExecutablePath())))
+	{
+		throw [LifecycleProcessException]::new('executable_mismatch', 'The window target executable does not match the exact owned Workbench.')
+	}
+	if (-not [StringComparer]::Ordinal.Equals($expectedCreation, $Handle.GetCreationTime()))
+	{
+		throw [LifecycleProcessException]::new('creation_time_mismatch', 'The window target creation time does not match the exact owned Workbench.')
+	}
+	if (-not $Handle.HasExactArgument($expectedArgument))
+	{
+		throw [LifecycleProcessException]::new('token_mismatch', 'The exact owner argument is absent from the window target process.')
+	}
+}
+
+function Invoke-InspectWindows
+{
+	$request = Read-LifecycleRequest
+	$expected = Get-LifecycleProperty -Object $request -Name 'expected'
+	$processId = [int](Get-LifecycleProperty -Object $expected -Name 'pid' -Default 0)
+	$handle = $null
+	try
+	{
+		$handle = [LifecycleProcessHandle]::Open($processId, $false)
+		Assert-ExactWindowProcess -Expected $expected -Handle $handle
+		Assert-LifecycleDeadline
+		$windows = [LifecycleWindowInspection]::ListVisibleProcessWindows($processId)
+		Write-LifecycleProtocol ([ordered]@{
+			ok = $true
+			status = 'complete'
+			windows = @($windows | ForEach-Object { $_ })
+		})
+	}
+	catch [LifecycleProcessException]
+	{
+		$processException = Resolve-LifecycleProcessException -ErrorRecord $_
+		Write-LifecycleProcessRefusal -Exception $processException
+	}
+	finally
+	{
+		if ($null -ne $handle) { $handle.Dispose() }
+	}
+}
+
+function Invoke-CloseWindow
+{
+	$request = Read-LifecycleRequest
+	$expected = Get-LifecycleProperty -Object $request -Name 'expected'
+	$processId = [int](Get-LifecycleProperty -Object $expected -Name 'pid' -Default 0)
+	$window = Get-LifecycleProperty -Object $request -Name 'window'
+	$handle = $null
+	try
+	{
+		$handle = [LifecycleProcessHandle]::Open($processId, $false)
+		Assert-ExactWindowProcess -Expected $expected -Handle $handle
+		$closed = [LifecycleWindowInspection]::CloseVisibleModalWindow(
+			$processId,
+			[string](Get-LifecycleProperty -Object $window -Name 'handle' -Default ''),
+			[string](Get-LifecycleProperty -Object $window -Name 'className' -Default ''),
+			[string](Get-LifecycleProperty -Object $window -Name 'title' -Default ''),
+			[string](Get-LifecycleProperty -Object $window -Name 'ownerHandle' -Default ''),
+			[string](Get-LifecycleProperty -Object $window -Name 'kind' -Default ''),
+			[string](Get-LifecycleProperty -Object $window -Name 'disabledMainHandle' -Default ''))
+		Assert-LifecycleDeadline
+		Write-LifecycleProtocol ([ordered]@{
+			ok = $closed
+			status = $(if ($closed) { 'closed' } else { 'refused' })
+			reason = $(if ($closed) { $null } else { 'window_mismatch' })
+		message = $(if ($closed) { $null } else { 'The visible native modal no longer matched the exact close request.' })
+		})
+	}
+	catch [LifecycleProcessException]
+	{
+		$processException = Resolve-LifecycleProcessException -ErrorRecord $_
+		Write-LifecycleProcessRefusal -Exception $processException
+	}
+	finally
+	{
+		if ($null -ne $handle) { $handle.Dispose() }
 	}
 }
 
@@ -1086,6 +1407,8 @@ try
 		'InspectProcess' { Invoke-InspectProcess }
 		'ListWorkbench' { Invoke-ListWorkbench }
 		'MinimizeWindow' { Invoke-MinimizeWindow }
+		'InspectWindows' { Invoke-InspectWindows }
+		'CloseWindow' { Invoke-CloseWindow }
 		'VerifyEndpointOwner' { Invoke-VerifyEndpointOwner }
 		'VerifyEndpointVacant' { Invoke-VerifyEndpointVacant }
 		'VerifyTerminate' { Invoke-VerifyTerminate }

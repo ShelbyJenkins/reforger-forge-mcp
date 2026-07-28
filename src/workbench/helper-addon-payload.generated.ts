@@ -9,6 +9,7 @@ export const WORKBENCH_HELPER_PAYLOAD_FILES = [
   "Scripts/WorkbenchGame/EnfusionMCP/EMCP_WB_DeleteEntity.c",
   "Scripts/WorkbenchGame/EnfusionMCP/EMCP_WB_EditorControl.c",
   "Scripts/WorkbenchGame/EnfusionMCP/EMCP_WB_ExecuteAction.c",
+  "Scripts/WorkbenchGame/EnfusionMCP/EMCP_WB_ExplicitResourceSave.c",
   "Scripts/WorkbenchGame/EnfusionMCP/EMCP_WB_GetCameraPos.c",
   "Scripts/WorkbenchGame/EnfusionMCP/EMCP_WB_GetEntity.c",
   "Scripts/WorkbenchGame/EnfusionMCP/EMCP_WB_GetState.c",
@@ -30,6 +31,7 @@ export const WORKBENCH_HELPER_PAYLOAD_FILES = [
   "Scripts/WorkbenchGame/EnfusionMCP/EMCP_WB_ScriptEditor.c",
   "Scripts/WorkbenchGame/EnfusionMCP/EMCP_WB_SelectEntity.c",
   "Scripts/WorkbenchGame/EnfusionMCP/EMCP_WB_Terrain.c",
+  "Scripts/WorkbenchGame/EnfusionMCP/EMCP_WB_ValidateResource.c",
   "Scripts/WorkbenchGame/EnfusionMCP/RFWB_HelperBuild.c",
 ] as const;
 
@@ -40,6 +42,7 @@ export const WORKBENCH_HELPER_HANDLER_FILES = [
   "EMCP_WB_DeleteEntity.c",
   "EMCP_WB_EditorControl.c",
   "EMCP_WB_ExecuteAction.c",
+  "EMCP_WB_ExplicitResourceSave.c",
   "EMCP_WB_GetCameraPos.c",
   "EMCP_WB_GetEntity.c",
   "EMCP_WB_GetState.c",
@@ -59,4 +62,5 @@ export const WORKBENCH_HELPER_HANDLER_FILES = [
   "EMCP_WB_ScriptEditor.c",
   "EMCP_WB_SelectEntity.c",
   "EMCP_WB_Terrain.c",
+  "EMCP_WB_ValidateResource.c",
 ] as const;

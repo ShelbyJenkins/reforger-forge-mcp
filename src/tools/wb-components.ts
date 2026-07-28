@@ -49,6 +49,18 @@ export function registerWbComponent(server: McpServer, client: WorkbenchClient):
         if (componentIndex !== undefined) params.componentIndex = componentIndex;
 
         const result = await client.call<Record<string, unknown>>("EMCP_WB_Components", params);
+        if (result.status !== "ok") {
+          const message = typeof result.message === "string" && result.message.trim()
+            ? result.message
+            : `Workbench could not ${action} component(s) on "${entityName}".`;
+          return {
+            content: [{
+              type: "text" as const,
+              text: `Error managing component on "${entityName}": ${message}${formatConnectionStatus(client)}`,
+            }],
+            isError: true,
+          };
+        }
 
         if (action === "list") {
           const components = Array.isArray(result.components) ? result.components : [];

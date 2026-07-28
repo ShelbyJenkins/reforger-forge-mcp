@@ -138,6 +138,8 @@ export interface WindowsHelperResponse {
   message?: string;
   identity?: unknown;
   ownerArgumentMatched?: unknown;
+  expectedArgumentsMatched?: unknown;
+  windows?: unknown;
   processes?: unknown;
   unverifiable?: unknown;
   listenerPid?: unknown;

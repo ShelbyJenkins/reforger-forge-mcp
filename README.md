@@ -300,6 +300,7 @@ recovery, and this replacement path never signals a Workbench process.
 | `wb_diagnose` | Non-mutating diagnostic — config, packaged/staged companion identity, NET API identity, lifecycle schema/generation/phase, canonical target, endpoint, lease status, and operation. |
 | `wb_restart` | Preflight a complete replacement, then terminate through the retained verified process handle and restart the same canonical `.gproj`. A live different MCP owner cannot be claimed. |
 | `wb_shutdown` | Stop only the exact verified owner process, wait for endpoint release, and transition lifecycle state to vacant. User-launched Workbench is never signalled. |
+| `wb_save_resource` | Save one explicit `.ent` or `.et` only after `wb_launch` created a fresh target-bound session for that same resource. It refuses generic sessions, mismatched targets, and document switches; it is not general Save/Save As. |
 | `wb_state` | Full Workbench snapshot — mode (edit/play), entity count, selection, terrain bounds, sub-scene, prefab edit status. |
 | `wb_reload` | Reload plugins only. Every in-process game-script reload is refused; use verified owner-scoped `wb_restart` for clean compilation. |
 
@@ -403,10 +404,11 @@ lifecycle state; `src/index.ts` already follows this explicit shutdown contract.
 | `wb_stop` | Exit play mode and return to World Editor; already-edit mode is an idempotent success. |
 | `wb_undo_redo` | Undo or redo the last World Editor action. |
 | `wb_open_resource` | Open a resource in its editor (.et → Prefab Editor, .c → Script Editor, etc.). |
+| `wb_save_resource` | Save only the `.ent` or `.et` supplied when `wb_launch` created the current fresh target-bound session. Generic sessions, different paths, and programmatic document switches are refused. |
 
-Enter Play and save intentional editor changes manually while a person is
-attending Workbench. No automated Play, Save/Save As, or generic menu-action
-tool is advertised because those operations cannot be made reliably modal-free.
+Enter Play manually while a person is attending Workbench. There is no broad
+automated Save/Save As or generic menu-action tool; the only automated save is
+the exact target-bound `wb_save_resource` flow described above.
 
 ### Workbench Entities (Live)
 

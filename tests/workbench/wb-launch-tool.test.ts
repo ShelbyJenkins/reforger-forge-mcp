@@ -13,7 +13,7 @@ interface ToolResult {
 }
 
 type ToolHandler = (
-  input: { readonly gprojPath?: string }
+  input: { readonly gprojPath?: string; readonly resourcePath?: string }
 ) => Promise<ToolResult>;
 
 function config(): Config {
@@ -79,5 +79,41 @@ describe("wb_launch MCP tool", () => {
     expect(ensureRunning).toHaveBeenCalledOnce();
     expect(ensureRunning).toHaveBeenCalledWith(gprojPath);
     expect(effectiveConfig.defaultMod).toBeUndefined();
+  });
+
+  it("requires an explicit project and uses the target-bound launch path for a resource", async () => {
+    const ensureRunning = vi.fn();
+    const ensureTargetResourceRunning = vi.fn(async () => ({
+      action: "launched" as const,
+      pid: 1234,
+      gprojPath: "C:\\mods\\Example\\Example.gproj",
+      generation: "generation-a",
+      resourcePath: "C:\\mods\\Example\\Worlds\\Target.ent",
+      targetBound: true as const,
+    }));
+    const client = {
+      ensureRunning,
+      ensureTargetResourceRunning,
+      state: { connected: false, mode: "unknown", lastUpdated: 0 },
+    } as unknown as WorkbenchClient;
+    const tool = register(client, config());
+
+    const missingProject = await tool({ resourcePath: "Worlds/Target.ent" });
+    expect(missingProject.isError).toBe(true);
+    expect(missingProject.content[0]?.text).toContain("`TARGET_REQUIRED`");
+    expect(ensureTargetResourceRunning).not.toHaveBeenCalled();
+
+    const result = await tool({
+      gprojPath: "C:\\mods\\Example\\Example.gproj",
+      resourcePath: "C:\\mods\\Example\\Worlds\\Target.ent",
+    });
+    expect(result.isError).not.toBe(true);
+    expect(result.content[0]?.text).toContain("Resource target");
+    expect(result.content[0]?.text).toContain("wb_save_resource");
+    expect(ensureRunning).not.toHaveBeenCalled();
+    expect(ensureTargetResourceRunning).toHaveBeenCalledWith(
+      "C:\\mods\\Example\\Example.gproj",
+      "C:\\mods\\Example\\Worlds\\Target.ent"
+    );
   });
 });

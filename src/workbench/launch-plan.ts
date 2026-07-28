@@ -5,7 +5,7 @@ import {
   realpathSync,
   statSync,
 } from "node:fs";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, extname, join, resolve } from "node:path";
 import type { Config } from "../config.js";
 import {
   canonicalizeExistingDirectory,
@@ -25,6 +25,10 @@ import {
   revalidateProjectIdentity,
   type CanonicalProjectIdentity,
 } from "./project-identity.js";
+import {
+  revalidateResourceTarget,
+  type CanonicalResourceTarget,
+} from "./resource-target.js";
 import {
   WorkbenchManagedBuildProfileError,
   validateWorkbenchManagedBuildProfile,
@@ -143,6 +147,25 @@ export interface McpEditorLaunchPlan extends WorkbenchLaunchPlanBase {
   }>;
 }
 
+/**
+ * A fresh MCP-owned World Editor whose sole initial document is an explicit
+ * canonical .ent.  This is deliberately distinct from the ordinary project
+ * editor plan: callers use it only when they need a target-bound save
+ * capability and must never silently reuse a generic editor.
+ */
+export interface McpTargetResourceLaunchPlan extends WorkbenchLaunchPlanBase {
+  readonly kind: "mcp_target_resource";
+  readonly window: "visible";
+  readonly process: "detached";
+  readonly resource: Readonly<CanonicalResourceTarget>;
+  readonly helper: Readonly<WorkbenchCompanionLaunch>;
+  readonly readiness: Readonly<WorkbenchCompanionReadinessPolicy>;
+  readonly lifetime: Readonly<{
+    kind: "return_after_ready";
+    supervised: true;
+  }>;
+}
+
 export interface CliEditorLaunchPlan extends WorkbenchLaunchPlanBase {
   readonly kind: "cli_editor";
   readonly window: "visible";
@@ -174,6 +197,7 @@ export interface TargetBuildLaunchPlan extends WorkbenchLaunchPlanBase {
 
 export type WorkbenchLaunchPlan =
   | McpEditorLaunchPlan
+  | McpTargetResourceLaunchPlan
   | CliEditorLaunchPlan
   | TargetBuildLaunchPlan;
 
@@ -189,6 +213,11 @@ interface EditorLaunchPlanInputBase {
 
 export interface McpEditorLaunchPlanInput extends EditorLaunchPlanInputBase {
   readonly kind: "mcp_editor";
+}
+
+export interface McpTargetResourceLaunchPlanInput extends EditorLaunchPlanInputBase {
+  readonly kind: "mcp_target_resource";
+  readonly resource: CanonicalResourceTarget;
 }
 
 export interface CliEditorLaunchPlanInput extends EditorLaunchPlanInputBase {
@@ -208,6 +237,7 @@ export interface TargetBuildLaunchPlanInput {
 
 export type WorkbenchLaunchPlanInput =
   | McpEditorLaunchPlanInput
+  | McpTargetResourceLaunchPlanInput
   | CliEditorLaunchPlanInput
   | TargetBuildLaunchPlanInput;
 
@@ -560,6 +590,39 @@ function editorArguments(
   return immutableArguments(args, ownerArgument);
 }
 
+function targetResourceEditorArguments(
+  addonDirectories: readonly string[],
+  companion: Readonly<WorkbenchCompanionLaunch>,
+  project: CanonicalProjectIdentity,
+  resource: CanonicalResourceTarget,
+  scriptAuthorizeAll: boolean,
+  ownerArgument: string
+): readonly string[] {
+  const args: string[] = [];
+  if (addonDirectories.length > 0) args.push("-addonsDir", addonDirectories.join(","));
+  args.push(
+    "-addons",
+    companion.addonGuid,
+    "-profile",
+    companion.workbenchProfilePath,
+    "-gproj",
+    project.displayPath
+  );
+  if (scriptAuthorizeAll) args.push("-scriptAuthorizeAll");
+  args.push("-noThrow", ownerArgument, "-wbModule=WorldEditor", "-run");
+  // A .ent can be loaded as the explicit World Editor document. In contrast,
+  // Workbench treats a .et supplied to -load as an unsaved temporary world,
+  // so WorldEditor.Save() opens "Save world as" instead of saving the prefab.
+  // The fresh target-bound process still carries the immutable target marker;
+  // its startup verifier opens a .et through WorldEditor only after the helper
+  // endpoint is attested.
+  if (extname(resource.displayPath).toLowerCase() !== ".et") {
+    args.push("-load", resource.displayPath);
+  }
+  args.push("-reforgerForgeExplicitTarget", resource.displayPath);
+  return immutableArguments(args, ownerArgument);
+}
+
 /**
  * @deprecated Stage-2 argument-only compatibility surface. New launch sites
  * must construct one of the three discriminated Workbench launch plans.
@@ -646,7 +709,7 @@ export function buildLegacyWorkbenchLaunchArguments(
 }
 
 function preparedEditorInput(
-  input: McpEditorLaunchPlanInput | CliEditorLaunchPlanInput
+  input: McpEditorLaunchPlanInput | McpTargetResourceLaunchPlanInput | CliEditorLaunchPlanInput
 ): {
   executablePath: string;
   project: CanonicalProjectIdentity;
@@ -720,6 +783,51 @@ export function buildMcpEditorLaunchPlan(
       true,
       false,
       "minimizedNoActivate"
+    ),
+    helper: prepared.companion,
+    readiness: prepared.readiness,
+    lifetime: Object.freeze({ kind: "return_after_ready", supervised: true }),
+  });
+}
+
+/**
+ * Build a fresh MCP-owned World Editor whose initial document is exactly the
+ * supplied canonical entity resource.  It is intentionally separate from the
+ * ordinary project editor plan so save-capable callers cannot silently reuse a
+ * generic Workbench session.
+ */
+export function buildMcpTargetResourceLaunchPlan(
+  input: McpTargetResourceLaunchPlanInput
+): McpTargetResourceLaunchPlan {
+  const prepared = preparedEditorInput(input);
+  const project = immutableProject(prepared.project);
+  const resource = Object.freeze({
+    ...revalidateResourceTarget(input.resource, project),
+    project,
+  });
+  return Object.freeze({
+    kind: "mcp_target_resource",
+    window: "visible",
+    process: "detached",
+    executablePath: prepared.executablePath,
+    project,
+    lifecycleTarget: toLifecycleTarget(prepared.project),
+    resource,
+    addonDirectories: prepared.addonDirectories,
+    ownerArgument: prepared.ownerArgument,
+    argv: targetResourceEditorArguments(
+      prepared.addonDirectories,
+      prepared.companion,
+      prepared.project,
+      resource,
+      input.config.workbenchScriptAuthorizeAll === true,
+      prepared.ownerArgument
+    ),
+    spawnOptions: spawnPolicy(
+      resolveMcpWorkingDirectory(input.config),
+      true,
+      false,
+      "normal"
     ),
     helper: prepared.companion,
     readiness: prepared.readiness,

@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -122,7 +123,14 @@ function asRecord(value: unknown, label: string): Record<string, unknown> {
 }
 
 function defaultAgentPath(): string {
-  return join(dirname(fileURLToPath(import.meta.url)), "agent", "private-child.js");
+  const moduleDirectory = dirname(fileURLToPath(import.meta.url));
+  const colocated = join(moduleDirectory, "agent", "private-child.js");
+  // Production loads application.js from dist/observer, where the private
+  // child is colocated. `tsx src/index.ts` loads this source file instead;
+  // in that case the child remains in the built dist tree and must not be
+  // resolved as the nonexistent src/observer/agent/private-child.js.
+  if (existsSync(colocated)) return colocated;
+  return resolve(moduleDirectory, "..", "..", "dist", "observer", "agent", "private-child.js");
 }
 
 export function defaultObserverManagedRoot(): string {
