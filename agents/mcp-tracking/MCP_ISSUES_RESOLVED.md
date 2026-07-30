@@ -5,6 +5,74 @@ records. Move newly resolved or verified entries to the top. The legacy records
 below were migrated from the mixed tracker on 2026-07-28; same-day ties retain
 their migration order.
 
+### MCP-039 — provide a safe way to release or transfer an idle lifecycle lease
+
+**Status:** Resolved
+
+**Priority:** P0
+
+**Closed:** 2026-07-28
+
+**Decision:** Preempt a provably idle lease at claim time instead of building a
+cooperative release/transfer protocol between MCP hosts.
+
+The root cause was that the lease had no release path at all: `mcpOwner` was
+never cleared, so a claim survived for the owning process's entire lifetime.
+`validateAndClaimLocked` recovered a dead owner but refused a live one purely
+because its PID still resolved, even when the record was quiescent.
+
+`WorkbenchProcessGuard.validateAndClaimLocked` now consults
+`provenIdleLease` before refusing a live owner, and claims with the new
+`source: "idle_owner"` when every one of these holds:
+
+- the durable record is `phase: vacant` with no `workbench` and no `operation`
+- no Workbench process exists (a strict scan, not a best-effort one)
+- the NET API endpoint is positively `vacant`
+- the recorded owner has the same Windows user SID (unchanged precondition)
+
+Anything unproven — an unverifiable process scan or an unverifiable endpoint
+probe — keeps the lease with its current owner and returns
+`OWNED_BY_OTHER_MCP` with the specific reason it was not idle.
+
+A cooperative request to the owner was deliberately not built. Every operation
+the lease protects (capture, editor session, build, target-bound save, Observer
+restoration) requires a live Workbench and is already fenced by
+`workbench !== null` plus `phase: running`, so a vacant record is itself the
+owner's durable idle attestation. Asking the owning process would add a channel
+and a new class of hangs without adding evidence. A heartbeat/expiry contract
+was also rejected: it is time-based, and it can revoke a lease from an owner
+whose Workbench is live but whose event loop is briefly blocked.
+
+Safety rests on two existing invariants rather than on process termination.
+The whole decision runs inside the machine-wide lifecycle mutex, so concurrent
+claims cannot interleave, and `transitionLocked` refuses any mutation whose
+generation and lease id were superseded. A preempted owner is never signalled;
+its next mutation fails `GENERATION_MISMATCH` and it recovers by re-claiming.
+
+Clearing `mcpOwner` inside `transitionToVacant` was evaluated and rejected as
+unsafe. Several flows — `ensureRunningCoordinated` in particular — pass through
+a vacant record as an intermediate state of one larger owned operation and then
+reacquire across a separate lock acquisition, so releasing there would open a
+window for a competing MCP mid-launch. Preemption covers those cases anyway,
+because it recovers any vacant lease regardless of how it was left behind.
+
+`wb_diagnose` lifecycle evidence gained `leaseOwner` (owning pid, instance id,
+lease id, claim time) and `leasePreemptible`, so the owning session can be
+identified without terminating an OS process.
+
+**Verification:** Focused regression coverage in
+`tests/workbench/process-guard.test.ts` for idle-owner preemption, the
+preempted owner's `GENERATION_MISMATCH` fence and re-claim, and refusal for a
+running Workbench, an in-progress operation, an occupied endpoint, an
+unverifiable endpoint, a live unowned Workbench process, an unverifiable
+process scan, and a different Windows user. `tests/workbench/diagnostics.test.ts`
+covers the new lease projection. `tests/workbench/multiprocess-lifecycle.test.ts`
+proves the handoff across two real live Node MCP processes on Windows: the
+contender takes the idle lease with `source: "idle_owner"`, neither process is
+terminated, and the previous owner is refused with `OWNED_BY_OTHER_MCP` once
+the new owner reserves the lease. The full Vitest suite (1820 tests),
+TypeScript typecheck, and knip passed.
+
 ## Historical and verified records
 
 ### MCP-030 — remove configured `projectPath` targeting

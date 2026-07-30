@@ -23,6 +23,17 @@ import type { LifecycleStateRead, WorkbenchProcessGuard } from "./process-guard.
 const WORKBENCH_EXE = "ArmaReforgerWorkbenchSteamDiag.exe";
 const WORKBENCH_SUBDIR = "Workbench";
 
+/**
+ * Enough of the recorded lease to identify the owning MCP session without
+ * exposing secrets or requiring an operator to hunt for an OS process to kill.
+ */
+export interface LifecycleLeaseOwnerDiagnostic {
+  pid: number;
+  instanceId: string;
+  leaseId: string;
+  claimedAtMs: number;
+}
+
 export interface LifecycleDiagnostic {
   state: "missing" | "valid" | "malformed";
   version: number | null;
@@ -31,6 +42,14 @@ export interface LifecycleDiagnostic {
   endpoint: string | null;
   target: string | null;
   lease: "current_mcp" | "other_mcp" | "vacant" | "unknown";
+  leaseOwner: LifecycleLeaseOwnerDiagnostic | null;
+  /**
+   * Whether the durable record is quiescent enough for another MCP to preempt
+   * the lease. This reports the recorded preconditions only; an actual claim
+   * additionally proves that no Workbench process exists and that the NET API
+   * endpoint is vacant.
+   */
+  leasePreemptible: boolean;
   operation: string | null;
   companionBuildIdentity: string | null;
   detail?: string;
@@ -92,6 +111,9 @@ function emptyLifecycleDiagnostic(
     endpoint: null,
     target: null,
     lease,
+    leaseOwner: null,
+    // A missing record is claimable; a malformed one is never assumed to be.
+    leasePreemptible: state === "missing",
     operation: null,
     companionBuildIdentity: null,
     ...(detail === undefined ? {} : { detail }),
@@ -123,6 +145,16 @@ export function formatLifecycleDiagnostic(
       : state.mcpOwner.instanceId === currentMcpInstanceId
         ? "current_mcp"
         : "other_mcp",
+    leaseOwner: state.mcpOwner
+      ? {
+          pid: state.mcpOwner.pid,
+          instanceId: state.mcpOwner.instanceId,
+          leaseId: state.mcpOwner.leaseId,
+          claimedAtMs: state.mcpOwner.claimedAtMs,
+        }
+      : null,
+    leasePreemptible: state.phase === "vacant" && state.workbench === null &&
+      state.operation === null,
     operation: state.operation ? `${state.operation.kind}:${state.operation.operationId}` : null,
     companionBuildIdentity: state.companion?.buildIdentity ?? null,
   };

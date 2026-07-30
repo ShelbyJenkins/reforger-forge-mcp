@@ -105,7 +105,7 @@ const FIXTURE_LINES = [
   "ENGINE       (E): Assertion failed: owner != null entity=RR_GameMode playerId=17",
   "RESOURCES    (E): Resources are leaking! count=3 owner=RR_GameMode",
   'RESOURCES    (W): resource not registered: @"$RoadblockRunners:Configs/Runtime/RR_RuntimeConfig.json". Setting null GUID',
-  "ENGINE       (E): failed to load addons/RoadblockRunners/Configs/Runtime.conf",
+  "ENGINE       (E): failed to load addons/addons-scenarios/RoadblockRunners/Configs/Runtime.conf",
   "RoadblockRunners startup banner",
 ];
 

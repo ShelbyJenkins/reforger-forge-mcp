@@ -172,7 +172,7 @@ export type LifecycleClaimResult =
   | {
       kind: "claimed";
       state: WorkbenchLifecycleStateV3;
-      source: "missing" | "vacant" | "dead_owner" | "malformed";
+      source: "missing" | "vacant" | "dead_owner" | "idle_owner" | "malformed";
     }
   | { kind: "owned_by_current_mcp"; state: WorkbenchLifecycleStateV3 }
   | {
@@ -1660,7 +1660,9 @@ export class WorkbenchProcessGuard {
       return { kind: "owned_by_current_mcp", state };
     }
 
+    let source: Extract<LifecycleClaimResult, { kind: "claimed" }>["source"] = "vacant";
     if (state.mcpOwner) {
+      source = "dead_owner";
       let prior: ProcessInspection | null;
       try {
         prior = await this.backend.inspectProcess(state.mcpOwner.pid);
@@ -1673,12 +1675,24 @@ export class WorkbenchProcessGuard {
         };
       }
       if (prior && processMatches(prior.identity, state.mcpOwner)) {
-        return {
-          kind: "refused",
-          code: "OWNED_BY_OTHER_MCP",
-          message: `Another live MCP process (PID ${state.mcpOwner.pid}) owns the Workbench lifecycle lease.`,
-          state,
-        };
+        // The prior owner is live, but a live process is not by itself a reason
+        // to keep the lease: every operation the lease protects requires a
+        // Workbench process, and a provably idle record has none. Preempting
+        // here is safe without asking that process anything, because this runs
+        // under the machine-wide lifecycle mutex and every mutation the old
+        // owner can still attempt is fenced by `transitionLocked`, which
+        // refuses a superseded generation and lease id.
+        const idle = await this.provenIdleLease(state, endpoint);
+        if (idle.kind === "held") {
+          return {
+            kind: "refused",
+            code: "OWNED_BY_OTHER_MCP",
+            message: `Another live MCP process (PID ${state.mcpOwner.pid}) owns the Workbench ` +
+              `lifecycle lease and it is not idle: ${idle.reason}.`,
+            state,
+          };
+        }
+        source = "idle_owner";
       }
     } else {
       const processes = await this.scanStrict();
@@ -1695,11 +1709,62 @@ export class WorkbenchProcessGuard {
       companion: state.companion,
       operation: state.operation,
     });
-    return {
-      kind: "claimed",
-      state: claimed,
-      source: state.mcpOwner ? "dead_owner" : "vacant",
-    };
+    return { kind: "claimed", state: claimed, source };
+  }
+
+  /**
+   * Decide whether a lease held by a live MCP process may be preempted.
+   *
+   * Idleness must be proven from evidence outside that process: a quiescent
+   * durable record, no Workbench process at all, and an endpoint that is
+   * positively vacant. Anything unproven — including an unverifiable scan or
+   * an unverifiable endpoint probe — keeps the lease with its current owner.
+   */
+  private async provenIdleLease(
+    state: WorkbenchLifecycleStateV3,
+    endpoint: LifecycleEndpoint
+  ): Promise<{ kind: "idle" } | { kind: "held"; reason: string }> {
+    if (state.phase !== "vacant" || state.operation !== null || state.workbench !== null) {
+      return {
+        kind: "held",
+        reason: [
+          `the lifecycle phase is ${state.phase}`,
+          ...(state.operation
+            ? [`a ${state.operation.kind} operation (${state.operation.operationId}) is in progress`]
+            : []),
+          ...(state.workbench ? [`exact Workbench PID ${state.workbench.pid} is recorded`] : []),
+        ].join(", "),
+      };
+    }
+    let processes: ExactProcessIdentity[];
+    try {
+      processes = await this.scanStrict();
+    } catch (error) {
+      return {
+        kind: "held",
+        reason: `Workbench process absence is unverifiable (${error instanceof Error ? error.message : String(error)})`,
+      };
+    }
+    if (processes.length > 0) {
+      return {
+        kind: "held",
+        reason: `Workbench PID(s) ${processes.map((entry) => entry.pid).join(", ")} are running`,
+      };
+    }
+    const vacancy = await this.verifyEndpointVacant(endpoint);
+    if (vacancy.kind === "occupied") {
+      return {
+        kind: "held",
+        reason: `endpoint ${endpoint.host}:${endpoint.port} is occupied by PID ${vacancy.listenerPid}`,
+      };
+    }
+    if (vacancy.kind !== "vacant") {
+      return {
+        kind: "held",
+        reason: `endpoint ${endpoint.host}:${endpoint.port} vacancy is unverifiable (${vacancy.reason})`,
+      };
+    }
+    return { kind: "idle" };
   }
 
   async transitionLocked(

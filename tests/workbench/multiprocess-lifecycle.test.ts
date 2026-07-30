@@ -77,7 +77,7 @@ afterEach(async () => {
 });
 
 describe.runIf(platform() === "win32")("real multi-process lifecycle ownership", () => {
-  it("keeps a second live Node MCP worker out of launch, restart, and shutdown", async () => {
+  it("hands an idle lease between two live Node MCP workers without killing either", async () => {
     const stateRoot = mkdtempSync(join(tmpdir(), "reforger-forge-node-workers-"));
     roots.push(stateRoot);
     const projectRoot = join(stateRoot, "WorkerFixture");
@@ -91,34 +91,47 @@ describe.runIf(platform() === "win32")("real multi-process lifecycle ownership",
       RR_MUTEX_NAME: `Global\\ReforgerForge.NodeWorkers.${Date.now()}.${process.pid}`,
       RR_GPROJ_PATH: gprojPath,
     };
-    const owner = track(spawn(process.execPath, ["--import", "tsx", workerPath], {
-      stdio: ["pipe", "pipe", "pipe"],
-      windowsHide: true,
-      env: { ...environment, RR_WORKER_ROLE: "owner" },
-    }));
-    const ownerMessage = JSON.parse(await readLine(owner)) as {
+    const worker = (role: string): ChildProcess => track(spawn(
+      process.execPath,
+      ["--import", "tsx", workerPath],
+      {
+        stdio: ["pipe", "pipe", "pipe"],
+        windowsHide: true,
+        env: { ...environment, RR_WORKER_ROLE: role },
+      }
+    ));
+    const ask = async (
+      child: ChildProcess,
+      command: string
+    ): Promise<{ result?: { kind: string; code?: string; source?: string }; error?: string }> => {
+      const line = readLine(child);
+      child.stdin?.write(`${command}\n`);
+      return JSON.parse(await line);
+    };
+
+    const owner = worker("owner");
+    const claimed = JSON.parse(await readLine(owner)) as {
       result?: { kind: string };
       error?: string;
     };
-    expect(ownerMessage.error).toBeUndefined();
-    expect(ownerMessage.result?.kind).toBe("claimed");
+    expect(claimed.error).toBeUndefined();
+    expect(claimed.result?.kind).toBe("claimed");
+
+    // The owner is live and idle, so the contender takes the lease outright.
+    const contender = worker("contender");
+    const handoff = await ask(contender, "claim");
+    expect(handoff.error).toBeUndefined();
+    expect(handoff.result).toMatchObject({ kind: "claimed", source: "idle_owner" });
     expect(owner.exitCode).toBeNull();
+    expect(contender.exitCode).toBeNull();
 
-    const contender = track(spawn(process.execPath, ["--import", "tsx", workerPath], {
-      stdio: ["pipe", "pipe", "pipe"],
-      windowsHide: true,
-      env: { ...environment, RR_WORKER_ROLE: "contender" },
-    }));
-    const contenderMessage = JSON.parse(await readLine(contender)) as {
-      results: Record<string, { kind: string; code: string }>;
-    };
-
-    for (const kind of ["launch", "restart", "shutdown"]) {
-      expect(contenderMessage.results[kind]).toMatchObject({
-        kind: "refused",
-        code: "OWNED_BY_OTHER_MCP",
-      });
-    }
+    // Once the new owner reserves the lease it stops being preemptible, and
+    // the previous owner is fenced out rather than silently racing it.
+    const reserved = await ask(contender, "reserve");
+    expect(reserved.error).toBeUndefined();
+    const refused = await ask(owner, "claim");
+    expect(refused.error).toBeUndefined();
+    expect(refused.result).toMatchObject({ kind: "refused", code: "OWNED_BY_OTHER_MCP" });
     expect(owner.exitCode).toBeNull();
     expect(contender.exitCode).toBeNull();
 

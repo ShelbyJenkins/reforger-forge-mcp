@@ -11,6 +11,7 @@ import { asBinary, open } from "lmdb";
 import {
   LifecycleGuardError,
   type WorkbenchIdentity,
+  type WorkbenchLifecycleStateV3,
 } from "../../src/workbench/process-guard.js";
 import { encodeDurableKey } from "../../src/foundation/durable-kv.js";
 import { createFakeLifecycleBackend } from "./fake-lifecycle-backend.js";
@@ -52,6 +53,36 @@ function target(name = "A"): { path: string; comparisonKey: string } {
   return { path: `C:\\mods\\${name}\\${name}.gproj`, comparisonKey: `c:\\mods\\${name.toLowerCase()}\\${name.toLowerCase()}.gproj` };
 }
 
+/**
+ * One live MCP owning a vacant lease, plus a second live MCP that can see the
+ * owner process. Both guards stay alive so preemption is never confused with
+ * dead-owner recovery.
+ */
+async function claimedIdleLease(stateDir: string): Promise<{
+  owner: WorkbenchProcessGuard;
+  ownerState: WorkbenchLifecycleStateV3;
+  contender: WorkbenchProcessGuard;
+  contenderBackend: ReturnType<typeof createFakeLifecycleBackend>;
+}> {
+  const ownerBackend = createFakeLifecycleBackend({
+    pid: 1101, executablePath: "C:\\node.exe", creationTime: "10001", userSid: "SID-A",
+  });
+  const contenderBackend = createFakeLifecycleBackend({
+    pid: 2202, executablePath: "C:\\node.exe", creationTime: "20002", userSid: "SID-A",
+  });
+  // Each side can see the other as live, so neither ever takes the
+  // dead-owner recovery path by accident.
+  contenderBackend.processes.set(ownerBackend.current.pid, ownerBackend.current);
+  ownerBackend.processes.set(contenderBackend.current.pid, contenderBackend.current);
+  const owner = new WorkbenchProcessGuard({ stateDir, backend: ownerBackend });
+  const contender = new WorkbenchProcessGuard({ stateDir, backend: contenderBackend });
+  const claim = await owner.withLifecycleLock((session) => session.validateAndClaim({
+    endpoint: { host: "127.0.0.1", port: 5775 }, target: target(),
+  }));
+  if (claim.kind !== "claimed") throw new Error("owner claim failed");
+  return { owner, ownerState: claim.state, contender, contenderBackend };
+}
+
 describe("WorkbenchProcessGuard v3 lifecycle state", () => {
   it("creates a durable vacant record with an exact MCP lease", async () => {
     const stateDir = root();
@@ -77,26 +108,169 @@ describe("WorkbenchProcessGuard v3 lifecycle state", () => {
     expect("lockPath" in guard).toBe(false);
   });
 
-  it("refuses a live different MCP owner", async () => {
+  it("preempts a live different MCP owner whose lease is provably idle", async () => {
     const stateDir = root();
-    const ownerBackend = createFakeLifecycleBackend({
-      pid: 1101, executablePath: "C:\\node.exe", creationTime: "10001", userSid: "SID-A",
-    });
-    const contenderBackend = createFakeLifecycleBackend({
-      pid: 2202, executablePath: "C:\\node.exe", creationTime: "20002", userSid: "SID-A",
-    });
-    contenderBackend.processes.set(ownerBackend.current.pid, ownerBackend.current);
-    const owner = new WorkbenchProcessGuard({ stateDir, backend: ownerBackend });
-    const contender = new WorkbenchProcessGuard({ stateDir, backend: contenderBackend });
-    await owner.withLifecycleLock((session) => session.validateAndClaim({
+    const { owner, contender } = await claimedIdleLease(stateDir);
+
+    const result = await contender.withLifecycleLock((session) => session.validateAndClaim({
       endpoint: { host: "127.0.0.1", port: 5775 }, target: target(),
     }));
+
+    expect(result).toMatchObject({ kind: "claimed", source: "idle_owner" });
+    if (result.kind !== "claimed") return;
+    expect(result.state.mcpOwner?.pid).toBe(2202);
+    expect(result.state.mcpOwner?.leaseId).toBe(contender.leaseId);
+    // The preempted owner is never terminated; it simply loses the next CAS.
+    expect(owner.leaseId).not.toBe(contender.leaseId);
+  });
+
+  it("fences the preempted owner's next mutation instead of corrupting state", async () => {
+    const stateDir = root();
+    const { owner, ownerState, contender } = await claimedIdleLease(stateDir);
+    await contender.withLifecycleLock((session) => session.validateAndClaim({
+      endpoint: { host: "127.0.0.1", port: 5775 }, target: target(),
+    }));
+
+    await expect(owner.withLifecycleLock((session) => session.transition(
+      { generation: ownerState.generation, leaseId: ownerState.mcpOwner!.leaseId },
+      { ...ownerState, phase: "starting" }
+    ))).rejects.toMatchObject({ code: "GENERATION_MISMATCH" });
+
+    // The old owner recovers by re-claiming rather than by being killed.
+    const reclaimed = await owner.withLifecycleLock((session) => session.validateAndClaim({
+      endpoint: { host: "127.0.0.1", port: 5775 }, target: target(),
+    }));
+    expect(reclaimed).toMatchObject({ kind: "claimed", source: "idle_owner" });
+  });
+
+  it("refuses preemption while the live owner records a running Workbench", async () => {
+    const stateDir = root();
+    const { owner, ownerState, contender, contenderBackend } = await claimedIdleLease(stateDir);
+    const wb: WorkbenchIdentity = {
+      pid: 4444,
+      executablePath: "C:\\Workbench.exe",
+      creationTime: "40004",
+      ownerTokenArgument: owner.ownerArgument("token-live"),
+      launchedAtMs: Date.now(),
+    };
+    await owner.withLifecycleLock((session) => session.transition(
+      { generation: ownerState.generation, leaseId: ownerState.mcpOwner!.leaseId },
+      {
+        ...ownerState,
+        phase: "running",
+        workbench: wb,
+        companion: companionLifecycleState(createFakeCompanionLaunch(stateDir)),
+        operation: null,
+      }
+    ));
+    contenderBackend.addWorkbench(wb, wb.ownerTokenArgument);
 
     const result = await contender.withLifecycleLock((session) => session.validateAndClaim({
       endpoint: { host: "127.0.0.1", port: 5775 }, target: target(),
     }));
 
     expect(result).toMatchObject({ kind: "refused", code: "OWNED_BY_OTHER_MCP" });
+    if (result.kind !== "refused") return;
+    expect(result.message).toContain("the lifecycle phase is running");
+    expect(result.message).toContain("exact Workbench PID 4444 is recorded");
+  });
+
+  it("refuses preemption while the live owner holds a lifecycle operation", async () => {
+    const stateDir = root();
+    const { owner, ownerState, contender } = await claimedIdleLease(stateDir);
+    await owner.withLifecycleLock((session) => session.transition(
+      { generation: ownerState.generation, leaseId: ownerState.mcpOwner!.leaseId },
+      {
+        ...ownerState,
+        phase: "starting",
+        operation: { kind: "launch", operationId: "operation-live" },
+      }
+    ));
+
+    const result = await contender.withLifecycleLock((session) => session.validateAndClaim({
+      endpoint: { host: "127.0.0.1", port: 5775 }, target: target(),
+    }));
+
+    expect(result).toMatchObject({ kind: "refused", code: "OWNED_BY_OTHER_MCP" });
+    if (result.kind !== "refused") return;
+    expect(result.message).toContain("launch operation (operation-live)");
+  });
+
+  it("refuses preemption when the endpoint is occupied or unverifiable", async () => {
+    const stateDir = root();
+    const { contender, contenderBackend } = await claimedIdleLease(stateDir);
+
+    contenderBackend.endpointVacancyResult = {
+      kind: "occupied", listenerPid: 9090, message: "occupied",
+    };
+    const occupied = await contender.withLifecycleLock((session) => session.validateAndClaim({
+      endpoint: { host: "127.0.0.1", port: 5775 }, target: target(),
+    }));
+    expect(occupied).toMatchObject({ kind: "refused", code: "OWNED_BY_OTHER_MCP" });
+    if (occupied.kind === "refused") expect(occupied.message).toContain("occupied by PID 9090");
+
+    contenderBackend.endpointVacancyResult = {
+      kind: "unverifiable", reason: "access_denied", message: "denied",
+    };
+    const unverifiable = await contender.withLifecycleLock((session) => session.validateAndClaim({
+      endpoint: { host: "127.0.0.1", port: 5775 }, target: target(),
+    }));
+    expect(unverifiable).toMatchObject({ kind: "refused", code: "OWNED_BY_OTHER_MCP" });
+    if (unverifiable.kind === "refused") {
+      expect(unverifiable.message).toContain("unverifiable (access_denied)");
+    }
+  });
+
+  it("refuses preemption while an unowned Workbench process is running", async () => {
+    const stateDir = root();
+    const { contender, contenderBackend } = await claimedIdleLease(stateDir);
+    contenderBackend.addWorkbench({
+      pid: 5555, executablePath: "C:\\Workbench.exe", creationTime: "50005",
+    });
+
+    const result = await contender.withLifecycleLock((session) => session.validateAndClaim({
+      endpoint: { host: "127.0.0.1", port: 5775 }, target: target(),
+    }));
+
+    expect(result).toMatchObject({ kind: "refused", code: "OWNED_BY_OTHER_MCP" });
+    if (result.kind === "refused") expect(result.message).toContain("PID(s) 5555 are running");
+  });
+
+  it("refuses preemption when Workbench process identity is unverifiable", async () => {
+    const stateDir = root();
+    const { contender, contenderBackend } = await claimedIdleLease(stateDir);
+    contenderBackend.unverifiable = [
+      { pid: 6666, reason: "access_denied", message: "denied" },
+    ];
+
+    const result = await contender.withLifecycleLock((session) => session.validateAndClaim({
+      endpoint: { host: "127.0.0.1", port: 5775 }, target: target(),
+    }));
+
+    expect(result).toMatchObject({ kind: "refused", code: "OWNED_BY_OTHER_MCP" });
+    if (result.kind === "refused") expect(result.message).toContain("unverifiable");
+  });
+
+  it("never preempts an idle lease belonging to another Windows user", async () => {
+    const stateDir = root();
+    const ownerBackend = createFakeLifecycleBackend({
+      pid: 1101, executablePath: "C:\\node.exe", creationTime: "10001", userSid: "SID-A",
+    });
+    const owner = new WorkbenchProcessGuard({ stateDir, backend: ownerBackend });
+    await owner.withLifecycleLock((session) => session.validateAndClaim({
+      endpoint: { host: "127.0.0.1", port: 5775 }, target: target(),
+    }));
+    const otherUserBackend = createFakeLifecycleBackend({
+      pid: 2202, executablePath: "C:\\node.exe", creationTime: "20002", userSid: "SID-B",
+    });
+    otherUserBackend.processes.set(ownerBackend.current.pid, ownerBackend.current);
+    const otherUser = new WorkbenchProcessGuard({ stateDir, backend: otherUserBackend });
+
+    const result = await otherUser.withLifecycleLock((session) => session.validateAndClaim({
+      endpoint: { host: "127.0.0.1", port: 5775 }, target: target(),
+    }));
+
+    expect(result).toMatchObject({ kind: "refused", code: "USER_CONFLICT" });
   });
 
   it("claims only after the prior exact MCP owner is absent", async () => {

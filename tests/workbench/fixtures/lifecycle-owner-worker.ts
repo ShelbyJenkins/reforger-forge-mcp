@@ -1,10 +1,7 @@
-import { once } from "node:events";
-import { join } from "node:path";
-import { fileURLToPath } from "node:url";
-import type { Config } from "../../../src/config.js";
-import { WorkbenchClient, WorkbenchError } from "../../../src/workbench/client.js";
-import { canonicalizeGproj } from "../../../src/workbench/project-identity.js";
+import { createInterface } from "node:readline";
+import { randomUUID } from "node:crypto";
 import { WorkbenchProcessGuard } from "../../../src/workbench/process-guard.js";
+import { canonicalizeGproj } from "../../../src/workbench/project-identity.js";
 
 const stateDir = process.env.RR_STATE_DIR;
 const helperPath = process.env.RR_HELPER_PATH;
@@ -25,61 +22,61 @@ const guard = new WorkbenchProcessGuard({
 const endpoint = { host: "127.0.0.1", port: 5775 };
 const project = canonicalizeGproj(gprojPath);
 const target = { path: project.displayPath, comparisonKey: project.comparisonKey };
-const packageRoot = fileURLToPath(new URL("../../../", import.meta.url));
-const config: Config = {
-  workbenchPath: packageRoot,
-  gamePath: packageRoot,
-  dataDir: join(packageRoot, "data"),
-  patternsDir: join(packageRoot, "data", "patterns"),
-  workbenchHost: endpoint.host,
-  workbenchPort: endpoint.port,
-};
+
+function emit(payload: Record<string, unknown>): void {
+  process.stdout.write(`${JSON.stringify({ role, ...payload })}\n`);
+}
 
 async function claim(): Promise<unknown> {
   return guard.withLifecycleLock((session) => session.validateAndClaim({ endpoint, target }));
 }
 
-async function refused(action: () => Promise<unknown>): Promise<unknown> {
-  try {
-    await action();
-    return { kind: "unexpected_success" };
-  } catch (error) {
-    return {
-      kind: "refused",
-      code: error instanceof WorkbenchError ? error.code : "UNEXPECTED_ERROR",
-      message: error instanceof Error ? error.message : String(error),
-    };
-  }
-}
-
-try {
-  if (role === "owner") {
-    const result = await claim();
-    process.stdout.write(`${JSON.stringify({ role, result })}\n`);
-  } else if (role === "contender") {
-    const client = new WorkbenchClient(
-      endpoint.host,
-      endpoint.port,
-      config,
-      "multiprocess-contender",
-      guard
+/**
+ * Move the lease this worker already owns out of the idle window, so a
+ * competing claim must be refused rather than preempted.
+ */
+async function reserve(): Promise<unknown> {
+  return guard.withLifecycleLock(async (session) => {
+    const read = await session.readState();
+    if (read.kind !== "valid") throw new Error(`Lifecycle state is ${read.kind}.`);
+    const state = read.state;
+    return session.transition(
+      { generation: state.generation, leaseId: state.mcpOwner?.leaseId ?? null },
+      {
+        phase: "starting",
+        endpoint: state.endpoint,
+        target: state.target,
+        mcpOwner: state.mcpOwner,
+        workbench: null,
+        companion: state.companion,
+        operation: { kind: "launch", operationId: randomUUID() },
+      }
     );
-    const results: Record<string, unknown> = {
-      launch: await refused(() => client.ensureRunning(gprojPath)),
-      restart: await refused(() => client.restartOwnedWorkbench()),
-      shutdown: await refused(() => client.shutdownOwnedWorkbench()),
-    };
-    process.stdout.write(`${JSON.stringify({ role, results })}\n`);
-  } else {
-    throw new Error(`Unknown lifecycle worker role: ${role}`);
-  }
-
-  await once(process.stdin, "data");
-  process.stdin.destroy();
-} catch (error) {
-  process.stdout.write(`${JSON.stringify({
-    role,
-    error: error instanceof Error ? error.message : String(error),
-  })}\n`);
-  process.exitCode = 1;
+  });
 }
+
+async function run(command: string): Promise<void> {
+  try {
+    if (command === "claim") emit({ command, result: await claim() });
+    else if (command === "reserve") emit({ command, result: await reserve() });
+    else throw new Error(`Unknown lifecycle worker command: ${command}`);
+  } catch (error) {
+    emit({ command, error: error instanceof Error ? error.message : String(error) });
+  }
+}
+
+if (role === "owner") {
+  await run("claim");
+} else if (role !== "contender") {
+  emit({ error: `Unknown lifecycle worker role: ${role}` });
+  process.exit(1);
+}
+
+const commands = createInterface({ input: process.stdin });
+for await (const line of commands) {
+  const command = line.trim();
+  if (!command || command === "release") break;
+  await run(command);
+}
+commands.close();
+await guard.close();

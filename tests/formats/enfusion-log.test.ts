@@ -43,7 +43,7 @@ describe("Enfusion log add-on attribution", () => {
       "RoadblockRunners"
     )).toBe(true);
     expect(referencesAddon(
-      "ENGINE       (E): failed to load addons/RoadblockRunners/Configs/Runtime.conf",
+      "ENGINE       (E): failed to load addons/addons-scenarios/RoadblockRunners/Configs/Runtime.conf",
       "RoadblockRunners"
     )).toBe(true);
   });

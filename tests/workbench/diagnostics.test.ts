@@ -63,8 +63,46 @@ describe("Workbench diagnostics", () => {
       endpoint: "127.0.0.1:5775",
       target: "C:\\mods\\Example\\Example.gproj",
       lease: "current_mcp",
+      leaseOwner: {
+        pid: 100,
+        instanceId: "mcp-current",
+        leaseId: "lease-1",
+        claimedAtMs: 1,
+      },
+      leasePreemptible: false,
       operation: "restart:operation-1",
       companionBuildIdentity: "build-1",
+    });
+  });
+
+  it("marks an idle lease preemptible and names its owning MCP session", () => {
+    const report = formatLifecycleDiagnostic({
+      kind: "valid",
+      state: {
+        version: 3,
+        generation: "generation-2",
+        phase: "vacant",
+        endpoint: { host: "127.0.0.1", port: 5775 },
+        target: { path: "C:\\mods\\Example\\Example.gproj", comparisonKey: "key" },
+        mcpOwner: {
+          pid: 12752,
+          executablePath: "C:\\node.exe",
+          creationTime: "123",
+          instanceId: "mcp-other",
+          leaseId: "lease-2",
+          userSid: "sid",
+          claimedAtMs: 5,
+        },
+        workbench: null,
+        companion: null,
+        operation: null,
+      },
+    }, "mcp-current");
+
+    expect(report).toMatchObject({
+      lease: "other_mcp",
+      leaseOwner: { pid: 12752, instanceId: "mcp-other" },
+      leasePreemptible: true,
     });
   });
 
@@ -77,6 +115,8 @@ describe("Workbench diagnostics", () => {
       endpoint: null,
       target: null,
       lease: "unknown",
+      leaseOwner: null,
+      leasePreemptible: false,
       operation: null,
       companionBuildIdentity: null,
       detail: "read failed",
