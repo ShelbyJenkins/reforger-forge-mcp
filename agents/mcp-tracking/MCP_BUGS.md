@@ -42,6 +42,25 @@ Workbench crash even when the reported owner no longer exists.
 **Workaround:** Pending. Do not terminate a process when the reported target
 cannot be verified as a currently owned Workbench process.
 
+**Additional reproduction (2026-07-31):** A SaltLine `wb_build` target-build
+crashed after reporting script diagnostics. Windows continued to report two
+listeners for `0.0.0.0:5775`, while both owning PIDs were absent from
+`Get-Process` and `Win32_Process`. `wb_shutdown` correctly declined to signal an
+unverified process, but later `wb_build` calls remained blocked with
+`RECOVERY_REQUIRED`. A standalone guarded build requested on the otherwise
+unused port `5776` was also refused with `ENDPOINT_UNVERIFIABLE` against the
+durable stale lifecycle state, so the documented configurable-port escape path
+could not establish an independent recovery build.
+
+**Expected:** Once the exact managed Workbench process is proven dead, recovery
+must either retire ghost socket rows safely or allow a freshly configured vacant
+endpoint to establish a new guarded lifecycle without requiring operators to
+terminate an unverifiable PID.
+
+**Affected:** `wb_build`, `wb_shutdown`, the standalone
+`reforger-forge-workbench build` runner, and Workbench endpoint-vacancy recovery
+in `src/workbench/runner.ts` / `src/workbench/session-controller.ts`.
+
 ### MCP-032 - Workbench launch and build disagree on target-relative dependencies
 
 **Status:** Open
