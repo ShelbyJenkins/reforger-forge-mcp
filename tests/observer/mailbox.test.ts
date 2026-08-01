@@ -74,6 +74,7 @@ function captureCommand(
     view: { kind: "current" },
     settleFrames: 0,
     performancePolicy: "evidence",
+    image: { format: "png" },
     commandKind: "capture",
     deliveryAttempt: 1,
     deliveryToken: "delivery_token_1234567890",

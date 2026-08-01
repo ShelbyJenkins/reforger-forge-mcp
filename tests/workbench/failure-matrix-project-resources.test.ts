@@ -7,7 +7,10 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { createDisposableProject } from "../../scripts/run-workbench-observer-acceptance.js";
+import {
+  createDisposableProject,
+  workbenchResourceVirtualPath,
+} from "../../scripts/run-workbench-observer-acceptance.js";
 
 describe("createDisposableProject matrix resources", () => {
   it("stages the fixture dependency and generates isolated Matrix A/B worlds", () => {
@@ -15,6 +18,7 @@ describe("createDisposableProject matrix resources", () => {
     try {
       const project = createDisposableProject(root, { stageMatrixFixture: true });
       expect(project.worldResource).toMatch(/^\{[A-F0-9]{16}\}Worlds\/ObserverMatrixA\.ent$/);
+      expect(workbenchResourceVirtualPath(project.worldResource)).toBe("Worlds/ObserverMatrixA.ent");
       expect(project.alternateWorldResource).toMatch(/^\{[A-F0-9]{16}\}Worlds\/ObserverMatrixB\.ent$/);
       expect(existsSync(join(project.modDirectory, "Worlds", "ObserverMatrixA.ent"))).toBe(true);
       expect(existsSync(join(project.modDirectory, "Worlds", "ObserverMatrixB.ent"))).toBe(true);

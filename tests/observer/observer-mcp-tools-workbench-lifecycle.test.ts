@@ -83,6 +83,7 @@ describe("observer MCP tools", () => {
     });
     expect(adapter.submit).toHaveBeenCalledWith({
       jobId: "durable-job", view: { kind: "current" }, settlePolls: 0,
+      image: { format: "png" },
     });
     await coordinator.close();
   });

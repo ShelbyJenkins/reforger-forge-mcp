@@ -70,6 +70,19 @@ const viewSchema = z.union([
     value.target[2] - value.position[2]
   ) > 0.000001, { message: "lookAt position and target must differ", path: ["target"] }),
 ]);
+const imageOutputSchema = z.object({
+  maxWidth: z.number().int().min(1).max(16_384).optional(),
+  maxHeight: z.number().int().min(1).max(16_384).optional(),
+  format: z.enum(["png", "jpeg", "webp"]).default("png"),
+  quality: z.number().int().min(1).max(100).optional(),
+}).refine(
+  (value) => value.format !== "png" || value.quality === undefined,
+  { message: "quality is valid only for jpeg or webp output", path: ["quality"] },
+).refine(
+  (value) => value.maxWidth === undefined || value.maxHeight === undefined ||
+    value.maxWidth * value.maxHeight <= 32_000_000,
+  { message: "requested image bounds exceed the 32000000-pixel limit" },
+);
 export interface ObserverToolDefaults {
   sessionTtlMs?: number;
   defaultCaptureTimeoutMs?: number;
@@ -157,14 +170,32 @@ function capturePresentation(result: Extract<ObserverCaptureResult, { asynchrono
       width: metadata.width ?? null,
       height: metadata.height ?? null,
     },
+    format: metadata.format ?? null,
+    mimeType: metadata.mimeType ?? null,
+    bytes: metadata.bytes ?? result.image.length,
+    requestedImage: metadata.requestedImage ?? null,
+    quality: metadata.imageQuality ?? null,
     sha256: metadata.contentSha256 ?? null,
     warnings: metadata.warnings ?? artifact.warnings ?? [],
     contaminated: metadata.contaminated ?? artifact.contaminated ?? false,
   };
 }
 
-function isPng(image: Buffer): boolean {
-  return image.length >= 8 && image.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]));
+function validatedImageMimeType(image: Buffer, metadata: Record<string, unknown>): "image/png" | "image/jpeg" | "image/webp" {
+  const mimeType = metadata.mimeType;
+  const png = image.length >= 8 && image.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]));
+  const jpeg = image.length >= 4 && image[0] === 0xff && image[1] === 0xd8 &&
+    image[image.length - 2] === 0xff && image[image.length - 1] === 0xd9;
+  const webp = image.length >= 12 && image.toString("ascii", 0, 4) === "RIFF" &&
+    image.toString("ascii", 8, 12) === "WEBP";
+  if (mimeType === undefined) {
+    if (png) return "image/png";
+    if (jpeg) return "image/jpeg";
+    if (webp) return "image/webp";
+  }
+  if ((mimeType === "image/png" && png) || (mimeType === "image/jpeg" && jpeg) ||
+      (mimeType === "image/webp" && webp)) return mimeType;
+  throw new ObserverApplicationError("ARTIFACT_INVALID", "Observer agent returned an image that does not match its MIME type");
 }
 
 export function registerObserverTools(
@@ -271,7 +302,7 @@ export function registerObserverTools(
     "observer_capture",
     {
       description:
-        "Capture candidate evidence into an open managed observer run. runId and a unique normalized captureLabel are required. sessionId is required for a runtime renderer and optional for an explicitly selected already-running Workbench renderer. Bind the selected renderer to the immediately preceding observer_instances inventory with its opaque expectedWorldRevision. Synchronous mode returns one validated PNG; asynchronous mode returns a job ID that observer_job read can retrieve after completion.",
+        "Capture candidate evidence into an open managed observer run. runId and a unique normalized captureLabel are required. sessionId is required for a runtime renderer and optional for an explicitly selected already-running Workbench renderer. Bind the selected renderer to the immediately preceding observer_instances inventory with its opaque expectedWorldRevision. Optional image bounds preserve aspect ratio and never enlarge; png is lossless while jpeg/webp accept quality. Omit image for native-resolution PNG. Synchronous mode returns one validated image; asynchronous mode returns a job ID that observer_job read can retrieve after completion.",
       inputSchema: {
         runId: z.string().regex(/^\d{8}T\d{6}Z-[a-f0-9]{8}$/),
         captureLabel: z.string().min(1).max(128),
@@ -288,6 +319,7 @@ export function registerObserverTools(
           "Required opaque exact world revision from the immediately preceding observer_instances inventory."
         ),
         performancePolicy: z.enum(["evidence", "instrumented"]).default("evidence"),
+        image: imageOutputSchema.optional(),
       },
     },
     async (input, extra) => {
@@ -304,16 +336,14 @@ export function registerObserverTools(
         if (result.image.length > application.maxInlineImageBytes) {
           throw new ObserverApplicationError(
             "ARTIFACT_TOO_LARGE",
-            "Validated PNG exceeds the configured MCP inline limit",
+            "Validated image exceeds the configured MCP inline limit",
             { job: result.job }
           );
         }
-        if (!isPng(result.image)) {
-          throw new ObserverApplicationError("ARTIFACT_INVALID", "Observer agent did not return a validated PNG");
-        }
+        const mimeType = validatedImageMimeType(result.image, result.metadata);
         return {
           content: [
-            { type: "image" as const, data: result.image.toString("base64"), mimeType: "image/png" },
+            { type: "image" as const, data: result.image.toString("base64"), mimeType },
             { type: "text" as const, text: jsonText("Observer capture completed.", capturePresentation(result)) },
           ],
         };
@@ -327,7 +357,7 @@ export function registerObserverTools(
     "observer_job",
     {
       description:
-        "Inspect, read, cancel, or release an observer capture job. read returns one completed validated PNG when it fits the inline limit; larger images stay managed and must be exported by observer_run finalize. sessionId is required for runtime jobs and optional for Workbench jobs. Artifacts retained by an open run cannot be released independently.",
+        "Inspect, read, cancel, or release an observer capture job. read returns one completed validated image when it fits the inline limit; larger images stay managed and must be exported by observer_run finalize. sessionId is required for runtime jobs and optional for Workbench jobs. Artifacts retained by an open run cannot be released independently.",
       inputSchema: {
         action: z.enum(["status", "read", "cancel", "release"]),
         sessionId: z.string().min(1).max(96).optional(),
@@ -338,10 +368,10 @@ export function registerObserverTools(
       try {
         if (action === "read") {
           const result = await application.readJob(sessionId, jobId);
-          if (!isPng(result.image)) throw new ObserverApplicationError("ARTIFACT_INVALID", "Observer agent did not return a validated PNG");
+          const mimeType = validatedImageMimeType(result.image, result.metadata);
           return {
             content: [
-              { type: "image" as const, data: result.image.toString("base64"), mimeType: "image/png" },
+              { type: "image" as const, data: result.image.toString("base64"), mimeType },
               { type: "text" as const, text: jsonText("Observer completed artifact.", capturePresentation({ asynchronous: false, ...result })) },
             ],
           };
@@ -366,7 +396,7 @@ export function registerObserverTools(
     "observer_run",
     {
       description:
-        "Manage a bounded observation run. begin creates external managed run storage; status reports capture labels and artifact availability; finalize writes a standardized reviewed bundle beneath an allowlisted configured evidence root without overwriting; discard releases retained artifacts and removes run work.",
+        "Manage a bounded observation run. begin creates external managed run storage; status reports capture labels and artifact availability; finalize requires runId, includeCaptureLabels, and review, then writes a standardized reviewed bundle beneath an allowlisted configured evidence root without overwriting; discard releases retained artifacts and removes run work.",
       inputSchema: {
         action: z.enum(["begin", "status", "finalize", "discard"]),
         runId: z.string().regex(/^\d{8}T\d{6}Z-[a-f0-9]{8}$/).optional(),
@@ -376,7 +406,9 @@ export function registerObserverTools(
         procedureRevision: z.string().min(1).max(256).optional(),
         idempotencyKey: z.string().min(1).max(128).optional(),
         evidenceRoot: z.string().min(1).max(32_768).optional(),
-        includeCaptureLabels: z.array(z.string().min(1).max(128)).min(1).max(64).optional(),
+        includeCaptureLabels: z.array(z.string().min(1).max(128)).min(1).max(64).optional().describe(
+          "(finalize) Required non-empty list of reviewed capture labels to export."
+        ),
         review: z.object({
           imagesReviewed: z.boolean(),
           reviewer: z.string().min(1).max(256).optional(),

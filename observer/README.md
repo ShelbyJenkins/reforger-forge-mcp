@@ -121,6 +121,9 @@ The configuration reference and first-use recovery procedures are in
   without it, but finalization fails with `CAPABILITY_UNAVAILABLE`.
 - `observer.supportingLogRoots` is a separate allowlist for relevant text logs
   included in a final bundle.
+- `observer.defaultLossyImageQuality` defaults JPEG and WebP to 75;
+  `minimumLossyImageQuality` and `maximumLossyImageQuality` bound caller
+  overrides.
 - `observer_setup action="doctor"` and the installed agent's `doctor` command
   are read-only: they do not create roots, stage files, load stores, or start a
   private child.
@@ -130,20 +133,27 @@ The configuration reference and first-use recovery procedures are in
 Launch preparation produces a one-shot, immutable descriptor bound to an
 Observer session, profile, and expiration. The descriptor contains one merged
 `-addonsDir`, one merged `-addons`, the matching `-profile`, and defaults for
-`-forceUpdate` and `-noFocus` unless callers opt out.
+`-forceUpdate` and `-noFocus` unless callers opt out. Graphical launches retain
+the engine's fullscreen default; pass `-window` (and optional dimensions) only
+when a visible windowed launch is intentional.
 
 The optional Windows runtime manager resolves an allowlisted graphical
 executable beneath the configured game path and uses a visible direct spawn
 without a shell. It publishes a `runtimeId` only after the child has passed
-exact process identity verification. A failed start leaves no successful
+exact process identity verification. For graphical `-noFocus` launches it also
+guards Reforger's replacement startup windows against activation, then restores
+their original styles so they remain normally focusable after initialization.
+A failed start leaves no successful
 ownership receipt; a retained child whose exit cannot be proved remains a
 non-success pending record without PID-only cleanup authority.
 
 Runtime registration uses acknowledged loopback REST delivery with a confined
 mailbox fallback. Session registration, heartbeats, job idempotency, artifact
 completion, and release receipts are replay-safe. The host validates each
-finished PNG as a regular file with stable size, valid structure and dimensions,
-digest, and session/job binding before reporting completion.
+finished source image as a regular file with stable size, valid structure and
+dimensions, digest, and session/job binding. It then uses the pinned
+`@napi-rs/image` encoder to apply optional fit-inside bounds and PNG, JPEG, or
+WebP output before retaining the artifact.
 
 Stopping an exact-owned runtime first reserves restoration, rejects new capture
 submissions, verifies that jobs and camera leases can become terminal, and then
@@ -160,7 +170,7 @@ instances before a camera lease is acquired. A request binds the selected
 instance to its required opaque world revision. Completion, cancellation,
 failure, release, and managed shutdown converge on terminal restoration.
 
-Synchronous capture returns one host-validated PNG and concise metadata only
+Synchronous capture returns one host-validated image and concise metadata only
 when it fits the configured inline limit. Larger artifacts remain in managed
 storage and can be exported through the evidence-run finalizer. Private managed
 paths are never published to clients.
@@ -198,7 +208,8 @@ full matrix, measured vertical FOV, read-only far plane, and viewport dimensions
 The API has no near-plane getter, so Observer does not mutate the near plane.
 Unexpected world, lifecycle, slot, or camera drift returns
 `RESTORATION_UNCONFIRMED`. Native PNG output is confined under the managed
-profile, validated, hashed, and returned through the shared capture contract.
+profile, validated, then optionally resized or converted before it enters the
+shared retained-artifact contract.
 
 The helper contains default-inert acceptance hooks for maintainer failure
 testing. They are not general editor commands, public Observer capabilities, or

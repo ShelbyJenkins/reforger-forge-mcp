@@ -81,6 +81,7 @@ const validTools = [
     inputSchema: {
       properties: {
         action: { enum: ["inspect"] },
+        gprojPath: { type: "string" },
       },
     },
   },
@@ -332,6 +333,13 @@ describe("server verification core", () => {
 });
 
 describe("tool surface inspection", () => {
+  it("permits the supported exact-project mod validation argument", () => {
+    expect(inspectToolRegistration(validTools)).toMatchObject({
+      status: "passed",
+      issues: [],
+    });
+  });
+
   it("returns sorted names and actionable contract issues", () => {
     const result = inspectToolRegistration([
       ...validTools,

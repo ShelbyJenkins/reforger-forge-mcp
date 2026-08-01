@@ -14,6 +14,18 @@ import { extname, join } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { BoundedJsonStore, JsonStoreError } from "#foundation/json-store";
 import {
+  ImageOutputError,
+  IMAGE_OUTPUT_FORMATS,
+  imageOutputDescriptor,
+  imageOutputFormatFromMimeType,
+  inspectImage as inspectImageOutput,
+  transformImage as transformImageOutput,
+  type ImageOutputFormat,
+  type ImageOutputMimeType,
+  type ImageSourceDescriptor,
+  type TransformedImage,
+} from "#foundation/image-output";
+import {
   deadlineAfter,
   pollUntil,
   systemClock,
@@ -49,7 +61,8 @@ export interface StoredArtifact {
   sha256: string;
   width: number;
   height: number;
-  mimeType: "image/png";
+  format: ImageOutputFormat;
+  mimeType: ImageOutputMimeType;
 }
 
 export interface ManagedArtifactRef {
@@ -60,6 +73,9 @@ export interface ManagedArtifactRef {
   bytes: number;
   width: number;
   height: number;
+  format?: ImageOutputFormat;
+  mimeType?: ImageOutputMimeType;
+  fileName?: string;
 }
 
 export interface ManagedArtifactRead {
@@ -85,13 +101,19 @@ export interface ArtifactStoreOptions {
   clock?: Clock;
   /** Test seam; production artifact intake uses cancellable native timers. */
   sleeper?: Sleeper;
+  /** Test seam for deterministic decoder-failure and retry coverage. */
+  imageInspector?: typeof inspectImageOutput;
+  /** Test seam for deterministic encoder-failure and retry coverage. */
+  imageTransformer?: typeof transformImageOutput;
 }
 
 interface RetainedArtifactMetadata {
   version: number;
   artifactId: string;
   contentSha256: string;
-  mimeType: "image/png";
+  format?: ImageOutputFormat;
+  fileName?: string;
+  mimeType: ImageOutputMimeType;
   width: number;
   height: number;
   sourceByteCount?: number;
@@ -100,6 +122,46 @@ interface RetainedArtifactMetadata {
 }
 
 const MAX_ARTIFACT_METADATA_BYTES = 4 * 1024 * 1024;
+const MAX_IMAGE_WIDTH = 16_384;
+const MAX_IMAGE_HEIGHT = 16_384;
+const MAX_IMAGE_PIXELS = 32_000_000;
+const IMAGE_FILE_NAMES = new Set(["image.png", "image.jpg", "image.webp"]);
+
+function imageFileName(format: ImageOutputFormat): string {
+  return `image${imageOutputDescriptor(format).extension}`;
+}
+
+function retainedImageDescriptor(metadata: Record<string, unknown>): {
+  format: ImageOutputFormat;
+  mimeType: ImageOutputMimeType;
+  fileName: string;
+} {
+  const mimeFormat = imageOutputFormatFromMimeType(metadata.mimeType);
+  const declaredFormat = typeof metadata.format === "string" &&
+    IMAGE_OUTPUT_FORMATS.includes(metadata.format as ImageOutputFormat)
+    ? metadata.format as ImageOutputFormat
+    : null;
+  if (mimeFormat && declaredFormat && mimeFormat !== declaredFormat) {
+    throw new ObserverError("ARTIFACT_INVALID", "Retained artifact format and MIME type disagree", 409);
+  }
+  const format = mimeFormat ?? declaredFormat ??
+    (metadata.mimeType === undefined && metadata.format === undefined ? "png" : null);
+  if (!format) throw new ObserverError("ARTIFACT_INVALID", "Retained artifact MIME type is invalid", 409);
+  const fileName = metadata.fileName === undefined ? imageFileName(format) : metadata.fileName;
+  if (typeof fileName !== "string" || !IMAGE_FILE_NAMES.has(fileName) || fileName !== imageFileName(format)) {
+    throw new ObserverError("ARTIFACT_INVALID", "Retained artifact filename is invalid", 409);
+  }
+  return { format, mimeType: imageOutputDescriptor(format).mimeType, fileName };
+}
+
+function mapImageOutputError(error: unknown): ObserverError {
+  if (error instanceof ObserverError) return error;
+  if (error instanceof ImageOutputError) {
+    const status = error.code === "ARTIFACT_TOO_LARGE" ? 413 : error.code === "CANCELLED" ? 408 : 400;
+    return new ObserverError(error.code, error.message, status);
+  }
+  return new ObserverError("ARTIFACT_INVALID", error instanceof Error ? error.message : "Image processing failed");
+}
 
 function parseMetadataObject(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
@@ -150,6 +212,8 @@ export class ArtifactStore {
   private readonly stableTimeoutMs: number;
   private readonly clock: Clock;
   private readonly sleeper: Sleeper;
+  private readonly imageInspector: typeof inspectImageOutput;
+  private readonly imageTransformer: typeof transformImageOutput;
   private readonly inUse = new Set<string>();
 
   constructor(
@@ -163,6 +227,8 @@ export class ArtifactStore {
     this.stableTimeoutMs = options.stableTimeoutMs ?? 2_000;
     this.clock = options.clock ?? systemClock;
     this.sleeper = options.sleeper ?? systemSleeper;
+    this.imageInspector = options.imageInspector ?? inspectImageOutput;
+    this.imageTransformer = options.imageTransformer ?? transformImageOutput;
   }
 
   async intake(input: unknown, token: string): Promise<StoredArtifact> {
@@ -193,35 +259,39 @@ export class ArtifactStore {
     const sessionRoot = ensureCanonicalDirectory(join(this.artifactsRoot, assertIdentifier(manifest.sessionId, "Session ID")));
     const jobRoot = join(sessionRoot, assertIdentifier(manifest.jobId, "Job ID"));
     assertManagedPath(sessionRoot, jobRoot);
-    const imagePath = join(jobRoot, "image.png");
     const metadataPath = join(jobRoot, "metadata.json");
     if (existsSync(jobRoot)) {
       if (lstatSync(jobRoot).isSymbolicLink()) throw new ObserverError("ARTIFACT_INVALID", "Artifact directory is a symbolic link");
       let existing: RetainedArtifactMetadata | null = null;
       let retainedSha256: string | null = null;
+      let existingImagePath: string | null = null;
       try {
-        const retainedImage = assertRegularManagedFile(jobRoot, imagePath);
         assertRegularManagedFile(jobRoot, metadataPath);
         existing = this.readMetadata(jobRoot, metadataPath) as unknown as RetainedArtifactMetadata;
+        const retained = retainedImageDescriptor(existing as unknown as Record<string, unknown>);
+        existingImagePath = assertRegularManagedFile(jobRoot, join(jobRoot, retained.fileName));
+        const retainedImage = existingImagePath;
         retainedSha256 = createHash("sha256").update(readFileSync(retainedImage)).digest("hex");
       } catch { /* conflict is reported below */ }
-      if (!existing || retainedSha256 === null || existing.version !== 1 || existing.artifactId !== manifest.artifactId ||
-        existing.mimeType !== "image/png" || existing.contentSha256 !== retainedSha256 ||
+      if (!existing || retainedSha256 === null || existingImagePath === null || existing.version !== 1 ||
+        existing.artifactId !== manifest.artifactId || existing.contentSha256 !== retainedSha256 ||
         !isDeepStrictEqual(existing.sourceManifest, manifest)) {
         throw new ObserverError("ARTIFACT_INVALID", "Artifact directory already exists with different content", 409);
       }
       // Always retry the host completion step. This closes the crash window
       // after atomic promotion but before the in-memory job commit.
-      this.jobs.completeArtifact(manifest.sessionId, manifest.jobId, manifest, imagePath);
+      this.jobs.completeArtifact(manifest.sessionId, manifest.jobId, manifest, existingImagePath);
       this.removeCommittedSource(captureRoot, sourcePath, existing.sourceByteCount, existing.sourceContentSha256);
+      const retained = retainedImageDescriptor(existing as unknown as Record<string, unknown>);
       return {
         artifactId: manifest.artifactId,
-        imagePath,
+        imagePath: existingImagePath,
         metadataPath,
         sha256: retainedSha256,
         width: existing.width,
         height: existing.height,
-        mimeType: "image/png",
+        format: retained.format,
+        mimeType: retained.mimeType,
       };
     }
 
@@ -240,19 +310,48 @@ export class ArtifactStore {
     const source = readFileSync(sourcePath);
     const sourceSha256 = createHash("sha256").update(source).digest("hex");
     const image = validateOrConvertImage(source, extname(sourcePath), { maxBytes: session.limits.maxArtifactBytes });
-    const sha256 = createHash("sha256").update(image.png).digest("hex");
+    let transformed: TransformedImage;
+    try {
+      const normalizedSource = this.imageInspector(image.png, "png", {
+        maxSourceBytes: session.limits.maxArtifactBytes,
+        maxWidth: MAX_IMAGE_WIDTH,
+        maxHeight: MAX_IMAGE_HEIGHT,
+        maxPixels: MAX_IMAGE_PIXELS,
+      });
+      transformed = await this.imageTransformer(image.png, normalizedSource, job.request.image, {
+        maxSourceBytes: session.limits.maxArtifactBytes,
+        maxRetainedBytes: session.limits.maxArtifactBytes,
+        maxWidth: MAX_IMAGE_WIDTH,
+        maxHeight: MAX_IMAGE_HEIGHT,
+        maxPixels: MAX_IMAGE_PIXELS,
+      });
+    } catch (error) {
+      throw mapImageOutputError(error);
+    }
+    const sha256 = createHash("sha256").update(transformed.image).digest("hex");
+    const retainedFileName = imageFileName(transformed.format);
+    const imagePath = join(jobRoot, retainedFileName);
     const temporary = join(sessionRoot, `.${manifest.jobId}.${randomUUID()}.tmp`);
     mkdirSync(temporary, { mode: 0o700 });
     try {
-      atomicWriteFile(temporary, join(temporary, "image.png"), image.png);
+      atomicWriteFile(temporary, join(temporary, retainedFileName), transformed.image);
       const metadata = {
         version: 1,
         artifactId: manifest.artifactId,
         contentSha256: sha256,
-        mimeType: image.mimeType,
-        width: image.width,
-        height: image.height,
+        format: transformed.format,
+        fileName: retainedFileName,
+        mimeType: transformed.mimeType,
+        width: transformed.width,
+        height: transformed.height,
+        bytes: transformed.bytes,
+        requestedImage: job.request.image,
+        imageQuality: transformed.quality ?? null,
+        resized: transformed.resized,
+        transcoded: transformed.transcoded,
         sourceFormat: image.sourceFormat,
+        normalizedSourceFormat: "png",
+        normalizedSourceByteCount: image.png.length,
         sourceByteCount: stableSize,
         sourceContentSha256: sourceSha256,
         sessionId: manifest.sessionId,
@@ -288,7 +387,16 @@ export class ArtifactStore {
     }
     this.jobs.completeArtifact(manifest.sessionId, manifest.jobId, manifest, imagePath);
     this.removeCommittedSource(captureRoot, sourcePath, stableSize, sourceSha256);
-    return { artifactId: manifest.artifactId, imagePath, metadataPath, sha256, width: image.width, height: image.height, mimeType: image.mimeType };
+    return {
+      artifactId: manifest.artifactId,
+      imagePath,
+      metadataPath,
+      sha256,
+      width: transformed.width,
+      height: transformed.height,
+      format: transformed.format,
+      mimeType: transformed.mimeType,
+    };
   }
 
   release(sessionId: string, jobId: string): { released: boolean } {
@@ -312,9 +420,10 @@ export class ArtifactStore {
     if (this.inUse.has(root)) throw new ObserverError("ARTIFACT_INCOMPLETE", "Retained artifact is currently in use", 409);
     // Verify both expected managed files before the recursive directory removal;
     // unrelated or replaced content is preserved for review.
-    assertRegularManagedFile(root, join(root, "image.png"));
-    assertRegularManagedFile(root, join(root, "metadata.json"));
-    const unrelated = readdirSync(root).filter((name) => name !== "image.png" && name !== "metadata.json");
+    const metadataPath = assertRegularManagedFile(root, join(root, "metadata.json"));
+    const retained = retainedImageDescriptor(this.readMetadata(root, metadataPath));
+    assertRegularManagedFile(root, join(root, retained.fileName));
+    const unrelated = readdirSync(root).filter((name) => name !== retained.fileName && name !== "metadata.json");
     if (unrelated.length > 0) throw new ObserverError("ARTIFACT_INVALID", "Retained artifact directory contains unrelated files", 409);
     rmSync(root, { recursive: true, force: false });
     this.jobs.recordArtifactRelease(sessionId, jobId, true);
@@ -327,11 +436,13 @@ export class ArtifactStore {
     const root = join(this.artifactsRoot, sessionId, jobId);
     assertManagedPath(this.artifactsRoot, root);
     if (!existsSync(root)) throw new ObserverError("ARTIFACT_INCOMPLETE", "Retained artifact is not available", 404);
-    const imagePath = assertRegularManagedFile(this.artifactsRoot, join(root, "image.png"));
     const metadataPath = assertRegularManagedFile(this.artifactsRoot, join(root, "metadata.json"));
+    const metadata = this.readMetadata(root, metadataPath);
+    const retained = retainedImageDescriptor(metadata);
+    const imagePath = assertRegularManagedFile(this.artifactsRoot, join(root, retained.fileName));
     this.inUse.add(root);
     try {
-      return { image: readFileSync(imagePath), metadata: this.readMetadata(root, metadataPath) };
+      return { image: readFileSync(imagePath), metadata };
     } finally {
       this.inUse.delete(root);
     }
@@ -345,14 +456,16 @@ export class ArtifactStore {
   workbenchRef(jobId: string): ManagedArtifactRef {
     assertIdentifier(jobId, "Job ID");
     const root = join(this.artifactsRoot, "workbench", jobId);
-    const imagePath = assertRegularManagedFile(this.artifactsRoot, join(root, "image.png"));
     const metadataPath = assertRegularManagedFile(this.artifactsRoot, join(root, "metadata.json"));
+    const metadata = this.readMetadata(root, metadataPath);
+    const retained = retainedImageDescriptor(metadata);
+    const imagePath = assertRegularManagedFile(this.artifactsRoot, join(root, retained.fileName));
     return this.refFromRead(
       "workbench",
       `workbench/${jobId}`,
       jobId,
       readFileSync(imagePath),
-      this.readMetadata(root, metadataPath)
+      metadata
     );
   }
 
@@ -361,8 +474,21 @@ export class ArtifactStore {
     if (!Buffer.isBuffer(input.image) || input.image.length === 0) {
       throw new ObserverError("ARTIFACT_INVALID", "Imported observer artifact is empty");
     }
-    const validated = validateOrConvertImage(input.image, ".png", { maxBytes: 64 * 1024 * 1024 });
-    const sha256 = createHash("sha256").update(validated.png).digest("hex");
+    const declaredFormat = imageOutputFormatFromMimeType(input.metadata.mimeType) ?? "png";
+    let validated: ImageSourceDescriptor;
+    try {
+      validated = inspectImageOutput(input.image, declaredFormat, {
+        maxSourceBytes: 64 * 1024 * 1024,
+        maxWidth: MAX_IMAGE_WIDTH,
+        maxHeight: MAX_IMAGE_HEIGHT,
+        maxPixels: MAX_IMAGE_PIXELS,
+      });
+    } catch (error) {
+      throw mapImageOutputError(error);
+    }
+    const descriptor = imageOutputDescriptor(declaredFormat);
+    const retainedFileName = imageFileName(declaredFormat);
+    const sha256 = validated.sha256;
     const backendRoot = ensureCanonicalDirectory(join(this.artifactsRoot, input.backend));
     const root = join(backendRoot, input.jobId);
     assertManagedPath(backendRoot, root);
@@ -372,10 +498,12 @@ export class ArtifactStore {
       backend: input.backend,
       jobId: input.jobId,
       contentSha256: sha256,
-      mimeType: "image/png",
+      format: declaredFormat,
+      fileName: retainedFileName,
+      mimeType: descriptor.mimeType,
       width: validated.width,
       height: validated.height,
-      bytes: validated.png.length,
+      bytes: input.image.length,
       retainedAt: typeof input.metadata.retainedAt === "string" ? input.metadata.retainedAt : new Date().toISOString(),
     };
     if (existsSync(root)) {
@@ -387,14 +515,17 @@ export class ArtifactStore {
         jobId: input.jobId,
         storeKey: `${input.backend}/${input.jobId}`,
         sha256,
-        bytes: validated.png.length,
+        bytes: input.image.length,
         width: validated.width,
         height: validated.height,
+        format: declaredFormat,
+        mimeType: descriptor.mimeType,
+        fileName: retainedFileName,
       });
       if (typeof existing.metadata.retainedAt === "string" && typeof input.metadata.retainedAt !== "string") {
         retainedMetadata.retainedAt = existing.metadata.retainedAt;
       }
-      if (!existing.image.equals(validated.png) || !isDeepStrictEqual(existing.metadata, retainedMetadata)) {
+      if (!existing.image.equals(input.image) || !isDeepStrictEqual(existing.metadata, retainedMetadata)) {
         throw new ObserverError("ARTIFACT_INVALID", "Imported artifact already exists with different content", 409);
       }
       return this.refFromRead(input.backend, `${input.backend}/${input.jobId}`, input.jobId, existing.image, existing.metadata);
@@ -402,7 +533,7 @@ export class ArtifactStore {
     const temporary = join(backendRoot, `.${input.jobId}.${randomUUID()}.tmp`);
     mkdirSync(temporary, { mode: 0o700 });
     try {
-      atomicWriteFile(temporary, join(temporary, "image.png"), validated.png);
+      atomicWriteFile(temporary, join(temporary, retainedFileName), input.image);
       this.writeMetadata(temporary, join(temporary, "metadata.json"), retainedMetadata);
       renameSync(temporary, root);
     } catch (error) {
@@ -414,25 +545,32 @@ export class ArtifactStore {
       jobId: input.jobId,
       storeKey: `${input.backend}/${input.jobId}`,
       sha256,
-      bytes: validated.png.length,
+      bytes: input.image.length,
       width: validated.width,
       height: validated.height,
+      format: declaredFormat,
+      mimeType: descriptor.mimeType,
+      fileName: retainedFileName,
     };
   }
 
   readRef(ref: ManagedArtifactRef): ManagedArtifactRead {
     const root = this.rootForRef(ref);
-    const imagePath = assertRegularManagedFile(root, join(root, "image.png"));
     const metadataPath = assertRegularManagedFile(root, join(root, "metadata.json"));
+    const metadataRecord = this.readMetadata(root, metadataPath);
+    const retained = retainedImageDescriptor(metadataRecord);
+    const imagePath = assertRegularManagedFile(root, join(root, retained.fileName));
     const alreadyInUse = this.inUse.has(root);
     this.inUse.add(root);
     try {
       const image = readFileSync(imagePath);
-      const metadataRecord = this.readMetadata(root, metadataPath);
       const actualSha256 = createHash("sha256").update(image).digest("hex");
       if (actualSha256 !== ref.sha256 || image.length !== ref.bytes ||
           metadataRecord.width !== ref.width || metadataRecord.height !== ref.height ||
-          metadataRecord.contentSha256 !== actualSha256) {
+          metadataRecord.contentSha256 !== actualSha256 ||
+          (ref.format !== undefined && ref.format !== retained.format) ||
+          (ref.mimeType !== undefined && ref.mimeType !== retained.mimeType) ||
+          (ref.fileName !== undefined && ref.fileName !== retained.fileName)) {
         throw new ObserverError("ARTIFACT_INVALID", "Retained artifact no longer matches its managed reference", 409);
       }
       return { image, metadata: metadataRecord };
@@ -450,9 +588,10 @@ export class ArtifactStore {
     if (entry.isSymbolicLink() || !entry.isDirectory()) {
       throw new ObserverError("ARTIFACT_INVALID", "Retained artifact path is not a managed directory", 409);
     }
-    assertRegularManagedFile(root, join(root, "image.png"));
-    assertRegularManagedFile(root, join(root, "metadata.json"));
-    if (readdirSync(root).some((name) => name !== "image.png" && name !== "metadata.json")) {
+    const metadataPath = assertRegularManagedFile(root, join(root, "metadata.json"));
+    const retained = retainedImageDescriptor(this.readMetadata(root, metadataPath));
+    assertRegularManagedFile(root, join(root, retained.fileName));
+    if (readdirSync(root).some((name) => name !== retained.fileName && name !== "metadata.json")) {
       throw new ObserverError("ARTIFACT_INVALID", "Retained artifact directory contains unrelated files", 409);
     }
     rmSync(root, { recursive: true, force: false });
@@ -498,9 +637,15 @@ export class ArtifactStore {
       for (const jobEntry of readdirSync(sessionRoot, { withFileTypes: true })) {
         if (!jobEntry.isDirectory() || jobEntry.isSymbolicLink()) continue;
         const root = join(sessionRoot, jobEntry.name);
-        const image = join(root, "image.png");
         const metadata = join(root, "metadata.json");
-        if (!existsSync(image) || !existsSync(metadata)) continue;
+        if (!existsSync(metadata)) continue;
+        let image: string;
+        try {
+          image = join(root, retainedImageDescriptor(this.readMetadata(root, metadata)).fileName);
+        } catch {
+          continue;
+        }
+        if (!existsSync(image)) continue;
         const bytes = statSync(image).size + statSync(metadata).size;
         const mtimeMs = Math.min(statSync(image).mtimeMs, statSync(metadata).mtimeMs);
         const storeKey = sessionEntry.name === "workbench"
@@ -585,6 +730,7 @@ export class ArtifactStore {
     if (metadata.contentSha256 !== undefined && metadata.contentSha256 !== contentSha256) {
       throw new ObserverError("ARTIFACT_INVALID", "Retained artifact digest metadata is invalid", 409);
     }
+    const retained = retainedImageDescriptor(metadata);
     return {
       backend,
       jobId,
@@ -593,6 +739,9 @@ export class ArtifactStore {
       bytes: image.length,
       width: width as number,
       height: height as number,
+      format: retained.format,
+      mimeType: retained.mimeType,
+      fileName: retained.fileName,
     };
   }
 

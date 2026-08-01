@@ -6,6 +6,236 @@ mixed tracker on 2026-07-28; same-day ties retain their migration order.
 
 ## Resolved defects
 
+### MCP-042 - `wb_component` reports an added prefab component that `wb_save_resource` drops
+
+**Status:** Resolved
+
+**Severity:** P0
+
+**Closed:** 2026-07-31
+
+**Resolution:** Prefab Edit Mode component operations now target the
+serializable prefab-template ancestor and verify their component-count delta.
+The public component and entity-modification tools can address an unnamed
+prefab root by `entityIndex`. Before native save, an inherited `.et` containing
+an explicit empty nested component override is refused and its target session
+is tainted, preventing the known lossy-success path.
+
+**Verification:** The disposable live explicit-save acceptance added a custom
+script component to an unnamed prefab root, configured its attributed value to
+`42`, saved it, and verified the component and value after a fresh Workbench
+reopen. A separate inherited prefab with an explicit empty array override was
+refused before native save; dispatch count and source bytes remained unchanged,
+and the tainted session rejected a second save. Focused and repository-wide
+offline tests also passed.
+
+### MCP-040 - loose-resource registration deadlocks behind World Editor edit mode
+
+**Status:** Resolved
+
+**Severity:** P0
+
+**Closed:** 2026-07-31
+
+**Resolution:** The Workbench state helper now reports `no_world_editor` when
+there is no document and `GetGame().InPlayMode()` is false. `wb_resources` uses
+a ResourceManager-specific mode guard that permits this generic state while
+continuing to reject actual Play mode.
+
+**Verification:** The disposable live lifecycle acceptance launched generic
+Workbench, observed `no_world_editor`, registered a loose `.et` and `.ent`
+without metadata, and verified distinct generated GUIDs plus responsive bridge
+ping. Fresh target-bound Workbench sessions then opened and saved both
+registered resources successfully, with final exact process vacancy.
+
+### MCP-036 - managed server launch is not borderless and steals foreground focus
+
+**Status:** Resolved
+
+**Severity:** Disruptive runtime-launch behavior
+
+**Closed:** 2026-07-31
+
+**Resolution:** Managed graphical acceptance launches no longer inject
+`-window` or fixed screen dimensions. Launch preparation retains
+`-noFocus -forceUpdate`, and exact-owned graphical launches containing
+`-noFocus` additionally use a short-lived Windows startup guard across
+Reforger's replacement windows. The guard restores original styles after
+initialization. Explicit `noFocus: false` bypasses the guard, caller-supplied
+`-window` remains supported, and dedicated runtimes and test runners are not
+guarded.
+
+**Verification:** An isolated live probe showed that current Reforger still
+took focus even with `-noFocus` first, proving argument order was not the cause.
+The complete graphical observer acceptance then passed with a visible
+borderless fullscreen popup covering the monitor, no foreground ownership
+during readiness, successful captures/restoration, and exact shutdown. The
+observed foreground PID remained the prior application rather than Reforger.
+
+### MCP-006 — resource registration can stall and disconnect Workbench
+
+**Status:** Resolved
+
+**Severity:** Non-breaking authoring failure
+
+**Closed:** 2026-07-31
+
+**Resolution:** Resource registration and rebuild calls now use a 120-second
+operation-specific deadline instead of the generic 10-second deadline. The
+`game_duplicate` and `wb_entity_duplicate` registration paths use the same
+deadline and cannot auto-launch a replacement Workbench mid-request.
+
+**Verification:** The disposable live lifecycle acceptance registered a loose
+prefab, world, and minimal valid material through generic Workbench, verified
+distinct generated metadata and bridge responsiveness after each registration,
+and reopened/saved the prefab and world in fresh target-bound sessions. The run
+finished with exact process vacancy; focused and repository-wide offline tests
+also passed.
+
+### MCP-044 - MCP verification rejected the supported `mod.gprojPath` input
+
+**Status:** Resolved
+
+**Severity:** P1
+
+**Closed:** 2026-07-30
+
+**Resolution:** The compiled-server verifier now distinguishes the removed mod
+build surface from the supported exact-project `gprojPath` used by mod
+validation. It still rejects `action: "build"` and the genuinely removed build
+arguments.
+
+**Verification:** `tests/setup/server-verification.test.ts` advertises
+`gprojPath` in the valid runtime surface and verifies that registration passes.
+The defect was discovered by the read-only `npm run mcp:verify` baseline; no
+Workbench or game process was launched.
+
+### MCP-041 — `wb_layers` advertised mutations that the staged helper did not implement
+
+**Status:** Resolved
+
+**Severity:** P1
+
+**Closed:** 2026-07-29
+
+**Resolution:** `wb_layers` now advertises exactly the helper's supported
+actions: `list`, `getActive`, `getEntityLayer`, `isVisible`, `getInfo`, and
+`toggleLock`. Unsupported create/delete/rename/active-layer/visibility
+mutations are no longer registered. Every advertised helper response is checked
+for `status: "ok"`, so a helper rejection becomes `isError: true` rather than
+a false `Layer Updated` receipt.
+
+**Verification:** `tests/workbench/wb-layers-tool.test.ts` covers schema/helper
+parity and a rejected helper action; the focused offline suite and TypeScript
+typecheck passed. No Workbench process was launched.
+
+### MCP-038 — `scenario_create_conflict` respects `patrolCount: 0`
+
+**Status:** Resolved
+
+**Severity:** P1
+
+**Closed:** 2026-07-29
+
+**Resolution:** Defender generation uses nullish defaulting
+(`base.patrolCount ?? 2`), preserving an explicit zero while applying the
+default only when the value is omitted.
+
+**Verification:** The existing zero-value regression in
+`tests/templates/scenario.test.ts` passed in the focused offline suite. No
+Workbench process was launched.
+
+### MCP-037 — `prefab(action: "create")` corrupted inherited game-mode structure
+
+**Status:** Resolved
+
+**Severity:** P0
+
+**Closed:** 2026-07-29
+
+**Resolution:** Parent-aware prefab creation now uses the resolved leaf
+ancestor's root entity class instead of the generic recipe root. It also uses
+only direct `components` members when materializing ancestry, so nested
+containers cannot be promoted into peer components.
+
+**Verification:** `tests/templates/prefab.test.ts` covers the typed inherited
+root, and `tests/utils/prefab-ancestry.test.ts` covers nested-container
+exclusion; both passed in the focused offline suite and TypeScript typecheck.
+No Workbench process was launched.
+
+### MCP-034 — `observer_run finalize` hid its required capture-label list
+
+**Status:** Resolved
+
+**Severity:** Non-breaking public-contract mismatch
+
+**Closed:** 2026-07-29
+
+**Resolution:** The registered `observer_run` description now states that
+finalize requires `runId`, `includeCaptureLabels`, and `review`; the
+`includeCaptureLabels` schema property explicitly identifies its finalize-only
+requirement. This matches the existing handler validation.
+
+**Verification:** `tests/observer/observer-mcp-tools-schema-responses.test.ts`
+inspects the public schema and description through the MCP transport; it passed
+in the focused offline suite and TypeScript typecheck.
+
+### MCP-033 — owned `dedicated` runtime launched the game client executable
+
+**Status:** Resolved
+
+**Severity:** Breaking runtime-lifecycle mismatch
+
+**Closed:** 2026-07-29
+
+**Resolution:** Owned-runtime executable discovery is now parameterized by the
+prepared runtime kind. `dedicated` selects an allowlisted
+`ArmaReforgerServer*.exe`; client, listen-server, and test-runner kinds retain
+the graphical executable allowlist. Start, status, and receipt re-attestation
+all resolve against the runtime kind on the durable descriptor or receipt.
+
+**Verification:** `tests/observer/owned-runtime-executable-resolution.test.ts`
+selects `ArmaReforgerServerDiag.exe` when both executable families exist, and
+`tests/observer/owned-runtime-manager-spawn-publication.test.ts` proves start
+passes the prepared dedicated kind into the resolver. Both passed offline,
+along with TypeScript typecheck.
+
+### MCP-032 — Workbench launch and build disagreed on target-relative dependencies
+
+**Status:** Resolved
+
+**Severity:** Breaking validation failure
+
+**Closed:** 2026-07-29
+
+**Resolution:** MCP-owned editor plans now include the target project's sibling
+add-on container, just as guarded target builds do, before dependency preflight
+and process spawn.
+
+**Verification:**
+`tests/workbench/restart-ownership-addon-dependencies.test.ts` proves an
+MCP-owned editor launch resolves a sibling dependency and emits that root in
+`-addonsDir`. The focused offline suite and TypeScript typecheck passed; no
+Workbench process was launched.
+
+### MCP-010 — guarded build reported a non-vacant endpoint after its process exited
+
+**Status:** Resolved
+
+**Severity:** Breaking validation failure
+
+**Closed:** 2026-07-29
+
+**Resolution:** The native endpoint-vacancy helper treats a retained TCP owner
+table row as vacant only after opening the reported PID with a native process
+handle proves it has exited or no longer exists. A live or unverifiable PID
+remains fail-closed.
+
+**Verification:** `tests/workbench/project-launcher-safety.test.ts` exercises
+the actual PowerShell helper against a local loopback listener and then its
+vacant endpoint. It passed in the focused offline suite; no Workbench process
+was launched.
+
 ### MCP-009 — TestContent MCP launch omitted the Core dependency root
 
 **Status:** Resolved

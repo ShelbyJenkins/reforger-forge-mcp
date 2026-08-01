@@ -14,7 +14,7 @@ game and project assets, generate mod content, and use Arma Reforger Workbench.
 
 ## Quick start
 
-Windows and Node.js 20 or newer are required. From a fresh clone, run:
+Windows and Node.js 24 LTS or newer are required. From a fresh clone, run:
 
 ```powershell
 git clone https://github.com/wastelandgoats/reforger-forge-mcp.git

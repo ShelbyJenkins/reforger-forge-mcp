@@ -1,6 +1,6 @@
 # Observer usage guide
 
-Observer captures validated PNG evidence from either a graphical Arma Reforger
+Observer captures validated PNG, JPEG, or WebP evidence from either a graphical Arma Reforger
 runtime or an already-running Workbench editor. It manages the capture
 transaction, camera restoration, and optional evidence export; it does not
 prove the gameplay claim shown in an image. A person must review the selected
@@ -76,6 +76,10 @@ Call `observer_prepare_launch` with the normal graphical runtime arguments and
 an exclusive, Observer-approved outer `profilePath`. It returns prepared
 argument tokens, an opaque `preparedLaunchId`, and session metadata. Preparation
 does not start the game.
+
+Preparation defaults `noFocus` and `forceUpdate` to true. Leave `-window` out
+to retain the engine's fullscreen default without stealing startup focus; add
+`-window` and optional dimensions only for an intentional windowed run.
 
 You can pass the returned arguments unchanged to your own launcher. On Windows,
 you can instead call `observer_runtime action: "start"` with the
@@ -166,11 +170,24 @@ world revision.
   "asynchronous": false,
   "timeoutMs": 30000,
   "settleFrames": 0,
-  "performancePolicy": "evidence"
+  "performancePolicy": "evidence",
+  "image": {
+    "maxWidth": 1920,
+    "maxHeight": 1080,
+    "format": "webp",
+    "quality": 75
+  }
 }
 ```
 
-Synchronous mode returns one host-validated PNG plus metadata when it fits the
+The optional `image` object limits the output while preserving aspect ratio and
+never enlarging the source. Either dimension may be supplied independently.
+`format` accepts `png`, `jpeg`, or `webp`; JPEG and WebP accept quality from 1
+through 100 within the operator-configured range. PNG is lossless and rejects a
+quality value. Omitting `image` preserves native resolution and returns PNG.
+The effective image policy is part of capture idempotency.
+
+Synchronous mode returns one host-validated image with its actual MIME type and metadata when it fits the
 MCP inline limit. It is best for interactive review. A completed capture proves
 that the image was validated, bound to the selected world, and reached terminal
 camera restoration; it does not prove the assertion depicted by the image.
@@ -212,7 +229,8 @@ been reviewed or cannot support a conclusion.
 When exactly one evidence root is configured, `evidenceRoot` may be omitted.
 With more than one configured root, provide the intended allowlisted root
 explicitly. Finalization creates `<evidenceRoot>/<runId>/` with `RESULT.md`,
-`manifest.json`, and the selected capture PNG/JSON pairs. It does not overwrite
+`manifest.json`, and selected capture image/JSON pairs using the actual image
+extension. It does not overwrite
 an existing bundle.
 
 Optionally include sanitized runtime configuration and approved relevant text

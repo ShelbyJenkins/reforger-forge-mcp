@@ -101,9 +101,12 @@ describe("dedicated Workbench observer handler contract", () => {
       source("EMCP_WB_ObserverCommon.c"),
     ]
       .join("\n");
-    expect(observerSource).toContain('string screenshotRequestPath = CAPTURE_DIRECTORY + "/" + m_Job.jobId');
-    expect(observerSource).toContain('m_Job.outputLogicalPath = screenshotRequestPath + ".png"');
-    expect(observerSource).toContain("System.MakeScreenshot(screenshotRequestPath)");
+    expect(observerSource).toContain('m_Job.outputLogicalPath = CAPTURE_DIRECTORY + "/" + m_Job.jobId + ".png"');
+    expect(observerSource).toContain("System.GetRenderingResolution(m_Job.sourceWidth, m_Job.sourceHeight)");
+    expect(observerSource).toContain("System.MakeScreenshotRawData(OnScreenshot");
+    expect(observerSource).toContain("Workbench.SavePixelRawData(m_Job.outputLogicalPath");
+    expect(observerSource).toContain("m_ScreenshotCallbackPending");
+    expect(observerSource).not.toContain("System.MakeScreenshot(");
     expect(observerSource).not.toMatch(/ExecuteAction|SwitchToGameMode|SetOpenedResource|Save\(|RunCmd|RunProcess|Reload/);
   });
 
@@ -115,7 +118,7 @@ describe("dedicated Workbench observer handler contract", () => {
       }
     }
     const submit = source("EMCP_WB_ObserverSubmit.c");
-    for (const field of ["jobId", "leaseId", "lifecycleGeneration", "canonicalTarget", "viewKind", "fovText"]) {
+    for (const field of ["jobId", "leaseId", "lifecycleGeneration", "canonicalTarget", "viewKind", "fovText", "maxWidth", "maxHeight"]) {
       expect(submit).toContain(`RegV("${field}")`);
     }
     const common = source("EMCP_WB_ObserverCommon.c");

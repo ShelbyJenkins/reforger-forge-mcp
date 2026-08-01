@@ -100,6 +100,7 @@ describe("observer package and source contracts", () => {
 
   it("keeps observer and MCP builds separate and publishes required runtime assets", () => {
     const packageJson = JSON.parse(readFileSync(join(repositoryRoot, "package.json"), "utf8"));
+    expect(packageJson.version).toBe("1.2.0");
     const gitAttributes = readFileSync(join(repositoryRoot, ".gitattributes"), "utf8");
     expect(gitAttributes.split(/\r?\n/)).toContain("observer/addon/** -text");
     expect(gitAttributes.split(/\r?\n/)).toContain("observer/workbench-addon/** -text");
@@ -121,6 +122,16 @@ describe("observer package and source contracts", () => {
     expect(enforceValidation).not.toMatch(/\b(?:npm\s+run\s+)?build\b/);
     expect(packageJson.devDependencies.tar).toBe("7.5.19");
     expect(packageJson.dependencies.tar).toBeUndefined();
+    expect(packageJson.dependencies["@napi-rs/image"]).toBe("1.14.0");
+    const packageLock = JSON.parse(readFileSync(join(repositoryRoot, "package-lock.json"), "utf8"));
+    expect(packageLock.version).toBe(packageJson.version);
+    expect(packageLock.packages[""].version).toBe(packageJson.version);
+    expect(packageLock.packages["node_modules/@napi-rs/image"]).toMatchObject({ version: "1.14.0" });
+    expect(packageLock.packages["node_modules/@napi-rs/image-win32-x64-msvc"]).toMatchObject({
+      version: "1.14.0",
+      os: ["win32"],
+      cpu: ["x64"],
+    });
     expect(Object.keys(packageJson.scripts).filter((name) =>
       name.startsWith("observer:acceptance:")
     )).toEqual([
@@ -140,6 +151,7 @@ describe("observer package and source contracts", () => {
       "observer/README.md",
       "SETUP.md",
       "docs/observer.md",
+      "docs/release-notes/RELEASE_NOTES_v1.2.0.md",
       "docs/runner-cli.md",
       "contributing.md",
     ]));
@@ -189,6 +201,9 @@ describe("observer package and source contracts", () => {
     expect(existsSync(join(repositoryRoot, "dist", "src"))).toBe(false);
     expect(existsSync(join(repositoryRoot, "observer", "protocol", "VERSION"))).toBe(true);
     const packageCheck = readFileSync(join(repositoryRoot, "scripts", "check-package.mjs"), "utf8");
+    expect(packageCheck).toContain("docs/release-notes/RELEASE_NOTES_v1.2.0.md");
+    const serverEntry = readFileSync(join(repositoryRoot, "src", "index.ts"), "utf8");
+    expect(serverEntry).toContain(`const SERVER_VERSION = "${packageJson.version}"`);
     expect(packageCheck).toContain("dist/observer/agent/private-child.js");
     expect(packageCheck).toContain("dist/observer/agent/application.js");
     expect(packageCheck).toContain("dist/observer/agent/application-operations.js");

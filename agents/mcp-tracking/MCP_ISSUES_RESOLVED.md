@@ -5,6 +5,89 @@ records. Move newly resolved or verified entries to the top. The legacy records
 below were migrated from the mixed tracker on 2026-07-28; same-day ties retain
 their migration order.
 
+### MCP-043 — fullscreen observer captures can exceed retained-image limits
+
+**Status:** Resolved
+
+**Priority:** P1
+
+**Closed:** 2026-07-31
+
+`observer_capture` now accepts an optional `image` policy with independent
+fit-inside `maxWidth` and `maxHeight` bounds and `png`, `jpeg`, or `webp`
+output. JPEG and WebP accept a bounded optional quality and otherwise use the
+configured default; PNG remains lossless and rejects quality. Omitting the
+policy preserves native-resolution PNG behavior. The normalized policy is part
+of capture idempotency and recovery identity.
+
+Runtime BMP and Workbench PNG intake share the pinned asynchronous
+`@napi-rs/image` 1.14.0 transformation service. Workbench uses
+`System.GetRenderingResolution`, `System.MakeScreenshotRawData`, and
+`Workbench.SavePixelRawData` to persist the requested fit-inside PNG while the
+callback-owned pixels are valid, before host transcoding or durable promotion.
+The retained artifact, MCP content, recovery record, evidence manifest, and
+finalization receipt bind the actual format, MIME type, extension, dimensions,
+quality, bytes, digest, source provenance, and requested policy. Existing PNG
+records remain readable and all source, decoded-pixel, retained, inline, and
+aggregate limits remain enforced.
+
+**Live verification:** The v4 positive-path Workbench acceptance passed on
+Workbench 1.7.0.54 and Node.js 24.18.0. Its 288x288 World Editor source viewport
+was reduced to 192x192 before PNG persistence and host retention. Six finalized
+captures included PNG, JPEG quality 61, JPEG quality 68, and WebP using the
+exact default quality 75 with their correct MIME types and extensions. The
+procedure also proved completed-request replay, an in-flight cancellation,
+pose and look-at restoration, post-cancellation capture, manifest validation,
+managed release, exact-owned shutdown, and zero remaining Workbench or
+supervised child processes. The same producer path computes its destination
+from the reported source viewport, so larger and fullscreen viewports do not
+materialize a native-size Workbench PNG first.
+
+**Failure verification:** Direct tests cover a valid final encoding above the
+retained-byte limit, injected decoder failure, a one-shot injected encoder
+failure before atomic promotion followed by successful recovery, post-promotion
+recovery, and exact explicit/default quality metadata across recovery. Failed
+transformations neither promote partial output nor discard the recoverable
+source.
+
+**Release verification:** The package, lockfile, and server version are 1.2.0;
+the current operator and agent guides describe the resolution/format/quality
+contract, and the v1.2.0 notes are required package content. Node 24 clean
+install, protocol check, unused-code check, byte-stable protocol generation,
+MCP and Observer builds, typecheck, the complete Vitest suite, and both online
+cache-warming and offline installed-tarball package checks passed. The earlier
+peak-memory benchmark suggestion is not a release gate: reviewed hard limits
+bound allocation and retention, while the live operational baseline records
+the representative capture timings and environment without imposing a
+hardware-specific performance threshold.
+
+Producer-side runtime raw-data capture remains a separate optional
+optimization. Runtime output is already bounded before durable artifact
+promotion, so that optimization is not required to resolve this issue.
+
+### MCP-003 — evidence runs may span a Workbench lifecycle restart
+
+**Status:** Resolved
+
+**Closed:** 2026-07-29
+
+Completed captures are retained as backend-neutral run artifacts. Their
+instance and world identity remain in each capture record, but a later
+Workbench lifecycle does not invalidate an already completed artifact.
+`ObserverRunStore.finalize` validates only the selected labels, their retained
+completed artifacts, review data, and export integrity; `discard` releases the
+same retained artifacts without a current-Workbench lifecycle check.
+
+Capture submission remains lifecycle-fenced, so a capture cannot be accepted
+from a stale observer. The resulting evidence bundle identifies each selected
+capture's instance and world, allowing review of a deliberately mixed-lifecycle
+bundle without silently attributing its images to one Workbench session.
+
+**Verification:** `tests/observer/runs.test.ts` creates two completed
+Workbench captures with distinct instance and world identities, then finalizes
+both in one reviewed bundle. The focused test suite passed (15 tests) without
+starting an MCP host, Workbench, or Arma client.
+
 ### MCP-039 — provide a safe way to release or transfer an idle lifecycle lease
 
 **Status:** Resolved

@@ -11,7 +11,7 @@ MCP client, see [MCP client notes](agents/README.md).
 ## Requirements
 
 - Windows
-- Node.js 20 or newer
+- Node.js 24 LTS or newer
 - Arma Reforger from Steam for game-asset browsing
 - Arma Reforger Tools from Steam for resource registration and reviewed live
   Workbench control
@@ -304,6 +304,9 @@ array with `[]`. A clear flag cannot be combined with its repeated value flag.
 | `observer.requestTimeoutMs` | `--observer-request-timeout-ms` | `30000` |
 | `observer.defaultCaptureTimeoutMs` | `--observer-capture-timeout-ms` | `30000` |
 | `observer.maxInlineImageBytes` | `--observer-max-inline-image-bytes` | `8388608` |
+| `observer.defaultLossyImageQuality` | `--observer-default-lossy-image-quality` | `75` |
+| `observer.minimumLossyImageQuality` | `--observer-minimum-lossy-image-quality` | `1` |
+| `observer.maximumLossyImageQuality` | `--observer-maximum-lossy-image-quality` | `100` |
 | `observer.retentionIntervalMs` | `--observer-retention-interval-ms` | `60000` |
 | `observer.retentionMaxAgeMs` | `--observer-retention-max-age-ms` | `604800000` |
 | `observer.retentionMaxBytes` | `--observer-retention-max-bytes` | `536870912` |

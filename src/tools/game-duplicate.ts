@@ -318,7 +318,7 @@ export function registerGameDuplicate(
           const regResp = await client.call<{ status: string; message?: string }>(
             "EMCP_WB_Resources",
             { action: "register", path: absDestPath, buildRuntime: false },
-            { timeout: 30000, skipAutoLaunch: true }
+            { timeout: 120_000, skipAutoLaunch: true }
           );
 
           if (regResp.status !== "ok") {

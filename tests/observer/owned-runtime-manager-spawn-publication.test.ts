@@ -57,6 +57,43 @@ describe("OwnedRuntimeManager", () => {
     expect(started).not.toHaveProperty("ownerTokenArgument");
   });
 
+  it("resolves the executable for the prepared dedicated runtime kind", async () => {
+    const value = makeHarness();
+    const prepared = await value.prepare([], "dedicated-prepare", "dedicated");
+
+    await value.startPrepared(prepared.id, "dedicated-start");
+
+    expect(value.resolvedRuntimeKinds).toEqual(["dedicated"]);
+  });
+
+  it("guards only graphical launches whose prepared arguments request no-focus startup", async () => {
+    const value = makeHarness();
+    const guarded = await value.prepare(["-noFocus"], "guarded-prepare", "listenServer");
+    const unguarded = await value.prepare(["-forceUpdate"], "unguarded-prepare", "client");
+    const dedicated = await value.prepare(["-noFocus"], "dedicated-prepare", "dedicated");
+
+    const guardedRuntime = await value.startPrepared(guarded.id, "guarded-start");
+    await value.startPrepared(unguarded.id, "unguarded-start");
+    await value.startPrepared(dedicated.id, "dedicated-start");
+
+    expect(value.foregroundProtectionPids).toEqual([guardedRuntime.pid]);
+  });
+
+  it("refuses ownership publication and cleans up when startup focus protection fails", async () => {
+    const value = makeHarness({
+      preserveForegroundDuringStartup: async () => {
+        throw new Error("focus guard failed");
+      },
+    });
+    const prepared = await value.prepare(["-noFocus"], "focus-failure-prepare");
+
+    await expect(value.startPrepared(prepared.id, "focus-failure-start"))
+      .rejects.toMatchObject({ code: "SPAWN_FAILED" });
+
+    expect(value.spawnCalls[0].child.killed).toBe(true);
+    expect(listRecordIds(value.manager, "runtimes")).toEqual([]);
+  });
+
   it("fences start before spawn and ownership publication when the mutex lease is lost", async () => {
     const backend = createLeaseLosingBackend();
     const value = makeHarness({ backend });

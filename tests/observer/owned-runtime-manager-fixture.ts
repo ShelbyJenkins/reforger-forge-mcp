@@ -482,9 +482,15 @@ export interface Harness {
   gate: FakeGate;
   manager: OwnedRuntimeManager;
   spawnCalls: Array<{ executable: string; arguments: string[]; options: Record<string, unknown>; child: FakeChild }>;
+  resolvedRuntimeKinds: ObserverLaunchInput["runtimeKind"][];
+  foregroundProtectionPids: number[];
   setClock(value: number): void;
   setExecutable(value: string): void;
-  prepare(argumentsArray?: string[], idempotencyKey?: string): Promise<{ id: string; prepared: ObserverPreparedLaunch }>;
+  prepare(
+    argumentsArray?: string[],
+    idempotencyKey?: string,
+    runtimeKind?: ObserverLaunchInput["runtimeKind"]
+  ): Promise<{ id: string; prepared: ObserverPreparedLaunch }>;
   startPrepared(preparedLaunchId: string, idempotencyKey: string): Promise<OwnedRuntimePublicStatus>;
   start(idempotencyKey: string, argumentsArray?: string[], prepareIdempotencyKey?: string): Promise<OwnedRuntimePublicStatus>;
   stop(runtimeId: string, idempotencyKey: string, waitForRestorationMs?: number): Promise<OwnedRuntimePublicStatus>;
@@ -582,6 +588,7 @@ export function makeHarness(options: {
   preparedSessionId?: string;
   preparedExpiresAt?: string;
   preparedProfilePath?: string;
+  preserveForegroundDuringStartup?: (pid: number) => Promise<void>;
 } = {}): Harness {
   const root = options.root ?? mkdtempSync(join(tmpdir(), "rfo-owned-runtime-"));
   if (!options.root) roots.push(root);
@@ -590,6 +597,8 @@ export function makeHarness(options: {
   const backend = options.backend ?? createFakeBackend();
   const gate = options.gate ?? new FakeGate();
   const spawnCalls: Harness["spawnCalls"] = [];
+  const resolvedRuntimeKinds: Harness["resolvedRuntimeKinds"] = [];
+  const foregroundProtectionPids: number[] = [];
   let pid = 4100;
   let clock = Date.parse("2026-07-18T12:00:00.000Z");
   let selectedExecutable = executable;
@@ -616,7 +625,14 @@ export function makeHarness(options: {
     observerGate: gate,
     backend,
     spawnProcess,
-    executableResolver: () => selectedExecutable,
+    preserveForegroundDuringStartup: async (targetPid) => {
+      foregroundProtectionPids.push(targetPid);
+      await options.preserveForegroundDuringStartup?.(targetPid);
+    },
+    executableResolver: (runtimeKind) => {
+      resolvedRuntimeKinds.push(runtimeKind);
+      return selectedExecutable;
+    },
     installationRoot: process.cwd(),
     clock: () => options.advanceClock ? (clock += 100) : clock,
     ownerToken: () => `owner_${String(id).padStart(58, "0")}`,
@@ -630,9 +646,13 @@ export function makeHarness(options: {
     ...(options.maxRecordBytes === undefined ? {} : { maxRecordBytes: options.maxRecordBytes }),
   });
   openManagers.push(manager);
-  const prepare = async (argumentsArray = ["-window", "-noSplash"], idempotencyKey?: string) => {
+  const prepare = async (
+    argumentsArray = ["-window", "-noSplash"],
+    idempotencyKey?: string,
+    runtimeKind: ObserverLaunchInput["runtimeKind"] = "listenServer"
+  ) => {
     const input: ObserverLaunchInput = {
-      runtimeKind: "listenServer",
+      runtimeKind,
       arguments: argumentsArray,
       profilePath: options.preparedProfilePath ?? join(root, "profiles", `profile-${id}`),
       sessionTtlMs: 60_000,
@@ -667,6 +687,8 @@ export function makeHarness(options: {
     gate,
     manager,
     spawnCalls,
+    resolvedRuntimeKinds,
+    foregroundProtectionPids,
     setClock: (value) => { clock = value; },
     setExecutable: (value) => { selectedExecutable = value; },
     prepare,

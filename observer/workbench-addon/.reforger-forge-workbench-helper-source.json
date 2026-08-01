@@ -5,8 +5,8 @@
   "protocolVersion": "2.0",
   "addonId": "ReforgerForgeWorkbenchHelper",
   "addonGuid": "4D74249D90703F46",
-  "buildIdentity": "bc03d671ed4c867472383c41048fcb40abb784dd287a4928c0588e5d5be9013d",
-  "bundleDigest": "2bfbf9020ce37cd4cff4db1bb9dbf944260260a9a7b0f485a5fd7d6cef9eac62",
+  "buildIdentity": "7c76e1d1ccd09b7a8b334c00d9555a0c218df9dc4d949a8b674ac537f5a43659",
+  "bundleDigest": "c06f9fc1aba9a94c806ac66fd54c8396d71695940de1f4781a2a90daee082e04",
   "files": [
     {
       "path": "addon.gproj",
@@ -18,7 +18,7 @@
     },
     {
       "path": "Scripts/WorkbenchGame/EnfusionMCP/EMCP_WB_Components.c",
-      "sha256": "aa15e4361e690df5ce3fd9a42371a983d4d7d2914cc70987bc3d2284768073f1"
+      "sha256": "431d958dd8628ccf98b6055f5670cf7fbfac2ca826920128818b71efa7e8582f"
     },
     {
       "path": "Scripts/WorkbenchGame/EnfusionMCP/EMCP_WB_CreateEntity.c",
@@ -50,7 +50,7 @@
     },
     {
       "path": "Scripts/WorkbenchGame/EnfusionMCP/EMCP_WB_GetState.c",
-      "sha256": "bbe52649433b3470212f98453596732ec05ab08c511ea62d88c8cad9330198fe"
+      "sha256": "0073334e040a75860f15ba5155c638a692f3ea09100fbbbc4c3cea0adc4a1122"
     },
     {
       "path": "Scripts/WorkbenchGame/EnfusionMCP/EMCP_WB_Layers.c",
@@ -66,7 +66,7 @@
     },
     {
       "path": "Scripts/WorkbenchGame/EnfusionMCP/EMCP_WB_ModifyEntity.c",
-      "sha256": "9645e7bd159282cb502e0678d38ed29b1a2ac87b4e8e92c772a9bd3e52da2403"
+      "sha256": "fadc2ab434c18e3ce19dd092d5614f8bb8fac73a84e4ebaad64e1fb59d8bbbd2"
     },
     {
       "path": "Scripts/WorkbenchGame/EnfusionMCP/EMCP_WB_ObserverCancel.c",
@@ -74,7 +74,7 @@
     },
     {
       "path": "Scripts/WorkbenchGame/EnfusionMCP/EMCP_WB_ObserverCommon.c",
-      "sha256": "3d35849048e5336f96c96b8059956354a675465498974b4af9215b255678d114"
+      "sha256": "4dbec0c354f5bf9c528a9c4abb0e66882e91f8d22a8c8f25f298c9b4d47da465"
     },
     {
       "path": "Scripts/WorkbenchGame/EnfusionMCP/EMCP_WB_ObserverPing.c",
@@ -94,11 +94,11 @@
     },
     {
       "path": "Scripts/WorkbenchGame/EnfusionMCP/EMCP_WB_ObserverSubmit.c",
-      "sha256": "99410ae4abfbb85c1139ae0d17c472885e494a6a6a83fa632047673e1e39c971"
+      "sha256": "b0cb63ccd5b24377f8cc74ee61d07e5874ea65b7286cd7c8182df70e955a86bf"
     },
     {
       "path": "Scripts/WorkbenchGame/EnfusionMCP/EMCP_WB_Ping.c",
-      "sha256": "cd6fc7cf94bdf166414eb2d1c61147fba6042476151d3c05202009a72305e5f1"
+      "sha256": "8cb18bc50af62af22c3d15aa6719c452ff3ad750cfee99ab5f79eda1e497cf83"
     },
     {
       "path": "Scripts/WorkbenchGame/EnfusionMCP/EMCP_WB_Prefabs.c",
@@ -130,7 +130,7 @@
     },
     {
       "path": "Scripts/WorkbenchGame/EnfusionMCP/RFWB_HelperBuild.c",
-      "sha256": "b68b7d3e4b5808c72ae2827bef4c14309bf46bd494bfa3ab4481518a1361db2e"
+      "sha256": "462662b52fedbe467f0f45de9a5ac833af03d42052ec48e89eac7723999de651"
     }
   ]
 }

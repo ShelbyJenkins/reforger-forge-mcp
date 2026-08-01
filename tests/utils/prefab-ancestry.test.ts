@@ -8,6 +8,7 @@ import {
   stripGuid,
   parseParentPath,
   parseComponents,
+  parseTopLevelComponents,
   walkChain,
   mergeAncestryComponents,
   type AncestorLevel,
@@ -149,6 +150,23 @@ describe("parseComponents", () => {
     expect(comps.size).toBe(2);
     expect(comps.has("AAAAAAAAAAAAAAAA")).toBe(true);
     expect(comps.has("BBBBBBBBBBBBBBBB")).toBe(true);
+  });
+});
+
+describe("parseTopLevelComponents", () => {
+  it("does not promote nested containers into peer components", () => {
+    const content = `GenericEntity {
+  components {
+   SCR_BaseGameMode "{AAAAAAAAAAAAAAAA}" {
+    SCR_UIDescription "{BBBBBBBBBBBBBBBB}" {
+     m_sTitle "Nested"
+    }
+   }
+  }
+}`;
+    const components = parseTopLevelComponents(content);
+    expect([...components.keys()]).toEqual(["AAAAAAAAAAAAAAAA"]);
+    expect(components.get("AAAAAAAAAAAAAAAA")?.typeName).toBe("SCR_BaseGameMode");
   });
 });
 

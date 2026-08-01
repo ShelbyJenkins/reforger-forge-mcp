@@ -8,6 +8,7 @@
 class EMCP_WB_ComponentsRequest : JsonApiStruct
 {
 	string entityName;
+	int entityIndex;
 	string action;
 	string componentClass;
 	int componentIndex;
@@ -15,9 +16,11 @@ class EMCP_WB_ComponentsRequest : JsonApiStruct
 	void EMCP_WB_ComponentsRequest()
 	{
 		RegV("entityName");
+		RegV("entityIndex");
 		RegV("action");
 		RegV("componentClass");
 		RegV("componentIndex");
+		entityIndex = -1;
 		componentIndex = -1;
 	}
 }
@@ -79,6 +82,16 @@ class EMCP_WB_Components : NetApiHandler
 	}
 
 	//------------------------------------------------------------------------------------------------
+	static IEntitySource ResolveEntity(WorldEditorAPI api, string name, int index)
+	{
+		if (name != "")
+			return FindEntityByName(api, name);
+		if (index >= 0 && index < api.GetEditorEntityCount())
+			return api.GetEditorEntity(index);
+		return null;
+	}
+
+	//------------------------------------------------------------------------------------------------
 	override JsonApiStruct GetRequest()
 	{
 		return new EMCP_WB_ComponentsRequest();
@@ -92,10 +105,10 @@ class EMCP_WB_Components : NetApiHandler
 		resp.action = req.action;
 		resp.entityName = req.entityName;
 
-		if (req.entityName == "")
+		if (req.entityName == "" && req.entityIndex < 0)
 		{
 			resp.status = "error";
-			resp.message = "entityName parameter required";
+			resp.message = "entityName or entityIndex parameter required";
 			return resp;
 		}
 
@@ -115,12 +128,29 @@ class EMCP_WB_Components : NetApiHandler
 			return resp;
 		}
 
-		IEntitySource entSrc = FindEntityByName(api, req.entityName);
+		IEntitySource entSrc = ResolveEntity(api, req.entityName, req.entityIndex);
 		if (!entSrc)
 		{
 			resp.status = "error";
-			resp.message = "Entity not found: " + req.entityName;
+			resp.message = "Entity not found by the supplied name/index";
 			return resp;
+		}
+		resp.entityName = entSrc.GetName();
+
+		// Prefab Edit Mode exposes a generated instance whose ancestor is the
+		// actual .et template saved by SaveEntityTemplate. Mutating the generated
+		// instance produces a session-only component that the explicit save drops.
+		IEntitySource componentOwner = entSrc;
+		IEntitySource prefabEditSource = api.GetEditorEntity(1);
+		if (worldEditor.IsPrefabEditMode() && entSrc == prefabEditSource)
+		{
+			componentOwner = IEntitySource.Cast(entSrc.GetAncestor());
+			if (!componentOwner)
+			{
+				resp.status = "error";
+				resp.message = "Prefab Edit Mode target has no editable prefab template ancestor";
+				return resp;
+			}
 		}
 
 		if (req.action == "add")
@@ -132,38 +162,39 @@ class EMCP_WB_Components : NetApiHandler
 				return resp;
 			}
 
+			int previousCount = componentOwner.GetComponentCount();
 			api.BeginEntityAction("Add component via NetAPI");
-			IEntityComponentSource newComp = api.CreateComponent(entSrc, req.componentClass);
+			IEntityComponentSource newComp = api.CreateComponent(componentOwner, req.componentClass);
 			api.EndEntityAction();
 
-			if (newComp)
+			if (newComp && componentOwner.GetComponentCount() == previousCount + 1)
 			{
-				resp.componentCount = entSrc.GetComponentCount();
+				resp.componentCount = componentOwner.GetComponentCount();
 				resp.status = "ok";
-				resp.message = "Component added: " + req.componentClass;
+				resp.message = "Component added to serializable owner: " + req.componentClass;
 			}
 			else
 			{
 				resp.status = "error";
-				resp.message = "CreateComponent returned null for class: " + req.componentClass;
+				resp.message = "CreateComponent did not produce a persistent owner mutation for class: " + req.componentClass;
 			}
 		}
 		else if (req.action == "remove")
 		{
-			int compCount = entSrc.GetComponentCount();
+			int compCount = componentOwner.GetComponentCount();
 
 			// Find component by class name or index
 			IEntityComponentSource targetComp = null;
 
 			if (req.componentIndex >= 0 && req.componentIndex < compCount)
 			{
-				targetComp = entSrc.GetComponent(req.componentIndex);
+				targetComp = componentOwner.GetComponent(req.componentIndex);
 			}
 			else if (req.componentClass != "")
 			{
 				for (int i = 0; i < compCount; i++)
 				{
-					IEntityComponentSource comp = entSrc.GetComponent(i);
+					IEntityComponentSource comp = componentOwner.GetComponent(i);
 					if (comp && comp.GetClassName() == req.componentClass)
 					{
 						targetComp = comp;
@@ -180,29 +211,29 @@ class EMCP_WB_Components : NetApiHandler
 			}
 
 			api.BeginEntityAction("Remove component via NetAPI");
-			bool deleted = api.DeleteComponent(entSrc, targetComp);
+			bool deleted = api.DeleteComponent(componentOwner, targetComp);
 			api.EndEntityAction();
 
-			if (deleted)
+			if (deleted && componentOwner.GetComponentCount() == compCount - 1)
 			{
-				resp.componentCount = entSrc.GetComponentCount();
+				resp.componentCount = componentOwner.GetComponentCount();
 				resp.status = "ok";
 				resp.message = "Component removed";
 			}
 			else
 			{
 				resp.status = "error";
-				resp.message = "DeleteComponent returned false";
+				resp.message = "DeleteComponent did not produce a persistent owner mutation";
 			}
 		}
 		else if (req.action == "list")
 		{
-			int compCount = entSrc.GetComponentCount();
+			int compCount = componentOwner.GetComponentCount();
 			resp.componentCount = compCount;
 
 			for (int i = 0; i < compCount; i++)
 			{
-				IEntityComponentSource comp = entSrc.GetComponent(i);
+				IEntityComponentSource comp = componentOwner.GetComponent(i);
 				if (comp)
 				{
 					resp.m_aComponentClasses.Insert(comp.GetClassName());

@@ -48,6 +48,7 @@ import {
   resolveManagedPath,
 } from "../foundation/managed-path.js";
 import { createWindowsExactProcessBackend } from "../platform/windows/exact-process-backend.js";
+import { preserveWindowsForegroundDuringRuntimeStartup } from "../platform/windows/runtime-focus-guard.js";
 import {
   ChildSupervisor,
   type SupervisedChildCounts,
@@ -228,7 +229,10 @@ export interface OwnedRuntimeManagerOptions {
   /** Required when backend does not also implement the legacy combined adapter. */
   machineMutex?: MachineMutex;
   spawnProcess?: typeof nodeSpawn;
-  executableResolver?: () => string;
+  /** Windows startup-focus enforcement seam for graphical `-noFocus` launches. */
+  preserveForegroundDuringStartup?: (pid: number) => Promise<void>;
+  /** Resolves the exact installed executable appropriate for the prepared runtime kind. */
+  executableResolver?: (runtimeKind: ObserverLaunchInput["runtimeKind"]) => string;
   clock?: () => number;
   /** Ordinary local-delay seam; durable deadlines and recovery remain local. */
   sleeper?: Sleeper;
@@ -722,19 +726,33 @@ function nowIso(clock: () => number): string {
   return new Date(clock()).toISOString();
 }
 
-/** Resolve only allowlisted graphical runtime names beneath the configured game installation. */
-export function resolveGraphicalRuntimeExecutable(gamePath: string): string {
+/** Resolve only allowlisted runtime names beneath the configured game installation. */
+export function resolveRuntimeExecutable(
+  gamePath: string,
+  runtimeKind: ObserverLaunchInput["runtimeKind"]
+): string {
   const gameRoot = canonicalDirectory(gamePath, false);
-  const names = [
-    "ArmaReforgerSteamDiag.exe",
-    "ArmaReforgerDiag.exe",
-    "ArmaReforgerSteam.exe",
-    "ArmaReforger.exe",
-  ];
+  const dedicated = runtimeKind === "dedicated";
+  const names = dedicated
+    ? [
+      "ArmaReforgerServerSteamDiag.exe",
+      "ArmaReforgerServerDiag.exe",
+      "ArmaReforgerServerSteam.exe",
+      "ArmaReforgerServer.exe",
+    ]
+    : [
+      "ArmaReforgerSteamDiag.exe",
+      "ArmaReforgerDiag.exe",
+      "ArmaReforgerSteam.exe",
+      "ArmaReforger.exe",
+    ];
   for (const name of names) {
     const candidate = join(gameRoot, name);
     if (!existsSync(candidate)) continue;
-    const executable = canonicalFile(candidate, "Configured Arma Reforger graphical executable");
+    const executable = canonicalFile(
+      candidate,
+      `Configured Arma Reforger ${dedicated ? "dedicated-server" : "graphical"} executable`
+    );
     if (!isContained(gameRoot, executable)) {
       throw new OwnedRuntimeError("IDENTITY_UNVERIFIABLE", "Configured runtime executable escapes the game installation");
     }
@@ -742,8 +760,13 @@ export function resolveGraphicalRuntimeExecutable(gamePath: string): string {
   }
   throw new OwnedRuntimeError(
     "RUNTIME_NOT_FOUND",
-    "No allowlisted graphical Arma Reforger executable exists beneath the configured game path"
+    `No allowlisted ${dedicated ? "dedicated-server" : "graphical"} Arma Reforger executable exists beneath the configured game path`
   );
+}
+
+/** Compatibility export for graphical client/listen-server callers. */
+export function resolveGraphicalRuntimeExecutable(gamePath: string): string {
+  return resolveRuntimeExecutable(gamePath, "client");
 }
 
 export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
@@ -754,11 +777,12 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
   private readonly machineMutex: MachineMutex;
   private readonly durableReservations = new DurableReservationGate();
   private readonly spawnProcess: typeof nodeSpawn;
+  private readonly preserveForegroundDuringStartup: (pid: number) => Promise<void>;
   private readonly clock: () => number;
   private readonly sleeper: Sleeper;
   private readonly createOwnerToken: () => string;
   private readonly createId: () => string;
-  private readonly resolveExecutable: () => string;
+  private readonly resolveExecutable: (runtimeKind: ObserverLaunchInput["runtimeKind"]) => string;
   private readonly inspectionTimeoutMs: number;
   private readonly terminationTimeoutMs: number;
   private readonly lockTimeoutMs: number;
@@ -785,11 +809,14 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
     }
     this.machineMutex = machineMutex;
     this.spawnProcess = options.spawnProcess ?? nodeSpawn;
+    this.preserveForegroundDuringStartup = options.preserveForegroundDuringStartup ??
+      preserveWindowsForegroundDuringRuntimeStartup;
     this.clock = options.clock ?? Date.now;
     this.sleeper = options.sleeper ?? systemSleeper;
     this.createOwnerToken = options.ownerToken ?? (() => randomBytes(32).toString("base64url"));
     this.createId = options.randomId ?? randomUUID;
-    this.resolveExecutable = options.executableResolver ?? (() => resolveGraphicalRuntimeExecutable(options.gamePath));
+    this.resolveExecutable = options.executableResolver ??
+      ((runtimeKind) => resolveRuntimeExecutable(options.gamePath, runtimeKind));
     this.inspectionTimeoutMs = options.inspectionTimeoutMs ?? DEFAULT_INSPECTION_TIMEOUT_MS;
     this.terminationTimeoutMs = options.terminationTimeoutMs ?? DEFAULT_TERMINATION_TIMEOUT_MS;
     this.lockTimeoutMs = options.lockTimeoutMs ?? 15_000;
@@ -1973,7 +2000,10 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
     // receipt, spawn, or other irreversible action is attempted.
     this.assertStartLifecycleHeadroom(root);
 
-    const executablePath = canonicalFile(this.resolveExecutable(), "Graphical runtime executable");
+    const executablePath = canonicalFile(
+      this.resolveExecutable(descriptor.runtimeKind),
+      `${descriptor.runtimeKind} runtime executable`
+    );
     const executableFile = inspectExecutableFile(executablePath);
     const ownerNonce = this.createOwnerToken();
     if (!/^[A-Za-z0-9_-]{32,128}$/.test(ownerNonce)) {
@@ -2052,6 +2082,7 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
     });
 
     let child: ChildProcess | null = null;
+    let foregroundProtection: Promise<void> | null = null;
     let receiptPublished = false;
     let pinnedReceipt: OwnedRuntimeReceipt | null = null;
     try {
@@ -2108,16 +2139,22 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
             stdio: "ignore",
             windowsHide: false,
           });
+          if ((descriptor.runtimeKind === "client" || descriptor.runtimeKind === "listenServer") &&
+              descriptor.arguments.some((argument) => argument.toLowerCase() === "-nofocus") &&
+              Number.isSafeInteger(child.pid) && (child.pid ?? 0) > 0) {
+            // Start protection immediately, before Reforger replaces its
+            // initial splash/top-level windows and attempts activation.
+            foregroundProtection = this.preserveForegroundDuringStartup(child.pid!);
+          }
           return child;
         },
         childPid: (spawned) => spawned.pid,
         awaitSpawn: (spawned) => this.awaitSpawn(spawned),
         inspect: async (spawned) => {
-          const identity = await this.inspectSpawned(
-            spawned,
-            executablePath,
-            ownerTokenArgument
-          );
+          const [identity] = await Promise.all([
+            this.inspectSpawned(spawned, executablePath, ownerTokenArgument),
+            foregroundProtection ?? Promise.resolve(),
+          ]);
           const executableFileAfterSpawn = inspectExecutableFile(executablePath);
           if (!executableFilesMatch(executableFile, executableFileAfterSpawn)) {
             throw new OwnedRuntimeError(
@@ -2621,7 +2658,10 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
     }
     let configuredExecutable: string;
     try {
-      configuredExecutable = canonicalFile(this.resolveExecutable(), "Configured graphical runtime executable");
+      configuredExecutable = canonicalFile(
+        this.resolveExecutable(receipt.runtimeKind),
+        `Configured ${receipt.runtimeKind} runtime executable`
+      );
     } catch (error) {
       return this.publicStatus(receipt, "unverifiable", false, `Configured executable is unavailable: ${this.message(error)}`);
     }
@@ -3056,7 +3096,10 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
   }
 
   private assertExecutableFileMatches(receipt: OwnedRuntimeReceipt): void {
-    const executable = canonicalFile(this.resolveExecutable(), "Configured graphical runtime executable");
+    const executable = canonicalFile(
+      this.resolveExecutable(receipt.runtimeKind),
+      `Configured ${receipt.runtimeKind} runtime executable`
+    );
     if (pathKey(executable) !== pathKey(receipt.executablePath)) {
       throw new OwnedRuntimeError("IDENTITY_MISMATCH", "Configured executable path drifted from the ownership receipt");
     }

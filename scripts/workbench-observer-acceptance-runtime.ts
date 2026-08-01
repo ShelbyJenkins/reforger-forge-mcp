@@ -55,6 +55,15 @@ export interface DisposableWorkbenchObserverProject {
   readonly alternateWorldResource: string | null;
 }
 
+/** ResourceManager metadata lookup accepts the virtual path, not a GUID-qualified ResourceName. */
+export function workbenchResourceVirtualPath(resourceName: string): string {
+  const match = /^\{[A-F0-9]{16}\}(.+)$/.exec(resourceName);
+  if (!match?.[1]) {
+    throw new Error(`Workbench acceptance resource name is not GUID-qualified: ${resourceName}`);
+  }
+  return match[1];
+}
+
 function randomGuid(): string {
   return randomBytes(8).toString("hex").toUpperCase();
 }
@@ -412,6 +421,9 @@ export class WorkbenchObserverAcceptanceRuntime<
         : {}),
       defaultCaptureTimeoutMs: 5 * 60_000,
       maxInlineImageBytes: 64 * 1024 * 1024,
+      defaultLossyImageQuality: this.config.observer?.defaultLossyImageQuality,
+      minimumLossyImageQuality: this.config.observer?.minimumLossyImageQuality,
+      maximumLossyImageQuality: this.config.observer?.maximumLossyImageQuality,
       evidenceRoots: [this.evidenceRoot],
       workbenchAdapter: this.adapter,
     });

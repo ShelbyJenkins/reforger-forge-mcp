@@ -40,6 +40,7 @@ export class EvidenceRunService implements CaptureRunPort {
       requestedView: input.request.view,
       settleFrames: input.request.settleFrames,
       performancePolicy: input.request.performancePolicy,
+      image: input.request.image,
       timeoutMs: input.request.timeoutMs,
       asynchronous: input.request.asynchronous,
     }), "Run capture reservation");

@@ -9,6 +9,7 @@
 class EMCP_WB_ModifyEntityRequest : JsonApiStruct
 {
 	string name;
+	int    entityIndex;
 	string action;
 	string value;
 	string propertyPath;
@@ -18,11 +19,13 @@ class EMCP_WB_ModifyEntityRequest : JsonApiStruct
 	void EMCP_WB_ModifyEntityRequest()
 	{
 		RegV("name");
+		RegV("entityIndex");
 		RegV("action");
 		RegV("value");
 		RegV("propertyPath");
 		RegV("propertyKey");
 		RegV("memberIndex");
+		entityIndex = -1;
 	}
 }
 
@@ -103,6 +106,16 @@ class EMCP_WB_ModifyEntity : NetApiHandler
 	}
 
 	//------------------------------------------------------------------------------------------------
+	static IEntitySource ResolveEntity(WorldEditorAPI api, string name, int index)
+	{
+		if (name != "")
+			return FindEntityByName(api, name);
+		if (index >= 0 && index < api.GetEditorEntityCount())
+			return api.GetEditorEntity(index);
+		return null;
+	}
+
+	//------------------------------------------------------------------------------------------------
 	// Build a ContainerIdPathEntry array from a dot-separated path string.
 	// Supports array indices: "m_aTriggerActions[0].m_aNames" produces
 	//   ContainerIdPathEntry("m_aTriggerActions", 0) then ContainerIdPathEntry("m_aNames").
@@ -154,10 +167,10 @@ class EMCP_WB_ModifyEntity : NetApiHandler
 		EMCP_WB_ModifyEntityResponse resp = new EMCP_WB_ModifyEntityResponse();
 		resp.action = req.action;
 
-		if (req.name == "")
+		if (req.name == "" && req.entityIndex < 0)
 		{
 			resp.status = "error";
-			resp.message = "name parameter required";
+			resp.message = "name or entityIndex parameter required";
 			return resp;
 		}
 
@@ -177,11 +190,11 @@ class EMCP_WB_ModifyEntity : NetApiHandler
 			return resp;
 		}
 
-		IEntitySource entSrc = FindEntityByName(api, req.name);
+		IEntitySource entSrc = ResolveEntity(api, req.name, req.entityIndex);
 		if (!entSrc)
 		{
 			resp.status = "error";
-			resp.message = "Entity not found: " + req.name;
+			resp.message = "Entity not found by the supplied name/index";
 			return resp;
 		}
 

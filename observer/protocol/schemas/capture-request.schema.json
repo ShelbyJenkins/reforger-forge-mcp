@@ -20,7 +20,18 @@
       ]
     },
     "settleFrames": { "type": "integer", "minimum": 0, "maximum": 30 },
-    "performancePolicy": { "enum": ["evidence", "instrumented", "performance"] }
+    "performancePolicy": { "enum": ["evidence", "instrumented", "performance"] },
+    "image": {
+      "type": "object",
+      "required": ["format"],
+      "properties": {
+        "format": { "enum": ["png", "jpeg", "webp"] },
+        "maxWidth": { "type": "integer", "minimum": 1, "maximum": 16384 },
+        "maxHeight": { "type": "integer", "minimum": 1, "maximum": 16384 },
+        "quality": { "type": "integer", "minimum": 1, "maximum": 100 }
+      },
+      "additionalProperties": false
+    }
   },
   "$defs": {
     "id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{1,96}$" },

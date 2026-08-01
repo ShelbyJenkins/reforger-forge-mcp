@@ -12,6 +12,7 @@ interface ToolResult {
 interface RegisteredTool {
   readonly name: string;
   readonly definition: {
+    readonly description: string;
     readonly inputSchema: Record<string, {
       safeParse(value: unknown): { readonly success: boolean };
     }>;
@@ -54,6 +55,15 @@ function resultText(result: ToolResult): string {
 }
 
 describe("wb_save_resource MCP tool", () => {
+  it("advertises the inherited-prefab empty-override refusal", () => {
+    const client = {
+      state: { connected: true, mode: "edit", lastUpdated: 0 },
+    } as unknown as WorkbenchClient;
+    const tool = register(client, config());
+
+    expect(tool!.definition.description).toContain("explicit empty nested overrides");
+  });
+
   it("requires an explicit target path before contacting the client", async () => {
     const saveResource = vi.fn();
     const client = {

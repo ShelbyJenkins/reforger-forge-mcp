@@ -13,6 +13,8 @@ class EMCP_WB_ObserverSubmitRequest : JsonApiStruct
 	string matrix3;
 	string fovText;
 	int settlePolls;
+	int maxWidth;
+	int maxHeight;
 
 	void EMCP_WB_ObserverSubmitRequest()
 	{
@@ -27,6 +29,8 @@ class EMCP_WB_ObserverSubmitRequest : JsonApiStruct
 		RegV("matrix3");
 		RegV("fovText");
 		RegV("settlePolls");
+		RegV("maxWidth");
+		RegV("maxHeight");
 	}
 }
 
@@ -44,7 +48,7 @@ class EMCP_WB_ObserverSubmit : NetApiHandler
 		EMCP_WB_ObserverJobResponse resp = new EMCP_WB_ObserverJobResponse();
 		string leaseId;
 		string message;
-		bool accepted = service.Submit(req.jobId, req.leaseId, req.lifecycleGeneration, req.canonicalTarget, req.viewKind, req.matrix0, req.matrix1, req.matrix2, req.matrix3, req.fovText, req.settlePolls, leaseId, message);
+		bool accepted = service.Submit(req.jobId, req.leaseId, req.lifecycleGeneration, req.canonicalTarget, req.viewKind, req.matrix0, req.matrix1, req.matrix2, req.matrix3, req.fovText, req.settlePolls, req.maxWidth, req.maxHeight, leaseId, message);
 		string status = "error";
 		if (accepted)
 			status = "ok";

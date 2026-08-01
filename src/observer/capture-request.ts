@@ -1,6 +1,29 @@
 import { createHash } from "node:crypto";
 import { assertWorldRevision, type WorldRevision } from "./world-revision.js";
 import { CaptureError, type CaptureInput, type CanonicalCaptureRequest, type CaptureView } from "./capture-contract.js";
+import {
+  IMAGE_OUTPUT_FORMATS,
+  type CanonicalImageOutputPolicy,
+  type ImageOutputRequest,
+} from "../foundation/image-output.js";
+
+export interface ImagePolicyDefaults {
+  lossyQuality: number;
+  minimumLossyQuality: number;
+  maximumLossyQuality: number;
+  maximumWidth: number;
+  maximumHeight: number;
+  maximumPixels: number;
+}
+
+export const DEFAULT_IMAGE_POLICY_LIMITS = Object.freeze({
+  lossyQuality: 75,
+  minimumLossyQuality: 1,
+  maximumLossyQuality: 100,
+  maximumWidth: 16_384,
+  maximumHeight: 16_384,
+  maximumPixels: 32_000_000,
+} satisfies ImagePolicyDefaults);
 
 function number(value: number, label: string): number {
   if (!Number.isFinite(value)) throw new CaptureError("INVALID_REQUEST", `${label} must be finite`);
@@ -31,6 +54,45 @@ function boundedString(value: string | undefined, label: string, max: number): s
   return value;
 }
 
+function normalizeImagePolicy(
+  input: ImageOutputRequest | undefined,
+  defaults: ImagePolicyDefaults,
+): CanonicalImageOutputPolicy {
+  const format = input?.format ?? "png";
+  if (!IMAGE_OUTPUT_FORMATS.includes(format)) {
+    throw new CaptureError("INVALID_REQUEST", "image.format must be png, jpeg, or webp");
+  }
+  const dimension = (value: number | undefined, label: string, maximum: number): number | undefined => {
+    if (value === undefined) return undefined;
+    if (!Number.isSafeInteger(value) || value < 1 || value > maximum) {
+      throw new CaptureError("INVALID_REQUEST", `${label} must be from 1 through ${maximum}`);
+    }
+    return value;
+  };
+  const maxWidth = dimension(input?.maxWidth, "image.maxWidth", defaults.maximumWidth);
+  const maxHeight = dimension(input?.maxHeight, "image.maxHeight", defaults.maximumHeight);
+  if (maxWidth !== undefined && maxHeight !== undefined && maxWidth * maxHeight > defaults.maximumPixels) {
+    throw new CaptureError("INVALID_REQUEST", `image dimensions exceed the ${defaults.maximumPixels}-pixel request limit`);
+  }
+  if (format === "png" && input?.quality !== undefined) {
+    throw new CaptureError("INVALID_REQUEST", "image.quality is valid only for jpeg or webp output");
+  }
+  const quality = format === "png" ? undefined : input?.quality ?? defaults.lossyQuality;
+  if (quality !== undefined && (!Number.isSafeInteger(quality) ||
+      quality < defaults.minimumLossyQuality || quality > defaults.maximumLossyQuality)) {
+    throw new CaptureError(
+      "INVALID_REQUEST",
+      `image.quality must be from ${defaults.minimumLossyQuality} through ${defaults.maximumLossyQuality}`,
+    );
+  }
+  return {
+    format,
+    ...(maxWidth === undefined ? {} : { maxWidth }),
+    ...(maxHeight === undefined ? {} : { maxHeight }),
+    ...(quality === undefined ? {} : { quality }),
+  };
+}
+
 export interface ExpectedWorldBindingInput {
   expectedWorldRevision?: unknown;
 }
@@ -47,7 +109,11 @@ export function resolveExpectedWorldRevision(input: ExpectedWorldBindingInput): 
 }
 
 /** Normalize all semantic input before routing or idempotency lookup. */
-export function normalizeCaptureRequest(input: CaptureInput, defaultTimeoutMs = 30_000): CanonicalCaptureRequest {
+export function normalizeCaptureRequest(
+  input: CaptureInput,
+  defaultTimeoutMs = 30_000,
+  imageDefaults: ImagePolicyDefaults = DEFAULT_IMAGE_POLICY_LIMITS,
+): CanonicalCaptureRequest {
   if (typeof input.idempotencyKey !== "string" || input.idempotencyKey.length < 1 || input.idempotencyKey.length > 128) {
     throw new CaptureError("INVALID_REQUEST", "idempotencyKey is required and must be bounded");
   }
@@ -74,6 +140,7 @@ export function normalizeCaptureRequest(input: CaptureInput, defaultTimeoutMs = 
     view: view(input.view),
     settleFrames,
     performancePolicy: input.performancePolicy ?? "evidence",
+    image: normalizeImagePolicy(input.image, imageDefaults),
     timeoutMs,
     expectedWorldRevision,
     ...(runId ? { runId } : {}),

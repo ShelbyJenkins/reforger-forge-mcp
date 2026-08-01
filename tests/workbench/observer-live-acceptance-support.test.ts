@@ -98,7 +98,7 @@ function gradientPixel(x: number, y: number): readonly [number, number, number] 
 function testWorkload(backend: "workbench" | "runtime"): OperationalBaselineWorkload {
   return {
     procedureRevision: backend === "workbench"
-      ? "workbench-observer-live-acceptance-v3"
+      ? "workbench-observer-live-acceptance-v4"
       : "runtime-observer-acceptance-v2",
     runtimeKind: backend === "workbench" ? "workbench" : "listenServer",
     overallTimeoutMs: 300_000,
@@ -640,7 +640,7 @@ describe("live observer acceptance support", () => {
       resolve(repositoryRoot, "scripts", "windows"),
       [".ps1"]
     );
-    expect(fixtureIdentity).toMatchObject({ fileCount: 1 });
+    expect(fixtureIdentity).toMatchObject({ fileCount: 2 });
     expect(fixtureIdentity.sha256).toMatch(/^[a-f0-9]{64}$/);
     expect(fixtureIdentity).not.toHaveProperty("path");
 

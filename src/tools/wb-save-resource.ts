@@ -24,7 +24,8 @@ export function registerWbSaveResource(
       description:
         "Commit one explicit .ent world or .et prefab in a fresh target-bound MCP Workbench session. First call wb_launch with both " +
         "gprojPath and resourcePath, make the target-bound edits, then pass the same resourcePath here. The tool " +
-        "refuses generic Workbench sessions, mismatched paths, and programmatic document switches.",
+        "refuses generic Workbench sessions, mismatched paths, programmatic document switches, and inherited prefabs " +
+        "whose explicit empty nested overrides are known to be dropped by Workbench's native serializer.",
       inputSchema: {
         confirm: z.literal("save").describe("Required acknowledgement that this writes the explicit target resource"),
         resourcePath: z.string().optional().describe(

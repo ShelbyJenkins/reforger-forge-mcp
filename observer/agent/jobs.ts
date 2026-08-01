@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import { z } from "zod";
 import { boundedOption } from "#foundation/bounded-option";
+import type { CanonicalImageOutputPolicy } from "#foundation/image-output";
 import { BoundedJsonMap } from "#foundation/json-store";
 import {
   COMMAND_DELIVERY_LEASE_MS,
@@ -10,6 +11,7 @@ import {
   PROTOCOL_VERSION,
   TERMINAL_JOB_STATES,
   captureRequestSchema,
+  imageOutputPolicySchema,
   artifactManifestSchema,
   isRuntimeJobTransition,
   jobStatusSchema,
@@ -62,6 +64,7 @@ export interface NormalizedCaptureRequest {
   view: CaptureView;
   settleFrames: number;
   performancePolicy: "evidence" | "instrumented" | "performance";
+  image: CanonicalImageOutputPolicy;
   expectedWorld: { kind: "any" } | { kind: "exact"; worldId: string | null };
   expectedWorldEpoch: number | null;
 }
@@ -113,6 +116,10 @@ export function normalizeCaptureRequest(input: SubmitJobInput): NormalizedCaptur
           target: input.view.target.map(canonicalNumber) as [number, number, number],
           fov: canonicalNumber(input.view.fov),
         };
+  const parsedImage = imageOutputPolicySchema.parse(input.image ?? { format: "png" });
+  const image = parsedImage.format === "png" || parsedImage.quality !== undefined
+    ? parsedImage
+    : { ...parsedImage, quality: 75 };
   return {
     sessionId: input.sessionId,
     instanceId: input.instanceId ?? null,
@@ -127,6 +134,7 @@ export function normalizeCaptureRequest(input: SubmitJobInput): NormalizedCaptur
     view,
     settleFrames: input.settleFrames ?? 0,
     performancePolicy: input.performancePolicy ?? "evidence",
+    image,
     expectedWorld: input.expectedWorldId === undefined
       ? { kind: "any" }
       : { kind: "exact", worldId: input.expectedWorldId },
@@ -181,6 +189,7 @@ export interface SubmitJobInput {
   view: CaptureView;
   settleFrames?: number;
   performancePolicy?: "evidence" | "instrumented" | "performance";
+  image?: CanonicalImageOutputPolicy;
   expectedWorldId?: string | null;
   expectedWorldEpoch?: number;
 }
@@ -519,6 +528,7 @@ export class JobStore {
       view: normalized.view,
       settleFrames: normalized.settleFrames,
       performancePolicy: normalized.performancePolicy,
+      image: normalized.image,
     });
     const now = this.clock.now();
     const record: JobRecord = {

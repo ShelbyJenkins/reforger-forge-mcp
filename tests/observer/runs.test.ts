@@ -261,6 +261,59 @@ describe("managed observer runs", () => {
     expect(retried).toMatchObject({ receipt: { manifestSha256: finalized.receipt && (finalized.receipt as Record<string, unknown>).manifestSha256 } });
   });
 
+  scopedIt("finalizes completed Workbench captures from distinct lifecycle instances", (root) => {
+    const value = setup(root);
+    const { runId } = completedCapture(value, "Before restart");
+    value.runs.reserveCapture({
+      runId,
+      captureLabel: "After restart",
+      purpose: "Show the state after the Workbench lifecycle changed",
+      idempotencyKey: "capture-after-restart",
+      expectedWorldId: "world-2",
+      expectedWorldEpoch: 1,
+      requestedView: { kind: "current" },
+      performancePolicy: "evidence",
+    });
+    value.runs.bindCapture({
+      runId,
+      captureLabel: "After restart",
+      backend: "workbench",
+      jobId: "wb-job-2",
+      instanceId: "workbench-2",
+      worldId: "world-2",
+      worldEpoch: 1,
+    });
+    const ref = value.artifacts.importArtifact({
+      backend: "workbench",
+      jobId: "wb-job-2",
+      image: convertBmpToPng(bmp24()).png,
+      metadata: {
+        actualCamera: { position: [4, 5, 6] },
+        actualFov: 70,
+        completedAt: "2026-07-17T20:01:00.000Z",
+        contaminated: false,
+        warnings: [],
+      },
+    });
+    value.runs.attachImportedArtifact(runId, "After restart", ref);
+
+    const finalized = value.runs.finalize({
+      ...reviewedFinalizeInput(value, runId),
+      includeCaptureLabels: ["before-restart", "after-restart"],
+    });
+
+    expect(finalized).toMatchObject({
+      receipt: { captureCount: 2 },
+      run: {
+        state: "finalized",
+        captures: [
+          { captureLabel: "before-restart", instanceId: "workbench-1", worldId: "world-1" },
+          { captureLabel: "after-restart", instanceId: "workbench-2", worldId: "world-2" },
+        ],
+      },
+    });
+  });
+
   scopedIt("rejects corrupted and unmanifested members when a finalized receipt is retried", (root) => {
     const value = setup(root);
     const { runId, ref } = completedCapture(value);

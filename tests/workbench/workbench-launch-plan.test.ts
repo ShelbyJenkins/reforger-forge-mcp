@@ -154,7 +154,11 @@ describe("canonical Workbench launch-plan policy", () => {
     });
     expect(plan.argv).toEqual([
       "-addonsDir",
-      `${harness.baseAddonRoot},${realpathSync.native(harness.companion.addonSearchRoot)}`,
+      [
+        harness.baseAddonRoot,
+        harness.targetAddonRoot,
+        realpathSync.native(harness.companion.addonSearchRoot),
+      ].join(","),
       "-addons",
       WORKBENCH_HELPER_ADDON_GUID,
       "-profile",
@@ -193,7 +197,11 @@ describe("canonical Workbench launch-plan policy", () => {
     expect(plan.resource.displayPath).toBe(realpathSync.native(resourcePath));
     expect(plan.argv).toEqual([
       "-addonsDir",
-      `${harness.baseAddonRoot},${realpathSync.native(harness.companion.addonSearchRoot)}`,
+      [
+        harness.baseAddonRoot,
+        harness.targetAddonRoot,
+        realpathSync.native(harness.companion.addonSearchRoot),
+      ].join(","),
       "-addons",
       WORKBENCH_HELPER_ADDON_GUID,
       "-profile",

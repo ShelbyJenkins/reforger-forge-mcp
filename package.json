@@ -1,6 +1,6 @@
 {
   "name": "reforger-forge-mcp",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "type": "module",
   "description": "Universal MCP server for Arma Reforger modding — works with any AI agent (Cursor, Claude, Kiro, VS Code)",
   "bin": {
@@ -64,6 +64,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.26.0",
+    "@napi-rs/image": "1.14.0",
     "adm-zip": "^0.5.16",
     "cheerio": "^1.0.0",
     "domhandler": "5.0.3",
@@ -74,7 +75,7 @@
   },
   "devDependencies": {
     "@types/adm-zip": "^0.5.7",
-    "@types/node": "^22.0.0",
+    "@types/node": "^24.0.0",
     "knip": "6.27.0",
     "tar": "7.5.19",
     "tsx": "^4.19.0",
@@ -82,7 +83,7 @@
     "vitest": "^3.0.0"
   },
   "engines": {
-    "node": ">=20.0.0"
+    "node": ">=24.0.0"
   },
   "os": [
     "win32"
@@ -103,10 +104,12 @@
     "scripts/run-observer-enforce-mailbox-acceptance.mjs",
     "scripts/update-observer-source-manifest.mjs",
     "scripts/setup.ps1",
+    "scripts/windows/runtime-focus-guard.ps1",
     "scripts/windows/workbench-lifecycle.ps1",
     "tests/fixtures/enforce-mailbox-acceptance-addon/addon.gproj",
     "tests/fixtures/enforce-mailbox-acceptance-addon/Scripts/WorkbenchGame/RFO_MailboxAcceptancePlugin.c",
     "docs/release-notes/RELEASE_NOTES_v1.1.0.md",
+    "docs/release-notes/RELEASE_NOTES_v1.2.0.md",
     "docs/observer.md",
     "docs/runner-cli.md",
     "README.md",

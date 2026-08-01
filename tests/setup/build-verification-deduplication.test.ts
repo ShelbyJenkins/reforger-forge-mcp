@@ -44,7 +44,7 @@ function canonicalReceiptJson(
       serverPath: "fixture-server",
       serverPresent: true,
       nodePath: "node",
-      nodeVersion: "v20.99.0",
+      nodeVersion: "v24.99.0",
       serverVersion: "0.0.0-test",
       transport: "stdio",
     },
@@ -131,7 +131,7 @@ function setupHarness(): {
     [
       "@echo off",
       'if "%~1"=="--version" (',
-      "  echo v20.99.0",
+      "  echo v24.99.0",
       "  exit /b 0",
       ")",
       'echo node^|%*>>"%ISSUE04_CALL_LOG%"',

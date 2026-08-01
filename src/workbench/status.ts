@@ -75,6 +75,25 @@ export async function requireEditMode(
 }
 
 /**
+ * ResourceManager mutations do not require an open World Editor document.
+ * They are safe in a generic Workbench session, but must still fail closed
+ * while the game is genuinely in Play mode.
+ */
+export async function requireResourceManagerMode(
+  client: WorkbenchClient,
+  toolAction: string
+): Promise<string | null> {
+  const state = await getAuthoritativeWorkbenchMode(client);
+  if (state.mode === "play") {
+    return `Cannot ${toolAction} while in play mode. Call \`wb_stop\` first to return to edit mode.`;
+  }
+  if (state.mode === "edit" || state.reportedMode === "no_world_editor") {
+    return null;
+  }
+  return `Cannot ${toolAction}: Workbench mode is unknown. Call \`wb_state\` first to confirm that Play mode is not active.`;
+}
+
+/**
  * Check if the cached state indicates edit mode.
  * Returns a warning message if so, or null if the tool can proceed.
  * Also blocks when mode is unknown.

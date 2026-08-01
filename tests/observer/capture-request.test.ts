@@ -15,6 +15,7 @@ describe("capture request normalization", () => {
     const normalized = normalizeCaptureRequest(base);
     expect(normalized.view).toMatchObject({ position: [0, 1, 2] });
     expect(normalized.performancePolicy).toBe("evidence");
+    expect(normalized.image).toEqual({ format: "png" });
     expect(normalized.fingerprint).toHaveLength(64);
     expect(normalizeCaptureRequest({ ...base, view: { ...base.view, position: [0, 1, 2] } }).fingerprint).toBe(normalized.fingerprint);
   });
@@ -36,5 +37,30 @@ describe("capture request normalization", () => {
 
   it("rejects blocked performance policy", () => {
     expect(() => normalizeCaptureRequest({ ...base, performancePolicy: "performance" })).toThrowError(CaptureError);
+  });
+
+  it("canonicalizes image policy into semantic request identity", () => {
+    const jpeg = normalizeCaptureRequest({ ...base, image: { format: "jpeg", maxWidth: 1920 } });
+    expect(jpeg.image).toEqual({ format: "jpeg", maxWidth: 1920, quality: 75 });
+    expect(jpeg.fingerprint).not.toBe(normalizeCaptureRequest(base).fingerprint);
+    expect(normalizeCaptureRequest({ ...base, image: { format: "jpeg", maxWidth: 1920, quality: 75 } }).fingerprint)
+      .toBe(jpeg.fingerprint);
+  });
+
+  it("enforces format-specific quality and configured lossy bounds", () => {
+    expect(() => normalizeCaptureRequest({ ...base, image: { format: "png", quality: 75 } }))
+      .toThrowError(expect.objectContaining({ code: "INVALID_REQUEST" }));
+    expect(() => normalizeCaptureRequest(
+      { ...base, image: { format: "webp", quality: 49 } },
+      30_000,
+      {
+        lossyQuality: 70,
+        minimumLossyQuality: 50,
+        maximumLossyQuality: 80,
+        maximumWidth: 16_384,
+        maximumHeight: 16_384,
+        maximumPixels: 32_000_000,
+      },
+    )).toThrowError(expect.objectContaining({ code: "INVALID_REQUEST" }));
   });
 });

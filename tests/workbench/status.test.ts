@@ -1,7 +1,12 @@
 import { describe, it, expect, afterEach } from "vitest";
 import { createServer, type Server, type Socket } from "node:net";
 import { WorkbenchClient } from "../../src/workbench/client.js";
-import { formatConnectionStatus, requireEditMode, requirePlayMode } from "../../src/workbench/status.js";
+import {
+  formatConnectionStatus,
+  requireEditMode,
+  requirePlayMode,
+  requireResourceManagerMode,
+} from "../../src/workbench/status.js";
 import { encodePascalString, decodePascalString, decodeInt32LE } from "../../src/workbench/protocol.js";
 import { WORKBENCH_HELPER_PING_RESPONSE } from "./fake-companion.js";
 
@@ -168,5 +173,37 @@ describe("requirePlayMode", () => {
     expect(result).toContain("enter Play mode manually");
     expect(result).toContain("wb_state");
     expect(result).not.toContain("wb_play");
+  });
+});
+
+describe("requireResourceManagerMode", () => {
+  let mock: ReturnType<typeof createMockWorkbench>;
+
+  afterEach(async () => {
+    if (mock) await mock.close();
+  });
+
+  it("allows document-independent work when no World Editor document is open", async () => {
+    mock = createMockWorkbench(() => ({
+      ...WORKBENCH_HELPER_PING_RESPONSE,
+      mode: "no_world_editor",
+    }));
+    const client = new WorkbenchClient("127.0.0.1", mock.port);
+    await client.call("EMCP_WB_Ping");
+
+    await expect(requireResourceManagerMode(client, "register resource")).resolves.toBeNull();
+  });
+
+  it("continues to refuse Resource Manager mutations in actual Play mode", async () => {
+    mock = createMockWorkbench(() => ({
+      ...WORKBENCH_HELPER_PING_RESPONSE,
+      mode: "game",
+    }));
+    const client = new WorkbenchClient("127.0.0.1", mock.port);
+    await client.call("EMCP_WB_Ping");
+
+    const result = await requireResourceManagerMode(client, "register resource");
+    expect(result).toContain("play mode");
+    expect(result).toContain("wb_stop");
   });
 });

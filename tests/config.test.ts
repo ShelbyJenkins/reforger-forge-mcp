@@ -395,6 +395,9 @@ describe("effective configuration contract", () => {
       "--observer-request-timeout-ms", "32000",
       "--observer-capture-timeout-ms", "33000",
       "--observer-max-inline-image-bytes", "9000000",
+      "--observer-default-lossy-image-quality", "70",
+      "--observer-minimum-lossy-image-quality", "40",
+      "--observer-maximum-lossy-image-quality", "90",
       "--observer-retention-interval-ms", "61000",
       "--observer-retention-max-age-ms", "700000000",
       "--observer-retention-max-bytes", "600000000",
@@ -421,6 +424,9 @@ describe("effective configuration contract", () => {
         requestTimeoutMs: 32_000,
         defaultCaptureTimeoutMs: 33_000,
         maxInlineImageBytes: 9_000_000,
+        defaultLossyImageQuality: 70,
+        minimumLossyImageQuality: 40,
+        maximumLossyImageQuality: 90,
         retentionIntervalMs: 61_000,
         retentionMaxAgeMs: 700_000_000,
         retentionMaxBytes: 600_000_000,
@@ -695,6 +701,20 @@ describe("effective configuration contract", () => {
 
     expect(() => loadConfig(["--config", configPath])).toThrowError(
       /observer\.maxInlineImageBytes.*less than or equal to 67108864/
+    );
+  });
+
+  it("rejects an inconsistent observer lossy image quality range", () => {
+    const configPath = writeConfig(requiredFileValues({
+      observer: {
+        minimumLossyImageQuality: 80,
+        defaultLossyImageQuality: 75,
+        maximumLossyImageQuality: 90,
+      },
+    }));
+
+    expect(() => loadConfig(["--config", configPath])).toThrowError(
+      /minimumLossyImageQuality <= defaultLossyImageQuality <= maximumLossyImageQuality/
     );
   });
 

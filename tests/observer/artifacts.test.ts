@@ -1,10 +1,11 @@
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import { ArtifactStore } from "../../observer/agent/artifacts.js";
+import { ArtifactStore, type ArtifactStoreOptions } from "../../observer/agent/artifacts.js";
 import { convertBmpToPng, validatePng } from "../../observer/agent/bmp.js";
 import { JobStore, type JobStoreOptions } from "../../observer/agent/jobs.js";
 import { InstanceRegistry } from "../../observer/agent/registry.js";
+import { ImageOutputError, transformImage } from "../../src/foundation/image-output.js";
 import type { Sleeper } from "../../src/foundation/time.js";
 import { withTemporaryDirectory } from "../support/temporary-directory.js";
 import { createObserverSessionFixture, graphicalRegistration } from "../support/observer-fixtures.js";
@@ -40,6 +41,8 @@ function setup(
     sleeper?: Sleeper;
     stableIntervalMs?: number;
     stableTimeoutMs?: number;
+    imageInspector?: ArtifactStoreOptions["imageInspector"];
+    imageTransformer?: ArtifactStoreOptions["imageTransformer"];
   } = {}
 ) {
   const clock = timing.clock ?? new ManualTime();
@@ -54,6 +57,8 @@ function setup(
     // full-suite run; the production default is 2 seconds.
     stableTimeoutMs: timing.stableTimeoutMs ?? 2_000,
     ...(timing.sleeper ? { clock, sleeper: timing.sleeper } : {}),
+    ...(timing.imageInspector ? { imageInspector: timing.imageInspector } : {}),
+    ...(timing.imageTransformer ? { imageTransformer: timing.imageTransformer } : {}),
   });
   return { root, ...fixture, clock, registry, registration, jobs, artifacts };
 }
@@ -82,6 +87,33 @@ function advanceCurrentJob(value: ReturnType<typeof setup>, jobId: string): stri
   value.jobs.update({ ...base, sequence: 1, state: "capturing", timestamp: new Date(value.clock.now()).toISOString() }, value.created.contract.sessionToken);
   value.jobs.update({ ...base, sequence: 2, state: "awaitingArtifact", timestamp: new Date(value.clock.now()).toISOString() }, value.created.contract.sessionToken);
   return command!.deliveryToken;
+}
+
+function currentArtifactManifest(
+  value: ReturnType<typeof setup>,
+  jobId: string,
+  artifactId: string,
+  source: Buffer,
+): Record<string, unknown> {
+  return {
+    protocolVersion: "1.0",
+    sessionId: value.registration.sessionId,
+    instanceId: value.registration.instanceId,
+    instanceNonce: value.registration.instanceNonce,
+    jobId,
+    artifactId,
+    relativeScreenshotFilename: `${jobId}.bmp`,
+    screenshotIssuedAt: new Date(value.clock.now()).toISOString(),
+    completedAt: new Date(value.clock.now() + 1).toISOString(),
+    expectedByteCount: source.length,
+    worldId: value.registration.worldId,
+    worldEpoch: value.registration.worldEpoch,
+    actualCamera: {},
+    requestedSettleFrames: 0,
+    actualSettleFrames: 0,
+    contaminated: false,
+    warnings: [],
+  };
 }
 
 describe("observer artifacts", () => {
@@ -198,6 +230,144 @@ describe("observer artifacts", () => {
     )).toThrowError(expect.objectContaining({ code: "JOB_RELEASED" }));
   });
 
+  scopedIt("transforms a runtime BMP into the requested bounded WebP artifact", async (root) => {
+    const value = setup(root);
+    const job = value.jobs.submit({
+      sessionId: value.registration.sessionId,
+      idempotencyKey: "artifact-webp",
+      deadlineAt: new Date(value.clock.now() + 10_000).toISOString(),
+      view: { kind: "current" },
+      image: { format: "webp", quality: 55, maxWidth: 1 },
+    });
+    advanceCurrentJob(value, job.request.jobId);
+    const captureRoot = join(value.profilePath, "profile", "ReforgerForgeObserver", "captures");
+    const source = bmp24(2, 2);
+    writeFileSync(join(captureRoot, `${job.request.jobId}.bmp`), source);
+
+    const stored = await value.artifacts.intake({
+      protocolVersion: "1.0",
+      sessionId: value.registration.sessionId,
+      instanceId: value.registration.instanceId,
+      instanceNonce: value.registration.instanceNonce,
+      jobId: job.request.jobId,
+      artifactId: "artifact-webp",
+      relativeScreenshotFilename: `${job.request.jobId}.bmp`,
+      screenshotIssuedAt: new Date(value.clock.now()).toISOString(),
+      completedAt: new Date(value.clock.now() + 1).toISOString(),
+      expectedByteCount: source.length,
+      worldId: value.registration.worldId,
+      worldEpoch: value.registration.worldEpoch,
+      actualCamera: {},
+      requestedSettleFrames: 0,
+      actualSettleFrames: 0,
+      contaminated: false,
+      warnings: [],
+    }, value.created.contract.sessionToken);
+
+    expect(stored).toMatchObject({
+      format: "webp",
+      mimeType: "image/webp",
+      width: 1,
+      height: 1,
+    });
+    expect(stored.imagePath).toMatch(/image\.webp$/);
+    const retained = value.artifacts.read(value.registration.sessionId, job.request.jobId);
+    expect(retained.image.toString("ascii", 0, 4)).toBe("RIFF");
+    expect(retained.metadata).toMatchObject({
+      requestedImage: { format: "webp", quality: 55, maxWidth: 1 },
+      format: "webp",
+      mimeType: "image/webp",
+      resized: true,
+      transcoded: true,
+    });
+    expect(value.artifacts.runtimeRef(value.registration.sessionId, job.request.jobId))
+      .toMatchObject({ format: "webp", mimeType: "image/webp", fileName: "image.webp" });
+    expect(value.artifacts.release(value.registration.sessionId, job.request.jobId)).toEqual({ released: true });
+  });
+
+  scopedIt("maps an injected decoder failure without promoting or deleting the source", async (root) => {
+    const imageInspector: NonNullable<ArtifactStoreOptions["imageInspector"]> = () => {
+      throw new ImageOutputError("ARTIFACT_INVALID", "injected decoder failure");
+    };
+    const value = setup(root, {}, { imageInspector });
+    const job = value.jobs.submit({
+      sessionId: value.registration.sessionId,
+      idempotencyKey: "artifact-decoder-failure",
+      deadlineAt: new Date(value.clock.now() + 10_000).toISOString(),
+      view: { kind: "current" },
+      image: { format: "jpeg", quality: 61 },
+    });
+    advanceCurrentJob(value, job.request.jobId);
+    const captureRoot = join(value.profilePath, "profile", "ReforgerForgeObserver", "captures");
+    const sourcePath = join(captureRoot, `${job.request.jobId}.bmp`);
+    const source = bmp24();
+    writeFileSync(sourcePath, source);
+
+    await expect(value.artifacts.intake(
+      currentArtifactManifest(value, job.request.jobId, "artifact-decoder-failure", source),
+      value.created.contract.sessionToken,
+    )).rejects.toMatchObject({ code: "ARTIFACT_INVALID", message: "injected decoder failure" });
+
+    expect(job.state).toBe("awaitingArtifact");
+    expect(existsSync(sourcePath)).toBe(true);
+    expect(existsSync(join(root, "artifacts", value.registration.sessionId, job.request.jobId))).toBe(false);
+  });
+
+  scopedIt("recovers an injected encoder failure before promotion with exact default quality", async (root) => {
+    const observedPolicies: unknown[] = [];
+    let attempts = 0;
+    const imageTransformer: NonNullable<ArtifactStoreOptions["imageTransformer"]> = async (...args) => {
+      attempts += 1;
+      observedPolicies.push(args[2]);
+      if (attempts === 1) {
+        throw new ImageOutputError("ARTIFACT_INVALID", "injected encoder failure");
+      }
+      return transformImage(...args);
+    };
+    const value = setup(root, {}, { imageTransformer });
+    const job = value.jobs.submit({
+      sessionId: value.registration.sessionId,
+      idempotencyKey: "artifact-encoder-recovery",
+      deadlineAt: new Date(value.clock.now() + 10_000).toISOString(),
+      view: { kind: "current" },
+      image: { format: "webp", maxWidth: 1 },
+    });
+    advanceCurrentJob(value, job.request.jobId);
+    const captureRoot = join(value.profilePath, "profile", "ReforgerForgeObserver", "captures");
+    const sourcePath = join(captureRoot, `${job.request.jobId}.bmp`);
+    const source = bmp24();
+    writeFileSync(sourcePath, source);
+    const manifest = currentArtifactManifest(
+      value,
+      job.request.jobId,
+      "artifact-encoder-recovery",
+      source,
+    );
+
+    await expect(value.artifacts.intake(manifest, value.created.contract.sessionToken))
+      .rejects.toMatchObject({ code: "ARTIFACT_INVALID", message: "injected encoder failure" });
+    const sessionRoot = join(root, "artifacts", value.registration.sessionId);
+    expect(job.state).toBe("awaitingArtifact");
+    expect(existsSync(sourcePath)).toBe(true);
+    expect(existsSync(join(sessionRoot, job.request.jobId))).toBe(false);
+    expect(readdirSync(sessionRoot).filter((name) => name.startsWith(`.${job.request.jobId}.`))).toEqual([]);
+
+    const recovered = await value.artifacts.intake(manifest, value.created.contract.sessionToken);
+    expect(recovered).toMatchObject({ format: "webp", mimeType: "image/webp", width: 1, height: 1 });
+    expect(observedPolicies).toEqual([
+      { format: "webp", quality: 75, maxWidth: 1 },
+      { format: "webp", quality: 75, maxWidth: 1 },
+    ]);
+    expect(value.artifacts.read(value.registration.sessionId, job.request.jobId).metadata).toMatchObject({
+      requestedImage: { format: "webp", quality: 75, maxWidth: 1 },
+      imageQuality: 75,
+      format: "webp",
+      mimeType: "image/webp",
+    });
+    expect(job.state).toBe("completed");
+    expect(existsSync(sourcePath)).toBe(false);
+  });
+
   scopedIt("retains a bounded release receipt after terminal job metadata is swept", async (root) => {
     const value = setup(root, { terminalJobRetentionMs: 1, idempotencyReceiptRetentionMs: 1 });
     const job = value.jobs.submit({
@@ -244,6 +414,7 @@ describe("observer artifacts", () => {
       idempotencyKey: "artifact-crash-window",
       deadlineAt: new Date(value.clock.now() + 10_000).toISOString(),
       view: { kind: "current" },
+      image: { format: "jpeg", quality: 61, maxWidth: 1 },
     });
     advanceCurrentJob(value, job.request.jobId);
     const captureRoot = join(value.profilePath, "profile", "ReforgerForgeObserver", "captures");
@@ -277,7 +448,14 @@ describe("observer artifacts", () => {
     expect(job.state).toBe("awaitingArtifact");
     expect(existsSync(join(captureRoot, filename))).toBe(true);
     const recovered = await value.artifacts.intake(manifest, value.created.contract.sessionToken);
-    expect(recovered.imagePath).toContain(job.request.jobId);
+    expect(recovered).toMatchObject({ format: "jpeg", mimeType: "image/jpeg", width: 1, height: 1 });
+    expect(recovered.imagePath).toMatch(/image\.jpg$/);
+    expect(value.artifacts.read(value.registration.sessionId, job.request.jobId).metadata).toMatchObject({
+      requestedImage: { format: "jpeg", quality: 61, maxWidth: 1 },
+      imageQuality: 61,
+      format: "jpeg",
+      mimeType: "image/jpeg",
+    });
     expect(job.state).toBe("completed");
     expect(completion).toHaveBeenCalledTimes(2);
     expect(existsSync(join(captureRoot, filename))).toBe(false);

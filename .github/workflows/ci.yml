@@ -12,11 +12,11 @@ jobs:
     timeout-minutes: 30
     strategy:
       matrix:
-        node-version: [20, 22]
+        node-version: [24]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: ${{ matrix.node-version }}
           cache: npm
@@ -41,5 +41,5 @@ jobs:
 
       # Run the installed-tarball smoke once rather than packing and installing
       # the same artifact for every matrix entry.
-      - if: matrix.node-version == 20
+      - if: matrix.node-version == 24
         run: npm run test:package

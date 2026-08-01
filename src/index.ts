@@ -21,7 +21,7 @@ import {
 } from "./workbench/addon-dirs-diagnostic.js";
 import { logger, setDebugEnabled } from "./utils/logger.js";
 
-const SERVER_VERSION = "1.1.0";
+const SERVER_VERSION = "1.2.0";
 
 function usage(): string {
   return [

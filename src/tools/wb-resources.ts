@@ -1,7 +1,9 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { WorkbenchClient } from "../workbench/client.js";
-import { formatConnectionStatus, requireEditMode } from "../workbench/status.js";
+import { formatConnectionStatus, requireResourceManagerMode } from "../workbench/status.js";
+
+const RESOURCE_MUTATION_TIMEOUT_MS = 120_000;
 
 function throwIfResourceHelperFailed(result: Record<string, unknown>, action: string): void {
   if (result.status !== "error") return;
@@ -37,9 +39,10 @@ export function registerWbResources(server: McpServer, client: WorkbenchClient):
     },
     async ({ action, path, buildRuntime }) => {
       try {
-        // Mutating actions require edit mode
+        // ResourceManager mutations are document-independent but still refuse
+        // a freshly confirmed Play mode.
         if (action === "register" || action === "rebuild") {
-          const modeErr = await requireEditMode(client, `${action} resource`);
+          const modeErr = await requireResourceManagerMode(client, `${action} resource`);
           if (modeErr) {
             return { content: [{ type: "text" as const, text: modeErr + formatConnectionStatus(client) }] };
           }
@@ -79,7 +82,13 @@ export function registerWbResources(server: McpServer, client: WorkbenchClient):
         const params: Record<string, unknown> = { action, path };
         if (buildRuntime !== undefined) params.buildRuntime = buildRuntime;
 
-        const result = await client.call<Record<string, unknown>>("EMCP_WB_Resources", params);
+        const result = await client.call<Record<string, unknown>>(
+          "EMCP_WB_Resources",
+          params,
+          action === "register" || action === "rebuild"
+            ? { timeout: RESOURCE_MUTATION_TIMEOUT_MS, skipAutoLaunch: true }
+            : undefined
+        );
         throwIfResourceHelperFailed(result, action);
 
         const actionLabels: Record<string, string> = {

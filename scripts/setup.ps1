@@ -695,8 +695,8 @@ $nodeCommand = Get-Command node -ErrorAction SilentlyContinue
 if (-not $nodeCommand) {
     Stop-CoreSetup `
         -Layer "runtime" `
-        -Message "Node.js 20 or newer is required." `
-        -ManualAction "Install Node.js 20+ from https://nodejs.org, then rerun setup."
+        -Message "Node.js 24 LTS or newer is required." `
+        -ManualAction "Install Node.js 24 LTS or newer from https://nodejs.org, then rerun setup."
 }
 $script:NodePath = $nodeCommand.Source
 
@@ -714,10 +714,10 @@ if (
 $script:NodeVersion = [string]$nodeVersion
 
 $nodeMajor = [int]$Matches.major
-if ($nodeMajor -lt 20) {
+if ($nodeMajor -lt 24) {
     Stop-CoreSetup `
         -Layer "runtime" `
-        -Message "Node.js 20 or newer is required (found $nodeVersion)." `
+        -Message "Node.js 24 LTS or newer is required (found $nodeVersion)." `
         -ManualAction "Upgrade Node.js, then rerun setup."
 }
 Write-SetupMessage -Message "Node.js: $nodeVersion"

@@ -30,6 +30,12 @@ export interface PrefabOptions {
   prefabType: PrefabType;
   /** Optional recipe variant (e.g., "handgun" for firearm type) */
   variant?: string;
+  /**
+   * Exact root entity class inherited from a resolved parent prefab. When a
+   * parent is supplied it overrides a generic recipe root, preserving typed
+   * roots such as SCR_BaseGameMode.
+   */
+  entityType?: string;
   /** Parent prefab path to inherit from (uses recipe default if omitted) */
   parentPrefab?: string;
   /** Additional components to add */
@@ -54,7 +60,7 @@ export function generatePrefab(opts: PrefabOptions): string {
   const parentPrefab = opts.parentPrefab || recipe.defaultParent;
   const entityGuid = generateGuid();
 
-  const root = createNode(recipe.entityType, {
+  const root = createNode(opts.entityType ?? recipe.entityType, {
     inheritance: parentPrefab || undefined,
     properties: [{ key: "ID", value: entityGuid }],
   });

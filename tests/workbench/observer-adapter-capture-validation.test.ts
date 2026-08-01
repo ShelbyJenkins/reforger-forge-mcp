@@ -90,6 +90,40 @@ describe("Workbench observer adapter", () => {
     expect(client.calls.some((call) => /ExecuteAction|Reload|Play|Save/.test(call.apiFunc))).toBe(false);
   });
 
+  scopedIt("resizes and converts the validated Workbench PNG before retaining it", async (root) => {
+    const client = fakeClient(root, { completeOnStatus: true });
+    const adapter = new WorkbenchObserverAdapter(client, { createJobId: () => "job-webp" });
+
+    await adapter.submit({
+      view: { kind: "current" },
+      image: { format: "webp", quality: 55, maxWidth: 1 },
+    });
+    expect(client.calls.find((call) => call.apiFunc === "EMCP_WB_ObserverSubmit")?.params)
+      .toMatchObject({ maxWidth: 1, maxHeight: 0 });
+    const completed = await adapter.status("job-webp");
+    expect(completed.artifact).toMatchObject({
+      format: "webp",
+      mimeType: "image/webp",
+      width: 1,
+      height: 1,
+      sourceWidth: 1,
+      sourceHeight: 1,
+      viewportWidth: 2,
+      viewportHeight: 2,
+    });
+    const converted = adapter.readCompletedArtifact("job-webp");
+    expect(converted.image.toString("ascii", 0, 4)).toBe("RIFF");
+    expect(converted.image.toString("ascii", 8, 12)).toBe("WEBP");
+    expect(converted.metadata).toMatchObject({
+      format: "webp",
+      mimeType: "image/webp",
+      requestedImage: { format: "webp", quality: 55, maxWidth: 1 },
+      resized: true,
+      producerResized: true,
+      transcoded: true,
+    });
+  });
+
   scopedIt("cancels a restored completed job through the real handler until artifact release", async (root) => {
     const client = fakeClient(root, { completeOnStatus: true });
     const adapter = new WorkbenchObserverAcceptanceAdapter(client, { createJobId: () => "terminal-cancel" });

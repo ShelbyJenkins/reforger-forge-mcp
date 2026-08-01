@@ -741,9 +741,11 @@ function preparedEditorInput(
     dirname(project.modDirectory),
     "Workbench target add-on search root"
   );
-  const extras = input.kind === "cli_editor"
-    ? [targetAddonSearchRoot, companion.addonSearchRoot]
-    : [companion.addonSearchRoot];
+  // Build and every editor launch must use the same target-relative add-on
+  // container. A target project commonly declares a sibling project as a
+  // dependency; omitting this root from MCP-owned editor launches made a
+  // build succeed and the identical editor target fail preflight.
+  const extras = [targetAddonSearchRoot, companion.addonSearchRoot];
   const addonDirectories = mergeAddonDirectories(input.config.workbenchAddonDirs, extras);
   rejectDuplicateCompanion(addonDirectories, companion);
   return {

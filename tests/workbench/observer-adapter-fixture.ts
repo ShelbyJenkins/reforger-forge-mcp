@@ -190,7 +190,8 @@ export class FakeObserverClient implements WorkbenchObserverClient {
     if (apiFunc === "EMCP_WB_ObserverStatus") {
       if (!this.options.completeOnStatus) return this.jobResponse("settling", false, true) as T;
       const path = join(this.artifactDirectory, `${String(params.jobId)}.png`);
-      const bytes = png(2, 2);
+      const dimensions = this.captureDimensions();
+      const bytes = png(dimensions.width, dimensions.height);
       if (this.options.corruptArtifact) bytes[bytes.length - 1] ^= 0xff;
       writeFileSync(path, bytes);
       return this.jobResponse("completed", true, false, {
@@ -245,6 +246,7 @@ export class FakeObserverClient implements WorkbenchObserverClient {
     overrides: Record<string, unknown> = {}
   ): Record<string, unknown> {
     if (!this.active) throw new Error("no active fake handler job");
+    const dimensions = this.captureDimensions();
     return {
       status: "ok",
       message: state,
@@ -269,6 +271,12 @@ export class FakeObserverClient implements WorkbenchObserverClient {
       settledPolls: 1,
       artifactBytes: 0,
       ownerCameraId: 7,
+      requestedMaxWidth: this.active.maxWidth,
+      requestedMaxHeight: this.active.maxHeight,
+      sourceWidth: state === "completed" ? 2 : 0,
+      sourceHeight: state === "completed" ? 2 : 0,
+      outputWidth: state === "completed" ? dimensions.width : 0,
+      outputHeight: state === "completed" ? dimensions.height : 0,
       actualFov: Number(this.active.fovText),
       nearPlane: 0.1,
       farPlane: 2_000,
@@ -276,6 +284,22 @@ export class FakeObserverClient implements WorkbenchObserverClient {
       restorationConfirmed: this.wireBoolean(restorationConfirmed),
       ...overrides,
     };
+  }
+
+  private captureDimensions(): { width: number; height: number } {
+    let width = 2;
+    let height = 2;
+    const maxWidth = Number(this.active?.maxWidth) || 0;
+    const maxHeight = Number(this.active?.maxHeight) || 0;
+    if (maxWidth > 0 && width > maxWidth) {
+      height = Math.max(1, Math.floor(height * maxWidth / width));
+      width = maxWidth;
+    }
+    if (maxHeight > 0 && height > maxHeight) {
+      width = Math.max(1, Math.floor(width * maxHeight / height));
+      height = maxHeight;
+    }
+    return { width, height };
   }
 
   private wireBoolean(value: boolean): boolean | number {
@@ -293,4 +317,3 @@ export function scopedIt(
 ): void {
   it(name, () => withTemporaryDirectory(run, { prefix: "reforger-forge-wb-observer-" }));
 }
-

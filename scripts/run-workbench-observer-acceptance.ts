@@ -15,6 +15,7 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { isDeepStrictEqual } from "node:util";
 import { OBSERVER_TERMINAL_STATES } from "../observer/protocol/enforce-contract.js";
 import {
   caseForId,
@@ -28,9 +29,18 @@ import {
   systemSleeper,
 } from "../src/foundation/time.js";
 import {
+  imageOutputDescriptor,
+  inspectImage,
+  transformImageSync,
+  type CanonicalImageOutputPolicy,
+  type ImageOutputRequest,
+} from "../src/foundation/image-output.js";
+import {
   type ObserverApplication,
   type ObserverCaptureView,
 } from "../src/observer/application.js";
+import type { CaptureInput } from "../src/observer/capture-contract.js";
+import { assertWorldRevision } from "../src/observer/world-revision.js";
 import {
   WorkbenchObserverAdapter,
   workbenchCameraMatrix,
@@ -77,6 +87,7 @@ import {
   acceptanceConfig,
   loadAcceptanceBaseConfig,
   workbenchEnvironmentExecutables,
+  workbenchResourceVirtualPath,
 } from "./workbench-observer-acceptance-runtime.js";
 import {
   WORKBENCH_MATRIX_FIXTURE_SOURCES,
@@ -84,6 +95,7 @@ import {
   failedWorkbenchMatrixEntry,
   runLiveWorkbenchMatrixCase as executeLiveWorkbenchMatrixCase,
   workbenchMatrixSourceRevision,
+  type WorkbenchLiveRetainedCapture,
   type WorkbenchLiveMatrixCaseOutcome,
   type WorkbenchLiveMatrixCaseServices,
 } from "./workbench-observer-live-matrix-case.js";
@@ -103,7 +115,10 @@ export {
   type WorkbenchMatrixValidatedCapture,
 } from "./workbench-observer-matrix-case.js";
 
-export { createDisposableProject } from "./workbench-observer-acceptance-runtime.js";
+export {
+  createDisposableProject,
+  workbenchResourceVirtualPath,
+} from "./workbench-observer-acceptance-runtime.js";
 
 export {
   captureStableWorkbenchMatrixSource,
@@ -179,8 +194,19 @@ const WORKBENCH_CAPTURE_LABELS = [
   "post-pose-restoration-current",
   "explicit-look-at",
   "post-look-at-restoration-current",
+  "post-cancel-restoration-current",
 ] as const;
 const TERMINAL_STATES = new Set<string>(OBSERVER_TERMINAL_STATES);
+const LIVE_IMAGE_LIMITS = Object.freeze({
+  maxSourceBytes: 64 * 1024 * 1024,
+  maxRetainedBytes: 64 * 1024 * 1024,
+  maxWidth: 16_384,
+  maxHeight: 16_384,
+  maxPixels: 32_000_000,
+});
+// Keep this below Workbench's smallest supported World Editor viewport so the
+// live case proves producer-side scaling regardless of desktop layout.
+const LIVE_IMAGE_BOUNDS = Object.freeze({ maxWidth: 192, maxHeight: 192 });
 
 export interface WorkbenchObserverAcceptanceOptions {
   confirmed: boolean;
@@ -203,12 +229,10 @@ export interface WorkbenchObserverAcceptanceResult {
   summary: Record<string, unknown>;
 }
 
-interface RetainedCapture {
-  label: string;
-  submitted: Record<string, unknown>;
-  completed: WorkbenchObserverJobStatus;
-  image: Buffer;
-  png: PngMaterialEvidence;
+interface RetainedCapture extends WorkbenchLiveRetainedCapture {
+  readonly output: NonNullable<WorkbenchLiveRetainedCapture["output"]>;
+  readonly comparisonImage: Buffer;
+  readonly request: CaptureInput;
 }
 
 interface FinalizedBundleEvidence {
@@ -422,7 +446,7 @@ export async function waitForCaptureCapability(
   throw new Error(`Timed out waiting for Workbench observer capture capability: ${lastError}`);
 }
 
-async function pollTerminal(
+async function pollTerminalState(
   application: ObserverApplication,
   jobId: string,
   deadline: number
@@ -448,7 +472,15 @@ async function pollTerminal(
       : "; no status response was retained";
     throw new Error(`Timed out waiting for Workbench observer job ${jobId}${last}`);
   }
-  status = result.value;
+  return result.value;
+}
+
+async function pollTerminal(
+  application: ObserverApplication,
+  jobId: string,
+  deadline: number
+): Promise<Record<string, unknown>> {
+  const status = await pollTerminalState(application, jobId, deadline);
   if (status.state !== "completed" || status.cameraLeaseHeld || !status.restorationConfirmed) {
     throw new Error(
       `Workbench observer job ${jobId} ended ${status.state}; ` +
@@ -459,6 +491,49 @@ async function pollTerminal(
   return status;
 }
 
+function canonicalAcceptanceImage(
+  image: ImageOutputRequest | undefined,
+  defaultLossyQuality: number,
+): CanonicalImageOutputPolicy {
+  const format = image?.format ?? "png";
+  return {
+    format,
+    ...(image?.maxWidth === undefined ? {} : { maxWidth: image.maxWidth }),
+    ...(image?.maxHeight === undefined ? {} : { maxHeight: image.maxHeight }),
+    ...(format === "png" ? {} : { quality: image?.quality ?? defaultLossyQuality }),
+  };
+}
+
+function analyzeCapturedImage(
+  image: Buffer,
+  policy: CanonicalImageOutputPolicy,
+): {
+  output: NonNullable<WorkbenchLiveRetainedCapture["output"]>;
+  png: PngMaterialEvidence;
+  comparisonImage: Buffer;
+} {
+  const descriptor = inspectImage(image, policy.format, LIVE_IMAGE_LIMITS);
+  const comparisonImage = policy.format === "png"
+    ? Buffer.from(image)
+    : transformImageSync(image, descriptor, { format: "png" }, LIVE_IMAGE_LIMITS).image;
+  const png = analyzePngMaterial(comparisonImage);
+  const outputDescriptor = imageOutputDescriptor(policy.format);
+  return {
+    output: {
+      format: policy.format,
+      mimeType: outputDescriptor.mimeType,
+      extension: outputDescriptor.extension,
+      width: descriptor.width,
+      height: descriptor.height,
+      byteCount: descriptor.bytes,
+      sha256: descriptor.sha256,
+      quality: policy.quality ?? null,
+    },
+    png,
+    comparisonImage,
+  };
+}
+
 async function captureAndRetainUnmeasured(
   application: ObserverApplication,
   view: ObserverCaptureView,
@@ -466,21 +541,26 @@ async function captureAndRetainUnmeasured(
   runId: string,
   instanceId: string,
   expectedWorldRevision: string,
-  deadline: number
+  deadline: number,
+  image?: ImageOutputRequest,
+  defaultLossyQuality = 75,
 ): Promise<RetainedCapture> {
-  const capture = await application.capture({
+  const expectedImage = canonicalAcceptanceImage(image, defaultLossyQuality);
+  const request: CaptureInput = {
     runId,
     captureLabel: label,
     purpose: `Live Workbench acceptance capture: ${label}`,
     instanceId,
-    expectedWorldRevision,
+    expectedWorldRevision: assertWorldRevision(expectedWorldRevision),
     idempotencyKey: `${runId}:${label}`,
     view,
     settleFrames: 3,
     performancePolicy: "evidence",
+    ...(image === undefined ? {} : { image }),
     asynchronous: true,
     timeoutMs: Math.max(1_000, Math.min(5 * 60_000, deadline - Date.now())),
-  });
+  };
+  const capture = await application.capture(request);
   if (!capture.asynchronous || typeof capture.job.jobId !== "string") {
     throw new Error(`${label} did not return an asynchronous managed Workbench job`);
   }
@@ -495,23 +575,29 @@ async function captureAndRetainUnmeasured(
     throw new Error(`${label} managed job state disagrees with the Workbench adapter's terminal restoration proof`);
   }
   const retained = await application.readJob(undefined, jobId);
-  const png = analyzePngMaterial(retained.image);
+  const { output, png, comparisonImage } = analyzeCapturedImage(retained.image, expectedImage);
   if (!png.materiallyVaried) {
     throw new Error(`${label} screenshot is blank or lacks material color/luminance variation`);
   }
-  if (completed.artifact?.width !== png.width || completed.artifact.height !== png.height) {
-    throw new Error(`${label} PNG dimensions disagree with the independently validated source artifact`);
+  if (completed.artifact?.width !== output.width || completed.artifact.height !== output.height ||
+      completed.artifact.format !== output.format || completed.artifact.mimeType !== output.mimeType) {
+    throw new Error(`${label} completed dimensions or format disagree with the independently validated artifact`);
   }
-  if (retained.metadata.contentSha256 !== png.sha256 || retained.metadata.bytes !== png.byteCount ||
-      retained.metadata.width !== png.width || retained.metadata.height !== png.height) {
-    throw new Error(`${label} managed artifact metadata disagrees with the independently validated PNG`);
+  if (retained.metadata.contentSha256 !== output.sha256 || retained.metadata.bytes !== output.byteCount ||
+      retained.metadata.width !== output.width || retained.metadata.height !== output.height ||
+      retained.metadata.format !== output.format || retained.metadata.mimeType !== output.mimeType ||
+      retained.metadata.imageQuality !== output.quality ||
+      !isDeepStrictEqual(retained.metadata.requestedImage, expectedImage)) {
+    throw new Error(`${label} managed artifact metadata disagrees with the independently validated image contract`);
   }
   const artifact = record(managedCompleted.artifact, `${label} managed job artifact metadata`);
-  if (artifact.bytes !== png.byteCount || artifact.contentSha256 !== png.sha256 ||
-      artifact.width !== png.width || artifact.height !== png.height) {
-    throw new Error(`${label} managed job artifact metadata disagrees with the independently validated PNG`);
+  if (artifact.bytes !== output.byteCount || artifact.contentSha256 !== output.sha256 ||
+      artifact.width !== output.width || artifact.height !== output.height ||
+      artifact.format !== output.format || artifact.mimeType !== output.mimeType ||
+      artifact.imageQuality !== output.quality || !isDeepStrictEqual(artifact.requestedImage, expectedImage)) {
+    throw new Error(`${label} managed job artifact metadata disagrees with the independently validated image`);
   }
-  return { label, submitted, completed, image: retained.image, png };
+  return { label, submitted, completed, image: retained.image, png, output, comparisonImage, request };
 }
 
 async function captureAndRetain(
@@ -522,7 +608,9 @@ async function captureAndRetain(
   instanceId: string,
   expectedWorldRevision: string,
   deadline: number,
-  baseline: OperationalBaselineRecorder
+  baseline: OperationalBaselineRecorder,
+  image?: ImageOutputRequest,
+  defaultLossyQuality = 75,
 ): Promise<RetainedCapture> {
   return baseline.measure(
     "capture",
@@ -534,10 +622,112 @@ async function captureAndRetain(
       runId,
       instanceId,
       expectedWorldRevision,
-      deadline
+      deadline,
+      image,
+      defaultLossyQuality,
     ),
     label
   );
+}
+
+function assertProducerBoundedPng(capture: RetainedCapture): Record<string, unknown> {
+  const artifact = capture.completed.artifact;
+  if (!artifact) throw new Error("Bounded PNG capture omitted Workbench artifact dimensions");
+  const { viewportWidth, viewportHeight } = artifact;
+  if (!Number.isSafeInteger(viewportWidth) || viewportWidth < 1 ||
+      !Number.isSafeInteger(viewportHeight) || viewportHeight < 1) {
+    throw new Error("Bounded PNG capture omitted a valid source viewport");
+  }
+  const scale = Math.min(
+    1,
+    LIVE_IMAGE_BOUNDS.maxWidth / viewportWidth,
+    LIVE_IMAGE_BOUNDS.maxHeight / viewportHeight,
+  );
+  const expectedWidth = Math.max(1, Math.floor(viewportWidth * scale));
+  const expectedHeight = Math.max(1, Math.floor(viewportHeight * scale));
+  if (scale >= 1) {
+    throw new Error(
+      `Workbench source viewport ${viewportWidth}x${viewportHeight} was not larger than the acceptance bound`,
+    );
+  }
+  if (artifact.sourceWidth !== expectedWidth || artifact.sourceHeight !== expectedHeight ||
+      capture.output.width !== expectedWidth || capture.output.height !== expectedHeight ||
+      capture.output.format !== "png" || capture.output.mimeType !== "image/png") {
+    throw new Error("Workbench did not persist the expected fit-inside PNG before host retention");
+  }
+  return {
+    viewportWidth,
+    viewportHeight,
+    requestedMaxWidth: LIVE_IMAGE_BOUNDS.maxWidth,
+    requestedMaxHeight: LIVE_IMAGE_BOUNDS.maxHeight,
+    producerWidth: artifact.sourceWidth,
+    producerHeight: artifact.sourceHeight,
+    retainedWidth: capture.output.width,
+    retainedHeight: capture.output.height,
+    producerResized: true,
+  };
+}
+
+async function verifyCaptureReplay(
+  application: ObserverApplication,
+  capture: RetainedCapture,
+): Promise<Record<string, unknown>> {
+  const replay = await application.capture(capture.request);
+  if (!replay.asynchronous || replay.job.jobId !== capture.completed.jobId ||
+      replay.job.state !== "completed" || replay.job.cameraLeaseHeld === true ||
+      replay.job.restorationConfirmed !== true) {
+    throw new Error("Exact observer capture replay did not return the existing restored completed job");
+  }
+  return {
+    jobId: replay.job.jobId,
+    state: replay.job.state,
+    reused: true,
+    restorationConfirmed: replay.job.restorationConfirmed,
+  };
+}
+
+async function cancelAndVerifyCapture(
+  application: ObserverApplication,
+  view: ObserverCaptureView,
+  instanceId: string,
+  expectedWorldRevision: string,
+  deadline: number,
+): Promise<Record<string, unknown>> {
+  const request: CaptureInput = {
+    instanceId,
+    expectedWorldRevision: assertWorldRevision(expectedWorldRevision),
+    idempotencyKey: `workbench-live-cancel-${randomUUID()}`,
+    view,
+    settleFrames: 120,
+    performancePolicy: "evidence",
+    image: { format: "webp", ...LIVE_IMAGE_BOUNDS },
+    asynchronous: true,
+    timeoutMs: Math.max(1_000, Math.min(5 * 60_000, deadline - Date.now())),
+  };
+  const submitted = await application.capture(request);
+  if (!submitted.asynchronous || typeof submitted.job.jobId !== "string" ||
+      submitted.job.cameraLeaseHeld !== true) {
+    throw new Error("Cancellation acceptance did not acquire a Workbench camera lease");
+  }
+  const jobId = submitted.job.jobId;
+  let terminal = await application.cancelJob(undefined, jobId);
+  if (typeof terminal.state !== "string" || !TERMINAL_STATES.has(terminal.state)) {
+    terminal = await pollTerminalState(application, jobId, deadline);
+  }
+  if (terminal.state !== "cancelled" || terminal.cameraLeaseHeld === true ||
+      terminal.restorationConfirmed !== true) {
+    throw new Error(
+      `Cancellation acceptance ended ${String(terminal.state)} without exact camera restoration`,
+    );
+  }
+  const release = await application.releaseJob(undefined, jobId);
+  return {
+    jobId,
+    submittedLeaseHeld: true,
+    terminalState: terminal.state,
+    restorationConfirmed: terminal.restorationConfirmed,
+    release,
+  };
 }
 
 function writeSummary(path: string, summary: Record<string, unknown>): void {
@@ -576,11 +766,26 @@ function bundleFiles(root: string): string[] {
   return files.sort((left, right) => left.localeCompare(right));
 }
 
+function retainedOutput(
+  capture: WorkbenchLiveRetainedCapture,
+): NonNullable<WorkbenchLiveRetainedCapture["output"]> {
+  return capture.output ?? {
+    format: "png",
+    mimeType: "image/png",
+    extension: ".png",
+    width: capture.png.width,
+    height: capture.png.height,
+    byteCount: capture.png.byteCount,
+    sha256: capture.png.sha256,
+    quality: null,
+  };
+}
+
 function validateFinalizedBundle(
   finalized: Record<string, unknown>,
   evidenceRoot: string,
   runId: string,
-  captures: RetainedCapture[]
+  captures: WorkbenchLiveRetainedCapture[]
 ): FinalizedBundleEvidence {
   const receipt = record(finalized.receipt, "Observer finalization receipt");
   const evidenceDirectory = canonicalDirectory(
@@ -616,7 +821,7 @@ function validateFinalizedBundle(
     "runtime-config.json",
     ...captures.flatMap((capture) => [
       `captures/${capture.label}.json`,
-      `captures/${capture.label}.png`,
+      `captures/${capture.label}${retainedOutput(capture).extension}`,
     ]),
   ].sort((left, right) => left.localeCompare(right));
   if (JSON.stringify(actualFiles) !== JSON.stringify(expectedFiles)) {
@@ -653,13 +858,22 @@ function validateFinalizedBundle(
     if (!item) throw new Error(`Finalized evidence omitted capture ${capture.label}`);
     const imagePath = requiredString(item.imagePath, `Finalized capture image path ${capture.label}`);
     const metadataPath = requiredString(item.metadataPath, `Finalized capture metadata path ${capture.label}`);
-    if (imagePath !== `captures/${capture.label}.png` || metadataPath !== `captures/${capture.label}.json`) {
+    const expectedOutput = retainedOutput(capture);
+    if (imagePath !== `captures/${capture.label}${expectedOutput.extension}` ||
+        metadataPath !== `captures/${capture.label}.json`) {
       throw new Error(`Finalized evidence used non-standard paths for capture ${capture.label}`);
     }
     const image = readFileSync(join(evidenceDirectory, ...imagePath.split("/")));
-    const png = analyzePngMaterial(image);
-    if (png.sha256 !== capture.png.sha256 || png.width !== capture.png.width || png.height !== capture.png.height ||
-        item.sha256 !== png.sha256 || item.bytes !== png.byteCount || item.width !== png.width || item.height !== png.height) {
+    const analyzed = analyzeCapturedImage(image, {
+      format: expectedOutput.format,
+      ...(expectedOutput.quality === null ? {} : { quality: expectedOutput.quality }),
+    });
+    if (analyzed.output.sha256 !== expectedOutput.sha256 ||
+        analyzed.output.byteCount !== expectedOutput.byteCount ||
+        analyzed.output.width !== expectedOutput.width || analyzed.output.height !== expectedOutput.height ||
+        item.sha256 !== expectedOutput.sha256 || item.bytes !== expectedOutput.byteCount ||
+        item.width !== expectedOutput.width || item.height !== expectedOutput.height ||
+        item.format !== expectedOutput.format || item.mimeType !== expectedOutput.mimeType) {
       throw new Error(`Finalized evidence image disagrees with managed capture ${capture.label}`);
     }
     const metadata = record(
@@ -706,6 +920,7 @@ export async function runWorkbenchObserverAcceptance(
       runDirectory,
       clientIdPrefix: "live-workbench-observer",
       launchTimeoutMs: Math.min(180_000, timeoutMs),
+      additionalLaunchArguments: ["-window", "-screenWidth", "1280", "-screenHeight", "720"],
       createAdapter: (client) => new WorkbenchObserverAdapter(client, {
         handlerTimeoutMs: 10_000,
       }),
@@ -764,7 +979,7 @@ export async function runWorkbenchObserverAcceptance(
     const begun = await application.beginRun({
       title: "Live Workbench observer screenshot acceptance",
       caseIds: ["WB-OBSERVER-LIVE-CAPTURE"],
-      procedureRevision: "workbench-observer-live-acceptance-v3",
+      procedureRevision: "workbench-observer-live-acceptance-v4",
       idempotencyKey: `workbench-live-${randomUUID()}`,
     });
     observerRunId = requiredString(begun.runId, "Managed observer run ID");
@@ -816,12 +1031,12 @@ export async function runWorkbenchObserverAcceptance(
       },
     });
     summary.faultMatrixControl = { configured: true, declaredCaseCount: phaseOneFaultCases.length };
-    const open = await baseline.measure(
+  const open = await baseline.measure(
       "managed_call",
       "WorkbenchClient.call(EMCP_WB_EditorControl.openResource)",
       () => client.call<Record<string, unknown>>("EMCP_WB_EditorControl", {
         action: "openResource",
-        path: project.worldResource,
+        path: workbenchResourceVirtualPath(project.worldResource),
       }, { skipAutoLaunch: true, timeout: 30_000 }),
       "representative_net_api"
     );
@@ -832,6 +1047,7 @@ export async function runWorkbenchObserverAcceptance(
     const instanceId = requiredString(selected.instanceId, "Selected Workbench observer instance ID");
     const expectedWorldRevision = requiredString(selected.worldRevision, "Selected Workbench observer world revision");
     const expectedWorldId = requiredString(selected.worldId, "Selected Workbench observer world ID");
+    const defaultLossyQuality = config.observer?.defaultLossyImageQuality ?? 75;
 
     const initial = await captureAndRetain(
       application,
@@ -841,8 +1057,12 @@ export async function runWorkbenchObserverAcceptance(
       instanceId,
       expectedWorldRevision,
       deadline,
-      baseline
+      baseline,
+      { format: "png", ...LIVE_IMAGE_BOUNDS },
+      defaultLossyQuality,
     );
+    const boundedPng = assertProducerBoundedPng(initial);
+    const replay = await verifyCaptureReplay(application, initial);
     const inventory = await application.instances({ renderersOnly: true });
     const workbenchInventory = inventory.instances.filter((instance) => instance.backend === "workbench");
     const ping = await baseline.measure(
@@ -883,9 +1103,14 @@ export async function runWorkbenchObserverAcceptance(
       instanceId,
       expectedWorldRevision,
       deadline,
-      baseline
+      baseline,
+      { format: "jpeg", quality: 61, ...LIVE_IMAGE_BOUNDS },
+      defaultLossyQuality,
     );
-    const poseDifference: PngComparisonEvidence = comparePngImages(initial.image, pose.image);
+    const poseDifference: PngComparisonEvidence = comparePngImages(
+      initial.comparisonImage,
+      pose.comparisonImage,
+    );
     if (!poseDifference.materiallyDifferent) {
       throw new Error("Explicit pose screenshot is not materially different from the initial current view");
     }
@@ -912,7 +1137,9 @@ export async function runWorkbenchObserverAcceptance(
       instanceId,
       expectedWorldRevision,
       deadline,
-      baseline
+      baseline,
+      { format: "webp", ...LIVE_IMAGE_BOUNDS },
+      defaultLossyQuality,
     );
     assertRestoredWorkbenchCurrent(initial, postPose, "Post-pose current capture");
 
@@ -944,9 +1171,14 @@ export async function runWorkbenchObserverAcceptance(
       instanceId,
       expectedWorldRevision,
       deadline,
-      baseline
+      baseline,
+      { format: "png", ...LIVE_IMAGE_BOUNDS },
+      defaultLossyQuality,
     );
-    const lookAtDifference: PngComparisonEvidence = comparePngImages(initial.image, lookAt.image);
+    const lookAtDifference: PngComparisonEvidence = comparePngImages(
+      initial.comparisonImage,
+      lookAt.comparisonImage,
+    );
     if (!lookAtDifference.materiallyDifferent) {
       throw new Error("Explicit look-at screenshot is not materially different from the initial current view");
     }
@@ -968,20 +1200,46 @@ export async function runWorkbenchObserverAcceptance(
       instanceId,
       expectedWorldRevision,
       deadline,
-      baseline
+      baseline,
+      { format: "jpeg", quality: 68, ...LIVE_IMAGE_BOUNDS },
+      defaultLossyQuality,
     );
     assertRestoredWorkbenchCurrent(initial, postLookAt, "Post-look-at current capture");
+    const cancellation = await cancelAndVerifyCapture(
+      application,
+      poseView,
+      instanceId,
+      expectedWorldRevision,
+      deadline,
+    );
+    const postCancel = await captureAndRetain(
+      application,
+      { kind: "current" },
+      "post-cancel-restoration-current",
+      observerRunId,
+      instanceId,
+      expectedWorldRevision,
+      deadline,
+      baseline,
+      { format: "png", ...LIVE_IMAGE_BOUNDS },
+      defaultLossyQuality,
+    );
+    assertRestoredWorkbenchCurrent(initial, postCancel, "Post-cancellation current capture");
     summary.inventory = inventory;
     summary.ping = ping;
+    summary.boundedPng = boundedPng;
+    summary.replay = replay;
+    summary.cancellation = cancellation;
     summary.poseRequest = poseView;
     summary.poseScreenshotDifference = poseDifference;
     summary.lookAtRequest = lookAtView;
     summary.lookAtScreenshotDifference = lookAtDifference;
-    const captures = [initial, pose, postPose, lookAt, postLookAt];
+    const captures = [initial, pose, postPose, lookAt, postLookAt, postCancel];
     summary.captures = captures.map((capture) => ({
       label: capture.label,
       managedJobId: capture.completed.jobId,
-      png: capture.png,
+      output: capture.output,
+      material: capture.png,
       submittedLeaseHeld: capture.submitted.cameraLeaseHeld,
       restorationConfirmed: capture.completed.restorationConfirmed,
     }));
@@ -993,19 +1251,21 @@ export async function runWorkbenchObserverAcceptance(
       review: {
         imagesReviewed: false,
         outcome: "Unreviewed",
-        summary: "Automation validated screenshot integrity, material variation, explicit pose and look-at execution, and exact camera restoration after both views. The image contents still require human review.",
+        summary: "Automation validated bounded PNG production, JPEG/WebP conversion and MIME binding, material variation, replay, cancellation, explicit pose/look-at execution, and exact camera restoration. The image contents still require human review.",
         limitations: [
           "This automated acceptance does not make a gameplay or editorial-content claim from the screenshots.",
         ],
       },
       runtimeConfig: {
-        configurationId: "workbench-observer-live-acceptance-v3",
+        configurationId: "workbench-observer-live-acceptance-v4",
         values: {
           backend: "workbench",
           worldResource: project.worldResource,
           captureSequence: captures.map((capture) => capture.label).join(","),
           settleFrames: 3,
           expectedWorldRevision,
+          imageBounds: LIVE_IMAGE_BOUNDS,
+          defaultLossyQuality,
         },
       },
       releaseManagedArtifacts: true,
@@ -1165,7 +1425,7 @@ export async function runWorkbenchObserverAcceptance(
         result: baselineFailed ? "failed" : "passed",
         environment: baselineEnvironment,
         workload: {
-          procedureRevision: "workbench-observer-live-acceptance-v3",
+          procedureRevision: "workbench-observer-live-acceptance-v4",
           runtimeKind: "workbench",
           overallTimeoutMs: timeoutMs,
           worldResource: BASE_EVERON_WORLD,
@@ -1192,7 +1452,15 @@ export async function runWorkbenchObserverAcceptance(
                 orientation: "initial-camera",
                 fovDeltaWithinBounds: 10,
               },
-              restorations: ["post-pose-current", "post-look-at-current"],
+              restorations: ["post-pose-current", "post-look-at-current", "post-cancel-current"],
+              image: {
+                bounds: LIVE_IMAGE_BOUNDS,
+                formats: ["png", "jpeg", "webp"],
+                explicitQualities: { jpeg: [61, 68] },
+                defaultQualityFormat: "webp",
+              },
+              replay: "exact-completed-request",
+              cancellation: { view: "pose", settleFrames: 120 },
               lookAt: {
                 positionInInitialBasis: { right: -90, up: 35, forward: -60 },
                 targetInInitialBasis: { forward: 150 },

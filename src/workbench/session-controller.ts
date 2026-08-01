@@ -129,6 +129,7 @@ import {
   revalidateResourceTarget,
   type CanonicalResourceTarget,
 } from "./resource-target.js";
+import { findExplicitEmptyPrefabOverrides } from "./prefab-save-integrity.js";
 
 const DEFAULT_CLIENT_ID = "EnfusionMCP";
 const LAUNCH_POLL_INTERVAL_MS = 3_000;
@@ -1249,6 +1250,26 @@ export class WorkbenchSessionController {
       this.assertExplicitResourceWritable(binding.resource);
       revalidateProjectIdentity(binding.project);
       revalidateResourceTarget(binding.resource, binding.project);
+      if (extname(binding.resource.displayPath).toLowerCase() === ".et") {
+        const emptyOverrides = findExplicitEmptyPrefabOverrides(
+          readFileSync(binding.resource.displayPath, "utf8")
+        );
+        if (emptyOverrides.length > 0) {
+          const listed = emptyOverrides.slice(0, 5).map((path) => `\`${path}\``).join(", ");
+          const extra = emptyOverrides.length > 5
+            ? ` and ${emptyOverrides.length - 5} more`
+            : "";
+          this.taintExplicitResourceSession(
+            "The target contains explicit empty inherited-prefab overrides that native SaveEntityTemplate may discard."
+          );
+          throw new WorkbenchError(
+            "Explicit save refused before invoking Workbench because the inherited prefab contains " +
+              `load-bearing empty override block(s): ${listed}${extra}. Preserve these overrides with a ` +
+              "minimal direct prefab edit, then relaunch the exact target.",
+            "TARGET_SESSION_TAINTED"
+          );
+        }
+      }
       await this.processGuard.verifyExactProcessArguments(
         binding.process,
         explicitResourceLaunchArguments(binding.resource)

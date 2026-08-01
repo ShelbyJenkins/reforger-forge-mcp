@@ -16,6 +16,7 @@ import {
   type CaptureInstance,
   type ListInstancesInput,
 } from "./capture-contract.js";
+import type { CanonicalImageOutputPolicy } from "../foundation/image-output.js";
 import { canonicalPublicObserverErrorCode } from "./public-contract.js";
 import { legacyWorldFields, sameWorldRevision, workbenchWorldRevision } from "./world-revision.js";
 
@@ -97,14 +98,24 @@ export class WorkbenchCaptureBackend implements CaptureBackend {
         jobId: input.jobId,
         view: input.request.view,
         settlePolls: input.request.settleFrames,
+        image: input.request.image,
       }), context);
-      return this.job(status, input.instance);
+      return this.job(status, {
+        ...input.instance,
+        recoveryBinding: { ...input.instance.recoveryBinding, image: input.request.image },
+      });
     } catch (error) { throw mapError(error); }
   }
 
   async status(ref: BackendJobRef, context: BackendCallContext): Promise<BackendJob> {
     try {
-      const status = await within(() => this.adapter.recover({ jobId: ref.jobId, expectedInstanceId: ref.instanceId }), context);
+      const status = await within(() => this.adapter.recover({
+        jobId: ref.jobId,
+        expectedInstanceId: ref.instanceId,
+        ...(ref.recoveryBinding.image && typeof ref.recoveryBinding.image === "object"
+          ? { image: ref.recoveryBinding.image as CanonicalImageOutputPolicy }
+          : {}),
+      }), context);
       return this.job(status, {
         backend: "workbench", instanceId: ref.instanceId, capabilities: [], worldRevision: ref.worldRevision, worldId: null,
         recoveryBinding: ref.recoveryBinding,

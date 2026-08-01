@@ -255,9 +255,12 @@ export function registerWbEntityTools(server: McpServer, client: WorkbenchClient
     "wb_entity_modify",
     {
       description:
-        "Modify an entity in the World Editor. Supports moving, rotating, renaming, reparenting, and setting or clearing component properties. Only works in edit mode.",
+        "Modify a named entity or an unnamed entity selected by editor index in the World Editor. Supports moving, rotating, renaming, reparenting, and setting or clearing component properties. Only works in edit mode.",
       inputSchema: {
-        name: z.string().describe("Name of the entity to modify"),
+        name: z.string().optional().describe("Name of the entity to modify; omit when using entityIndex"),
+        entityIndex: z.number().int().min(0).optional().describe(
+          "Editor entity index for an unnamed target, such as index 1 for the generated root in Prefab Edit Mode"
+        ),
         action: z
           .enum([
             "move", "rotate", "rename", "reparent",
@@ -288,7 +291,7 @@ export function registerWbEntityTools(server: McpServer, client: WorkbenchClient
           .describe("Array element index for addArrayItem (insert position, -1 = append) or removeArrayItem (item to remove, 0-based)"),
       },
     },
-    async ({ name, action, value, propertyPath, propertyKey, memberIndex }) => {
+    async ({ name, entityIndex, action, value, propertyPath, propertyKey, memberIndex }) => {
       // Only require edit mode for mutating actions, not read-only ones
       const READ_ONLY_ACTIONS = ["getProperty", "listProperties", "listArrayItems", "getWorldTransform", "makeVisible"];
       if (!READ_ONLY_ACTIONS.includes(action)) {
@@ -298,6 +301,14 @@ export function registerWbEntityTools(server: McpServer, client: WorkbenchClient
         }
       }
       try {
+        const normalizedName = name?.trim();
+        if (!normalizedName && entityIndex === undefined) {
+          return {
+            content: [{ type: "text" as const, text: "Error: `name` or `entityIndex` is required." }],
+            isError: true,
+          };
+        }
+        const targetLabel = normalizedName || `editor entity #${entityIndex}`;
         // Validate value is provided for actions that require it
         // Note: setProperty allows empty string as a valid value, so it's validated separately
         const actionsRequiringValue = ["move", "rotate", "rename", "reparent", "addArrayItem", "setObjectClass"];
@@ -314,7 +325,9 @@ export function registerWbEntityTools(server: McpServer, client: WorkbenchClient
           };
         }
 
-        const params: Record<string, unknown> = { name, action };
+        const params: Record<string, unknown> = { action };
+        if (normalizedName) params.name = normalizedName;
+        if (entityIndex !== undefined) params.entityIndex = entityIndex;
         if (!READ_ONLY_ACTIONS.includes(action)) {
           params.value = value ?? "";
         }
@@ -329,11 +342,11 @@ export function registerWbEntityTools(server: McpServer, client: WorkbenchClient
         if (result.status !== "ok") {
           const message = typeof result.message === "string" && result.message.trim()
             ? result.message
-            : `Workbench could not ${action} on entity "${name}".`;
+            : `Workbench could not ${action} on entity "${targetLabel}".`;
           return {
             content: [{
               type: "text" as const,
-              text: `Error modifying entity "${name}": ${message}${formatConnectionStatus(client)}`,
+              text: `Error modifying entity "${targetLabel}": ${message}${formatConnectionStatus(client)}`,
             }],
             isError: true,
           };
@@ -347,7 +360,7 @@ export function registerWbEntityTools(server: McpServer, client: WorkbenchClient
           return {
             content: [{
               type: "text" as const,
-              text: `**Transform: ${name}**\n\n- **Position:** ${(pos?.value as string | undefined)?.trim() || "(unknown)"}\n- **Rotation:** ${(rot?.value as string | undefined)?.trim() || "(unknown)"}${formatConnectionStatus(client)}`,
+              text: `**Transform: ${targetLabel}**\n\n- **Position:** ${(pos?.value as string | undefined)?.trim() || "(unknown)"}\n- **Rotation:** ${(rot?.value as string | undefined)?.trim() || "(unknown)"}${formatConnectionStatus(client)}`,
             }],
           };
         }
@@ -383,15 +396,15 @@ export function registerWbEntityTools(server: McpServer, client: WorkbenchClient
           addArrayItem: `Added '${value}' to '${propertyKey || "array"}' at index ${memberIndex ?? -1}`,
           removeArrayItem: `Removed index ${memberIndex ?? 0} from '${propertyKey || "array"}'`,
           setObjectClass: `Changed class of '${propertyKey || "property"}' to '${value}'`,
-          getWorldTransform: `Got world transform of ${name}`,
-          makeVisible: `Scrolled to ${name}`,
+          getWorldTransform: `Got world transform of ${targetLabel}`,
+          makeVisible: `Scrolled to ${targetLabel}`,
         };
 
         return {
           content: [
             {
               type: "text" as const,
-              text: `**Entity Modified**\n\n- **Entity:** ${name}\n- **Action:** ${actionLabels[action] || action}${result.message ? `\n- **Note:** ${result.message}` : ""}${formatConnectionStatus(client)}`,
+              text: `**Entity Modified**\n\n- **Entity:** ${targetLabel}\n- **Action:** ${actionLabels[action] || action}${result.message ? `\n- **Note:** ${result.message}` : ""}${formatConnectionStatus(client)}`,
             },
           ],
         };

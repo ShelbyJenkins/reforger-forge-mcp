@@ -260,9 +260,6 @@ export function launchArguments(
   runtimeKind: "listenServer" | "client" = "listenServer"
 ): string[] {
   const result = [
-    "-window",
-    "-screenWidth", "1280",
-    "-screenHeight", "720",
     "-noSplash",
     "-noThrow",
     "-disableCrashReporter",

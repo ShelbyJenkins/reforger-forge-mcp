@@ -120,6 +120,30 @@ describe("owner-scoped editor add-on dependency preflight", () => {
     });
   });
 
+  it("uses the target's sibling add-on container for an MCP-owned editor launch", async () => {
+    const harness = createHarness();
+    writeProject(
+      harness.projectPath,
+      "ExampleMod",
+      TARGET_GUID,
+      [DEPENDENCY_GUID]
+    );
+    const dependencyPath = join(harness.root, "projects", "SiblingCore", "SiblingCore.gproj");
+    mkdirSync(join(harness.root, "projects", "SiblingCore"), { recursive: true });
+    writeProject(dependencyPath, "SiblingCore", DEPENDENCY_GUID);
+
+    await expect(harness.client.ensureRunning(harness.projectPath)).resolves.toMatchObject({
+      action: "launched",
+    });
+
+    const addonsDirIndex = harness.spawnArgs[0].indexOf("-addonsDir");
+    expect(addonsDirIndex).toBeGreaterThanOrEqual(0);
+    expect(harness.spawnArgs[0][addonsDirIndex + 1].split(",")).toContain(
+      realpathSync.native(join(harness.root, "projects"))
+    );
+    await harness.client.shutdownOwnedWorkbench();
+  });
+
   it("re-audits after durable pre_spawn and safely permits a later retry", async () => {
     const harness = createHarness();
     writeProject(

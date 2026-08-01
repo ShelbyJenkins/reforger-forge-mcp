@@ -299,7 +299,6 @@ export function inspectToolRegistration(
     "addonName",
     "platform",
     "outputPath",
-    "gprojPath",
     "filterPath",
   ].filter((name) => Object.hasOwn(modProperties, name));
   const removedModSurface = [

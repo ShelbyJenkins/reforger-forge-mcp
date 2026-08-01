@@ -112,7 +112,7 @@ describe("game_duplicate contract", () => {
       expect(call).toHaveBeenCalledWith(
         "EMCP_WB_Resources",
         { action: "register", path: destination, buildRuntime: false },
-        { timeout: 30_000, skipAutoLaunch: true }
+        { timeout: 120_000, skipAutoLaunch: true }
       );
     });
   });

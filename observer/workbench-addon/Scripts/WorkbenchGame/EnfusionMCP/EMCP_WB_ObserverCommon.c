@@ -32,6 +32,12 @@ class EMCP_WB_ObserverJob
 	int ownerCameraId;
 	int viewportWidth;
 	int viewportHeight;
+	int requestedMaxWidth;
+	int requestedMaxHeight;
+	int sourceWidth;
+	int sourceHeight;
+	int outputWidth;
+	int outputHeight;
 	float originalFov;
 	float originalNearPlane;
 	float originalFarPlane;
@@ -94,6 +100,12 @@ class EMCP_WB_ObserverJobResponse : JsonApiStruct
 	int settledPolls;
 	int artifactBytes;
 	int ownerCameraId;
+	int requestedMaxWidth;
+	int requestedMaxHeight;
+	int sourceWidth;
+	int sourceHeight;
+	int outputWidth;
+	int outputHeight;
 	float actualFov;
 	float nearPlane;
 	float farPlane;
@@ -125,6 +137,12 @@ class EMCP_WB_ObserverJobResponse : JsonApiStruct
 		RegV("settledPolls");
 		RegV("artifactBytes");
 		RegV("ownerCameraId");
+		RegV("requestedMaxWidth");
+		RegV("requestedMaxHeight");
+		RegV("sourceWidth");
+		RegV("sourceHeight");
+		RegV("outputWidth");
+		RegV("outputHeight");
 		RegV("actualFov");
 		RegV("nearPlane");
 		RegV("farPlane");
@@ -155,6 +173,12 @@ class EMCP_WB_ObserverJobResponse : JsonApiStruct
 		settledPolls = job.settledPolls;
 		artifactBytes = job.artifactBytes;
 		ownerCameraId = job.ownerCameraId;
+		requestedMaxWidth = job.requestedMaxWidth;
+		requestedMaxHeight = job.requestedMaxHeight;
+		sourceWidth = job.sourceWidth;
+		sourceHeight = job.sourceHeight;
+		outputWidth = job.outputWidth;
+		outputHeight = job.outputHeight;
 		actualFov = job.actualFov;
 		nearPlane = job.originalNearPlane;
 		farPlane = job.originalFarPlane;
@@ -195,6 +219,8 @@ class EMCP_WB_ObserverService
 	protected ref EMCP_WB_ObserverJob m_Job;
 	protected ref EMCP_WB_ObserverReleaseReceipt m_LastRelease;
 	protected bool m_RestorationProven;
+	protected bool m_ScreenshotCallbackPending;
+	protected string m_ScreenshotCallbackJobId;
 	protected string m_LastProjectionDiagnostic;
 	protected string m_LastRestorationDiagnostic;
 
@@ -338,6 +364,8 @@ class EMCP_WB_ObserverService
 		string matrix3,
 		string fovText,
 		int settlePolls,
+		int maxWidth,
+		int maxHeight,
 		out string acceptedLeaseId,
 		out string message)
 	{
@@ -372,12 +400,22 @@ class EMCP_WB_ObserverService
 			message = "settlePolls is outside the reviewed bound";
 			return false;
 		}
+		if (maxWidth < 0 || maxWidth > 16384 || maxHeight < 0 || maxHeight > 16384 || (maxWidth > 0 && maxHeight > 0 && maxWidth * maxHeight > 32000000))
+		{
+			message = "Requested image bounds are outside the reviewed range";
+			return false;
+		}
+		if (!m_Job && m_ScreenshotCallbackPending)
+		{
+			message = "The previous raw screenshot callback is still pending";
+			return false;
+		}
 		if (m_Job)
 		{
 			// Submit is an acknowledged, idempotent delivery boundary. The host
 			// chooses the lease before delivery, so an identical retry recovers a
 			// lost response without applying camera state twice.
-			bool replay = m_Job.jobId == jobId && m_Job.leaseId == requestedLeaseId && m_Job.lifecycleGeneration == lifecycleGeneration && NormalizedPath(m_Job.canonicalTarget) == NormalizedPath(canonicalTarget) && m_Job.viewKind == viewKind && m_Job.requestedMatrix0 == matrix0 && m_Job.requestedMatrix1 == matrix1 && m_Job.requestedMatrix2 == matrix2 && m_Job.requestedMatrix3 == matrix3 && Math.AbsFloat(m_Job.requestedFov - fov) <= MATRIX_EPSILON && m_Job.settlePolls == settlePolls;
+			bool replay = m_Job.jobId == jobId && m_Job.leaseId == requestedLeaseId && m_Job.lifecycleGeneration == lifecycleGeneration && NormalizedPath(m_Job.canonicalTarget) == NormalizedPath(canonicalTarget) && m_Job.viewKind == viewKind && m_Job.requestedMatrix0 == matrix0 && m_Job.requestedMatrix1 == matrix1 && m_Job.requestedMatrix2 == matrix2 && m_Job.requestedMatrix3 == matrix3 && Math.AbsFloat(m_Job.requestedFov - fov) <= MATRIX_EPSILON && m_Job.settlePolls == settlePolls && m_Job.requestedMaxWidth == maxWidth && m_Job.requestedMaxHeight == maxHeight;
 			if (replay)
 			{
 				acceptedLeaseId = m_Job.leaseId;
@@ -426,6 +464,8 @@ class EMCP_WB_ObserverService
 		job.message = "Workbench observer camera lease acquired";
 		job.sequence = 1;
 		job.settlePolls = settlePolls;
+		job.requestedMaxWidth = maxWidth;
+		job.requestedMaxHeight = maxHeight;
 		job.world = world;
 		job.originalWorldCameraId = world.GetCurrentCameraId();
 		job.ownerCameraId = job.originalWorldCameraId;
@@ -621,8 +661,7 @@ class EMCP_WB_ObserverService
 				message = m_Job.message;
 				return true;
 			}
-			string screenshotRequestPath = CAPTURE_DIRECTORY + "/" + m_Job.jobId;
-			m_Job.outputLogicalPath = screenshotRequestPath + ".png";
+			m_Job.outputLogicalPath = CAPTURE_DIRECTORY + "/" + m_Job.jobId + ".png";
 			if (!Workbench.GetAbsolutePath(m_Job.outputLogicalPath, m_Job.outputAbsolutePath, false) || m_Job.outputAbsolutePath.IsEmpty())
 			{
 				FailAndRestore("SCREENSHOT_PATH_UNAVAILABLE", "Workbench could not resolve the generated profile capture path");
@@ -646,18 +685,32 @@ class EMCP_WB_ObserverService
 				return true;
 			}
 			m_Job.renderedEvidenceCaptured = true;
-			// Workbench MakeScreenshot appends its engine-selected .png suffix. Keep the
-			// extensionless request separate from the exact artifact contract.
-			if (!System.MakeScreenshot(screenshotRequestPath))
+			System.GetRenderingResolution(m_Job.sourceWidth, m_Job.sourceHeight);
+			if (m_Job.sourceWidth < 1 || m_Job.sourceHeight < 1 || m_Job.sourceWidth > 16384 || m_Job.sourceHeight > 16384 || m_Job.sourceWidth * m_Job.sourceHeight > 32000000)
 			{
-				FailAndRestore("SCREENSHOT_REJECTED", "System.MakeScreenshot rejected the generated PNG request");
+				FailAndRestore("SCREENSHOT_REJECTED", "Workbench reported an invalid or excessive rendering resolution");
 				message = m_Job.message;
 				return true;
 			}
+			m_Job.outputWidth = m_Job.sourceWidth;
+			m_Job.outputHeight = m_Job.sourceHeight;
+			if (m_Job.requestedMaxWidth > 0 && m_Job.outputWidth > m_Job.requestedMaxWidth)
+			{
+				m_Job.outputHeight = Math.Max(1, m_Job.outputHeight * m_Job.requestedMaxWidth / m_Job.outputWidth);
+				m_Job.outputWidth = m_Job.requestedMaxWidth;
+			}
+			if (m_Job.requestedMaxHeight > 0 && m_Job.outputHeight > m_Job.requestedMaxHeight)
+			{
+				m_Job.outputWidth = Math.Max(1, m_Job.outputWidth * m_Job.requestedMaxHeight / m_Job.outputHeight);
+				m_Job.outputHeight = m_Job.requestedMaxHeight;
+			}
 			m_Job.screenshotIssued = true;
 			m_Job.state = EMCP_WB_ObserverProtocol.STATE_CAPTURING;
-			m_Job.message = "Screenshot issued; waiting for a stable artifact";
+			m_Job.message = "Bounded raw screenshot issued; waiting for PNG persistence";
 			m_Job.sequence++;
+			m_ScreenshotCallbackPending = true;
+			m_ScreenshotCallbackJobId = m_Job.jobId;
+			System.MakeScreenshotRawData(OnScreenshot, 0, 0, m_Job.sourceWidth, m_Job.sourceHeight, m_Job.outputWidth, m_Job.outputHeight);
 			if (!OnCaptureInProgressBarrier(m_Job))
 			{
 				message = m_Job.message;
@@ -745,6 +798,27 @@ class EMCP_WB_ObserverService
 		}
 		message = m_Job.message;
 		return true;
+	}
+
+	void OnScreenshot(PixelRawData data, int imageWidth, int imageHeight, int stride)
+	{
+		string callbackJobId = m_ScreenshotCallbackJobId;
+		m_ScreenshotCallbackPending = false;
+		m_ScreenshotCallbackJobId = string.Empty;
+		if (!m_Job || m_Job.jobId != callbackJobId || !m_Job.screenshotIssued || m_Job.IsTerminal())
+			return;
+		if (!data || imageWidth != m_Job.outputWidth || imageHeight != m_Job.outputHeight || stride < imageWidth * 4)
+		{
+			FailAndRestore("SCREENSHOT_REJECTED", "Workbench returned invalid bounded raw screenshot data");
+			return;
+		}
+		if (!Workbench.SavePixelRawData(m_Job.outputLogicalPath, data, imageWidth, imageHeight, stride))
+		{
+			FailAndRestore("SCREENSHOT_REJECTED", "Workbench could not persist the bounded raw screenshot as PNG");
+			return;
+		}
+		m_Job.message = "Bounded Workbench PNG persisted; waiting for stable artifact verification";
+		m_Job.sequence++;
 	}
 
 	bool Cancel(string jobId, string leaseId, string lifecycleGeneration, string canonicalTarget, out string message)

@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
   existsSync,
@@ -133,6 +134,107 @@ const CAPTURE_LABELS = [
   "explicit-look-at",
   "post-look-at-restoration-current",
 ] as const;
+
+interface GraphicalRuntimeWindowEvidence {
+  readonly ready: boolean;
+  readonly pid: number;
+  readonly handle: number;
+  readonly foregroundPid: number;
+  readonly isForeground: boolean;
+  readonly visible: boolean;
+  readonly coversMonitor: boolean;
+  readonly hasCaption: boolean;
+  readonly hasThickFrame: boolean;
+  readonly popupStyle: boolean;
+  readonly rectangle: { readonly left: number; readonly top: number; readonly right: number; readonly bottom: number };
+  readonly monitor: { readonly left: number; readonly top: number; readonly right: number; readonly bottom: number };
+}
+
+function inspectGraphicalRuntimeWindow(pid: number): GraphicalRuntimeWindowEvidence {
+  if (!Number.isSafeInteger(pid) || pid <= 0) throw new Error("Graphical runtime window inspection requires a PID");
+  const command = `
+$ErrorActionPreference = 'Stop'
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public struct RfoRect { public int Left; public int Top; public int Right; public int Bottom; }
+public struct RfoMonitorInfo { public int cbSize; public RfoRect rcMonitor; public RfoRect rcWork; public uint dwFlags; }
+public static class RfoNativeWindow {
+  [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RfoRect rect);
+  [DllImport("user32.dll")] public static extern IntPtr MonitorFromWindow(IntPtr hWnd, uint flags);
+  [DllImport("user32.dll")] public static extern bool GetMonitorInfo(IntPtr monitor, ref RfoMonitorInfo info);
+  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
+  [DllImport("user32.dll")] public static extern int GetWindowLong(IntPtr hWnd, int index);
+  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
+}
+'@
+$process = Get-Process -Id ([int]$env:RFO_GRAPHICAL_WINDOW_PID) -ErrorAction Stop
+$window = [IntPtr]$process.MainWindowHandle
+if ($window -eq [IntPtr]::Zero) {
+  [Console]::Out.Write((ConvertTo-Json -Compress -InputObject ([ordered]@{ ready = $false; pid = $process.Id })))
+  exit 0
+}
+$rect = New-Object RfoRect
+if (-not [RfoNativeWindow]::GetWindowRect($window, [ref]$rect)) { throw 'GetWindowRect failed' }
+$monitorHandle = [RfoNativeWindow]::MonitorFromWindow($window, 2)
+$monitor = New-Object RfoMonitorInfo
+$monitor.cbSize = [Runtime.InteropServices.Marshal]::SizeOf([type][RfoMonitorInfo])
+if (-not [RfoNativeWindow]::GetMonitorInfo($monitorHandle, [ref]$monitor)) { throw 'GetMonitorInfo failed' }
+$foregroundPid = [uint32]0
+[void][RfoNativeWindow]::GetWindowThreadProcessId([RfoNativeWindow]::GetForegroundWindow(), [ref]$foregroundPid)
+$styleBytes = [BitConverter]::GetBytes([int][RfoNativeWindow]::GetWindowLong($window, -16))
+$style = [BitConverter]::ToUInt32($styleBytes, 0)
+$covers = [Math]::Abs($rect.Left - $monitor.rcMonitor.Left) -le 2 -and [Math]::Abs($rect.Top - $monitor.rcMonitor.Top) -le 2 -and [Math]::Abs($rect.Right - $monitor.rcMonitor.Right) -le 2 -and [Math]::Abs($rect.Bottom - $monitor.rcMonitor.Bottom) -le 2
+$value = [ordered]@{
+  ready = $true
+  pid = $process.Id
+  handle = $window.ToInt64()
+  foregroundPid = [int]$foregroundPid
+  isForeground = ([int]$foregroundPid -eq $process.Id)
+  visible = [RfoNativeWindow]::IsWindowVisible($window)
+  coversMonitor = $covers
+  hasCaption = (($style -band 0x00C00000) -ne 0)
+  hasThickFrame = (($style -band 0x00040000) -ne 0)
+  popupStyle = (([uint64]$style -band [uint64]2147483648) -ne 0)
+  rectangle = [ordered]@{ left = $rect.Left; top = $rect.Top; right = $rect.Right; bottom = $rect.Bottom }
+  monitor = [ordered]@{ left = $monitor.rcMonitor.Left; top = $monitor.rcMonitor.Top; right = $monitor.rcMonitor.Right; bottom = $monitor.rcMonitor.Bottom }
+}
+[Console]::Out.Write((ConvertTo-Json -Compress -InputObject $value))
+`;
+  const result = spawnSync(
+    "powershell.exe",
+    ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command],
+    {
+      encoding: "utf8",
+      windowsHide: true,
+      timeout: 15_000,
+      maxBuffer: 256 * 1024,
+      env: { ...process.env, RFO_GRAPHICAL_WINDOW_PID: String(pid) },
+    }
+  );
+  if (result.error || result.status !== 0) {
+    throw new Error(`Graphical runtime window inspection failed: ${result.stderr || result.error?.message || "unknown error"}`);
+  }
+  return JSON.parse(result.stdout) as GraphicalRuntimeWindowEvidence;
+}
+
+async function waitForGraphicalRuntimeWindow(
+  pid: number,
+  deadline: number
+): Promise<GraphicalRuntimeWindowEvidence & { readonly observedForegroundDuringReadiness: boolean }> {
+  let latest: GraphicalRuntimeWindowEvidence | null = null;
+  let observedForegroundDuringReadiness = false;
+  while (Date.now() < deadline) {
+    latest = inspectGraphicalRuntimeWindow(pid);
+    if (latest.ready && latest.visible) {
+      observedForegroundDuringReadiness ||= latest.isForeground;
+      if (latest.coversMonitor) return { ...latest, observedForegroundDuringReadiness };
+    }
+    await delay(500);
+  }
+  throw new Error(`Graphical runtime window did not become fullscreen: ${JSON.stringify(latest)}`);
+}
 
 export interface RuntimeObserverMarkerExpectation {
   color: [number, number, number];
@@ -815,6 +917,20 @@ export async function runRuntimeObserverAcceptance(
     summary.runtimeStart = startedRuntime;
     summary.ownedRuntimePid = startedRuntime.pid;
     summary.runtimeStatus = runningRuntime;
+    const windowEvidence = await waitForGraphicalRuntimeWindow(
+      startedRuntime.pid,
+      Math.min(deadline, Date.now() + 60_000)
+    );
+    summary.graphicalWindow = windowEvidence;
+    if (windowEvidence.observedForegroundDuringReadiness || windowEvidence.isForeground) {
+      throw new Error("Managed graphical runtime stole foreground focus during window readiness");
+    }
+    if (windowEvidence.hasCaption || windowEvidence.hasThickFrame || !windowEvidence.popupStyle) {
+      throw new Error(`Managed graphical runtime is not borderless fullscreen: ${JSON.stringify(windowEvidence)}`);
+    }
+    process.stdout.write(
+      `[live-runtime-observer-acceptance] borderless background window passed: ${JSON.stringify(windowEvidence)}\n`
+    );
     const runtimeLifecycle = await runtimeManager.lifecycleIdentity(startedRuntime.runtimeId);
     const fixtureContentIdentity = baselineFixtureContent?.sha256 ?? operationalBaselineProcedureSha256({ fixture: "no-generated-addon" });
     const generatedProjectIdentity = operationalBaselineProcedureSha256({

@@ -2,7 +2,9 @@ import { randomBytes } from "node:crypto";
 import { existsSync, lstatSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { sha256Hex } from "#foundation/digest";
+import type { CanonicalImageOutputPolicy } from "#foundation/image-output";
 import { LmdbRecordStore } from "#foundation/lmdb-record-store";
+import { imageOutputPolicySchema } from "../protocol/index.js";
 import type { ArtifactStore, ManagedArtifactRef } from "./artifacts.js";
 import {
   DisabledEvidenceBundleService,
@@ -47,6 +49,7 @@ export interface ReserveRunCaptureInput {
   requestedView: Record<string, unknown>;
   settleFrames?: number;
   performancePolicy: "evidence" | "instrumented";
+  image?: CanonicalImageOutputPolicy;
   timeoutMs?: number;
   asynchronous?: boolean;
 }
@@ -142,6 +145,7 @@ function publicCapture(capture: RunCaptureRecord, missingArtifact: boolean): Rec
     missingArtifact,
     terminalErrorCode: capture.terminalErrorCode ?? null,
     terminalMessage: capture.terminalMessage ?? null,
+    requestedImage: capture.requestedImage ?? { format: "png" },
     updatedAt: capture.updatedAt,
   };
 }
@@ -208,6 +212,7 @@ export class ObserverRunStore {
     if (input.expectedWorldId !== undefined && input.expectedWorldId !== null) boundedText(input.expectedWorldId, "Expected world ID", 512);
     if (input.expectedWorldEpoch !== undefined && (!Number.isSafeInteger(input.expectedWorldEpoch) || input.expectedWorldEpoch < 0)) throw new ObserverError("INVALID_REQUEST", "Expected world epoch must be a non-negative integer");
     if (input.jobId !== undefined) assertIdentifier(input.jobId, "Job ID");
+    const requestedImage = imageOutputPolicySchema.parse(input.image ?? { format: "png" });
     const semantic = {
       captureLabel: label,
       purpose: boundedText(input.purpose, "Capture purpose", 512, false),
@@ -219,6 +224,7 @@ export class ObserverRunStore {
       requestedView: input.requestedView,
       settleFrames: input.settleFrames ?? 0,
       performancePolicy: input.performancePolicy,
+      requestedImage,
       timeoutMs: input.timeoutMs ?? null,
       asynchronous: input.asynchronous === true,
     };
@@ -246,6 +252,7 @@ export class ObserverRunStore {
       requestedView: input.requestedView,
       settleFrames: input.settleFrames ?? 0,
       performancePolicy: input.performancePolicy,
+      requestedImage,
       ...(input.timeoutMs !== undefined ? { timeoutMs: input.timeoutMs } : {}),
       asynchronous: input.asynchronous === true,
       state: "reserved",

@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
 import {
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readdirSync,
   readFileSync,
   rmSync,
+  writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, relative, resolve } from "node:path";
@@ -28,6 +30,9 @@ export const LIVE_WORKBENCH_EXPLICIT_SAVE_ENVIRONMENT =
   "RFO_RUN_LIVE_WORKBENCH_EXPLICIT_SAVE_ACCEPTANCE";
 
 const BASE_PROBE_PREFAB = "{1391CE8C0E255636}Prefabs/Systems/MilitaryBase/ConflictMilitaryBase.et";
+const BASE_GAME_MODE_PREFAB = "{0F307326459A1395}Prefabs/MP/Modes/GameMode_Base.et";
+const LIVE_COMPONENT_CLASS = "RFO_LivePersistenceProbeComponent";
+const LIVE_COMPONENT_ENTITY = "RFO_ComponentPersistenceRoot";
 
 interface ParsedArguments {
   readonly configPath?: string;
@@ -258,6 +263,194 @@ async function runHappySaveCase(
   });
 }
 
+async function runPrefabIntegrityCase(
+  configPath: string,
+  baseConfig: ReturnType<typeof loadAcceptanceBaseConfig>
+): Promise<void> {
+  let explicitSaveDispatches = 0;
+  await runLiveExplicitSaveCase({
+    label: "prefab-integrity",
+    configPath,
+    baseConfig,
+    makeDependencies: () => {
+      const delegate = new WorkbenchNetApiClient(baseConfig.workbenchHost, baseConfig.workbenchPort, {
+        clientId: "live-prefab-integrity",
+      });
+      return {
+        netApi: {
+          async call<T = Record<string, unknown>>(
+            apiFunc: string,
+            params?: Record<string, unknown>,
+            requestOptions?: Parameters<WorkbenchNetApiClient["call"]>[2]
+          ): Promise<T> {
+            if (apiFunc === "EMCP_WB_ExplicitResourceSave" && params?.action === "save") {
+              explicitSaveDispatches += 1;
+            }
+            return delegate.call<T>(apiFunc, params, requestOptions);
+          },
+        },
+      };
+    },
+  }, async (context) => {
+    const { client, guard, project } = context;
+    const prefabsDirectory = join(project.modDirectory, "Prefabs");
+    const scriptsDirectory = join(project.modDirectory, "Scripts", "Game");
+    mkdirSync(prefabsDirectory, { recursive: true });
+    mkdirSync(scriptsDirectory, { recursive: true });
+    writeFileSync(join(scriptsDirectory, "RFO_LivePersistenceProbeComponent.c"), [
+      '[ComponentEditorProps(category: "GameScripted/ReforgerForge", description: "Live persistence probe")]',
+      "class RFO_LivePersistenceProbeComponentClass : ScriptComponentClass",
+      "{",
+      "}",
+      "",
+      "class RFO_LivePersistenceProbeComponent : ScriptComponent",
+      "{",
+      ' [Attribute("0")] int m_iProbeValue;',
+      "}",
+      "",
+    ].join("\n"), "utf8");
+
+    const componentPrefab = join(prefabsDirectory, "ComponentPersistence.et");
+    const lossyPrefab = join(prefabsDirectory, "EmptyOverride.et");
+    writeFileSync(componentPrefab, [
+      "GenericEntity {",
+      ' ID "A11CE00000000201"',
+      ` Name "${LIVE_COMPONENT_ENTITY}"`,
+      "}",
+      "",
+    ].join("\n"), "utf8");
+    writeFileSync(lossyPrefab, [
+      `SCR_BaseGameMode : "${BASE_GAME_MODE_PREFAB}" {`,
+      ' ID "A11CE00000000202"',
+      ' Name "RFO_EmptyOverrideRoot"',
+      " components {",
+      '  SCR_DataCollectorComponent "{5ADE83EE64329989}" {',
+      "   m_aModules {",
+      "   }",
+      "  }",
+      " }",
+      "}",
+      "",
+    ].join("\n"), "utf8");
+
+    const generic = await client.ensureRunning(project.projectPath);
+    assert.equal(generic.action, "launched");
+    const state = await client.call<Record<string, unknown>>(
+      "EMCP_WB_GetState",
+      {},
+      { timeout: 30_000, skipAutoLaunch: true }
+    );
+    assert.equal(state.mode, "no_world_editor");
+    for (const path of [componentPrefab, lossyPrefab]) {
+      const registered: Record<string, unknown> = await client.call<Record<string, unknown>>(
+        "EMCP_WB_Resources",
+        { action: "register", path, buildRuntime: false },
+        { timeout: 120_000, skipAutoLaunch: true }
+      );
+      assert.equal(registered.status, "ok", `prefab registration failed: ${String(registered.message)}`);
+      assert.equal(existsSync(`${path}.meta`), true);
+    }
+    await client.shutdownOwnedWorkbench();
+    assert.deepEqual(await guard.listWorkbenchProcesses(), []);
+
+    const prefabEntityIndex = async (): Promise<number> => {
+      const listed = await client.call<Record<string, unknown>>("EMCP_WB_ListEntities", {
+        offset: 0,
+        limit: 10,
+        nameFilter: "",
+      });
+      assert.equal(listed.status, "ok", `entity listing failed: ${String(listed.message)}`);
+      const entities = Array.isArray(listed.entities)
+        ? listed.entities.filter((item): item is Record<string, unknown> =>
+          Boolean(item && typeof item === "object" && !Array.isArray(item)))
+        : [];
+      assert.equal(entities[1]?.className, "GenericEntity", `prefab edit root was not editor entity #1: ${JSON.stringify(entities)}`);
+      return 1;
+    };
+    const componentClasses = async (entityIndex: number): Promise<string[]> => {
+      const listed = await client.call<Record<string, unknown>>("EMCP_WB_Components", {
+        action: "list",
+        entityIndex,
+      });
+      assert.equal(listed.status, "ok", `component listing failed: ${String(listed.message)}`);
+      return Array.isArray(listed.components)
+        ? listed.components.flatMap((item) =>
+          item && typeof item === "object" && !Array.isArray(item) &&
+          typeof (item as Record<string, unknown>).className === "string"
+            ? [(item as Record<string, unknown>).className as string]
+            : [])
+        : [];
+    };
+
+    await client.ensureTargetResourceRunning(project.projectPath, componentPrefab);
+    const rootIndex = await prefabEntityIndex();
+    assert.equal((await componentClasses(rootIndex)).includes(LIVE_COMPONENT_CLASS), false);
+    const added = await client.call<Record<string, unknown>>("EMCP_WB_Components", {
+      action: "add",
+      entityIndex: rootIndex,
+      componentClass: LIVE_COMPONENT_CLASS,
+    });
+    assert.equal(added.status, "ok", `component addition failed: ${String(added.message)}`);
+    assert.equal((await componentClasses(rootIndex)).includes(LIVE_COMPONENT_CLASS), true);
+    const modified = await client.call<Record<string, unknown>>("EMCP_WB_ModifyEntity", {
+      action: "setProperty",
+      entityIndex: rootIndex,
+      propertyPath: LIVE_COMPONENT_CLASS,
+      propertyKey: "m_iProbeValue",
+      value: "42",
+    });
+    assert.equal(modified.status, "ok", `component property mutation failed: ${String(modified.message)}`);
+    const readBack = await client.call<Record<string, unknown>>("EMCP_WB_ModifyEntity", {
+      action: "getProperty",
+      entityIndex: rootIndex,
+      propertyPath: LIVE_COMPONENT_CLASS,
+      propertyKey: "m_iProbeValue",
+    });
+    assert.equal(readBack.status, "ok", `component property lookup failed: ${String(readBack.message)}`);
+    assert.equal(String(readBack.message), "42");
+
+    const componentSave = await client.saveResource(componentPrefab);
+    assert.equal(componentSave.outcome, "changed");
+    assert.equal(explicitSaveDispatches, 1);
+    const serialized = readFileSync(componentPrefab, "utf8");
+    assert.match(serialized, new RegExp(`\\b${LIVE_COMPONENT_CLASS}\\b`));
+    assert.match(serialized, /\bm_iProbeValue\s+42\b/);
+    await client.shutdownOwnedWorkbench();
+    assert.deepEqual(await guard.listWorkbenchProcesses(), []);
+
+    await client.ensureTargetResourceRunning(project.projectPath, componentPrefab);
+    const reopenedIndex = await prefabEntityIndex();
+    assert.equal((await componentClasses(reopenedIndex)).includes(LIVE_COMPONENT_CLASS), true);
+    const reopenedValue = await client.call<Record<string, unknown>>("EMCP_WB_ModifyEntity", {
+      action: "getProperty",
+      entityIndex: reopenedIndex,
+      propertyPath: LIVE_COMPONENT_CLASS,
+      propertyKey: "m_iProbeValue",
+    });
+    assert.equal(reopenedValue.status, "ok");
+    assert.equal(String(reopenedValue.message), "42");
+    await client.shutdownOwnedWorkbench();
+    assert.deepEqual(await guard.listWorkbenchProcesses(), []);
+    process.stdout.write("[live-explicit-save-acceptance] prefab component persisted across native save and fresh reopen\n");
+
+    const lossyBefore = readFileSync(lossyPrefab);
+    await client.ensureTargetResourceRunning(project.projectPath, lossyPrefab);
+    await assert.rejects(client.saveResource(lossyPrefab), (error: unknown) =>
+      error instanceof WorkbenchError && error.code === "TARGET_SESSION_TAINTED" &&
+      error.message.includes("empty override")
+    );
+    assert.equal(explicitSaveDispatches, 1, "lossy-save refusal dispatched the native serializer");
+    assert.deepEqual(readFileSync(lossyPrefab), lossyBefore);
+    await assert.rejects(client.saveResource(lossyPrefab), (error: unknown) =>
+      error instanceof WorkbenchError && error.code === "TARGET_SESSION_TAINTED"
+    );
+    assert.equal(explicitSaveDispatches, 1);
+    await client.shutdownOwnedWorkbench();
+    assert.deepEqual(await guard.listWorkbenchProcesses(), []);
+    process.stdout.write("[live-explicit-save-acceptance] inherited empty override refused before native save with bytes preserved\n");
+  });
+}
+
 async function runForcedNativeModalCase(
   configPath: string,
   baseConfig: ReturnType<typeof loadAcceptanceBaseConfig>,
@@ -374,6 +567,7 @@ export async function runWorkbenchExplicitSaveAcceptance(options: {
   assertAuthorized(options.confirmed, options.environment ?? process.env);
   const baseConfig = loadAcceptanceBaseConfig(options.configPath);
   await runHappySaveCase(options.configPath, baseConfig, "happy-before-modal");
+  await runPrefabIntegrityCase(options.configPath, baseConfig);
   const modalRuns = options.modalRuns ?? 1;
   for (let run = 1; run <= modalRuns; run += 1) {
     await runForcedNativeModalCase(options.configPath, baseConfig, run);

@@ -5,7 +5,7 @@ deferred improvements that are not currently a broken supported behavior.
 Append new findings at the bottom; move resolved or verified records to
 [MCP_ISSUES_RESOLVED.md](MCP_ISSUES_RESOLVED.md).
 
-### MCP-002 — a running stdio MCP does not reload a repaired local build
+### MCP-002 â€” a running stdio MCP does not reload a repaired local build
 
 **Status:** Open
 
@@ -23,25 +23,7 @@ affects the active stdio process.
 removing the exact stale generated `UserMaps.desc` from the external managed
 helper cache allowed Workbench to launch before the restart.
 
-### MCP-003 — evidence runs cannot span a Workbench lifecycle restart
-
-**Status:** Open
-
-**Severity:** Non-breaking, fail-closed workflow limitation
-
-**Observed:** 2026-07-28
-
-An evidence run containing captures from before a Workbench restart accepted
-later captures but refused finalization with `STALE_LIFECYCLE`. Once stale,
-`discard` also refused the run, leaving a fail-closed record for retention.
-
-**Impact:** A mixed-lifecycle run cannot become durable evidence, and the
-incompatibility is surfaced only at finalization.
-
-**Workaround:** Begin a fresh run after the restart, recapture and review the
-selected images, and finalize only the stable-lifecycle bundle.
-
-### MCP-004 — material validation cannot resolve inherited stock dependencies
+### MCP-004 â€” material validation cannot resolve inherited stock dependencies
 
 **Status:** Open
 
@@ -60,7 +42,7 @@ missing base-game dependency metadata in the current project context.
 verify the property assignment and explicit save in Workbench, and retain a
 visual Workbench review as the presentation check.
 
-### MCP-007 — guarded TestContent build can terminate in a Workbench access violation
+### MCP-007 â€” guarded TestContent build can terminate in a Workbench access violation
 
 **Status:** Open
 
@@ -86,7 +68,7 @@ guarded build is stable.
 
 ## Deferred API-reference improvements
 
-### MCP-027 — public MCP metadata is incomplete
+### MCP-027 â€” public MCP metadata is incomplete
 
 **Status:** Deferred
 
@@ -100,7 +82,7 @@ limits discoverability and machine validation.
 **Next step:** Apply the incremental metadata work in the
 [MCP API contract follow-up plan](../../docs/plans/2026-07-28-mcp-api-contract-follow-up.md).
 
-### MCP-028 — runtime API reference and drift gate are not generated
+### MCP-028 â€” runtime API reference and drift gate are not generated
 
 **Status:** Deferred
 
@@ -114,7 +96,7 @@ or a release check that detects their drift.
 and verify them in CI as described in the
 [MCP API contract follow-up plan](../../docs/plans/2026-07-28-mcp-api-contract-follow-up.md).
 
-### MCP-031 — review the implemented `game_duplicate` contract
+### MCP-031 â€” review the implemented `game_duplicate` contract
 
 **Status:** Decision required
 

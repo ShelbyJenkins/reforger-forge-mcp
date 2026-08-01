@@ -4,6 +4,14 @@ import { resolve } from "node:path";
 import { inflateSync } from "node:zlib";
 import { z } from "zod";
 import {
+  ImageOutputError,
+  transformImage,
+  type CanonicalImageOutputPolicy,
+  type ImageOutputFormat,
+  type ImageOutputMimeType,
+  type TransformedImage,
+} from "../foundation/image-output.js";
+import {
   WORKBENCH_ADAPTER_CAPABILITIES,
   WORKBENCH_ADAPTER_ERROR_CODES,
   WORKBENCH_ADAPTER_PROTOCOL,
@@ -57,11 +65,26 @@ const viewSchema = z.union([
     path: ["target"],
   }),
 ]);
+const imagePolicySchema = z.object({
+  format: z.enum(["png", "jpeg", "webp"]),
+  maxWidth: z.number().int().min(1).max(16_384).optional(),
+  maxHeight: z.number().int().min(1).max(16_384).optional(),
+  quality: z.number().int().min(1).max(100).optional(),
+}).strict().superRefine((value, context) => {
+  if (value.format === "png" && value.quality !== undefined) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ["quality"], message: "quality is valid only for jpeg or webp output" });
+  }
+  if (value.maxWidth !== undefined && value.maxHeight !== undefined &&
+      value.maxWidth * value.maxHeight > DEFAULT_MAX_PIXELS) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ["maxHeight"], message: "requested image dimensions exceed the reviewed pixel bound" });
+  }
+});
 
 const submitSchema = z.object({
   jobId: z.string().regex(/^[A-Za-z0-9_-]{1,96}$/).optional(),
   view: viewSchema,
   settlePolls: z.number().int().min(0).max(120).default(3),
+  image: imagePolicySchema.default({ format: "png" }),
 }).strict();
 
 const pingResponseSchema = z.object({
@@ -100,6 +123,12 @@ const jobResponseSchema = z.object({
   settledPolls: z.number().int().min(0).default(0),
   artifactBytes: z.number().int().min(0).default(0),
   ownerCameraId: z.number().int().default(0),
+  requestedMaxWidth: z.number().int().min(0).max(16_384).default(0),
+  requestedMaxHeight: z.number().int().min(0).max(16_384).default(0),
+  sourceWidth: z.number().int().min(0).max(16_384).default(0),
+  sourceHeight: z.number().int().min(0).max(16_384).default(0),
+  outputWidth: z.number().int().min(0).max(16_384).default(0),
+  outputHeight: z.number().int().min(0).max(16_384).default(0),
   actualFov: finite.default(0),
   nearPlane: finite.default(0),
   farPlane: finite.default(0),
@@ -122,16 +151,22 @@ export interface WorkbenchObserverSubmitInput {
   jobId?: string;
   view: WorkbenchObserverView;
   settlePolls?: number;
+  image?: CanonicalImageOutputPolicy;
 }
 
 export interface WorkbenchObserverArtifact {
-  format: "png";
+  format: ImageOutputFormat;
+  mimeType: ImageOutputMimeType;
   path: string;
   logicalPath: string;
   bytes: number;
   pngBytes: number;
   width: number;
   height: number;
+  sourceWidth: number;
+  sourceHeight: number;
+  viewportWidth: number;
+  viewportHeight: number;
   sha256: string;
   pngSha256: string;
   completedAt: string;
@@ -197,6 +232,7 @@ export interface WorkbenchObserverRecoverInput {
   jobId: string;
   /** Durable lifecycle/target binding recorded when the run capture was submitted. */
   expectedInstanceId?: string;
+  image?: CanonicalImageOutputPolicy;
 }
 
 export interface WorkbenchObserverClient {
@@ -229,6 +265,7 @@ interface AdapterJobRecord {
   readonly snapshot: WorkbenchObserverSnapshot;
   readonly activityLease: WorkbenchCaptureActivityLease;
   readonly viewKind: "current" | "pose" | "lookAt";
+  readonly image: CanonicalImageOutputPolicy;
   handlerLeaseId: string | null;
   lastStatus: WorkbenchObserverJobStatus | null;
   gateReleased: boolean;
@@ -412,6 +449,9 @@ export class WorkbenchObserverAdapter {
     if (!parsed.success) {
       throw new WorkbenchObserverAdapterError(WORKBENCH_ADAPTER_ERROR_CODES.INVALID_REQUEST, parsed.error.issues.map((issue) => issue.message).join("; "));
     }
+    const image = parsed.data.image.format === "png" || parsed.data.image.quality !== undefined
+      ? parsed.data.image
+      : { ...parsed.data.image, quality: 75 };
     const snapshot = await this.client.getRunningObserverSnapshot();
     const ping = await this.pingSnapshot();
     if (!ping.captureCurrent) {
@@ -450,6 +490,7 @@ export class WorkbenchObserverAdapter {
       snapshot,
       activityLease,
       viewKind: parsed.data.view.kind,
+      image,
       handlerLeaseId,
       lastStatus: null,
       gateReleased: false,
@@ -478,6 +519,8 @@ export class WorkbenchObserverAdapter {
         matrix3: vectorToString(matrix[3]),
         fovText: decimalWireValue(parsed.data.view.kind === "current" ? 0 : parsed.data.view.fov),
         settlePolls: parsed.data.settlePolls,
+        maxWidth: image.maxWidth ?? 0,
+        maxHeight: image.maxHeight ?? 0,
       };
       let response: z.infer<typeof jobResponseSchema>;
       try {
@@ -511,7 +554,7 @@ export class WorkbenchObserverAdapter {
       if (response.leaseId !== handlerLeaseId) {
         throw new WorkbenchObserverAdapterError(WORKBENCH_ADAPTER_ERROR_CODES.STALE_LIFECYCLE, "Workbench observer submit acknowledged a different handler lease");
       }
-      record.lastStatus = this.publicStatus(record, response);
+      record.lastStatus = await this.publicStatus(record, response);
       deliveryUncertain = false;
       return record.lastStatus;
     } catch (error) {
@@ -547,13 +590,13 @@ export class WorkbenchObserverAdapter {
     this.assertResponseBinding(response, record);
     let status: WorkbenchObserverJobStatus;
     try {
-      status = this.publicStatus(record, response);
+      status = await this.publicStatus(record, response);
     } catch (error) {
       // Artifact validation is downstream of handler-proven camera restoration.
       // Preserve the terminal status and release the lifecycle activity gate
       // even when the generated image is corrupt or otherwise unacceptable.
       if (TERMINAL_STATES.has(response.state) && !response.cameraLeaseHeld && response.restorationConfirmed) {
-        record.lastStatus = this.publicStatus(record, response, false);
+        record.lastStatus = await this.publicStatus(record, response, false);
         this.releaseGate(record);
       }
       throw error;
@@ -615,6 +658,7 @@ export class WorkbenchObserverAdapter {
       // Status responses always carry the retained view kind. Current is only
       // a non-mutating provisional value used if a broken handler omits it.
       viewKind: "current",
+      image: input.image ?? { format: "png" },
       handlerLeaseId,
       lastStatus: null,
       gateReleased: false,
@@ -693,12 +737,25 @@ export class WorkbenchObserverAdapter {
     return {
       image: Buffer.from(image),
       metadata: {
+        format: status.artifact.format,
+        mimeType: status.artifact.mimeType,
         width: status.artifact.width,
         height: status.artifact.height,
         contentSha256: status.artifact.pngSha256,
         sourceContentSha256: status.artifact.sha256,
         bytes: status.artifact.pngBytes,
         sourceBytes: status.artifact.bytes,
+        sourceWidth: status.artifact.sourceWidth,
+        sourceHeight: status.artifact.sourceHeight,
+        viewportWidth: status.artifact.viewportWidth,
+        viewportHeight: status.artifact.viewportHeight,
+        requestedImage: record.image,
+        imageQuality: record.image.quality ?? null,
+        resized: status.artifact.width !== status.artifact.viewportWidth ||
+          status.artifact.height !== status.artifact.viewportHeight,
+        producerResized: status.artifact.sourceWidth !== status.artifact.viewportWidth ||
+          status.artifact.sourceHeight !== status.artifact.viewportHeight,
+        transcoded: status.artifact.format !== "png",
         completedAt: status.artifact.completedAt,
         actualCamera: status.actualCamera,
         actualFov: status.actualFov,
@@ -813,13 +870,38 @@ export class WorkbenchObserverAdapter {
         !samePath(response.canonicalTarget, record.snapshot.target.path) || !response.projectFile) {
       throw new WorkbenchObserverAdapterError(WORKBENCH_ADAPTER_ERROR_CODES.STALE_LIFECYCLE, "Workbench observer response is bound to a different job, lifecycle generation, or canonical target");
     }
+    const requestedMaxWidth = record.image.maxWidth ?? 0;
+    const requestedMaxHeight = record.image.maxHeight ?? 0;
+    if (response.requestedMaxWidth !== requestedMaxWidth || response.requestedMaxHeight !== requestedMaxHeight) {
+      throw new WorkbenchObserverAdapterError(WORKBENCH_ADAPTER_ERROR_CODES.STALE_LIFECYCLE, "Workbench observer response is bound to a different image resolution policy");
+    }
+    const dimensions = [response.sourceWidth, response.sourceHeight, response.outputWidth, response.outputHeight];
+    const hasDimensions = dimensions.some((value) => value !== 0);
+    if (hasDimensions) {
+      const [sourceWidth, sourceHeight, outputWidth, outputHeight] = dimensions;
+      let expectedWidth = sourceWidth;
+      let expectedHeight = sourceHeight;
+      if (requestedMaxWidth > 0 && expectedWidth > requestedMaxWidth) {
+        expectedHeight = Math.max(1, Math.floor(expectedHeight * requestedMaxWidth / expectedWidth));
+        expectedWidth = requestedMaxWidth;
+      }
+      if (requestedMaxHeight > 0 && expectedHeight > requestedMaxHeight) {
+        expectedWidth = Math.max(1, Math.floor(expectedWidth * requestedMaxHeight / expectedHeight));
+        expectedHeight = requestedMaxHeight;
+      }
+      if (dimensions.some((value) => value < 1) ||
+          sourceWidth * sourceHeight > this.maxPixels ||
+          outputWidth !== expectedWidth || outputHeight !== expectedHeight) {
+        throw new WorkbenchObserverAdapterError(WORKBENCH_ADAPTER_ERROR_CODES.STALE_LIFECYCLE, "Workbench observer response contains dimensions that do not match the bound image policy");
+      }
+    }
   }
 
-  private publicStatus(
+  private async publicStatus(
     record: AdapterJobRecord,
     response: z.infer<typeof jobResponseSchema>,
     validateArtifact = true
-  ): WorkbenchObserverJobStatus {
+  ): Promise<WorkbenchObserverJobStatus> {
     const result: WorkbenchObserverJobStatus = {
       jobId: record.jobId,
       instanceId: record.instanceId,
@@ -849,7 +931,7 @@ export class WorkbenchObserverAdapter {
       },
     };
     if (response.state === WORKBENCH_ADAPTER_STATE_VALUES.COMPLETED && validateArtifact) {
-      result.artifact = this.validateArtifact(record, response);
+      result.artifact = await this.validateArtifact(record, response);
     }
     if (response.terminalErrorCode === WORKBENCH_ADAPTER_ERROR_CODES.RESTORATION_UNCONFIRMED) {
       result.terminalErrorCode = WORKBENCH_ADAPTER_ERROR_CODES.RESTORATION_UNCONFIRMED;
@@ -875,25 +957,64 @@ export class WorkbenchObserverAdapter {
     return { canonical: inspection.canonicalPath, info: inspection.info };
   }
 
-  private validateArtifact(
+  private async validateArtifact(
     record: AdapterJobRecord,
     response: z.infer<typeof jobResponseSchema>
-  ): WorkbenchObserverArtifact {
+  ): Promise<WorkbenchObserverArtifact> {
     const { canonical, info } = this.inspectArtifactEnvelope(record, response);
     const bytes = readFileSync(canonical);
     const dimensions = this.validatePng(bytes);
-    this.completedImages.set(record.jobId, bytes);
+    if (response.outputWidth < 1 || response.outputHeight < 1 ||
+        dimensions.width !== response.outputWidth || dimensions.height !== response.outputHeight) {
+      throw new WorkbenchObserverAdapterError(
+        WORKBENCH_ADAPTER_ERROR_CODES.ARTIFACT_INVALID,
+        "Workbench PNG dimensions do not match the producer-side capture dimensions",
+      );
+    }
     const digest = createHash("sha256").update(bytes).digest("hex");
+    let transformed: TransformedImage;
+    try {
+      transformed = await transformImage(bytes, {
+        format: "png",
+        width: dimensions.width,
+        height: dimensions.height,
+        bytes: bytes.length,
+        sha256: digest,
+      }, record.image, {
+        maxSourceBytes: this.maxArtifactBytes,
+        maxRetainedBytes: this.maxArtifactBytes,
+        maxWidth: 16_384,
+        maxHeight: 16_384,
+        maxPixels: this.maxPixels,
+      });
+    } catch (error) {
+      if (error instanceof ImageOutputError) {
+        throw new WorkbenchObserverAdapterError(
+          error.code === "ARTIFACT_TOO_LARGE"
+            ? WORKBENCH_ADAPTER_ERROR_CODES.ARTIFACT_TOO_LARGE
+            : WORKBENCH_ADAPTER_ERROR_CODES.ARTIFACT_INVALID,
+          error.message,
+        );
+      }
+      throw error;
+    }
+    this.completedImages.set(record.jobId, transformed.image);
+    const outputDigest = createHash("sha256").update(transformed.image).digest("hex");
     return {
-      format: "png",
+      format: transformed.format,
+      mimeType: transformed.mimeType,
       path: canonical,
       logicalPath: response.artifactLogicalPath,
       bytes: bytes.length,
-      pngBytes: bytes.length,
-      width: dimensions.width,
-      height: dimensions.height,
+      pngBytes: transformed.bytes,
+      width: transformed.width,
+      height: transformed.height,
+      sourceWidth: dimensions.width,
+      sourceHeight: dimensions.height,
+      viewportWidth: response.sourceWidth,
+      viewportHeight: response.sourceHeight,
       sha256: digest,
-      pngSha256: digest,
+      pngSha256: outputDigest,
       completedAt: info.mtime.toISOString(),
     };
   }
@@ -1049,7 +1170,7 @@ export class WorkbenchObserverAdapter {
       const response = await this.handlerJobCall("EMCP_WB_ObserverCancel", this.boundRequest(record));
       if (response.status !== "ok") throw new WorkbenchObserverAdapterError(WORKBENCH_ADAPTER_ERROR_CODES.HANDLER_REJECTED, response.message);
       this.assertResponseBinding(response, record);
-      const status = this.publicStatus(record, response);
+      const status = await this.publicStatus(record, response);
       record.lastStatus = status;
       if (!status.cameraLeaseHeld && status.restorationConfirmed) this.releaseGate(record);
       if (!status.restorationConfirmed && status.terminalErrorCode === WORKBENCH_ADAPTER_ERROR_CODES.RESTORATION_UNCONFIRMED) {

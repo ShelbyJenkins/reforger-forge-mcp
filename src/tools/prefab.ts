@@ -14,6 +14,7 @@ import { recipeLoader } from "../templates/recipe-loader.js";
 import {
   walkChain,
   mergeAncestryComponents,
+  parseTopLevelComponents,
   type AncestorLevel,
 } from "../utils/prefab-ancestry.js";
 import {
@@ -215,12 +216,20 @@ export function registerPrefab(
 
           // Resolve ancestry if parentPrefab is given and includeAncestry is not disabled
           let ancestorComponents: ComponentDef[] | undefined;
+          let parentEntityType: string | undefined;
           let ancestryNote = "";
 
           if (parentPrefab && includeAncestry) {
             const { levels, warnings } = walkChain(parentPrefab, config, basePath ?? undefined);
             if (levels.length > 0) {
-              const merged = mergeAncestryComponents(levels);
+              // The generic inspector retains nested structures for its raw
+              // report. Creation may materialize only direct members of a
+              // `components` block; nested containers are not peer components.
+              const directLevels = levels.map((level) => ({
+                ...level,
+                components: parseTopLevelComponents(level.rawContent),
+              }));
+              const merged = mergeAncestryComponents(directLevels);
               ancestorComponents = Array.from(merged.values()).map(({ comp }) => ({
                 type: comp.typeName,
                 guid: comp.guid,
@@ -228,6 +237,7 @@ export function registerPrefab(
                 // override slots, not property copies. Fill values manually as needed.
                 properties: {},
               }));
+              parentEntityType = levels.at(-1)?.entityClass;
               ancestryNote = `\n\nAncestry resolved: ${levels.length} ancestor level(s), ${ancestorComponents.length} inherited component(s) pre-populated.`;
               if (warnings.length > 0) {
                 ancestryNote += `\nWarnings: ${warnings.join("; ")}`;
@@ -244,6 +254,7 @@ export function registerPrefab(
             name,
             prefabType: prefabType as PrefabType,
             variant: variant as string | undefined,
+            entityType: parentEntityType,
             parentPrefab,
             components: components as ComponentDef[] | undefined,
             description,

@@ -19,7 +19,12 @@ import {
 } from "./capture-contract.js";
 import { canonicalPublicObserverErrorCode } from "./public-contract.js";
 import { CaptureJobStore, type CaptureJobRecord } from "./capture-job-store.js";
-import { idempotencyScope, normalizeCaptureRequest } from "./capture-request.js";
+import {
+  DEFAULT_IMAGE_POLICY_LIMITS,
+  idempotencyScope,
+  normalizeCaptureRequest,
+  type ImagePolicyDefaults,
+} from "./capture-request.js";
 import {
   assertWorldRevision,
   isWorldRevision,
@@ -37,6 +42,7 @@ export interface CaptureServiceOptions {
   defaultTimeoutMs?: number;
   pollIntervalMs?: number;
   maxInlineImageBytes?: number;
+  imagePolicyDefaults?: Partial<ImagePolicyDefaults>;
   clock?: () => number;
   sleep?: (milliseconds: number, signal?: AbortSignal) => Promise<void>;
   createJobId?: () => string;
@@ -134,6 +140,7 @@ export class CaptureService {
   readonly store: CaptureJobStore;
   readonly defaultTimeoutMs: number;
   readonly maxInlineImageBytes: number;
+  readonly imagePolicyDefaults: ImagePolicyDefaults;
   private readonly backends = new Map<CaptureBackendKind, CaptureBackend>();
   private readonly runPort?: CaptureRunPort;
   private readonly pollIntervalMs: number;
@@ -150,6 +157,19 @@ export class CaptureService {
     this.store = options.store ?? new CaptureJobStore({ clock: options.clock });
     this.defaultTimeoutMs = boundedTimeout(options.defaultTimeoutMs, 30_000);
     this.maxInlineImageBytes = options.maxInlineImageBytes ?? 8 * 1024 * 1024;
+    this.imagePolicyDefaults = {
+      ...DEFAULT_IMAGE_POLICY_LIMITS,
+      ...options.imagePolicyDefaults,
+    };
+    if (Object.values(this.imagePolicyDefaults).some((value) => !Number.isSafeInteger(value) || value < 1) ||
+        this.imagePolicyDefaults.maximumWidth > DEFAULT_IMAGE_POLICY_LIMITS.maximumWidth ||
+        this.imagePolicyDefaults.maximumHeight > DEFAULT_IMAGE_POLICY_LIMITS.maximumHeight ||
+        this.imagePolicyDefaults.maximumPixels > DEFAULT_IMAGE_POLICY_LIMITS.maximumPixels ||
+        this.imagePolicyDefaults.maximumLossyQuality > 100 ||
+        this.imagePolicyDefaults.minimumLossyQuality > this.imagePolicyDefaults.lossyQuality ||
+        this.imagePolicyDefaults.lossyQuality > this.imagePolicyDefaults.maximumLossyQuality) {
+      throw new TypeError("Capture image quality defaults are inconsistent");
+    }
     this.pollIntervalMs = options.pollIntervalMs ?? 200;
     this.now = options.clock ?? Date.now;
     this.sleep = options.sleep ?? defaultSleep;
@@ -192,7 +212,7 @@ export class CaptureService {
 
   async capture(input: CaptureInput): Promise<CaptureResult> {
     if (this.sealed) throw new CaptureError("TRANSPORT_UNAVAILABLE", "Observer capture admission is closed");
-    const request = normalizeCaptureRequest(input, this.defaultTimeoutMs);
+    const request = normalizeCaptureRequest(input, this.defaultTimeoutMs, this.imagePolicyDefaults);
     const scope = idempotencyScope(input);
     const retained = this.store.get(scope);
     if (retained) {
@@ -411,6 +431,7 @@ export class CaptureService {
           view: { kind: "current" } as const,
           settleFrames: 0,
           performancePolicy: "evidence" as const,
+          image: { format: "png" as const },
           timeoutMs: this.defaultTimeoutMs,
           expectedWorldRevision: worldRevision,
           runId,

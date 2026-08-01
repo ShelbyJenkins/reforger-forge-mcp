@@ -48,6 +48,18 @@ describe("generatePrefab", () => {
     expect(node.inheritance).toBe("{AABB}Prefabs/Weapons/AK47.et");
   });
 
+  it("preserves a resolved parent's typed root entity class", () => {
+    const text = generatePrefab({
+      name: "TypedChild",
+      prefabType: "gamemode",
+      parentPrefab: "{AABB}Prefabs/MP/Modes/TeamDeathmatch/GameMode.et",
+      entityType: "SCR_BaseGameMode",
+    });
+    const node = parse(text);
+    expect(node.type).toBe("SCR_BaseGameMode");
+    expect(node.inheritance).toBe("{AABB}Prefabs/MP/Modes/TeamDeathmatch/GameMode.et");
+  });
+
   it("generates firearm prefab with variant", () => {
     const text = generatePrefab({
       name: "MyPistol",

@@ -36,6 +36,9 @@ export interface ObserverConfig {
   requestTimeoutMs: number;
   defaultCaptureTimeoutMs: number;
   maxInlineImageBytes: number;
+  defaultLossyImageQuality: number;
+  minimumLossyImageQuality: number;
+  maximumLossyImageQuality: number;
   retentionIntervalMs: number;
   retentionMaxAgeMs: number;
   retentionMaxBytes: number;
@@ -89,6 +92,9 @@ const OBSERVER_NUMERIC_BOUNDS: Record<
   requestTimeoutMs: [1_000, 300_000],
   defaultCaptureTimeoutMs: [1_000, 300_000],
   maxInlineImageBytes: [1_024, 64 * 1024 * 1024],
+  defaultLossyImageQuality: [1, 100],
+  minimumLossyImageQuality: [1, 100],
+  maximumLossyImageQuality: [1, 100],
   retentionIntervalMs: [1_000, 24 * 60 * 60 * 1_000],
   retentionMaxAgeMs: [1_000, 5 * 365 * 24 * 60 * 60 * 1_000],
   retentionMaxBytes: [1024 * 1024, 64 * 1024 * 1024 * 1024],
@@ -112,6 +118,9 @@ const observerFileSchema = z.object({
   requestTimeoutMs: boundedInteger("requestTimeoutMs").optional(),
   defaultCaptureTimeoutMs: boundedInteger("defaultCaptureTimeoutMs").optional(),
   maxInlineImageBytes: boundedInteger("maxInlineImageBytes").optional(),
+  defaultLossyImageQuality: boundedInteger("defaultLossyImageQuality").optional(),
+  minimumLossyImageQuality: boundedInteger("minimumLossyImageQuality").optional(),
+  maximumLossyImageQuality: boundedInteger("maximumLossyImageQuality").optional(),
   retentionIntervalMs: boundedInteger("retentionIntervalMs").optional(),
   retentionMaxAgeMs: boundedInteger("retentionMaxAgeMs").optional(),
   retentionMaxBytes: boundedInteger("retentionMaxBytes").optional(),
@@ -160,6 +169,9 @@ const INTERNAL_OBSERVER_DEFAULTS: ObserverConfig = {
   requestTimeoutMs: 30_000,
   defaultCaptureTimeoutMs: 30_000,
   maxInlineImageBytes: 8 * 1024 * 1024,
+  defaultLossyImageQuality: 75,
+  minimumLossyImageQuality: 1,
+  maximumLossyImageQuality: 100,
   retentionIntervalMs: 60_000,
   retentionMaxAgeMs: 7 * 24 * 60 * 60 * 1_000,
   retentionMaxBytes: 512 * 1024 * 1024,
@@ -183,6 +195,9 @@ const VALUE_FLAGS = new Set([
   "--observer-request-timeout-ms",
   "--observer-capture-timeout-ms",
   "--observer-max-inline-image-bytes",
+  "--observer-default-lossy-image-quality",
+  "--observer-minimum-lossy-image-quality",
+  "--observer-maximum-lossy-image-quality",
   "--observer-retention-interval-ms",
   "--observer-retention-max-age-ms",
   "--observer-retention-max-bytes",
@@ -234,6 +249,7 @@ export const CONFIGURATION_USAGE = [
   "  --observer-supporting-log-root <dir>    Replace supportingLogRoots; repeat for each root.",
   "  --no-observer-supporting-log-roots      Replace supportingLogRoots with an empty array.",
   "  --observer-*-ms / --observer-max-*      Override the documented observer limits.",
+  "  --observer-*-lossy-image-quality <1..100> Configure the default and allowed lossy quality range.",
   "  --debug / --no-debug                    Enable or disable diagnostic logging.",
 ].join("\n");
 
@@ -383,6 +399,15 @@ function parseConfigurationArguments(
         break;
       case "--observer-max-inline-image-bytes":
         setObserverNumber("maxInlineImageBytes", flag, raw!);
+        break;
+      case "--observer-default-lossy-image-quality":
+        setObserverNumber("defaultLossyImageQuality", flag, raw!);
+        break;
+      case "--observer-minimum-lossy-image-quality":
+        setObserverNumber("minimumLossyImageQuality", flag, raw!);
+        break;
+      case "--observer-maximum-lossy-image-quality":
+        setObserverNumber("maximumLossyImageQuality", flag, raw!);
         break;
       case "--observer-retention-interval-ms":
         setObserverNumber("retentionIntervalMs", flag, raw!);
@@ -677,6 +702,12 @@ function validateConfig(config: Config): Config {
     throw new ConfigurationError("observer.supportingLogRoots may contain at most 64 entries.");
   }
   if (config.observer) {
+    if (config.observer.minimumLossyImageQuality > config.observer.defaultLossyImageQuality ||
+        config.observer.defaultLossyImageQuality > config.observer.maximumLossyImageQuality) {
+      throw new ConfigurationError(
+        "observer lossy image quality must satisfy minimumLossyImageQuality <= defaultLossyImageQuality <= maximumLossyImageQuality."
+      );
+    }
     config.observer.evidenceRoots = validateOptionalDirectories(
       config.observer.evidenceRoots,
       "observer.evidenceRoots entry"

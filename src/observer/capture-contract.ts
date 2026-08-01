@@ -1,5 +1,9 @@
 import type { WorldRevision } from "./world-revision.js";
 import type { ERROR_REGISTRY } from "../../observer/protocol/registry.js";
+import type {
+  CanonicalImageOutputPolicy,
+  ImageOutputRequest,
+} from "../foundation/image-output.js";
 
 export type CaptureBackendKind = "runtime" | "workbench";
 export type CaptureState = "queued" | "running" | "completed" | "failed" | "cancelled" | "released";
@@ -101,6 +105,7 @@ export interface CanonicalCaptureRequest {
   view: CaptureView;
   settleFrames: number;
   performancePolicy: "evidence" | "instrumented";
+  image: CanonicalImageOutputPolicy;
   timeoutMs: number;
   expectedWorldRevision: WorldRevision;
   runId?: string;
@@ -117,6 +122,7 @@ export interface CaptureInput {
   view: CaptureView;
   settleFrames?: number;
   performancePolicy?: "evidence" | "instrumented" | "performance";
+  image?: ImageOutputRequest;
   timeoutMs?: number;
   expectedWorldRevision: WorldRevision;
   runId?: string;

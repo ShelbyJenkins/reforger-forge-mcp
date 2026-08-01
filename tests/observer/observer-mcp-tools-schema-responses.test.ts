@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { Transformer } from "@napi-rs/image";
 import { ObserverApplicationError } from "../../src/observer/errors.js";
 import { runtimeWorldRevision } from "../../src/observer/world-revision.js";
 import { registerObserverTools } from "../../src/observer/tools.js";
@@ -25,12 +26,18 @@ describe("observer MCP tools", () => {
       await client.connect(clientTransport);
       const listed = await client.listTools();
       const capture = listed.tools.find((tool) => tool.name === "observer_capture");
+      const run = listed.tools.find((tool) => tool.name === "observer_run");
       expect(capture).toBeDefined();
+      expect(run).toBeDefined();
       expect(capture!.inputSchema.required).toContain("expectedWorldRevision");
       expect(capture!.inputSchema.properties).toHaveProperty("expectedWorldRevision");
       expect(capture!.inputSchema.properties).not.toHaveProperty("expectedWorldId");
       expect(capture!.inputSchema.properties).not.toHaveProperty("expectedWorldEpoch");
       expect(capture!.inputSchema.additionalProperties).toBe(false);
+      expect(run!.description).toContain("finalize requires runId, includeCaptureLabels, and review");
+      expect(run!.inputSchema.properties!.includeCaptureLabels).toMatchObject({
+        description: expect.stringContaining("Required non-empty list"),
+      });
 
       const visit = (value: unknown): void => {
         if (Array.isArray(value)) {
@@ -47,6 +54,9 @@ describe("observer MCP tools", () => {
 
       const captureSchema = toolRegistry(coordinator).get("observer_capture")!.definition.inputSchema!;
       const view = captureSchema.view;
+      expect(captureSchema.image.safeParse({ maxWidth: 1920, format: "webp", quality: 75 }).success).toBe(true);
+      expect(captureSchema.image.safeParse({ format: "png", quality: 75 }).success).toBe(false);
+      expect(captureSchema.image.safeParse({ maxWidth: 8_000, maxHeight: 8_000 }).success).toBe(false);
       expect(captureSchema.performancePolicy.safeParse("performance").success).toBe(false);
       expect(captureSchema.performancePolicy.safeParse("instrumented").success).toBe(true);
       expect(captureSchema.runId.safeParse("20260717T184233Z-a1b2c3d4").success).toBe(true);
@@ -179,6 +189,29 @@ describe("observer MCP tools", () => {
     expect(result.content[0]).toMatchObject({ type: "image", mimeType: "image/png", data: png.toString("base64") });
     expect(result.content[1].text).toContain('"worldEpoch": 4');
     expect(result.content[1].text).toContain('"width": 1920');
+  });
+
+  it("returns the retained JPEG MIME type for synchronous capture", async () => {
+    const jpeg = Transformer.fromRgbaPixels(Buffer.from([255, 0, 0, 255]), 1, 1).jpegSync(60);
+    const { call } = createToolHarness({
+      capture: vi.fn(async () => ({
+        asynchronous: false,
+        image: jpeg,
+        job: { jobId: "job-jpeg", instanceId: "instance-1" },
+        metadata: { mimeType: "image/jpeg", format: "jpeg", width: 1, height: 1 },
+      })),
+    });
+    const result = await call("observer_capture", captureToolInput({
+      image: { format: "jpeg", quality: 60 },
+      expectedWorldRevision: runtimeWorldRevision("world-jpeg", 1),
+    }));
+
+    expect(result.isError).not.toBe(true);
+    expect(result.content[0]).toMatchObject({
+      type: "image",
+      mimeType: "image/jpeg",
+      data: jpeg.toString("base64"),
+    });
   });
 
   it("refuses an image larger than the MCP inline limit", async () => {

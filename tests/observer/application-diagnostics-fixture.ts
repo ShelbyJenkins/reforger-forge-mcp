@@ -231,9 +231,11 @@ export function workbenchJob(
     },
     ...(state === "completed" ? {
       artifact: {
-        format: "png", path: "C:/profile/ReforgerForgeObserver/workbench/wb-job-1.png",
+        format: "png", mimeType: "image/png", path: "C:/profile/ReforgerForgeObserver/workbench/wb-job-1.png",
         logicalPath: "$profile:ReforgerForgeObserver/workbench/wb-job-1.png",
         bytes: 70, pngBytes: png.length, width: 1, height: 1,
+        sourceWidth: 1, sourceHeight: 1,
+        viewportWidth: 1, viewportHeight: 1,
         sha256: "a".repeat(64), pngSha256: "b".repeat(64),
         completedAt: "2026-07-15T12:00:00.000Z",
       },

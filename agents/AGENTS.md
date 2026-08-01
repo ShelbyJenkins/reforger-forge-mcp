@@ -126,6 +126,9 @@ template grants write access or replaces a tool call.
   copied file's absolute path. Workbench uses that path to create the `.meta`
   file and assign the resource GUID. Verify the result with **wb_resources**
   `getInfo` or **wb_prefabs** `getGuid` before referencing the copy.
+- Resource registration is document-independent. A generic exact-owned
+  Workbench with no open World Editor document can register loose resources;
+  registration remains prohibited during actual Play mode.
 - A `game_duplicate(register=true)` result can be a recoverable partial
   success: the `.et` may have been written even though registration failed.
   Preserve the file and register that existing absolute path with
@@ -175,6 +178,10 @@ API.
 
 The save call refuses generic Workbench sessions, a missing or different
 resourcePath, and paths that were not supplied at launch.
+It also refuses an inherited prefab containing explicit empty nested override
+blocks before invoking Workbench, because the native template serializer can
+silently remove those load-bearing overrides. Preserve such a prefab with a
+minimal direct source edit and relaunch it before further live editing.
 
 ### Build, lifecycle, and diagnostics
 
@@ -237,9 +244,15 @@ name, or runtimeId.
   capture is available in that state.
 - Use view kind=current first. Explicit pose and look-at requests require the
   selected backend capability and may be safely refused.
-- Synchronous capture returns one validated PNG. For asynchronous capture,
-  poll **observer_job** action=status, use action=read when complete, and use
-  cancel or release only as the job contract allows.
+- Synchronous capture returns one validated image in the requested format.
+  Omit `image` for a native-resolution PNG, or provide independent
+  `maxWidth`/`maxHeight` fit-inside bounds and `format`=`png`, `jpeg`, or
+  `webp`. JPEG and WebP accept an optional quality from 1 through 100 within
+  the configured range and otherwise use the configured default; PNG rejects
+  quality. For asynchronous capture, poll **observer_job** action=status, use
+  action=read when complete, and use cancel or release only as the job
+  contract allows. The read result carries the actual MIME type and image
+  metadata.
 - Review images before **observer_run** action=finalize. Finalization exports
   reviewed labels only to a configured allowlisted evidence root; use discard
   when no evidence should be retained.

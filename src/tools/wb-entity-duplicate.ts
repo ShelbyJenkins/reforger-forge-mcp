@@ -145,7 +145,7 @@ export function registerWbEntityDuplicate(
         const regResp = await client.call<{ status: string; message?: string }>(
           "EMCP_WB_Resources",
           { action: "register", path: absDestPath, buildRuntime: false },
-          { timeout: 30000 }
+          { timeout: 120_000, skipAutoLaunch: true }
         );
 
         if (regResp.status !== "ok") {

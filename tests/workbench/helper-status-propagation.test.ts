@@ -44,6 +44,28 @@ function helperErrorClient(message: string): {
 }
 
 describe("Workbench helper status propagation", () => {
+  it("registers from a generic no-document session with an operation-specific deadline", async () => {
+    const call = vi.fn(async (apiFunc: string) => {
+      if (apiFunc === "EMCP_WB_GetState") return { mode: "no_world_editor" };
+      return { status: "ok", message: "Resource registered" };
+    });
+    const client = {
+      state: { connected: true, mode: "unknown", lastUpdated: Date.now() },
+      call,
+    } as unknown as WorkbenchClient;
+    const handler = registeredTools(registerWbResources, client).get("wb_resources");
+
+    const result = await handler?.({ action: "register", path: "C:\\Mods\\Example\\New.et" });
+
+    expect(result?.isError).not.toBe(true);
+    expect(call).toHaveBeenNthCalledWith(
+      2,
+      "EMCP_WB_Resources",
+      { action: "register", path: "C:\\Mods\\Example\\New.et" },
+      { timeout: 120_000, skipAutoLaunch: true }
+    );
+  });
+
   it.each([
     ["register", "RegisterResourceFile returned false for: Prefabs/Failed.et"],
     ["open", "SetOpenedResource returned false for: Prefabs/Failed.et"],
@@ -132,6 +154,37 @@ describe("Workbench helper status propagation", () => {
       expect(source).toContain(
         'resp.message = "Resource metadata not found for: " + req.path;'
       );
+    }
+  });
+
+  it("the state helper distinguishes no document from actual Play mode", () => {
+    const statePath = fileURLToPath(new URL(
+      "../../observer/workbench-addon/Scripts/WorkbenchGame/EnfusionMCP/EMCP_WB_GetState.c",
+      import.meta.url
+    ));
+    const pingPath = fileURLToPath(new URL(
+      "../../observer/workbench-addon/Scripts/WorkbenchGame/EnfusionMCP/EMCP_WB_Ping.c",
+      import.meta.url
+    ));
+
+    for (const source of [readFileSync(statePath, "utf8"), readFileSync(pingPath, "utf8")]) {
+      expect(source).toContain("GetGame().InPlayMode()");
+      expect(source).toContain('resp.mode = "game";');
+      expect(source).toContain('resp.mode = "no_world_editor";');
+    }
+  });
+
+  it("gives every direct resource-registration wrapper the extended deadline", () => {
+    const wrapperPaths = [
+      "../../src/tools/game-duplicate.ts",
+      "../../src/tools/wb-entity-duplicate.ts",
+    ];
+
+    for (const relativePath of wrapperPaths) {
+      const path = fileURLToPath(new URL(relativePath, import.meta.url));
+      const source = readFileSync(path, "utf8");
+      expect(source).toContain("{ timeout: 120_000, skipAutoLaunch: true }");
+      expect(source).not.toContain("{ timeout: 30000 }");
     }
   });
 });

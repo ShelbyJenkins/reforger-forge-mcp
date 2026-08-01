@@ -161,6 +161,7 @@ function serializeJob(record: JobRecord): Record<string, unknown> {
     view: record.request.view,
     settleFrames: record.request.settleFrames,
     performancePolicy: record.request.performancePolicy,
+    image: record.request.image,
     deadlineAt: record.request.deadlineAt,
     cancellationRequested: record.cancellationRequestedAt !== null,
     cameraLease: { ...record.cameraLease },

@@ -24,6 +24,37 @@ function matchingLines(source: string, pattern: RegExp): string[] {
 }
 
 describe("one-command setup orchestration contract", () => {
+  it("keeps the supported runtime, setup guard, documentation, and CI on Node 24 LTS", () => {
+    const packageJson = JSON.parse(read("package.json")) as {
+      engines?: { node?: string };
+      devDependencies?: Record<string, string>;
+    };
+    const packageLock = JSON.parse(read("package-lock.json")) as {
+      packages?: Record<
+        string,
+        { engines?: { node?: string }; version?: string }
+      >;
+    };
+    const setup = read("scripts/setup.ps1");
+    const workflow = read(".github/workflows/ci.yml");
+
+    expect(packageJson.engines?.node).toBe(">=24.0.0");
+    expect(packageJson.devDependencies?.["@types/node"]).toBe("^24.0.0");
+    expect(packageLock.packages?.[""]?.engines?.node).toBe(">=24.0.0");
+    expect(
+      packageLock.packages?.["node_modules/@types/node"]?.version
+    ).toMatch(/^24\./);
+    expect(read("README.md")).toContain("Node.js 24 LTS or newer");
+    expect(read("SETUP.md")).toContain("Node.js 24 LTS or newer");
+    expect(setup).toContain("$nodeMajor -lt 24");
+    expect(setup).toContain("Node.js 24 LTS or newer is required");
+    expect(workflow).toContain("node-version: [24]");
+    expect(workflow).toContain("actions/checkout@v6");
+    expect(workflow).toContain("actions/setup-node@v6");
+    expect(workflow).toContain("matrix.node-version == 24");
+    expect(workflow).not.toMatch(/node-version:\s*\[[^\]]*\b(?:20|22)\b/);
+  });
+
   it("documents policy-independent setup and Doctor entry points", () => {
     const setupGuide = read("SETUP.md");
     const policyIndependentPrefix =

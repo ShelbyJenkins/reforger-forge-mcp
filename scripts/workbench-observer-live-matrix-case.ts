@@ -89,6 +89,16 @@ export interface WorkbenchLiveRetainedCapture {
   readonly completed: WorkbenchObserverJobStatus;
   readonly image: Buffer;
   readonly png: PngMaterialEvidence;
+  readonly output?: {
+    readonly format: "png" | "jpeg" | "webp";
+    readonly mimeType: "image/png" | "image/jpeg" | "image/webp";
+    readonly extension: ".png" | ".jpg" | ".webp";
+    readonly width: number;
+    readonly height: number;
+    readonly byteCount: number;
+    readonly sha256: string;
+    readonly quality: number | null;
+  };
 }
 
 export interface WorkbenchLiveMatrixCaseServices {

@@ -120,6 +120,29 @@ export const lookAtViewSchema = z.object({
   value.target[2] - value.position[2]
 ) > 0.000001, { message: "lookAt position and target must differ", path: ["target"] });
 
+export const imageOutputPolicySchema = z.object({
+  format: z.enum(["png", "jpeg", "webp"]),
+  maxWidth: z.number().int().min(1).max(16_384).optional(),
+  maxHeight: z.number().int().min(1).max(16_384).optional(),
+  quality: z.number().int().min(1).max(100).optional(),
+}).strict().superRefine((value, context) => {
+  if (value.format === "png" && value.quality !== undefined) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["quality"],
+      message: "quality is valid only for jpeg or webp output",
+    });
+  }
+  if (value.maxWidth !== undefined && value.maxHeight !== undefined &&
+      value.maxWidth * value.maxHeight > 32_000_000) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["maxWidth"],
+      message: "image bounds exceed the 32000000-pixel limit",
+    });
+  }
+});
+
 export const captureRequestSchema = z.object({
   protocolVersion,
   jobId: identifier,
@@ -130,6 +153,7 @@ export const captureRequestSchema = z.object({
   view: z.union([currentViewSchema, poseViewSchema, lookAtViewSchema]),
   settleFrames: z.number().int().min(0).max(DEFAULT_LIMITS.maxSettleFrames),
   performancePolicy: z.enum(["evidence", "instrumented", "performance"]),
+  image: imageOutputPolicySchema.default({ format: "png" }),
 }).passthrough();
 
 const deliveryToken = z.string().min(16).max(256).regex(/^[A-Za-z0-9_-]+$/);

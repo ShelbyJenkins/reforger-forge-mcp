@@ -8,6 +8,9 @@
   "workbenchHost": "127.0.0.1",
   "workbenchPort": 5775,
   "observer": {
+    "defaultLossyImageQuality": 75,
+    "minimumLossyImageQuality": 1,
+    "maximumLossyImageQuality": 100,
     "evidenceRoots": [
       "C:\\path\\to\\arma-projects\\addons\\.reforger-forge-screenshots"
     ]

@@ -3,6 +3,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -17,9 +18,19 @@ import { WorkbenchHelperStager } from "../src/workbench/helper-addon.js";
 import { resolveWorkbenchExecutablePath } from "../src/workbench/launch-plan.js";
 import { WorkbenchProcessGuard } from "../src/workbench/process-guard.js";
 import { canonicalizeGproj } from "../src/workbench/project-identity.js";
+import { requireResourceManagerMode } from "../src/workbench/status.js";
 
 export const LIVE_WORKBENCH_LIFECYCLE_ENVIRONMENT =
   "RFO_RUN_LIVE_WORKBENCH_LIFECYCLE_ACCEPTANCE";
+
+const BASE_EVERON_WORLD = "{853E92315D1D9EFE}worlds/Eden/Eden.ent";
+
+function registeredResourceGuid(metaPath: string): string {
+  assert.equal(existsSync(metaPath), true, `resource registration did not create ${metaPath}`);
+  const match = readFileSync(metaPath, "utf8").match(/\{([A-F0-9]{16})\}/i);
+  assert.ok(match?.[1], `registered metadata has no resource GUID: ${metaPath}`);
+  return match[1].toUpperCase();
+}
 
 interface WorkbenchLifecycleAcceptanceOptions {
   readonly configPath: string;
@@ -169,6 +180,34 @@ export async function runWorkbenchLifecycleAcceptance(
       title: "Reforger Forge lifecycle acceptance B",
       guid: "A11CE00000000002",
     }), "utf8");
+    const prefabsDirectory = join(firstMod, "Prefabs");
+    const worldsDirectory = join(firstMod, "Worlds");
+    const materialsDirectory = join(firstMod, "Materials");
+    mkdirSync(prefabsDirectory);
+    mkdirSync(worldsDirectory);
+    mkdirSync(materialsDirectory);
+    const loosePrefab = join(prefabsDirectory, "RegistrationProbe.et");
+    const looseWorld = join(worldsDirectory, "RegistrationProbe.ent");
+    const looseMaterial = join(materialsDirectory, "RegistrationProbe.emat");
+    writeFileSync(loosePrefab, [
+      "GenericEntity {",
+      ' ID "A11CE00000000101"',
+      ' Name "RFO_RegistrationProbe"',
+      "}",
+      "",
+    ].join("\n"), "utf8");
+    writeFileSync(looseWorld, [
+      "SubScene {",
+      ` Parent "${BASE_EVERON_WORLD}"`,
+      "}",
+      "",
+    ].join("\n"), "utf8");
+    // Minimal valid material container used by Bohemia's official Reforger
+    // samples; keeping it dependency-free isolates ResourceManager registration.
+    writeFileSync(looseMaterial, ["MatPBRBasic {", "}", ""].join("\n"), "utf8");
+    assert.equal(existsSync(`${loosePrefab}.meta`), false);
+    assert.equal(existsSync(`${looseWorld}.meta`), false);
+    assert.equal(existsSync(`${looseMaterial}.meta`), false);
 
     const stateDir = join(root, "state");
     const helperPath = fileURLToPath(
@@ -207,6 +246,52 @@ export async function runWorkbenchLifecycleAcceptance(
       throw new Error("could not create vacant live state");
     }
     assert.equal(initial.state.phase, "vacant");
+
+    const registrationLaunch = await client.ensureRunning(firstProject);
+    assert.equal(registrationLaunch.action, "launched");
+    assert.equal(await client.ping(), true);
+    const noDocumentState = await client.call<Record<string, unknown>>(
+      "EMCP_WB_GetState",
+      {},
+      { timeout: 30_000, skipAutoLaunch: true }
+    );
+    assert.equal(noDocumentState.status, "ok");
+    assert.equal(noDocumentState.mode, "no_world_editor");
+    assert.equal(await requireResourceManagerMode(client, "register resource"), null);
+
+    for (const path of [loosePrefab, looseWorld, looseMaterial]) {
+      const registered: Record<string, unknown> = await client.call<Record<string, unknown>>(
+        "EMCP_WB_Resources",
+        { action: "register", path, buildRuntime: false },
+        { timeout: 120_000, skipAutoLaunch: true }
+      );
+      assert.equal(registered.status, "ok", `resource registration failed: ${String(registered.message)}`);
+      assert.equal(await client.ping(), true, "Workbench bridge did not respond after resource registration");
+    }
+    const prefabGuid = registeredResourceGuid(`${loosePrefab}.meta`);
+    const worldGuid = registeredResourceGuid(`${looseWorld}.meta`);
+    const materialGuid = registeredResourceGuid(`${looseMaterial}.meta`);
+    assert.notEqual(prefabGuid, worldGuid, "Workbench assigned the same GUID to two resources");
+    assert.equal(new Set([prefabGuid, worldGuid, materialGuid]).size, 3,
+      "Workbench did not assign distinct GUIDs to all registered resources");
+    process.stdout.write(
+      `[live-lifecycle-acceptance] generic no-document registration passed: ` +
+      `prefab=${prefabGuid}; world=${worldGuid}; material=${materialGuid}\n`
+    );
+
+    await client.shutdownOwnedWorkbench();
+    assert.deepEqual(await guard.listWorkbenchProcesses(), []);
+    for (const path of [loosePrefab, looseWorld]) {
+      const targetLaunch = await client.ensureTargetResourceRunning(firstProject, path);
+      assert.equal(targetLaunch.action, "launched");
+      assert.equal(targetLaunch.resourcePath.toLowerCase(), path.toLowerCase());
+      const saved = await client.saveResource(path);
+      assert.equal(saved.resourcePath.toLowerCase(), path.toLowerCase());
+      assert.ok(saved.outcome === "no_change" || saved.outcome === "changed");
+      await client.shutdownOwnedWorkbench();
+      assert.deepEqual(await guard.listWorkbenchProcesses(), []);
+    }
+    process.stdout.write("[live-lifecycle-acceptance] registered resources reopened and saved in fresh target sessions\n");
 
     const launched = await client.ensureRunning(firstProject);
     assert.equal(launched.action, "launched");

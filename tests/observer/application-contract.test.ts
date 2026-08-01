@@ -249,6 +249,13 @@ describe("observer application", () => {
         sessions: [],
         instances: [],
         jobs: [],
+        imageOutput: {
+          defaultFormat: "png",
+          defaultLossyQuality: 75,
+          minimumLossyQuality: 1,
+          maximumLossyQuality: 100,
+          inlineResponseMaxBytes: 8 * 1024 * 1024,
+        },
       });
       expect(doctor).toMatchObject({
         readOnly: true,

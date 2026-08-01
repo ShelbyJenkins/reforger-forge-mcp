@@ -16,6 +16,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "nod
 import { isDeepStrictEqual } from "node:util";
 import { sha256File, sha256Hex } from "#foundation/digest";
 import { BoundedJsonStore, JsonStoreError } from "#foundation/json-store";
+import { imageOutputDescriptor, type CanonicalImageOutputPolicy } from "#foundation/image-output";
 import { canonicalizePotentialPath } from "#foundation/managed-path";
 import { redactText } from "#foundation/redact";
 import { AGENT_VERSION, DEFAULT_LIMITS, PROTOCOL_VERSION, SHA256_PATTERN } from "../protocol/index.js";
@@ -39,6 +40,11 @@ const MAX_MEMBER_BYTES = DEFAULT_LIMITS.maxArtifactBytes;
 const RUN_ID_PATTERN = /^\d{8}T\d{6}Z-[a-f0-9]{8}$/;
 const SECRET_KEY_PATTERN = /(authorization|bearer|credential|password|secret|token|private.?key)/i;
 const MEMBER_PATTERN = /^[A-Za-z0-9._/-]{1,512}$/;
+
+function captureImagePath(capture: Readonly<EvidenceCaptureSnapshot>): string {
+  const format = capture.artifact?.format ?? "png";
+  return `captures/${capture.label}${imageOutputDescriptor(format).extension}`;
+}
 
 interface FilesystemIdentity { dev: bigint; ino: bigint }
 interface BundleFile { path: string; bytes: number; sha256: string }
@@ -71,6 +77,7 @@ export interface EvidenceCaptureSnapshot extends Record<string, unknown> {
   worldEpoch?: number;
   requestedView: Record<string, unknown>;
   performancePolicy: "evidence" | "instrumented";
+  requestedImage?: CanonicalImageOutputPolicy;
   artifact?: ManagedArtifactRef;
 }
 
@@ -268,7 +275,7 @@ export class FileEvidenceBundleService implements EvidenceBundleService {
     try {
       const captures: Array<Record<string, unknown>> = [];
       for (const { capture, artifact } of selected) {
-        const imagePath = `captures/${capture.label}.png`;
+        const imagePath = captureImagePath(capture);
         const metadataPath = `captures/${capture.label}.json`;
         atomicWriteFile(workRoot, join(workRoot, imagePath), artifact.image!);
         const item = this.captureManifest(capture, artifact.metadata!, imagePath, metadataPath);
@@ -372,10 +379,13 @@ export class FileEvidenceBundleService implements EvidenceBundleService {
       worldId: capture.worldId ?? null,
       worldEpoch: capture.worldEpoch,
       requestedView: capture.requestedView,
+      requestedImage: capture.requestedImage ?? { format: "png" },
       actualCamera: metadata.actualCamera ?? null,
       actualFov: metadata.actualFov ?? null,
       width: ref.width,
       height: ref.height,
+      format: ref.format ?? "png",
+      mimeType: ref.mimeType ?? "image/png",
       bytes: ref.bytes,
       sha256: ref.sha256,
       screenshotIssuedAt: metadata.screenshotIssuedAt ?? null,
@@ -516,10 +526,19 @@ export class FileEvidenceBundleService implements EvidenceBundleService {
       const raw = captures[index];
       if (!capture?.artifact || !raw || typeof raw !== "object" || Array.isArray(raw)) throw new ObserverError("ARTIFACT_INVALID", "Evidence manifest references an unknown run capture", 409);
       const item = raw as Record<string, unknown>;
-      const imagePath = `captures/${capture.label}.png`;
+      const imagePath = captureImagePath(capture);
       const metadataPath = `captures/${capture.label}.json`;
       const ref = capture.artifact;
-      if (item.label !== capture.label || item.imagePath !== imagePath || item.metadataPath !== metadataPath || item.backend !== capture.backend || item.jobId !== capture.jobId || item.instanceId !== capture.instanceId || item.worldId !== (capture.worldId ?? null) || item.worldEpoch !== capture.worldEpoch || !isDeepStrictEqual(item.requestedView, capture.requestedView) || item.width !== ref.width || item.height !== ref.height || item.bytes !== ref.bytes || item.sha256 !== ref.sha256) throw new ObserverError("ARTIFACT_INVALID", `Evidence capture '${capture.label}' is not bound to its managed artifact`, 409);
+      const formatMatches = ref.format === undefined
+        ? item.format === undefined || item.format === "png"
+        : item.format === ref.format;
+      const mimeTypeMatches = ref.mimeType === undefined
+        ? item.mimeType === undefined || item.mimeType === "image/png"
+        : item.mimeType === ref.mimeType;
+      const requestedImageMatches = capture.requestedImage === undefined
+        ? item.requestedImage === undefined || isDeepStrictEqual(item.requestedImage, { format: "png" })
+        : isDeepStrictEqual(item.requestedImage, capture.requestedImage);
+      if (item.label !== capture.label || item.imagePath !== imagePath || item.metadataPath !== metadataPath || item.backend !== capture.backend || item.jobId !== capture.jobId || item.instanceId !== capture.instanceId || item.worldId !== (capture.worldId ?? null) || item.worldEpoch !== capture.worldEpoch || !isDeepStrictEqual(item.requestedView, capture.requestedView) || !requestedImageMatches || item.width !== ref.width || item.height !== ref.height || !formatMatches || !mimeTypeMatches || item.bytes !== ref.bytes || item.sha256 !== ref.sha256) throw new ObserverError("ARTIFACT_INVALID", `Evidence capture '${capture.label}' is not bound to its managed artifact`, 409);
       const image = members.get(imagePath);
       if (!image || image.bytes !== ref.bytes || image.sha256 !== ref.sha256) throw new ObserverError("ARTIFACT_INVALID", `Evidence capture '${capture.label}' image attestation is invalid`, 409);
       const metadata = members.get(metadataPath);

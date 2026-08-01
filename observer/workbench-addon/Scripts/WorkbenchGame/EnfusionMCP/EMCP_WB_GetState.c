@@ -79,10 +79,18 @@ class EMCP_WB_GetState : NetApiHandler
 		if (!api)
 		{
 			resp.status = "ok";
-			resp.mode = "game";
-			resp.message = "In game mode (WorldEditorAPI not available)";
+			if (GetGame() && GetGame().InPlayMode())
+			{
+				resp.mode = "game";
+				resp.message = "In game mode (WorldEditorAPI not available)";
+			}
+			else
+			{
+				resp.mode = "no_world_editor";
+				resp.message = "No World Editor document is open";
+			}
 
-			// Still get terrain bounds from WorldEditor
+			// Terrain bounds may still be available while Play mode is active.
 			vector bMin, bMax;
 			if (worldEditor.GetTerrainBounds(bMin, bMax))
 			{

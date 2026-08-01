@@ -3,25 +3,28 @@ import { z } from "zod";
 import type { WorkbenchClient } from "../workbench/client.js";
 import { formatConnectionStatus, requireEditMode } from "../workbench/status.js";
 
-const MUTATING_LAYER_ACTIONS = new Set(["create", "delete", "rename", "toggleLock"]);
+const MUTATING_LAYER_ACTIONS = new Set(["toggleLock"]);
+
+function throwIfLayerHelperFailed(result: Record<string, unknown>, action: string): void {
+  if (result.status === "ok") return;
+  const message = typeof result.message === "string" && result.message.trim()
+    ? result.message
+    : `Workbench layer ${action} failed.`;
+  throw new Error(message);
+}
 
 export function registerWbLayers(server: McpServer, client: WorkbenchClient): void {
   server.registerTool(
     "wb_layers",
     {
       description:
-        "Manage layers in the World Editor. List layers, create/delete layers, rename, set active layer, query visibility, get layer info, or toggle lock. Create/delete/rename/toggleLock only work in edit mode.",
+        "Inspect World Editor layer IDs, find an entity's layer, query layer visibility or info, and toggle a layer lock. toggleLock works only in edit mode. Create, delete, rename, active-layer, and visibility mutations are not advertised because the staged helper does not implement them.",
       inputSchema: {
         action: z
           .enum([
             "list",
-            "create",
-            "delete",
-            "rename",
-            "setActive",
-            "setVisibility",
-            "lock",
-            "unlock",
+            "getActive",
+            "getEntityLayer",
             "isVisible",
             "getInfo",
             "toggleLock",
@@ -34,22 +37,14 @@ export function registerWbLayers(server: McpServer, client: WorkbenchClient): vo
         layerPath: z
           .string()
           .optional()
-          .describe("Layer path (e.g., 'default/MyLayer'). Required for most actions except list and create."),
-        name: z
+          .describe("Numeric layer ID as a string, required for isVisible, getInfo, and toggleLock."),
+        entityName: z
           .string()
           .optional()
-          .describe("Layer name for create or new name for rename"),
-        parentPath: z
-          .string()
-          .optional()
-          .describe("Parent layer path for create (e.g., 'default')"),
-        visible: z
-          .boolean()
-          .optional()
-          .describe("Visibility state for setVisibility (true = visible, false = hidden)"),
+          .describe("Entity name, required for getEntityLayer."),
       },
     },
-    async ({ action, subScene, layerPath, name, parentPath, visible }) => {
+    async ({ action, subScene, layerPath, entityName }) => {
       if (MUTATING_LAYER_ACTIONS.has(action)) {
         const modeErr = await requireEditMode(client, `${action} layer`);
         if (modeErr) {
@@ -59,11 +54,10 @@ export function registerWbLayers(server: McpServer, client: WorkbenchClient): vo
       try {
         const params: Record<string, unknown> = { action, subScene };
         if (layerPath) params.layerPath = layerPath;
-        if (name) params.name = name;
-        if (parentPath) params.parentPath = parentPath;
-        if (visible !== undefined) params.visible = visible;
+        if (entityName) params.entityName = entityName;
 
         const result = await client.call<Record<string, unknown>>("EMCP_WB_Layers", params);
+        throwIfLayerHelperFailed(result, action);
 
         if (action === "list") {
           const layers = Array.isArray(result.layers) ? result.layers : [];
@@ -76,7 +70,8 @@ export function registerWbLayers(server: McpServer, client: WorkbenchClient): vo
           const lines = [`**Layers** (SubScene ${subScene})\n`];
           for (const layer of layers) {
             const l = layer as Record<string, unknown>;
-            const path = l.path || l.name || "(unnamed)";
+            const path = l.path || l.name ||
+              (l.layerID !== undefined ? `Layer ${l.layerID}` : "(unnamed)");
             const flags: string[] = [];
             if (l.active) flags.push("ACTIVE");
             if (l.locked) flags.push("LOCKED");
@@ -93,13 +88,14 @@ export function registerWbLayers(server: McpServer, client: WorkbenchClient): vo
           return { content: [{ type: "text" as const, text: lines.join("\n") + formatConnectionStatus(client) }] };
         }
 
-        if (action === "isVisible" || action === "getInfo") {
+        if (action === "isVisible" || action === "getInfo" || action === "getEntityLayer" || action === "getActive") {
           const lines = [`**Layer ${layerPath || result.layerID}**\n`];
           if (result.layerVisible !== undefined) lines.push(`- **Visible:** ${result.layerVisible}`);
           if (result.layerLocked !== undefined) lines.push(`- **Locked:** ${result.layerLocked}`);
           if (result.layerActive !== undefined) lines.push(`- **Active:** ${result.layerActive}`);
           if (result.layerEntityCount !== undefined) lines.push(`- **Entities:** ${result.layerEntityCount}`);
           if (result.layerID !== undefined) lines.push(`- **Layer ID:** ${result.layerID}`);
+          if (result.currentSubScene !== undefined) lines.push(`- **Current SubScene:** ${result.currentSubScene}`);
           return { content: [{ type: "text" as const, text: lines.join("\n") + formatConnectionStatus(client) }] };
         }
 
@@ -114,13 +110,8 @@ export function registerWbLayers(server: McpServer, client: WorkbenchClient): vo
         }
 
         const actionLabels: Record<string, string> = {
-          create: `Created layer "${name || "(unnamed)"}"${parentPath ? ` under ${parentPath}` : ""}`,
-          delete: `Deleted layer "${layerPath}"`,
-          rename: `Renamed layer "${layerPath}" to "${name}"`,
-          setActive: `Set active layer to "${layerPath}"`,
-          setVisibility: `Set "${layerPath}" visibility to ${visible ? "visible" : "hidden"}`,
-          lock: `Locked layer "${layerPath}"`,
-          unlock: `Unlocked layer "${layerPath}"`,
+          getActive: "Read active layer",
+          getEntityLayer: `Read layer for entity "${entityName}"`,
           isVisible: `Queried visibility of layer "${layerPath}"`,
           getInfo: `Got info for layer "${layerPath}"`,
           toggleLock: `Toggled lock on layer "${layerPath}"`,

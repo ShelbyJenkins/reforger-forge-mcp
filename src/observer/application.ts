@@ -62,6 +62,9 @@ export interface CreateObserverApplicationOptions {
   requestDeadlineAtMs?: () => number | undefined;
   defaultCaptureTimeoutMs?: number;
   maxInlineImageBytes?: number;
+  defaultLossyImageQuality?: number;
+  minimumLossyImageQuality?: number;
+  maximumLossyImageQuality?: number;
   retentionIntervalMs?: number;
   retentionMaxAgeMs?: number;
   retentionMaxBytes?: number;
@@ -165,6 +168,16 @@ class DefaultObserverApplication implements ObserverApplication {
     this.requestTimeoutMs = boundedOption(options.requestTimeoutMs, 30_000, 1_000, 5 * 60_000, "Observer request timeout", optionError);
     this.defaultCaptureTimeoutMs = boundedOption(options.defaultCaptureTimeoutMs, 30_000, 1_000, 5 * 60_000, "Observer capture timeout", optionError);
     this.maxInlineImageBytes = boundedOption(options.maxInlineImageBytes, 8 * 1024 * 1024, 1_024, 64 * 1024 * 1024, "Observer inline image limit", optionError);
+    const defaultLossyImageQuality = boundedOption(options.defaultLossyImageQuality, 75, 1, 100, "Observer default lossy image quality", optionError);
+    const minimumLossyImageQuality = boundedOption(options.minimumLossyImageQuality, 1, 1, 100, "Observer minimum lossy image quality", optionError);
+    const maximumLossyImageQuality = boundedOption(options.maximumLossyImageQuality, 100, 1, 100, "Observer maximum lossy image quality", optionError);
+    if (minimumLossyImageQuality > defaultLossyImageQuality ||
+        defaultLossyImageQuality > maximumLossyImageQuality) {
+      throw new ObserverApplicationError(
+        "INVALID_REQUEST",
+        "Observer lossy image quality must satisfy minimum <= default <= maximum"
+      );
+    }
     const pollIntervalMs = boundedOption(options.pollIntervalMs, 200, 10, 5_000, "Observer poll interval", optionError);
     if (options.retentionIntervalMs !== undefined) boundedOption(options.retentionIntervalMs, options.retentionIntervalMs, 1_000, 24 * 60 * 60_000, "Observer retention interval", optionError);
     if (options.retentionMaxAgeMs !== undefined) boundedOption(options.retentionMaxAgeMs, options.retentionMaxAgeMs, 1_000, 5 * 365 * 24 * 60 * 60_000, "Observer retention maximum age", optionError);
@@ -213,6 +226,11 @@ class DefaultObserverApplication implements ObserverApplication {
       defaultTimeoutMs: this.defaultCaptureTimeoutMs,
       pollIntervalMs,
       maxInlineImageBytes: this.maxInlineImageBytes,
+      imagePolicyDefaults: {
+        lossyQuality: defaultLossyImageQuality,
+        minimumLossyQuality: minimumLossyImageQuality,
+        maximumLossyQuality: maximumLossyImageQuality,
+      },
     });
     this.captureService = captureService;
     if (options.gamePath) {
@@ -227,8 +245,18 @@ class DefaultObserverApplication implements ObserverApplication {
   get child(): unknown { return this.agentClient.childProcess; }
   diagnosticPrivateChildCount(): number { return this.agentClient.diagnosticPrivateChildCount(); }
   ensureStarted(): Promise<ObserverChildDescriptor> { return this.agentClient.ensureStarted(); }
-  status(): Promise<Record<string, unknown>> { return this.diagnostics.inspect("status", this.closing, this.closed); }
-  doctor(): Promise<Record<string, unknown>> { return this.diagnostics.inspect("doctor", this.closing, this.closed); }
+  async status(): Promise<Record<string, unknown>> {
+    return {
+      ...await this.diagnostics.inspect("status", this.closing, this.closed),
+      imageOutput: this.imageOutputDiagnostics(),
+    };
+  }
+  async doctor(): Promise<Record<string, unknown>> {
+    return {
+      ...await this.diagnostics.inspect("doctor", this.closing, this.closed),
+      imageOutput: this.imageOutputDiagnostics(),
+    };
+  }
   async ensureSetup(): Promise<Record<string, unknown>> { return asRecord(await this.request("stage", {}), "Observer setup"); }
   async uninstall(): Promise<Record<string, unknown>> { return asRecord(await this.request("uninstall", {}), "Observer uninstall"); }
   async prepareLaunch(input: Record<string, unknown>): Promise<Record<string, unknown>> { return asRecord(await this.request("prepareLaunch", input), "Observer launch preparation"); }
@@ -342,6 +370,23 @@ class DefaultObserverApplication implements ObserverApplication {
     if (this.closing || this.closed) throw new ObserverApplicationError("TRANSPORT_UNAVAILABLE", "Observer application is unavailable");
     await this.ensureStarted();
     return this.agentClient.request(operation, payload, { timeoutMs });
+  }
+
+  private imageOutputDiagnostics(): Record<string, unknown> {
+    return {
+      formats: ["png", "jpeg", "webp"],
+      defaultFormat: "png",
+      defaultLossyQuality: this.captureService.imagePolicyDefaults.lossyQuality,
+      minimumLossyQuality: this.captureService.imagePolicyDefaults.minimumLossyQuality,
+      maximumLossyQuality: this.captureService.imagePolicyDefaults.maximumLossyQuality,
+      maximumRequestedWidth: this.captureService.imagePolicyDefaults.maximumWidth,
+      maximumRequestedHeight: this.captureService.imagePolicyDefaults.maximumHeight,
+      maximumDecodedPixels: this.captureService.imagePolicyDefaults.maximumPixels,
+      sourceArtifactMaxBytes: 64 * 1024 * 1024,
+      retainedArtifactMaxBytes: 64 * 1024 * 1024,
+      inlineResponseMaxBytes: this.maxInlineImageBytes,
+      aggregateRetention: "observer.retentionMaxBytes",
+    };
   }
 
   private mapError(error: unknown): ObserverApplicationError {

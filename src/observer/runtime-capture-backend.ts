@@ -87,6 +87,7 @@ export class RuntimeCaptureBackend implements CaptureBackend {
         view: input.request.view,
         settleFrames: input.request.settleFrames,
         performancePolicy: input.request.performancePolicy,
+        image: input.request.image,
         expectedWorldId: expected.worldId,
         expectedWorldEpoch: expected.worldEpoch,
       }, { deadlineAtMs: context.deadlineAtMs, signal: context.signal }), "Runtime job submission");
