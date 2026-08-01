@@ -151,7 +151,7 @@ This applies to ALL physical in-game objects: interactive props, spawn points wi
    c. After confirmation, call **wb_state** and proceed only after it reports Play mode. Verify that the world launches successfully.
    d. Use **wb_stop** to return to the World Editor. Calling it in edit mode is an idempotent success.
    e. If compilation failed (errors in the Workbench console), fix with **project** and \`action: "write"\`, then use **wb_restart** to recompile from a clean owner-scoped session. Ask the user to enter Play manually again, wait for confirmation, and verify the result with **wb_state**. Do not hot-reload scripts while a world is loaded.
-   f. **wb_resources** (action: "register") — Register every new prefab, config, and layout file
+   f. **wb_resources** (action: "register") — Register every new prefab, config, and layout file by its absolute existing path inside the exact active project
 
 10. If further runtime testing is needed, repeat the attended manual Play, confirmation, and **wb_state** verification flow. Use **wb_stop** to return to edit mode.
 

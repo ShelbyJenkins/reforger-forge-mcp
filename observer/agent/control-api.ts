@@ -1,4 +1,4 @@
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
@@ -12,6 +12,7 @@ import {
   createObserverPaths,
   ensureCanonicalDirectory,
   isPathContained,
+  resolveManagedRuntimeLogLocation,
   type ObserverManagedPaths,
 } from "./paths.js";
 import {
@@ -233,11 +234,14 @@ export class ObserverControlApi {
     const staged = this.staging.ensureStaged();
     const profilePath = this.prepareProfile(request.profilePath);
     await this.sessions.recoverProfileContract(profilePath, this.recoveryProbe);
+    const sessionId = `s-${randomUUID()}`;
+    const runtimeLog = resolveManagedRuntimeLogLocation(profilePath, sessionId, { create: true });
     const argumentsArray = mergeLaunchArguments({
       arguments: request.arguments,
       profilePath,
       addonSearchRoot: staged.addonSearchRoot,
       stagedAddonPath: staged.addonDirectory,
+      logsDirectoryName: runtimeLog.logsDirectoryName,
       forceUpdate: request.forceUpdate,
       noFocus: request.noFocus,
     });
@@ -251,6 +255,7 @@ export class ObserverControlApi {
       ttlMs: request.sessionTtlMs,
       transportPreference: request.transportPreference as ObserverTransport[],
       limits: DEFAULT_LIMITS,
+      sessionId,
     });
     const result: PreparedLaunch = {
       arguments: argumentsArray,

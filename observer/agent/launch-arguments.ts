@@ -4,7 +4,7 @@ import { ADDON_GUID, ADDON_ID } from "../protocol/index.js";
 import { ObserverError } from "./errors.js";
 import { canonicalizeExistingDirectory } from "./paths.js";
 
-const VALUE_FLAGS = new Set(["-profile", "-addonsdir", "-addons"]);
+const VALUE_FLAGS = new Set(["-profile", "-addonsdir", "-addons", "-logsdir"]);
 const OBSERVER_FLAGS = new Set([...VALUE_FLAGS, "-forceupdate", "-nofocus"]);
 
 function key(path: string): string {
@@ -36,6 +36,7 @@ export interface MergeLaunchArgumentsInput {
   profilePath: string;
   addonSearchRoot: string;
   stagedAddonPath: string;
+  logsDirectoryName: string;
   forceUpdate: boolean;
   noFocus: boolean;
 }
@@ -52,6 +53,7 @@ export function mergeLaunchArguments(input: MergeLaunchArgumentsInput): string[]
   const profiles: string[] = [];
   const addonRoots: string[] = [];
   const addonIds: string[] = [];
+  let callerLogsDirectory: string | null = null;
   let forceUpdateSeen = false;
   let noFocusSeen = false;
   for (let index = 0; index < input.arguments.length; index += 1) {
@@ -75,7 +77,15 @@ export function mergeLaunchArguments(input: MergeLaunchArgumentsInput): string[]
     const value = input.arguments[++index];
     if (flag === "-profile") profiles.push(value);
     else if (flag === "-addonsdir") addonRoots.push(...splitCommaValue(value, token));
-    else addonIds.push(...splitCommaValue(value, token));
+    else if (flag === "-addons") addonIds.push(...splitCommaValue(value, token));
+    else callerLogsDirectory = value;
+  }
+
+  if (callerLogsDirectory !== null) {
+    throw new ObserverError(
+      "ARGUMENT_CONFLICT",
+      "observer_prepare_launch assigns its own session-specific -logsDir; caller-supplied values are not accepted"
+    );
   }
 
   if (profiles.length > 1) throw new ObserverError("ARGUMENT_CONFLICT", "Multiple -profile flags are not supported");
@@ -110,7 +120,13 @@ export function mergeLaunchArguments(input: MergeLaunchArgumentsInput): string[]
     uniqueAddonIds.push(addonId);
   }
 
-  const result = [...unrelated, "-addonsDir", canonicalRoots.join(","), "-addons", uniqueAddonIds.join(","), "-profile", profilePath];
+  const result = [
+    ...unrelated,
+    "-addonsDir", canonicalRoots.join(","),
+    "-addons", uniqueAddonIds.join(","),
+    "-profile", profilePath,
+    "-logsDir", input.logsDirectoryName,
+  ];
   if (input.forceUpdate || forceUpdateSeen) result.push("-forceUpdate");
   if (input.noFocus || noFocusSeen) result.push("-noFocus");
   return result;

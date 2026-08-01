@@ -209,6 +209,36 @@ export class OwnedRuntimeAuthorityStore {
     }
   }
 
+  /** Find the sole durable retained exact-runtime authority for one session. */
+  retainedForSession(sessionId: string): OwnedRuntimeAuthorityRecord | null {
+    if (typeof sessionId !== "string" || sessionId.length < 1 || sessionId.length > 96) {
+      throw new ObserverError("INVALID_REQUEST", "Observer session ID is invalid");
+    }
+    const matches: OwnedRuntimeAuthorityRecord[] = [];
+    for (const runtimeId of this.recordStore.listIds(AUTHORITY_FAMILY)) {
+      if (!runtimeIdSchema.safeParse(runtimeId).success) {
+        throw new ObserverError(
+          "SESSION_UNVERIFIABLE",
+          "Owned runtime authority store contains an invalid record identity",
+          409
+        );
+      }
+      const record = this.read(runtimeId);
+      if (record?.state === "retained" && "preparedLaunchId" in record.authority &&
+          record.authority.sessionId === sessionId) {
+        matches.push(record);
+      }
+    }
+    if (matches.length > 1) {
+      throw new ObserverError(
+        "SESSION_UNVERIFIABLE",
+        "Observer session has more than one retained exact runtime authority",
+        409
+      );
+    }
+    return matches[0] ?? null;
+  }
+
   retain(
     authorityInput: unknown,
     snapshot: OwnedRuntimeAuthoritySnapshot

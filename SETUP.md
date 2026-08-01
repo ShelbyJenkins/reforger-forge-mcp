@@ -299,7 +299,7 @@ array with `[]`. A clear flag cannot be combined with its repeated value flag.
 | `observer.profileRoot` | `--observer-profile-root` | `<managed root>/profiles` |
 | `observer.agentPath` | `--observer-agent-path` | Packaged private child, or an existing regular file |
 | `observer.evidenceRoots` | repeat `--observer-evidence-root` | Explicit allowlisted finalization roots; finalization requires at least one |
-| `observer.supportingLogRoots` | repeat `--observer-supporting-log-root` | Existing directories; defaults to the managed observer log root |
+| `observer.supportingLogRoots` | repeat `--observer-supporting-log-root` | Existing directories for explicit-path logs; defaults to the managed observer log root. Exact-owned runtime `script.log` admission uses a private capture grant and does not require or widen this allowlist. |
 | `observer.startupTimeoutMs` | `--observer-startup-timeout-ms` | `10000` |
 | `observer.requestTimeoutMs` | `--observer-request-timeout-ms` | `30000` |
 | `observer.defaultCaptureTimeoutMs` | `--observer-capture-timeout-ms` | `30000` |

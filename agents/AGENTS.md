@@ -115,25 +115,28 @@ template grants write access or replaces a tool call.
   hand-edit them casually.
 - Search with **asset_search** before choosing a game resource. Preserve
   prefab ancestry unless a standalone flattened copy is intentional.
-- **game_duplicate** currently supports `.et` prefabs only. With register=true
-  it requires a compatible Workbench that is already running; it does not
-  launch Workbench. Launch the exact target `.gproj` first or pass the matching
-  `gprojPath`.
+- **game_duplicate** supports `.et` prefabs only, loaded from extracted data,
+  loose game data, or PAK files. `.conf` copying is intentionally outside this
+  prefab-specific tool. With register=true it requires a compatible Workbench
+  that is already running; it does not launch Workbench. Launch the exact
+  target `.gproj` first or pass the matching `gprojPath`.
 - With `game_duplicate(register=false)`, the copied `.et` has a fresh internal
   entity ID but no registered resource GUID or Workbench-created `.meta` file.
   Registration does not require a GUID: after opening the exact destination
   project in Workbench, call **wb_resources** with `action: "register"` and the
-  copied file's absolute path. Workbench uses that path to create the `.meta`
-  file and assign the resource GUID. Verify the result with **wb_resources**
+  copied file's absolute path. **wb_resources** verifies that the existing file
+  belongs to the exact active project before Workbench creates the `.meta` file
+  and assigns the resource GUID. Verify the result with **wb_resources**
   `getInfo` or **wb_prefabs** `getGuid` before referencing the copy.
 - Resource registration is document-independent. A generic exact-owned
   Workbench with no open World Editor document can register loose resources;
   registration remains prohibited during actual Play mode.
 - A `game_duplicate(register=true)` result can be a recoverable partial
   success: the `.et` may have been written even though registration failed.
-  Preserve the file and register that existing absolute path with
-  **wb_resources**. Do not rerun **game_duplicate** at the same destination;
-  it refuses to overwrite an existing file.
+  Preserve the file, open its exact destination project, and register that
+  existing absolute path with **wb_resources**. Registration fails closed if
+  the path is outside the active project. Do not rerun **game_duplicate** at
+  the same destination; it refuses to overwrite an existing file.
 - Reopen and validate directly patched .et, .conf, and world resources in
   Workbench before treating them as usable. Prefer Workbench-created metadata.
 - Never reuse a project GUID, resource GUID, entity ID, or mod prefix from a
@@ -211,7 +214,8 @@ Inspect the capture itself and record what it proves and does not prove.
 ### Runtime capture
 
 1. Call **observer_prepare_launch** and retain its sessionId and
-   preparedLaunchId.
+   preparedLaunchId. Preparation assigns a session-specific `-logsDir`; do not
+   replace it.
 2. To let the MCP own the runtime, call **observer_runtime** with action=start,
    preparedLaunchId, and a unique idempotencyKey; retain its runtimeId.
    External launching may use the prepared argument array instead.
@@ -256,6 +260,13 @@ name, or runtimeId.
 - Review images before **observer_run** action=finalize. Finalization exports
   reviewed labels only to a configured allowlisted evidence root; use discard
   when no evidence should be retained.
+- For an exact-owned runtime capture selected for export, attach its correlated
+  runtime log semantically with `supportingFiles: [{ kind: "relevantLog",
+  label: "runtime", sourceCaptureLabel: "<captureLabel>" }]`. Observer resolves
+  only the private exact-generation grant for that capture's assigned
+  `script.log`; it does not allowlist the profile. Keep the `path` form for
+  logs beneath explicitly configured `supportingLogRoots`, including external
+  launches.
 - Before an MCP-owned runtime stop, wait for every job and camera restoration
   to reach terminal state. Then call **observer_runtime** action=stop with its
   runtimeId and a new idempotencyKey. Never stop by PID, process name, or broad
@@ -299,10 +310,11 @@ observed results, and remaining gaps. Never describe an unrun check as passed.
 | Symptom | Safe next step |
 |---|---|
 | **wb_connect** cannot reach Workbench | Confirm the NET API and target .gproj, then run **wb_diagnose**. |
+| **wb_build** reports `exitStatus.classification: "windows_exception"` | Treat it as a Workbench engine crash, not an output-attestation failure or usable build. Record `nativeStatus`/`exceptionName`, inspect the attributed log with **wb_log_query**, and do not retry automatically. |
 | A wb_* action reports an undefined API function | The companion is absent, stale, or incompatible. Run **wb_diagnose**, then launch the exact project through **wb_launch**. |
 | A component is Unknown or a script change is stale | Fix compile errors, save intentional work, and use **wb_restart**. Do not use **wb_reload** for game scripts. |
-| A duplicated resource has no usable GUID | Open the exact destination project in Workbench, then call **wb_resources** with `action: "register"` and the copied file's absolute path. Registration creates its `.meta` GUID; no GUID is needed as input. |
-| **game_duplicate** registration fails after copying | Keep the copied file and register its absolute path with **wb_resources**. Do not rerun **game_duplicate** at the occupied destination. |
+| A duplicated resource has no usable GUID | Open the exact destination project in Workbench, then call **wb_resources** with `action: "register"` and the copied file's absolute path. Registration verifies that the file is inside that active project and creates its `.meta` GUID; no GUID is needed as input. |
+| **game_duplicate** registration fails after copying | Keep the copied file, open its exact destination project, and register its absolute path with **wb_resources**. Do not rerun **game_duplicate** at the occupied destination. |
 | Observer capture is rejected for world binding | Re-run **observer_instances** immediately, select the renderer again, and copy its expectedWorldRevision. |
 | **observer_runtime** reports identity mismatch or stop is blocked | Preserve the receipt. Finish or cancel captures and wait for restoration; never terminate the process by PID or name. |
 

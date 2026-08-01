@@ -6,6 +6,30 @@ mixed tracker on 2026-07-28; same-day ties retain their migration order.
 
 ## Resolved defects
 
+### MCP-045 — `game_duplicate` source lookup could escape configured data roots
+
+**Status:** Resolved
+
+**Severity:** P1
+
+**Closed:** 2026-07-31
+
+**Resolution:** Game-resource references now pass through a shared normalizer
+that permits one valid resource GUID prefix but rejects absolute,
+drive-relative, traversing, empty-segment, malformed-GUID, and NUL-containing
+paths. Loose-file lookup resolves every direct and `Data`-prefixed candidate
+through link-safe canonical containment and requires a regular file, so callers
+such as prefab ancestry fail closed at the configured data-root boundary.
+`game_duplicate` validates the source before any read or destination write.
+
+**Verification:** Focused coverage passes 61/61 tests. It exercises accepted
+direct and `Data`-prefixed resources, traversal and absolute forms, malformed
+GUID prefixes, and a concrete `game_duplicate` sibling-file escape attempt that
+is rejected without creating a destination. The same run covers the associated
+PAK-leaf and deferred-registration hardening approved under MCP-031. The full
+repository test suite, typecheck, unused-code analysis, compiled MCP build, and
+fresh-process MCP verification also pass.
+
 ### MCP-042 - `wb_component` reports an added prefab component that `wb_save_resource` drops
 
 **Status:** Resolved

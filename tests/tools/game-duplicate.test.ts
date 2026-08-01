@@ -1,10 +1,12 @@
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { Config } from "../../src/config.js";
+import { PakVirtualFS } from "../../src/pak/vfs.js";
 import { registerGameDuplicate } from "../../src/tools/game-duplicate.js";
 import type { WorkbenchClient } from "../../src/workbench/client.js";
+import { buildTestPak } from "../support/pak-fixture.js";
 import { withTemporaryDirectory } from "../support/temporary-directory.js";
 
 interface ToolResult {
@@ -73,6 +75,7 @@ describe("game_duplicate contract", () => {
 
       expect(definition.description).toContain(".et");
       expect(definition.description).not.toContain(".conf");
+      expect(definition.description).toContain("PAK");
       expect(definition.description).toContain("never launches Workbench");
 
       return expect(handler({
@@ -85,6 +88,75 @@ describe("game_duplicate contract", () => {
         isError: true,
         content: [{ text: expect.stringContaining("only .et") }],
       });
+    });
+  });
+
+  it("rejects a traversing source before it can read outside extracted data", async () => {
+    await withTemporaryDirectory(async (root) => {
+      const { config, destination, gprojPath } = createPrefabFixture(root);
+      writeFileSync(
+        join(root, "outside.et"),
+        'Entity {\n ID "2222222222222222"\n}\n',
+        "utf8"
+      );
+      const call = vi.fn();
+      const { handler } = registeredTool(config, { call } as unknown as WorkbenchClient);
+
+      const result = await handler({
+        sourcePath: "../outside.et",
+        destPath: "Prefabs/Copied.et",
+        gprojPath,
+        flatten: false,
+        register: false,
+      });
+
+      expect(result).toMatchObject({
+        isError: true,
+        content: [{ text: expect.stringMatching(/invalid source path.*\.\./i) }],
+      });
+      expect(existsSync(destination)).toBe(false);
+      expect(call).not.toHaveBeenCalled();
+    });
+  });
+
+  it("duplicates a leaf prefab that exists only in base-game PAK data", async () => {
+    await withTemporaryDirectory(async (root) => {
+      const addon = join(root, "addons", "ExampleMod");
+      const gprojPath = join(addon, "ExampleMod.gproj");
+      const destination = join(addon, "Prefabs", "Copied.et");
+      const gamePath = join(root, "game");
+      const pakDirectory = join(gamePath, "addons", "data");
+      mkdirSync(addon, { recursive: true });
+      mkdirSync(pakDirectory, { recursive: true });
+      writeFileSync(gprojPath, "GameProject {}\n", "utf8");
+      writeFileSync(join(pakDirectory, "data.pak"), buildTestPak([{
+        path: "Prefabs/PakOnly.et",
+        content: 'GenericEntity {\n ID "1111111111111111"\n PAK_MARKER 42\n}\n',
+      }]));
+      const config: Config = {
+        ...createConfig(join(root, "missing-extracted")),
+        gamePath,
+      };
+      const call = vi.fn();
+      PakVirtualFS.invalidate();
+      try {
+        const { handler } = registeredTool(config, { call } as unknown as WorkbenchClient);
+        const result = await handler({
+          sourcePath: "{657590C1EC9E27D3}Prefabs/PakOnly.et",
+          destPath: "Prefabs/Copied.et",
+          gprojPath,
+          flatten: false,
+          register: false,
+        });
+
+        expect(result.isError).not.toBe(true);
+        expect(result.content[0]?.text).toContain("Prefab copied (not registered)");
+        expect(readFileSync(destination, "utf8")).toContain("PAK_MARKER 42");
+        expect(readFileSync(destination, "utf8")).not.toContain('ID "1111111111111111"');
+        expect(call).not.toHaveBeenCalled();
+      } finally {
+        PakVirtualFS.invalidate();
+      }
     });
   });
 
@@ -187,6 +259,8 @@ describe("game_duplicate contract", () => {
       expect(result.isError).not.toBe(true);
       expect(result.content[0]?.text).toContain("wb_resources");
       expect(result.content[0]?.text).toContain(destination);
+      expect(result.content[0]?.text).toContain("exact destination project");
+      expect(result.content[0]?.text).toContain("belongs to the active project");
       expect(result.content[0]?.text).not.toContain("call again with register=true");
       expect(existsSync(destination)).toBe(true);
       expect(call).not.toHaveBeenCalled();

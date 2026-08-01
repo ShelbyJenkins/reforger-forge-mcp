@@ -53,6 +53,7 @@ describe("observer MCP tools", () => {
       visit(capture!.inputSchema);
 
       const captureSchema = toolRegistry(coordinator).get("observer_capture")!.definition.inputSchema!;
+      const runSchema = toolRegistry(coordinator).get("observer_run")!.definition.inputSchema!;
       const view = captureSchema.view;
       expect(captureSchema.image.safeParse({ maxWidth: 1920, format: "webp", quality: 75 }).success).toBe(true);
       expect(captureSchema.image.safeParse({ format: "png", quality: 75 }).success).toBe(false);
@@ -60,6 +61,22 @@ describe("observer MCP tools", () => {
       expect(captureSchema.performancePolicy.safeParse("performance").success).toBe(false);
       expect(captureSchema.performancePolicy.safeParse("instrumented").success).toBe(true);
       expect(captureSchema.runId.safeParse("20260717T184233Z-a1b2c3d4").success).toBe(true);
+      expect(runSchema.supportingFiles.safeParse([{
+        kind: "relevantLog",
+        label: "runtime",
+        sourceCaptureLabel: "overview",
+      }]).success).toBe(true);
+      expect(runSchema.supportingFiles.safeParse([{
+        kind: "relevantLog",
+        label: "runtime",
+        path: "C:\\logs\\script.log",
+      }]).success).toBe(true);
+      expect(runSchema.supportingFiles.safeParse([{
+        kind: "relevantLog",
+        label: "runtime",
+        sourceCaptureLabel: "overview",
+        path: "C:\\caller-cannot-mint\\script.log",
+      }]).success).toBe(false);
       expect(view.safeParse({
         kind: "pose",
         position: [1, 2, 3],

@@ -84,7 +84,15 @@ describe("standalone Workbench lifecycle runner", () => {
         bundleDigest: harness.companion.bundleDigest,
       },
       logDirectory: join(harness.logRoot, "editor-run"),
-      exitStatus: { reason: "exited", exitCode: 0, signal: null, timedOut: false },
+      exitStatus: {
+        reason: "exited",
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        classification: "success",
+        nativeStatus: null,
+        exceptionName: null,
+      },
     });
     expect(JSON.stringify(receipt)).not.toContain("reforgerForgeOwnerToken");
     expect(childSupervisor.counts()).toEqual({ active: 0, reconciling: 0, total: 0 });

@@ -1,5 +1,6 @@
-import { existsSync, readdirSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { existsSync, readdirSync, statSync } from "node:fs";
+import { dirname, isAbsolute, join, posix, win32 } from "node:path";
+import { resolveManagedPath } from "../foundation/managed-path.js";
 import { canonicalizeGproj } from "../workbench/project-identity.js";
 
 export const ADDON_TARGET_REQUIRED = "ADDON_TARGET_REQUIRED";
@@ -26,6 +27,55 @@ export interface ActiveProjectProvider {
   activeProjectGprojPath(): Promise<string | null>;
 }
 
+export class GameResourcePathError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "GameResourcePathError";
+  }
+}
+
+/** Normalize one optional GUID-prefixed relative game-resource path. */
+export function normalizeGameResourcePath(reference: string): string {
+  if (typeof reference !== "string" || reference.length === 0 || reference !== reference.trim()) {
+    throw new GameResourcePathError("Game resource path must be a nonempty trimmed string.");
+  }
+
+  let bare = reference;
+  if (bare.startsWith("{")) {
+    const guid = /^\{[0-9A-Fa-f]{16}\}/.exec(bare);
+    if (!guid) {
+      throw new GameResourcePathError(
+        "Game resource path has an invalid GUID prefix; expected exactly 16 hexadecimal digits."
+      );
+    }
+    bare = bare.slice(guid[0].length);
+    if (bare.startsWith("{")) {
+      throw new GameResourcePathError("Game resource path may contain at most one GUID prefix.");
+    }
+  }
+
+  const normalized = bare.replace(/\\/g, "/");
+  if (
+    normalized.length === 0 ||
+    isAbsolute(bare) ||
+    posix.isAbsolute(normalized) ||
+    win32.isAbsolute(bare) ||
+    /^[A-Za-z]:/.test(bare) ||
+    normalized.includes("\0")
+  ) {
+    throw new GameResourcePathError("Game resource path must be relative to configured game data.");
+  }
+
+  const segments = normalized.split("/");
+  if (segments.some((segment) => segment === "" || segment === "." || segment === "..")) {
+    throw new GameResourcePathError(
+      "Game resource path must be normalized and cannot contain empty, '.' or '..' segments."
+    );
+  }
+
+  return segments.join("/");
+}
+
 /**
  * Resolve the game data directory (loose/extracted files).
  * Tries gamePath/addons/data first (standard Steam install), then gamePath/addons.
@@ -43,16 +93,32 @@ export function resolveGameDataPath(gamePath: string): string | null {
  * Handles paths with DataXXX prefix ("Data006/Prefabs/...") and bare paths ("Prefabs/...").
  */
 export function findLooseFile(gameDataPath: string, relativePath: string): string | null {
-  const direct = join(gameDataPath, relativePath);
-  if (existsSync(direct)) return direct;
+  let normalized: string;
+  try {
+    normalized = normalizeGameResourcePath(relativePath);
+  } catch {
+    return null;
+  }
 
-  if (!relativePath.startsWith("Data")) {
+  const containedFile = (candidate: string): string | null => {
+    try {
+      const resolved = resolveManagedPath(gameDataPath, candidate, "link-safe");
+      return existsSync(resolved) && statSync(resolved).isFile() ? resolved : null;
+    } catch {
+      return null;
+    }
+  };
+
+  const direct = containedFile(join(gameDataPath, ...normalized.split("/")));
+  if (direct) return direct;
+
+  if (!/^Data/i.test(normalized.split("/", 1)[0] ?? "")) {
     try {
       const entries = readdirSync(gameDataPath, { withFileTypes: true });
       for (const entry of entries) {
         if (!entry.isDirectory() || !entry.name.startsWith("Data")) continue;
-        const candidate = join(gameDataPath, entry.name, relativePath);
-        if (existsSync(candidate)) return candidate;
+        const candidate = containedFile(join(gameDataPath, entry.name, ...normalized.split("/")));
+        if (candidate) return candidate;
       }
     } catch {
       // ignore

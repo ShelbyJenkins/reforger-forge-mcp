@@ -24,12 +24,15 @@ describe("observer launch preparation", () => {
       profilePath: profile,
       addonSearchRoot: search,
       stagedAddonPath: addon,
+      logsDirectoryName: "observer-test-session",
       forceUpdate: false,
       noFocus: false,
     });
     expect(result.slice(0, 3)).toEqual(["-client", "-someFlag", "value"]);
     expect(result.filter((value) => value.toLowerCase() === "-addonsdir")).toHaveLength(1);
     expect(result.filter((value) => value.toLowerCase() === "-profile")).toHaveLength(1);
+    expect(result.slice(result.indexOf("-logsDir"), result.indexOf("-logsDir") + 2))
+      .toEqual(["-logsDir", "observer-test-session"]);
     expect(result).not.toContain("-forceUpdate");
     expect(result).not.toContain("-noFocus");
     expect(result.some((value) => value.startsWith('"'))).toBe(false);
@@ -44,9 +47,31 @@ describe("observer launch preparation", () => {
     const search = join(root, "search");
     const addon = join(search, "ReforgerForgeObserver");
     [profile, otherProfile, addon].forEach((path) => mkdirSync(path, { recursive: true }));
-    expect(() => mergeLaunchArguments({ arguments: ["-profile", otherProfile], profilePath: profile, addonSearchRoot: search, stagedAddonPath: addon, forceUpdate: false, noFocus: false }))
+    expect(() => mergeLaunchArguments({ arguments: ["-profile", otherProfile], profilePath: profile, addonSearchRoot: search, stagedAddonPath: addon, logsDirectoryName: "observer-test-session", forceUpdate: false, noFocus: false }))
       .toThrowError(expect.objectContaining({ code: "PROFILE_CONFLICT" }));
     });
+  });
+
+  it("refuses caller-supplied -logsDir authority, including absolute paths", async () => {
+    await withTemporaryDirectory((root) => {
+      const profile = join(root, "profiles", "one");
+      const search = join(root, "search");
+      const addon = join(search, "ReforgerForgeObserver");
+      mkdirSync(profile, { recursive: true });
+      mkdirSync(addon, { recursive: true });
+      expect(() => mergeLaunchArguments({
+        arguments: ["-logsDir", join(root, "caller-logs")],
+        profilePath: profile,
+        addonSearchRoot: search,
+        stagedAddonPath: addon,
+        logsDirectoryName: "observer-test-session",
+        forceUpdate: false,
+        noFocus: false,
+      })).toThrowError(expect.objectContaining({
+        code: "ARGUMENT_CONFLICT",
+        message: expect.stringContaining("assigns its own session-specific -logsDir"),
+      }));
+    }, { prefix: "rfo-logs-dir-conflict-" });
   });
 
   it("defaults to appending both -forceUpdate and -noFocus when requested", async () => {
@@ -61,6 +86,7 @@ describe("observer launch preparation", () => {
         profilePath: profile,
         addonSearchRoot: search,
         stagedAddonPath: addon,
+        logsDirectoryName: "observer-test-session",
         forceUpdate: true,
         noFocus: true,
       });
@@ -81,6 +107,7 @@ describe("observer launch preparation", () => {
         profilePath: profile,
         addonSearchRoot: search,
         stagedAddonPath: addon,
+        logsDirectoryName: "observer-test-session",
         forceUpdate: false,
         noFocus: false,
       });
@@ -114,6 +141,7 @@ describe("observer launch preparation", () => {
         profilePath: profile,
         addonSearchRoot: observerRoot,
         stagedAddonPath: observerAddon,
+        logsDirectoryName: "observer-test-session",
         forceUpdate: false,
         noFocus: false,
       });
@@ -211,6 +239,10 @@ describe("observer launch preparation", () => {
     const observerDirectory = join(launchProfile, "profile", SESSION_DIRECTORY_NAME);
     expect(first.arguments[first.arguments.indexOf("-profile") + 1]).toBe(launchProfile);
     expect(first.session.contractPath).toBe(join(observerDirectory, SESSION_CONTRACT_NAME));
+    const logsDirectoryName = `observer-${first.session.sessionId}`;
+    expect(first.arguments.slice(first.arguments.indexOf("-logsDir"), first.arguments.indexOf("-logsDir") + 2))
+      .toEqual(["-logsDir", logsDirectoryName]);
+    expect(existsSync(join(launchProfile, "profile", "logs", logsDirectoryName))).toBe(true);
     expect(existsSync(join(launchProfile, SESSION_DIRECTORY_NAME))).toBe(false);
     expect(existsSync(join(observerDirectory, "captures"))).toBe(true);
 

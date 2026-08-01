@@ -171,11 +171,77 @@ export interface WorkbenchBuildIntent {
 
 export type WorkbenchRunnerIntent = WorkbenchEditorIntent | WorkbenchBuildIntent;
 
-export interface WorkbenchRunnerExitStatus {
+export type WorkbenchRunnerExitClassification =
+  | "success"
+  | "nonzero_exit"
+  | "windows_exception"
+  | "signal"
+  | "timed_out"
+  | "aborted"
+  | "unknown";
+
+export interface WorkbenchRunnerExitEvidence {
   reason: "exited" | "timed_out" | "aborted";
   exitCode: number | null;
   signal: NodeJS.Signals | null;
   timedOut: boolean;
+}
+
+export interface WorkbenchRunnerExitStatus extends WorkbenchRunnerExitEvidence {
+  classification: WorkbenchRunnerExitClassification;
+  nativeStatus: string | null;
+  exceptionName: string | null;
+}
+
+function windowsExceptionName(unsignedCode: number): string | null {
+  switch (unsignedCode) {
+    case 0xC0000005: return "STATUS_ACCESS_VIOLATION";
+    case 0xC000001D: return "STATUS_ILLEGAL_INSTRUCTION";
+    case 0xC0000094: return "STATUS_INTEGER_DIVIDE_BY_ZERO";
+    case 0xC0000096: return "STATUS_PRIVILEGED_INSTRUCTION";
+    case 0xC00000FD: return "STATUS_STACK_OVERFLOW";
+    case 0xC0000374: return "STATUS_HEAP_CORRUPTION";
+    case 0xC0000409: return "STATUS_STACK_BUFFER_OVERRUN";
+    case 0xE06D7363: return "MSVC_CPP_EXCEPTION";
+    default: return null;
+  }
+}
+
+/** Add stable diagnostic meaning without changing the native completion evidence. */
+export function classifyWorkbenchExitStatus(
+  evidence: Readonly<WorkbenchRunnerExitEvidence>
+): WorkbenchRunnerExitStatus {
+  let classification: WorkbenchRunnerExitClassification;
+  let nativeStatus: string | null = null;
+  let exceptionName: string | null = null;
+
+  if (evidence.reason === "timed_out") {
+    classification = "timed_out";
+  } else if (evidence.reason === "aborted") {
+    classification = "aborted";
+  } else if (evidence.signal !== null) {
+    classification = "signal";
+  } else if (evidence.exitCode === 0) {
+    classification = "success";
+  } else if (evidence.exitCode !== null) {
+    const unsignedCode = evidence.exitCode >>> 0;
+    if (unsignedCode >= 0xC0000000) {
+      classification = "windows_exception";
+      nativeStatus = `0x${unsignedCode.toString(16).toUpperCase().padStart(8, "0")}`;
+      exceptionName = windowsExceptionName(unsignedCode);
+    } else {
+      classification = "nonzero_exit";
+    }
+  } else {
+    classification = "unknown";
+  }
+
+  return {
+    ...evidence,
+    classification,
+    nativeStatus,
+    exceptionName,
+  };
 }
 
 export interface WorkbenchEditorReceipt {
@@ -995,7 +1061,7 @@ async function runTargetBuildStage(args: TargetBuildStageArgs): Promise<Workbenc
     logDirectory,
     output,
     validationFailure,
-    exitStatus: run.exitStatus,
+    exitStatus: classifyWorkbenchExitStatus(run.exitStatus),
   };
 }
 
@@ -1310,7 +1376,7 @@ async function runWorkbenchIntentWithExecution(
     endpointOwnership: "verified",
     companionIdentity: run.qualification,
     logDirectory,
-    exitStatus: run.exitStatus,
+    exitStatus: classifyWorkbenchExitStatus(run.exitStatus),
   };
 
 }

@@ -153,6 +153,9 @@ describe("hermetic target-build acceptance", () => {
         exitCode: 0,
         signal: null,
         timedOut: false,
+        classification: "success",
+        nativeStatus: null,
+        exceptionName: null,
       },
     } satisfies WorkbenchBuildReceipt;
 

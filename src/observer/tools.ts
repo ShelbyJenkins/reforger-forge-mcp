@@ -396,7 +396,7 @@ export function registerObserverTools(
     "observer_run",
     {
       description:
-        "Manage a bounded observation run. begin creates external managed run storage; status reports capture labels and artifact availability; finalize requires runId, includeCaptureLabels, and review, then writes a standardized reviewed bundle beneath an allowlisted configured evidence root without overwriting; discard releases retained artifacts and removes run work.",
+        "Manage a bounded observation run. begin creates external managed run storage; status reports capture labels and artifact availability; finalize requires runId, includeCaptureLabels, and review, then writes a standardized reviewed bundle beneath an allowlisted configured evidence root without overwriting. Relevant logs may use an allowlisted path or the private exact-owned runtime grant of a selected completed capture. discard releases retained artifacts and removes run work.",
       inputSchema: {
         action: z.enum(["begin", "status", "finalize", "discard"]),
         runId: z.string().regex(/^\d{8}T\d{6}Z-[a-f0-9]{8}$/).optional(),
@@ -420,11 +420,20 @@ export function registerObserverTools(
           configurationId: z.string().min(1).max(128),
           values: z.record(z.string(), z.union([z.string(), z.number().finite(), z.boolean(), z.null()])),
         }).optional(),
-        supportingFiles: z.array(z.object({
-          kind: z.literal("relevantLog"),
-          label: z.string().min(1).max(128),
-          path: z.string().min(1).max(32_768),
-        })).max(16).optional(),
+        supportingFiles: z.array(z.union([
+          z.object({
+            kind: z.literal("relevantLog"),
+            label: z.string().min(1).max(128),
+            path: z.string().min(1).max(32_768),
+          }).strict(),
+          z.object({
+            kind: z.literal("relevantLog"),
+            label: z.string().min(1).max(128),
+            sourceCaptureLabel: z.string().min(1).max(128),
+          }).strict(),
+        ])).max(16).optional().describe(
+          "Relevant logs: use path only beneath a configured supportingLogRoot, or sourceCaptureLabel for the exact assigned script.log of a selected completed exact-owned runtime capture."
+        ),
         releaseManagedArtifacts: z.boolean().default(true),
       },
     },

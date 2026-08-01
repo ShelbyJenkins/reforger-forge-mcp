@@ -9,10 +9,10 @@ the home for the larger future idea: generated, mechanically checked public API
 reference artifacts.
 Implementation changes corresponding to `MCP-005`, `MCP-011`, `MCP-012`, and
 `MCP-013` have been made. The Observer world-binding contract was approved in
-`MCP-029`; exact addon targeting was approved in `MCP-030`, while the
-duplication contract remains under review in `MCP-031`. Historical-document handling is recorded in
-`MCP-026`; the remaining API-reference work is tracked as `MCP-027` and
-`MCP-028`.
+`MCP-029`; exact addon targeting was approved in `MCP-030`, and the `.et`-only
+duplication contract was approved in `MCP-031`. Historical-document handling
+is recorded in `MCP-026`; the remaining API-reference work is tracked as
+`MCP-027` and `MCP-028`.
 
 ## Goal
 
@@ -44,9 +44,14 @@ closed:
    `defaultMod`, container scanning, and their CLI flags are removed.
    Addon-scoped tools use an exact `gprojPath` or the verified running
    Workbench lifecycle target.
-2. **Game duplication scope (`MCP-031`).** `game_duplicate` now supports only `.et`
-   prefabs, validates both extensions, and requires an already-running
-   compatible Workbench when registration is requested.
+2. **Game duplication scope (`MCP-031`).** `game_duplicate` supports only `.et`
+   prefabs, validates both extensions, reads source prefabs from extracted,
+   loose, or PAK-backed data, and requires an already-running compatible
+   Workbench when registration is requested. Offline copies remain supported;
+   deferred `wb_resources(register)` recovery requires an absolute existing
+   resource path contained by the exact active project. `.conf` copying is a
+   separate future enhancement because it does not use prefab ancestry and
+   entity-ID transformations.
 3. **Release history.** The relevant release notes are explicitly labeled as
    historical records; current MCP schemas and guides are the live reference.
 

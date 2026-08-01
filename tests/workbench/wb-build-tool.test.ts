@@ -10,6 +10,7 @@ import type { WorkbenchCompanionProvider } from "../../src/workbench/helper-addo
 import type { WorkbenchLifecycleExecutionPort } from "../../src/workbench/lifecycle-execution.js";
 import type { WorkbenchProcessGuard } from "../../src/workbench/process-guard.js";
 import {
+  classifyWorkbenchExitStatus,
   WorkbenchRunnerError,
   type WorkbenchBuildReceipt,
   type WorkbenchRunnerDependencies,
@@ -86,12 +87,12 @@ function receipt(
       resourceDatabaseSha256: "c".repeat(64),
     },
     validationFailure: null,
-    exitStatus: {
+    exitStatus: classifyWorkbenchExitStatus({
       reason: "exited",
       exitCode: 0,
       signal: null,
       timedOut: false,
-    },
+    }),
     ...overrides,
   };
 }
@@ -189,6 +190,7 @@ describe("wb_build MCP tool", () => {
     );
     const schema = tool.definition.inputSchema!;
 
+    expect(tool.definition.description).toMatch(/Windows exceptions/i);
     expect(schema.gprojPath.safeParse(undefined).success).toBe(false);
     expect(schema.gprojPath.safeParse("").success).toBe(false);
     expect(schema.gprojPath.safeParse("C:\\mods\\OPZO\\OPZO.gproj").success).toBe(true);
@@ -373,12 +375,12 @@ describe("wb_build MCP tool", () => {
           await releaseCleanup.promise;
           return receipt({
             output: null,
-            exitStatus: {
+            exitStatus: classifyWorkbenchExitStatus({
               reason: "aborted",
               exitCode: null,
               signal: null,
               timedOut: false,
-            },
+            }),
           });
         },
         {}
@@ -416,12 +418,21 @@ describe("wb_build MCP tool", () => {
     const cases = [
       receipt({
         output: null,
-        exitStatus: {
+        exitStatus: classifyWorkbenchExitStatus({
           reason: "exited",
           exitCode: 7,
           signal: null,
           timedOut: false,
-        },
+        }),
+      }),
+      receipt({
+        output: null,
+        exitStatus: classifyWorkbenchExitStatus({
+          reason: "exited",
+          exitCode: 0xC0000005,
+          signal: null,
+          timedOut: false,
+        }),
       }),
       receipt({
         output: null,

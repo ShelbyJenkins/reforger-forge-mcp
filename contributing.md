@@ -22,7 +22,14 @@ to each supported client.
 4. Build: `npm run build`
 5. Verify the MCP server: `npm run mcp:verify` (add `-- --config <path>` only
    when testing an explicit override)
-6. Open a pull request
+6. Refresh the MCP server in the AI client, or restart the client, before
+   testing the rebuilt code through that client
+7. Open a pull request
+
+An already-running stdio MCP process does not reload files changed by
+`npm run build`. The verification command starts a separate fresh process; it
+does not update the server already connected to an AI client. `wb_restart`
+restarts only an MCP-owned Workbench process, not the MCP server.
 
 For Observer architecture, maintainer validation, and technical
 troubleshooting, see [observer/README.md](observer/README.md).

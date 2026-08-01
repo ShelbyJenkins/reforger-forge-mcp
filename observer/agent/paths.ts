@@ -43,6 +43,22 @@ export interface EngineProfileDirectoryOptions {
   requireExisting?: boolean;
 }
 
+export interface ManagedRuntimeLogLocation {
+  /** Relative `-logsDir` value resolved by Enfusion beneath `$profile:/logs`. */
+  logsDirectoryName: string;
+  /** Canonical session-specific directory that may contain runtime diagnostics. */
+  directory: string;
+  /** The sole runtime log eligible for automatic evidence admission. */
+  scriptLogPath: string;
+}
+
+export interface ManagedRuntimeLogLocationOptions {
+  /** Create the session-specific logs directory during launch preparation. */
+  create?: boolean;
+  /** Require the already-prepared directory without creating it. */
+  requireExisting?: boolean;
+}
+
 export function isPathContained(root: string, candidate: string): boolean {
   return foundationIsPathContained(root, candidate);
 }
@@ -96,6 +112,41 @@ export function resolveEngineProfileDirectory(
     return canonical;
   }
   return candidate;
+}
+
+/** Resolve the exact script log assigned to one prepared observer session. */
+export function resolveManagedRuntimeLogLocation(
+  launchProfilePath: string,
+  sessionId: string,
+  options: ManagedRuntimeLogLocationOptions = {}
+): ManagedRuntimeLogLocation {
+  assertIdentifier(sessionId, "Session ID");
+  const launchProfile = canonicalizeExistingDirectory(launchProfilePath, "Launch profile root");
+  const engineProfile = resolveEngineProfileDirectory(launchProfile, {
+    create: options.create,
+    requireExisting: options.requireExisting,
+  });
+  const logsRootCandidate = join(engineProfile, "logs");
+  assertManagedPath(engineProfile, logsRootCandidate);
+  const logsRoot = options.create
+    ? ensureCanonicalDirectory(logsRootCandidate)
+    : options.requireExisting
+      ? canonicalizeExistingDirectory(logsRootCandidate, "Engine logs directory")
+      : logsRootCandidate;
+  assertManagedPath(engineProfile, logsRoot);
+
+  const logsDirectoryName = `observer-${sessionId}`;
+  const directoryCandidate = join(logsRoot, logsDirectoryName);
+  assertManagedPath(logsRoot, directoryCandidate);
+  const directory = options.create
+    ? ensureCanonicalDirectory(directoryCandidate)
+    : options.requireExisting
+      ? canonicalizeExistingDirectory(directoryCandidate, "Observer runtime logs directory")
+      : directoryCandidate;
+  assertManagedPath(logsRoot, directory);
+  const scriptLogPath = join(directory, "script.log");
+  assertManagedPath(directory, scriptLogPath);
+  return { logsDirectoryName, directory, scriptLogPath };
 }
 
 export function assertManagedPath(rootPath: string, candidatePath: string): string {

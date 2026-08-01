@@ -30,7 +30,7 @@ put caller logging on stderr or in a separate file.
 | Exit code | Meaning |
 |---|---|
 | `0` | The requested intent completed successfully. For a build, this also means output attestation succeeded and `validationFailure` is `null`. |
-| `1` | A build exited zero but failed output attestation, an ordinary runner error occurred, or the child returned/fell back to exit code `1`. |
+| `1` | A build exited zero but failed output attestation, an ordinary runner error occurred, the child returned/fell back to exit code `1`, or a native status could not be represented as a portable CLI exit code. |
 | `124` | The runner timed out the intent. |
 | `130` | The invocation was aborted. |
 | `2`–`255` | The child process's ordinary exit code, passed through unchanged. |
@@ -78,8 +78,8 @@ expected by the running MCP; a wrapper does not need to re-check them.
 | `processOwnership` | `"verified"` | Exact process ownership was proven by the runner. |
 | `endpointVacancy` | `"verified"` | The Workbench endpoint was proven vacant for the target-build reservation and spawn. |
 | `logDirectory` | string | Attributed target-build log directory; optional diagnostic evidence. |
-| `output` | object or `null` | Non-null on exit `0`; the fresh-output proof is described below. |
-| `validationFailure` | object or `null` | `null` on exit `0`; an `OUTPUT_ATTESTATION_FAILED` object maps an otherwise zero native exit to CLI exit `1`. |
+| `output` | object or `null` | Non-null only after a zero native exit and successful fresh-output attestation; the proof is described below. |
+| `validationFailure` | object or `null` | An `OUTPUT_ATTESTATION_FAILED` object maps an otherwise zero native exit to CLI exit `1`; native process failures leave this field `null`. |
 | `exitStatus` | object | The native completion status already mapped to the CLI exit code. |
 
 `targetAddon` contains strings `addonId`, `addonGuid`, and `sourceSha256`.
@@ -98,9 +98,19 @@ When present, `validationFailure` contains the literal code
 `"OUTPUT_ATTESTATION_FAILED"` and a string `message`.
 
 `exitStatus` has `reason` (`"exited"`, `"timed_out"`, or `"aborted"`),
-`exitCode` (number or `null`), `signal` (string or `null`), and `timedOut`
-(boolean). It is receipt evidence for logging and diagnosis; use the process
-exit code rather than reimplementing this mapping in a wrapper.
+`exitCode` (number or `null`), `signal` (string or `null`), `timedOut`
+(boolean), and a derived `classification`. The classification is one of
+`success`, `nonzero_exit`, `windows_exception`, `signal`, `timed_out`,
+`aborted`, or `unknown`.
+
+For a Windows error-status exit, `nativeStatus` contains a normalized unsigned
+eight-digit value such as `0xC0000005`; otherwise it is `null`. The nullable
+`exceptionName` supplies a known symbolic name, such as
+`STATUS_ACCESS_VIOLATION`. These fields distinguish a native crash from an
+ordinary validation failure without changing the original exit evidence. Do
+not automatically retry `windows_exception`: inspect the attributed log and
+the failing project or engine state first. The runner does not collect Windows
+crash dumps or their potentially private contents.
 
 ## Guarantees and redundant checks
 

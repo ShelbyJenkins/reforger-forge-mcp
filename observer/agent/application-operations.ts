@@ -379,7 +379,19 @@ export class ObserverApplicationOperations {
     if (name === "runReserveCapture") return app.runs.reserveCapture(payload as never);
     if (name === "runBindCapture") return app.runs.bindCapture(payload as never);
     if (name === "runFailCapture") return app.runs.failCapture(requiredString(payload, "runId"), requiredString(payload, "captureLabel"), requiredString(payload, "code"), requiredString(payload, "message"));
-    if (name === "runCompleteCapture") return app.runs.completeCapture(requiredString(payload, "runId"), requiredString(payload, "captureLabel"));
+    if (name === "runCompleteCapture") {
+      const runId = requiredString(payload, "runId");
+      const captureLabel = requiredString(payload, "captureLabel");
+      const binding = app.runs.captureEvidenceBinding(runId, captureLabel);
+      const grant = binding.runtimeLogEvidenceGrant ?? (binding.backend === "runtime" && binding.sessionId
+        ? app.server.createRuntimeLogEvidenceGrant(
+          binding.runId,
+          binding.captureLabel,
+          binding.sessionId
+        )
+        : null);
+      return app.runs.completeCapture(runId, captureLabel, grant ?? undefined);
+    }
     if (name === "runFinalize") return app.runs.finalize(payload as never);
     if (name === "runDiscard") return app.runs.discard(requiredString(payload, "runId"));
     if (name === "assertJobReleaseAllowed") {

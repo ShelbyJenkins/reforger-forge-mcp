@@ -15,6 +15,11 @@ import { InstanceRegistry, type RegistryDurableMutation } from "./registry.js";
 import { ObserverRuntimeApi } from "./runtime-api.js";
 import { ObserverRunStore } from "./runs.js";
 import type { ObserverApplicationOperations, ObserverApplicationOperationName } from "./application-operations.js";
+import { resolveManagedRuntimeLogLocation } from "./paths.js";
+import {
+  type RuntimeLogEvidenceGrant,
+  validateRuntimeLogEvidenceGrant,
+} from "./runtime-log-evidence.js";
 import {
   OwnedRuntimeAuthorityStore,
   type OwnedRuntimeRecoveryAuthority,
@@ -448,6 +453,58 @@ export class ObserverAgentServer {
       );
     }
     return true;
+  }
+
+  /**
+   * Mint private evidence authority only from a currently retained exact-owned
+   * runtime. Absence is an ordinary externally launched session, never a grant.
+   */
+  createRuntimeLogEvidenceGrant(
+    runId: string,
+    captureLabel: string,
+    sessionId: string
+  ): RuntimeLogEvidenceGrant | null {
+    const matchingPins = [...this.ownedRuntimeLifecyclePins.values()]
+      .filter((pin) => pin.sessionId === sessionId);
+    if (matchingPins.length > 1) {
+      throw new ObserverError(
+        "SESSION_UNVERIFIABLE",
+        "Observer session has ambiguous exact runtime authority",
+        409
+      );
+    }
+    const pin = matchingPins[0];
+    const durable = pin
+      ? this.ownedRuntimeAuthorities.read(pin.runtimeId)
+      : this.ownedRuntimeAuthorities.retainedForSession(sessionId);
+    if (!durable) return null;
+    if (durable.state !== "retained" ||
+        !("preparedLaunchId" in durable.authority) ||
+        durable.authority.sessionId !== sessionId ||
+        (pin && (durable.authority.runtimeId !== pin.runtimeId ||
+          durable.authority.generation !== pin.generation))) {
+      throw new ObserverError(
+        "SESSION_UNVERIFIABLE",
+        "Exact runtime log authority is missing or no longer retained",
+        409
+      );
+    }
+    const session = this.control.sessions.peek(sessionId);
+    if (session) this.assertOwnedRuntimeSessionBinding(session, durable.authority);
+    const runtimeLog = resolveManagedRuntimeLogLocation(durable.authority.profilePath, sessionId, {
+      requireExisting: true,
+    });
+    return validateRuntimeLogEvidenceGrant({
+      version: 1,
+      runId,
+      captureLabel,
+      sessionId,
+      runtimeId: durable.authority.runtimeId,
+      generation: durable.authority.generation,
+      profilePath: durable.authority.profilePath,
+      scriptLogPath: runtimeLog.scriptLogPath,
+      grantedAt: new Date(this.options.clock?.now() ?? Date.now()).toISOString(),
+    });
   }
 
   /**

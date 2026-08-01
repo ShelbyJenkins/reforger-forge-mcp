@@ -75,7 +75,10 @@ Keep the returned `runId`. Every capture belongs to one open run and every
 Call `observer_prepare_launch` with the normal graphical runtime arguments and
 an exclusive, Observer-approved outer `profilePath`. It returns prepared
 argument tokens, an opaque `preparedLaunchId`, and session metadata. Preparation
-does not start the game.
+does not start the game. It also assigns one relative, session-specific
+`-logsDir` whose physical log is
+`<profilePath>/profile/logs/observer-<sessionId>/script.log`; caller-supplied
+`-logsDir` values are refused.
 
 Preparation defaults `noFocus` and `forceUpdate` to true. Leave `-window` out
 to retain the engine's fullscreen default without stealing startup focus; add
@@ -222,6 +225,11 @@ been reviewed or cannot support a conclusion.
     "outcome": "Passed",
     "summary": "Reviewed the bound runtime image against VEH-DAMAGE-01."
   },
+  "supportingFiles": [{
+    "kind": "relevantLog",
+    "label": "runtime",
+    "sourceCaptureLabel": "vehicle-damaged-runtime-current"
+  }],
   "releaseManagedArtifacts": true
 }
 ```
@@ -233,9 +241,18 @@ explicitly. Finalization creates `<evidenceRoot>/<runId>/` with `RESULT.md`,
 extension. It does not overwrite
 an existing bundle.
 
-Optionally include sanitized runtime configuration and approved relevant text
-logs. Supporting logs must be under a configured supporting-log root. If the
-run should produce no bundle, use `observer_run action: "discard"` instead.
+For a selected, completed runtime capture started through `observer_runtime`,
+the semantic `sourceCaptureLabel` form above resolves only the private durable
+grant for that exact runtime generation and its assigned `script.log`. The
+profile directory is not added to an allowlist, and Workbench, unselected,
+external, or otherwise unowned captures cannot mint this authority.
+
+The existing `path` form remains available for regular text logs beneath an
+explicitly configured `observer.supportingLogRoots` entry. Use that form for
+external launches and operator-managed logs. Both forms receive the same size,
+UTF-8, redaction, regular-file, link, and identity-change checks before the
+copied log is hashed into `manifest.json`. If the run should produce no bundle,
+use `observer_run action: "discard"` instead.
 
 ## Clean up safely
 
@@ -266,6 +283,7 @@ then follow the normal owner-scoped editor shutdown process.
 | Runtime capture rejects a missing session | Supply the `sessionId` from `observer_prepare_launch`; do not use the runtime lifecycle ID as a substitute. |
 | An image cannot be read inline | Leave it managed and finalize the run; oversized images are intentionally not exposed by private path. |
 | Finalization is unavailable or ambiguous | Configure an evidence root, or provide the chosen root when several are allowlisted. |
+| Semantic runtime log admission is refused | Select the completed runtime capture for export and confirm it came from the exact process started by `observer_runtime`. For external launches, configure a narrow supporting-log root and use the `path` form. |
 | Managed runtime stop reports a busy camera | Cancel or finish the captures, wait for terminal restoration through `observer_job`, then retry the same stop operation with an appropriate bound. |
 | Runtime status is `identity_mismatch`, `unverifiable`, or `stale` | Do not terminate by PID or name. Preserve the receipt and investigate the configured executable, owner identity, and lifecycle state. |
 

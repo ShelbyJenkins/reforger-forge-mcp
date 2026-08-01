@@ -1,4 +1,5 @@
-import { readFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -6,6 +7,7 @@ import { registerWbEditorTools } from "../../src/tools/wb-editor.js";
 import { registerWbPrefabs } from "../../src/tools/wb-prefabs.js";
 import { registerWbResources } from "../../src/tools/wb-resources.js";
 import type { WorkbenchClient } from "../../src/workbench/client.js";
+import { withTemporaryDirectory } from "../support/temporary-directory.js";
 
 interface ToolResult {
   content: Array<{ type: string; text: string }>;
@@ -45,39 +47,60 @@ function helperErrorClient(message: string): {
 
 describe("Workbench helper status propagation", () => {
   it("registers from a generic no-document session with an operation-specific deadline", async () => {
-    const call = vi.fn(async (apiFunc: string) => {
-      if (apiFunc === "EMCP_WB_GetState") return { mode: "no_world_editor" };
-      return { status: "ok", message: "Resource registered" };
-    });
-    const client = {
-      state: { connected: true, mode: "unknown", lastUpdated: Date.now() },
-      call,
-    } as unknown as WorkbenchClient;
-    const handler = registeredTools(registerWbResources, client).get("wb_resources");
+    await withTemporaryDirectory(async (root) => {
+      const addon = join(root, "Example");
+      const gprojPath = join(addon, "Example.gproj");
+      const resourcePath = join(addon, "New.et");
+      mkdirSync(addon, { recursive: true });
+      writeFileSync(gprojPath, "GameProject {}\n", "utf8");
+      writeFileSync(resourcePath, "GenericEntity {}\n", "utf8");
+      const call = vi.fn(async (apiFunc: string) => {
+        if (apiFunc === "EMCP_WB_GetState") return { mode: "no_world_editor" };
+        return { status: "ok", message: "Resource registered" };
+      });
+      const client = {
+        state: { connected: true, mode: "unknown", lastUpdated: Date.now() },
+        activeProjectGprojPath: async () => gprojPath,
+        call,
+      } as unknown as WorkbenchClient;
+      const handler = registeredTools(registerWbResources, client).get("wb_resources");
 
-    const result = await handler?.({ action: "register", path: "C:\\Mods\\Example\\New.et" });
+      const result = await handler?.({ action: "register", path: resourcePath });
 
-    expect(result?.isError).not.toBe(true);
-    expect(call).toHaveBeenNthCalledWith(
-      2,
-      "EMCP_WB_Resources",
-      { action: "register", path: "C:\\Mods\\Example\\New.et" },
-      { timeout: 120_000, skipAutoLaunch: true }
-    );
+      expect(result?.isError).not.toBe(true);
+      expect(call).toHaveBeenNthCalledWith(
+        2,
+        "EMCP_WB_Resources",
+        { action: "register", path: resourcePath },
+        { timeout: 120_000, skipAutoLaunch: true }
+      );
+    }, { prefix: "rfo-resource-register-" });
   });
 
   it.each([
     ["register", "RegisterResourceFile returned false for: Prefabs/Failed.et"],
     ["open", "SetOpenedResource returned false for: Prefabs/Failed.et"],
   ])("wb_resources exposes a helper %s failure", async (action, message) => {
-    const { client } = helperErrorClient(message);
-    const handler = registeredTools(registerWbResources, client).get("wb_resources");
+    await withTemporaryDirectory(async (root) => {
+      const addon = join(root, "Example");
+      const gprojPath = join(addon, "Example.gproj");
+      const resourcePath = join(addon, "Prefabs", "Failed.et");
+      mkdirSync(join(addon, "Prefabs"), { recursive: true });
+      writeFileSync(gprojPath, "GameProject {}\n", "utf8");
+      writeFileSync(resourcePath, "GenericEntity {}\n", "utf8");
+      const { client } = helperErrorClient(message);
+      Object.assign(client, { activeProjectGprojPath: async () => gprojPath });
+      const handler = registeredTools(registerWbResources, client).get("wb_resources");
 
-    const result = await handler?.({ action, path: "Prefabs/Failed.et" });
+      const result = await handler?.({
+        action,
+        path: action === "register" ? resourcePath : "Prefabs/Failed.et",
+      });
 
-    expect(result?.isError).toBe(true);
-    expect(result?.content[0]?.text).toContain(message);
-    expect(result?.content[0]?.text).not.toContain("No resources found");
+      expect(result?.isError).toBe(true);
+      expect(result?.content[0]?.text).toContain(message);
+      expect(result?.content[0]?.text).not.toContain("No resources found");
+    }, { prefix: "rfo-resource-helper-error-" });
   });
 
   it("wb_open_resource exposes a helper failure", async () => {

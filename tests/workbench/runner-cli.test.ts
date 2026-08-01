@@ -7,9 +7,10 @@ import {
   receiptExitCode,
   type WorkbenchRunnerCliDependencies,
 } from "../../src/workbench/runner-cli.js";
-import type {
-  WorkbenchEditorReceipt,
-  WorkbenchRunnerExitStatus,
+import {
+  classifyWorkbenchExitStatus,
+  type WorkbenchEditorReceipt,
+  type WorkbenchRunnerExitStatus,
 } from "../../src/workbench/runner.js";
 
 const CLI_ARGUMENTS = ["editor", "--gproj", "C:\\target\\project.gproj", "--foreground"];
@@ -39,12 +40,12 @@ function status(
   reason: WorkbenchRunnerExitStatus["reason"],
   exitCode: number | null
 ): WorkbenchRunnerExitStatus {
-  return {
+  return classifyWorkbenchExitStatus({
     reason,
     exitCode,
     signal: null,
     timedOut: reason === "timed_out",
-  };
+  });
 }
 
 function dependencies(
@@ -144,6 +145,20 @@ describe("Workbench runner CLI contract", () => {
     expect(stderr).toEqual([]);
     expect(stdout[0].endsWith("\n")).toBe(true);
     expect(JSON.parse(stdout[0])).toEqual(value);
+  });
+
+  it.each([
+    ["unsigned", 0xC0000005],
+    ["signed", -1_073_741_819],
+  ] as const)("normalizes an %s Windows access-violation status", (_label, exitCode) => {
+    const exitStatus = status("exited", exitCode);
+
+    expect(exitStatus).toMatchObject({
+      classification: "windows_exception",
+      nativeStatus: "0xC0000005",
+      exceptionName: "STATUS_ACCESS_VIOLATION",
+    });
+    expect(receiptExitCode(receipt(exitStatus))).toBe(1);
   });
 
   it("emits one redacted JSON error record and no success record", async () => {

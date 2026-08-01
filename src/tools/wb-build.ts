@@ -80,7 +80,9 @@ export function registerWbBuild(
         "Build one exact Arma Reforger .gproj through the active MCP owner's guarded " +
         "Workbench lifecycle. Requires a caller-exclusive empty output directory, refuses " +
         "a running editor or concurrent lifecycle mutation, and returns the full helper-free " +
-        "receipt only after exact process cleanup, endpoint vacancy, and fresh output attestation.",
+        "receipt only after exact process cleanup and endpoint vacancy. The exitStatus " +
+        "classification distinguishes ordinary nonzero exits from Windows exceptions; fresh " +
+        "output attestation runs only after a zero native exit.",
       inputSchema: {
         gprojPath: z.string().trim().min(1).describe(
           "Absolute path to the exact target .gproj. No configured or prior-target fallback is used."

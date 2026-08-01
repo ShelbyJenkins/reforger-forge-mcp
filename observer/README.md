@@ -119,8 +119,9 @@ The configuration reference and first-use recovery procedures are in
 - `observer.profileRoot` constrains all Observer-owned profile directories.
 - `observer.evidenceRoots` is an allowlist. Capture and run creation work
   without it, but finalization fails with `CAPABILITY_UNAVAILABLE`.
-- `observer.supportingLogRoots` is a separate allowlist for relevant text logs
-  included in a final bundle.
+- `observer.supportingLogRoots` is a separate allowlist for explicit-path text
+  logs, including external launches. Exact-owned runtime logs use a private
+  capture grant and do not add managed profiles to this allowlist.
 - `observer.defaultLossyImageQuality` defaults JPEG and WebP to 75;
   `minimumLossyImageQuality` and `maximumLossyImageQuality` bound caller
   overrides.
@@ -132,8 +133,9 @@ The configuration reference and first-use recovery procedures are in
 
 Launch preparation produces a one-shot, immutable descriptor bound to an
 Observer session, profile, and expiration. The descriptor contains one merged
-`-addonsDir`, one merged `-addons`, the matching `-profile`, and defaults for
-`-forceUpdate` and `-noFocus` unless callers opt out. Graphical launches retain
+`-addonsDir`, one merged `-addons`, the matching `-profile`, a session-specific
+relative `-logsDir`, and defaults for `-forceUpdate` and `-noFocus` unless
+callers opt out. Caller-supplied `-logsDir` values are refused. Graphical launches retain
 the engine's fullscreen default; pass `-window` (and optional dimensions) only
 when a visible windowed launch is intentional.
 
@@ -179,9 +181,14 @@ An evidence run is backend-neutral. Finalization confines output to an
 allowlisted evidence root, rejects path/link escapes, pins artifacts while
 exporting, hashes bundle members, writes `manifest.json` last, and never
 overwrites an existing run directory. It accepts only bounded structured
-runtime configuration and bounded regular text log files under configured
-supporting-log roots. A matching retry returns its existing receipt; managed
-artifacts release only after verified export.
+runtime configuration and bounded regular text logs. Explicit paths remain
+confined to configured supporting-log roots. A semantic capture reference can
+resolve only the completed, selected runtime capture's private durable grant,
+which binds its session and exact-owned runtime generation to the assigned
+`script.log`; the managed profile root is never globally admitted. Both forms
+share regular-file, link, identity, size, UTF-8, redaction, copying, and hashing
+checks. A matching retry returns its existing receipt; managed artifacts
+release only after verified export.
 
 ## Workbench adapter design
 

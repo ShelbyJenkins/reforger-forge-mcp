@@ -89,6 +89,9 @@ describe("standalone Workbench lifecycle runner", () => {
       exitCode: null,
       signal: null,
       timedOut: true,
+      classification: "timed_out",
+      nativeStatus: null,
+      exceptionName: null,
     });
     expect(receipt).toMatchObject({
       intent: "build",
@@ -224,7 +227,14 @@ describe("standalone Workbench lifecycle runner", () => {
         resourceDatabaseSha256: expect.stringMatching(/^[a-f0-9]{64}$/),
       },
       validationFailure: null,
-      exitStatus: { reason: "exited", exitCode: 0, timedOut: false },
+      exitStatus: {
+        reason: "exited",
+        exitCode: 0,
+        timedOut: false,
+        classification: "success",
+        nativeStatus: null,
+        exceptionName: null,
+      },
     });
     expect(receipt.intent === "build" && receipt.output?.freshBytes).toBeGreaterThan(0);
     expect(journalPhases).toEqual([
@@ -433,7 +443,40 @@ describe("standalone Workbench lifecycle runner", () => {
     expect(receipt).toMatchObject({
       output: null,
       validationFailure: null,
-      exitStatus: { reason: "exited", exitCode: 7, timedOut: false },
+      exitStatus: {
+        reason: "exited",
+        exitCode: 7,
+        timedOut: false,
+        classification: "nonzero_exit",
+        nativeStatus: null,
+        exceptionName: null,
+      },
+    });
+  });
+
+  it.each([
+    ["unsigned", 0xC0000005],
+    ["signed", -1_073_741_819],
+  ] as const)("classifies an %s Workbench access violation", async (_label, exitCode) => {
+    const harness = createHarness();
+    const spawner = createBuildSpawner(harness, {
+      pidBase: 22_310,
+      buildExitCode: exitCode,
+    });
+
+    const receipt = await runBuild(harness, spawner.spawnProcess);
+
+    expect(receipt).toMatchObject({
+      output: null,
+      validationFailure: null,
+      exitStatus: {
+        reason: "exited",
+        exitCode,
+        timedOut: false,
+        classification: "windows_exception",
+        nativeStatus: "0xC0000005",
+        exceptionName: "STATUS_ACCESS_VIOLATION",
+      },
     });
   });
 

@@ -17,6 +17,10 @@ import {
 } from "./evidence-bundle-service.js";
 import { ObserverError } from "./errors.js";
 import { assertIdentifier, assertManagedPath, ensureCanonicalDirectory } from "./paths.js";
+import {
+  type RuntimeLogEvidenceGrant,
+  validateRuntimeLogEvidenceGrant,
+} from "./runtime-log-evidence.js";
 
 export type { EvidenceBundleFinalizeInput as ObserverRunFinalizeInput, ObserverRunReview } from "./evidence-bundle-service.js";
 
@@ -83,6 +87,7 @@ interface RunCaptureRecord extends EvidenceCaptureSnapshot {
   terminalMessage?: string;
   createdAt: string;
   updatedAt: string;
+  runtimeLogEvidenceGrant?: RuntimeLogEvidenceGrant;
 }
 
 interface ObserverRunRecord {
@@ -297,10 +302,58 @@ export class ObserverRunStore {
     return this.attach(record, capture, ref);
   }
 
-  completeCapture(runId: string, captureLabel: string): Record<string, unknown> {
+  captureEvidenceBinding(runId: string, captureLabel: string): {
+    runId: string;
+    captureLabel: string;
+    backend: "runtime" | "workbench";
+    sessionId?: string;
+    runtimeLogEvidenceGrant?: RuntimeLogEvidenceGrant;
+  } {
+    const record = this.requireOpen(runId);
+    const capture = record.captures.find((item) => item.label === normalizeEvidenceLabel(captureLabel));
+    if (!capture?.backend || !capture.jobId) {
+      throw new ObserverError("INVALID_REQUEST", "Run capture is not durably bound", 409);
+    }
+    return {
+      runId: record.runId,
+      captureLabel: capture.label,
+      backend: capture.backend,
+      ...(capture.sessionId ? { sessionId: capture.sessionId } : {}),
+      ...(capture.runtimeLogEvidenceGrant
+        ? { runtimeLogEvidenceGrant: validateRuntimeLogEvidenceGrant(capture.runtimeLogEvidenceGrant) }
+        : {}),
+    };
+  }
+
+  completeCapture(
+    runId: string,
+    captureLabel: string,
+    runtimeLogEvidenceGrant?: RuntimeLogEvidenceGrant
+  ): Record<string, unknown> {
     const record = this.requireOpen(runId);
     const capture = record.captures.find((item) => item.label === normalizeEvidenceLabel(captureLabel));
     if (!capture?.backend || !capture.jobId) throw new ObserverError("INVALID_REQUEST", "Run capture is not durably bound", 409);
+    if (runtimeLogEvidenceGrant) {
+      const grant = validateRuntimeLogEvidenceGrant(runtimeLogEvidenceGrant);
+      if (capture.backend !== "runtime" || !capture.sessionId ||
+          grant.runId !== record.runId || grant.captureLabel !== capture.label ||
+          grant.sessionId !== capture.sessionId) {
+        throw new ObserverError(
+          "SESSION_MISMATCH",
+          "Runtime log evidence authority does not match its run capture",
+          409
+        );
+      }
+      if (capture.runtimeLogEvidenceGrant &&
+          JSON.stringify(capture.runtimeLogEvidenceGrant) !== JSON.stringify(grant)) {
+        throw new ObserverError(
+          "SESSION_MISMATCH",
+          "Run capture already has authority for another exact runtime generation",
+          409
+        );
+      }
+      capture.runtimeLogEvidenceGrant = grant;
+    }
     const ref = capture.backend === "runtime"
       ? this.artifacts.runtimeRef(capture.sessionId ?? "", capture.jobId)
       : this.artifacts.workbenchRef(capture.jobId);
@@ -624,6 +677,14 @@ export class ObserverRunStore {
   }
   private assertRecord(record: ObserverRunRecord, runId: string): void {
     if (record.version !== RUN_RECORD_VERSION || record.runId !== runId || !["open", "finalized", "expired"].includes(record.state) || !Array.isArray(record.captures) || typeof record.title !== "string" || typeof record.createdAt !== "string" || typeof record.updatedAt !== "string") throw new ObserverError("INVALID_REQUEST", "Observer run record is invalid", 409);
+    for (const capture of record.captures) {
+      if (!capture.runtimeLogEvidenceGrant) continue;
+      const grant = validateRuntimeLogEvidenceGrant(capture.runtimeLogEvidenceGrant);
+      if (capture.backend !== "runtime" || !capture.sessionId || grant.runId !== runId ||
+          grant.captureLabel !== capture.label || grant.sessionId !== capture.sessionId) {
+        throw new ObserverError("SESSION_UNVERIFIABLE", "Observer run contains invalid runtime log evidence authority", 409);
+      }
+    }
   }
   private assertRunId(runId: string): void {
     if (!RUN_ID_PATTERN.test(runId)) throw new ObserverError("INVALID_REQUEST", "Observer run ID is invalid");

@@ -29,7 +29,12 @@ import {
   canonicalizeExistingDirectory,
   ensureCanonicalDirectory,
   listRegularFiles,
+  resolveManagedRuntimeLogLocation,
 } from "./paths.js";
+import {
+  type RuntimeLogEvidenceGrant,
+  validateRuntimeLogEvidenceGrant,
+} from "./runtime-log-evidence.js";
 
 const MANIFEST_VERSION = 1;
 const MAX_SUPPORTING_FILE_BYTES = 8 * 1024 * 1024;
@@ -63,14 +68,19 @@ export interface EvidenceBundleFinalizeInput {
   includeCaptureLabels: string[];
   review: ObserverRunReview;
   runtimeConfig?: { configurationId: string; values: Record<string, unknown> };
-  supportingFiles?: Array<{ kind: "relevantLog"; label: string; path: string }>;
+  supportingFiles?: EvidenceSupportingFile[];
   releaseManagedArtifacts?: boolean;
 }
+
+export type EvidenceSupportingFile =
+  | { kind: "relevantLog"; label: string; path: string }
+  | { kind: "relevantLog"; label: string; sourceCaptureLabel: string };
 
 export interface EvidenceCaptureSnapshot extends Record<string, unknown> {
   label: string;
   state: string;
   backend?: "runtime" | "workbench";
+  sessionId?: string;
   jobId?: string;
   instanceId?: string;
   worldId?: string | null;
@@ -79,6 +89,8 @@ export interface EvidenceCaptureSnapshot extends Record<string, unknown> {
   performancePolicy: "evidence" | "instrumented";
   requestedImage?: CanonicalImageOutputPolicy;
   artifact?: ManagedArtifactRef;
+  /** Agent-private durable authority; never emitted by run status or capture metadata. */
+  runtimeLogEvidenceGrant?: RuntimeLogEvidenceGrant;
 }
 
 export interface EvidenceArtifactSnapshot {
@@ -126,6 +138,11 @@ export interface EvidenceBundleService {
   verifyReceipt(snapshot: EvidenceRunExportSnapshot, receipt: EvidenceExportReceipt, fingerprint: string): void;
   sweepWork(now: number, maxAgeMs: number): string[];
   diagnostics(): Record<string, unknown>;
+}
+
+export interface FileEvidenceBundleServiceOptions {
+  /** Deterministic test seam for replacement races after the source is opened. */
+  afterSupportingFileOpen?: (canonicalPath: string) => void;
 }
 
 function comparisonPath(value: string): string { return value.toLowerCase(); }
@@ -179,7 +196,12 @@ export class FileEvidenceBundleService implements EvidenceBundleService {
   readonly supportingLogRoots: readonly string[];
   private readonly evidenceIdentities = new Map<string, FilesystemIdentity>();
 
-  constructor(exportWorkRoot: string, evidenceRoots: readonly string[], supportingLogRoots: readonly string[] = []) {
+  constructor(
+    exportWorkRoot: string,
+    evidenceRoots: readonly string[],
+    supportingLogRoots: readonly string[] = [],
+    private readonly options: FileEvidenceBundleServiceOptions = {}
+  ) {
     if (evidenceRoots.length === 0) throw new ObserverError("CAPABILITY_UNAVAILABLE", "Evidence bundle service requires at least one evidence root", 409);
     this.exportWorkRoot = ensureCanonicalDirectory(exportWorkRoot);
     this.evidenceRoots = evidenceRoots.map((root) => this.approvedEvidenceRoot(root));
@@ -219,7 +241,34 @@ export class FileEvidenceBundleService implements EvidenceBundleService {
     if (!Array.isArray(supporting) || supporting.length > 16) throw new ObserverError("INVALID_REQUEST", "supportingFiles must contain at most 16 entries");
     const normalizedSupporting = supporting.map((file) => {
       if (file.kind !== "relevantLog") throw new ObserverError("INVALID_REQUEST", "Only relevantLog supporting files are allowed");
-      return { kind: file.kind, label: normalizeEvidenceLabel(file.label, "Supporting file label"), path: boundedText(file.path, "Supporting file path", 32_768)! };
+      const label = normalizeEvidenceLabel(file.label, "Supporting file label");
+      const hasPath = "path" in file;
+      const hasCapture = "sourceCaptureLabel" in file;
+      if (hasPath === hasCapture) {
+        throw new ObserverError(
+          "INVALID_REQUEST",
+          "A relevantLog supporting file requires exactly one of path or sourceCaptureLabel"
+        );
+      }
+      if (hasPath) {
+        return {
+          kind: file.kind,
+          label,
+          path: boundedText(file.path, "Supporting file path", 32_768)!,
+        };
+      }
+      const sourceCaptureLabel = normalizeEvidenceLabel(
+        file.sourceCaptureLabel,
+        "Supporting file source capture label"
+      );
+      if (!labels.includes(sourceCaptureLabel)) {
+        throw new ObserverError(
+          "INVALID_REQUEST",
+          `Relevant log source capture '${sourceCaptureLabel}' must be selected for export`,
+          409
+        );
+      }
+      return { kind: file.kind, label, sourceCaptureLabel };
     });
     if (new Set(normalizedSupporting.map((file) => file.label)).size !== normalizedSupporting.length) throw new ObserverError("INVALID_REQUEST", "supportingFiles contains duplicate normalized labels");
     const normalized: EvidenceBundleFinalizeInput = {
@@ -282,7 +331,12 @@ export class FileEvidenceBundleService implements EvidenceBundleService {
         atomicWriteJson(workRoot, join(workRoot, metadataPath), item);
         captures.push(item);
       }
-      const supportingFiles = this.copySupportingFiles(workRoot, prepared.input.supportingFiles);
+      const supportingFiles = this.copySupportingFiles(
+        workRoot,
+        prepared.input.supportingFiles,
+        snapshot,
+        prepared.includeCaptureLabels
+      );
       if (prepared.input.runtimeConfig) atomicWriteJson(workRoot, join(workRoot, "runtime-config.json"), prepared.input.runtimeConfig);
       const finalizedAt = new Date().toISOString();
       const manifestBase = {
@@ -407,14 +461,22 @@ export class FileEvidenceBundleService implements EvidenceBundleService {
     return `${lines.join("\n")}\n`;
   }
 
-  private copySupportingFiles(workRoot: string, files: EvidenceBundleFinalizeInput["supportingFiles"]): Array<Record<string, unknown>> {
+  private copySupportingFiles(
+    workRoot: string,
+    files: EvidenceBundleFinalizeInput["supportingFiles"],
+    snapshot: EvidenceRunExportSnapshot,
+    selectedCaptureLabels: readonly string[]
+  ): Array<Record<string, unknown>> {
     const result: Array<Record<string, unknown>> = [];
     let total = 0;
     for (const file of files ?? []) {
-      const canonical = this.resolveSupportingFile(file.path);
+      const canonical = "path" in file
+        ? this.resolveSupportingFile(file.path)
+        : this.resolveGrantedRuntimeLog(file.sourceCaptureLabel, snapshot, selectedCaptureLabels);
       const descriptor = openSync(canonical, "r");
       let bytes: Buffer;
       try {
+        this.options.afterSupportingFileOpen?.(canonical);
         const opened = fstatSync(descriptor);
         if (!opened.isFile() || opened.size > MAX_SUPPORTING_FILE_BYTES || total + opened.size > MAX_SUPPORTING_TOTAL_BYTES) throw new ObserverError("INVALID_REQUEST", "Relevant log attachments exceed the evidence size limit");
         const pathEntry = lstatSync(canonical);
@@ -430,9 +492,62 @@ export class FileEvidenceBundleService implements EvidenceBundleService {
       const filtered = Buffer.from(redactText(new TextDecoder("utf-8", { fatal: true }).decode(bytes), { profile: "diagnostic" }), "utf8");
       const path = `relevant-logs/${file.label}.log`;
       atomicWriteFile(workRoot, join(workRoot, path), filtered);
-      result.push({ kind: "relevantLog", label: file.label, path, bytes: filtered.length, sha256: sha256Hex(filtered) });
+      result.push({
+        kind: "relevantLog",
+        label: file.label,
+        ...("sourceCaptureLabel" in file
+          ? { sourceCaptureLabel: file.sourceCaptureLabel }
+          : {}),
+        path,
+        bytes: filtered.length,
+        sha256: sha256Hex(filtered),
+      });
     }
     return result;
+  }
+
+  private resolveGrantedRuntimeLog(
+    sourceCaptureLabel: string,
+    snapshot: EvidenceRunExportSnapshot,
+    selectedCaptureLabels: readonly string[]
+  ): string {
+    if (!selectedCaptureLabels.includes(sourceCaptureLabel)) {
+      throw new ObserverError(
+        "INVALID_REQUEST",
+        `Relevant log source capture '${sourceCaptureLabel}' is not selected for export`,
+        409
+      );
+    }
+    const capture = snapshot.captures.find((item) => item.label === sourceCaptureLabel);
+    if (!capture || capture.state !== "completed" || capture.backend !== "runtime" ||
+        !capture.artifact || !capture.sessionId || !capture.runtimeLogEvidenceGrant) {
+      throw new ObserverError(
+        "SESSION_UNVERIFIABLE",
+        `Capture '${sourceCaptureLabel}' has no exact-owned runtime log evidence authority`,
+        409
+      );
+    }
+    const grant = validateRuntimeLogEvidenceGrant(capture.runtimeLogEvidenceGrant);
+    if (grant.runId !== snapshot.run.runId || grant.captureLabel !== capture.label ||
+        grant.sessionId !== capture.sessionId) {
+      throw new ObserverError(
+        "SESSION_UNVERIFIABLE",
+        `Capture '${sourceCaptureLabel}' has mismatched runtime log evidence authority`,
+        409
+      );
+    }
+    const expected = resolveManagedRuntimeLogLocation(grant.profilePath, grant.sessionId, {
+      requireExisting: true,
+    });
+    if (comparisonPath(resolve(expected.scriptLogPath)) !==
+        comparisonPath(resolve(grant.scriptLogPath))) {
+      throw new ObserverError(
+        "SESSION_UNVERIFIABLE",
+        `Capture '${sourceCaptureLabel}' runtime log authority does not name its assigned script.log`,
+        409
+      );
+    }
+    return this.resolveRegularSupportingFile(grant.scriptLogPath);
   }
 
   private hashMembers(root: string): BundleFile[] {
@@ -555,7 +670,14 @@ export class FileEvidenceBundleService implements EvidenceBundleService {
       const item = raw as Record<string, unknown>;
       const expected = expectedSupporting[index];
       const path = expected ? `relevant-logs/${expected.label}.log` : `relevant-logs/${item.label}.log`;
-      if (item.kind !== "relevantLog" || !safeMember(item.path) || item.path !== path || (expected && item.label !== expected.label)) throw new ObserverError("ARTIFACT_INVALID", "Evidence supporting member is not bound to the finalize request", 409);
+      const sourceCaptureMatches = !expected
+        || ("sourceCaptureLabel" in expected
+          ? item.sourceCaptureLabel === expected.sourceCaptureLabel
+          : item.sourceCaptureLabel === undefined);
+      if (item.kind !== "relevantLog" || !safeMember(item.path) || item.path !== path ||
+          (expected && item.label !== expected.label) || !sourceCaptureMatches) {
+        throw new ObserverError("ARTIFACT_INVALID", "Evidence supporting member is not bound to the finalize request", 409);
+      }
       const member = members.get(item.path);
       if (!member || item.bytes !== member.bytes || item.sha256 !== member.sha256) throw new ObserverError("ARTIFACT_INVALID", `Evidence supporting member attestation is invalid: ${item.path}`, 409);
       required.add(item.path);
@@ -652,11 +774,18 @@ export class FileEvidenceBundleService implements EvidenceBundleService {
     this.revalidateEvidenceRoot(approved);
   }
   private resolveSupportingFile(input: string): string {
+    const canonical = this.resolveRegularSupportingFile(input);
+    if (!this.supportingLogRoots.some((root) => contained(root, canonical))) throw new ObserverError("INVALID_REQUEST", "Supporting log is outside configured supporting log roots", 403);
+    return canonical;
+  }
+  private resolveRegularSupportingFile(input: string): string {
     assertWindowsPath(input, "Supporting log path");
     const absolute = resolve(input);
     if (!existsSync(absolute) || lstatSync(absolute).isSymbolicLink() || !lstatSync(absolute).isFile()) throw new ObserverError("INVALID_REQUEST", "Supporting log is not a regular file");
     const canonical = realpathSync.native(absolute);
-    if (!this.supportingLogRoots.some((root) => contained(root, canonical))) throw new ObserverError("INVALID_REQUEST", "Supporting log is outside configured supporting log roots", 403);
+    if (comparisonPath(canonical) !== comparisonPath(absolute)) {
+      throw new ObserverError("INVALID_REQUEST", "Supporting log path changed through a link or junction", 409);
+    }
     return canonical;
   }
   private revalidateEvidenceRoot(root: string): void {

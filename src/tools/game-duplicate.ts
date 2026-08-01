@@ -13,8 +13,10 @@ import { validateProjectPath } from "../utils/safe-path.js";
 import {
   resolveGameDataPath,
   findLooseFile,
+  normalizeGameResourcePath,
   resolveProjectGprojPath,
 } from "../utils/game-paths.js";
+import { PakVirtualFS } from "../pak/vfs.js";
 import { generateGuid } from "../formats/guid.js";
 import {
   canonicalizeGproj,
@@ -35,7 +37,7 @@ export function registerGameDuplicate(
     "game_duplicate",
     {
       description:
-        "Duplicate a base-game prefab (.et) from configured extracted or loose game data into an explicitly selected addon for editing. " +
+        "Duplicate a base-game prefab (.et) from configured extracted, loose, or PAK game data into an explicitly selected addon for editing. " +
         "Resolves the full ancestor chain and injects " +
         "inherited components so the duplicate is a complete representation of what the entity provides. " +
         "Writes the file to your addon directory, then can register it with an already-running compatible Workbench so it gets a new resource GUID; it never launches Workbench. " +
@@ -81,7 +83,18 @@ export function registerGameDuplicate(
     },
     async ({ sourcePath, destPath, gprojPath, flatten, register }) => {
       // Strip GUID prefix from sourcePath if present: {GUID}path → path
-      const bareSourcePath = sourcePath.replace(/^\{[0-9A-Fa-f]{16}\}/, "");
+      let bareSourcePath: string;
+      try {
+        bareSourcePath = normalizeGameResourcePath(sourcePath);
+      } catch (error) {
+        return {
+          content: [{
+            type: "text",
+            text: `Invalid source path: ${error instanceof Error ? error.message : String(error)}`,
+          }],
+          isError: true,
+        };
+      }
       if (extname(bareSourcePath).toLowerCase() !== ".et") {
         return {
           content: [{ type: "text", text: "game_duplicate currently supports only .et prefab sources." }],
@@ -143,6 +156,8 @@ export function registerGameDuplicate(
       }
 
       let sourceFile: string | null = null;
+      let pakSourcePath: string | null = null;
+      let pakVfs: PakVirtualFS | null = null;
       let sourceLabel = "";
 
       if (config.extractedPath && existsSync(config.extractedPath)) {
@@ -152,17 +167,19 @@ export function registerGameDuplicate(
 
       if (!sourceFile) {
         const gameDataPath = resolveGameDataPath(config.gamePath);
-        if (!gameDataPath) {
-          return {
-            content: [{ type: "text", text: `Base game not found at ${config.gamePath}.` }],
-            isError: true,
-          };
+        if (gameDataPath) {
+          sourceFile = findLooseFile(gameDataPath, bareSourcePath);
+          if (sourceFile) sourceLabel = "(loose game data)";
         }
-        sourceFile = findLooseFile(gameDataPath, bareSourcePath);
-        if (sourceFile) sourceLabel = "(loose game data)";
       }
 
       if (!sourceFile) {
+        pakVfs = PakVirtualFS.get(config.gamePath);
+        pakSourcePath = pakVfs?.canonicalFilePath(bareSourcePath) ?? null;
+        if (pakSourcePath) sourceLabel = "(PAK game data)";
+      }
+
+      if (!sourceFile && !pakSourcePath) {
         return {
           content: [
             {
@@ -170,6 +187,7 @@ export function registerGameDuplicate(
               text: `Source file not found: ${bareSourcePath}\n` +
                 (config.extractedPath ? `Searched extracted library: ${config.extractedPath}\n` : "") +
                 `Searched loose game data under: ${config.gamePath}\n` +
+                `Searched PAK game data under: ${config.gamePath}\n` +
                 `Use asset_search to verify the path exists.`,
             },
           ],
@@ -198,7 +216,9 @@ export function registerGameDuplicate(
       // Read source content
       let rawContent: string;
       try {
-        rawContent = readFileSync(sourceFile, "utf-8");
+        rawContent = sourceFile
+          ? readFileSync(sourceFile, "utf-8")
+          : pakVfs!.readTextFile(pakSourcePath!);
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
         return {
@@ -332,7 +352,7 @@ export function registerGameDuplicate(
                     `- Registration response: ${regResp.message ?? JSON.stringify(regResp)}`,
                     "",
                     "A compatible Workbench must already be running; game_duplicate did not launch one.",
-                    `To register the existing copy later, use wb_resources with action: "register" and path: ${absDestPath}.`,
+                    `To register the existing copy later, open its exact destination project and use wb_resources with action: "register" and path: ${absDestPath}; wb_resources verifies that the file belongs to the active project.`,
                   ].join("\n") + ancestryNote,
                 },
               ],
@@ -347,7 +367,7 @@ export function registerGameDuplicate(
                 text: [
                   `**Prefab duplicated successfully**`,
                   `- Source: ${sourcePath}`,
-                  `- Copied from: ${sourceFile} ${sourceLabel}`,
+                  `- Copied from: ${sourceFile ?? pakSourcePath} ${sourceLabel}`,
                   `- Saved to: ${absDestPath}`,
                   ``,
                   `Registered with Workbench — a new GUID has been assigned.`,
@@ -372,7 +392,7 @@ export function registerGameDuplicate(
                   `- Registration error: ${msg}`,
                   ``,
                   `A compatible Workbench must already be running; game_duplicate did not launch one.`,
-                  `To register the existing copy later, use wb_resources with action: "register" and path: ${absDestPath}.`,
+                  `To register the existing copy later, open its exact destination project and use wb_resources with action: "register" and path: ${absDestPath}; wb_resources verifies that the file belongs to the active project.`,
                 ].join("\n") + ancestryNote,
               },
             ],
@@ -390,7 +410,7 @@ export function registerGameDuplicate(
               `- Source: ${sourcePath}`,
               `- Saved to: ${absDestPath}`,
               ``,
-              `To assign a GUID later, use wb_resources with action: "register" and path: ${absDestPath}.`,
+              `To assign a GUID later, open the exact destination project and use wb_resources with action: "register" and path: ${absDestPath}; wb_resources verifies that the file belongs to the active project.`,
             ].join("\n") + ancestryNote,
           },
         ],

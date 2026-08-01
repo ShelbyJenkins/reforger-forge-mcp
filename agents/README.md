@@ -57,6 +57,18 @@ When manually adding a configured server, append:
 Keep that machine-local file out of source control. Restart the client after
 changing its registration or its selected configuration path.
 
+## Local Development Rebuilds
+
+After `npm run build`, refresh the `reforger-forge` MCP server in the AI client
+or restart the client before testing the rebuilt code. An already-running
+stdio process continues using the modules, tool registrations, and startup
+policy it loaded when it started.
+
+`npm run mcp:verify` validates the build by starting a separate fresh MCP
+process; it does not update the process already connected to the client.
+Likewise, `wb_restart` restarts only the exact MCP-owned Workbench process. It
+does not reload the MCP server.
+
 ## Client-Specific Registration
 
 ### Codex

@@ -5,6 +5,140 @@ records. Move newly resolved or verified entries to the top. The legacy records
 below were migrated from the mixed tracker on 2026-07-28; same-day ties retain
 their migration order.
 
+### MCP-035 — decide whether exact-owned runtime profile logs are supporting evidence
+
+**Status:** Resolved
+
+**Priority:** P1
+
+**Closed:** 2026-07-31
+
+**Decision:** Admit only the assigned `script.log` of a selected, completed
+exact-owned runtime capture. `observer_prepare_launch` now assigns a relative
+session-specific `-logsDir` beneath the exclusive engine profile and refuses
+caller-supplied replacements. Managed profile directories are not added to the
+global supporting-log allowlist.
+
+**Authority:** When runtime capture completion is committed, the private agent
+mints a durable run-record grant binding run ID, normalized capture label,
+session ID, exact runtime ID and generation, canonical profile, and exact
+`script.log` path. The public schema exposes only
+`{ kind: "relevantLog", label, sourceCaptureLabel }`; caller-supplied runtime
+identity, generation, profile, and path fields cannot mint or replace a grant.
+The referenced capture must be completed, selected for export, runtime-backed,
+and privately granted by a currently retained exact-owned lifecycle.
+
+**Compatibility and security:** The explicit `path` form remains supported for
+regular text files beneath configured `supportingLogRoots`, preserving external
+launch and operator-managed log workflows. Both forms reuse the same bounded
+regular-file, symlink/junction, source-identity, replacement-during-read, UTF-8,
+redaction, copy, hash, manifest, and receipt checks. The semantic manifest entry
+records its source capture label without exposing the profile path or grant.
+
+**Verification:** Observer coverage passes 481/481 tests. It includes automatic
+redacted export, private grant durability and non-disclosure, external/unowned
+and unselected capture rejection, other-profile and private-file denial,
+caller-supplied `-logsDir` rejection, junction escape rejection, and a
+deterministic source-replacement race. The full repository test suite,
+typecheck, unused-code analysis, both production builds, compiled MCP
+handshake/tool-registration verification, protocol check, and Observer source
+manifest checks also pass.
+
+### MCP-031 — review the implemented `game_duplicate` contract
+
+**Status:** Resolved
+
+**Priority:** P0
+
+**Closed:** 2026-07-31
+
+**Related implementation records:** MCP-012, MCP-013, and MCP-045
+
+**Decision:** Approve `game_duplicate` as an `.et`-only prefab tool. It keeps
+`register=false` as an offline-copy mode and never launches Workbench for
+`register=true`; registration requires an already-running Workbench targeting
+the exact destination project. `.conf` copying remains unsupported because it
+does not need the prefab ancestry and entity-ID transformations performed by
+this tool, and should be considered separately with its own contract and tests.
+
+**Hardening:** Source prefab leaves can now be loaded from PAK files as well as
+extracted or loose game data, matching ancestry resolution. Deferred
+`wb_resources(action: "register")` recovery now accepts only an absolute,
+existing resource file contained by the exact active project's canonical addon
+directory. Copied-but-unregistered files remain recoverable partial successes;
+structured status fields remain part of the broader output-schema work.
+
+**Verification:** Focused path, duplication, ancestry, PAK, resource-tool, and
+helper-status coverage passes 61/61 tests, including PAK-only leaf duplication,
+invalid source traversal, and cross-project deferred-registration rejection.
+The full repository test suite, typecheck, unused-code analysis, compiled MCP
+build, and fresh-process MCP handshake/tool-registration verification also pass.
+
+### MCP-007 — guarded build did not classify a Workbench access violation
+
+**Status:** Resolved
+
+**Severity:** Breaking validation limitation
+
+**Closed:** 2026-07-31
+
+**Observed behavior:** `wb_build` for `OnePointZeroOneTestContent.gproj`
+terminated twice with Windows status `0xC0000005`, no output tree, and no
+`validationFailure`. The receipt failed closed but exposed only the numeric
+exit, so callers could not distinguish the engine crash from an ordinary
+nonzero Workbench exit.
+
+**Resolution:** Runner editor and build receipts now derive a structured
+`exitStatus.classification` while preserving the raw reason, exit code, signal,
+and timeout fields. Windows error statuses are normalized to unsigned
+eight-digit `nativeStatus` values, and known statuses receive an
+`exceptionName`; `0xC0000005` is reported as `windows_exception` and
+`STATUS_ACCESS_VIOLATION`. Signed and unsigned representations normalize to the
+same result.
+
+`validationFailure` remains reserved for post-exit output-attestation failures
+after a zero native exit. A Windows exception therefore remains an MCP error
+with `output: null` and `validationFailure: null`, but it is no longer
+ambiguous. The standalone CLI maps native statuses outside its portable exit
+range to exit code `1`. Guidance explicitly rejects automatic crash retries
+and the runner does not collect private crash-dump contents.
+
+The underlying Workbench engine or project crash is not treated as an MCP
+defect: the guarded lifecycle already proved exact ownership and cleanup, and
+no MCP output can certify a build that the native process did not complete.
+
+**Verification:** Focused runner coverage exercises successful, ordinary
+nonzero, timeout, unsigned access-violation, and signed access-violation exits.
+The MCP tool coverage verifies that unsuccessful receipts remain `isError` and
+retain their structured classification, and CLI coverage verifies portable
+exit-code mapping and normalized access-violation metadata.
+
+### MCP-002 — a running stdio MCP does not reload a repaired local build
+
+**Status:** Verified — accepted behavior
+
+**Severity:** Non-breaking workflow limitation
+
+**Closed:** 2026-07-31
+
+**Decision:** Do not add in-process hot reload or self-restart behavior. The
+client owns the stdio MCP process and session, while the server loads its
+modules, registered tools, staged-file policy, and lifecycle state at process
+startup. A client refresh or restart is the safe boundary that starts the
+rebuilt server and renegotiates the MCP session.
+
+Contributor and client guidance now states that every local `npm run build`
+must be followed by an MCP-server refresh or client restart before testing the
+rebuilt code. `wb_restart` restarts only the exact MCP-owned Workbench process;
+it does not reload the MCP server. `npm run mcp:verify` checks a separate fresh
+process and likewise does not replace a server already running in a client.
+
+**Verification:** The server entry point establishes one stdio transport for
+the process and disposes its owned resources when that process terminates. The
+original stale generated `UserMaps.desc` observation was the separate MCP-001
+helper-staging defect; its generated-file handling and cleanup were fixed and
+verified independently.
+
 ### MCP-043 — fullscreen observer captures can exceed retained-image limits
 
 **Status:** Resolved
