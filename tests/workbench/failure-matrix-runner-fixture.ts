@@ -132,7 +132,10 @@ export function fakeHarness(matrixCase: WorkbenchFaultMatrixCase): FakeHarness {
     publicStatus("completed", null, true, view);
   const terminalForPrimary = (): Record<string, unknown> => {
     if (action === "replace_fixture_world" && phase !== "terminal_release") {
-      return publicStatus("failed", "RESTORATION_UNCONFIRMED", false);
+      return {
+        ...publicStatus("failed", "RESTORATION_UNCONFIRMED", false),
+        cameraLeaseHeld: false,
+      };
     }
     if (action === "stop_owned_workbench" && matrixCase.cameraDisposition === "exact_process_exit") {
       return publicStatus("failed", "WORKBENCH_EXITED", false);

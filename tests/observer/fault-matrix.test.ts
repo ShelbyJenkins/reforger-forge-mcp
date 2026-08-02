@@ -170,7 +170,7 @@ describe("observer fault-matrix contract", () => {
               });
           expect(item.cameraDisposition).toBe(item.injection.phase === "before_lease"
             ? "not_acquired"
-            : item.injection.phase === "terminal_release" ? "restored" : "exact_process_exit");
+            : item.injection.phase === "terminal_release" ? "restored" : "relinquished");
           break;
         case "write_truncated_artifact":
         case "write_crc_artifact":
@@ -278,6 +278,7 @@ describe("observer fault-matrix contract", () => {
     invalid((value) => { value.expectedTerminal = { state: "failed", errorCode: null }; });
     invalid((value) => { value.cameraDisposition = "not_acquired"; });
     invalid((value) => { value.cameraDisposition = "exact_process_exit"; });
+    invalid((value) => { value.cameraDisposition = "relinquished"; });
     invalid((value) => { value.requiredChecks.push("child_vacant"); });
     invalid((value) => { value.requiredEvidence = []; });
     invalid((value) => { value.requiredEvidence.push("camera"); });

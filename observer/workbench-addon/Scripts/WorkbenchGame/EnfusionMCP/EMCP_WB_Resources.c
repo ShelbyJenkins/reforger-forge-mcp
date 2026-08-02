@@ -1,7 +1,7 @@
 /**
  * EMCP_WB_Resources.c - Resource operations handler
  *
- * Actions: register, rebuild, open, browse
+ * Actions: register, rebuild, getInfo, open, browse
  * Uses the ResourceManager Workbench module.
  * Called via NET API TCP protocol: APIFunc = "EMCP_WB_Resources"
  */
@@ -33,6 +33,12 @@ class EMCP_WB_ResourcesResponse : JsonApiStruct
 	string message;
 	string action;
 	string path;
+	string resourceName;
+	string guid;
+	string resourceClass;
+	string sourcePath;
+	string editor;
+	int configurationCount;
 	int entryCount;
 	ref array<ref EMCP_WB_ResourceEntry> m_aEntries;
 
@@ -42,6 +48,12 @@ class EMCP_WB_ResourcesResponse : JsonApiStruct
 		RegV("message");
 		RegV("action");
 		RegV("path");
+		RegV("resourceName");
+		RegV("guid");
+		RegV("resourceClass");
+		RegV("sourcePath");
+		RegV("editor");
+		RegV("configurationCount");
 		RegV("entryCount");
 		m_aEntries = {};
 	}
@@ -114,11 +126,12 @@ class EMCP_WB_Resources : NetApiHandler
 			resp.status = "ok";
 			resp.message = "Rebuild initiated for: " + req.path;
 		}
-		else if (req.action == "open")
+		else if (req.action == "getInfo" || req.action == "open")
 		{
 			// ResourceManager validates virtual project paths without assuming they
-			// are directly addressable filesystem paths. This blocks the native
-			// SetOpenedResource false-success behavior for missing resources.
+			// are directly addressable filesystem paths. Keep this preflight even
+			// though Workbench.OpenResource also returns a success flag: native open
+			// APIs can change editor context before discovering a bad logical path.
 			MetaFile metaFile = resMgr.GetMetaFile(req.path);
 			if (!metaFile)
 			{
@@ -127,16 +140,48 @@ class EMCP_WB_Resources : NetApiHandler
 				return resp;
 			}
 
-			bool result = resMgr.SetOpenedResource(req.path);
-			if (result)
+			ResourceName registeredName = metaFile.GetResourceID();
+			resp.resourceName = registeredName;
+			resp.sourcePath = metaFile.GetSourceFilePath();
+			int guidEnd = resp.resourceName.IndexOf("}");
+			if (resp.resourceName.IndexOf("{") == 0 && guidEnd > 1)
+				resp.guid = resp.resourceName.Substring(1, guidEnd - 1);
+
+			BaseContainerList configurations = metaFile.GetObjectArray("Configurations");
+			if (configurations)
+			{
+				resp.configurationCount = configurations.Count();
+				if (resp.configurationCount > 0)
+				{
+					BaseContainer primaryConfiguration = configurations.Get(0);
+					if (primaryConfiguration)
+						resp.resourceClass = primaryConfiguration.GetClassName();
+				}
+			}
+			if (resp.resourceClass == "PTCResourceClass")
+				resp.editor = "ParticleEditor";
+
+			if (req.action == "getInfo")
 			{
 				resp.status = "ok";
-				resp.message = "Opened resource: " + req.path;
+				resp.message = "Resolved registered resource metadata: " + req.path;
 			}
 			else
 			{
-				resp.status = "error";
-				resp.message = "SetOpenedResource returned false for: " + req.path;
+				// Workbench.OpenResource owns resource-class routing. In particular, a
+				// .ptc must be routed to ParticleEditor rather than offered to the
+				// already-open ResourceManager or WorldEditor module.
+				bool result = Workbench.OpenResource(req.path);
+				if (result)
+				{
+					resp.status = "ok";
+					resp.message = "Opened resource through Workbench routing: " + req.path;
+				}
+				else
+				{
+					resp.status = "error";
+					resp.message = "Workbench.OpenResource returned false for: " + req.path;
+				}
 			}
 		}
 		else if (req.action == "browse")
@@ -150,7 +195,7 @@ class EMCP_WB_Resources : NetApiHandler
 		else
 		{
 			resp.status = "error";
-			resp.message = "Unknown action: " + req.action + ". Valid: register, rebuild, open, browse";
+			resp.message = "Unknown action: " + req.action + ". Valid: register, rebuild, getInfo, open, browse";
 		}
 
 		return resp;

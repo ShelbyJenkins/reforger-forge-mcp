@@ -373,6 +373,7 @@ export class LmdbDurableKvStore<T> implements DurableKvStore<T> {
     key: string,
     value: T,
     expectedVersion: number | null,
+    assertCommitAllowed?: () => void,
   ): Promise<DurableKvPutResult<T>> {
     if (expectedVersion !== null && (!Number.isSafeInteger(expectedVersion) || expectedVersion < 1)) {
       throw new LmdbStoreError("INVALID_OPTIONS", "Expected LMDB storage version must be null or positive.");
@@ -380,12 +381,17 @@ export class LmdbDurableKvStore<T> implements DurableKvStore<T> {
     const encoded = this.encodeStoredValue(value);
     const bytes = keyBytes(key);
     const database = this.openDatabase();
+    assertCommitAllowed?.();
     return database.transaction(() => {
       const existing = database.getEntry(bytes);
       const actualVersion = existing ? entryVersion(existing) : null;
       if (actualVersion !== expectedVersion) {
         return { kind: "conflict", actualVersion } as const;
       }
+      // The transaction callback may run after the caller yielded. Re-check
+      // cooperative authority at the final synchronous commit boundary so a
+      // lost machine mutex can never publish a late write.
+      assertCommitAllowed?.();
       const nextVersion = actualVersion === null ? 1 : actualVersion + 1;
       database.putSync(bytes, asBinary(encoded), nextVersion);
       return {
@@ -395,15 +401,21 @@ export class LmdbDurableKvStore<T> implements DurableKvStore<T> {
     });
   }
 
-  async remove(key: string, expectedVersion: number): Promise<boolean> {
+  async remove(
+    key: string,
+    expectedVersion: number,
+    assertCommitAllowed?: () => void,
+  ): Promise<boolean> {
     if (!Number.isSafeInteger(expectedVersion) || expectedVersion < 1) {
       throw new LmdbStoreError("INVALID_OPTIONS", "Expected LMDB storage version must be positive.");
     }
     const bytes = keyBytes(key);
     const database = this.openDatabase();
+    assertCommitAllowed?.();
     return database.transaction(() => {
       const existing = database.getEntry(bytes);
       if (!existing || entryVersion(existing) !== expectedVersion) return false;
+      assertCommitAllowed?.();
       return database.removeSync(bytes, expectedVersion);
     });
   }

@@ -41,6 +41,26 @@ function worldFrom(value: Record<string, unknown>, fallback?: WorldRevision): Wo
   return runtimeWorldRevision(typeof value.worldId === "string" ? value.worldId : null, epoch(value.worldEpoch ?? (fallback ? runtimeWorldFields(fallback).worldEpoch : 0)));
 }
 
+function runtimeLeaseState(value: Record<string, unknown>): Pick<BackendJob, "cameraLeaseHeld" | "restorationConfirmed"> {
+  const lease = value.cameraLease && typeof value.cameraLease === "object" && !Array.isArray(value.cameraLease)
+    ? value.cameraLease as Record<string, unknown>
+    : null;
+  if (!lease) {
+    return {
+      cameraLeaseHeld: value.cameraLeaseHeld === true,
+      // Missing restoration evidence must remain an obligation for terminal jobs.
+      restorationConfirmed: value.restorationConfirmed === true,
+    };
+  }
+  return {
+    cameraLeaseHeld: lease.held === true,
+    restorationConfirmed:
+      lease.restorationConfirmed === true ||
+      lease.everHeld === false ||
+      lease.vacancyDisposition === "exact_runtime_vacant",
+  };
+}
+
 export interface RuntimeCaptureBackendOptions {
   maxInlineImageBytes?: number;
 }
@@ -148,6 +168,7 @@ export class RuntimeCaptureBackend implements CaptureBackend {
     const revision = worldFrom(value, fallback.worldRevision);
     const jobId = typeof value.jobId === "string" ? value.jobId : "";
     if (!jobId) throw new CaptureError("TRANSPORT_UNAVAILABLE", "Runtime observer returned a job without an ID");
+    const leaseState = runtimeLeaseState(value);
     return {
       ...value,
       ref: {
@@ -159,6 +180,7 @@ export class RuntimeCaptureBackend implements CaptureBackend {
         recoveryBinding: fallback.recoveryBinding,
       },
       state: typeof value.state === "string" ? value.state : "failed",
+      ...leaseState,
       ...(typeof value.artifact === "object" && value.artifact !== null ? { artifact: value.artifact as Record<string, unknown> } : {}),
     };
   }

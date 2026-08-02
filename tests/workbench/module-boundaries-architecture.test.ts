@@ -42,6 +42,7 @@ describe("Workbench architecture boundaries", () => {
     for (const path of [
       "src/foundation/child-supervisor.ts",
       "src/workbench/activity-gate.ts",
+      "src/workbench/compile-diagnostics.ts",
       "src/workbench/diagnostics.ts",
       "src/workbench/launch-plan.ts",
       "src/workbench/lifecycle-execution.ts",

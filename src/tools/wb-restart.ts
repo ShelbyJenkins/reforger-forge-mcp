@@ -8,6 +8,7 @@ export function registerWbRestart(server: McpServer, client: WorkbenchClient): v
     {
       description:
         "Restart only the exact Workbench bound to the lifecycle record's canonical .gproj. " +
+        "The replacement opens as a normal, focusable attended editor window. " +
         "A replacement MCP may claim the lease only after the prior MCP's exact process identity is " +
         "proven dead. Complete replacement preflight runs before the healthy process is stopped; " +
         "termination uses the retained verified OS handle. Different-target, user-launched, live-other-MCP, " +

@@ -47,6 +47,7 @@ class EMCP_WB_ObserverJob
 	bool renderedEvidenceCaptured;
 	bool cameraLeaseHeld;
 	bool restorationConfirmed;
+	bool installationRollbackPending;
 	BaseWorld world;
 	vector originalWorldMatrix[4];
 	vector requestedMatrix[4];
@@ -214,6 +215,9 @@ class EMCP_WB_ObserverService
 	static const float FOV_SYMMETRY_EPSILON = 0.05;
 	static const int MAX_SETTLE_POLLS = 120;
 	static const int MAX_ARTIFACT_BYTES = 67108864;
+	static const int CAMERA_OWNERSHIP_INDETERMINATE = -1;
+	static const int CAMERA_OWNERSHIP_DISPLACED = 0;
+	static const int CAMERA_OWNERSHIP_OWNED = 1;
 
 	protected static ref EMCP_WB_ObserverService s_Instance;
 	protected ref EMCP_WB_ObserverJob m_Job;
@@ -415,7 +419,7 @@ class EMCP_WB_ObserverService
 			// Submit is an acknowledged, idempotent delivery boundary. The host
 			// chooses the lease before delivery, so an identical retry recovers a
 			// lost response without applying camera state twice.
-			bool replay = m_Job.jobId == jobId && m_Job.leaseId == requestedLeaseId && m_Job.lifecycleGeneration == lifecycleGeneration && NormalizedPath(m_Job.canonicalTarget) == NormalizedPath(canonicalTarget) && m_Job.viewKind == viewKind && m_Job.requestedMatrix0 == matrix0 && m_Job.requestedMatrix1 == matrix1 && m_Job.requestedMatrix2 == matrix2 && m_Job.requestedMatrix3 == matrix3 && Math.AbsFloat(m_Job.requestedFov - fov) <= MATRIX_EPSILON && m_Job.settlePolls == settlePolls && m_Job.requestedMaxWidth == maxWidth && m_Job.requestedMaxHeight == maxHeight;
+			bool replay = m_Job.jobId == jobId && m_Job.leaseId == requestedLeaseId && m_Job.lifecycleGeneration == lifecycleGeneration && NormalizedPath(m_Job.canonicalTarget) == NormalizedPath(canonicalTarget) && m_Job.viewKind == viewKind && m_Job.requestedMatrix0 == matrix0 && m_Job.requestedMatrix1 == matrix1 && m_Job.requestedMatrix2 == matrix2 && m_Job.requestedMatrix3 == matrix3 && ScalarEquals(m_Job.requestedFov, fov, MATRIX_EPSILON) && m_Job.settlePolls == settlePolls && m_Job.requestedMaxWidth == maxWidth && m_Job.requestedMaxHeight == maxHeight;
 			if (replay)
 			{
 				acceptedLeaseId = m_Job.leaseId;
@@ -489,7 +493,7 @@ class EMCP_WB_ObserverService
 		job.actualFov = job.originalFov;
 		world.GetCurrentCamera(job.originalWorldMatrix);
 		float confirmedFov;
-		if (!CameraMatrixValid(job.originalWorldMatrix) || world.GetCurrentCameraId() != job.originalWorldCameraId || api.GetScreenWidth() != job.viewportWidth || api.GetScreenHeight() != job.viewportHeight || !MeasureVerticalFov(api, world, job.originalWorldCameraId, confirmedFov) || Math.AbsFloat(confirmedFov - job.originalFov) > FOV_EPSILON || Math.AbsFloat(world.GetCameraFarPlane(job.originalWorldCameraId) - job.originalFarPlane) > MATRIX_EPSILON)
+		if (!CameraMatrixValid(job.originalWorldMatrix) || world.GetCurrentCameraId() != job.originalWorldCameraId || api.GetScreenWidth() != job.viewportWidth || api.GetScreenHeight() != job.viewportHeight || !MeasureVerticalFov(api, world, job.originalWorldCameraId, confirmedFov) || !ScalarEquals(confirmedFov, job.originalFov, FOV_EPSILON) || !ScalarEquals(world.GetCameraFarPlane(job.originalWorldCameraId), job.originalFarPlane, MATRIX_EPSILON))
 		{
 			message = "The native editor camera changed while its lease snapshot was being acquired";
 			return false;
@@ -498,6 +502,7 @@ class EMCP_WB_ObserverService
 			job.requestedMatrix[currentAxis] = job.originalWorldMatrix[currentAxis];
 		if (viewKind != "current")
 		{
+			job.installationRollbackPending = true;
 			if (fov < 1 || fov > 179 || !ParseMatrix(matrix0, matrix1, matrix2, matrix3, job.requestedMatrix))
 			{
 				message = "Requested camera matrix or FOV is invalid";
@@ -505,7 +510,10 @@ class EMCP_WB_ObserverService
 			}
 			for (int requestedAxis = 0; requestedAxis < 4; requestedAxis++)
 				job.installedWorldMatrix[requestedAxis] = job.requestedMatrix[requestedAxis];
-			job.installedFov = 0;
+			// Retain the exact expected projection before its first measurement.
+			// A transiently unmeasurable viewport must not turn the default float
+			// value into false proof that a newer editor camera displaced this pose.
+			job.installedFov = fov;
 		}
 		else
 		{
@@ -527,13 +535,30 @@ class EMCP_WB_ObserverService
 			api.SetCamera(job.requestedMatrix[3], job.requestedMatrix[2]);
 			world.SetCameraEx(job.originalWorldCameraId, job.requestedMatrix);
 			world.SetCameraVerticalFOV(job.originalWorldCameraId, fov);
-			bool projectionMeasured = MeasureVerticalFov(api, world, job.originalWorldCameraId, job.installedFov);
-			bool requestedInstalled = projectionMeasured && Math.AbsFloat(job.installedFov - fov) <= FOV_EPSILON && InstalledStateStillOwned(job);
+			float measuredInstalledFov = job.installedFov;
+			bool projectionMeasured = MeasureVerticalFov(api, world, job.originalWorldCameraId, measuredInstalledFov);
+			bool requestedInstalled = projectionMeasured && ScalarEquals(measuredInstalledFov, fov, FOV_EPSILON) && InspectInstalledStateOwnership(job) == CAMERA_OWNERSHIP_OWNED;
 			if (!requestedInstalled)
 			{
 				job.state = EMCP_WB_ObserverProtocol.STATE_RESTORING;
 				job.sequence++;
-				bool restoredAfterRejectedInstall = RestoreJob(job);
+				bool restoredAfterRejectedInstall;
+				if (ImmediateRejectedInstallCanRollback(job, api))
+				{
+					// Submit has not yielded since its three camera writes, so any finite
+					// native result under the same exact binding is attributable to this
+					// transaction, including engine-normalized matrices. Always reset the
+					// persistent controller as well as the native slot; native values that
+					// already look original are not enough because the requested controller
+					// can reapply on the next frame. Later retries use the stricter exact
+					// original/requested component inspection in RestoreJob.
+					restoredAfterRejectedInstall = ApplyAndVerifyOriginalState(job, api, "The partial synchronous camera installation was rolled back to the exact original state");
+				}
+				else
+				{
+					restoredAfterRejectedInstall = RestoreJob(job);
+				}
+				m_RestorationProven = restoredAfterRejectedInstall;
 				job.state = EMCP_WB_ObserverProtocol.STATE_FAILED;
 				if (restoredAfterRejectedInstall)
 				{
@@ -549,7 +574,8 @@ class EMCP_WB_ObserverService
 				message = job.message;
 				return true;
 			}
-			job.actualFov = job.installedFov;
+			job.installationRollbackPending = false;
+			job.actualFov = measuredInstalledFov;
 			job.state = EMCP_WB_ObserverProtocol.STATE_SETTLING;
 			job.message = "Requested editor camera state installed";
 			job.sequence++;
@@ -874,14 +900,16 @@ class EMCP_WB_ObserverService
 		if (!Matches(jobId, leaseId, lifecycleGeneration, canonicalTarget, message))
 			return false;
 		// Public release is artifact/reference disposal only. It must never take
-		// control of an active or restoration-unconfirmed camera transaction;
-		// callers must cancel first and observe exact restoration.
-		if (!m_Job.IsTerminal() || m_Job.cameraLeaseHeld || !m_Job.restorationConfirmed)
+		// control of an active camera transaction. A terminal transaction that
+		// lost ownership may be retired without claiming exact restoration: the
+		// observer has already relinquished its lease and Release performs no
+		// camera mutation.
+		if (!m_Job.IsTerminal() || m_Job.cameraLeaseHeld)
 		{
-			message = "Release refused until cancellation/completion proves exact camera restoration";
+			message = "Release refused until cancellation/completion resolves the active camera lease";
 			return false;
 		}
-		restored = true;
+		restored = m_Job.restorationConfirmed;
 		if (!m_Job.outputLogicalPath.IsEmpty() && FileIO.FileExists(m_Job.outputLogicalPath))
 		{
 			artifactRemoved = FileIO.DeleteFile(m_Job.outputLogicalPath);
@@ -896,9 +924,12 @@ class EMCP_WB_ObserverService
 		m_LastRelease.leaseId = m_Job.leaseId;
 		m_LastRelease.lifecycleGeneration = m_Job.lifecycleGeneration;
 		m_LastRelease.canonicalTarget = m_Job.canonicalTarget;
-		m_LastRelease.restorationConfirmed = true;
+		m_LastRelease.restorationConfirmed = restored;
 		m_LastRelease.artifactRemoved = artifactRemoved;
-		message = "Workbench observer job and managed artifact reference released";
+		if (restored)
+			message = "Workbench observer job and managed artifact reference released after exact restoration";
+		else
+			message = "Workbench observer job and managed artifact reference released after the stale camera lease was relinquished";
 		m_Job = null;
 		return true;
 	}
@@ -952,7 +983,7 @@ class EMCP_WB_ObserverService
 			return EMCP_WB_ObserverProtocol.ERROR_WORLD_CHANGED;
 		if (worldEditor.GetApi().GetScreenWidth() != job.viewportWidth || worldEditor.GetApi().GetScreenHeight() != job.viewportHeight)
 			return EMCP_WB_ObserverProtocol.ERROR_STALE_LIFECYCLE;
-		if (!InstalledStateStillOwned(job))
+		if (InspectInstalledStateOwnership(job) != CAMERA_OWNERSHIP_OWNED)
 			return EMCP_WB_ObserverProtocol.ERROR_STALE_LIFECYCLE;
 		return string.Empty;
 	}
@@ -994,39 +1025,139 @@ class EMCP_WB_ObserverService
 		WorldEditorAPI api = null;
 		if (worldEditor)
 			api = worldEditor.GetApi();
-		if (!api || api.GetWorld() != job.world)
+		if (!api)
 		{
-			m_LastRestorationDiagnostic = "The active editor world changed during the camera lease";
+			m_LastRestorationDiagnostic = "The active editor API is unavailable during the camera lease";
 			return false;
 		}
-		if (api.GetScreenWidth() != job.viewportWidth || api.GetScreenHeight() != job.viewportHeight)
+		if (api.GetWorld() != job.world)
 		{
-			m_LastRestorationDiagnostic = "The active editor viewport dimensions changed during the camera lease";
-			return false;
+			return RelinquishJob(job, "The active editor world displaced the leased world; the stale observer lease was relinquished without mutating either world");
 		}
 		if (NormalizedPath(CurrentProjectFile()) != NormalizedPath(job.projectFile))
 		{
-			m_LastRestorationDiagnostic = "The base game project identity changed during the camera lease";
-			return false;
+			return RelinquishJob(job, "The base game project identity displaced the leased project; the stale observer lease was relinquished without mutating either project");
 		}
 		if (CurrentWorldIdentity() != job.worldIdentity)
 		{
-			m_LastRestorationDiagnostic = "The editor world/subscene identity changed during the camera lease";
-			return false;
+			return RelinquishJob(job, "The editor world/subscene identity displaced the leased context; the stale observer lease was relinquished without mutating the newer context");
+		}
+		if (job.installationRollbackPending)
+		{
+			int rollbackOwnership = InspectRejectedInstallRollbackOwnership(job, api);
+			if (rollbackOwnership == CAMERA_OWNERSHIP_INDETERMINATE)
+				return false;
+			if (rollbackOwnership == CAMERA_OWNERSHIP_DISPLACED)
+			{
+				return RelinquishJob(job, m_LastRestorationDiagnostic + "; the rejected-install lease was relinquished without overwriting a newer editor camera state");
+			}
+			return ApplyAndVerifyOriginalState(job, api, "The retained partial camera installation was rolled back to the exact original state");
 		}
 		if (OriginalStateAlreadyPresent(job))
 		{
-			job.cameraLeaseHeld = false;
-			job.restorationConfirmed = true;
-			m_LastRestorationDiagnostic = "The exact original native editor camera state was already present";
-			return true;
+			// Reapply the persistent controller even when the native slot already
+			// looks original. A prior explicit pose may otherwise be replayed by
+			// the editor controller on the next frame.
+			return ApplyAndVerifyOriginalState(job, api, "The exact original native editor camera state was re-applied and verified");
 		}
 		// Never overwrite a user, tool, or newer observer camera change. This
 		// lease may restore only while every camera/projection value still equals
 		// the exact state it installed (the original state for current view).
-		if (!InstalledStateStillOwned(job))
+		int installedOwnership = InspectInstalledStateOwnership(job);
+		if (installedOwnership == CAMERA_OWNERSHIP_INDETERMINATE)
 			return false;
+		if (installedOwnership == CAMERA_OWNERSHIP_DISPLACED)
+		{
+			// The observer may only write the original state while it still owns
+			// every camera value it installed. Once a newer editor state displaces
+			// that exact value, retaining an "active" lease cannot make restoration
+			// safer: it only deadlocks later lifecycle work. Relinquish the stale
+			// lease without overwriting the newer camera and retain the failed,
+			// restoration-unconfirmed result for honest diagnostics.
+			return RelinquishJob(job, m_LastRestorationDiagnostic + "; the stale observer lease was relinquished without overwriting the newer editor camera state");
+		}
 
+		return ApplyAndVerifyOriginalState(job, api, "The exact native editor camera slot, matrix, FOV, and far plane were restored");
+	}
+
+	protected bool ImmediateRejectedInstallCanRollback(EMCP_WB_ObserverJob job, WorldEditorAPI api)
+	{
+		if (!job || !job.world || !api || api.GetWorld() != job.world)
+			return false;
+		if (NormalizedPath(CurrentProjectFile()) != NormalizedPath(job.projectFile))
+			return false;
+		if (CurrentWorldIdentity() != job.worldIdentity)
+			return false;
+		if (job.world.GetCurrentCameraId() != job.originalWorldCameraId)
+			return false;
+		if (!ScalarEquals(job.world.GetCameraFarPlane(job.originalWorldCameraId), job.originalFarPlane, MATRIX_EPSILON))
+			return false;
+		vector actualWorld[4];
+		job.world.GetCurrentCamera(actualWorld);
+		return CameraMatrixFinite(actualWorld);
+	}
+
+	protected int InspectRejectedInstallRollbackOwnership(EMCP_WB_ObserverJob job, WorldEditorAPI api)
+	{
+		if (!job || !job.world || !api)
+		{
+			m_LastRestorationDiagnostic = "The rejected camera installation cannot inspect its editor binding";
+			return CAMERA_OWNERSHIP_INDETERMINATE;
+		}
+		if (api.GetWorld() != job.world)
+		{
+			m_LastRestorationDiagnostic = "The active editor world displaced the rejected camera installation";
+			return CAMERA_OWNERSHIP_DISPLACED;
+		}
+		if (NormalizedPath(CurrentProjectFile()) != NormalizedPath(job.projectFile))
+		{
+			m_LastRestorationDiagnostic = "The active project displaced the rejected camera installation";
+			return CAMERA_OWNERSHIP_DISPLACED;
+		}
+		if (CurrentWorldIdentity() != job.worldIdentity)
+		{
+			m_LastRestorationDiagnostic = "The editor world/subscene context displaced the rejected camera installation";
+			return CAMERA_OWNERSHIP_DISPLACED;
+		}
+		if (job.world.GetCurrentCameraId() != job.originalWorldCameraId)
+		{
+			m_LastRestorationDiagnostic = "The native camera slot displaced the rejected camera installation";
+			return CAMERA_OWNERSHIP_DISPLACED;
+		}
+		if (!ScalarEquals(job.world.GetCameraFarPlane(job.originalWorldCameraId), job.originalFarPlane, MATRIX_EPSILON))
+		{
+			m_LastRestorationDiagnostic = "The native far plane displaced the rejected camera installation";
+			return CAMERA_OWNERSHIP_DISPLACED;
+		}
+
+		vector actualWorld[4];
+		job.world.GetCurrentCamera(actualWorld);
+		bool matrixIsOriginal = MatrixEquals(actualWorld, job.originalWorldMatrix);
+		bool matrixIsRequested = MatrixEquals(actualWorld, job.requestedMatrix);
+		if (!matrixIsOriginal && !matrixIsRequested)
+		{
+			m_LastRestorationDiagnostic = "The native camera matrix displaced the rejected camera installation";
+			return CAMERA_OWNERSHIP_DISPLACED;
+		}
+		float measuredFov;
+		if (!MeasureVerticalFov(api, job.world, job.originalWorldCameraId, measuredFov))
+		{
+			m_LastRestorationDiagnostic = "The rejected camera installation projection remains unmeasurable";
+			return CAMERA_OWNERSHIP_INDETERMINATE;
+		}
+		bool fovIsOriginal = ScalarEquals(measuredFov, job.originalFov, FOV_EPSILON);
+		bool fovIsRequested = ScalarEquals(measuredFov, job.requestedFov, FOV_EPSILON);
+		if (!fovIsOriginal && !fovIsRequested)
+		{
+			m_LastRestorationDiagnostic = "The native FOV displaced the rejected camera installation";
+			return CAMERA_OWNERSHIP_DISPLACED;
+		}
+		m_LastRestorationDiagnostic = "The rejected camera installation remains an exact original/requested component combination";
+		return CAMERA_OWNERSHIP_OWNED;
+	}
+
+	protected bool ApplyAndVerifyOriginalState(EMCP_WB_ObserverJob job, WorldEditorAPI api, string successDiagnostic)
+	{
 		api.SetCamera(job.originalWorldMatrix[3], job.originalWorldMatrix[2]);
 		job.world.SetCameraEx(job.originalWorldCameraId, job.originalWorldMatrix);
 		job.world.SetCameraVerticalFOV(job.originalWorldCameraId, job.originalFov);
@@ -1051,12 +1182,12 @@ class EMCP_WB_ObserverService
 			exact = false;
 			m_LastRestorationDiagnostic = "The restored native editor camera matrix did not match the original matrix";
 		}
-		else if (Math.AbsFloat(restoredFov - job.originalFov) > FOV_EPSILON)
+		else if (!ScalarEquals(restoredFov, job.originalFov, FOV_EPSILON))
 		{
 			exact = false;
 			m_LastRestorationDiagnostic = "The restored native editor FOV did not match the original FOV (expected " + job.originalFov.ToString() + ", actual " + restoredFov.ToString() + ")";
 		}
-		else if (Math.AbsFloat(job.world.GetCameraFarPlane(job.originalWorldCameraId) - job.originalFarPlane) > MATRIX_EPSILON)
+		else if (!ScalarEquals(job.world.GetCameraFarPlane(job.originalWorldCameraId), job.originalFarPlane, MATRIX_EPSILON))
 		{
 			exact = false;
 			m_LastRestorationDiagnostic = "The restored native editor far plane did not match the original far plane";
@@ -1065,57 +1196,70 @@ class EMCP_WB_ObserverService
 		if (exact)
 		{
 			job.cameraLeaseHeld = false;
-			m_LastRestorationDiagnostic = "The exact native editor camera slot, matrix, FOV, and far plane were restored";
+			job.installationRollbackPending = false;
+			m_LastRestorationDiagnostic = successDiagnostic;
 		}
 		return exact;
 	}
 
-	protected bool InstalledStateStillOwned(EMCP_WB_ObserverJob job)
+	protected bool RelinquishJob(EMCP_WB_ObserverJob job, string diagnostic)
+	{
+		m_LastRestorationDiagnostic = diagnostic;
+		if (job)
+		{
+			job.cameraLeaseHeld = false;
+			job.restorationConfirmed = false;
+			job.installationRollbackPending = false;
+		}
+		return false;
+	}
+
+	protected int InspectInstalledStateOwnership(EMCP_WB_ObserverJob job)
 	{
 		if (!job || !job.world)
 		{
 			m_LastRestorationDiagnostic = "The installed camera state lost its editor world";
-			return false;
+			return CAMERA_OWNERSHIP_INDETERMINATE;
 		}
 		if (job.world.GetCurrentCameraId() != job.originalWorldCameraId)
 		{
 			m_LastRestorationDiagnostic = "The active native editor camera slot changed after installation";
-			return false;
+			return CAMERA_OWNERSHIP_DISPLACED;
 		}
 		vector actualWorld[4];
 		job.world.GetCurrentCamera(actualWorld);
+		if (!MatrixEquals(actualWorld, job.installedWorldMatrix))
+		{
+			m_LastRestorationDiagnostic = "The native editor camera matrix changed after observer installation";
+			return CAMERA_OWNERSHIP_DISPLACED;
+		}
+		if (!ScalarEquals(job.world.GetCameraFarPlane(job.originalWorldCameraId), job.originalFarPlane, MATRIX_EPSILON))
+		{
+			m_LastRestorationDiagnostic = "The native editor far plane changed during observer installation";
+			return CAMERA_OWNERSHIP_DISPLACED;
+		}
 		WorldEditor worldEditor = Workbench.GetModule(WorldEditor);
 		WorldEditorAPI api = null;
 		if (worldEditor)
 			api = worldEditor.GetApi();
-		if (!api || api.GetScreenWidth() != job.viewportWidth || api.GetScreenHeight() != job.viewportHeight)
+		if (!api)
 		{
-			m_LastRestorationDiagnostic = "The native editor viewport binding changed after camera installation";
-			return false;
+			m_LastRestorationDiagnostic = "The native editor projection became unavailable after camera installation";
+			return CAMERA_OWNERSHIP_INDETERMINATE;
 		}
 		float actualFov;
 		if (!MeasureVerticalFov(api, job.world, job.originalWorldCameraId, actualFov))
 		{
 			m_LastRestorationDiagnostic = "The installed native editor projection could no longer be measured";
-			return false;
+			return CAMERA_OWNERSHIP_INDETERMINATE;
 		}
-		if (!MatrixEquals(actualWorld, job.installedWorldMatrix))
-		{
-			m_LastRestorationDiagnostic = "The native editor camera matrix changed after observer installation";
-			return false;
-		}
-		if (Math.AbsFloat(actualFov - job.installedFov) > FOV_EPSILON)
+		if (!ScalarEquals(actualFov, job.installedFov, FOV_EPSILON))
 		{
 			m_LastRestorationDiagnostic = "The native editor FOV changed after observer installation";
-			return false;
-		}
-		if (Math.AbsFloat(job.world.GetCameraFarPlane(job.originalWorldCameraId) - job.originalFarPlane) > MATRIX_EPSILON)
-		{
-			m_LastRestorationDiagnostic = "The native editor far plane changed during observer installation";
-			return false;
+			return CAMERA_OWNERSHIP_DISPLACED;
 		}
 		m_LastRestorationDiagnostic = "The observer still owns the exact installed native editor camera state";
-		return true;
+		return CAMERA_OWNERSHIP_OWNED;
 	}
 
 	protected bool OriginalStateAlreadyPresent(EMCP_WB_ObserverJob job)
@@ -1136,9 +1280,9 @@ class EMCP_WB_ObserverService
 		WorldEditorAPI api = null;
 		if (worldEditor)
 			api = worldEditor.GetApi();
-		if (!api || api.GetScreenWidth() != job.viewportWidth || api.GetScreenHeight() != job.viewportHeight)
+		if (!api)
 		{
-			m_LastRestorationDiagnostic = "The original native editor viewport binding is no longer active";
+			m_LastRestorationDiagnostic = "The original native editor projection is no longer available";
 			return false;
 		}
 		float actualFov;
@@ -1152,12 +1296,12 @@ class EMCP_WB_ObserverService
 			m_LastRestorationDiagnostic = "The current native editor matrix does not match the original snapshot";
 			return false;
 		}
-		if (Math.AbsFloat(actualFov - job.originalFov) > FOV_EPSILON)
+		if (!ScalarEquals(actualFov, job.originalFov, FOV_EPSILON))
 		{
 			m_LastRestorationDiagnostic = "The current native editor FOV does not match the original snapshot";
 			return false;
 		}
-		if (Math.AbsFloat(job.world.GetCameraFarPlane(job.originalWorldCameraId) - job.originalFarPlane) > MATRIX_EPSILON)
+		if (!ScalarEquals(job.world.GetCameraFarPlane(job.originalWorldCameraId), job.originalFarPlane, MATRIX_EPSILON))
 		{
 			m_LastRestorationDiagnostic = "The current native editor far plane does not match the original snapshot";
 			return false;
@@ -1254,6 +1398,8 @@ class EMCP_WB_ObserverService
 	{
 		// Keep the 0.001 submitted-matrix validation local; it is distinct from
 		// MATRIX_EPSILON restoration equality in the contract tuning ledger.
+		if (!CameraMatrixFinite(matrix))
+			return false;
 		float len0 = matrix[0].Length();
 		float len1 = matrix[1].Length();
 		float len2 = matrix[2].Length();
@@ -1321,11 +1467,36 @@ class EMCP_WB_ObserverService
 		{
 			for (int column = 0; column < 3; column++)
 			{
-				if (Math.AbsFloat(left[row][column] - right[row][column]) > MATRIX_EPSILON)
+				if (!ScalarEquals(left[row][column], right[row][column], MATRIX_EPSILON))
 					return false;
 			}
 		}
 		return true;
+	}
+
+	protected bool CameraMatrixFinite(vector matrix[4])
+	{
+		for (int row = 0; row < 4; row++)
+		{
+			for (int column = 0; column < 3; column++)
+			{
+				if (!ScalarFinite(matrix[row][column]))
+					return false;
+			}
+		}
+		return true;
+	}
+
+	protected bool ScalarFinite(float value)
+	{
+		return value == value && Math.AbsFloat(value) <= 1000000000;
+	}
+
+	protected bool ScalarEquals(float left, float right, float epsilon)
+	{
+		if (!ScalarFinite(left) || !ScalarFinite(right))
+			return false;
+		return Math.AbsFloat(left - right) <= epsilon;
 	}
 
 	protected bool Identifier(string value, int minimum, int maximum)

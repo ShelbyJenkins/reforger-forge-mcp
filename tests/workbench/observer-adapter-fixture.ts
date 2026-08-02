@@ -70,8 +70,10 @@ export interface FakeOptions {
   loseFirstReleaseAcknowledgement?: boolean;
   corruptArtifact?: boolean;
   completedArtifactOverrides?: Record<string, unknown>;
+  submitResponseOverrides?: Record<string, unknown>;
   cancelResponseOverrides?: Record<string, unknown>;
   failFirstCancel?: boolean;
+  releaseRestorationConfirmed?: boolean;
   releaseReplayOverrides?: Record<string, unknown>;
   releaseReplayError?: Error;
 }
@@ -185,7 +187,7 @@ export class FakeObserverClient implements WorkbenchObserverClient {
         this.lostSubmitAcknowledgement = true;
         throw new Error("submit response was lost after delivery");
       }
-      return this.jobResponse("settling", false, true) as T;
+      return this.jobResponse("settling", false, true, this.options.submitResponseOverrides ?? {}) as T;
     }
     if (apiFunc === "EMCP_WB_ObserverStatus") {
       if (!this.options.completeOnStatus) return this.jobResponse("settling", false, true) as T;
@@ -220,7 +222,7 @@ export class FakeObserverClient implements WorkbenchObserverClient {
           message: "released",
           adapterProtocol: "reforger-forge-workbench-observer/1",
           jobId: params.jobId,
-          restorationConfirmed: this.wireBoolean(true),
+          restorationConfirmed: this.wireBoolean(this.options.releaseRestorationConfirmed ?? true),
           artifactRemoved: this.wireBoolean(true),
         };
         this.active = null;

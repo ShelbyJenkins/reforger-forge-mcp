@@ -147,6 +147,96 @@ describe("Workbench observer adapter", () => {
     });
   });
 
+  scopedIt("releases the activity gate when Submit immediately reports a relinquished terminal lease", async (root) => {
+    const client = fakeClient(root, {
+      cameraEditor: true,
+      submitResponseOverrides: {
+        state: "failed",
+        terminalErrorCode: "RESTORATION_UNCONFIRMED",
+        cameraLeaseHeld: false,
+        restorationConfirmed: false,
+        message: "camera installation drifted and the stale lease was relinquished",
+      },
+      releaseRestorationConfirmed: false,
+    });
+    const adapter = new WorkbenchObserverAdapter(client, {
+      createJobId: () => "relinquished-submit-job",
+    });
+
+    await expect(adapter.submit({
+      view: { kind: "pose", position: [1, 2, 3], orientation: [0, 0, 0, 1], fov: 55 },
+    })).resolves.toMatchObject({
+      state: "failed",
+      terminalErrorCode: "RESTORATION_UNCONFIRMED",
+      cameraLeaseHeld: false,
+      restorationConfirmed: false,
+    });
+    expect(client.releaseCaptureActivity).toHaveBeenCalledOnce();
+    await expect(adapter.release("relinquished-submit-job")).resolves.toMatchObject({
+      restorationConfirmed: false,
+    });
+    expect(client.active).toBeNull();
+  });
+
+  scopedIt("does not infer a released camera lease when a handler response omits cameraLeaseHeld", async (root) => {
+    const client = fakeClient(root, {
+      completeOnStatus: true,
+      completedArtifactOverrides: { cameraLeaseHeld: undefined },
+    });
+    const adapter = new WorkbenchObserverAdapter(client, {
+      createJobId: () => "missing-camera-lease-field-job",
+    });
+    await adapter.submit({ view: { kind: "current" } });
+
+    await expect(adapter.status("missing-camera-lease-field-job")).rejects.toMatchObject({
+      code: "HANDLER_UNAVAILABLE",
+    });
+    expect(client.releaseCaptureActivity).not.toHaveBeenCalled();
+
+    await expect(adapter.cancel("missing-camera-lease-field-job")).resolves.toMatchObject({
+      state: "cancelled",
+      cameraLeaseHeld: false,
+      restorationConfirmed: true,
+    });
+    await adapter.release("missing-camera-lease-field-job");
+    expect(client.releaseCaptureActivity).toHaveBeenCalledOnce();
+  });
+
+  scopedIt("retires a terminal camera lease that was safely relinquished after editor camera drift", async (root) => {
+    const client = fakeClient(root, {
+      cameraEditor: true,
+      cancelResponseOverrides: {
+        state: "failed",
+        terminalErrorCode: "RESTORATION_UNCONFIRMED",
+        cameraLeaseHeld: false,
+        restorationConfirmed: false,
+        message: "newer editor camera state displaced the observer lease",
+      },
+      releaseRestorationConfirmed: false,
+    });
+    const adapter = new WorkbenchObserverAdapter(client, {
+      createJobId: () => "relinquished-pose-job",
+    });
+    await adapter.submit({
+      view: { kind: "pose", position: [1, 2, 3], orientation: [0, 0, 0, 1], fov: 55 },
+    });
+
+    await expect(adapter.cancel("relinquished-pose-job")).resolves.toMatchObject({
+      state: "failed",
+      terminalErrorCode: "RESTORATION_UNCONFIRMED",
+      cameraLeaseHeld: false,
+      restorationConfirmed: false,
+    });
+    expect(client.releaseCaptureActivity).toHaveBeenCalledOnce();
+    await expect(adapter.release("relinquished-pose-job")).resolves.toEqual({
+      jobId: "relinquished-pose-job",
+      restorationConfirmed: false,
+      artifactRemoved: true,
+    });
+    expect(client.releaseMutations).toBe(1);
+    expect(client.active).toBeNull();
+  });
+
   scopedIt("rejects an old lifecycle generation and requests handler restoration", async (root) => {
     const client = fakeClient(root, { cameraEditor: true });
     const adapter = new WorkbenchObserverAdapter(client, { createJobId: () => "stale-job" });
@@ -214,4 +304,3 @@ describe("Workbench observer adapter", () => {
     expect(client.calls.some((call) => call.apiFunc === "EMCP_WB_ObserverSubmit")).toBe(false);
   });
 });
-

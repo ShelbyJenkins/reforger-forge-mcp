@@ -60,6 +60,22 @@ describe("bundled Windows Workbench lifecycle helper", () => {
     expect(helper).not.toContain("Write-Host");
   });
 
+  it("minimizes each discovered window handle at most once", () => {
+    const methodStart = helper.indexOf(
+      "public static bool TryMinimizeProcessWindow(int processId, int timeoutMilliseconds)"
+    );
+    const methodEnd = helper.indexOf("\n    }\n}\n\npublic sealed class LifecycleWindowRecord", methodStart);
+    expect(methodStart).toBeGreaterThan(-1);
+    expect(methodEnd).toBeGreaterThan(methodStart);
+    const method = helper.slice(methodStart, methodEnd);
+
+    expect(helper).toContain("FindUnseenVisibleTopLevelWindow");
+    expect(helper).toContain("handledWindows.Contains(hWnd)");
+    expect(method).toContain("handledWindows.Add(hWnd)");
+    expect(method.match(/ShowWindow\(/g)).toHaveLength(1);
+    expect(method).not.toContain("FindVisibleTopLevelWindow");
+  });
+
   it("exposes an explicit fail-closed endpoint-vacancy protocol mode", () => {
     expect(helper).toContain("'VerifyEndpointVacant'");
     expect(helper).toContain("function Invoke-VerifyEndpointVacant");

@@ -320,6 +320,13 @@ Automated Workbench launches enforce `-noThrow`. Assertions remain in the
 Workbench log and can still fail a validation gate, but they cannot block an
 agent behind a dialog that requires a person to dismiss it.
 
+A fresh `wb_launch` and every `wb_restart` leave Workbench's normal, focusable
+attended window policy in place. Reusing an existing session does not change
+its current window state. The internal minimize-without-activation policy is
+not the generic MCP editor default; when explicitly selected by a low-level
+automation plan, each newly discovered top-level window is minimized at most
+once, so restoring that same window is not undone repeatedly.
+
 Use `wb_log_query` with the `logDirectory` returned by `wb_build` to inspect
 only relevant managed Workbench log lines. It requires one or more addon,
 severity, channel, or case-insensitive text filters and never returns an

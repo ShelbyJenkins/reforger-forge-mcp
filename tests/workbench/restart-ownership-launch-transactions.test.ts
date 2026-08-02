@@ -36,7 +36,9 @@ describe("launch and replacement transactions", () => {
       detached: true,
       stdio: "ignore",
       windowsHide: false,
+      showWindow: "normal",
     });
+    expect(harness.backend.minimizeWindowCalls).toEqual([]);
   });
 
   it("restarts only the recorded exact process and never calls ChildProcess.kill", async () => {
@@ -47,6 +49,11 @@ describe("launch and replacement transactions", () => {
     expect(restarted.previousPid).toBe(launched.pid);
     expect(restarted.pid).not.toBe(launched.pid);
     expect(restarted.gprojPath).toBe(harness.projectPath);
+    expect(harness.spawnOptions).toHaveLength(2);
+    expect(harness.spawnOptions.every((options) =>
+      (options as { showWindow?: unknown }).showWindow === "normal"
+    )).toBe(true);
+    expect(harness.backend.minimizeWindowCalls).toEqual([]);
     expect(harness.backend.terminationCalls).toHaveLength(1);
     expect(harness.backend.terminationCalls[0]).toMatchObject({
       pid: launched.pid,

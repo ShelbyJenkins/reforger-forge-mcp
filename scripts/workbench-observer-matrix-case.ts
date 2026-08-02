@@ -449,6 +449,7 @@ class WorkbenchMatrixCaseExecution {
   private publicTerminal: FaultMatrixTerminal | null = null;
   private terminalStatus: Record<string, unknown> | null = null;
   private cancellationStatus: Record<string, unknown> | null = null;
+  private runDiscarded = false;
   private exactOwnerVacant = false;
   private currentWorldId: string;
   private currentWorldRevision: string;
@@ -485,11 +486,12 @@ class WorkbenchMatrixCaseExecution {
     await this.verifyShutdownDecoy();
     await this.retainValidatedArtifact();
     this.verifyCameraDisposition();
-    await this.releaseCancelledPrimary();
+    await this.releaseRetiredPrimary();
+    await this.discardRelinquishedRun();
     await this.proveFreshAcquisition();
     await this.finishFixtureCase();
 
-    if (terminal.state !== "completed") await this.input.actions.discardRun?.();
+    if (terminal.state !== "completed" && !this.runDiscarded) await this.input.actions.discardRun?.();
     return this.buildEntry(terminal);
   }
 
@@ -922,24 +924,41 @@ class WorkbenchMatrixCaseExecution {
   }
 
   private verifyCameraDisposition(): void {
-    if (this.input.matrixCase.cameraDisposition !== "restored") return;
     const proof = this.terminalStatus ?? this.cancellationStatus;
-    if (!proof || proof.cameraLeaseHeld === true || proof.restorationConfirmed !== true) {
+    if (this.input.matrixCase.cameraDisposition === "restored" &&
+        (!proof || proof.cameraLeaseHeld !== false || proof.restorationConfirmed !== true)) {
       throw new Error("Workbench matrix case did not prove exact editor camera restoration");
+    }
+    if (this.input.matrixCase.cameraDisposition === "relinquished" &&
+        (!proof || proof.cameraLeaseHeld !== false || proof.restorationConfirmed !== false)) {
+      throw new Error("Workbench matrix case did not prove safe no-write camera lease relinquishment");
     }
   }
 
-  private async releaseCancelledPrimary(): Promise<void> {
+  private async releaseRetiredPrimary(): Promise<void> {
     if (this.input.matrixCase.injection.action === "cancel_capture" && this.primaryJobId) {
       await this.input.adapter.release(this.primaryJobId);
     }
   }
 
+  private async discardRelinquishedRun(): Promise<void> {
+    if (this.input.matrixCase.cameraDisposition !== "relinquished") return;
+    await requireAction(
+      this.input.actions.discardRun,
+      "replace_fixture_world:discard-relinquished-run"
+    )();
+    this.runDiscarded = true;
+    this.diagnostics.push("discard converged the relinquished primary lease before fresh acquisition");
+  }
+
   private async proveFreshAcquisition(): Promise<void> {
     const action = this.input.matrixCase.injection.action;
     const expectsValidatedArtifact = this.requirePublicTerminal().state === "completed";
+    const provesReplacementRelinquishment = action === "replace_fixture_world" &&
+      this.input.matrixCase.cameraDisposition === "relinquished";
     if (!((expectsValidatedArtifact && action !== "stop_owned_workbench") ||
-        action === "cancel_capture" || action === "submit_competing_capture")) return;
+        action === "cancel_capture" || action === "submit_competing_capture" ||
+        provesReplacementRelinquishment)) return;
 
     const followUp = await this.input.application.capture(matrixCaptureInput(this.input, {
       label: "matrix-followup-current",

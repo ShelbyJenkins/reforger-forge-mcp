@@ -79,7 +79,7 @@ describe("Workbench helper status propagation", () => {
 
   it.each([
     ["register", "RegisterResourceFile returned false for: Prefabs/Failed.et"],
-    ["open", "SetOpenedResource returned false for: Prefabs/Failed.et"],
+    ["open", "Workbench.OpenResource returned false for: Prefabs/Failed.et"],
   ])("wb_resources exposes a helper %s failure", async (action, message) => {
     await withTemporaryDirectory(async (root) => {
       const addon = join(root, "Example");
@@ -104,7 +104,7 @@ describe("Workbench helper status propagation", () => {
   });
 
   it("wb_open_resource exposes a helper failure", async () => {
-    const message = "SetOpenedResource returned false for: Prefabs/Failed.et";
+    const message = "Workbench.OpenResource returned false for: Prefabs/Failed.et";
     const { client } = helperErrorClient(message);
     const handler = registeredTools(registerWbEditorTools, client).get("wb_open_resource");
 
@@ -137,7 +137,7 @@ describe("Workbench helper status propagation", () => {
     expect(save?.content[0]?.text).not.toContain("Prefab Saved");
   });
 
-  it("resource-opening helpers report false native results as errors", () => {
+  it("resource-opening helpers use Workbench resource-class routing and report false results", () => {
     const resourcesPath = fileURLToPath(new URL(
       "../../observer/workbench-addon/Scripts/WorkbenchGame/EnfusionMCP/EMCP_WB_Resources.c",
       import.meta.url
@@ -153,11 +153,34 @@ describe("Workbench helper status propagation", () => {
       /if \(result\)\s*\{\s*resp\.status = "ok";[\s\S]*?\}\s*else\s*\{\s*resp\.status = "error";\s*resp\.message = "RegisterResourceFile returned false/
     );
     expect(resources).toMatch(
-      /if \(result\)\s*\{\s*resp\.status = "ok";[\s\S]*?\}\s*else\s*\{\s*resp\.status = "error";\s*resp\.message = "SetOpenedResource returned false/
+      /bool result = Workbench\.OpenResource\(req\.path\);\s*if \(result\)\s*\{\s*resp\.status = "ok";[\s\S]*?\}\s*else\s*\{\s*resp\.status = "error";\s*resp\.message = "Workbench\.OpenResource returned false/
     );
     expect(editor).toMatch(
-      /if \(opened\)\s*\{\s*resp\.status = "ok";[\s\S]*?\}\s*else\s*\{\s*resp\.status = "error";\s*resp\.message = "SetOpenedResource returned false/
+      /bool opened = Workbench\.OpenResource\(req\.path\);\s*if \(opened\)\s*\{\s*resp\.status = "ok";[\s\S]*?\}\s*else\s*\{\s*resp\.status = "error";\s*resp\.message = "Workbench\.OpenResource returned false/
     );
+    expect(resources).not.toContain("resMgr.SetOpenedResource(req.path)");
+    expect(editor).not.toContain("worldEditor.SetOpenedResource(req.path)");
+
+    const routedOpen = editor.indexOf('if (req.action == "openResource")');
+    const worldEditorLookup = editor.indexOf(
+      "WorldEditor worldEditor = Workbench.GetModule(WorldEditor);"
+    );
+    expect(routedOpen).toBeGreaterThanOrEqual(0);
+    expect(worldEditorLookup).toBeGreaterThan(routedOpen);
+  });
+
+  it("the generic resource helper exposes registered PTC metadata and its editor route", () => {
+    const resourcesPath = fileURLToPath(new URL(
+      "../../observer/workbench-addon/Scripts/WorkbenchGame/EnfusionMCP/EMCP_WB_Resources.c",
+      import.meta.url
+    ));
+    const resources = readFileSync(resourcesPath, "utf8");
+
+    expect(resources).toContain('req.action == "getInfo"');
+    expect(resources).toContain('metaFile.GetObjectArray("Configurations")');
+    expect(resources).toContain("primaryConfiguration.GetClassName()");
+    expect(resources).toContain('resp.resourceClass == "PTCResourceClass"');
+    expect(resources).toContain('resp.editor = "ParticleEditor";');
   });
 
   it("resource-opening helpers reject unresolved resource paths before opening", () => {

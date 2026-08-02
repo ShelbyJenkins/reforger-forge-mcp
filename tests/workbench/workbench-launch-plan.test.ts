@@ -137,7 +137,7 @@ describe("canonical Workbench launch-plan policy", () => {
         stdio: "ignore",
         windowsHide: false,
         shell: false,
-        showWindow: "minimizedNoActivate",
+        showWindow: "normal",
       },
       readiness: {
         kind: "companion_net_api",
@@ -195,6 +195,7 @@ describe("canonical Workbench launch-plan policy", () => {
 
     expect(plan.kind).toBe("mcp_target_resource");
     expect(plan.resource.displayPath).toBe(realpathSync.native(resourcePath));
+    expect(plan.spawnOptions.showWindow).toBe("normal");
     expect(plan.argv).toEqual([
       "-addonsDir",
       [

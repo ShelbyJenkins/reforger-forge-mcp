@@ -124,6 +124,37 @@ describe("LMDB durable KV store", () => {
         }, { prefix: "rfo-lmdb-persist-" });
     });
 
+    it("rechecks a cooperative commit fence inside put and remove transactions", async () => {
+        await withTemporaryDirectory(async (root) => {
+            const store = createStore(root);
+            const leaseLoss = Object.assign(new Error("fixture mutex lease lost"), {
+                code: "RECOVERY_REQUIRED",
+            });
+            let checks = 0;
+            const loseAtCommit = (): void => {
+                checks += 1;
+                if (checks === 2) throw leaseLoss;
+            };
+
+            await expect(store.put(
+                key,
+                { generation: "g1", state: "new" },
+                null,
+                loseAtCommit,
+            )).rejects.toBe(leaseLoss);
+            await expect(store.read(key)).resolves.toBeNull();
+
+            await store.put(key, { generation: "g1", state: "new" }, null);
+            checks = 0;
+            await expect(store.remove(key, 1, loseAtCommit)).rejects.toBe(leaseLoss);
+            await expect(store.read(key)).resolves.toMatchObject({
+                value: { generation: "g1", state: "new" },
+                version: 1,
+            });
+            await store.close();
+        }, { prefix: "rfo-lmdb-fence-" });
+    });
+
     it("allows exactly one of two same-version writers", async () => {
         await withTemporaryDirectory(async (root) => {
             const first = createStore(root);

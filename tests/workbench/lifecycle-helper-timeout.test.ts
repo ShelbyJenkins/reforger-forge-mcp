@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { execFileSync, spawn } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { platform, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -20,6 +20,9 @@ const lifecycleHelperPath = fileURLToPath(
 );
 const failStopWorkerPath = fileURLToPath(
   new URL("./fixtures/mutex-holder-failstop-worker.ts", import.meta.url)
+);
+const fencedWorkerPath = fileURLToPath(
+  new URL("./fixtures/mutex-holder-fenced-worker.ts", import.meta.url)
 );
 
 afterEach(() => {
@@ -226,6 +229,39 @@ describe.runIf(platform() === "win32")("Windows lifecycle helper parent deadline
     expect(exit).toEqual({ code: 86, signal: null });
     await new Promise((resolvePromise) => setTimeout(resolvePromise, 800));
     expect(existsSync(markerPath)).toBe(false);
+  }, 10_000);
+
+  it("returns structured recovery without closing a fenced MCP host when its mutex holder exits", async () => {
+    const helperPath = helper([
+      "if ($Mode -eq 'HoldMutex') {",
+      "  [Console]::Out.WriteLine('{\"ok\":true,\"status\":\"acquired\"}')",
+      "  [Console]::Out.Flush()",
+      "  Start-Sleep -Milliseconds 250",
+      "  exit 0",
+      "}",
+      "[Console]::Out.WriteLine('{\"ok\":true,\"status\":\"absent\"}')",
+      "[Console]::Out.Flush()",
+    ].join("\r\n"));
+    const root = roots[roots.length - 1];
+    const lateMutationPath = join(root, "late-fenced-mutation.txt");
+    const survivalPath = join(root, "stdio-host-survived.txt");
+    const worker = spawn(process.execPath, [
+      "--import", "tsx", fencedWorkerPath,
+      helperPath,
+      lateMutationPath,
+      survivalPath,
+      `Global\\ReforgerForge.Timeout.FencedHolderExit.${process.pid}.${Date.now()}`,
+    ], { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+
+    const exit = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
+      (resolveExit, reject) => {
+        worker.once("error", reject);
+        worker.once("exit", (code, signal) => resolveExit({ code, signal }));
+      }
+    );
+    expect(exit).toEqual({ code: 0, signal: null });
+    expect(existsSync(lateMutationPath)).toBe(false);
+    expect(readFileSync(survivalPath, "utf8")).toBe("RECOVERY_REQUIRED");
   }, 10_000);
 
   it("bounds a helper hung during process inspection without fail-stopping", async () => {

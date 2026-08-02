@@ -394,6 +394,7 @@ const requiredFiles = [
   "scripts/run-observer-enforce-mailbox-acceptance.mjs",
   "scripts/update-observer-source-manifest.mjs",
   "scripts/setup.ps1",
+  "scripts/start-mcp-stdio.ps1",
   "scripts/windows/runtime-focus-guard.ps1",
   "scripts/windows/workbench-lifecycle.ps1",
   "tests/fixtures/enforce-mailbox-acceptance-addon/addon.gproj",

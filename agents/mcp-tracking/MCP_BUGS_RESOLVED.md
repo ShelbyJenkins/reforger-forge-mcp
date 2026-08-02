@@ -6,6 +6,112 @@ mixed tracker on 2026-07-28; same-day ties retain their migration order.
 
 ## Resolved defects
 
+### MCP-051 — `wb_launch` masks project compile failures as an undefined Ping API
+
+**Status:** Resolved
+
+**Severity:** P2 — delays diagnosis and misclassifies a project compile failure
+
+**Closed:** 2026-08-02
+
+**Resolution:** Every fresh Workbench launch now carries a new owner token.
+When readiness ends in a launch failure, bounded diagnostics inspect only the
+managed profile's recent, unambiguously owner-attributed log directory. A
+`Can't compile "<module>" script module!` marker is reclassified as
+`PROJECT_COMPILE_FAILED`, and `wb_launch` reports the module, first relevant
+compiler diagnostic, and exact `script.log` path. The controller scans both
+before and after rollback to allow for log flushing, preserves identity and
+recovery failures as authoritative, and exposes the last compiler failure in
+`wb_diagnose` until the next actual fresh-launch attempt.
+
+**Verification:** Parser and launch integration coverage exercises the observed
+absolute readiness timeout whose last Ping error is `Undefined API func`,
+owner-token attribution, bounded and ambiguous logs, diagnostic extraction,
+post-rollback log discovery, identity-error precedence, and diagnosis cleanup.
+The combined regression run passed 126/126 tests; the full repository suite,
+typecheck, build, compiled MCP verification, unused-code check, manifest and
+protocol checks, and packed-package smoke install also passed. A live broken
+RainbowVeil launch followed by a fixed relaunch was not repeated.
+
+### MCP-050 — registered `.ptc` resources cannot be opened in Particle Editor
+
+**Status:** Resolved
+
+**Severity:** P2 — attended resource navigation failure with a manual workaround
+
+**Closed:** 2026-08-02
+
+**Resolution:** Registered `MetaFile` resources are now validated before any
+World Editor requirement, and `.ptc` navigation delegates to the global
+`Workbench.OpenResource` router so Workbench can select Particle Editor even in
+`no_world_editor` mode. `wb_resources(getInfo)` recognizes `.ptc` metadata and
+returns its registered resource name, GUID, resource/config class, source path,
+editor type, and config count; other resource types retain their native path.
+
+**Verification:** Resource-tool and helper-contract coverage passes registered
+`.ptc` identity through both open surfaces, verifies Particle Editor routing
+without a World Editor document, checks structured metadata, and preserves the
+existing behavior for other resource types. The combined 126-test regression
+run, full repository suite, typecheck, build, manifest verification, and package
+smoke install passed. A live registered RainbowVeil particle was not opened in
+an attended Particle Editor during this close-out.
+
+### MCP-049 — `wb_launch` closes the MCP transport before starting Workbench
+
+**Status:** Resolved
+
+**Severity:** P1 — blocks all Workbench lifecycle and diagnostic tools
+
+**Closed:** 2026-08-02
+
+**Resolution:** The Windows machine-mutex holder-loss path no longer ignores
+its lease-loss callback and unconditionally aborts the long-running MCP host.
+Loss now synchronously fences lifecycle work and returns structured
+`RECOVERY_REQUIRED` when durable mutation can be stopped. Lifecycle sessions,
+LMDB writes, compare-and-swap operations, and spawn-journal updates recheck that
+fence at their commit boundaries. Exact native termination remains deliberately
+non-cancellable and fail-stop if the holder cannot be fenced safely.
+
+**Verification:** A Windows stdio integration test starts the actual source MCP,
+forces a managed Workbench child to exit during `wb_launch`, receives a
+structured launch refusal, and successfully calls `wb_diagnose` through the
+same client and transport. Native holder-loss, post-await fencing, LMDB
+transaction, and exact-termination tests also pass. The combined regression run
+passed 126/126 tests, and the full suite, typecheck, build, compiled MCP
+verification, unused-code check, and package smoke install passed. The original
+RainbowVeil transport-loss incident was not replayed live.
+
+### MCP-048 — failed Workbench pose capture retains an unreleasable camera lease
+
+**Status:** Resolved
+
+**Severity:** P1 — disruptive editor-state and lifecycle cleanup failure
+
+**Closed:** 2026-08-02
+
+**Resolution:** A pose installation that is synchronously rejected now rolls
+back the entire original camera transaction, including the persistent editor
+controller, before Submit yields. Indeterminate verification retains a bounded
+rollback obligation for later cancel retries; later exact world, project,
+subscene, camera, or projection displacement relinquishes the stale lease
+without writing over newer editor state. Nonfinite camera evidence fails closed.
+Terminal Workbench jobs release only with an explicit no-held-lease result, and
+discard keeps held or unreachable cleanup actionable and retryable. Durable job
+records cannot be swept before a release receipt, and nested runtime lease state
+is projected into the shared restoration contract without treating missing
+proof as success.
+
+**Verification:** The observer safety suite passed 85/85 tests, Stage 4 passed
+113/113, and fault-matrix/helper coverage passed 78/78. It covers normalized and
+partial installation rollback, temporarily unmeasurable projection, user/world
+displacement, nonfinite evidence, viewport changes, terminal held-lease discard,
+transport loss, later cancel/release recovery, runtime lease projection, and
+handler retention until receipt. Protocol-only Enforce validation, protocol and
+manifest checks (Workbench helper digest
+`fd64ed0a4f279a4a473bb728ebc020baa15806ab7358a6440f294f5d397f8bda`), the
+full repository suite, typecheck, build, and package smoke install passed. No
+attended Workbench camera acceptance or native ScriptEditor compile was run.
+
 ### MCP-045 — `game_duplicate` source lookup could escape configured data roots
 
 **Status:** Resolved

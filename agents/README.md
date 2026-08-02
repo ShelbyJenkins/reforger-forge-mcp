@@ -43,6 +43,25 @@ A normal registration starts the built server with:
 node <absolute-package-path>\dist\index.js
 ~~~
 
+A workspace may instead register a project-owned `start_mcp.ps1` when it needs
+repository dependency roots, Observer evidence roots, or another explicit
+startup setting. With no mode, that script is a stdio command owned by the MCP
+client. Do not run it in an interactive terminal or launch it as a background
+server; doing so does not connect the new process to an already-running client.
+
+Project launchers based on `scripts/start-mcp-stdio.ps1` also support two
+non-persistent checks:
+
+~~~powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\path\to\start_mcp.ps1 -Mode Describe
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\path\to\start_mcp.ps1 -Mode Verify
+~~~
+
+`Describe` writes one JSON document containing the resolved Node executable,
+built server, verifier, and exact startup arguments; it starts neither the MCP
+server nor Workbench. `Verify` runs the existing fresh-process MCP verifier with
+those arguments and exits. Neither mode refreshes the client-owned server.
+
 Do not create a ReforgerForge configuration file for ordinary discovery. Use an
 explicit configuration only for nonstandard paths or settings. The full
 procedure, including the manual installer, is in
@@ -68,6 +87,12 @@ policy it loaded when it started.
 process; it does not update the process already connected to the client.
 Likewise, `wb_restart` restarts only the exact MCP-owned Workbench process. It
 does not reload the MCP server.
+
+When the ReforgerForge tools are already visible in a coding session, do not
+shell-launch `node dist/index.js` or a project `start_mcp.ps1`: the client owns
+the connected stdio process. Use `wb_launch` for attended Workbench. Use the
+standalone `reforger-forge-workbench editor` command only when no live MCP owns
+the lifecycle lease.
 
 ## Client-Specific Registration
 

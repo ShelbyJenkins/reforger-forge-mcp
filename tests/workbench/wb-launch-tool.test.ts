@@ -11,25 +11,35 @@ interface ToolResult {
   readonly isError?: boolean;
 }
 
+interface ToolDefinition {
+  readonly description?: string;
+}
+
 type ToolHandler = (
   input: { readonly gprojPath?: string; readonly resourcePath?: string }
 ) => Promise<ToolResult>;
 
-function register(client: WorkbenchClient): ToolHandler {
+function register(client: WorkbenchClient): {
+  readonly handler: ToolHandler;
+  readonly definition: ToolDefinition;
+} {
   let handler: ToolHandler | undefined;
+  let definition: ToolDefinition | undefined;
   const server = {
     registerTool(
       name: string,
-      _definition: unknown,
+      candidateDefinition: ToolDefinition,
       candidate: ToolHandler
     ): void {
       expect(name).toBe("wb_launch");
+      definition = candidateDefinition;
       handler = candidate;
     },
   } as unknown as McpServer;
   registerWbLaunch(server, client);
   expect(handler).toBeDefined();
-  return handler!;
+  expect(definition).toBeDefined();
+  return { handler: handler!, definition: definition! };
 }
 
 describe("wb_launch MCP tool", () => {
@@ -48,7 +58,7 @@ describe("wb_launch MCP tool", () => {
       ensureRunning,
       state: { connected: false, mode: "unknown", lastUpdated: 0 },
     } as unknown as WorkbenchClient;
-    const tool = register(client);
+    const { handler: tool, definition } = register(client);
     const gprojPath =
       "C:\\mods\\OnePointZeroOne\\TestContent\\OnePointZeroOneTestContent.gproj";
 
@@ -65,6 +75,7 @@ describe("wb_launch MCP tool", () => {
     expect(text).toContain("`Workbench: disconnected`");
     expect(ensureRunning).toHaveBeenCalledOnce();
     expect(ensureRunning).toHaveBeenCalledWith(gprojPath);
+    expect(definition.description).toContain("normal, focusable attended editor window");
   });
 
   it("requires an explicit project and uses the target-bound launch path for a resource", async () => {
@@ -82,7 +93,7 @@ describe("wb_launch MCP tool", () => {
       ensureTargetResourceRunning,
       state: { connected: false, mode: "unknown", lastUpdated: 0 },
     } as unknown as WorkbenchClient;
-    const tool = register(client);
+    const { handler: tool } = register(client);
 
     const missingProject = await tool({ resourcePath: "Worlds/Target.ent" });
     expect(missingProject.isError).toBe(true);
@@ -101,5 +112,27 @@ describe("wb_launch MCP tool", () => {
       "C:\\mods\\Example\\Example.gproj",
       "C:\\mods\\Example\\Worlds\\Target.ent"
     );
+  });
+
+  it("labels project compiler failures distinctly from lifecycle launch refusals", async () => {
+    const ensureRunning = vi.fn(async () => {
+      throw new WorkbenchError(
+        "Workbench could not compile the Game project script module. First compiler diagnostic: Broken.c(7): Syntax error",
+        "PROJECT_COMPILE_FAILED"
+      );
+    });
+    const client = {
+      ensureRunning,
+      state: { connected: false, mode: "unknown", lastUpdated: 0 },
+    } as unknown as WorkbenchClient;
+    const { handler } = register(client);
+
+    const result = await handler({ gprojPath: "C:\\mods\\Broken\\Broken.gproj" });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0]?.text).toContain("**Project Compilation Failed**");
+    expect(result.content[0]?.text).toContain("`PROJECT_COMPILE_FAILED`");
+    expect(result.content[0]?.text).toContain("Broken.c(7): Syntax error");
+    expect(result.content[0]?.text).not.toContain("**Launch Refused**");
   });
 });

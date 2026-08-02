@@ -90,6 +90,11 @@ import {
   type DiagnosticReport,
 } from "./diagnostics.js";
 import {
+  findWorkbenchCompileFailure,
+  formatWorkbenchCompileFailure,
+  type WorkbenchCompileFailure,
+} from "./compile-diagnostics.js";
+import {
   WorkbenchNetApiClient,
   WorkbenchNetApiError,
   type WorkbenchNetApiPort,
@@ -305,6 +310,7 @@ export type WorkbenchErrorCode =
   | "PROTOCOL_ERROR"
   | "API_ERROR"
   | "LAUNCH_FAILED"
+  | "PROJECT_COMPILE_FAILED"
   | "TARGET_REQUIRED"
   | "AMBIGUOUS_TARGET"
   | "INVALID_CONFIG"
@@ -514,6 +520,7 @@ export class WorkbenchSessionController {
   private readonly qualificationIntervalMs: number;
   private readonly now: () => number;
   private readonly onExplicitSaveModal: WorkbenchClientDependencies["onExplicitSaveModal"];
+  private lastLaunchCompileFailure: WorkbenchCompileFailure | null = null;
   private companionAttestationKey: string | null = null;
   private qualificationCache: {
     authority: ManagedRunningAuthority;
@@ -1664,7 +1671,7 @@ export class WorkbenchSessionController {
   }
 
   async diagnose(): Promise<DiagnosticReport> {
-    return this.diagnosticsService({
+    const report = await this.diagnosticsService({
       host: this.host,
       port: this.port,
       config: this.config,
@@ -1672,6 +1679,9 @@ export class WorkbenchSessionController {
       callNetApi: (apiFunc, params, options) => this.rawCall(apiFunc, params, options),
       classifyNetError: (error) => error instanceof WorkbenchError ? error : null,
     });
+    return this.lastLaunchCompileFailure
+      ? { ...report, lastLaunchFailure: this.lastLaunchCompileFailure }
+      : report;
   }
 
   toString(): string {
@@ -3196,6 +3206,7 @@ export class WorkbenchSessionController {
     preflight: LaunchPreflight
   ): Promise<WorkbenchLifecycleStateV3> {
     let state = initialState;
+    this.lastLaunchCompileFailure = null;
 
     const ownerArgument = preflight.ownerArgument;
     const args = [...preflight.argv];
@@ -3210,6 +3221,7 @@ export class WorkbenchSessionController {
 
     let child: ChildProcess | null = null;
     let identity: WorkbenchIdentity | null = null;
+    let launchedAtMs: number | null = null;
     let childObservation: OwnedChildObservation | null = null;
     let resolveOwnedObservation!: (observation: OwnedChildObservation | null) => void;
     const ownedObservationReady = new Promise<OwnedChildObservation | null>((resolvePromise) => {
@@ -3238,7 +3250,7 @@ export class WorkbenchSessionController {
         );
       }
       this.companionProvider.verifyStaged(preflight.helper, preflight.project.displayPath);
-      const launchedAtMs = Date.now();
+      launchedAtMs = Date.now();
       const transaction = await this.runnerLifecycleExecution.spawnRecoverable({
         lifecycle: state,
         purpose: "mcp_editor",
@@ -3327,8 +3339,32 @@ export class WorkbenchSessionController {
       if (childObservation) childObservation.generation = state.generation;
     } catch (error) {
       settleOwnedObservation(null);
+      const mapped = this.mapLifecycleError(error);
+      const mayDiagnoseCompileFailure = mapped.code === "LAUNCH_FAILED";
+      let compileFailure = launchedAtMs === null || !mayDiagnoseCompileFailure
+        ? null
+        : findWorkbenchCompileFailure({
+            profilePath: preflight.helper.workbenchProfilePath,
+            launchedAtMs,
+            ownerArgument,
+          });
+      if (compileFailure) this.lastLaunchCompileFailure = compileFailure;
       await this.rollbackFailedLaunch(state, identity);
-      throw this.mapLifecycleError(error);
+      if (!compileFailure && launchedAtMs !== null && mayDiagnoseCompileFailure) {
+        compileFailure = findWorkbenchCompileFailure({
+          profilePath: preflight.helper.workbenchProfilePath,
+          launchedAtMs,
+          ownerArgument,
+        });
+        if (compileFailure) this.lastLaunchCompileFailure = compileFailure;
+      }
+      if (compileFailure) {
+        throw new WorkbenchError(
+          formatWorkbenchCompileFailure(compileFailure),
+          "PROJECT_COMPILE_FAILED"
+        );
+      }
+      throw mapped;
     }
 
     const runningIdentity = identity;

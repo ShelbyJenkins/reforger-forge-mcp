@@ -41,6 +41,26 @@ Each addon is a separate project. Read the target project's .gproj, metadata,
 dependencies, prefixes, and local conventions; never borrow IDs, GUIDs, or
 naming rules from a neighboring addon.
 
+## Session Ownership and Startup
+
+If the current coding client exposes the ReforgerForge tools, its stdio MCP
+server is already running. Do not start `node dist/index.js`, a project's
+`start_mcp.ps1`, or a second MCP host from a shell. A project `start_mcp.ps1`
+with no mode is a client registration command: it waits for MCP protocol input
+and is not an interactive or background-server command.
+
+Use `start_mcp.ps1 -Mode Describe` to inspect a project's resolved Node path,
+server path, and startup arguments without starting the MCP server or
+Workbench. Use `-Mode Verify` to run a bounded fresh-process handshake with
+those exact arguments. Verification does not replace the server already owned
+by the client. After rebuilding ReforgerForge or changing a launcher, refresh
+the MCP server in the client or restart the client before testing it.
+
+Start attended Workbench only through **wb_launch** while an MCP session owns
+the lifecycle. The standalone `reforger-forge-workbench editor` runner is for a
+foreground project script or operator session when no live MCP owns the lease;
+do not invoke it as a second editor launcher from an active MCP task.
+
 ## Before Editing
 
 1. Identify the target addon and read its .gproj plus any project instructions.
@@ -146,7 +166,9 @@ template grants write access or replaces a tool call.
 
 ### Normal live editing
 
-1. Call **wb_launch** with the exact gprojPath.
+1. Call **wb_launch** with the exact gprojPath. A fresh MCP-owned editor opens
+   as a normal, focusable attended window; restoring or focusing it must not be
+   treated as an automation failure.
 2. Confirm readiness with **wb_connect** or inspect the editor with
    **wb_state**.
 3. If the editor is in Play mode, call **wb_stop** before changing the world.
@@ -155,8 +177,9 @@ template grants write access or replaces a tool call.
 5. Save intentional edits through the supported target-bound save workflow
    below or through an attended editor action.
 6. After game-script changes, use **wb_restart** for a clean owner-scoped
-   compilation session. **wb_reload** reloads Workbench plugins only; it is not
-   a game-script reload.
+   compilation session. Its replacement also opens as a normal, focusable
+   attended window. **wb_reload** reloads Workbench plugins only; it is not a
+   game-script reload.
 7. Restore or cancel active Observer captures and wait for terminal jobs before
    calling **wb_shutdown**.
 

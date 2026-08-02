@@ -165,6 +165,7 @@ const WORKBENCH_OPERATIONAL_BASELINE_SOURCES = [
   "src/workbench/activity-gate.ts",
   "src/workbench/child-supervisor.ts",
   "src/workbench/client.ts",
+  "src/workbench/compile-diagnostics.ts",
   "src/workbench/diagnostics.ts",
   "src/workbench/helper-addon.ts",
   "src/workbench/launch-plan.ts",

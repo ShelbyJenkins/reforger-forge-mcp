@@ -690,6 +690,82 @@ describe("WorkbenchProcessGuard v3 lifecycle state", () => {
     expect(backend.processes.has(expected.pid)).toBe(false);
   });
 
+  it("fences a real lifecycle session at the final durable commit boundary after mutex loss", async () => {
+    const stateDir = root();
+    const backend = createFakeLifecycleBackend();
+    const withMachineMutex = backend.withMachineMutex.bind(backend);
+    const leaseLoss = Object.assign(new Error("fixture lifecycle mutex lease lost"), {
+      code: "RECOVERY_REQUIRED",
+    });
+    let triggerLeaseLoss = (): void => {
+      throw new Error("fixture lease-loss callback was not installed");
+    };
+    backend.withMachineMutex = (request) => withMachineMutex({
+      ...request,
+      action: async () => {
+        triggerLeaseLoss = () => {
+          if (!request.onLeaseLost) throw new Error("lifecycle session did not install a lease-loss fence");
+          request.onLeaseLost(leaseLoss);
+        };
+        return request.action();
+      },
+    });
+    const guard = new WorkbenchProcessGuard({
+      stateDir,
+      backend,
+      // This seam fires inside compareAndSwap, after its awaited inspection
+      // and immediately before the underlying LMDB transaction.
+      beforeLifecycleReplace: () => { triggerLeaseLoss(); },
+    });
+
+    await expect(guard.withLifecycleLock((session) => session.validateAndClaim({
+      endpoint: { host: "127.0.0.1", port: 5775 },
+      target: target(),
+    }))).rejects.toBe(leaseLoss);
+
+    expect((await guard.readLifecycleState()).kind).toBe("missing");
+  });
+
+  it("requires process fail-stop when the mutex is lost during exact termination", async () => {
+    const stateDir = root();
+    const backend = createFakeLifecycleBackend();
+    const withMachineMutex = backend.withMachineMutex.bind(backend);
+    const leaseLoss = Object.assign(new Error("fixture termination mutex lease lost"), {
+      code: "RECOVERY_REQUIRED",
+    });
+    let triggerLeaseLoss = (): void => {
+      throw new Error("fixture lease-loss callback was not installed");
+    };
+    backend.withMachineMutex = (request) => withMachineMutex({
+      ...request,
+      action: async () => {
+        triggerLeaseLoss = () => {
+          if (!request.onLeaseLost) throw new Error("lifecycle session did not install a lease-loss fence");
+          request.onLeaseLost(leaseLoss);
+        };
+        return request.action();
+      },
+    });
+    backend.verifyAndTerminate = async () => {
+      // A thrown fence callback instructs the Windows backend to abort rather
+      // than let a non-cancellable native signal outlive its mutex lease.
+      expect(triggerLeaseLoss).toThrow(leaseLoss);
+      return { kind: "terminated" };
+    };
+    const guard = new WorkbenchProcessGuard({ stateDir, backend });
+    const expected: WorkbenchIdentity = {
+      pid: 6061,
+      executablePath: "C:\\Tools\\Workbench.exe",
+      creationTime: "6061",
+      ownerTokenArgument: guard.ownerArgument("termination-lease-loss"),
+      launchedAtMs: 1,
+    };
+
+    await expect(guard.withLifecycleLock((session) =>
+      session.verifyAndTerminate(expected, 1000)
+    )).rejects.toBe(leaseLoss);
+  });
+
   it("fails closed on zero or unknown current-process creation time", async () => {
     const stateDir = root();
     const backend = createFakeLifecycleBackend({

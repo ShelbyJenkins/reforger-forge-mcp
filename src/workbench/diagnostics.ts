@@ -19,6 +19,7 @@ import {
   verifyWorkbenchHelperSource,
 } from "./helper-addon.js";
 import type { LifecycleStateRead, WorkbenchProcessGuard } from "./process-guard.js";
+import type { WorkbenchCompileFailure } from "./compile-diagnostics.js";
 
 const WORKBENCH_EXE = "ArmaReforgerWorkbenchSteamDiag.exe";
 const WORKBENCH_SUBDIR = "Workbench";
@@ -69,6 +70,8 @@ export interface DiagnosticReport {
   netApi: "up_with_companion" | "up_no_companion" | "refused" | "timeout" | "error";
   netApiError?: string;
   lifecycle: LifecycleDiagnostic;
+  /** Exact owner-attributed compiler failure retained by this MCP launch session. */
+  lastLaunchFailure?: WorkbenchCompileFailure;
 }
 
 export interface WorkbenchDiagnosticNetError {

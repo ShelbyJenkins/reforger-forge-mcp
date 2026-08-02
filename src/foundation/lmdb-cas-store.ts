@@ -114,8 +114,13 @@ export class LmdbCasStore<T> {
     };
   }
 
-  async compareAndSwap(expected: string | null, next: T): Promise<LmdbCasResult<T>> {
+  async compareAndSwap(
+    expected: string | null,
+    next: T,
+    assertCommitAllowed?: () => void,
+  ): Promise<LmdbCasResult<T>> {
     const current = await this.store.inspect(this.key);
+    assertCommitAllowed?.();
     if (current.kind === "corrupt") {
       throw new LmdbCasStoreError(
         "CORRUPT_RECORD",
@@ -128,21 +133,29 @@ export class LmdbCasStore<T> {
     }
     const injected = this.beforeCompareAndSwap?.({ expectedGeneration: expected, next });
     if (injected) throw injected;
+    assertCommitAllowed?.();
     const currentVersion = current.kind === "missing" ? null : current.version;
-    const result = await this.store.put(this.key, next, currentVersion);
+    const result = await this.store.put(this.key, next, currentVersion, assertCommitAllowed);
+    assertCommitAllowed?.();
     if (result.kind === "conflict") {
       const fresh = await this.store.inspect(this.key);
+      assertCommitAllowed?.();
       const freshGeneration = fresh.kind === "valid" ? this.generationOf(fresh.value) : null;
       return { kind: "conflict", actualGeneration: freshGeneration };
     }
     const generation = this.generationOf(next);
     this.afterCompareAndSwap?.({ generation, next });
+    assertCommitAllowed?.();
     return { kind: "replaced", current: { value: next, generation } };
   }
 
   /** Remove only the exact generation inspected by the caller. */
-  async compareAndRemove(expected: string): Promise<LmdbCasRemoveResult> {
+  async compareAndRemove(
+    expected: string,
+    assertCommitAllowed?: () => void,
+  ): Promise<LmdbCasRemoveResult> {
     const current = await this.store.inspect(this.key);
+    assertCommitAllowed?.();
     if (current.kind === "corrupt") {
       throw new LmdbCasStoreError(
         "CORRUPT_RECORD",
@@ -153,23 +166,31 @@ export class LmdbCasStore<T> {
     if (actualGeneration !== expected || current.kind === "missing") {
       return { kind: "conflict", actualGeneration };
     }
-    const removed = await this.store.remove(this.key, current.version);
+    const removed = await this.store.remove(this.key, current.version, assertCommitAllowed);
+    assertCommitAllowed?.();
     if (removed) return { kind: "removed" };
 
     const fresh = await this.store.inspect(this.key);
+    assertCommitAllowed?.();
     const freshGeneration = fresh.kind === "valid" ? this.generationOf(fresh.value) : null;
     return { kind: "conflict", actualGeneration: freshGeneration };
   }
 
   /** Archive raw corrupt bytes as an external evidence file, then remove the LMDB entry. */
-  async archiveCorrupt(record: { kind: "corrupt" } & LmdbCasInspection<T>, archivePath: string): Promise<void> {
+  async archiveCorrupt(
+    record: { kind: "corrupt" } & LmdbCasInspection<T>,
+    archivePath: string,
+    assertCommitAllowed?: () => void,
+  ): Promise<void> {
     const raw = await this.store.readRaw(this.key);
+    assertCommitAllowed?.();
     if (!raw) {
       throw new LmdbCasStoreError("ARCHIVE_MISMATCH", "LMDB record disappeared before archival.");
     }
     if (sha256Hex(raw.bytes) !== record.rawSha256) {
       throw new LmdbCasStoreError("ARCHIVE_MISMATCH", "LMDB record changed before archival.");
     }
+    assertCommitAllowed?.();
     atomicWriteFile({
       root: this.corruptArchiveDir,
       targetPath: archivePath,
@@ -179,7 +200,9 @@ export class LmdbCasStore<T> {
       durable: true,
       exclusive: true,
     });
-    const removed = await this.store.remove(this.key, raw.version);
+    assertCommitAllowed?.();
+    const removed = await this.store.remove(this.key, raw.version, assertCommitAllowed);
+    assertCommitAllowed?.();
     if (!removed) {
       throw new LmdbCasStoreError("ARCHIVE_CONFLICT", "LMDB record changed before archival removal.");
     }

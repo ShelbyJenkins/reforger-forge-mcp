@@ -9,6 +9,16 @@ import { formatConnectionStatus, requireResourceManagerMode } from "../workbench
 
 const RESOURCE_MUTATION_TIMEOUT_MS = 120_000;
 
+type GenericResourceInfo = {
+  path: string;
+  resourceName: string;
+  guid?: string;
+  resourceClass: string;
+  sourcePath?: string;
+  editor?: string;
+  configurationCount: number;
+};
+
 function throwIfResourceHelperFailed(result: Record<string, unknown>, action: string): void {
   if (result.status !== "error") return;
 
@@ -16,6 +26,45 @@ function throwIfResourceHelperFailed(result: Record<string, unknown>, action: st
     ? result.message
     : `Workbench resource ${action} failed.`;
   throw new Error(message);
+}
+
+function isParticleResourcePath(path: string): boolean {
+  return path.trim().toLowerCase().endsWith(".ptc");
+}
+
+function genericResourceInfoFrom(
+  result: Record<string, unknown>,
+  requestedPath: string
+): GenericResourceInfo {
+  throwIfResourceHelperFailed(result, "get info");
+  if (result.status !== "ok" || result.action !== "getInfo" || result.path !== requestedPath) {
+    throw new Error("Workbench resource metadata response did not match the requested .ptc resource.");
+  }
+  if (typeof result.resourceName !== "string" || result.resourceName.length === 0) {
+    throw new Error("Workbench resource metadata response omitted its registered resource identity.");
+  }
+  if (typeof result.resourceClass !== "string" || result.resourceClass.length === 0) {
+    throw new Error("Workbench resource metadata response omitted its resource class.");
+  }
+  if (!Number.isInteger(result.configurationCount) || (result.configurationCount as number) < 0) {
+    throw new Error("Workbench resource metadata response has an invalid configuration count.");
+  }
+  for (const field of ["guid", "sourcePath", "editor"] as const) {
+    if (result[field] !== undefined && typeof result[field] !== "string") {
+      throw new Error(`Workbench resource metadata response has an invalid ${field}.`);
+    }
+  }
+  return {
+    path: requestedPath,
+    resourceName: result.resourceName,
+    ...(typeof result.guid === "string" && result.guid.length > 0 ? { guid: result.guid } : {}),
+    resourceClass: result.resourceClass,
+    ...(typeof result.sourcePath === "string" && result.sourcePath.length > 0
+      ? { sourcePath: result.sourcePath }
+      : {}),
+    ...(typeof result.editor === "string" && result.editor.length > 0 ? { editor: result.editor } : {}),
+    configurationCount: result.configurationCount as number,
+  };
 }
 
 async function validateRegistrationPath(
@@ -88,6 +137,32 @@ export function registerWbResources(server: McpServer, client: WorkbenchClient):
         }
 
         if (action === "getInfo") {
+          // The engine's built-in GetResourceInfo handler rejects
+          // PTCResourceClass. Use registered MetaFile data for particles while
+          // preserving the richer native response for resource classes it
+          // supports.
+          if (isParticleResourcePath(path)) {
+            const raw = await client.call<Record<string, unknown>>("EMCP_WB_Resources", {
+              action,
+              path,
+            });
+            const info = genericResourceInfoFrom(raw, path);
+            const lines = [
+              "**Resource Info**",
+              "",
+              `- **Path:** ${info.path}`,
+              `- **Registered name:** ${info.resourceName}`,
+              ...(info.guid ? [`- **GUID:** ${info.guid}`] : []),
+              `- **Type:** ${info.resourceClass}`,
+              ...(info.sourcePath ? [`- **Source:** ${info.sourcePath}`] : []),
+              ...(info.editor ? [`- **Editor:** ${info.editor}`] : []),
+              `- **Platform configurations:** ${info.configurationCount}`,
+            ];
+            return {
+              content: [{ type: "text" as const, text: lines.join("\n") + formatConnectionStatus(client) }],
+            };
+          }
+
           // Use built-in GetResourceInfo handler
           const result = await client.call<Record<string, unknown>>("GetResourceInfo", {
             path,

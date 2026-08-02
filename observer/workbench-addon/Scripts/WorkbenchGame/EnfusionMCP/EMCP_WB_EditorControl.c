@@ -61,6 +61,48 @@ class EMCP_WB_EditorControl : NetApiHandler
 			return resp;
 		}
 
+		if (req.action == "openResource")
+		{
+			if (req.path == "")
+			{
+				resp.status = "error";
+				resp.message = "path parameter required for openResource action";
+				return resp;
+			}
+
+			// Workbench.OpenResource chooses the editor for the registered resource
+			// class. A WorldEditor instance is intentionally not required here: a
+			// generic no-document session must still be able to open a .ptc in the
+			// Particle Editor.
+			ResourceManager resourceManager = Workbench.GetModule(ResourceManager);
+			if (!resourceManager)
+			{
+				resp.status = "error";
+				resp.message = "ResourceManager module not available";
+				return resp;
+			}
+			MetaFile metaFile = resourceManager.GetMetaFile(req.path);
+			if (!metaFile)
+			{
+				resp.status = "error";
+				resp.message = "Resource metadata not found for: " + req.path;
+				return resp;
+			}
+
+			bool opened = Workbench.OpenResource(req.path);
+			if (opened)
+			{
+				resp.status = "ok";
+				resp.message = "Opened resource through Workbench routing: " + req.path;
+			}
+			else
+			{
+				resp.status = "error";
+				resp.message = "Workbench.OpenResource returned false for: " + req.path;
+			}
+			return resp;
+		}
+
 		WorldEditor worldEditor = Workbench.GetModule(WorldEditor);
 		if (!worldEditor)
 		{
@@ -103,47 +145,6 @@ class EMCP_WB_EditorControl : NetApiHandler
 			worldEditor.ExecuteAction(menuPath);
 			resp.status = "ok";
 			resp.message = "Redo executed";
-		}
-		else if (req.action == "openResource")
-		{
-			if (req.path == "")
-			{
-				resp.status = "error";
-				resp.message = "path parameter required for openResource action";
-			}
-			else
-			{
-				// SetOpenedResource can report success after changing context even when
-				// the requested logical resource does not exist. ResourceManager owns
-				// virtual project paths, so check its registered metadata instead of
-				// trying to convert the path to a filesystem path.
-				ResourceManager resourceManager = Workbench.GetModule(ResourceManager);
-				if (!resourceManager)
-				{
-					resp.status = "error";
-					resp.message = "ResourceManager module not available";
-					return resp;
-				}
-				MetaFile metaFile = resourceManager.GetMetaFile(req.path);
-				if (!metaFile)
-				{
-					resp.status = "error";
-					resp.message = "Resource metadata not found for: " + req.path;
-					return resp;
-				}
-
-				bool opened = worldEditor.SetOpenedResource(req.path);
-				if (opened)
-				{
-					resp.status = "ok";
-					resp.message = "Opened resource: " + req.path;
-				}
-				else
-				{
-					resp.status = "error";
-					resp.message = "SetOpenedResource returned false for: " + req.path;
-				}
-			}
 		}
 		else
 		{

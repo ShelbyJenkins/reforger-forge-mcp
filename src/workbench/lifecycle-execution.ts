@@ -176,9 +176,9 @@ function delay(ms: number): Promise<void> {
 
 /**
  * Workbench can take well over a minute to create its real main window (past
- * any splash/loading window) on a cold start with asset-heavy projects. The
- * PowerShell helper keeps re-suppressing activation for this whole window
- * rather than minimizing once and stopping, so it stays generous.
+ * any splash/loading window) on a cold start with asset-heavy projects. An
+ * explicit background policy therefore keeps a generous discovery window,
+ * while the native helper handles each newly discovered window at most once.
  */
 const MINIMIZE_WINDOW_TIMEOUT_MS = 120_000;
 

@@ -132,7 +132,7 @@ const jobResponseSchema = z.object({
   actualFov: finite.default(0),
   nearPlane: finite.default(0),
   farPlane: finite.default(0),
-  cameraLeaseHeld: workbenchBoolean.default(false),
+  cameraLeaseHeld: workbenchBoolean,
   restorationConfirmed: workbenchBoolean.default(false),
 }).passthrough();
 
@@ -555,6 +555,9 @@ export class WorkbenchObserverAdapter {
         throw new WorkbenchObserverAdapterError(WORKBENCH_ADAPTER_ERROR_CODES.STALE_LIFECYCLE, "Workbench observer submit acknowledged a different handler lease");
       }
       record.lastStatus = await this.publicStatus(record, response);
+      if (TERMINAL_STATES.has(record.lastStatus.state) && !record.lastStatus.cameraLeaseHeld) {
+        this.releaseGate(record);
+      }
       deliveryUncertain = false;
       return record.lastStatus;
     } catch (error) {
@@ -595,14 +598,14 @@ export class WorkbenchObserverAdapter {
       // Artifact validation is downstream of handler-proven camera restoration.
       // Preserve the terminal status and release the lifecycle activity gate
       // even when the generated image is corrupt or otherwise unacceptable.
-      if (TERMINAL_STATES.has(response.state) && !response.cameraLeaseHeld && response.restorationConfirmed) {
+      if (TERMINAL_STATES.has(response.state) && !response.cameraLeaseHeld) {
         record.lastStatus = await this.publicStatus(record, response, false);
         this.releaseGate(record);
       }
       throw error;
     }
     record.lastStatus = status;
-    if (TERMINAL_STATES.has(status.state) && !status.cameraLeaseHeld && status.restorationConfirmed) this.releaseGate(record);
+    if (TERMINAL_STATES.has(status.state) && !status.cameraLeaseHeld) this.releaseGate(record);
     return status;
   }
 
@@ -698,10 +701,10 @@ export class WorkbenchObserverAdapter {
       return { jobId, restorationConfirmed: false, artifactRemoved: false };
     }
     const status = record.lastStatus;
-    if (!status || !TERMINAL_STATES.has(status.state) || status.cameraLeaseHeld || !status.restorationConfirmed) {
+    if (!status || !TERMINAL_STATES.has(status.state) || status.cameraLeaseHeld) {
       throw new WorkbenchObserverAdapterError(
       WORKBENCH_ADAPTER_ERROR_CODES.CAMERA_BUSY,
-        "Workbench observer release requires a terminal job with proven restoration; cancel the active job first"
+        "Workbench observer release requires a terminal job with no active camera lease; cancel the active job first"
       );
     }
     if (!record.gateReleased) await this.revalidate(record);
@@ -712,10 +715,6 @@ export class WorkbenchObserverAdapter {
     const parsed = releaseResponseSchema.safeParse(raw);
     if (!parsed.success) throw new WorkbenchObserverAdapterError(WORKBENCH_ADAPTER_ERROR_CODES.HANDLER_UNAVAILABLE, "Workbench observer release returned an invalid response");
     if (parsed.data.status !== "ok") throw new WorkbenchObserverAdapterError(WORKBENCH_ADAPTER_ERROR_CODES.HANDLER_REJECTED, parsed.data.message);
-    if (!parsed.data.restorationConfirmed) {
-      throw new WorkbenchObserverAdapterError(WORKBENCH_ADAPTER_ERROR_CODES.RESTORATION_UNCONFIRMED, parsed.data.message);
-    }
-
     record.released = true;
     this.jobs.delete(jobId);
     this.completedImages.delete(jobId);
@@ -781,13 +780,13 @@ export class WorkbenchObserverAdapter {
           continue;
         }
         let status = record.lastStatus;
-        if (!status || !TERMINAL_STATES.has(status.state) || status.cameraLeaseHeld || !status.restorationConfirmed) {
+        if (!status || !TERMINAL_STATES.has(status.state) || status.cameraLeaseHeld) {
           status = await this.cancelBound(record);
         }
-        if (status.cameraLeaseHeld || !status.restorationConfirmed) {
+        if (status.cameraLeaseHeld) {
           throw new WorkbenchObserverAdapterError(
             WORKBENCH_ADAPTER_ERROR_CODES.RESTORATION_UNCONFIRMED,
-            `Workbench observer job ${record.jobId} could not prove restoration during shutdown`
+            `Workbench observer job ${record.jobId} retained its camera lease during shutdown convergence`
           );
         }
         await this.release(record.jobId);
@@ -822,10 +821,16 @@ export class WorkbenchObserverAdapter {
   private async recoverUnacknowledgedSubmit(record: AdapterJobRecord): Promise<boolean> {
     try {
       const status = await this.cancelBound(record);
-      return !status.cameraLeaseHeld && status.restorationConfirmed;
+      if (status.cameraLeaseHeld) return false;
+      // Submit never returned a public job, so no caller can later dispose the
+      // handler transaction. Retire it here once cancellation has either
+      // restored the camera or safely relinquished a displaced lease.
+      await this.release(record.jobId);
+      return true;
     } catch {
       this.convergeAbort(record);
-      if (record.gateReleased) return true;
+      const exitReason = record.activityLease.signal.reason as { code?: unknown } | undefined;
+      if (exitReason?.code === WORKBENCH_ADAPTER_ERROR_CODES.WORKBENCH_EXITED) return true;
       try {
         const ping = await this.pingSnapshot();
         // A different or empty active job proves this random lease did not
@@ -1172,8 +1177,8 @@ export class WorkbenchObserverAdapter {
       this.assertResponseBinding(response, record);
       const status = await this.publicStatus(record, response);
       record.lastStatus = status;
-      if (!status.cameraLeaseHeld && status.restorationConfirmed) this.releaseGate(record);
-      if (!status.restorationConfirmed && status.terminalErrorCode === WORKBENCH_ADAPTER_ERROR_CODES.RESTORATION_UNCONFIRMED) {
+      if (!status.cameraLeaseHeld) this.releaseGate(record);
+      if (status.cameraLeaseHeld && !status.restorationConfirmed && status.terminalErrorCode === WORKBENCH_ADAPTER_ERROR_CODES.RESTORATION_UNCONFIRMED) {
         throw new WorkbenchObserverAdapterError(WORKBENCH_ADAPTER_ERROR_CODES.RESTORATION_UNCONFIRMED, status.message);
       }
       return status;

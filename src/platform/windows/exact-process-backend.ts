@@ -45,8 +45,9 @@ export interface WindowsExactProcessBackendOptions {
   /** Optional absolute deadline shared by every nested helper phase. */
   operationDeadlineAtMs?: () => number | undefined;
   /**
-   * Process-level fail-stop invoked if an acquired OS mutex disappears before
-   * the protected action finishes. It must not return.
+   * Process-level fallback invoked if an acquired OS mutex disappears before
+   * an unfenced action finishes, or if the supplied lease-loss fence throws.
+   * It must not return.
    */
   leaseLossFailStop?: (error: WindowsExactProcessFailure) => never;
   /** Compatibility hook for domain adapters that retain their public error type. */
@@ -488,9 +489,31 @@ export class WindowsExactProcessBackend implements ExactProcessBackend, MachineM
       if (!released) {
         const error = this.failure(
           `Lifecycle mutex holder exited unexpectedly with code ${code}; ` +
-            "the MCP must fail-stop before any unprotected lifecycle work can continue.",
+            "the protected action lost its machine-wide lifecycle lease.",
           "RECOVERY_REQUIRED"
         );
+        if (args.onLeaseLost) {
+          // A fenced caller revokes its session/transaction authority before
+          // this rejection can leave the mutex boundary. The action may still
+          // have asynchronous work settling in the background, but every
+          // subsequent mutation is required to re-check that synchronous
+          // fence. Preserve the stdio host so the tool can report and diagnose
+          // the durable RECOVERY_REQUIRED state.
+          try {
+            args.onLeaseLost(error);
+          } catch {
+            // A broken fence cannot prove that late mutation was disabled.
+            try {
+              this.leaseLossFailStop(error);
+            } finally {
+              process.abort();
+            }
+          }
+          throw error;
+        }
+        // Generic/unfenced actions retain the process-level safety boundary:
+        // without a synchronous revocation hook they could mutate after the
+        // OS released the mutex.
         try {
           this.leaseLossFailStop(error);
         } finally {

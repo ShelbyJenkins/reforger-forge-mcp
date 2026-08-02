@@ -148,8 +148,11 @@ export class CaptureJobStore {
     for (const [jobId, record] of this.jobs) {
       if (record.pinned) continue;
       if (!options.force && record.retentionUntilMs > now) continue;
-      // Force only evicts terminal records; an unresolved camera obligation is
-      // never made forgettable by a byte-pressure sweep.
+      // Never orphan a backend job/handler reference. Even an exactly restored
+      // terminal Workbench transaction keeps the helper's activeJobId until
+      // backend release succeeds and its durable receipt is retained.
+      if (!record.releaseReceipt) continue;
+      // Force only evicts terminal records.
       const state = record.lastBackendJob.state;
       if (state !== "completed" && state !== "failed" && state !== "cancelled" && state !== "released") continue;
       this.jobs.delete(jobId);

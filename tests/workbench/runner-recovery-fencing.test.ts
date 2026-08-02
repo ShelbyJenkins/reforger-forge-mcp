@@ -175,7 +175,7 @@ describe("standalone Workbench lifecycle runner", () => {
 
     await execution.spawnRecoverable({
       lifecycle,
-      purpose: "target_build",
+      purpose: "mcp_editor",
       executablePath: harness.executablePath,
       launchArguments: [ownerArgument],
       spawnOptions: { cwd: harness.root, showWindow: "minimizedNoActivate" } as SpawnOptions,
@@ -205,7 +205,7 @@ describe("standalone Workbench lifecycle runner", () => {
 
     await execution.spawnRecoverable({
       lifecycle,
-      purpose: "target_build",
+      purpose: "mcp_editor",
       executablePath: harness.executablePath,
       launchArguments: [ownerArgument],
       spawnOptions: { cwd: harness.root, showWindow: "normal" } as SpawnOptions,
@@ -238,7 +238,7 @@ describe("standalone Workbench lifecycle runner", () => {
 
     await expect(execution.spawnRecoverable({
       lifecycle,
-      purpose: "target_build",
+      purpose: "mcp_editor",
       executablePath: harness.executablePath,
       launchArguments: [ownerArgument],
       spawnOptions: { cwd: harness.root, showWindow: "minimizedNoActivate" } as SpawnOptions,

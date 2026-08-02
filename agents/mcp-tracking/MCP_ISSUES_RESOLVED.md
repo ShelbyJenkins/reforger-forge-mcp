@@ -5,6 +5,83 @@ records. Move newly resolved or verified entries to the top. The legacy records
 below were migrated from the mixed tracker on 2026-07-28; same-day ties retain
 their migration order.
 
+### MCP-047 - project MCP launchers had no safe inspection or same-arguments verification path
+
+**Status:** Resolved
+
+**Priority:** P1
+
+**Observed:** 2026-08-01
+
+**Closed:** 2026-08-01
+
+**Decision:** Keep the AI client, its stdio MCP server, and Workbench as three
+separate ownership boundaries. Do not add an all-in-one background launcher:
+an external script cannot attach a second stdio server to an already-running
+client, and the standalone Workbench runner must not compete with an MCP-owned
+lifecycle.
+
+**Resolution:** The packaged `scripts/start-mcp-stdio.ps1` now supplies one
+shared project-launcher implementation with three modes. `Serve` is the
+protocol-clean default intended only for client registration. `Describe`
+validates Node 24+, the built server, configured directories, and ordered
+startup arguments, then emits JSON without starting the server or Workbench.
+`Verify` sends those same normalized arguments through the bounded compiled-MCP
+verifier. Agent and setup guidance now explains client refresh, stdio ownership,
+`wb_launch`, and the standalone foreground editor boundary explicitly.
+
+The containing workspace's 13 project wrappers now delegate to that helper.
+The migration fixed three incorrect repository-root calculations, added the
+missing ArcadeVehicles wrapper, removed ineffective broad add-on roots, and
+replaced Roadblock Runners' deleted evidence directory with its two current
+vehicle evidence roots. A project-level dependency audit also restored the
+specific OnePointZeroOne root required by ArcadeVehicles and the systems root
+required by VoroDeploy.
+
+**Verification:** The combined launcher and Workbench regression run passes
+51/51 tests, including JSON-only description, exact Verify/Serve argument
+parity, Node-version refusal, absence of direct Workbench spawning, and a
+dynamic contract check for every adjacent `.gproj` launcher, including local
+dependency visibility. TypeScript typecheck passes. All 13 real project
+wrappers pass `-Mode Verify` with a 58-tool MCP handshake, and the
+installed-package smoke test passes with the shared launcher present. These
+checks launched bounded verifier processes only; they did not launch Workbench
+or a game runtime.
+
+### MCP-046 - generic `wb_launch` repeatedly minimizes the attended editor
+
+**Status:** Resolved
+
+**Priority:** P1
+
+**Observed:** 2026-08-01
+
+**Closed:** 2026-08-01
+
+**Decision:** A fresh generic `wb_launch` and every `wb_restart` now leave the
+normal, focusable attended Workbench window policy in place. Reuse does not
+alter an existing window's state. The public tool does not expose background
+mode; minimize-without-activation remains a retained low-level spawn capability
+that no MCP tool selects.
+
+**Resolution:** `buildMcpEditorLaunchPlan()` now selects `showWindow: "normal"`,
+matching target-resource and foreground CLI editor plans. Tool descriptions,
+setup guidance, coding-agent guidance, and guided prompts state the attended
+contract. The retained native background helper tracks every top-level window
+handle it has handled and minimizes each distinct handle at most once. It can
+still catch a later main window after a splash window, but it cannot repeatedly
+undo a user's restoration of the same window during its 120-second discovery
+period.
+
+**Verification:** Five focused suites pass 46/46 tests. Launch-plan and
+controller transaction coverage prove generic launch and replacement restart
+both select `showWindow: "normal"` and schedule no minimize calls. Lifecycle
+coverage retains the explicit background, normal-window, and nonfatal-helper
+contracts. The bundled Windows helper compiled and passed its native process,
+endpoint, mutex, and exact-termination tests, while a source contract verifies
+per-window handle deduplication. No live Workbench process was launched during
+this offline verification.
+
 ### MCP-035 — decide whether exact-owned runtime profile logs are supporting evidence
 
 **Status:** Resolved

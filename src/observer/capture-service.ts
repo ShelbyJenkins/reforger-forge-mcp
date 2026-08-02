@@ -6,6 +6,7 @@ import {
   type BackendCallContext,
   type BackendJob,
   type BackendJobRef,
+  type BackendReleaseResult,
   type CaptureArtifact,
   type CaptureBackend,
   type CaptureBackendKind,
@@ -357,9 +358,13 @@ export class CaptureService {
     if (record.releaseReceipt) return { ...record.releaseReceipt };
     if (this.runPort) await this.runPort.assertReleaseAllowed({ jobId, backend: record.ref.backend, sessionId: record.ref.sessionId });
     let current = record.lastBackendJob;
-    if (!isTerminalJob(current) || hasRestorationObligation(current)) {
+    const workbenchLeaseResolved = (): boolean =>
+      record.ref.backend === "workbench" && isTerminalJob(current) && current.cameraLeaseHeld === false;
+    if (!isTerminalJob(current) || (hasRestorationObligation(current) && !workbenchLeaseResolved())) {
       current = await this.refresh(record);
-      if (!isTerminalJob(current) || hasRestorationObligation(current)) throw new CaptureError("CAMERA_BUSY", "Capture release requires terminal state with proven restoration", { job: publicJob(current) });
+      if (!isTerminalJob(current) || (hasRestorationObligation(current) && !workbenchLeaseResolved())) {
+        throw new CaptureError("CAMERA_BUSY", "Capture release requires terminal state with no active camera lease", { job: publicJob(current) });
+      }
     }
     const retainedHandler = current.handlerRelease && typeof current.handlerRelease === "object"
       ? current.handlerRelease as Record<string, unknown> : null;
@@ -492,10 +497,36 @@ export class CaptureService {
         record = this.store.getById(jobId);
       }
       if (!record) continue;
-      if (runReleasedArtifact && record.lastBackendJob.handlerRelease) continue;
+      if (runReleasedArtifact && record.lastBackendJob.handlerRelease &&
+          typeof record.lastBackendJob.handlerRelease === "object") {
+        this.retainReleasedRunReceipt(
+          jobId,
+          backend,
+          record.lastBackendJob.handlerRelease as BackendReleaseResult
+        );
+        continue;
+      }
       try {
-        const job = await this.refresh(record, this.operationDeadline());
-        if (job.state === "completed") {
+        let job = await this.refresh(record, this.operationDeadline());
+        if (backend === "workbench" && runReleasedArtifact &&
+            (!isTerminalJob(job) || job.cameraLeaseHeld === true)) {
+          job = await this.cancelOnce(this.store.getById(jobId)!);
+        }
+        if (backend === "workbench" && runReleasedArtifact &&
+            (!isTerminalJob(job) || job.cameraLeaseHeld !== false)) {
+          throw new CaptureError(
+            "RESTORATION_UNCONFIRMED",
+            `Discarded run retained an active Workbench camera lease for job ${jobId}`,
+            {
+              runId,
+              job: publicJob(job),
+              recovery: `Retry observer_job cancel/release for retained Workbench job ${jobId}`,
+            }
+          );
+        }
+        const workbenchLeaseResolved = backend === "workbench" &&
+          isTerminalJob(job) && job.cameraLeaseHeld === false;
+        if (job.state === "completed" || workbenchLeaseResolved) {
           const current = this.store.getById(jobId)!;
           // Workbench has already imported a separate managed copy, so its
           // external handler may be released during convergence. Runtime run
@@ -505,11 +536,15 @@ export class CaptureService {
           if (mayReleaseBackend &&
               (current.runCompleted || current.lastBackendJob.managedArtifactAvailable === true)) {
             const released = await this.backends.get(backend)!.release(current.ref, this.context(this.operationDeadline()));
-            this.store.update(jobId, (stored) => {
-              stored.runCompleted = true;
-              stored.lastBackendJob = { ...stored.lastBackendJob, handlerRelease: released };
-              stored.lastProjection = publicJob(stored.lastBackendJob);
-            });
+            if (runReleasedArtifact) {
+              this.retainReleasedRunReceipt(jobId, backend, released);
+            } else {
+              this.store.update(jobId, (stored) => {
+                stored.runCompleted = true;
+                stored.lastBackendJob = { ...stored.lastBackendJob, handlerRelease: released };
+                stored.lastProjection = publicJob(stored.lastBackendJob);
+              });
+            }
           } else {
             await this.completeIfNeeded(current);
           }
@@ -523,6 +558,14 @@ export class CaptureService {
             stored.lastProjection = publicJob(stored.lastBackendJob);
           });
           continue;
+        }
+        if (code === "TRANSPORT_UNAVAILABLE" && backend === "workbench" && runReleasedArtifact) {
+          const retained = this.store.getById(jobId) ?? record;
+          throw asCaptureError(error, {
+            runId,
+            job: publicJob(retained.lastBackendJob),
+            recovery: `Retry observer_job cancel/release for retained Workbench job ${jobId}`,
+          });
         }
         if (code !== "JOB_NOT_FOUND" && code !== "TRANSPORT_UNAVAILABLE") throw error;
       }
@@ -647,10 +690,48 @@ export class CaptureService {
     const backend = this.backends.get(record.ref.backend)!;
     try {
       const job = await backend.cancel(record.ref, this.context(this.operationDeadline()));
-      this.store.update(record.jobId, (stored) => { stored.lastBackendJob = { ...job, ref: { ...stored.ref, ...job.ref, jobId: stored.jobId } }; stored.lastProjection = publicJob(stored.lastBackendJob); });
+      this.store.update(record.jobId, (stored) => {
+        stored.lastBackendJob = { ...job, ref: { ...stored.ref, ...job.ref, jobId: stored.jobId } };
+        stored.lastProjection = publicJob(stored.lastBackendJob);
+        // A bounded cancellation attempt that still reports an active
+        // restoration obligation must remain retryable. The backend command is
+        // idempotent for the exact retained job binding.
+        stored.cancelRequested = !hasRestorationObligation(stored.lastBackendJob);
+      });
       await this.failRun(this.store.getById(record.jobId)!, new CaptureError("CANCELLED", "Capture was cancelled"));
       return this.store.getById(record.jobId)!.lastBackendJob;
-    } catch (error) { throw asCaptureError(error); }
+    } catch (error) {
+      this.store.update(record.jobId, (stored) => { stored.cancelRequested = false; });
+      throw asCaptureError(error);
+    }
+  }
+
+  private retainReleasedRunReceipt(
+    jobId: string,
+    backend: CaptureBackendKind,
+    released: BackendReleaseResult
+  ): void {
+    const receipt = {
+      ...released,
+      backend,
+      jobId,
+      managedArtifactReleased: true,
+    };
+    this.store.update(jobId, (stored) => {
+      stored.releaseReceipt = receipt;
+      stored.runCompleted = true;
+      stored.managedArtifactReleased = true;
+      stored.pinned = false;
+      stored.lastBackendJob = {
+        ...stored.lastBackendJob,
+        state: "released",
+        cameraLeaseHeld: false,
+        restorationConfirmed: released.restorationConfirmed !== false,
+        managedArtifactAvailable: false,
+        handlerRelease: released,
+      };
+      stored.lastProjection = publicJob(stored.lastBackendJob);
+    });
   }
 
   private async completeIfNeeded(record: CaptureJobRecord, deadlineAtMs = this.operationDeadline()): Promise<void> {

@@ -170,7 +170,12 @@ adopting an uncertain process.
 The capture service rejects stale, unhealthy, or capability-incompatible
 instances before a camera lease is acquired. A request binds the selected
 instance to its required opaque world revision. Completion, cancellation,
-failure, release, and managed shutdown converge on terminal restoration.
+failure, release, and managed shutdown converge on a terminal restoration
+disposition. Runtime requires exact restoration. Workbench also permits a
+terminal, restoration-unconfirmed job to relinquish its lease without a camera
+write when a newer editor world, context, or camera state definitively displaced
+the installed state; that result remains a failed capture, but its retired
+handler reference can be released.
 
 Synchronous capture returns one host-validated image and concise metadata only
 when it fits the configured inline limit. Larger artifacts remain in managed
@@ -301,8 +306,8 @@ runtime native fixture; it does not launch Arma Reforger or Workbench.
 |---|---|---|
 | Companion staging fails | `observer_setup action="doctor"`, managed-root ACLs, and package integrity | Correct explicit configuration or package state; do not manually place helper files in a mod. |
 | Workbench ping has a wrong helper identity | Active helper ID/GUID/version/protocol/build identity and lifecycle target | Close or diagnose the mismatched session, then launch the exact target through the managed Workbench path. |
-| A capture remains nonterminal | Job state, active camera lease, selected renderer health, and world identity | Cancel through `observer_job` and preserve managed state until terminal restoration is proved. |
-| `RESTORATION_UNCONFIRMED` | Camera slot/matrix/FOV, active world, lifecycle generation, and error receipt | Treat it as a hard failure. Do not promote or delete the retained evidence as a successful capture. |
+| A capture remains nonterminal | Job state, active camera lease, selected renderer health, and world identity | Cancel through `observer_job`. Preserve runtime or active-lease state until restoration is proved; a Workbench job may instead become terminal with `cameraLeaseHeld=false` after safe no-write relinquishment. |
+| `RESTORATION_UNCONFIRMED` | Camera slot/matrix/FOV, active world, lifecycle generation, lease flag, and error receipt | Treat it as a hard failure and never promote it as successful evidence. Retain and retry while `cameraLeaseHeld=true`; a terminal Workbench record with `cameraLeaseHeld=false` may be released because the displaced lease was already relinquished. |
 | Runtime lifecycle is `identity_mismatch`, `unverifiable`, or `stale` | Persisted receipt, executable identity, creation time, owner argument, MCP installation, and Windows owner | Preserve the process and receipt; never use PID/name-based termination. |
 | Mailbox is backlogged | Store diagnostics, quarantine disposition, lock/retry state, and quota | Fix the underlying storage or access condition. Do not delete markerless active-writer data. |
 | Finalization cannot write evidence | Configured evidence roots, selected root, path confinement, and supporting-log allowlist | Fix configuration or choose an allowlisted destination. Capture and discard remain usable without an exporter root. |

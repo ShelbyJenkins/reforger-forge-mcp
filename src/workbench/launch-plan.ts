@@ -97,8 +97,9 @@ export interface WorkbenchSpawnPolicy {
   readonly shell: false;
   /**
    * "minimizedNoActivate" launches Workbench without stealing window focus
-   * (best-effort: a native helper minimizes its window after spawn without
-   * calling SetForegroundWindow). "normal" leaves default OS activation.
+   * (best-effort: a native helper minimizes each newly discovered top-level
+   * window at most once without calling SetForegroundWindow). "normal" leaves
+   * default OS activation.
    */
   readonly showWindow: "normal" | "minimizedNoActivate";
 }
@@ -784,7 +785,7 @@ export function buildMcpEditorLaunchPlan(
       resolveMcpWorkingDirectory(input.config),
       true,
       false,
-      "minimizedNoActivate"
+      "normal"
     ),
     helper: prepared.companion,
     readiness: prepared.readiness,

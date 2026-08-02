@@ -146,7 +146,7 @@ This applies to ALL physical in-game objects: interactive props, spawn points wi
 8. Use **mod** with \`action: "validate"\` to check for structural issues.
 
 9. **Workbench Setup** (MANDATORY — automate every safe step; attended Play is the one manual exception):
-   a. **wb_launch** with \`gprojPath\` set to the addon's .gproj file — this stages the private helper outside the mod and opens the project in the World Editor with verified NET API access
+   a. **wb_launch** with \`gprojPath\` set to the addon's .gproj file — this stages the private helper outside the mod and opens a normal, focusable attended World Editor with verified NET API access
    b. Ask the user to enter Play mode manually in Workbench because no automated Play tool exists. Pause and wait for the user to confirm that Play has started.
    c. After confirmation, call **wb_state** and proceed only after it reports Play mode. Verify that the world launches successfully.
    d. Use **wb_stop** to return to the World Editor. Calling it in edit mode is an idempotent success.

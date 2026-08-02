@@ -1067,7 +1067,7 @@ interface MatrixCaseEntryBase {
     readonly budgetMs: number;
   };
   readonly worldRevision: "unchanged" | "changed" | "not_acquired" | "unavailable";
-  readonly camera: "restored" | "exact_process_exit" | "not_acquired" | "unproven";
+  readonly camera: "restored" | "relinquished" | "exact_process_exit" | "not_acquired" | "unproven";
   readonly artifact: "validated" | "not_created" | "rejected" | "unproven";
   readonly cleanup: {
     readonly lifecycleVacant: boolean;
@@ -1489,7 +1489,7 @@ function validateMatrixCaseEntry(
     throw new Error("Failure-matrix deadline is invalid");
   }
   if (typeof value.worldRevision !== "string" || !["unchanged", "changed", "not_acquired", "unavailable"].includes(value.worldRevision) ||
-      typeof value.camera !== "string" || !["restored", "exact_process_exit", "not_acquired", "unproven"].includes(value.camera) ||
+      typeof value.camera !== "string" || !["restored", "relinquished", "exact_process_exit", "not_acquired", "unproven"].includes(value.camera) ||
       typeof value.artifact !== "string" || !["validated", "not_created", "rejected", "unproven"].includes(value.artifact) ||
       !Array.isArray(value.retainedDiagnostics) || value.retainedDiagnostics.length > 16) {
     throw new Error("Failure-matrix case dispositions are invalid");

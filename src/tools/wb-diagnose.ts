@@ -64,6 +64,16 @@ export function registerWbDiagnose(server: McpServer, client: WorkbenchClient): 
       lines.push(`- **Companion build:** ${lifecycle.companionBuildIdentity ?? "(none)"}`);
       if (lifecycle.detail) lines.push(`- **Detail:** ${lifecycle.detail}`);
 
+      if (report.lastLaunchFailure) {
+        lines.push("\n### Last Launch Compiler Failure");
+        lines.push(`- **Classification:** ${report.lastLaunchFailure.code}`);
+        lines.push(`- **Module:** ${report.lastLaunchFailure.module}`);
+        for (const diagnostic of report.lastLaunchFailure.diagnostics) {
+          lines.push(`- **Compiler diagnostic:** ${diagnostic}`);
+        }
+        lines.push(`- **Exact script log:** \`${report.lastLaunchFailure.logPath}\``);
+      }
+
       const issues: string[] = [];
       if (!report.companionAddon) {
         issues.push("The packaged Workbench companion failed verification. Re-install reforger-forge-mcp.");

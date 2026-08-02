@@ -570,11 +570,14 @@ public static class LifecycleWindowVisibility
     [DllImport("user32.dll")]
     private static extern bool IsIconic(IntPtr hWnd);
 
-    private static IntPtr FindVisibleTopLevelWindow(int processId)
+    private static IntPtr FindUnseenVisibleTopLevelWindow(
+        int processId,
+        HashSet<IntPtr> handledWindows)
     {
         IntPtr found = IntPtr.Zero;
         EnumWindows(delegate (IntPtr hWnd, IntPtr lParam)
         {
+            if (handledWindows.Contains(hWnd)) return true;
             uint windowProcessId;
             GetWindowThreadProcessId(hWnd, out windowProcessId);
             if ((int)windowProcessId != processId) return true;
@@ -604,24 +607,25 @@ public static class LifecycleWindowVisibility
     }
 
     /// <summary>
-    /// Best-effort: repeatedly polls for the process's visible top-level window
-    /// for the whole timeout window and (re-)minimizes it without activating
-    /// (no SetForegroundWindow call) whenever it is not already minimized. A
-    /// slow-starting app can replace an early splash window with its real main
-    /// window, or re-show itself during init, well after the first poll; this
-    /// keeps suppressing that instead of minimizing once and stopping. Exits
+    /// Best-effort: polls for newly visible top-level windows for the whole
+    /// timeout and minimizes each distinct handle at most once without
+    /// activating it (no SetForegroundWindow call). A slow-starting app can
+    /// replace an early splash window with its real main window, but restoring
+    /// a window the helper already handled will not minimize it again. Exits
     /// early once the process is gone. Never throws.
     /// </summary>
     public static bool TryMinimizeProcessWindow(int processId, int timeoutMilliseconds)
     {
         DateTime deadline = DateTime.UtcNow.AddMilliseconds(timeoutMilliseconds);
         bool handledAtLeastOnce = false;
+        HashSet<IntPtr> handledWindows = new HashSet<IntPtr>();
         while (DateTime.UtcNow < deadline)
         {
             if (!IsProcessAlive(processId)) break;
-            IntPtr hWnd = FindVisibleTopLevelWindow(processId);
+            IntPtr hWnd = FindUnseenVisibleTopLevelWindow(processId, handledWindows);
             if (hWnd != IntPtr.Zero)
             {
+                handledWindows.Add(hWnd);
                 if (!IsIconic(hWnd))
                 {
                     ShowWindow(hWnd, SW_SHOWMINNOACTIVE);

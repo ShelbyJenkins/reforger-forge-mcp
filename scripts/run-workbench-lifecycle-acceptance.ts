@@ -32,6 +32,32 @@ function registeredResourceGuid(metaPath: string): string {
   return match[1].toUpperCase();
 }
 
+async function assertAttendedWorkbenchWindow(
+  guard: WorkbenchProcessGuard,
+  expectedPid: number
+): Promise<void> {
+  const lifecycle = await guard.readLifecycleState();
+  assert.equal(lifecycle.kind, "valid");
+  if (lifecycle.kind !== "valid" || !lifecycle.state.workbench) {
+    throw new Error("attended-window check has no exact running Workbench identity");
+  }
+  assert.equal(lifecycle.state.workbench.pid, expectedPid);
+  const deadlineMs = Date.now() + 30_000;
+  let windows = await guard.inspectExactWindows(lifecycle.state.workbench);
+  while (!windows.some((window) =>
+    window.visible && window.enabled && window.ownerHandle === "0" && !window.iconic
+  )) {
+    if (Date.now() >= deadlineMs) {
+      throw new Error(
+        `Workbench PID ${expectedPid} has no visible, enabled, non-minimized ` +
+          `top-level attended window: ${JSON.stringify(windows)}`
+      );
+    }
+    await delay(250);
+    windows = await guard.inspectExactWindows(lifecycle.state.workbench);
+  }
+}
+
 interface WorkbenchLifecycleAcceptanceOptions {
   readonly configPath: string;
   readonly confirmed: boolean;
@@ -250,6 +276,7 @@ export async function runWorkbenchLifecycleAcceptance(
     const registrationLaunch = await client.ensureRunning(firstProject);
     assert.equal(registrationLaunch.action, "launched");
     assert.equal(await client.ping(), true);
+    await assertAttendedWorkbenchWindow(guard, registrationLaunch.pid);
     const noDocumentState = await client.call<Record<string, unknown>>(
       "EMCP_WB_GetState",
       {},
@@ -296,6 +323,7 @@ export async function runWorkbenchLifecycleAcceptance(
     const launched = await client.ensureRunning(firstProject);
     assert.equal(launched.action, "launched");
     assert.equal(await client.ping(), true);
+    await assertAttendedWorkbenchWindow(guard, launched.pid);
     let processes = await guard.listWorkbenchProcesses();
     assert.equal(processes.length, 1);
     assert.equal(processes[0].pid, launched.pid);
@@ -343,6 +371,7 @@ export async function runWorkbenchLifecycleAcceptance(
       canonical.displayPath.toLowerCase()
     );
     assert.equal(await client.ping(), true);
+    await assertAttendedWorkbenchWindow(guard, restarted.pid);
     processes = await guard.listWorkbenchProcesses();
     assert.equal(processes.length, 1);
     assert.equal(processes[0].pid, restarted.pid);

@@ -16,7 +16,8 @@ export function registerWbLaunch(
     "wb_launch",
     {
       description:
-        "Launch or reuse the exact canonical .gproj in an owner-scoped Windows Workbench session. Supply both " +
+        "Launch or reuse the exact canonical .gproj in an owner-scoped Windows Workbench session. Fresh launches " +
+        "open a normal, focusable attended editor window. Supply both " +
         "gprojPath and resourcePath to create a fresh target-bound World Editor session for one .ent world or .et prefab; that form " +
         "is required before wb_save_resource. " +
         "The MCP stages its private helper outside the project, loads it with a dedicated profile, " +
@@ -63,10 +64,13 @@ export function registerWbLaunch(
           }],
         };
       } catch (error) {
+        const heading = error instanceof WorkbenchError && error.code === "PROJECT_COMPILE_FAILED"
+          ? "Project Compilation Failed"
+          : "Launch Refused";
         return {
           content: [{
             type: "text" as const,
-            text: `**Launch Refused**\n\n${errorText(error)}${formatConnectionStatus(client)}`,
+            text: `**${heading}**\n\n${errorText(error)}${formatConnectionStatus(client)}`,
           }],
           isError: true,
         };

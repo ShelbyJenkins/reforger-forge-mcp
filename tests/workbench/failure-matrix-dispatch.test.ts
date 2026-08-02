@@ -94,6 +94,24 @@ describe("complete Workbench failure-matrix dispatch", () => {
     );
   });
 
+  it("discards a safely relinquished world-replacement run before proving fresh acquisition", async () => {
+    const matrixCase = caseForId(
+      OBSERVER_FAULT_MATRIX,
+      "workbench.replace_fixture_world.capture_in_progress.pose"
+    ) as WorkbenchFaultMatrixCase;
+    const harness = fakeHarness(matrixCase);
+    const entry = await runWorkbenchMatrixCase(harness.input);
+
+    expect(entry).toMatchObject({
+      publicTerminal: { state: "failed", errorCode: "RESTORATION_UNCONFIRMED" },
+      camera: "relinquished",
+    });
+    expect(harness.calls.indexOf("discardRun")).toBeLessThan(
+      harness.calls.indexOf("capture:matrix-followup-current")
+    );
+    expect(harness.calls).not.toContain("requireExactExit:job-primary");
+  });
+
   it("gets the exact-exit barrier acknowledgement before sealing and shutting down", async () => {
     const matrixCase = caseForId(
       OBSERVER_FAULT_MATRIX,

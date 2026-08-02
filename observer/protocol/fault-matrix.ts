@@ -78,7 +78,7 @@ interface FaultMatrixCaseBase<Backend extends FaultMatrixBackend, Action extends
   readonly injection: { readonly phase: FaultMatrixPhase; readonly action: Action };
   readonly phaseSupport: PhaseSupportMap;
   readonly expectedTerminal: FaultMatrixTerminal;
-  readonly cameraDisposition: "restored" | "exact_process_exit" | "not_acquired";
+  readonly cameraDisposition: "restored" | "relinquished" | "exact_process_exit" | "not_acquired";
   readonly requiredChecks: readonly MatrixRequiredCheck[];
   readonly requiredEvidence: readonly MatrixEvidenceField[];
 }
@@ -247,13 +247,18 @@ function validateCase(caseValue: unknown, seenObjects: Set<object>, ids: Set<str
     validatePhaseSupport(phaseSupport[phase], phase, caseValue.injection.phase as FaultMatrixPhase);
   }
   if (!isCanonicalFaultMatrixTerminal(caseValue.expectedTerminal)) fail("case has an invalid expected terminal result");
-  if (caseValue.cameraDisposition !== "restored" && caseValue.cameraDisposition !== "exact_process_exit" &&
-      caseValue.cameraDisposition !== "not_acquired") {
+  if (caseValue.cameraDisposition !== "restored" && caseValue.cameraDisposition !== "relinquished" &&
+      caseValue.cameraDisposition !== "exact_process_exit" && caseValue.cameraDisposition !== "not_acquired") {
     fail("case has an invalid camera disposition");
   }
   if (caseValue.cameraDisposition === "not_acquired" &&
       FAULT_MATRIX_PHASES.indexOf(caseValue.injection.phase as FaultMatrixPhase) >= FAULT_MATRIX_PHASES.indexOf("lease_acquired")) {
     fail("not-acquired camera disposition is invalid after lease acquisition");
+  }
+  if (caseValue.cameraDisposition === "relinquished" &&
+      (caseValue.backend !== "workbench" || caseValue.injection.phase === "before_lease" ||
+        caseValue.expectedTerminal.state !== "failed")) {
+    fail("relinquished camera disposition requires a failed Workbench transaction after lease acquisition");
   }
   uniqueKnownValues(caseValue.requiredChecks, CHECK_SET, "case requiredChecks");
   uniqueKnownValues(caseValue.requiredEvidence, EVIDENCE_SET, "case requiredEvidence");
@@ -476,7 +481,7 @@ const WORKBENCH_PHASE_3_CASES: readonly WorkbenchFaultMatrixCase[] = Object.free
         },
     cameraDisposition: phase === "before_lease"
       ? "not_acquired"
-      : phase === "terminal_release" ? "restored" : "exact_process_exit",
+      : phase === "terminal_release" ? "restored" : "relinquished",
   }))),
   ...WORKBENCH_ARTIFACT_ACTIONS.map((action) => workbenchCase({
     action,

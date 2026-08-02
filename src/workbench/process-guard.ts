@@ -262,9 +262,9 @@ export interface WorkbenchLifecycleBackend extends ExactProcessBackend, MachineM
   ): Promise<VerifyEndpointOwnerResult>;
   verifyEndpointVacant(endpoint: LifecycleEndpoint): Promise<VerifyEndpointVacantResult>;
   /**
-   * Best-effort, non-identity cosmetic action: polls briefly for the process's
-   * visible top-level window and minimizes it without activating. Never
-   * throws for a merely absent or not-yet-created window.
+   * Best-effort, non-identity cosmetic action: polls for newly discovered
+   * visible top-level windows and minimizes each one at most once without
+   * activating. Never throws for a merely absent or not-yet-created window.
    */
   minimizeWindow(pid: number, timeoutMs: number): Promise<{ minimized: boolean }>;
   /**
@@ -551,9 +551,9 @@ export interface WindowsLifecycleBackendOptions {
   helperTimeoutMs?: number | (() => number);
   operationDeadlineAtMs?: () => number | undefined;
   /**
-   * Process-level fail-stop invoked if an acquired OS mutex disappears before
-   * the protected action finishes. It must not return. Injection exists only
-   * so a subprocess test can use a deterministic exit code.
+   * Process-level fallback for an unfenced action or broken lease-loss fence.
+   * It must not return. Injection exists only so a subprocess test can use a
+   * deterministic exit code.
    */
   leaseLossFailStop?: (error: LifecycleGuardError) => never;
 }
@@ -762,6 +762,7 @@ export class WindowsLifecycleBackend extends WindowsExactProcessBackend
 class LifecycleSession implements WorkbenchLifecycleSession {
   private active = true;
   private leaseLoss: MachineMutexLeaseLoss | null = null;
+  private failStopOperations = 0;
 
   constructor(
     private readonly guard: WorkbenchProcessGuard,
@@ -771,6 +772,12 @@ class LifecycleSession implements WorkbenchLifecycleSession {
   close(reason?: MachineMutexLeaseLoss): void {
     this.leaseLoss ??= reason ?? null;
     this.active = false;
+    if (reason && this.failStopOperations > 0) {
+      // Exact termination is a native, handle-bound operation that cannot be
+      // cooperatively cancelled after dispatch. Preserve the historical
+      // process fail-stop boundary if its mutex disappears in flight.
+      throw reason;
+    }
   }
 
   assertActive(): void {
@@ -783,46 +790,64 @@ class LifecycleSession implements WorkbenchLifecycleSession {
     }
   }
 
-  async readState(): Promise<LifecycleStateRead> {
+  private async runFenced<T>(action: () => Promise<T>): Promise<T> {
     this.assertActive();
-    return this.guard.readLifecycleState();
+    const result = await action();
+    this.assertActive();
+    return result;
+  }
+
+  private async runFailStopFenced<T>(action: () => Promise<T>): Promise<T> {
+    this.assertActive();
+    this.failStopOperations += 1;
+    try {
+      const result = await action();
+      this.assertActive();
+      return result;
+    } finally {
+      this.failStopOperations -= 1;
+    }
+  }
+
+  async readState(): Promise<LifecycleStateRead> {
+    return this.runFenced(() => this.guard.readLifecycleState());
   }
 
   async validateAndClaim(args: {
     endpoint: LifecycleEndpoint;
     target?: CanonicalProjectIdentity | null;
   }): Promise<LifecycleClaimResult> {
-    this.assertActive();
-    return this.guard.validateAndClaimLocked(this, args);
+    return this.runFenced(() => this.guard.validateAndClaimLocked(this, args));
   }
 
   async transition(
     expected: ExpectedStateVersion,
     next: LifecycleStateDraft
   ): Promise<WorkbenchLifecycleStateV3> {
-    this.assertActive();
-    return this.guard.transitionLocked(this, expected, next);
+    return this.runFenced(() => this.guard.transitionLocked(this, expected, next));
   }
 
   async transitionToVacant(
     expected: ExpectedStateVersion,
     overrides: Partial<Pick<LifecycleStateDraft, "endpoint" | "target" | "companion">> = {}
   ): Promise<WorkbenchLifecycleStateV3> {
-    this.assertActive();
-    const read = await this.guard.readLifecycleState();
-    if (read.kind !== "valid") {
-      throw new LifecycleGuardError("Cannot vacate a missing or invalid lifecycle state.", "STATE_INVALID");
-    }
-    return this.guard.transitionLocked(this, expected, {
-      phase: "vacant",
-      endpoint: overrides.endpoint ?? read.state.endpoint,
-      target: overrides.target === undefined ? read.state.target : overrides.target,
-      mcpOwner: read.state.mcpOwner,
-      workbench: null,
-      companion: overrides.companion === undefined
-        ? read.state.companion
-        : overrides.companion,
-      operation: null,
+    return this.runFenced(async () => {
+      const read = await this.guard.readLifecycleState();
+      this.assertActive();
+      if (read.kind !== "valid") {
+        throw new LifecycleGuardError("Cannot vacate a missing or invalid lifecycle state.", "STATE_INVALID");
+      }
+      return this.guard.transitionLocked(this, expected, {
+        phase: "vacant",
+        endpoint: overrides.endpoint ?? read.state.endpoint,
+        target: overrides.target === undefined ? read.state.target : overrides.target,
+        mcpOwner: read.state.mcpOwner,
+        workbench: null,
+        companion: overrides.companion === undefined
+          ? read.state.companion
+          : overrides.companion,
+        operation: null,
+      });
     });
   }
 
@@ -832,34 +857,29 @@ class LifecycleSession implements WorkbenchLifecycleSession {
     ownerTokenArgument: string;
     launchedAtMs: number;
   }): Promise<WorkbenchIdentity> {
-    this.assertActive();
-    return this.guard.inspectSpawnedWorkbench(args);
+    return this.runFenced(() => this.guard.inspectSpawnedWorkbench(args));
   }
 
   async verifyEndpointOwner(
     endpoint: LifecycleEndpoint,
     expected: WorkbenchIdentity
   ): Promise<VerifyEndpointOwnerResult> {
-    this.assertActive();
-    return this.guard.verifyEndpointOwner(endpoint, expected);
+    return this.runFenced(() => this.guard.verifyEndpointOwner(endpoint, expected));
   }
 
   async verifyEndpointVacant(endpoint: LifecycleEndpoint): Promise<VerifyEndpointVacantResult> {
-    this.assertActive();
-    return this.guard.verifyEndpointVacant(endpoint);
+    return this.runFenced(() => this.guard.verifyEndpointVacant(endpoint));
   }
 
   async verifyAndTerminate(
     expected: WorkbenchIdentity,
     timeoutMs: number
   ): Promise<VerifyTerminateResult> {
-    this.assertActive();
-    return this.guard.verifyAndTerminate(expected, timeoutMs);
+    return this.runFailStopFenced(() => this.guard.verifyAndTerminate(expected, timeoutMs));
   }
 
   async assertNoWorkbenchProcesses(): Promise<void> {
-    this.assertActive();
-    return this.guard.assertNoWorkbenchProcesses();
+    return this.runFenced(() => this.guard.assertNoWorkbenchProcesses());
   }
 }
 
@@ -1152,63 +1172,68 @@ export class WorkbenchProcessGuard {
             "STATE_INVALID"
           );
         }
-        return this.backend.withMachineMutex({
-          name: this.mutexName,
-          timeoutMs: this.currentLockTimeoutMs(),
-          action: async () => {
-            mkdirSync(this.stateDir, { recursive: true });
-            const lifecycle = await this.readLifecycleState();
-            const current = lifecycle.kind === "valid" ? lifecycle.state : null;
-            const sameOwner = current?.mcpOwner && lifecycleAuthority.mcpOwner &&
-              processMatches(current.mcpOwner, lifecycleAuthority.mcpOwner) &&
-              current.mcpOwner.instanceId === lifecycleAuthority.mcpOwner.instanceId &&
-              current.mcpOwner.leaseId === lifecycleAuthority.mcpOwner.leaseId &&
-              current.mcpOwner.userSid === lifecycleAuthority.mcpOwner.userSid;
-            const sameTarget = current?.target?.comparisonKey === next.metadata.targetKey &&
-              lifecycleAuthority.target?.comparisonKey === next.metadata.targetKey;
-            const publishedIdentityMatches = next.phase === "published" && current?.workbench &&
-              next.identity && processMatches(current.workbench, next.identity) &&
-              current.workbench.ownerTokenArgument === next.identity.ownerTokenArgument &&
-              current.workbench.launchedAtMs === next.identity.launchedAtMs;
-            const reservedGenerationMatches = next.phase !== "published" &&
-              current?.generation === lifecycleAuthority.generation &&
-              next.metadata.lifecycleGeneration === lifecycleAuthority.generation;
-            if (next.metadata.lifecycleGeneration !== lifecycleAuthority.generation ||
-                !sameOwner || !sameTarget ||
-                (!reservedGenerationMatches && !publishedIdentityMatches)) {
+        return this.withFencedBackendMutex(async (assertLeaseActive) => {
+          assertLeaseActive();
+          mkdirSync(this.stateDir, { recursive: true });
+          const lifecycle = await this.readLifecycleState();
+          assertLeaseActive();
+          const current = lifecycle.kind === "valid" ? lifecycle.state : null;
+          const sameOwner = current?.mcpOwner && lifecycleAuthority.mcpOwner &&
+            processMatches(current.mcpOwner, lifecycleAuthority.mcpOwner) &&
+            current.mcpOwner.instanceId === lifecycleAuthority.mcpOwner.instanceId &&
+            current.mcpOwner.leaseId === lifecycleAuthority.mcpOwner.leaseId &&
+            current.mcpOwner.userSid === lifecycleAuthority.mcpOwner.userSid;
+          const sameTarget = current?.target?.comparisonKey === next.metadata.targetKey &&
+            lifecycleAuthority.target?.comparisonKey === next.metadata.targetKey;
+          const publishedIdentityMatches = next.phase === "published" && current?.workbench &&
+            next.identity && processMatches(current.workbench, next.identity) &&
+            current.workbench.ownerTokenArgument === next.identity.ownerTokenArgument &&
+            current.workbench.launchedAtMs === next.identity.launchedAtMs;
+          const reservedGenerationMatches = next.phase !== "published" &&
+            current?.generation === lifecycleAuthority.generation &&
+            next.metadata.lifecycleGeneration === lifecycleAuthority.generation;
+          if (next.metadata.lifecycleGeneration !== lifecycleAuthority.generation ||
+              !sameOwner || !sameTarget ||
+              (!reservedGenerationMatches && !publishedIdentityMatches)) {
+            throw new LifecycleGuardError(
+              "Workbench spawn journal phase lacks the exact reserved lifecycle authority.",
+              "GENERATION_MISMATCH"
+            );
+          }
+          if (previous === null) {
+            const locked = await this.readSpawnJournal();
+            assertLeaseActive();
+            const lockedGeneration = locked.kind === "valid" ? locked.generation
+              : locked.kind === "missing" ? null
+                : undefined;
+            if (lockedGeneration !== initialGeneration) {
               throw new LifecycleGuardError(
-                "Workbench spawn journal phase lacks the exact reserved lifecycle authority.",
+                "Workbench spawn journal changed after recovery preflight; stale publication was refused.",
                 "GENERATION_MISMATCH"
               );
             }
-            if (previous === null) {
-              const locked = await this.readSpawnJournal();
-              const lockedGeneration = locked.kind === "valid" ? locked.generation
-                : locked.kind === "missing" ? null
-                  : undefined;
-              if (lockedGeneration !== initialGeneration) {
-                throw new LifecycleGuardError(
-                  "Workbench spawn journal changed after recovery preflight; stale publication was refused.",
-                  "GENERATION_MISMATCH"
-                );
-              }
-              expectedGeneration = initialGeneration!;
-            }
-            const envelope: WorkbenchSpawnJournalStateV3 = {
-              version: 3,
-              generation: randomUUID(),
-              record: next,
-            };
-            const result = await this.spawnStore().compareAndSwap(expectedGeneration!, envelope);
-            if (result.kind === "conflict") {
-              throw new LifecycleGuardError(
-                "Workbench spawn journal generation changed; stale phase publication was refused.",
-                "GENERATION_MISMATCH"
-              );
-            }
-            expectedGeneration = result.current.generation;
-            return result.current.value.record;
-          },
+            expectedGeneration = initialGeneration!;
+          }
+          const envelope: WorkbenchSpawnJournalStateV3 = {
+            version: 3,
+            generation: randomUUID(),
+            record: next,
+          };
+          assertLeaseActive();
+          const result = await this.spawnStore().compareAndSwap(
+            expectedGeneration!,
+            envelope,
+            assertLeaseActive
+          );
+          assertLeaseActive();
+          if (result.kind === "conflict") {
+            throw new LifecycleGuardError(
+              "Workbench spawn journal generation changed; stale phase publication was refused.",
+              "GENERATION_MISMATCH"
+            );
+          }
+          expectedGeneration = result.current.generation;
+          return result.current.value.record;
         });
       },
       discardPreSpawn: async (record) => {
@@ -1219,49 +1244,53 @@ export class WorkbenchProcessGuard {
           );
         }
         try {
-          await this.backend.withMachineMutex({
-            name: this.mutexName,
-            timeoutMs: this.currentLockTimeoutMs(),
-            action: async () => {
-              const lifecycle = await this.readLifecycleState();
-              const current = lifecycle.kind === "valid" ? lifecycle.state : null;
-              const sameOwner = current?.mcpOwner && lifecycleAuthority.mcpOwner &&
-                processMatches(current.mcpOwner, lifecycleAuthority.mcpOwner) &&
-                current.mcpOwner.instanceId === lifecycleAuthority.mcpOwner.instanceId &&
-                current.mcpOwner.leaseId === lifecycleAuthority.mcpOwner.leaseId &&
-                current.mcpOwner.userSid === lifecycleAuthority.mcpOwner.userSid;
-              const sameTarget =
-                current?.target?.comparisonKey === record.metadata.targetKey &&
-                lifecycleAuthority.target?.comparisonKey === record.metadata.targetKey;
-              const sameReservation =
-                current?.generation === lifecycleAuthority.generation &&
-                record.metadata.lifecycleGeneration === lifecycleAuthority.generation;
-              if (!sameOwner || !sameTarget || !sameReservation) {
-                throw new LifecycleGuardError(
-                  "RECOVERY_REQUIRED: pre_spawn journal retirement lost exact lifecycle authority.",
-                  "RECOVERY_REQUIRED"
-                );
-              }
+          await this.withFencedBackendMutex(async (assertLeaseActive) => {
+            assertLeaseActive();
+            const lifecycle = await this.readLifecycleState();
+            assertLeaseActive();
+            const current = lifecycle.kind === "valid" ? lifecycle.state : null;
+            const sameOwner = current?.mcpOwner && lifecycleAuthority.mcpOwner &&
+              processMatches(current.mcpOwner, lifecycleAuthority.mcpOwner) &&
+              current.mcpOwner.instanceId === lifecycleAuthority.mcpOwner.instanceId &&
+              current.mcpOwner.leaseId === lifecycleAuthority.mcpOwner.leaseId &&
+              current.mcpOwner.userSid === lifecycleAuthority.mcpOwner.userSid;
+            const sameTarget =
+              current?.target?.comparisonKey === record.metadata.targetKey &&
+              lifecycleAuthority.target?.comparisonKey === record.metadata.targetKey;
+            const sameReservation =
+              current?.generation === lifecycleAuthority.generation &&
+              record.metadata.lifecycleGeneration === lifecycleAuthority.generation;
+            if (!sameOwner || !sameTarget || !sameReservation) {
+              throw new LifecycleGuardError(
+                "RECOVERY_REQUIRED: pre_spawn journal retirement lost exact lifecycle authority.",
+                "RECOVERY_REQUIRED"
+              );
+            }
 
-              const journal = await this.readSpawnJournal();
-              if (journal.kind !== "valid" ||
-                  journal.generation !== expectedGeneration ||
-                  journal.record.phase !== "pre_spawn" ||
-                  journal.record.transactionId !== record.transactionId) {
-                throw new LifecycleGuardError(
-                  "RECOVERY_REQUIRED: pre_spawn journal changed before exact retirement.",
-                  "RECOVERY_REQUIRED"
-                );
-              }
-              const removed = await this.spawnStore().compareAndRemove(expectedGeneration);
-              if (removed.kind === "conflict") {
-                throw new LifecycleGuardError(
-                  "RECOVERY_REQUIRED: pre_spawn journal changed during exact retirement.",
-                  "RECOVERY_REQUIRED"
-                );
-              }
-              expectedGeneration = undefined;
-            },
+            const journal = await this.readSpawnJournal();
+            assertLeaseActive();
+            if (journal.kind !== "valid" ||
+                journal.generation !== expectedGeneration ||
+                journal.record.phase !== "pre_spawn" ||
+                journal.record.transactionId !== record.transactionId) {
+              throw new LifecycleGuardError(
+                "RECOVERY_REQUIRED: pre_spawn journal changed before exact retirement.",
+                "RECOVERY_REQUIRED"
+              );
+            }
+            assertLeaseActive();
+            const removed = await this.spawnStore().compareAndRemove(
+              expectedGeneration,
+              assertLeaseActive
+            );
+            assertLeaseActive();
+            if (removed.kind === "conflict") {
+              throw new LifecycleGuardError(
+                "RECOVERY_REQUIRED: pre_spawn journal changed during exact retirement.",
+                "RECOVERY_REQUIRED"
+              );
+            }
+            expectedGeneration = undefined;
           });
         } catch (error) {
           if (error instanceof LifecycleGuardError &&
@@ -1276,6 +1305,31 @@ export class WorkbenchProcessGuard {
         }
       },
     };
+  }
+
+  /**
+   * Fence direct spawn-journal transactions as tightly as lifecycle sessions.
+   * A native holder loss may reject without killing the client-owned stdio host
+   * only after this callback synchronously revokes all remaining mutations.
+   */
+  private withFencedBackendMutex<T>(
+    action: (assertLeaseActive: () => void) => Promise<T>
+  ): Promise<T> {
+    let leaseLoss: MachineMutexLeaseLoss | null = null;
+    const assertLeaseActive = (): void => {
+      if (leaseLoss) throw leaseLoss;
+    };
+    return this.backend.withMachineMutex({
+      name: this.mutexName,
+      timeoutMs: this.currentLockTimeoutMs(),
+      onLeaseLost: (error) => { leaseLoss = error; },
+      action: async () => {
+        assertLeaseActive();
+        const result = await action(assertLeaseActive);
+        assertLeaseActive();
+        return result;
+      },
+    });
   }
 
   private currentLockTimeoutMs(): number {
@@ -1560,6 +1614,7 @@ export class WorkbenchProcessGuard {
       target?: CanonicalProjectIdentity | null;
     }
   ): Promise<LifecycleClaimResult> {
+    session.assertActive();
     const endpoint = normalizedEndpoint(args.endpoint);
     if (!isLoopbackLifecycleHost(endpoint.host)) {
       return {
@@ -1570,16 +1625,19 @@ export class WorkbenchProcessGuard {
     }
     const target = args.target ?? null;
     const read = await this.readLifecycleState();
+    session.assertActive();
 
     if (read.kind === "missing") {
       const processes = await this.scanStrict();
+      session.assertActive();
       if (processes.length > 0) return this.unownedRefusal(processes);
-      const state = await this.createClaimedState(null, endpoint, target, session.mcp);
+      const state = await this.createClaimedState(session, null, endpoint, target, session.mcp);
       return { kind: "claimed", state, source: "missing" };
     }
 
     if (read.kind === "malformed") {
       const processes = await this.scanStrict();
+      session.assertActive();
       if (processes.length > 0) {
         return {
           kind: "refused",
@@ -1592,14 +1650,20 @@ export class WorkbenchProcessGuard {
         `malformed-${Date.now()}-${randomUUID()}.json`
       );
       const malformed = await this.lifecycleStore().inspect();
+      session.assertActive();
       if (malformed.kind !== "corrupt" || malformed.rawSha256 !== read.rawSha256) {
         throw new LifecycleGuardError(
           "Lifecycle state changed before malformed-state archival.",
           "GENERATION_MISMATCH"
         );
       }
-      await this.lifecycleStore().archiveCorrupt(malformed, archivePath);
-      const state = await this.createClaimedState(null, endpoint, target, session.mcp);
+      await this.lifecycleStore().archiveCorrupt(
+        malformed,
+        archivePath,
+        () => session.assertActive()
+      );
+      session.assertActive();
+      const state = await this.createClaimedState(session, null, endpoint, target, session.mcp);
       return { kind: "claimed", state, source: "malformed" };
     }
 
@@ -1655,6 +1719,7 @@ export class WorkbenchProcessGuard {
           companion: state.companion,
           operation: state.operation,
         });
+        session.assertActive();
         return { kind: "owned_by_current_mcp", state: changed };
       }
       return { kind: "owned_by_current_mcp", state };
@@ -1666,7 +1731,9 @@ export class WorkbenchProcessGuard {
       let prior: ProcessInspection | null;
       try {
         prior = await this.backend.inspectProcess(state.mcpOwner.pid);
+        session.assertActive();
       } catch (error) {
+        session.assertActive();
         return {
           kind: "refused",
           code: "IDENTITY_UNVERIFIABLE",
@@ -1683,6 +1750,7 @@ export class WorkbenchProcessGuard {
         // owner can still attempt is fenced by `transitionLocked`, which
         // refuses a superseded generation and lease id.
         const idle = await this.provenIdleLease(state, endpoint);
+        session.assertActive();
         if (idle.kind === "held") {
           return {
             kind: "refused",
@@ -1696,11 +1764,12 @@ export class WorkbenchProcessGuard {
       }
     } else {
       const processes = await this.scanStrict();
+      session.assertActive();
       if (processes.length > 0) return this.unownedRefusal(processes, state);
     }
 
     const claimedOwner: McpOwnerIdentity = { ...session.mcp, claimedAtMs: Date.now() };
-    const claimed = await this.replaceExisting(state, {
+    const claimed = await this.replaceExisting(session, state, {
       phase: state.phase,
       endpoint,
       target: target ?? state.target,
@@ -1772,7 +1841,9 @@ export class WorkbenchProcessGuard {
     expected: ExpectedStateVersion,
     next: LifecycleStateDraft
   ): Promise<WorkbenchLifecycleStateV3> {
+    session.assertActive();
     const read = await this.readLifecycleState();
+    session.assertActive();
     if (read.kind !== "valid" || read.state.generation !== expected.generation ||
         (read.state.mcpOwner?.leaseId ?? null) !== expected.leaseId) {
       throw new LifecycleGuardError(
@@ -1787,7 +1858,7 @@ export class WorkbenchProcessGuard {
         "STATE_INVALID"
       );
     }
-    return this.replaceExisting(read.state, next);
+    return this.replaceExisting(session, read.state, next);
   }
 
   private async currentIdentity(): Promise<ExactProcessIdentity & { userSid: string }> {
@@ -1804,11 +1875,13 @@ export class WorkbenchProcessGuard {
   }
 
   private async createClaimedState(
+    session: LifecycleSession,
     expectedGeneration: string | null,
     endpoint: LifecycleEndpoint,
     target: CanonicalProjectIdentity | null,
     owner: McpOwnerIdentity
   ): Promise<WorkbenchLifecycleStateV3> {
+    session.assertActive();
     const next: WorkbenchLifecycleStateV3 = {
       version: 3,
       generation: randomUUID(),
@@ -1823,7 +1896,12 @@ export class WorkbenchProcessGuard {
     if (!parseLifecycleState(next)) {
       throw new LifecycleGuardError("Initial lifecycle state is invalid.", "STATE_INVALID");
     }
-    const replacement = await this.lifecycleStore().compareAndSwap(expectedGeneration, next);
+    const replacement = await this.lifecycleStore().compareAndSwap(
+      expectedGeneration,
+      next,
+      () => session.assertActive()
+    );
+    session.assertActive();
     if (replacement.kind === "conflict") {
       throw new LifecycleGuardError(
         "Lifecycle state generation changed; stale initial claim was refused.",
@@ -1834,9 +1912,11 @@ export class WorkbenchProcessGuard {
   }
 
   private async replaceExisting(
+    session: LifecycleSession,
     current: WorkbenchLifecycleStateV3,
     draft: LifecycleStateDraft
   ): Promise<WorkbenchLifecycleStateV3> {
+    session.assertActive();
     const next: WorkbenchLifecycleStateV3 = {
       ...draft,
       // Write protected schema/CAS fields after the caller draft so a stale or
@@ -1848,7 +1928,12 @@ export class WorkbenchProcessGuard {
     if (!parseLifecycleState(next)) {
       throw new LifecycleGuardError("Refusing to write an invalid lifecycle state transition.", "STATE_INVALID");
     }
-    const replacement = await this.lifecycleStore().compareAndSwap(current.generation, next);
+    const replacement = await this.lifecycleStore().compareAndSwap(
+      current.generation,
+      next,
+      () => session.assertActive()
+    );
+    session.assertActive();
     if (replacement.kind === "conflict") {
       throw new LifecycleGuardError(
         "Lifecycle state generation changed; stale mutation was refused.",

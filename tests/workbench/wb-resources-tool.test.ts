@@ -114,4 +114,55 @@ describe("wb_resources MCP schema", () => {
       );
     }, { prefix: "rfo-resource-relative-" });
   });
+
+  it.each([
+    "Particles/Example/Smoke.ptc",
+    "Particles/Example/Smoke.PTC",
+  ])("gets registered particle metadata without the unsupported built-in handler: %s", async (path) => {
+    const call = vi.fn(async (apiFunc: string) => {
+      if (apiFunc !== "EMCP_WB_Resources") throw new Error(`Unexpected API function: ${apiFunc}`);
+      return {
+        status: "ok",
+        action: "getInfo",
+        path,
+        resourceName: `{D5C3520FD0C5DF9A}${path}`,
+        guid: "D5C3520FD0C5DF9A",
+        resourceClass: "PTCResourceClass",
+        sourcePath: `C:\\Example\\${path.replaceAll("/", "\\")}`,
+        editor: "ParticleEditor",
+        configurationCount: 6,
+      };
+    });
+    const tool = register({
+      state: { connected: true, mode: "unknown", lastUpdated: Date.now() },
+      call,
+    } as unknown as WorkbenchClient);
+
+    const result = await tool.handler({ action: "getInfo", path });
+
+    expect(result.isError).not.toBe(true);
+    expect(call).toHaveBeenCalledOnce();
+    expect(call).toHaveBeenCalledWith("EMCP_WB_Resources", { action: "getInfo", path });
+    expect(result.content[0]?.text).toContain("PTCResourceClass");
+    expect(result.content[0]?.text).toContain("D5C3520FD0C5DF9A");
+    expect(result.content[0]?.text).toContain("ParticleEditor");
+    expect(result.content[0]?.text).not.toMatch(/unsu+pported resource type/i);
+  });
+
+  it("keeps the native metadata handler for resource classes it supports", async () => {
+    const call = vi.fn(async () => ({
+      guid: "0123456789ABCDEF",
+      type: "EntityTemplateResourceClass",
+    }));
+    const tool = register({
+      state: { connected: true, mode: "unknown", lastUpdated: Date.now() },
+      call,
+    } as unknown as WorkbenchClient);
+
+    const result = await tool.handler({ action: "getInfo", path: "Prefabs/Example.et" });
+
+    expect(result.isError).not.toBe(true);
+    expect(call).toHaveBeenCalledWith("GetResourceInfo", { path: "Prefabs/Example.et" });
+    expect(result.content[0]?.text).toContain("EntityTemplateResourceClass");
+  });
 });
