@@ -1153,10 +1153,10 @@ export function buildTargetCheckLaunchPlan(
     "-gprojConfig",
     input.configuration,
     ownerArgument,
+    "-wbsilent",
     "-wbModule=ScriptEditor",
     "-validate",
-    input.configuration,
-    "-wbsilent"
+    input.configuration
   );
   const argv = immutableArguments(args, ownerArgument);
   if (argv.includes("-run") || argv.includes("-addons") || argv.includes("-builddata") ||

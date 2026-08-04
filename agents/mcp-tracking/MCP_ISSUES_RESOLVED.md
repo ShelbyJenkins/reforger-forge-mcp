@@ -5,6 +5,55 @@ records. Move newly resolved or verified entries to the top. The legacy records
 below were migrated from the mixed tracker on 2026-07-28; same-day ties retain
 their migration order.
 
+## MCP-052 - add a guarded compile-only Enforce Script check
+
+**Status:** Resolved
+
+**Priority:** P1
+
+**Observed:** 2026-08-02
+
+**Closed:** 2026-08-03
+
+**Resolution:** The new `wb_check` MCP tool and `reforger-forge-workbench
+check` CLI intent run one exact, helper-free, bounded Workbench ScriptEditor
+validation transaction for an absolute `.gproj` and declared configuration.
+The receipt is explicitly scoped to Enforce Script compilation and retains the
+exact target add-on, process/generation, attributed log directory, native exit
+evidence, and `compiled`, `PROJECT_COMPILE_FAILED`, or indeterminate result.
+It neither accepts a build-output directory nor runs ResourceManager
+`-buildData`, and it makes no whole-project validity claim.
+
+Build and check now share operation-neutral owner-scoped admission, recovery,
+exact-child supervision, timeout/abort cleanup, endpoint vacancy, target
+re-attestation, and dependency-drift fencing. Build-output reservation and
+attestation remain build-only. The check has its own durable operation and
+spawn purpose, MCP schemas, CLI parser and portable exit mapping, focused
+fixtures/tests, package smoke, operator guidance, and guarded live acceptance
+harness.
+
+**Characterization:** Workbench 1.7.0.54 proved the selected global/module
+boundary as `-wbsilent -wbModule=ScriptEditor -validate PC`, without `-run`.
+The valid fixture exited `0`, compiled, produced no build-output tree, and
+exposed no visible window. The broken Game fixture automatically exited with
+Windows/Node value `4294967295` (native `-1`) and the exact attributed
+diagnostic `Scripts/Game/RFO_MCP052_Broken.c(5): Expected ',' or ')', not a
+'52'`; the CLI maps that value to portable exit `1` without altering the JSON
+receipt. This installed Workbench briefly exposed one native Qt failure window
+for the broken fixture despite `-wbsilent -noThrow`; valid compilation remained
+fully headless. An absent configuration returned `INVALID_TARGET` with zero
+spawn delta. Fixture sources were byte-stable, exact children and endpoint were
+vacant after both runs, and the harness removed the ordinary ignored
+`resourceDatabase.rdb` fixture caches created during project initialization.
+The complete record is in
+[`docs/workbench-check-characterization.md`](../../docs/workbench-check-characterization.md).
+
+**Verification:** TypeScript typecheck passes; six focused runner, launch-plan,
+process-guard, CLI, and MCP-tool suites pass 68/68 tests; the complete `npm test`
+suite passes; and the packed tarball passes a fresh production-only install,
+both advertised CLI binaries, both descriptor-derived Enforce targets, and the
+public-projection/mailbox import checks.
+
 ## MCP-004 - material validation could not resolve inherited stock dependencies
 
 **Status:** Resolved

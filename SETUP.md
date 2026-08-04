@@ -331,10 +331,18 @@ For a fast Enforce Script compilation preflight while the MCP owns the
 lifecycle, call `wb_check` with an exact absolute `gprojPath`, a configuration
 declared by that project (default `PC`), and a bounded timeout. The operation
 starts a hidden, helper-free Workbench, returns only after exact-child cleanup
-and endpoint vacancy, and produces no build artifacts. A successful receipt
-means only that Enforce Scripts compiled; it does not validate resources,
+and endpoint vacancy, and does not run `-buildData` or create a caller-selected
+build-output tree. Workbench can still refresh the target's ordinary ignored
+`resourceDatabase.rdb` project cache during `.gproj` initialization. A
+successful receipt means only that Enforce Scripts compiled; it does not validate resources,
 materials, prefabs, worlds, packaging, or the whole add-on. `mod` with
 `action: "validate"` remains a separate static check.
+
+On Workbench 1.7.0.54, a valid `PC` check remained fully headless. An
+intentionally broken script briefly exposed Workbench's small native Qt
+failure window despite `-wbsilent -noThrow`; the guarded receipt and exact log
+still classified that normal native `-1` compiler result without requiring
+interaction.
 
 When no MCP server owns the Workbench lifecycle, the packaged equivalent is:
 

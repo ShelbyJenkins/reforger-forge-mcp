@@ -378,10 +378,10 @@ describe("canonical Workbench launch-plan policy", () => {
       "-gprojConfig",
       "PC",
       OWNER_ARGUMENT,
+      "-wbsilent",
       "-wbModule=ScriptEditor",
       "-validate",
       "PC",
-      "-wbsilent",
     ]);
     expect(plan.argv).not.toContain("-run");
     expect(plan.argv).not.toContain("-builddata");

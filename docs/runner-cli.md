@@ -166,10 +166,16 @@ and `attestFreshBuildOutput` in `src/workbench/runner.ts`.
 For `check`, the same lifecycle and target/dependency drift guarantees apply.
 The runner additionally proves that `configuration` is declared by the exact
 target before spawn, uses a private managed profile, starts hidden with
-`-wbModule=ScriptEditor -validate <configuration> -wbsilent`, attributes one
+`-wbsilent -wbModule=ScriptEditor -validate <configuration>`, attributes one
 owner-token log directory, and performs no build-output reservation or output
 attestation. Do not combine its receipt with `mod(action: "validate")` or call
 it proof that non-script project content is valid.
+
+Workbench may create or refresh the target's normal ignored
+`resourceDatabase.rdb` project cache while initializing the exact `.gproj`.
+That cache is not a caller-selected build-output directory and is neither
+returned nor attested as build output. The live argv and native-exit evidence
+are recorded in [the MCP-052 characterization](workbench-check-characterization.md).
 
 ## The one caller-side identity check
 

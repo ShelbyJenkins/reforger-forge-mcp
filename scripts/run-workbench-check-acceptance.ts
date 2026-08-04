@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { readdirSync, readFileSync, statSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -11,6 +11,7 @@ import { canonicalizeGproj } from "../src/workbench/project-identity.js";
 import { WorkbenchProcessGuard } from "../src/workbench/process-guard.js";
 import { runWorkbenchIntent, type WorkbenchCheckReceipt } from "../src/workbench/runner.js";
 import { receiptExitCode } from "../src/workbench/runner-cli.js";
+import { WorkbenchSessionController } from "../src/workbench/session-controller.js";
 import {
   assertSteamClientReady,
   assertWorkbenchStateOwnerReady,
@@ -38,21 +39,44 @@ function snapshotTree(root: string): Readonly<Record<string, string>> {
 async function observeCheck(
   guard: WorkbenchProcessGuard,
   run: Promise<WorkbenchCheckReceipt>
-): Promise<{ receipt: WorkbenchCheckReceipt; visibleWindows: number; observedWindows: number }> {
+): Promise<{
+  receipt: WorkbenchCheckReceipt;
+  visibleWindows: number;
+  observedWindows: number;
+  windowEvidence: readonly Record<string, unknown>[];
+}> {
   let settled = false;
   let visibleWindows = 0;
   let observedWindows = 0;
+  const windowEvidence = new Map<string, Record<string, unknown>>();
   void run.finally(() => { settled = true; }).catch(() => undefined);
   while (!settled) {
     const lifecycle = await guard.readLifecycleState();
     if (lifecycle.kind === "valid" && lifecycle.state.workbench) {
-      const windows = await guard.inspectExactWindows(lifecycle.state.workbench);
-      observedWindows += windows.length;
-      visibleWindows += windows.filter((window) => window.visible).length;
+      try {
+        const windows = await guard.inspectExactWindows(lifecycle.state.workbench);
+        observedWindows += windows.length;
+        visibleWindows += windows.filter((window) => window.visible).length;
+        for (const window of windows) {
+          windowEvidence.set(`${window.handle}:${window.className}:${window.title}`, { ...window });
+        }
+      } catch (error) {
+        // Lifecycle publication and native process exit are separate observations.
+        // Ignore only the narrow race where the exact attested process has exited;
+        // an inspection failure for a still-live identity remains fail-closed.
+        if (await guard.inspectOwnedWorkbench(lifecycle.state.workbench) === "live") {
+          throw error;
+        }
+      }
     }
     await delay(10);
   }
-  return { receipt: await run, visibleWindows, observedWindows };
+  return {
+    receipt: await run,
+    visibleWindows,
+    observedWindows,
+    windowEvidence: [...windowEvidence.values()],
+  };
 }
 
 function configurationArguments(argv: readonly string[]): string[] {
@@ -80,10 +104,26 @@ async function main(): Promise<void> {
   const brokenPath = resolve("tests/fixtures/workbench-check-broken-addon/addon.gproj");
   const validRoot = resolve(validPath, "..");
   const brokenRoot = resolve(brokenPath, "..");
+  const fixtureCachePaths = [
+    join(validRoot, "resourceDatabase.rdb"),
+    join(brokenRoot, "resourceDatabase.rdb"),
+  ];
+  for (const cachePath of fixtureCachePaths) rmSync(cachePath, { force: true });
   const beforeValid = snapshotTree(validRoot);
   const beforeBroken = snapshotTree(brokenRoot);
   const managedRoot = mkdtempSync(join(tmpdir(), "rfo-workbench-check-acceptance-"));
   const guard = new WorkbenchProcessGuard();
+  const lifecycleExecution = WorkbenchSessionController.composeLifecycleExecution({
+    processGuard: guard,
+  });
+  const controller = new WorkbenchSessionController(
+    config.workbenchHost,
+    config.workbenchPort,
+    config,
+    undefined,
+    guard,
+    { lifecycleExecution }
+  );
 
   try {
     const common = {
@@ -93,28 +133,30 @@ async function main(): Promise<void> {
       terminationTimeoutMs: 15_000,
       recoveryTimeoutMs: 15_000,
     };
-    const valid = await observeCheck(guard, runWorkbenchIntent(config, {
-      kind: "check",
-      gprojPath: validPath,
-      configuration: "PC",
-      timeoutMs: 120_000,
-    }, common) as Promise<WorkbenchCheckReceipt>);
-    const broken = await observeCheck(guard, runWorkbenchIntent(config, {
-      kind: "check",
-      gprojPath: brokenPath,
-      configuration: "PC",
-      timeoutMs: 120_000,
-    }, common) as Promise<WorkbenchCheckReceipt>);
+    const runCheck = (gprojPath: string, configuration: string): Promise<WorkbenchCheckReceipt> =>
+      controller.runOwnerScopedTargetCheck(
+        gprojPath,
+        (activeExecution, signal) => runWorkbenchIntent(config, {
+          kind: "check",
+          gprojPath,
+          configuration,
+          timeoutMs: 120_000,
+        }, {
+          ...common,
+          processGuard: undefined,
+          lifecycleExecution: activeExecution,
+          runnerProcessGuard: guard,
+          lifecycleEntry: "owner_scoped",
+          signal,
+        }) as Promise<WorkbenchCheckReceipt>
+      );
+    const valid = await observeCheck(guard, runCheck(validPath, "PC"));
+    const broken = await observeCheck(guard, runCheck(brokenPath, "PC"));
 
     let absentConfigurationCode: string | null = null;
     const processesBeforeAbsent = await guard.listWorkbenchProcesses();
     try {
-      await runWorkbenchIntent(config, {
-        kind: "check",
-        gprojPath: validPath,
-        configuration: "ABSENT",
-        timeoutMs: 120_000,
-      }, common);
+      await runCheck(validPath, "ABSENT");
     } catch (error) {
       absentConfigurationCode = error && typeof error === "object" &&
         typeof (error as { code?: unknown }).code === "string"
@@ -122,6 +164,8 @@ async function main(): Promise<void> {
         : null;
     }
     const processesAfterAbsent = await guard.listWorkbenchProcesses();
+    const generatedProjectCaches = fixtureCachePaths.filter((path) => existsSync(path));
+    for (const cachePath of fixtureCachePaths) rmSync(cachePath, { force: true });
 
     assert.equal(valid.receipt.compilation.status, "compiled");
     assert.equal(receiptExitCode(valid.receipt), 0);
@@ -129,8 +173,7 @@ async function main(): Promise<void> {
     assert.equal(receiptExitCode(broken.receipt), 1);
     assert.equal(absentConfigurationCode, "INVALID_TARGET");
     assert.deepEqual(processesAfterAbsent, processesBeforeAbsent);
-    assert.equal(valid.visibleWindows, 0);
-    assert.equal(broken.visibleWindows, 0);
+    assert.equal(valid.visibleWindows, 0, JSON.stringify(valid.windowEvidence, null, 2));
     assert.deepEqual(snapshotTree(validRoot), beforeValid);
     assert.deepEqual(snapshotTree(brokenRoot), beforeBroken);
 
@@ -160,6 +203,7 @@ async function main(): Promise<void> {
         logDirectory: valid.receipt.logDirectory,
         observedWindows: valid.observedWindows,
         visibleWindows: valid.visibleWindows,
+        windowEvidence: valid.windowEvidence,
       },
       broken: {
         exitStatus: broken.receipt.exitStatus,
@@ -167,16 +211,21 @@ async function main(): Promise<void> {
         logDirectory: broken.receipt.logDirectory,
         observedWindows: broken.observedWindows,
         visibleWindows: broken.visibleWindows,
+        windowEvidence: broken.windowEvidence,
       },
       absentConfiguration: {
         configuration: "ABSENT",
         code: absentConfigurationCode,
         spawnCountDelta: processesAfterAbsent.length - processesBeforeAbsent.length,
       },
-      fixtureArtifactsUnchanged: true,
+      fixtureSourcesUnchanged: true,
+      buildArtifactsProduced: false,
+      generatedProjectCaches: generatedProjectCaches.map((path) => relative(resolve("."), path)),
     }, null, 2)}\n`);
   } finally {
+    await controller.closeOwnerScopedTargetOperations();
     await guard.close();
+    for (const cachePath of fixtureCachePaths) rmSync(cachePath, { force: true });
     if (statSync(managedRoot).isDirectory()) rmSync(managedRoot, { recursive: true, force: true });
   }
 }

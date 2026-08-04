@@ -47,11 +47,11 @@ describe("guarded Enforce Script check runner", () => {
       compilation: { status: "compiled" },
       exitStatus: { classification: "success", exitCode: 0 },
     });
-    expect(observedArguments.slice(observedArguments.indexOf("-wbModule=ScriptEditor"))).toEqual([
+    expect(observedArguments.slice(observedArguments.indexOf("-wbsilent"))).toEqual([
+      "-wbsilent",
       "-wbModule=ScriptEditor",
       "-validate",
       "PC",
-      "-wbsilent",
     ]);
     expect(observedArguments).not.toContain("-run");
     expect(observedArguments).not.toContain("-builddata");
