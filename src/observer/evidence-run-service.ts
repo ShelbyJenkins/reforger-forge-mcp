@@ -29,7 +29,7 @@ export class EvidenceRunService implements CaptureRunPort {
   async reserve(input: RunCaptureReservation): Promise<ReservedRunCapture> {
     const result = object(await this.agent.request("runReserveCapture", {
       runId: input.runId,
-      captureLabel: input.captureLabel,
+      ...(input.captureLabel ? { captureLabel: input.captureLabel } : {}),
       ...(input.purpose ? { purpose: input.purpose } : {}),
       idempotencyKey: input.idempotencyKey,
       jobId: input.jobId,
@@ -48,7 +48,7 @@ export class EvidenceRunService implements CaptureRunPort {
       ? result.capture as Record<string, unknown> : {};
     return {
       runId: input.runId,
-      captureLabel: input.captureLabel,
+      captureLabel: typeof capture.captureLabel === "string" ? capture.captureLabel : input.captureLabel ?? "",
       ...capture,
       ...(typeof capture.jobId === "string" ? { jobId: capture.jobId } : {}),
       ...(typeof capture.backend === "string" ? { backend: capture.backend as "runtime" | "workbench" } : {}),
@@ -68,6 +68,34 @@ export class EvidenceRunService implements CaptureRunPort {
       worldId: legacy.worldId,
       worldEpoch: legacy.worldEpoch,
       worldRevision: input.ref.worldRevision,
+      ...(input.request ? { requestFingerprint: input.request.fingerprint } : {}),
+      selectionDelegated: input.selectionDelegated === true,
+      retryCount: input.retryCount ?? 0,
+    });
+  }
+
+  async submitted(input: BoundRunCapture): Promise<void> {
+    await this.agent.request("runSubmitCapture", {
+      runId: input.runId,
+      captureLabel: input.captureLabel,
+    });
+  }
+
+  async reviseAdmission(input: BoundRunCapture & { request: import("./capture-contract.js").CanonicalCaptureRequest; retryCount: number }): Promise<void> {
+    const legacy = legacyWorldFields(input.ref.worldRevision);
+    await this.agent.request("runReviseCaptureAdmission", {
+      runId: input.runId,
+      captureLabel: input.captureLabel,
+      backend: input.ref.backend,
+      ...(input.ref.sessionId ? { sessionId: input.ref.sessionId } : {}),
+      jobId: input.ref.jobId,
+      instanceId: input.ref.instanceId,
+      worldId: legacy.worldId,
+      worldEpoch: legacy.worldEpoch,
+      worldRevision: input.ref.worldRevision,
+      requestFingerprint: input.request.fingerprint,
+      selectionDelegated: true,
+      retryCount: input.retryCount,
     });
   }
 

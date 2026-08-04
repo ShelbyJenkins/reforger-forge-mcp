@@ -9,6 +9,7 @@ export type ObserverApplicationOperationName =
   | "status" | "doctor" | "stage" | "prepareLaunch" | "revoke" | "instances"
   | "submitJob" | "jobStatus" | "cancelJob" | "readArtifact" | "runBegin"
   | "runStatus" | "runReserveCapture" | "runBindCapture" | "runFailCapture"
+  | "runSubmitCapture" | "runReviseCaptureAdmission"
   | "runFinalize" | "runDiscard" | "assertJobReleaseAllowed" | "releaseJob"
   | "readWorkbenchArtifact" | "inspectWorkbenchArtifact" | "importWorkbenchArtifact"
   | "releaseWorkbenchArtifact" | "shutdown"
@@ -378,6 +379,8 @@ export class ObserverApplicationOperations {
     if (name === "runStatus") return app.runs.status(requiredString(payload, "runId"));
     if (name === "runReserveCapture") return app.runs.reserveCapture(payload as never);
     if (name === "runBindCapture") return app.runs.bindCapture(payload as never);
+    if (name === "runSubmitCapture") return app.runs.markCaptureSubmitted(requiredString(payload, "runId"), requiredString(payload, "captureLabel"));
+    if (name === "runReviseCaptureAdmission") return app.runs.reviseCaptureAdmission(payload as never);
     if (name === "runFailCapture") return app.runs.failCapture(requiredString(payload, "runId"), requiredString(payload, "captureLabel"), requiredString(payload, "code"), requiredString(payload, "message"));
     if (name === "runCompleteCapture") {
       const runId = requiredString(payload, "runId");

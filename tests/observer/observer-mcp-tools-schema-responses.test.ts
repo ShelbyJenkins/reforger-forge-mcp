@@ -27,18 +27,19 @@ describe("observer MCP tools", () => {
       const listed = await client.listTools();
       const prepare = listed.tools.find((tool) => tool.name === "observer_prepare_launch");
       const capture = listed.tools.find((tool) => tool.name === "observer_capture");
-      const run = listed.tools.find((tool) => tool.name === "observer_run");
+      const run = listed.tools.find((tool) => tool.name === "observer_run_finalize");
       expect(prepare).toBeDefined();
       expect(capture).toBeDefined();
       expect(run).toBeDefined();
-      expect(capture!.inputSchema.required).toContain("expectedWorldRevision");
+      expect(capture!.inputSchema.required ?? []).not.toContain("expectedWorldRevision");
+      expect(capture!.inputSchema.properties).toHaveProperty("target");
       expect(capture!.inputSchema.properties).toHaveProperty("expectedWorldRevision");
       expect(capture!.inputSchema.properties).not.toHaveProperty("expectedWorldId");
       expect(capture!.inputSchema.properties).not.toHaveProperty("expectedWorldEpoch");
       expect(capture!.inputSchema.additionalProperties).toBe(false);
-      expect(run!.description).toContain("finalize requires runId, includeCaptureLabels, and review");
+      expect(run!.description).toContain("reviewed capture labels");
       expect(run!.inputSchema.properties!.includeCaptureLabels).toMatchObject({
-        description: expect.stringContaining("Required non-empty list"),
+        minItems: 1,
       });
       expect(prepare!.description).toContain("native borderless-fullscreen window by default");
       expect(prepare!.description).toContain("forceNonNativeWindowSize");
@@ -67,7 +68,7 @@ describe("observer MCP tools", () => {
       visit(prepare!.inputSchema);
 
       const captureSchema = toolRegistry(coordinator).get("observer_capture")!.definition.inputSchema!;
-      const runSchema = toolRegistry(coordinator).get("observer_run")!.definition.inputSchema!;
+      const runSchema = toolRegistry(coordinator).get("observer_run_finalize")!.definition.inputSchema!;
       const view = captureSchema.view;
       expect(captureSchema.image.safeParse({ maxWidth: 1920, format: "webp", quality: 75 }).success).toBe(true);
       expect(captureSchema.image.safeParse({ format: "png", quality: 75 }).success).toBe(false);
@@ -152,7 +153,7 @@ describe("observer MCP tools", () => {
     }));
   });
 
-  it("requires the sole canonical world binding and rejects legacy-only input", async () => {
+  it("keeps legacy world binding explicit while allowing delegated selection", async () => {
     const capture = vi.fn(async () => ({
       asynchronous: true,
       job: { jobId: "job-world-binding", state: "queued" },
@@ -170,7 +171,7 @@ describe("observer MCP tools", () => {
 
     expect(definition).not.toHaveProperty("expectedWorldId");
     expect(definition).not.toHaveProperty("expectedWorldEpoch");
-    expect(definition.expectedWorldRevision.safeParse(undefined).success).toBe(false);
+    expect(definition.expectedWorldRevision.safeParse(undefined).success).toBe(true);
     expect(definition.expectedWorldRevision.safeParse(revision).success).toBe(true);
 
     const accepted = await call("observer_capture", { ...base, expectedWorldRevision: revision });
@@ -178,17 +179,17 @@ describe("observer MCP tools", () => {
     expect(capture).toHaveBeenCalledOnce();
     expect(coordinator.capture).toHaveBeenCalledWith(expect.objectContaining({
       expectedWorldRevision: revision,
+      selectionMode: "explicit",
     }));
 
-    for (const input of [
-      base,
-      { ...base, expectedWorldId: "world-1", expectedWorldEpoch: 7 },
-    ]) {
-      const result = await call("observer_capture", input);
-      expect(result.isError).toBe(true);
-      expect(result.content[0].text).toContain("INVALID_REQUEST");
-    }
-    expect(capture).toHaveBeenCalledOnce();
+    const missingLegacyRevision = await call("observer_capture", base);
+    expect(missingLegacyRevision.isError).toBe(true);
+    expect(missingLegacyRevision.content[0].text).toContain("INVALID_REQUEST");
+
+    const { instanceId: _instanceId, sessionId: _sessionId, ...delegatedInput } = base;
+    const delegated = await call("observer_capture", delegatedInput);
+    expect(delegated.isError).not.toBe(true);
+    expect(coordinator.capture).toHaveBeenLastCalledWith(expect.objectContaining({ selectionMode: "delegated" }));
   });
 
   it("formats one validated PNG image and one concise text metadata item", async () => {
@@ -273,8 +274,7 @@ describe("observer MCP tools", () => {
       evidenceRoots: ["C:\\evidence"],
     });
 
-    const result = await tools.get("observer_run")!.handler({
-      action: "finalize",
+    const result = await tools.get("observer_run_finalize")!.handler({
       runId: "20260717T184233Z-a1b2c3d4",
       includeCaptureLabels: ["proof"],
       review: {
@@ -298,8 +298,7 @@ describe("observer MCP tools", () => {
       evidenceRoots: ["C:\\evidence", "c:\\EVIDENCE"],
     });
 
-    const result = await tools.get("observer_run")!.handler({
-      action: "finalize",
+    const result = await tools.get("observer_run_finalize")!.handler({
       runId: "20260717T184233Z-a1b2c3d4",
       includeCaptureLabels: ["proof"],
       review: {
@@ -318,7 +317,6 @@ describe("observer MCP tools", () => {
 
   it("returns actionable errors when an omitted finalize root is absent or ambiguous", async () => {
     const input = {
-      action: "finalize",
       runId: "20260717T184233Z-a1b2c3d4",
       includeCaptureLabels: ["proof"],
       review: {
@@ -330,7 +328,7 @@ describe("observer MCP tools", () => {
     };
     const coordinator = toolApplication({ finalizeRun: vi.fn() });
     const withoutRoots = toolRegistry(coordinator);
-    const noRoot = await withoutRoots.get("observer_run")!.handler(
+    const noRoot = await withoutRoots.get("observer_run_finalize")!.handler(
       input,
       { signal: new AbortController().signal }
     );
@@ -341,7 +339,7 @@ describe("observer MCP tools", () => {
     const withMultiple = toolRegistry(coordinator, {} as never, {
       evidenceRoots: ["C:\\first", "C:\\second"],
     });
-    const ambiguous = await withMultiple.get("observer_run")!.handler(
+    const ambiguous = await withMultiple.get("observer_run_finalize")!.handler(
       input,
       { signal: new AbortController().signal }
     );
@@ -350,7 +348,7 @@ describe("observer MCP tools", () => {
     expect(coordinator.finalizeRun).not.toHaveBeenCalled();
   });
 
-  it("preserves a specific run failure at the public observer_run boundary", async () => {
+  it("preserves a specific run failure at the public observer_run_status boundary", async () => {
     const coordinator = toolApplication({
       runStatus: vi.fn(async () => {
         throw new ObserverApplicationError(
@@ -361,8 +359,7 @@ describe("observer MCP tools", () => {
     });
     const tools = toolRegistry(coordinator);
 
-    const result = await tools.get("observer_run")!.handler({
-      action: "status",
+    const result = await tools.get("observer_run_status")!.handler({
       runId: "20260726T022925Z-d7867722",
     }, { signal: new AbortController().signal });
 
@@ -378,8 +375,7 @@ describe("observer MCP tools", () => {
       evidenceRoots: ["C:\\first", "C:\\second"],
     });
 
-    const result = await tools.get("observer_run")!.handler({
-      action: "finalize",
+    const result = await tools.get("observer_run_finalize")!.handler({
       runId: "20260717T184233Z-a1b2c3d4",
       evidenceRoot: "C:\\second",
       includeCaptureLabels: ["proof"],
@@ -395,5 +391,79 @@ describe("observer MCP tools", () => {
     expect(finalizeRun).toHaveBeenCalledWith(expect.objectContaining({
       evidenceRoot: "C:\\second",
     }));
+  });
+
+  it("uses and clears the process-local active run without auto-adopting durable runs", async () => {
+    const activeRunId = "20260804T120000Z-a1b2c3d4";
+    const beginRun = vi.fn(async () => ({ runId: activeRunId, state: "open" }));
+    const capture = vi.fn(async (input) => ({
+      asynchronous: true as const,
+      job: { jobId: "job-active-run", runId: input.runId, captureLabel: "current-1", state: "queued" },
+    }));
+    const runStatus = vi.fn(async (runId) => ({ runId, state: "open" }));
+    const discardRun = vi.fn(async (runId) => ({ runId, discarded: true }));
+    const first = createToolHarness({ beginRun, capture, runStatus, discardRun });
+
+    expect((await first.call("observer_run_begin", { title: "Active run" })).isError).not.toBe(true);
+    expect((await first.call("observer_capture", {
+      view: { kind: "current" },
+      asynchronous: true,
+      timeoutMs: 30_000,
+      settleFrames: 0,
+      performancePolicy: "evidence",
+    })).isError).not.toBe(true);
+    expect(capture).toHaveBeenCalledWith(expect.objectContaining({
+      runId: activeRunId,
+      selectionMode: "delegated",
+    }));
+    expect(capture.mock.calls[0][0]).not.toHaveProperty("captureLabel");
+
+    expect((await first.call("observer_run_status", {})).isError).not.toBe(true);
+    expect(runStatus).toHaveBeenLastCalledWith(activeRunId);
+    expect((await first.call("observer_run_discard", {})).isError).not.toBe(true);
+    expect(discardRun).toHaveBeenCalledWith(activeRunId);
+    const cleared = await first.call("observer_run_status", {});
+    expect(cleared.isError).toBe(true);
+    expect(cleared.content[0].text).toContain("no active run");
+
+    const secondRegistry = toolRegistry(toolApplication({ runStatus }));
+    const notAdopted = await secondRegistry.get("observer_run_status")!.handler(
+      {},
+      { signal: new AbortController().signal },
+    );
+    expect(notAdopted.isError).toBe(true);
+    expect(runStatus).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not clear the active run when another explicit run is finalized or finalization fails", async () => {
+    const activeRunId = "20260804T120100Z-b1c2d3e4";
+    const otherRunId = "20260804T120200Z-c1d2e3f4";
+    const beginRun = vi.fn(async () => ({ runId: activeRunId, state: "open" }));
+    const runStatus = vi.fn(async (runId) => ({ runId, state: "open" }));
+    const finalizeRun = vi.fn(async (input) => input.runId === otherRunId
+      ? { run: { runId: otherRunId, state: "finalized" } }
+      : Promise.reject(new ObserverApplicationError("ARTIFACT_INVALID", "finalization failed")));
+    const tools = toolRegistry(toolApplication({ beginRun, runStatus, finalizeRun }), {} as never, {
+      evidenceRoots: ["C:\\evidence"],
+    });
+    const signal = new AbortController().signal;
+    await tools.get("observer_run_begin")!.handler({ title: "Active run" }, { signal });
+    const finalizeInput = {
+      includeCaptureLabels: ["current-1"],
+      review: { imagesReviewed: false, outcome: "Unreviewed", summary: "Pending review." },
+      releaseManagedArtifacts: true,
+    };
+
+    expect((await tools.get("observer_run_finalize")!.handler({
+      ...finalizeInput,
+      runId: otherRunId,
+    }, { signal })).isError).not.toBe(true);
+    await tools.get("observer_run_status")!.handler({}, { signal });
+    expect(runStatus).toHaveBeenLastCalledWith(activeRunId);
+
+    const failed = await tools.get("observer_run_finalize")!.handler(finalizeInput, { signal });
+    expect(failed.isError).toBe(true);
+    await tools.get("observer_run_status")!.handler({}, { signal });
+    expect(runStatus).toHaveBeenLastCalledWith(activeRunId);
   });
 });

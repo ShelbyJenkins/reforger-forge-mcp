@@ -6,6 +6,7 @@ import { ArtifactStore } from "../../observer/agent/artifacts.js";
 import { convertBmpToPng } from "../../observer/agent/bmp.js";
 import { ObserverRunStore } from "../../observer/agent/runs.js";
 import { FileEvidenceBundleService } from "../../observer/agent/evidence-bundle-service.js";
+import { workbenchWorldRevision } from "../../src/observer/world-revision.js";
 import { withTemporaryDirectory } from "../support/temporary-directory.js";
 
 function bmp24(width = 2, height = 2): Buffer {
@@ -180,6 +181,88 @@ function reattestBundleMember(
 }
 
 describe("managed observer runs", () => {
+  scopedIt("allocates automatic labels atomically and preserves the cursor across restart", async (root) => {
+    const value = setup(root);
+    const begun = value.runs.begin({ title: "Automatic labels" });
+    const runId = begun.runId as string;
+    value.runs.reserveCapture({
+      runId,
+      captureLabel: "current-1",
+      idempotencyKey: "manual-current",
+      requestedView: { kind: "current" },
+      performancePolicy: "evidence",
+    });
+
+    expect(value.runs.reserveCapture({
+      runId,
+      idempotencyKey: "automatic-current",
+      requestedView: { kind: "current" },
+      performancePolicy: "evidence",
+    })).toMatchObject({ capture: { captureLabel: "current-2" } });
+
+    await value.runs.close();
+    const reopened = new ObserverRunStore(join(root, "runs"), value.artifacts);
+    runStoresByRoot.set(root, reopened);
+    expect(reopened.reserveCapture({
+      runId,
+      idempotencyKey: "automatic-pose",
+      requestedView: { kind: "pose" },
+      performancePolicy: "evidence",
+    })).toMatchObject({ capture: { captureLabel: "pose-3" } });
+  });
+
+  scopedIt("persists provisional admission and permits one exact delegated world revision", (root) => {
+    const value = setup(root);
+    const begun = value.runs.begin({ title: "Delegated admission" });
+    const runId = begun.runId as string;
+    const reserved = value.runs.reserveCapture({
+      runId,
+      idempotencyKey: "delegated-admission",
+      requestFingerprint: "a".repeat(64),
+      requestedView: { kind: "current" },
+      performancePolicy: "evidence",
+    });
+    const captureLabel = (reserved.capture as { captureLabel: string }).captureLabel;
+    const firstRevision = workbenchWorldRevision("project|world-a|0|false");
+    const secondRevision = workbenchWorldRevision("project|world-b|0|false");
+    const binding = {
+      runId,
+      captureLabel,
+      backend: "workbench" as const,
+      jobId: "wb-job-1",
+      instanceId: "workbench-1",
+      worldRevision: firstRevision,
+      worldId: "project|world-a|0|false",
+      worldEpoch: 0,
+      requestFingerprint: "b".repeat(64),
+      selectionDelegated: true,
+      retryCount: 0,
+    };
+
+    expect(value.runs.bindCapture(binding)).toMatchObject({ capture: { state: "admitting" } });
+    expect(value.runs.bindCapture(binding)).toMatchObject({ capture: { state: "admitting" } });
+    expect(() => value.runs.bindCapture({ ...binding, instanceId: "workbench-2" }))
+      .toThrowError(expect.objectContaining({ code: "INVALID_REQUEST", httpStatus: 409 }));
+
+    const revision = {
+      ...binding,
+      worldRevision: secondRevision,
+      worldId: "project|world-b|0|false",
+      requestFingerprint: "c".repeat(64),
+      retryCount: 1,
+    };
+    expect(value.runs.reviseCaptureAdmission(revision)).toMatchObject({
+      capture: { state: "admitting", worldRevision: secondRevision },
+    });
+    expect(() => value.runs.reviseCaptureAdmission(revision))
+      .toThrowError(expect.objectContaining({ code: "INVALID_REQUEST", httpStatus: 409 }));
+    expect(value.runs.markCaptureSubmitted(runId, captureLabel)).toMatchObject({
+      capture: { state: "submitted", worldRevision: secondRevision },
+    });
+    expect(() => value.runs.bindCapture({ ...revision, worldId: "forged" }))
+      .toThrowError(expect.objectContaining({ code: "INVALID_REQUEST", httpStatus: 409 }));
+  });
+
   scopedIt("normalizes unique labels and rejects collisions", (root) => {
     const value = setup(root);
     const begun = value.runs.begin({ title: "Labels" });

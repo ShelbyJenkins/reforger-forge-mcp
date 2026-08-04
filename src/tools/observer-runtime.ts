@@ -1,4 +1,5 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { createHash } from "node:crypto";
 import { z } from "zod";
 import {
   OwnedRuntimeError,
@@ -35,6 +36,25 @@ function toolError(error: unknown) {
   };
 }
 
+export type ObserverRuntimeLifecycleOperation =
+  | { action: "start"; preparedLaunchId: string }
+  | { action: "stop"; runtimeId: string; waitForRestorationMs: number };
+
+/** Stable private key for retrying one canonical public lifecycle mutation. */
+export function deriveObserverRuntimeIdempotencyKey(
+  operation: ObserverRuntimeLifecycleOperation,
+): string {
+  const canonical = operation.action === "start"
+    ? JSON.stringify({ action: "start", preparedLaunchId: operation.preparedLaunchId })
+    : JSON.stringify({
+        action: "stop",
+        runtimeId: operation.runtimeId,
+        waitForRestorationMs: operation.waitForRestorationMs,
+      });
+  const digest = createHash("sha256").update(canonical, "utf8").digest("hex");
+  return `mcp-runtime-${operation.action}-v1-${digest}`;
+}
+
 export function registerObserverRuntime(
   server: McpServer,
   manager: OwnedRuntimeManager
@@ -49,21 +69,23 @@ export function registerObserverRuntime(
         preparedLaunchId: z.string().regex(/^pl-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/).optional(),
         runtimeId: z.string().regex(/^rt-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/).optional(),
         waitForRestorationMs: z.number().int().min(0).max(5 * 60 * 1_000).default(20_000),
-        idempotencyKey: z.string().min(1).max(128).optional(),
       },
     },
     async (input, extra) => {
       try {
         if (input.action === "start") {
-          if (!input.preparedLaunchId || !input.idempotencyKey) {
+          if (!input.preparedLaunchId) {
             throw new OwnedRuntimeError(
               "INVALID_REQUEST",
-              "preparedLaunchId and idempotencyKey are required for observer_runtime start"
+              "preparedLaunchId is required for observer_runtime start"
             );
           }
           const result = await manager.start({
             preparedLaunchId: input.preparedLaunchId,
-            idempotencyKey: input.idempotencyKey,
+            idempotencyKey: deriveObserverRuntimeIdempotencyKey({
+              action: "start",
+              preparedLaunchId: input.preparedLaunchId,
+            }),
           });
           return { content: [{ type: "text" as const, text: jsonText("Exact-owned observer runtime started.", result) }] };
         }
@@ -74,13 +96,14 @@ export function registerObserverRuntime(
           const result = await manager.status(input.runtimeId);
           return { content: [{ type: "text" as const, text: jsonText("Exact-owned observer runtime status.", result) }] };
         }
-        if (!input.idempotencyKey) {
-          throw new OwnedRuntimeError("INVALID_REQUEST", "idempotencyKey is required for observer_runtime stop");
-        }
         const result = await manager.stop({
           runtimeId: input.runtimeId,
           waitForRestorationMs: input.waitForRestorationMs,
-          idempotencyKey: input.idempotencyKey,
+          idempotencyKey: deriveObserverRuntimeIdempotencyKey({
+            action: "stop",
+            runtimeId: input.runtimeId,
+            waitForRestorationMs: input.waitForRestorationMs,
+          }),
           signal: extra.signal,
         });
         return { content: [{ type: "text" as const, text: jsonText("Exact-owned observer runtime stopped.", result) }] };

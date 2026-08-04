@@ -68,7 +68,7 @@ describe("Workbench observer adapter", () => {
     const client = fakeClient(root, { completeOnStatus: true });
     const adapter = new WorkbenchObserverAdapter(client, { createJobId: () => "job-current" });
 
-    const submitted = await adapter.submit({ view: { kind: "current" }, settlePolls: 2 });
+    const submitted = await adapter.submit({ expectedWorldIdentity: `${client.project}|world-a|0|false`, view: { kind: "current" }, settlePolls: 2 });
     expect(submitted).toMatchObject({
       jobId: "job-current",
       state: "settling",
@@ -94,7 +94,7 @@ describe("Workbench observer adapter", () => {
     const client = fakeClient(root, { completeOnStatus: true });
     const adapter = new WorkbenchObserverAdapter(client, { createJobId: () => "job-webp" });
 
-    await adapter.submit({
+    await adapter.submit({ expectedWorldIdentity: `${client.project}|world-a|0|false`,
       view: { kind: "current" },
       image: { format: "webp", quality: 55, maxWidth: 1 },
     });
@@ -128,7 +128,7 @@ describe("Workbench observer adapter", () => {
     const client = fakeClient(root, { completeOnStatus: true });
     const adapter = new WorkbenchObserverAcceptanceAdapter(client, { createJobId: () => "terminal-cancel" });
 
-    await adapter.submit({ view: { kind: "current" } });
+    await adapter.submit({ expectedWorldIdentity: `${client.project}|world-a|0|false`, view: { kind: "current" } });
     await expect(adapter.status("terminal-cancel")).resolves.toMatchObject({
       state: "completed",
       cameraLeaseHeld: false,
@@ -147,7 +147,7 @@ describe("Workbench observer adapter", () => {
     const client = fakeClient(root, { completeOnStatus: true });
     const adapter = new WorkbenchObserverAdapter(client, { createJobId: () => "production-terminal" });
 
-    await adapter.submit({ view: { kind: "current" } });
+    await adapter.submit({ expectedWorldIdentity: `${client.project}|world-a|0|false`, view: { kind: "current" } });
     await adapter.status("production-terminal");
     await expect(adapter.cancel("production-terminal")).resolves.toMatchObject({
       state: "completed",
@@ -166,7 +166,7 @@ describe("Workbench observer adapter", () => {
       createJobId: () => "terminal-cancel-unproven",
     });
 
-    await adapter.submit({ view: { kind: "current" } });
+    await adapter.submit({ expectedWorldIdentity: `${client.project}|world-a|0|false`, view: { kind: "current" } });
     await adapter.status("terminal-cancel-unproven");
     await expect(adapter.cancel("terminal-cancel-unproven")).rejects.toMatchObject({
       code: "RESTORATION_UNCONFIRMED",
@@ -177,7 +177,7 @@ describe("Workbench observer adapter", () => {
     const client = fakeClient(root, { completeOnStatus: true, corruptArtifact: true });
     const adapter = new WorkbenchObserverAdapter(client, { createJobId: () => "corrupt-png" });
 
-    await adapter.submit({ view: { kind: "current" } });
+    await adapter.submit({ expectedWorldIdentity: `${client.project}|world-a|0|false`, view: { kind: "current" } });
     await expect(adapter.status("corrupt-png")).rejects.toMatchObject({ code: "ARTIFACT_INVALID" });
     expect(client.releaseCaptureActivity).toHaveBeenCalledTimes(1);
     await expect(adapter.release("corrupt-png")).resolves.toMatchObject({
@@ -201,7 +201,7 @@ describe("Workbench observer adapter", () => {
       beforeArtifactValidation,
     });
 
-    await adapter.submit({ view: { kind: "current" } });
+    await adapter.submit({ expectedWorldIdentity: `${client.project}|world-a|0|false`, view: { kind: "current" } });
     await expect(adapter.status("pre-validation-crc")).rejects.toMatchObject({
       code: "ARTIFACT_INVALID",
     });
@@ -239,7 +239,7 @@ describe("Workbench observer adapter", () => {
       beforeArtifactValidation,
     });
 
-    await adapter.submit({ view: { kind: "current" } });
+    await adapter.submit({ expectedWorldIdentity: `${client.project}|world-a|0|false`, view: { kind: "current" } });
     await expect(adapter.status("unbound-artifact")).rejects.toMatchObject({
       code: "ARTIFACT_INVALID",
     });
@@ -257,7 +257,7 @@ describe("Workbench observer adapter", () => {
       beforeArtifactValidation,
     });
 
-    await adapter.submit({ view: { kind: "current" } });
+    await adapter.submit({ expectedWorldIdentity: `${client.project}|world-a|0|false`, view: { kind: "current" } });
     let failure: unknown;
     try {
       await adapter.status("hook-failure");
@@ -288,7 +288,7 @@ describe("Workbench observer adapter", () => {
       restorationApiAvailable: true,
       readinessMessage: "full camera APIs available",
     });
-    await expect(adapter.submit({ view: { kind: "current" } })).resolves.toMatchObject({
+    await expect(adapter.submit({ expectedWorldIdentity: `${client.project}|world-a|0|false`, view: { kind: "current" } })).resolves.toMatchObject({
       cameraLeaseHeld: true,
       restorationConfirmed: false,
     });

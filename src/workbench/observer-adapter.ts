@@ -82,6 +82,7 @@ const imagePolicySchema = z.object({
 
 const submitSchema = z.object({
   jobId: z.string().regex(/^[A-Za-z0-9_-]{1,96}$/).optional(),
+  expectedWorldIdentity: z.string().min(1).max(4_096),
   view: viewSchema,
   settlePolls: z.number().int().min(0).max(120).default(3),
   image: imagePolicySchema.default({ format: "png" }),
@@ -149,6 +150,7 @@ export type WorkbenchObserverView = z.infer<typeof viewSchema>;
 
 export interface WorkbenchObserverSubmitInput {
   jobId?: string;
+  expectedWorldIdentity: string;
   view: WorkbenchObserverView;
   settlePolls?: number;
   image?: CanonicalImageOutputPolicy;
@@ -512,6 +514,7 @@ export class WorkbenchObserverAdapter {
         leaseId: handlerLeaseId,
         lifecycleGeneration: snapshot.generation,
         canonicalTarget: snapshot.target.path,
+        expectedWorldIdentity: parsed.data.expectedWorldIdentity,
         viewKind: parsed.data.view.kind,
         matrix0: vectorToString(matrix[0]),
         matrix1: vectorToString(matrix[1]),
@@ -545,7 +548,10 @@ export class WorkbenchObserverAdapter {
         response = await this.handlerJobCall("EMCP_WB_ObserverSubmit", submitRequest);
       }
       if (response.status !== "ok") {
-        throw new WorkbenchObserverAdapterError(WORKBENCH_ADAPTER_ERROR_CODES.HANDLER_REJECTED, response.message);
+        const code = response.terminalErrorCode === WORKBENCH_ADAPTER_ERROR_CODES.WORLD_CHANGED
+          ? WORKBENCH_ADAPTER_ERROR_CODES.WORLD_CHANGED
+          : WORKBENCH_ADAPTER_ERROR_CODES.HANDLER_REJECTED;
+        throw new WorkbenchObserverAdapterError(code, response.message);
       }
       // An ok response means the command may own camera state until all
       // acknowledgement bindings and the public status parse are proven.

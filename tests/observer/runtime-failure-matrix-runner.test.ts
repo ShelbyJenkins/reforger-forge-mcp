@@ -109,13 +109,13 @@ function fakeApplication(calls: string[], options: FakeApplicationOptions = {}):
         metadata: { actualCamera: { matrix: DISPLACED_MATRIX } },
       };
     },
-    async cancelJob(_sessionId, jobId) {
+    async cancelJob(jobId) {
       calls.push(`cancelJob:${jobId}`);
       cancellationRequested = true;
       if (options.cancelJobImpl) return options.cancelJobImpl();
       return {};
     },
-    async jobStatus(_sessionId, jobId) {
+    async jobStatus(jobId) {
       calls.push(`jobStatus:${jobId}`);
       if (!cancellationRequested) {
         preBarrierStatusCalls += 1;
@@ -123,7 +123,7 @@ function fakeApplication(calls: string[], options: FakeApplicationOptions = {}):
       }
       return finalJob;
     },
-    async releaseJob(_sessionId, jobId) {
+    async releaseJob(jobId) {
       calls.push(`releaseJob:${jobId}`);
       if (options.releaseJobImpl) return options.releaseJobImpl();
       return { released: true, artifactRemoved: true, restorationConfirmed: true };

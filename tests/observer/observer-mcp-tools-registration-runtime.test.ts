@@ -6,6 +6,7 @@ import {
   type OwnedRuntimeManager,
 } from "../../src/observer/owned-runtime-manager.js";
 import { createToolHarness, toolApplication, toolRegistry } from "./application-diagnostics-fixture.js";
+import { deriveObserverRuntimeIdempotencyKey } from "../../src/tools/observer-runtime.js";
 
 describe("observer MCP tools", () => {
   it("passes configured Workbench addon roots into launch preparation before caller arguments", async () => {
@@ -127,14 +128,17 @@ describe("observer MCP tools", () => {
     expect(externalOnly).not.toHaveProperty("preparedLaunchId");
   });
 
-  it("registers the seven exact public tools", () => {
+  it("registers the ten exact public tools", () => {
     const { tools } = createToolHarness();
     expect([...tools.keys()].sort()).toEqual([
       "observer_capture",
       "observer_instances",
       "observer_job",
       "observer_prepare_launch",
-      "observer_run",
+      "observer_run_begin",
+      "observer_run_discard",
+      "observer_run_finalize",
+      "observer_run_status",
       "observer_runtime",
       "observer_setup",
     ]);
@@ -163,15 +167,15 @@ describe("observer MCP tools", () => {
     } as unknown as OwnedRuntimeManager;
     const { handler, signal, extra } = createToolHarness({}, manager);
     const runtime = handler("observer_runtime");
+    const preparedLaunchId = "pl-00000000-0000-4000-8000-000000000001";
     const started = await runtime({
       action: "start",
-      preparedLaunchId: "pl-00000000-0000-4000-8000-000000000001",
-      idempotencyKey: "start-one",
+      preparedLaunchId,
     }, extra);
     expect(started.isError).not.toBe(true);
     expect(manager.start).toHaveBeenCalledWith({
-      preparedLaunchId: "pl-00000000-0000-4000-8000-000000000001",
-      idempotencyKey: "start-one",
+      preparedLaunchId,
+      idempotencyKey: deriveObserverRuntimeIdempotencyKey({ action: "start", preparedLaunchId }),
     });
     await runtime({ action: "status", runtimeId: "rt-00000000-0000-4000-8000-000000000001" }, extra);
     expect(manager.status).toHaveBeenCalledOnce();
@@ -179,16 +183,59 @@ describe("observer MCP tools", () => {
       action: "stop",
       runtimeId: "rt-00000000-0000-4000-8000-000000000001",
       waitForRestorationMs: 20_000,
-      idempotencyKey: "stop-one",
     }, extra);
     expect(manager.stop).toHaveBeenCalledWith(expect.objectContaining({
-      idempotencyKey: "stop-one",
+      idempotencyKey: deriveObserverRuntimeIdempotencyKey({
+        action: "stop",
+        runtimeId: "rt-00000000-0000-4000-8000-000000000001",
+        waitForRestorationMs: 20_000,
+      }),
       waitForRestorationMs: 20_000,
       signal,
     }));
     const invalid = await runtime({ action: "start" }, extra);
     expect(invalid.isError).toBe(true);
     expect(invalid.content[0].text).toContain("INVALID_REQUEST");
+    expect(createToolHarness({}, manager).tools.get("observer_runtime")!.definition.inputSchema)
+      .not.toHaveProperty("idempotencyKey");
+  });
+
+  it("reuses the same hidden lifecycle key when a start or stop response is lost", async () => {
+    const observedStartKeys: string[] = [];
+    const observedStopKeys: string[] = [];
+    let startCalls = 0;
+    let stopCalls = 0;
+    const manager = {
+      start: vi.fn(async (input: { idempotencyKey: string }) => {
+        observedStartKeys.push(input.idempotencyKey);
+        startCalls += 1;
+        if (startCalls === 1) throw new OwnedRuntimeError("TRANSPORT_UNAVAILABLE", "start acknowledgement was lost");
+        return { runtimeId: "rt-one", state: "running", exactOwned: true };
+      }),
+      stop: vi.fn(async (input: { idempotencyKey: string }) => {
+        observedStopKeys.push(input.idempotencyKey);
+        stopCalls += 1;
+        if (stopCalls === 1) throw new OwnedRuntimeError("TRANSPORT_UNAVAILABLE", "stop acknowledgement was lost");
+        return { runtimeId: input.idempotencyKey, state: "exited", identityVacant: true };
+      }),
+    } as unknown as OwnedRuntimeManager;
+    const { call } = createToolHarness({}, manager);
+    const start = { action: "start" as const, preparedLaunchId: "pl-00000000-0000-4000-8000-000000000001" };
+    const stop = { action: "stop" as const, runtimeId: "rt-00000000-0000-4000-8000-000000000001", waitForRestorationMs: 0 };
+
+    expect((await call("observer_runtime", start)).isError).toBe(true);
+    expect((await call("observer_runtime", start)).isError).not.toBe(true);
+    expect(observedStartKeys).toEqual([
+      deriveObserverRuntimeIdempotencyKey(start),
+      deriveObserverRuntimeIdempotencyKey(start),
+    ]);
+
+    expect((await call("observer_runtime", stop)).isError).toBe(true);
+    expect((await call("observer_runtime", stop)).isError).not.toBe(true);
+    expect(observedStopKeys).toEqual([
+      deriveObserverRuntimeIdempotencyKey(stop),
+      deriveObserverRuntimeIdempotencyKey(stop),
+    ]);
   });
 
   it("does not re-expose fixed-policy diagnostics through structured tool details", async () => {
@@ -208,7 +255,6 @@ describe("observer MCP tools", () => {
     const runtimeResult = await call("observer_runtime", {
       action: "start",
       preparedLaunchId: "pl-00000000-0000-4000-8000-000000000001",
-      idempotencyKey: "redacted-start",
     });
     const instancesResult = await call("observer_instances", {});
 

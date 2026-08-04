@@ -41,7 +41,7 @@ export const WORKBENCH_HELPER_ADDON_VERSION = "0.1.0" as const;
 export const WORKBENCH_HELPER_PROTOCOL_VERSION = "2.0" as const;
 /** Content identity of the helper payload, excluding only its generated identity source. */
 export const WORKBENCH_HELPER_BUILD_IDENTITY =
-  "080399d444e0815b73cedf1b7542e562361c55e88ccf28f8c28b12de873893d1" as const;
+  "d1be66f8dbf3f23d80dfac833bc0b3aeaeccf9de7f0525850b78985a117b0fb7" as const;
 export const WORKBENCH_HELPER_HANDLER_FILES = generatedWorkbenchHelperHandlerFiles;
 /**
  * Workbench writes these local derived files beside addon.gproj after loading a

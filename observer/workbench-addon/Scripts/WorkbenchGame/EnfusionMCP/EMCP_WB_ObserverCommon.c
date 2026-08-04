@@ -361,19 +361,28 @@ class EMCP_WB_ObserverService
 		string requestedLeaseId,
 		string lifecycleGeneration,
 		string canonicalTarget,
+		string expectedWorldIdentity,
 		string viewKind,
-		string matrix0,
-		string matrix1,
-		string matrix2,
-		string matrix3,
+		array<string> matrixRows,
 		string fovText,
 		int settlePolls,
 		int maxWidth,
 		int maxHeight,
 		out string acceptedLeaseId,
-		out string message)
+		out string message,
+		out string errorCode)
 	{
 		acceptedLeaseId = string.Empty;
+		errorCode = string.Empty;
+		if (!matrixRows || matrixRows.Count() != 4)
+		{
+			message = "Invalid canonical Workbench camera matrix row count";
+			return false;
+		}
+		string matrix0 = matrixRows[0];
+		string matrix1 = matrixRows[1];
+		string matrix2 = matrixRows[2];
+		string matrix3 = matrixRows[3];
 		float fov;
 		if (!ParseDecimal(fovText, fov))
 		{
@@ -404,6 +413,11 @@ class EMCP_WB_ObserverService
 			message = "settlePolls is outside the reviewed bound";
 			return false;
 		}
+		if (expectedWorldIdentity.IsEmpty() || expectedWorldIdentity.Length() > 4096)
+		{
+			message = "The expected Workbench world identity is invalid";
+			return false;
+		}
 		if (maxWidth < 0 || maxWidth > 16384 || maxHeight < 0 || maxHeight > 16384 || (maxWidth > 0 && maxHeight > 0 && maxWidth * maxHeight > 32000000))
 		{
 			message = "Requested image bounds are outside the reviewed range";
@@ -419,7 +433,7 @@ class EMCP_WB_ObserverService
 			// Submit is an acknowledged, idempotent delivery boundary. The host
 			// chooses the lease before delivery, so an identical retry recovers a
 			// lost response without applying camera state twice.
-			bool replay = m_Job.jobId == jobId && m_Job.leaseId == requestedLeaseId && m_Job.lifecycleGeneration == lifecycleGeneration && NormalizedPath(m_Job.canonicalTarget) == NormalizedPath(canonicalTarget) && m_Job.viewKind == viewKind && m_Job.requestedMatrix0 == matrix0 && m_Job.requestedMatrix1 == matrix1 && m_Job.requestedMatrix2 == matrix2 && m_Job.requestedMatrix3 == matrix3 && ScalarEquals(m_Job.requestedFov, fov, MATRIX_EPSILON) && m_Job.settlePolls == settlePolls && m_Job.requestedMaxWidth == maxWidth && m_Job.requestedMaxHeight == maxHeight;
+			bool replay = m_Job.jobId == jobId && m_Job.leaseId == requestedLeaseId && m_Job.lifecycleGeneration == lifecycleGeneration && NormalizedPath(m_Job.canonicalTarget) == NormalizedPath(canonicalTarget) && m_Job.worldIdentity == expectedWorldIdentity && m_Job.viewKind == viewKind && m_Job.requestedMatrix0 == matrix0 && m_Job.requestedMatrix1 == matrix1 && m_Job.requestedMatrix2 == matrix2 && m_Job.requestedMatrix3 == matrix3 && ScalarEquals(m_Job.requestedFov, fov, MATRIX_EPSILON) && m_Job.settlePolls == settlePolls && m_Job.requestedMaxWidth == maxWidth && m_Job.requestedMaxHeight == maxHeight;
 			if (replay)
 			{
 				acceptedLeaseId = m_Job.leaseId;
@@ -446,6 +460,13 @@ class EMCP_WB_ObserverService
 			message = inspection;
 			return false;
 		}
+		string measuredWorldIdentity = CurrentWorldIdentity();
+		if (measuredWorldIdentity != expectedWorldIdentity)
+		{
+			message = "Workbench world changed between inventory and capture submission";
+			errorCode = EMCP_WB_ObserverProtocol.ERROR_WORLD_CHANGED;
+			return false;
+		}
 
 		WorldEditor worldEditor = Workbench.GetModule(WorldEditor);
 		WorldEditorAPI api = worldEditor.GetApi();
@@ -457,7 +478,7 @@ class EMCP_WB_ObserverService
 		job.lifecycleGeneration = lifecycleGeneration;
 		job.canonicalTarget = canonicalTarget;
 		job.projectFile = CurrentProjectFile();
-		job.worldIdentity = CurrentWorldIdentity();
+		job.worldIdentity = measuredWorldIdentity;
 		job.viewKind = viewKind;
 		job.requestedMatrix0 = matrix0;
 		job.requestedMatrix1 = matrix1;

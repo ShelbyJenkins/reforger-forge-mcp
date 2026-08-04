@@ -76,6 +76,7 @@ export interface FakeOptions {
   releaseRestorationConfirmed?: boolean;
   releaseReplayOverrides?: Record<string, unknown>;
   releaseReplayError?: Error;
+  submitWorldIdentity?: string;
 }
 
 export class FakeObserverClient implements WorkbenchObserverClient {
@@ -179,6 +180,16 @@ export class FakeObserverClient implements WorkbenchObserverClient {
       } as T;
     }
     if (apiFunc === "EMCP_WB_ObserverSubmit") {
+      const measuredWorldIdentity = this.options.submitWorldIdentity ?? `${this.project}|world-a|0|false`;
+      if (params.expectedWorldIdentity !== measuredWorldIdentity) {
+        return {
+          status: "error",
+          message: "Workbench world changed between inventory and capture submission",
+          adapterProtocol: "reforger-forge-workbench-observer/1",
+          terminalErrorCode: "WORLD_CHANGED",
+          cameraLeaseHeld: this.wireBoolean(false),
+        } as T;
+      }
       if (!this.active) {
         this.active = { ...params };
         this.submitMutations += 1;

@@ -341,6 +341,16 @@ describe("live graphical runtime observer acceptance contract", () => {
     expect(production).not.toMatch(/ArmaReforgerSteamDiag|spawnOwnedRuntime|runRuntimeObserverAcceptance/);
   });
 
+  it("imports the focus guard thread API from its Windows system library", () => {
+    const source = readFileSync(resolve("scripts/windows/runtime-focus-guard.ps1"), "utf8");
+    expect(source).toMatch(
+      /\[DllImport\("kernel32\.dll"\)\]\s+private static extern uint GetCurrentThreadId\(\);/
+    );
+    expect(source).not.toMatch(
+      /\[DllImport\("user32\.dll"\)\]\s+private static extern uint GetCurrentThreadId\(\);/
+    );
+  });
+
   it("builds launch arguments and validates external roots in the shared launch-support module", () => {
     const source = readFileSync(resolve("scripts/observer-runtime-launch-support.ts"), "utf8");
     expect(source).toContain('runtimeKind === "listenServer" ? "-server" : "-world", worldResource');

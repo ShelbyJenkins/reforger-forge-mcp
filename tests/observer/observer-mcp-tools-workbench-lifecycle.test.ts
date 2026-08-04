@@ -83,6 +83,7 @@ describe("observer MCP tools", () => {
     });
     expect(adapter.submit).toHaveBeenCalledWith({
       jobId: "durable-job", view: { kind: "current" }, settlePolls: 0,
+      expectedWorldIdentity: "world-editor-1",
       image: { format: "png" },
     });
     await coordinator.close();
@@ -128,17 +129,17 @@ describe("observer MCP tools", () => {
     expect(adapter.release).toHaveBeenCalledOnce();
     expect(child.operations).toEqual(expect.arrayContaining(["runStatus", "importWorkbenchArtifact"]));
 
-    await expect(coordinator.jobStatus(undefined, "wb-job-1")).resolves.toMatchObject({
+    await expect(coordinator.jobStatus("wb-job-1")).resolves.toMatchObject({
       state: "completed", ownerCameraId: 4, restorationConfirmed: true, actualFov: 70,
     });
-    await expect(coordinator.readJob(undefined, "wb-job-1")).resolves.toMatchObject({
+    await expect(coordinator.readJob("wb-job-1")).resolves.toMatchObject({
       image: png,
       job: { state: "completed", ownerCameraId: 4 },
     });
     expect(adapter.recover).toHaveBeenCalledOnce();
     expect(adapter.status).not.toHaveBeenCalled();
 
-    await expect(coordinator.releaseJob(undefined, "wb-job-1")).resolves.toMatchObject({
+    await expect(coordinator.releaseJob("wb-job-1")).resolves.toMatchObject({
       backend: "workbench", jobId: "wb-job-1",
       restorationConfirmed: true, managedArtifactReleased: true,
     });
@@ -207,7 +208,7 @@ describe("observer MCP tools", () => {
       if (!submitted.asynchronous || typeof submitted.job.jobId !== "string") {
         throw new Error("managed Workbench capture returned no job ID");
       }
-      await expect(coordinator.jobStatus(undefined, submitted.job.jobId)).resolves.toMatchObject({
+      await expect(coordinator.jobStatus(submitted.job.jobId)).resolves.toMatchObject({
         state: "completed", restorationConfirmed: true });
       expect(activeJobId).toBeNull();
       return submitted.job.jobId;
@@ -232,7 +233,7 @@ describe("observer MCP tools", () => {
     respondWithRun(child, runId, [managedWorkbenchCaptureRecord("restart-status")]);
     adapter.recover.mockRejectedValue(codedError("JOB_NOT_FOUND", "handler retired"));
     await coordinator.runStatus(runId);
-    await expect(coordinator.jobStatus(undefined, "wb-job-1")).resolves.toMatchObject({
+    await expect(coordinator.jobStatus("wb-job-1")).resolves.toMatchObject({
       backend: "workbench", jobId: "wb-job-1", state: "completed", restorationConfirmed: true,
       recoveredFromManagedArtifact: true,
     });
@@ -266,17 +267,17 @@ describe("observer MCP tools", () => {
     await coordinator.runStatus(runId);
     expect(events).toEqual(["adapter-recover", "adapter-release"]);
 
-    await expect(coordinator.releaseJob(undefined, "wb-job-1")).rejects.toMatchObject({
+    await expect(coordinator.releaseJob("wb-job-1")).rejects.toMatchObject({
       code: "TRANSPORT_UNAVAILABLE",
     });
     expect(adapter.recover).toHaveBeenCalledOnce();
     expect(adapter.release).toHaveBeenCalledOnce();
 
-    await expect(coordinator.releaseJob(undefined, "wb-job-1")).resolves.toMatchObject({
+    await expect(coordinator.releaseJob("wb-job-1")).resolves.toMatchObject({
       backend: "workbench", jobId: "wb-job-1", managedArtifactReleased: true,
     });
     expect(events).toEqual(["adapter-recover", "adapter-release", "managed-1", "managed-2"]);
-    expect(await coordinator.releaseJob(undefined, "wb-job-1")).toMatchObject({ managedArtifactReleased: true });
+    expect(await coordinator.releaseJob("wb-job-1")).toMatchObject({ managedArtifactReleased: true });
     expect(releaseAttempts).toBe(2);
     expect(adapter.release).toHaveBeenCalledOnce();
     await coordinator.close();
@@ -322,7 +323,7 @@ describe("observer MCP tools", () => {
       expect(adapter.recover).toHaveBeenCalledOnce();
       expect(adapter.release).toHaveBeenCalledOnce();
 
-      await expect(coordinator.releaseJob(undefined, "wb-job-1")).resolves.toMatchObject({
+      await expect(coordinator.releaseJob("wb-job-1")).resolves.toMatchObject({
         backend: "workbench",
         jobId: "wb-job-1",
         restorationConfirmed: true,

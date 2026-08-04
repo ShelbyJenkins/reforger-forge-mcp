@@ -180,11 +180,11 @@ export function fakeHarness(matrixCase: WorkbenchFaultMatrixCase): FakeHarness {
       }
       return { asynchronous: true as const, job: { jobId: "job-primary", state: "submitted" } };
     },
-    async cancelJob(_sessionId: string | undefined, jobId: string) {
+    async cancelJob(jobId: string) {
       calls.push(`cancel:${jobId}`);
       return publicStatus("cancelled", null, true);
     },
-    async jobStatus(_sessionId: string | undefined, jobId: string) {
+    async jobStatus(jobId: string) {
       calls.push(`jobStatus:${jobId}`);
       if (jobId === "job-followup") {
         return publicStatus(
@@ -212,7 +212,7 @@ export function fakeHarness(matrixCase: WorkbenchFaultMatrixCase): FakeHarness {
       }
       return terminalForPrimary();
     },
-    async readJob(_sessionId: string | undefined, jobId: string) {
+    async readJob(jobId: string) {
       calls.push(`read:${jobId}`);
       return {
         job: {

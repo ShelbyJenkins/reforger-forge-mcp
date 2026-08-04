@@ -40,7 +40,7 @@ export interface ObserverRunBeginInput {
 
 export interface ReserveRunCaptureInput {
   runId: string;
-  captureLabel: string;
+  captureLabel?: string;
   purpose?: string;
   idempotencyKey: string;
   jobId?: string;
@@ -68,6 +68,14 @@ export interface BindRunCaptureInput {
   worldRevision?: string;
   worldId: string | null;
   worldEpoch: number;
+  requestFingerprint?: string;
+  selectionDelegated?: boolean;
+  retryCount?: number;
+}
+
+export interface ReviseRunCaptureAdmissionInput extends BindRunCaptureInput {
+  requestFingerprint: string;
+  retryCount: number;
 }
 
 interface RunCaptureRecord extends EvidenceCaptureSnapshot {
@@ -88,6 +96,8 @@ interface RunCaptureRecord extends EvidenceCaptureSnapshot {
   createdAt: string;
   updatedAt: string;
   runtimeLogEvidenceGrant?: RuntimeLogEvidenceGrant;
+  selectionDelegated?: boolean;
+  admissionRetryCount?: number;
 }
 
 interface ObserverRunRecord {
@@ -106,6 +116,7 @@ interface ObserverRunRecord {
   captures: RunCaptureRecord[];
   finalizeFingerprint?: string;
   exportReceipt?: EvidenceExportReceipt;
+  captureLabelCursor?: number;
 }
 
 function boundedText(value: unknown, label: string, maximum: number, required = true): string | undefined {
@@ -205,6 +216,7 @@ export class ObserverRunStore {
       createdAt: timestamp.toISOString(),
       updatedAt: timestamp.toISOString(),
       captures: [],
+      captureLabelCursor: 0,
     };
     this.write(record, true);
     return this.publicRun(record);
@@ -212,14 +224,14 @@ export class ObserverRunStore {
 
   reserveCapture(input: ReserveRunCaptureInput): Record<string, unknown> {
     const record = this.requireOpen(input.runId);
-    const label = normalizeEvidenceLabel(input.captureLabel);
     const idempotencyHash = sha256Hex(boundedText(input.idempotencyKey, "Idempotency key", 128)!);
     if (input.expectedWorldId !== undefined && input.expectedWorldId !== null) boundedText(input.expectedWorldId, "Expected world ID", 512);
     if (input.expectedWorldEpoch !== undefined && (!Number.isSafeInteger(input.expectedWorldEpoch) || input.expectedWorldEpoch < 0)) throw new ObserverError("INVALID_REQUEST", "Expected world epoch must be a non-negative integer");
     if (input.jobId !== undefined) assertIdentifier(input.jobId, "Job ID");
     const requestedImage = imageOutputPolicySchema.parse(input.image ?? { format: "png" });
+    const requestedLabel = input.captureLabel === undefined ? undefined : normalizeEvidenceLabel(input.captureLabel);
     const semantic = {
-      captureLabel: label,
+      captureLabel: requestedLabel ?? null,
       purpose: boundedText(input.purpose, "Capture purpose", 512, false),
       sessionId: input.sessionId ?? null,
       requestedInstanceId: input.requestedInstanceId ?? null,
@@ -235,13 +247,16 @@ export class ObserverRunStore {
     };
     const requestFingerprint = input.requestFingerprint ?? sha256Hex(JSON.stringify(semantic));
     if (!/^[a-f0-9]{64}$/.test(requestFingerprint)) throw new ObserverError("INVALID_REQUEST", "Capture request fingerprint is invalid");
-    const existing = record.captures.find((capture) => capture.label === label);
+    const existing = requestedLabel
+      ? record.captures.find((capture) => capture.label === requestedLabel)
+      : record.captures.find((capture) => capture.idempotencyHash === idempotencyHash);
     if (existing) {
       if (existing.idempotencyHash !== idempotencyHash || existing.requestFingerprint !== requestFingerprint || (input.jobId && existing.jobId && input.jobId !== existing.jobId)) {
-        throw new ObserverError("INVALID_REQUEST", `Capture label '${label}' is already reserved in this run`, 409);
+        throw new ObserverError("INVALID_REQUEST", `Capture label '${existing.label}' is already reserved in this run`, 409);
       }
       return { runId: record.runId, capture: publicCapture(existing, this.missing(existing)) };
     }
+    const label = requestedLabel ?? this.allocateCaptureLabel(record, input.requestedView);
     const now = new Date().toISOString();
     const capture: RunCaptureRecord = {
       label,
@@ -279,6 +294,25 @@ export class ObserverRunStore {
     if (!Number.isSafeInteger(input.worldEpoch) || input.worldEpoch < 0) throw new ObserverError("INVALID_REQUEST", "World epoch is invalid");
     if (capture.jobId && capture.jobId !== input.jobId) throw new ObserverError("INVALID_REQUEST", "Reserved run capture is already bound to a different job", 409);
     if (capture.backend && capture.backend !== input.backend) throw new ObserverError("INVALID_REQUEST", "Reserved run capture is already bound to a different backend", 409);
+    if (capture.state !== "reserved" && capture.state !== "admitting" && capture.state !== "submitted") {
+      throw new ObserverError("INVALID_REQUEST", "Run capture is no longer open for admission", 409);
+    }
+    if (capture.state !== "reserved") {
+      const exactReplay = capture.jobId === input.jobId &&
+        capture.backend === input.backend &&
+        capture.sessionId === input.sessionId &&
+        capture.instanceId === input.instanceId &&
+        capture.worldRevision === input.worldRevision &&
+        capture.worldId === input.worldId &&
+        capture.worldEpoch === input.worldEpoch &&
+        capture.selectionDelegated === (input.selectionDelegated === true) &&
+        (capture.admissionRetryCount ?? 0) === (input.retryCount ?? 0) &&
+        (!input.requestFingerprint || capture.requestFingerprint === input.requestFingerprint);
+      if (!exactReplay) {
+        throw new ObserverError("INVALID_REQUEST", "Run capture admission is already bound to different input", 409);
+      }
+      return { runId: record.runId, capture: publicCapture(capture, this.missing(capture)) };
+    }
     Object.assign(capture, {
       backend: input.backend,
       sessionId: input.sessionId,
@@ -287,7 +321,54 @@ export class ObserverRunStore {
       worldRevision: input.worldRevision,
       worldId: input.worldId,
       worldEpoch: input.worldEpoch,
-      state: "submitted",
+      ...(input.requestFingerprint ? { requestFingerprint: input.requestFingerprint } : {}),
+      selectionDelegated: input.selectionDelegated === true,
+      admissionRetryCount: input.retryCount ?? 0,
+      state: "admitting",
+      updatedAt: new Date().toISOString(),
+    });
+    record.updatedAt = capture.updatedAt;
+    this.write(record);
+    return { runId: record.runId, capture: publicCapture(capture, this.missing(capture)) };
+  }
+
+  markCaptureSubmitted(runId: string, captureLabel: string): Record<string, unknown> {
+    const record = this.requireOpen(runId);
+    const capture = record.captures.find((item) => item.label === normalizeEvidenceLabel(captureLabel));
+    if (!capture) throw new ObserverError("INVALID_REQUEST", "Run capture label is not reserved", 404);
+    if (capture.state !== "admitting" && capture.state !== "submitted") {
+      throw new ObserverError("INVALID_REQUEST", "Run capture is not awaiting backend acceptance", 409);
+    }
+    capture.state = "submitted";
+    capture.updatedAt = new Date().toISOString();
+    record.updatedAt = capture.updatedAt;
+    this.write(record);
+    return { runId, capture: publicCapture(capture, this.missing(capture)) };
+  }
+
+  reviseCaptureAdmission(input: ReviseRunCaptureAdmissionInput): Record<string, unknown> {
+    const record = this.requireOpen(input.runId);
+    const capture = record.captures.find((item) => item.label === normalizeEvidenceLabel(input.captureLabel));
+    if (!capture) throw new ObserverError("INVALID_REQUEST", "Run capture label is not reserved", 404);
+    if (capture.state !== "admitting" || capture.selectionDelegated !== true ||
+        capture.backend !== input.backend || capture.jobId !== input.jobId ||
+        capture.instanceId !== input.instanceId ||
+        (capture.admissionRetryCount ?? 0) !== 0 || input.retryCount !== 1) {
+      throw new ObserverError("INVALID_REQUEST", "Run capture admission revision is not permitted", 409);
+    }
+    if (!/^[a-f0-9]{64}$/.test(input.requestFingerprint)) {
+      throw new ObserverError("INVALID_REQUEST", "Capture request fingerprint is invalid");
+    }
+    Object.assign(capture, {
+      sessionId: input.sessionId,
+      worldRevision: input.worldRevision,
+      worldId: input.worldId,
+      worldEpoch: input.worldEpoch,
+      expectedWorldRevision: input.worldRevision,
+      expectedWorldId: input.worldId,
+      expectedWorldEpoch: input.worldEpoch,
+      requestFingerprint: input.requestFingerprint,
+      admissionRetryCount: 1,
       updatedAt: new Date().toISOString(),
     });
     record.updatedAt = capture.updatedAt;
@@ -554,6 +635,20 @@ export class ObserverRunStore {
     record.updatedAt = capture.updatedAt;
     this.write(record);
     return { runId: record.runId, capture: publicCapture(capture, false) };
+  }
+
+  private allocateCaptureLabel(record: ObserverRunRecord, requestedView: Record<string, unknown>): string {
+    let cursor = Number.isSafeInteger(record.captureLabelCursor) && (record.captureLabelCursor ?? 0) >= 0
+      ? record.captureLabelCursor!
+      : record.captures.length;
+    const kind = requestedView.kind === "pose" ? "pose" : requestedView.kind === "lookAt" ? "look-at" : "current";
+    let label: string;
+    do {
+      cursor += 1;
+      label = `${kind}-${cursor}`;
+    } while (record.captures.some((capture) => capture.label === label));
+    record.captureLabelCursor = cursor;
+    return label;
   }
 
   private snapshot(record: ObserverRunRecord, includeImages: boolean): EvidenceRunExportSnapshot {

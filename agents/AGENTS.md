@@ -101,7 +101,7 @@ authoritative field-level contract.
 | Build and inspect a Workbench build | **wb_build**, **wb_log_query** |
 | Edit a live world or its entities | **wb_entity_\***, **wb_component**, **wb_layers**, **wb_terrain**, **wb_clipboard**, **scenario_create** |
 | Inspect or manage live resources | **wb_resources**, **wb_prefabs**, **wb_projects**, **wb_localization**, **wb_script_editor**, **wb_validate** |
-| Stage Observer, run captures, and export evidence | **observer_setup**, **observer_run**, **observer_prepare_launch**, **observer_runtime**, **observer_instances**, **observer_capture**, **observer_job** |
+| Stage Observer, run captures, and export evidence | **observer_setup**, **observer_run_begin**, **observer_run_status**, **observer_run_finalize**, **observer_run_discard**, **observer_prepare_launch**, **observer_runtime**, **observer_instances**, **observer_capture**, **observer_job** |
 
 Use game-data tools rather than ordinary filesystem commands to inspect the
 installed game. Use **game_duplicate** for a base-game `.et` prefab and
@@ -237,7 +237,8 @@ Inspect the capture itself and record what it proves and does not prove.
 
 1. Call **observer_setup** to inspect or stage the managed companions when
    needed.
-2. Call **observer_run** with action=begin and retain the returned runId.
+2. Call **observer_run_begin**. It becomes the process-local active run; retain
+   its runId when work may need an explicit cross-reference.
 3. Choose one renderer: a prepared runtime or an already launched compatible
    Workbench. Observer capture never launches Workbench for you.
 
@@ -251,36 +252,40 @@ Inspect the capture itself and record what it proves and does not prove.
    a compelling external reason; the exceptional field requires bounded width,
    height, and a meaningful justification. Large screenshots are not a reason
    to shrink the renderer—bound `observer_capture.image` output instead.
-2. To let the MCP own the runtime, call **observer_runtime** with action=start,
-   preparedLaunchId, and a unique idempotencyKey; retain its runtimeId.
+2. To let the MCP own the runtime, call **observer_runtime** with action=start
+   and preparedLaunchId; retain its runtimeId. The host derives the stable
+   lifecycle idempotency key internally.
    External launching may use the prepared argument array instead.
-3. Call **observer_instances** with the runtime sessionId and choose one
-   renderer instance.
-4. Call **observer_capture** with the runId, runtime sessionId, instanceId,
-   unique captureLabel, requested view, and the world binding from the
-   immediately preceding inventory.
-5. Runtime **observer_job** operations also require the same sessionId.
+3. Call **observer_instances** with the runtime sessionId when explicit
+   selection is needed and retain its opaque target.
+4. Call **observer_capture** with the target and requested view. Omit runId to
+   use the active run and omit captureLabel for durable automatic allocation.
+   With exactly one compatible renderer, omit target as well.
+5. **observer_job** operations require only action and jobId.
 
-For runtime work, sessionId is required. Do not replace it with a PID, process
-name, or runtimeId.
+For runtime preparation and explicit inventory, sessionId is required. The
+preferred capture target carries it internally. Do not replace session
+authority with a PID, process name, or runtimeId.
 
 ### Workbench capture
 
 1. Launch the target Workbench project through **wb_launch** and confirm it is
    ready.
 2. Call **observer_instances** and select the compatible Workbench renderer.
-3. Submit **observer_capture** using the selected instance. A sessionId is
-   optional only for an explicitly selected already-running Workbench renderer.
+3. Submit **observer_capture** with the selected opaque target, or omit target
+   when Workbench is the only compatible renderer. Explicit-view priming is
+   automatic on an exact editor with the restoration API.
 4. Restore or cancel outstanding captures and wait for terminal jobs before
    restarting or shutting down Workbench.
 
 ### Capture and cleanup contract
 
-- Every capture needs the runId and a unique normalized captureLabel.
-- Copy the inventory's opaque expectedWorldRevision into the capture request as
-  the required world binding. Do not send separate world-ID or epoch fields.
-  A revision may represent a runtime with no loaded world; only a current-view
-  capture is available in that state.
+- A capture uses an explicit runId or the process-local active run. Labels are
+  durably allocated when omitted. A capture may also be runless.
+- Prefer the opaque target from inventory. It binds backend, exact instance,
+  runtime session, and world revision. Do not combine target with legacy
+  sessionId, instanceId, or expectedWorldRevision fields. Targetless delegated
+  selection succeeds only with exactly one compatible renderer.
 - Use view kind=current first. Explicit pose and look-at requests require the
   selected backend capability and may be safely refused.
 - Synchronous capture returns one validated image in the requested format.
@@ -291,10 +296,12 @@ name, or runtimeId.
   quality. For asynchronous capture, poll **observer_job** action=status, use
   action=read when complete, and use cancel or release only as the job
   contract allows. The read result carries the actual MIME type and image
-  metadata.
-- Review images before **observer_run** action=finalize. Finalization exports
-  reviewed labels only to a configured allowlisted evidence root; use discard
-  when no evidence should be retained.
+  metadata. Runless synchronous delivery, successful asynchronous reads, safe
+  terminal cancellation, and oversized inline results automatically attempt
+  release; honor `cleanupRequired` and the retained job when cleanup fails.
+- Review images before **observer_run_finalize**. Finalization exports reviewed
+  labels only to a configured allowlisted evidence root; use
+  **observer_run_discard** when no evidence should be retained.
 - For an exact-owned runtime capture selected for export, attach its correlated
   runtime log semantically with `supportingFiles: [{ kind: "relevantLog",
   label: "runtime", sourceCaptureLabel: "<captureLabel>" }]`. Observer resolves
@@ -304,8 +311,7 @@ name, or runtimeId.
   launches.
 - Before an MCP-owned runtime stop, wait for every job and camera restoration
   to reach terminal state. Then call **observer_runtime** action=stop with its
-  runtimeId and a new idempotencyKey. Never stop by PID, process name, or broad
-  process-tree action.
+  runtimeId. Never stop by PID, process name, or broad process-tree action.
 
 ## Safety and Scope
 
@@ -353,7 +359,7 @@ observed results, and remaining gaps. Never describe an unrun check as passed.
 | A component is Unknown or a script change is stale | Fix compile errors, save intentional work, and use **wb_restart**. Do not use **wb_reload** for game scripts. |
 | A duplicated resource has no usable GUID | Open the exact destination project in Workbench, then call **wb_resources** with `action: "register"` and the copied file's absolute path. Registration verifies that the file is inside that active project and creates its `.meta` GUID; no GUID is needed as input. |
 | **game_duplicate** registration fails after copying | Keep the copied file, open its exact destination project, and register its absolute path with **wb_resources**. Do not rerun **game_duplicate** at the occupied destination. |
-| Observer capture is rejected for world binding | Re-run **observer_instances** immediately, select the renderer again, and copy its expectedWorldRevision. |
+| Observer capture is rejected for world binding | Re-run **observer_instances** immediately and use the renderer's new opaque target. |
 | **observer_runtime** reports identity mismatch or stop is blocked | Preserve the receipt. Finish or cancel captures and wait for restoration; never terminate the process by PID or name. |
 
 ## Completion Notes

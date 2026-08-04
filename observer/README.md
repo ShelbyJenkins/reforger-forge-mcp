@@ -74,7 +74,7 @@ directory, not a shared or broadly writable location.
 
 ## Public MCP contract
 
-Observer exposes seven related MCP tools. Their client-facing descriptions and
+Observer exposes ten related MCP tools. Their client-facing descriptions and
 input schemas are the authoritative API surface; the operator call order is in
 [docs/observer.md](../docs/observer.md).
 
@@ -84,23 +84,32 @@ input schemas are the authoritative API surface; the operator call order is in
 | `observer_prepare_launch` | Creates an expiring runtime activation session and structured arguments without starting the runtime. |
 | `observer_runtime` | Explicitly starts, inspects, or restoration-gated stops an exact-owned graphical runtime on Windows. |
 | `observer_instances` | Reports live or stale renderers, capabilities, world identity, health, and active work. |
-| `observer_capture` | Submits a current, pose, or look-at transaction to an open managed run. |
+| `observer_capture` | Submits a current, pose, or look-at transaction, optionally attached to an active or explicit managed run. |
 | `observer_job` | Reads status, validated inline output, cancellation, and release state for a capture job. |
-| `observer_run` | Begins, inspects, finalizes, or discards a bounded managed evidence run. |
+| `observer_run_begin` | Begins a bounded managed evidence run and activates it in the current MCP process. |
+| `observer_run_status` | Inspects an explicit run or the process-local active run. |
+| `observer_run_finalize` | Finalizes reviewed capture labels from an explicit or active run. |
+| `observer_run_discard` | Discards an explicit or active unfinalized run. |
 
-`expectedWorldRevision` is the required `observer_capture` world binding and
-must come from the immediately preceding inventory result. The public capture
-input does not accept separate world-ID or epoch fields. A revision can bind a
-runtime that currently has no loaded world; only a `current` capture is
-available in that state.
+`observer_instances` projects an opaque, versioned capture target for each
+renderer. A target binds the backend, exact instance, runtime session when
+applicable, and world revision; it is mutually exclusive with the legacy
+`sessionId`/`instanceId`/`expectedWorldRevision` fields. With no selection
+fields, capture delegates only when exactly one compatible renderer exists.
 
-Runtime capture and runtime job operations require the launch-preparation
-`sessionId`; a lifecycle `runtimeId` is not a substitute. A selected
-already-running Workbench renderer uses no runtime session ID. A runtime must
-advertise `render.capture` for `current`; `pose` and `lookAt` additionally
-require `camera.runtime`. Workbench explicit views require `camera.editor`,
-which is withheld until a current-view transaction proves restoration in that
-editor process.
+`observer_job` takes only an action and job ID; backend and session authority
+remain in the retained internal reference. A runtime must advertise
+`render.capture` for `current`; `pose` and `lookAt` additionally require
+`camera.runtime`. Workbench explicit views require `camera.editor`. When the
+exact editor exposes restoration support but has not yet proven that capability,
+the host primes it with one internal runless current capture, releases it, and
+re-inventories the same lifecycle before submitting the requested view.
+
+Public runtime start/stop calls do not accept idempotency keys. The host derives
+stable operation keys from the exact prepared launch or owned runtime identity,
+so a lost response can be retried without creating a second lifecycle command.
+Runless capture delivery automatically attempts release; cleanup failure stays
+visible through a retained job handle and `cleanupRequired` diagnostics.
 
 ## Configuration and managed roots
 

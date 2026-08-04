@@ -20,6 +20,8 @@ describe("Observer application composition architecture", () => {
     const server = readFileSync(join(repositoryRoot, "observer", "agent", "server.ts"), "utf8");
     expect(runs).not.toMatch(/JobStore|supportingLogRoots|RESULT\.md|hashMembers|copySupportingFiles/);
     expect(child).not.toMatch(/jobs\.submit|runs\.finalize|artifacts\.release|revokeSession\(/);
+    expect(child).toContain('"runSubmitCapture"');
+    expect(child).toContain('"runReviseCaptureAdmission"');
     expect(server).toContain("operations.execute");
   });
 

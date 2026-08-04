@@ -334,7 +334,7 @@ async function pollWorkbenchMatrixTerminal(
     deadline: deadlineAt(deadline),
     intervalMs: 250,
     probe: async () => {
-      const status = await application.jobStatus(undefined, jobId);
+      const status = await application.jobStatus(jobId);
       if (typeof status.state !== "string") {
         throw new Error("Workbench matrix status omitted its public state");
       }
@@ -587,7 +587,7 @@ class WorkbenchMatrixCaseExecution {
     const { application, actions, matrixCase } = this.input;
     const action = matrixCase.injection.action;
     if (action === "cancel_capture") {
-      this.cancellationStatus = await application.cancelJob(undefined, this.primaryJobId!);
+      this.cancellationStatus = await application.cancelJob(this.primaryJobId!);
       this.recordPublicTerminal(canonicalTerminalFromStatus(this.cancellationStatus));
       return;
     }
@@ -669,7 +669,7 @@ class WorkbenchMatrixCaseExecution {
           this.terminalStatus.restorationConfirmed !== true) {
         throw new Error("Workbench matrix contention changed or stranded the original camera lease");
       }
-      await application.readJob(undefined, this.primaryJobId!);
+      await application.readJob(this.primaryJobId!);
       return;
     }
     if (action === "disable_fixture_handler") {
@@ -691,7 +691,7 @@ class WorkbenchMatrixCaseExecution {
         probe: async () => {
           let status: Record<string, unknown>;
           try {
-            status = await application.jobStatus(undefined, this.primaryJobId!);
+            status = await application.jobStatus(this.primaryJobId!);
           } catch (error) {
             observedTerminal = canonicalTerminalFromError(error);
             return true;
@@ -742,7 +742,7 @@ class WorkbenchMatrixCaseExecution {
       this.recordPublicTerminal(canonicalTerminalFromError(outcome.error));
     } else {
       try {
-        this.terminalStatus = await application.jobStatus(undefined, this.primaryJobId!);
+        this.terminalStatus = await application.jobStatus(this.primaryJobId!);
         throw new Error("Workbench handler loss did not reach the public transport boundary");
       } catch (error) {
         this.recordPublicTerminal(canonicalTerminalFromError(error));
@@ -833,7 +833,7 @@ class WorkbenchMatrixCaseExecution {
         this.input.actions.confirmExactOwnerExit,
         "stop_owned_workbench:confirm-exact-owner-exit"
       )(this.primaryJobId, this.exactOwnerVacant);
-      this.terminalStatus = await this.input.application.jobStatus(undefined, this.primaryJobId);
+      this.terminalStatus = await this.input.application.jobStatus(this.primaryJobId);
       this.recordPublicTerminal(canonicalTerminalFromStatus(this.terminalStatus));
       await this.input.adapter.release(this.primaryJobId);
       return;
@@ -869,7 +869,7 @@ class WorkbenchMatrixCaseExecution {
       if (!this.primaryJobId || !this.primarySubmitted || !this.terminalStatus) {
         throw new Error("Workbench completed matrix case lacks its retained primary capture");
       }
-      const retained = await this.input.application.readJob(undefined, this.primaryJobId);
+      const retained = await this.input.application.readJob(this.primaryJobId);
       assertRequestedWorkbenchMatrixView(this.input.captureView, this.terminalStatus);
       if (this.input.captureView.kind === "current") {
         assertRestoredWorkbenchCameraProof(
@@ -997,7 +997,7 @@ class WorkbenchMatrixCaseExecution {
         "Workbench matrix post-restoration current capture"
       );
     }
-    await this.input.application.readJob(undefined, followUpJobId);
+    await this.input.application.readJob(followUpJobId);
     await this.input.adapter.release(followUpJobId);
     this.diagnostics.push(action === "replace_fixture_world"
       ? "fresh current-view acquisition proved complete camera evidence in the replacement editor world"

@@ -2,17 +2,34 @@
 
 ## Status
 
-Ready for implementation as of 2026-08-03. This plan incorporates the
-source-backed review of the original three-tier proposal and the subsequent
-verification of all seven review findings. It records the amended scope; it
-does not claim that any implementation task below is complete.
+Phases 0, 1, and 2 were implemented and validated on 2026-08-04. Lifecycle
+idempotency, the Workbench submit-time world compare-and-swap, the smaller
+public contract, retry-safe capture admission, delegated selection, automatic
+labels, process-local active runs, and internal Workbench priming are complete.
+No implementation task in this plan remains open.
 
-The implementation must start with lifecycle idempotency because that is a
-correctness and recovery fix independent of the API ergonomics work. Tier 1a
-then closes the current Workbench submit-time world-binding window and
-introduces the smaller public contract. The second phase performs the capture
-admission refactor needed for safe delegated selection, automatic labels,
-Workbench priming, and an ambient process-local run.
+The final hermetic suite passed 2,030 tests with one intentional skip and no
+failures across 609 suites. Typecheck, protocol generation checks, both addon
+manifests, native runtime and Workbench Enforce validation, the package build,
+and a fresh production tarball install also passed. The package contained
+1,011 files and verified both advertised binaries and both descriptor-derived
+Enforce targets.
+
+Guarded Workbench acceptance passed on 1.7.0.54, including internal current
+capture priming, release, explicit pose capture, restoration, evidence
+isolation, application shutdown, and exact process vacancy without manual
+cleanup. Guarded runtime acceptance then passed on graphical
+`ArmaReforgerSteamDiag.exe` 1.7.0.54 against the installed stock MP Test world.
+It produced and validated the five current/pose/restored/look-at/restored PNGs
+at 2560x1440, finalized the evidence bundle, restored both camera leases,
+stopped the exact owned runtime, and proved process vacancy with no manual
+cleanup.
+
+The first runtime attempt exposed an invalid Windows native declaration in the
+focus guard: `GetCurrentThreadId` was imported from `user32.dll` instead of
+`kernel32.dll`. The helper failed closed and still proved exact runtime and
+private-child cleanup. The import was corrected, a regression assertion was
+added, and the complete runtime acceptance and final suite then passed.
 
 ## Plan validation record (2026-08-03)
 

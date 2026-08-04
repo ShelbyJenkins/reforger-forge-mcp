@@ -38,6 +38,9 @@ export class FakeChild extends EventEmitter {
 
   constructor() {
     super();
+  }
+
+  announceReady(): void {
     queueMicrotask(() => this.emit("message", {
       protocol: CHILD_PROTOCOL,
       type: "ready",
@@ -110,6 +113,7 @@ export class FakeChild extends EventEmitter {
 function fakeFork(child: FakeChild, count: { value: number }): typeof fork {
   return (() => {
     count.value += 1;
+    child.announceReady();
     return child as unknown as ChildProcess;
   }) as typeof fork;
 }

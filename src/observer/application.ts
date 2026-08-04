@@ -38,15 +38,24 @@ export interface ObserverInstanceList {
   warnings?: string[];
 }
 
-export type ObserverCaptureView = CaptureInput["view"];
+export type ObserverCaptureView = NonNullable<CaptureInput["view"]>;
 
-export interface ObserverCaptureInput extends Omit<CaptureInput, "expectedWorldRevision"> {
-  expectedWorldRevision: string;
+export interface ObserverCaptureInput extends Omit<CaptureInput, "view" | "expectedWorldRevision"> {
+  view: ObserverCaptureView;
+  expectedWorldRevision?: string;
 }
 
 export type ObserverCaptureResult =
   | { asynchronous: true; job: Record<string, unknown> }
-  | { asynchronous: false; job: Record<string, unknown>; image: Buffer; metadata: Record<string, unknown> };
+  | {
+      asynchronous: false;
+      job: Record<string, unknown>;
+      image: Buffer;
+      metadata: Record<string, unknown>;
+      cleanup?: Record<string, unknown>;
+      cleanupRequired?: boolean;
+      cleanupWarning?: string;
+    };
 
 export type ObserverApplicationLifecycleState =
   | "open"
@@ -114,10 +123,10 @@ export interface ObserverApplication {
   runStatus(runId: string): Promise<Record<string, unknown>>;
   finalizeRun(input: Record<string, unknown>): Promise<Record<string, unknown>>;
   discardRun(runId: string): Promise<Record<string, unknown>>;
-  jobStatus(sessionId: string | undefined, jobId: string): Promise<Record<string, unknown>>;
-  cancelJob(sessionId: string | undefined, jobId: string): Promise<Record<string, unknown>>;
-  releaseJob(sessionId: string | undefined, jobId: string): Promise<Record<string, unknown>>;
-  readJob(sessionId: string | undefined, jobId: string): Promise<{ job: Record<string, unknown>; image: Buffer; metadata: Record<string, unknown> }>;
+  jobStatus(jobId: string): Promise<Record<string, unknown>>;
+  cancelJob(jobId: string): Promise<Record<string, unknown>>;
+  releaseJob(jobId: string): Promise<Record<string, unknown>>;
+  readJob(jobId: string): Promise<{ job: Record<string, unknown>; image: Buffer; metadata: Record<string, unknown>; cleanup?: Record<string, unknown>; cleanupRequired?: boolean; cleanupWarning?: string }>;
   closeRuntimeLifecycle(deadlineAtMs?: number): Promise<Record<string, unknown>>;
   emergencyTerminatePrivateChildren(): void;
   close(): Promise<void>;
@@ -320,8 +329,13 @@ class DefaultObserverApplication implements ObserverApplication {
     this.assertPublicOpen();
     try {
       const { expectedWorldRevision: rawRevision, ...captureInput } = input;
-      const expectedWorldRevision = resolveExpectedWorldRevision({ expectedWorldRevision: rawRevision });
-      return await this.captureService.capture({ ...captureInput, expectedWorldRevision }) as CaptureResult;
+      const expectedWorldRevision = rawRevision === undefined
+        ? undefined
+        : resolveExpectedWorldRevision({ expectedWorldRevision: rawRevision });
+      return await this.captureService.capture({
+        ...captureInput,
+        ...(expectedWorldRevision ? { expectedWorldRevision } : {}),
+      }) as CaptureResult;
     } catch (error) { throw this.mapError(error); }
   }
   async beginRun(input: Record<string, unknown>): Promise<Record<string, unknown>> {
@@ -340,21 +354,21 @@ class DefaultObserverApplication implements ObserverApplication {
     this.assertPublicOpen();
     try { return await this.evidenceRuns.discard(runId); } catch (error) { throw this.mapError(error); }
   }
-  async jobStatus(sessionId: string | undefined, jobId: string): Promise<Record<string, unknown>> {
+  async jobStatus(jobId: string): Promise<Record<string, unknown>> {
     this.assertPublicOpen();
-    try { return await this.captureService.status(sessionId, jobId); } catch (error) { throw this.mapError(error); }
+    try { return await this.captureService.status(jobId); } catch (error) { throw this.mapError(error); }
   }
-  async cancelJob(sessionId: string | undefined, jobId: string): Promise<Record<string, unknown>> {
+  async cancelJob(jobId: string): Promise<Record<string, unknown>> {
     this.assertPublicOpen();
-    try { return await this.captureService.cancel(sessionId, jobId); } catch (error) { throw this.mapError(error); }
+    try { return await this.captureService.cancel(jobId); } catch (error) { throw this.mapError(error); }
   }
-  async releaseJob(sessionId: string | undefined, jobId: string): Promise<Record<string, unknown>> {
+  async releaseJob(jobId: string): Promise<Record<string, unknown>> {
     this.assertPublicOpen();
-    try { return await this.captureService.release(sessionId, jobId); } catch (error) { throw this.mapError(error); }
+    try { return await this.captureService.release(jobId); } catch (error) { throw this.mapError(error); }
   }
-  async readJob(sessionId: string | undefined, jobId: string): Promise<{ job: Record<string, unknown>; image: Buffer; metadata: Record<string, unknown> }> {
+  async readJob(jobId: string): Promise<{ job: Record<string, unknown>; image: Buffer; metadata: Record<string, unknown>; cleanup?: Record<string, unknown>; cleanupRequired?: boolean; cleanupWarning?: string }> {
     this.assertPublicOpen();
-    try { return await this.captureService.read(sessionId, jobId); } catch (error) { throw this.mapError(error); }
+    try { return await this.captureService.read(jobId); } catch (error) { throw this.mapError(error); }
   }
 
   closeRuntimeLifecycle(deadlineAtMs = Date.now() + 30_000): Promise<Record<string, unknown>> {
