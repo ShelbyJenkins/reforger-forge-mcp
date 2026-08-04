@@ -10,7 +10,7 @@ import {
   statSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { basename, dirname, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { Config } from "../config.js";
 import { redactText } from "../foundation/redact.js";
 import {
@@ -47,6 +47,7 @@ import {
 import {
   buildCliEditorLaunchPlan,
   buildTargetBuildLaunchPlan,
+  buildTargetCheckLaunchPlan,
   isLoopbackLifecycleHost,
   WORKBENCH_PROCESS_NAME,
   WorkbenchLaunchPlanError,
@@ -54,6 +55,10 @@ import {
   toLifecycleTarget,
   type WorkbenchLifecycleTarget,
 } from "./launch-plan.js";
+import {
+  readWorkbenchCompileFailureFromLogDirectory,
+  type WorkbenchCompileFailure,
+} from "./compile-diagnostics.js";
 import {
   ensureWorkbenchManagedBuildProfile,
   type WorkbenchManagedBuildProfile,
@@ -87,6 +92,7 @@ const DEFAULT_LOG_POLL_MS = 200;
 const DEFAULT_TERMINATION_TIMEOUT_MS = 15_000;
 const DEFAULT_RECOVERY_TIMEOUT_MS = 15_000;
 const MAX_BUILD_TIMEOUT_MS = 60 * 60 * 1_000;
+const MAX_CHECK_TIMEOUT_MS = 10 * 60 * 1_000;
 const LOG_CLOCK_SKEW_MS = 2_000;
 const NET_API_CLIENT_ID = "ReforgerForgeWorkbenchRunner";
 const MAX_PING_RESPONSE_BYTES = 1024 * 1024;
@@ -105,7 +111,9 @@ export type WorkbenchRunnerErrorCode =
   | "LOG_ATTRIBUTION_FAILED"
   | "OUTPUT_ATTESTATION_FAILED"
   | "BUILD_DEADLINE_EXCEEDED"
-  | "BUILD_ABORTED";
+  | "BUILD_ABORTED"
+  | "CHECK_DEADLINE_EXCEEDED"
+  | "CHECK_ABORTED";
 
 export class WorkbenchRunnerError extends Error {
   constructor(
@@ -134,17 +142,24 @@ function rethrowLaunchPlanError(error: unknown): never {
 
 function mapControllerRunError(
   error: unknown,
-  intent: "editor" | "build"
+  intent: "editor" | "build" | "check"
 ): unknown {
   if (!(error instanceof WorkbenchRunError)) return error;
   if (error.code === "ABORTED") {
     return new WorkbenchRunnerError(
       error.message,
-      intent === "build" ? "BUILD_ABORTED" : "ENDPOINT_UNVERIFIABLE"
+      intent === "build"
+        ? "BUILD_ABORTED"
+        : intent === "check"
+          ? "CHECK_ABORTED"
+          : "ENDPOINT_UNVERIFIABLE"
     );
   }
   if (error.code === "DEADLINE_EXCEEDED") {
-    return new WorkbenchRunnerError(error.message, "BUILD_DEADLINE_EXCEEDED");
+    return new WorkbenchRunnerError(
+      error.message,
+      intent === "check" ? "CHECK_DEADLINE_EXCEEDED" : "BUILD_DEADLINE_EXCEEDED"
+    );
   }
   return new WorkbenchRunnerError(
     error.message,
@@ -169,7 +184,17 @@ export interface WorkbenchBuildIntent {
   timeoutMs: number;
 }
 
-export type WorkbenchRunnerIntent = WorkbenchEditorIntent | WorkbenchBuildIntent;
+export interface WorkbenchCheckIntent {
+  kind: "check";
+  gprojPath: string;
+  configuration: string;
+  timeoutMs: number;
+}
+
+export type WorkbenchRunnerIntent =
+  | WorkbenchEditorIntent
+  | WorkbenchBuildIntent
+  | WorkbenchCheckIntent;
 
 export type WorkbenchRunnerExitClassification =
   | "success"
@@ -225,7 +250,11 @@ export function classifyWorkbenchExitStatus(
     classification = "success";
   } else if (evidence.exitCode !== null) {
     const unsignedCode = evidence.exitCode >>> 0;
-    if (unsignedCode >= 0xC0000000) {
+    // Workbench documents -1 as the ordinary script-validation failure. Node
+    // may expose it either signed or as the unsigned DWORD value.
+    if (evidence.exitCode === -1 || unsignedCode === 0xFFFFFFFF) {
+      classification = "nonzero_exit";
+    } else if (unsignedCode >= 0xC0000000) {
       classification = "windows_exception";
       nativeStatus = `0x${unsignedCode.toString(16).toUpperCase().padStart(8, "0")}`;
       exceptionName = windowsExceptionName(unsignedCode);
@@ -286,7 +315,37 @@ export interface WorkbenchBuildReceipt {
   exitStatus: WorkbenchRunnerExitStatus;
 }
 
-export type WorkbenchRunnerReceipt = WorkbenchEditorReceipt | WorkbenchBuildReceipt;
+export type WorkbenchCheckCompilationResult =
+  | { readonly status: "compiled" }
+  | ({ readonly status: "failed" } & WorkbenchCompileFailure)
+  | {
+      readonly status: "indeterminate";
+      readonly code: "COMPILATION_INDETERMINATE";
+      readonly message: string;
+    };
+
+export interface WorkbenchCheckReceipt {
+  intent: "check";
+  scope: "enforceScripts";
+  engineValidated: true;
+  pid: number;
+  executablePath: string;
+  creationTime: string;
+  target: string;
+  targetAddon: { addonId: string; addonGuid: string; sourceSha256: string };
+  configuration: string;
+  lifecycleGeneration: string;
+  processOwnership: "verified";
+  endpointVacancy: "verified";
+  logDirectory: string;
+  compilation: WorkbenchCheckCompilationResult;
+  exitStatus: WorkbenchRunnerExitStatus;
+}
+
+export type WorkbenchRunnerReceipt =
+  | WorkbenchEditorReceipt
+  | WorkbenchBuildReceipt
+  | WorkbenchCheckReceipt;
 
 export interface WorkbenchRunnerCompanionIdentity {
   addonId: string;
@@ -535,6 +594,35 @@ function validateBuildOutput(
   }
 }
 
+function validateCheckIntent(
+  intent: WorkbenchCheckIntent,
+  project: WorkbenchTargetProjectMetadata
+): void {
+  positiveInteger(intent.timeoutMs, "Check timeoutMs", MAX_CHECK_TIMEOUT_MS);
+  if (!isAbsolute(intent.gprojPath.trim())) {
+    throw new WorkbenchRunnerError(
+      "Check gprojPath must be an exact absolute .gproj path.",
+      "INVALID_INTENT"
+    );
+  }
+  if (!/^[A-Za-z0-9_.-]{1,64}$/.test(intent.configuration)) {
+    throw new WorkbenchRunnerError(
+      "Check configuration must be a safe non-empty configuration identifier.",
+      "INVALID_INTENT"
+    );
+  }
+  if (!project.configurations.includes(intent.configuration)) {
+    const declared = project.configurations.length > 0
+      ? project.configurations.join(", ")
+      : "none";
+    throw new WorkbenchRunnerError(
+      `Workbench project does not declare configuration ${intent.configuration}. ` +
+        `Declared configurations: ${declared}. No Workbench process was launched.`,
+      "INVALID_TARGET"
+    );
+  }
+}
+
 function assertEmptyBuildOutput(root: string): void {
   if (readdirSync(root).length !== 0) {
     throw new WorkbenchRunnerError(
@@ -558,10 +646,11 @@ function assertBuildOutputIsolated(
   }
 }
 
-interface WorkbenchBuildProjectMetadata {
+interface WorkbenchTargetProjectMetadata {
   addonId: string;
   addonGuid: string;
   sourceSha256: string;
+  configurations: readonly string[];
 }
 
 interface BuildOutputArtifactState {
@@ -577,7 +666,7 @@ interface WorkbenchBuildOutputReservation {
   revalidateAndSnapshot(): Map<string, BuildOutputArtifactState>;
 }
 
-function resolveBuildProjectMetadata(gprojPath: string): WorkbenchBuildProjectMetadata {
+function resolveTargetProjectMetadata(gprojPath: string): WorkbenchTargetProjectMetadata {
   let document;
   let source: Buffer;
   try {
@@ -585,7 +674,7 @@ function resolveBuildProjectMetadata(gprojPath: string): WorkbenchBuildProjectMe
     document = parseEnfusionText(source.toString("utf8"));
   } catch (error) {
     throw new WorkbenchRunnerError(
-      `Workbench build project could not be parsed: ${gprojPath} ` +
+      `Workbench target project could not be parsed: ${gprojPath} ` +
         `(${error instanceof Error ? error.message : String(error)})`,
       "INVALID_TARGET"
     );
@@ -595,7 +684,17 @@ function resolveBuildProjectMetadata(gprojPath: string): WorkbenchBuildProjectMe
   if (typeof addonId !== "string" || !/^[A-Za-z0-9_.-]{1,128}$/.test(addonId) ||
       typeof addonGuid !== "string" || !/^[A-Fa-f0-9]{16}$/.test(addonGuid)) {
     throw new WorkbenchRunnerError(
-      `Workbench build project must declare one safe GameProject ID and GUID: ${gprojPath}`,
+      `Workbench target project must declare one safe GameProject ID and GUID: ${gprojPath}`,
+      "INVALID_TARGET"
+    );
+  }
+  const configurationsNode = document.children.find((child) => child.type === "Configurations");
+  const configurations = configurationsNode?.children
+    .filter((child) => child.type === "GameProjectConfig" && typeof child.id === "string")
+    .map((child) => child.id!) ?? [];
+  if (new Set(configurations.map((value) => value.toLowerCase())).size !== configurations.length) {
+    throw new WorkbenchRunnerError(
+      `Workbench target project declares ambiguous duplicate configurations: ${gprojPath}`,
       "INVALID_TARGET"
     );
   }
@@ -603,6 +702,7 @@ function resolveBuildProjectMetadata(gprojPath: string): WorkbenchBuildProjectMe
     addonId,
     addonGuid: addonGuid.toUpperCase(),
     sourceSha256: createHash("sha256").update(source).digest("hex"),
+    configurations: Object.freeze(configurations),
   };
 }
 
@@ -884,6 +984,8 @@ async function attributeLogDirectory(args: {
   ownerToken: string;
   deadline: Deadline;
   pollMs: number;
+  operationName: string;
+  abortedCode: WorkbenchRunnerErrorCode;
   signal?: AbortSignal;
 }): Promise<string> {
   let result;
@@ -912,8 +1014,8 @@ async function attributeLogDirectory(args: {
   } catch (error) {
     if (args.signal?.aborted) {
       throw new WorkbenchRunnerError(
-        "Workbench build was aborted while attributing its exact log directory.",
-        "BUILD_ABORTED"
+        `Workbench ${args.operationName} was aborted while attributing its exact log directory.`,
+        args.abortedCode
       );
     }
     throw error;
@@ -931,9 +1033,9 @@ interface TargetBuildStageArgs {
   intent: WorkbenchBuildIntent;
   project: CanonicalGprojIdentity;
   target: WorkbenchLifecycleTarget;
-  buildProject: WorkbenchBuildProjectMetadata;
+  buildProject: WorkbenchTargetProjectMetadata;
   managedProfile: Readonly<WorkbenchManagedBuildProfile>;
-  reattestTarget: () => WorkbenchBuildProjectMetadata;
+  reattestTarget: () => WorkbenchTargetProjectMetadata;
   reattestDependencies: () => void;
   logRoot: string;
   outputReservation: WorkbenchBuildOutputReservation;
@@ -1042,6 +1144,8 @@ async function runTargetBuildStage(args: TargetBuildStageArgs): Promise<Workbenc
       args.logAttributionTimeoutMs
     ),
     pollMs: args.logPollMs,
+    operationName: "build",
+    abortedCode: "BUILD_ABORTED",
     signal: args.signal,
   });
   return {
@@ -1065,6 +1169,157 @@ async function runTargetBuildStage(args: TargetBuildStageArgs): Promise<Workbenc
   };
 }
 
+interface TargetCheckStageArgs {
+  controller: WorkbenchSessionController;
+  config: Config;
+  intent: WorkbenchCheckIntent;
+  project: CanonicalGprojIdentity;
+  target: WorkbenchLifecycleTarget;
+  targetProject: WorkbenchTargetProjectMetadata;
+  managedProfile: Readonly<WorkbenchManagedBuildProfile>;
+  reattestTarget: () => WorkbenchTargetProjectMetadata;
+  reattestDependencies: () => void;
+  logRoot: string;
+  logAttributionTimeoutMs: number;
+  logPollMs: number;
+  terminationTimeoutMs: number;
+  recoveryTimeoutMs: number;
+  deadlineMs: number;
+  signal?: AbortSignal;
+}
+
+function checkCompilationResult(
+  exitStatus: WorkbenchRunnerExitStatus,
+  failure: WorkbenchCompileFailure | null
+): WorkbenchCheckCompilationResult {
+  if (failure) return Object.freeze({ status: "failed", ...failure });
+  if (exitStatus.reason === "exited" && exitStatus.exitCode === 0) {
+    return Object.freeze({ status: "compiled" });
+  }
+  return Object.freeze({
+    status: "indeterminate",
+    code: "COMPILATION_INDETERMINATE",
+    message: exitStatus.classification === "windows_exception"
+      ? `Workbench terminated with native exception ${exitStatus.nativeStatus ?? "unknown"}.`
+      : `Workbench did not provide an attributed Enforce Script compiler failure ` +
+        `(terminal classification: ${exitStatus.classification}).`,
+  });
+}
+
+async function runTargetCheckStage(args: TargetCheckStageArgs): Promise<WorkbenchCheckReceipt> {
+  if (args.signal?.aborted) {
+    throw new WorkbenchRunnerError(
+      "Workbench Enforce Script check was aborted before target spawn.",
+      "CHECK_ABORTED"
+    );
+  }
+  if (Date.now() >= args.deadlineMs) {
+    throw new WorkbenchRunnerError(
+      "Workbench Enforce Script check deadline expired before target spawn.",
+      "CHECK_DEADLINE_EXCEEDED"
+    );
+  }
+  const revalidatedTarget = args.reattestTarget();
+  args.reattestDependencies();
+  const beforeLogs = snapshotLogDirectories(args.logRoot);
+  const owner = args.controller.createPlanOwnerCredential();
+  let launchPlan: ReturnType<typeof buildTargetCheckLaunchPlan>;
+  try {
+    launchPlan = buildTargetCheckLaunchPlan({
+      kind: "target_check",
+      config: args.config,
+      project: args.project,
+      ownerArgument: owner.argument,
+      managedProfile: args.managedProfile,
+      configuration: args.intent.configuration,
+      timeoutMs: Math.max(1, args.deadlineMs - Date.now()),
+    });
+  } catch (error) {
+    rethrowLaunchPlanError(error);
+  }
+  if (launchPlan.targetAddon.addonId !== revalidatedTarget.addonId ||
+      launchPlan.targetAddon.addonGuid !== revalidatedTarget.addonGuid ||
+      launchPlan.targetAddon.sourceSha256 !== revalidatedTarget.sourceSha256) {
+    throw new WorkbenchRunnerError(
+      "Workbench check launch plan changed its validated add-on identity.",
+      "INVALID_TARGET"
+    );
+  }
+
+  let run;
+  try {
+    run = await args.controller.runTargetCheck(launchPlan, {
+      deadlineMs: args.deadlineMs,
+      signal: args.signal,
+      terminationTimeoutMs: args.terminationTimeoutMs,
+      recoveryTimeoutMs: args.recoveryTimeoutMs,
+      beforeFinalVacancyCheck: () => {
+        args.reattestTarget();
+        args.reattestDependencies();
+      },
+      beforeSpawn: () => {
+        args.reattestTarget();
+        args.reattestDependencies();
+      },
+    });
+  } catch (error) {
+    throw mapControllerRunError(error, "check");
+  }
+
+  if (run.exitStatus.reason === "timed_out") {
+    throw new WorkbenchRunnerError(
+      "Workbench Enforce Script check exceeded its absolute deadline after exact-child cleanup.",
+      "CHECK_DEADLINE_EXCEEDED"
+    );
+  }
+  if (run.exitStatus.reason === "aborted") {
+    throw new WorkbenchRunnerError(
+      "Workbench Enforce Script check was aborted after exact-child cleanup.",
+      "CHECK_ABORTED"
+    );
+  }
+
+  args.reattestTarget();
+  const logDirectory = await attributeLogDirectory({
+    logRoot: args.logRoot,
+    before: beforeLogs,
+    launchedAtMs: run.process.launchedAtMs,
+    ownerToken: owner.token,
+    deadline: deriveDeadline(
+      systemClock,
+      deadlineAt(args.deadlineMs),
+      args.logAttributionTimeoutMs
+    ),
+    pollMs: args.logPollMs,
+    operationName: "Enforce Script check",
+    abortedCode: "CHECK_ABORTED",
+    signal: args.signal,
+  });
+  const exitStatus = classifyWorkbenchExitStatus(run.exitStatus);
+  const compileFailure = readWorkbenchCompileFailureFromLogDirectory(logDirectory);
+  return {
+    intent: "check",
+    scope: "enforceScripts",
+    engineValidated: true,
+    pid: run.process.pid,
+    executablePath: run.process.executablePath,
+    creationTime: run.process.creationTime,
+    target: args.target.path,
+    targetAddon: {
+      addonId: args.targetProject.addonId,
+      addonGuid: args.targetProject.addonGuid,
+      sourceSha256: args.targetProject.sourceSha256,
+    },
+    configuration: args.intent.configuration,
+    lifecycleGeneration: run.lifecycleGeneration,
+    processOwnership: "verified",
+    endpointVacancy: run.endpointVacancy,
+    logDirectory,
+    compilation: checkCompilationResult(exitStatus, compileFailure),
+    exitStatus,
+  };
+}
+
 
 /**
  * Run a structured Workbench purpose under a durable lifecycle reservation.
@@ -1079,7 +1334,7 @@ export async function runWorkbenchIntent(
   intent: WorkbenchRunnerIntent,
   dependencies: WorkbenchRunnerDependencies = {}
 ): Promise<WorkbenchRunnerReceipt> {
-  if (!intent || (intent.kind !== "editor" && intent.kind !== "build")) {
+  if (!intent || !["editor", "build", "check"].includes(intent.kind)) {
     throw new WorkbenchRunnerError("Workbench runner intent is unsupported.", "INVALID_INTENT");
   }
   const suppliedExecution = dependencies.lifecycleExecution;
@@ -1112,9 +1367,9 @@ async function runWorkbenchIntentWithExecution(
   lifecycleExecution: WorkbenchLifecycleExecutionPort
 ): Promise<WorkbenchRunnerReceipt> {
   const lifecycleEntry = dependencies.lifecycleEntry ?? "standalone";
-  if (lifecycleEntry === "owner_scoped" && intent.kind !== "build") {
+  if (lifecycleEntry === "owner_scoped" && intent.kind === "editor") {
     throw new WorkbenchRunnerError(
-      "Owner-scoped runner entry is supported only for bounded target builds.",
+      "Owner-scoped runner entry is supported only for bounded target operations.",
       "INVALID_INTENT"
     );
   }
@@ -1133,7 +1388,7 @@ async function runWorkbenchIntentWithExecution(
   } catch (error) {
     throw new WorkbenchRunnerError(
       `${lifecycleEntry === "owner_scoped"
-        ? "Owner-scoped Workbench build"
+        ? "Owner-scoped Workbench target operation"
         : "Standalone Workbench launch"} is refused while durable spawn recovery is unresolved: ` +
         `${error instanceof Error ? error.message : String(error)}`,
       "LIFECYCLE_CONFLICT"
@@ -1183,8 +1438,10 @@ async function runWorkbenchIntentWithExecution(
   );
 
   const target: WorkbenchLifecycleTarget = toLifecycleTarget(project);
-  if (intent.kind === "build") {
-    const buildProject = resolveBuildProjectMetadata(project.displayPath);
+  if (intent.kind === "build" || intent.kind === "check") {
+    const operationName = intent.kind === "build" ? "build" : "Enforce Script check";
+    const targetProject = resolveTargetProjectMetadata(project.displayPath);
+    if (intent.kind === "check") validateCheckIntent(intent, targetProject);
     let managedBuildProfile: Readonly<WorkbenchManagedBuildProfile>;
     try {
       managedBuildProfile = ensureWorkbenchManagedBuildProfile(managedRootPath, project);
@@ -1204,55 +1461,76 @@ async function runWorkbenchIntentWithExecution(
       addonRoots: targetAddonDirectories,
       launchStatus: "No Workbench process was launched.",
     });
-    const reattestBuildDependencies = (): void => {
+    const reattestTargetDependencies = (): void => {
       assertRunnerAddonDependenciesAvailable({
         targetGprojPath: project.displayPath,
         addonRoots: targetAddonDirectories,
       });
     };
-    const reattestBuildTarget = (): WorkbenchBuildProjectMetadata => {
-      let current: WorkbenchBuildProjectMetadata;
+    const reattestTarget = (): WorkbenchTargetProjectMetadata => {
+      let current: WorkbenchTargetProjectMetadata;
       try {
         const identity = revalidateProjectIdentity(project);
-        current = resolveBuildProjectMetadata(identity.displayPath);
+        current = resolveTargetProjectMetadata(identity.displayPath);
       } catch (error) {
         if (error instanceof WorkbenchRunnerError) throw error;
         throw new WorkbenchRunnerError(
-          `Workbench build target identity could not be revalidated: ` +
+          `Workbench ${operationName} target identity could not be revalidated: ` +
             `${error instanceof Error ? error.message : String(error)}`,
           "INVALID_TARGET"
         );
       }
-      if (current.addonId !== buildProject.addonId ||
-          current.addonGuid !== buildProject.addonGuid ||
-          current.sourceSha256 !== buildProject.sourceSha256) {
+      if (current.addonId !== targetProject.addonId ||
+          current.addonGuid !== targetProject.addonGuid ||
+          current.sourceSha256 !== targetProject.sourceSha256) {
         throw new WorkbenchRunnerError(
-          "Workbench build target path, add-on ID/GUID, or project content changed after validation.",
+          `Workbench ${operationName} target path, add-on ID/GUID, or project content ` +
+            "changed after validation.",
           "INVALID_TARGET"
         );
       }
       return current;
     };
-    const buildLogRoot = dependencies.logRoot
+    const targetLogRoot = dependencies.logRoot
       ? canonicalDirectory(dependencies.logRoot, "Workbench log root")
       : managedBuildProfile.logRoot;
+    const deadlineMs = Date.now() + intent.timeoutMs;
+    if (intent.kind === "check") {
+      return runTargetCheckStage({
+        controller,
+        config,
+        intent,
+        project,
+        target,
+        targetProject,
+        managedProfile: managedBuildProfile,
+        reattestTarget,
+        reattestDependencies: reattestTargetDependencies,
+        logRoot: targetLogRoot,
+        logAttributionTimeoutMs,
+        logPollMs,
+        terminationTimeoutMs,
+        recoveryTimeoutMs,
+        deadlineMs,
+        signal: dependencies.signal,
+      });
+    }
     const outputPath = validateBuildOutput(intent, [
       { label: "the target mod", path: project.modDirectory },
       { label: "the observer managed root", path: managedBuildProfile.managedRoot },
     ]);
     const outputReservation = reserveBuildOutput(outputPath);
-    const deadlineMs = Date.now() + intent.timeoutMs;
     return runTargetBuildStage({
       controller,
       config,
       intent,
       project,
       target,
-      buildProject,
+      buildProject: targetProject,
       managedProfile: managedBuildProfile,
-      reattestTarget: reattestBuildTarget,
-      reattestDependencies: reattestBuildDependencies,
-      logRoot: buildLogRoot,
+      reattestTarget,
+      reattestDependencies: reattestTargetDependencies,
+      logRoot: targetLogRoot,
       outputReservation,
       logAttributionTimeoutMs,
       logPollMs,
@@ -1367,6 +1645,8 @@ async function runWorkbenchIntentWithExecution(
     ownerToken: owner.token,
     deadline: deadlineAfter(systemClock, logAttributionTimeoutMs),
     pollMs: logPollMs,
+    operationName: "editor run",
+    abortedCode: "ENDPOINT_UNVERIFIABLE",
   });
   return {
     intent: "editor",
@@ -1383,13 +1663,14 @@ async function runWorkbenchIntentWithExecution(
 
 export type ParsedWorkbenchRunnerCommand = WorkbenchRunnerIntent;
 
-/** Strict parser for the standalone CLI's two supported purposes. */
+/** Strict parser for the standalone CLI's supported guarded purposes. */
 export function parseWorkbenchRunnerArguments(argv: readonly string[]): ParsedWorkbenchRunnerCommand {
   const [command, ...tokens] = argv;
-  if (command !== "editor" && command !== "build") {
+  if (command !== "editor" && command !== "build" && command !== "check") {
     throw new WorkbenchRunnerError(
       "Usage: reforger-forge-workbench editor --gproj <path> --foreground | " +
         "build --gproj <path> --platform PC --output <path> --timeout-ms <n>; " +
+        "check --gproj <absolute-path> --configuration PC --timeout-ms <n>; " +
         "supply shared configuration with --config <file> or explicit configuration flags",
       "INVALID_INTENT"
     );
@@ -1405,7 +1686,7 @@ export function parseWorkbenchRunnerArguments(argv: readonly string[]): ParsedWo
       foreground = true;
       continue;
     }
-    if (!["--gproj", "--platform", "--output", "--timeout-ms"].includes(token)) {
+    if (!["--gproj", "--platform", "--output", "--configuration", "--timeout-ms"].includes(token)) {
       throw new WorkbenchRunnerError(`Unsupported Workbench runner argument: ${token}`, "INVALID_INTENT");
     }
     if (values.has(token) || index + 1 >= tokens.length || tokens[index + 1].startsWith("--")) {
@@ -1426,6 +1707,27 @@ export function parseWorkbenchRunnerArguments(argv: readonly string[]): ParsedWo
       );
     }
     return { kind: "editor", gprojPath, foreground: true };
+  }
+  if (command === "check") {
+    if (foreground || values.size !== 3) {
+      throw new WorkbenchRunnerError(
+        "Check requires exactly --gproj, --configuration, and --timeout-ms.",
+        "INVALID_INTENT"
+      );
+    }
+    if (!isAbsolute(gprojPath)) {
+      throw new WorkbenchRunnerError("Check --gproj must be an absolute path.", "INVALID_INTENT");
+    }
+    const configuration = values.get("--configuration")!;
+    if (!/^[A-Za-z0-9_.-]{1,64}$/.test(configuration)) {
+      throw new WorkbenchRunnerError(
+        "Check --configuration must be a safe configuration identifier.",
+        "INVALID_INTENT"
+      );
+    }
+    const timeoutMs = Number(values.get("--timeout-ms"));
+    positiveInteger(timeoutMs, "Check --timeout-ms", MAX_CHECK_TIMEOUT_MS);
+    return { kind: "check", gprojPath, configuration, timeoutMs };
   }
   if (foreground || values.size !== 4) {
     throw new WorkbenchRunnerError(

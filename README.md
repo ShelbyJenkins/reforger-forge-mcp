@@ -8,7 +8,7 @@ game and project assets, generate mod content, and use Arma Reforger Workbench.
 
 - Search the bundled Enfusion API, modding guidance, and implementation patterns.
 - Browse game assets, inspect projects, and create scripts, prefabs, layouts, and scenarios.
-- Control a compatible Workbench session for guarded editor and build workflows.
+- Control Workbench for guarded editor, Enforce Script compile-check, and build workflows.
 - Capture reviewable runtime or Workbench PNG evidence with Observer.
 - Use the same local server from supported MCP clients and coding tools.
 

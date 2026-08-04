@@ -11,6 +11,7 @@ import {
   workbenchCaptureCapabilityProbeWaitMs,
 } from "../../scripts/run-workbench-observer-acceptance.js";
 import type { ObserverApplication } from "../../src/observer/application.js";
+import { workbenchObserverAcceptanceLaunchArguments } from "../../scripts/workbench-observer-acceptance-runtime.js";
 
 function readWorkbenchAcceptanceSources(): string {
   return [
@@ -30,6 +31,22 @@ describe("live Workbench observer acceptance contract", () => {
     expect(() => assertLiveWorkbenchObserverAuthorized(true, {
       [LIVE_WORKBENCH_OBSERVER_ENVIRONMENT]: "1",
     })).not.toThrow();
+  });
+
+  it("keeps the Workbench acceptance launch at its normal native size", () => {
+    expect(workbenchObserverAcceptanceLaunchArguments(
+      ["-gproj", "C:/project/addon.gproj"],
+      ["-plugin=RFO_WorkbenchObserverMatrixPlugin"],
+    )).toEqual([
+      "-gproj", "C:/project/addon.gproj", "-forceUpdate",
+      "-plugin=RFO_WorkbenchObserverMatrixPlugin",
+    ]);
+    for (const argument of ["-window", "-screenWidth", "-screenHeight=720"]) {
+      expect(() => workbenchObserverAcceptanceLaunchArguments([], [argument]))
+        .toThrow(/does not permit forced window sizing.*not accepted/i);
+      expect(() => workbenchObserverAcceptanceLaunchArguments([argument]))
+        .toThrow(/does not permit forced window sizing.*not accepted/i);
+    }
   });
 
   it("derives a normalized pose quaternion from the captured Workbench matrix", () => {
@@ -126,7 +143,9 @@ describe("live Workbench observer acceptance contract", () => {
   it("routes live screenshots through managed runs and exports only a standardized unreviewed bundle", () => {
     const source = readWorkbenchAcceptanceSources();
     expect(source).toContain("createObserverApplication({");
-    expect(source).toContain('additionalLaunchArguments: ["-window", "-screenWidth", "1280", "-screenHeight", "720"]');
+    expect(source).not.toContain('additionalLaunchArguments: ["-window"');
+    expect(source).not.toContain('"-screenWidth"');
+    expect(source).not.toContain('"-screenHeight"');
     expect(source).toContain("path: workbenchResourceVirtualPath(project.worldResource)");
     expect(source).toMatch(/"dist",\s*"observer",\s*"agent",\s*"private-child\.js"/);
     expect(source).toContain("await application.beginRun({");

@@ -2,19 +2,23 @@
 
 `reforger-forge-workbench` is the packaged standalone entry point for a
 project script or CI job when no live MCP server owns the Workbench lifecycle
-lease. When an MCP server already owns that lease, use `wb_build` instead.
-Both paths use the same guarded build policy; this page is the authoritative
+lease. When an MCP server already owns that lease, use `wb_build` or `wb_check`
+instead. All paths use the same guarded lifecycle policy; this page is the authoritative
 contract for the standalone runner's JSON receipts.
 
-The runner has two intents:
+The runner has three intents:
 
 ```text
 reforger-forge-workbench --config <file> editor --gproj <path> --foreground
 reforger-forge-workbench --config <file> build --gproj <path> --platform PC --output <path> --timeout-ms <n>
+reforger-forge-workbench --config <file> check --gproj <absolute-path> --configuration PC --timeout-ms <n>
 ```
 
 `editor` is deliberately foreground-only. `build` requires a caller-exclusive,
-new, empty output directory. `--config` is optional; the runner also accepts
+new, empty output directory. `check` compiles only the target's Enforce Scripts
+with the named configuration; it neither accepts nor creates a build-output
+directory and does not claim that resources or the packaged add-on are valid.
+`--config` is optional; the runner also accepts
 the normal shared configuration flags, including repeated
 `--workbench-addon-dir` values. See the [setup guide](../SETUP.md#optional-configuration)
 for configuration precedence, add-on-root discovery, and the full flag
@@ -29,8 +33,8 @@ put caller logging on stderr or in a separate file.
 
 | Exit code | Meaning |
 |---|---|
-| `0` | The requested intent completed successfully. For a build, this also means output attestation succeeded and `validationFailure` is `null`. |
-| `1` | A build exited zero but failed output attestation, an ordinary runner error occurred, the child returned/fell back to exit code `1`, or a native status could not be represented as a portable CLI exit code. |
+| `0` | The requested intent completed successfully. For a build, output attestation succeeded. For a check, `compilation.status` is `compiled`. |
+| `1` | A build failed output attestation, an Enforce Script check returned Workbench's native `-1` compile failure, an ordinary runner error occurred, or a native status could not be represented portably. The JSON receipt retains the native value. |
 | `124` | The runner timed out the intent. |
 | `130` | The invocation was aborted. |
 | `2`–`255` | The child process's ordinary exit code, passed through unchanged. |
@@ -41,7 +45,7 @@ only the first rule: exit code `0` is the fully verified success path.
 
 ## Receipt shapes
 
-Neither receipt has a `version` field. The build receipt is one direct,
+No receipt has a `version` field. The build receipt is one direct,
 helper-free target build: it intentionally has no `preflight` or
 `companionIdentity` field. The editor receipt retains `companionIdentity`
 because an editor launch really does load and qualify the managed helper.
@@ -97,6 +101,33 @@ expected by the running MCP; a wrapper does not need to re-check them.
 When present, `validationFailure` contains the literal code
 `"OUTPUT_ATTESTATION_FAILED"` and a string `message`.
 
+### Enforce Script check receipt
+
+| Field | JSON type | Meaning |
+|---|---|---|
+| `intent` | `"check"` | Discriminates the compile-only receipt. |
+| `scope` | `"enforceScripts"` | Excludes resource, material, prefab, world, and package validation. |
+| `engineValidated` | `true` | Workbench performed the native compile check; this is not whole-project validity. |
+| `pid`, `executablePath`, `creationTime` | number/string/string | Exact supervised Workbench process identity. |
+| `target`, `targetAddon` | string/object | Canonical `.gproj` and re-attested add-on ID, GUID, and project-file hash. |
+| `configuration` | string | Exact configuration declared by the target and passed to Workbench. |
+| `lifecycleGeneration` | string | Guarded lifecycle generation for this check. |
+| `processOwnership`, `endpointVacancy` | `"verified"` | Exact child ownership and final endpoint vacancy proofs. |
+| `logDirectory` | string | The one log directory attributed through this run's private owner token. |
+| `compilation` | object | `compiled`, `failed`, or `indeterminate`, as described below. |
+| `exitStatus` | object | Original native completion evidence and derived terminal classification. |
+
+`compilation.status: "compiled"` is the only compile-success result. A normal
+compiler failure has status `"failed"`, code `"PROJECT_COMPILE_FAILED"`, the
+exact `module`, bounded `diagnostics`, and the attributed `logPath`. A timeout,
+abort, native exception, unattributed nonzero exit, or other failure is not
+misreported as a compiler error; where a terminal receipt is possible it uses
+status `"indeterminate"` and preserves the distinct `exitStatus`.
+
+Workbench documents native `-1` for script compilation failure. The CLI maps
+that value to portable process exit `1`, while `exitStatus.exitCode` remains
+`-1` in the JSON receipt.
+
 `exitStatus` has `reason` (`"exited"`, `"timed_out"`, or `"aborted"`),
 `exitCode` (number or `null`), `signal` (string or `null`), `timedOut`
 (boolean), and a derived `classification`. The classification is one of
@@ -129,8 +160,16 @@ duplicate or weaken the runner's already fail-closed transaction.
 | `targetAddon.addonId` and `targetAddon.addonGuid` are the project the caller intended | The runner can prove what the supplied path contains, not which add-on the caller meant to supply. | Check this once after exit `0`. |
 
 The source references for the target and output guarantees are
-`resolveBuildProjectMetadata`, the `reattestTarget` closure, `reserveBuildOutput`,
+`resolveTargetProjectMetadata`, the `reattestTarget` closure, `reserveBuildOutput`,
 and `attestFreshBuildOutput` in `src/workbench/runner.ts`.
+
+For `check`, the same lifecycle and target/dependency drift guarantees apply.
+The runner additionally proves that `configuration` is declared by the exact
+target before spawn, uses a private managed profile, starts hidden with
+`-wbModule=ScriptEditor -validate <configuration> -wbsilent`, attributes one
+owner-token log directory, and performs no build-output reservation or output
+attestation. Do not combine its receipt with `mod(action: "validate")` or call
+it proof that non-script project content is valid.
 
 ## The one caller-side identity check
 

@@ -26,7 +26,7 @@ import {
 afterEach(cleanupOwnedRuntimeManagerFixtures);
 
 const onePointZeroOneArguments = [
-  "-window",
+  "-noSplash",
   "-addons",
   "36374155AAC14289",
   "-world",
@@ -247,7 +247,7 @@ describe("OwnedRuntimeManager", () => {
       preparedProfilePath: profilePath,
     });
     value.setExecutable(executable);
-    const started = await value.start("agent-lease-start", ["-window"]);
+    const started = await value.start("agent-lease-start", ["-noSplash"]);
     expect(agent.server.storeDiagnostics()).toMatchObject({
       sessions: { lifecycleLeased: 1 },
       ownedRuntimeLifecyclePins: { records: 1 },
@@ -410,7 +410,7 @@ describe("OwnedRuntimeManager", () => {
       preparedProfilePath: profilePath,
     });
     first.setExecutable(executable);
-    const started = await first.start("crash-recovery-start", ["-window"]);
+    const started = await first.start("crash-recovery-start", ["-noSplash"]);
 
     const job = firstAgent.jobs.submit({
       sessionId: created.record.sessionId,

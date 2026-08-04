@@ -186,6 +186,30 @@ export function findWorkbenchCompileFailure(
   }
 }
 
+/** Parse compiler evidence only from an already uniquely owner-attributed log directory. */
+export function readWorkbenchCompileFailureFromLogDirectory(
+  logDirectory: string
+): WorkbenchCompileFailure | null {
+  try {
+    const directory = canonicalizeExistingDirectory(
+      logDirectory,
+      "attributed Workbench log directory"
+    );
+    const scriptEntries = readdirSync(directory, { withFileTypes: true }).filter((entry) =>
+      entry.isFile() && !entry.isSymbolicLink() && entry.name.toLowerCase() === "script.log"
+    );
+    if (scriptEntries.length !== 1) return null;
+    const scriptPath = realpathSync.native(join(directory, scriptEntries[0].name));
+    if (!isPathContained(directory, scriptPath)) return null;
+    return parseWorkbenchCompileFailure(
+      boundedFileTail(scriptPath, MAX_SCRIPT_LOG_BYTES),
+      scriptPath
+    );
+  } catch {
+    return null;
+  }
+}
+
 export function formatWorkbenchCompileFailure(failure: WorkbenchCompileFailure): string {
   const detail = failure.diagnostics.length > 0
     ? ` First compiler diagnostic: ${failure.diagnostics[0]}`

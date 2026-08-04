@@ -31,8 +31,14 @@ instead of silently changing requested quality.
 
 - Node.js 24 is now the supported and CI-tested runtime. Package metadata,
   setup validation, type definitions, and the Windows CI job use Node 24.
-- The public change is additive. Existing capture callers that omit `image`
-  continue to receive native-resolution PNG output.
+- Existing capture callers that omit `image` continue to receive
+  native-resolution PNG output.
+- Graphical launch preparation now keeps the engine's native borderless
+  fullscreen as the normal path. Raw `-window`, `-screenWidth`, and
+  `-screenHeight` tokens are refused. The exceptional
+  `forceNonNativeWindowSize` object requires bounded dimensions and a written
+  justification; capture output bounds replace launch-window shrinking for
+  screenshot-size control.
 
 ## Validation
 

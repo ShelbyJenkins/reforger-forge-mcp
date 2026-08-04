@@ -1,0 +1,14 @@
+GameProject {
+ ID RFOWorkbenchCheckBroken
+ GUID "8B2D0F5C3E719146"
+ TITLE "RFO Workbench Check Broken Fixture"
+ Dependencies {
+  "58D0FB3206B6F859"
+ }
+ Configurations {
+  GameProjectConfig PC {
+  }
+  GameProjectConfig HEADLESS {
+  }
+ }
+}

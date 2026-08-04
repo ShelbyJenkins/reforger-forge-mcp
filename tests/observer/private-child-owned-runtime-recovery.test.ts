@@ -251,7 +251,7 @@ function makeBoundaryHarness(
     async prepare(cycle: string, sessionTtlMs = 1_000) {
       const input: ObserverLaunchInput = {
         runtimeKind: "listenServer",
-        arguments: ["-window", `-${cycle}`],
+        arguments: ["-noSplash", `-${cycle}`],
         profilePath: join(profileRoot, cycle),
         sessionTtlMs,
         transportPreference: ["rest"],

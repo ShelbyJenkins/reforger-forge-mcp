@@ -24,8 +24,8 @@ describe("OwnedRuntimeManager", () => {
 
   it("recovers an exact receipt after MCP restart and supports multiple independent runtimes", async () => {
     const value = makeHarness();
-    const one = await value.start("multi-one", ["-window", "-server", "one"]);
-    const two = await value.start("multi-two", ["-window", "-server", "two"]);
+    const one = await value.start("multi-one", ["-noSplash", "-server", "one"]);
+    const two = await value.start("multi-two", ["-noSplash", "-server", "two"]);
     expect(one.runtimeId).not.toBe(two.runtimeId);
     const sealed = await value.manager.close();
     expect(sealed).toMatchObject({ sealedRuntimeIds: expect.arrayContaining([one.runtimeId, two.runtimeId]) });

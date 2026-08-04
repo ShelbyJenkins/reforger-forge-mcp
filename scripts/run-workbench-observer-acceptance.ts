@@ -921,7 +921,6 @@ export async function runWorkbenchObserverAcceptance(
       runDirectory,
       clientIdPrefix: "live-workbench-observer",
       launchTimeoutMs: Math.min(180_000, timeoutMs),
-      additionalLaunchArguments: ["-window", "-screenWidth", "1280", "-screenHeight", "720"],
       createAdapter: (client) => new WorkbenchObserverAdapter(client, {
         handlerTimeoutMs: 10_000,
       }),

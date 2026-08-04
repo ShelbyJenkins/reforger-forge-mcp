@@ -17,6 +17,7 @@ import {
 import {
   runWorkbenchIntent,
   type WorkbenchBuildIntent,
+  type WorkbenchCheckIntent,
   type WorkbenchEditorIntent,
   type WorkbenchRunnerDependencies,
 } from "../../src/workbench/runner.js";
@@ -97,6 +98,12 @@ export function createHarness(): RunnerHarness {
     "GameProject {",
     " ID ExampleMod",
     ' GUID "1122334455667788"',
+    " Configurations {",
+    "  GameProjectConfig PC {",
+    "  }",
+    "  GameProjectConfig HEADLESS {",
+    "  }",
+    " }",
     "}",
     "",
   ].join("\n"));
@@ -170,6 +177,19 @@ export function buildIntent(
     gprojPath: harness.projectPath,
     platform: "PC",
     outputPath: harness.outputPath,
+    timeoutMs: 1_000,
+    ...overrides,
+  };
+}
+
+export function checkIntent(
+  harness: RunnerHarness,
+  overrides: Partial<Omit<WorkbenchCheckIntent, "kind">> = {}
+): WorkbenchCheckIntent {
+  return {
+    kind: "check",
+    gprojPath: harness.projectPath,
+    configuration: "PC",
     timeoutMs: 1_000,
     ...overrides,
   };
@@ -274,6 +294,21 @@ export function runBuild(
   return runWorkbenchIntent(
     harness.config,
     buildIntent(harness, options.intent),
+    runnerDependencies(harness, spawnProcess, options.dependencies)
+  );
+}
+
+export function runCheck(
+  harness: RunnerHarness,
+  spawnProcess: RunnerSpawnProcess,
+  options: {
+    intent?: Partial<Omit<WorkbenchCheckIntent, "kind">>;
+    dependencies?: Partial<WorkbenchRunnerDependencies>;
+  } = {}
+) {
+  return runWorkbenchIntent(
+    harness.config,
+    checkIntent(harness, options.intent),
     runnerDependencies(harness, spawnProcess, options.dependencies)
   );
 }

@@ -138,7 +138,7 @@ export interface WorkbenchLifecycleExecutionPort {
   reserve(args: {
     endpoint: LifecycleEndpoint;
     target: CanonicalProjectIdentity;
-    /** Null is reserved for the controller's helper-free target-build plan. */
+    /** Null is reserved for controller-owned helper-free bounded target plans. */
     companion: WorkbenchCompanionLaunch | null;
   }): Promise<WorkbenchLifecycleReservation>;
   transition(

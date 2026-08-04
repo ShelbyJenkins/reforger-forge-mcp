@@ -5,56 +5,7 @@ deferred improvements that are not currently a broken supported behavior.
 Append new findings at the bottom; move resolved or verified records to
 [MCP_ISSUES_RESOLVED.md](MCP_ISSUES_RESOLVED.md).
 
-### MCP-004 â€” material validation cannot resolve inherited stock dependencies
-
-**Status:** Open
-
-**Severity:** Non-breaking validation limitation
-
-**Observed:** 2026-07-28
-
-`wb_validate(action: "material")` reported fatal missing metafiles for stock
-S105 dependencies in both newly added Sedan Red wrappers and a pre-existing,
-known-good Sedan Blue wrapper.
-
-**Impact:** The result cannot distinguish a wrapper-specific defect from
-missing base-game dependency metadata in the current project context.
-
-**Workaround:** Treat the result as an environmental validator limitation,
-verify the property assignment and explicit save in Workbench, and retain a
-visual Workbench review as the presentation check.
-
-## Deferred API-reference improvements
-
-### MCP-027 â€” public MCP metadata is incomplete
-
-**Status:** Deferred
-
-**Priority:** P1
-
-Registered tools provide descriptions and input schemas, but do not yet have
-consistent titles, action-safe annotations, output schemas, or structured
-output contracts. This does not contradict the current runtime API, but it
-limits discoverability and machine validation.
-
-**Next step:** Apply the incremental metadata work in the
-[MCP API contract follow-up plan](../../docs/plans/2026-07-28-mcp-api-contract-follow-up.md).
-
-### MCP-028 â€” runtime API reference and drift gate are not generated
-
-**Status:** Deferred
-
-**Priority:** P1
-
-MCP-023 removed the obsolete README parser, but the MCP still has no generated,
-checked-in reference for its tools, prompts, resources, and resource templates,
-or a release check that detects their drift.
-
-**Next step:** Generate those artifacts from a hermetic MCP discovery session
-and verify them in CI as described in the
-[MCP API contract follow-up plan](../../docs/plans/2026-07-28-mcp-api-contract-follow-up.md).
-
-### MCP-052 - add a guarded compile-only Enforce Script check
+## MCP-052 - add a guarded compile-only Enforce Script check
 
 **Status:** Open
 
@@ -120,15 +71,30 @@ any deliberately supported engine sentinel such as `ALL`) and re-attest both
 the project identity and dependency resolution at the same boundaries as a
 guarded build.
 
-The receipt should identify intent `check`, the exact target add-on and
-configuration, exact process identity and lifecycle generation, attributed log
-directory, terminal exit classification, and a compilation result. A compiler
+The public operation is an Enforce Script compilation check, not a general
+project validator. Its description, result fields, and human-readable output
+must say that scripts compiled or failed to compile; they must not describe an
+exit-zero result as proof that the project, resources, or packaged add-on are
+valid.
+
+The receipt should identify intent `check`, scope `enforceScripts`, and
+`engineValidated: true`, along with the exact target add-on and configuration,
+exact process identity and lifecycle generation, attributed log directory,
+terminal exit classification, and a compilation result. The MCP surface should
+declare an output schema for this machine-readable receipt when it is
+introduced, with any text rendering derived from the same result. A compiler
 failure should be a normal, actionable `PROJECT_COMPILE_FAILED` result carrying
 the module and bounded diagnostics when the exact attributed log supports that
 classification. Timeouts, aborts, dependency failures, native exceptions, log
 attribution failures, and other nonzero exits must remain distinct. The CLI
 must map Workbench's documented `-1` failure to a portable nonzero process exit
 without losing the native value in its JSON receipt.
+
+**Scope and non-goals:** MCP-052 does not add material or texture validation,
+offline resource checks, prefab/world/config validation, or a general claim of
+add-on validity. It must not implicitly run `mod(action: "validate")`, stage or
+reload the Workbench helper, replace the existing live `wb_validate` contract,
+or combine those independently meaningful results into the compile receipt.
 
 **Lifecycle design notes:** Implement this as a helper-free, hidden,
 foreground, bounded-exit target operation. It must refuse a live attended or
@@ -139,7 +105,9 @@ where their invariants are identical instead of copying them into a second
 process launcher. Keep build-output reservation and output attestation confined
 to `build`. Review durable operation names, spawn-journal purposes, errors, and
 shutdown cancellation so a check is not incorrectly persisted or reported as
-a build.
+a build. The shared primitive must remain operation-neutral, with check-specific
+launch planning and terminal-result classification supplied at its boundary;
+the initial public contract remains compile-only.
 
 Do not implement this through the older speculative
 [`wb_compile` helper plan](../../docs/superpowers/plans/2026-03-19-workbench-api-expansion.md#task-7-new-tool-wb_compile).
@@ -169,8 +137,10 @@ tool-routing and validation guidance.
 
 **Acceptance criteria:**
 
-1. A valid fixture returns an exit-zero MCP/CLI receipt without showing a
-   Workbench window or producing build artifacts.
+1. A valid fixture returns an exit-zero MCP/CLI receipt with intent `check`,
+   scope `enforceScripts`, and `engineValidated: true`, without showing a
+   Workbench window or producing build artifacts; it reports compilation
+   success without claiming whole-project validity.
 2. A syntax-broken fixture returns `PROJECT_COMPILE_FAILED` with the exact
    module, useful bounded diagnostics, and exact attributed log evidence.
 3. Missing/ambiguous dependencies and unknown configurations fail before
@@ -179,12 +149,6 @@ tool-routing and validation guidance.
    exception, and recovery cases preserve the existing fail-closed lifecycle
    guarantees and leave no unowned child or falsely vacant lease.
 5. Target or dependency drift between preflight and spawn is rejected.
-6. Registered MCP schema/description, standalone parser and exit mapping,
-   focused unit/integration tests, packaged CLI smoke coverage, and operator
-   guidance agree on the same contract.
-
-### MCP-053 - Force full screen borderless unless specifically overridden
-
-launchers KEEP launching tiny windows which makes it difficult to screen shot and inspect.
-
-we should rework the launcher so resolution is gatted behind a very specific 'force non-native' field with a name that enforces it's not to be used unless a very good reason exists for it.
+6. Registered MCP input/output schemas and description, standalone parser and
+   exit mapping, focused unit/integration tests, packaged CLI smoke coverage,
+   and operator guidance agree on the same contract.

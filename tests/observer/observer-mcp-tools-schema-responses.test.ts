@@ -25,8 +25,10 @@ describe("observer MCP tools", () => {
       await server.connect(serverTransport);
       await client.connect(clientTransport);
       const listed = await client.listTools();
+      const prepare = listed.tools.find((tool) => tool.name === "observer_prepare_launch");
       const capture = listed.tools.find((tool) => tool.name === "observer_capture");
       const run = listed.tools.find((tool) => tool.name === "observer_run");
+      expect(prepare).toBeDefined();
       expect(capture).toBeDefined();
       expect(run).toBeDefined();
       expect(capture!.inputSchema.required).toContain("expectedWorldRevision");
@@ -37,6 +39,17 @@ describe("observer MCP tools", () => {
       expect(run!.description).toContain("finalize requires runId, includeCaptureLabels, and review");
       expect(run!.inputSchema.properties!.includeCaptureLabels).toMatchObject({
         description: expect.stringContaining("Required non-empty list"),
+      });
+      expect(prepare!.description).toContain("native borderless-fullscreen window by default");
+      expect(prepare!.description).toContain("forceNonNativeWindowSize");
+      expect(prepare!.inputSchema.properties!.arguments).toMatchObject({
+        description: expect.stringContaining("native fullscreen is the default"),
+      });
+      expect(prepare!.inputSchema.properties!.forceNonNativeWindowSize).toMatchObject({
+        type: "object",
+        additionalProperties: false,
+        required: expect.arrayContaining(["width", "height", "justification"]),
+        description: expect.stringContaining("Exceptional opt-in"),
       });
 
       const visit = (value: unknown): void => {
@@ -51,6 +64,7 @@ describe("observer MCP tools", () => {
         for (const entry of Object.values(record)) visit(entry);
       };
       visit(capture!.inputSchema);
+      visit(prepare!.inputSchema);
 
       const captureSchema = toolRegistry(coordinator).get("observer_capture")!.definition.inputSchema!;
       const runSchema = toolRegistry(coordinator).get("observer_run")!.definition.inputSchema!;

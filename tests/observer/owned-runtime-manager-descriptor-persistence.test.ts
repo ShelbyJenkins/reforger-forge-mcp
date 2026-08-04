@@ -15,7 +15,7 @@ describe("OwnedRuntimeManager", () => {
   describe("descriptor persistence and capacity budgets", () => {
   it("persists the maximum normalized descriptor produced from 512 launch tokens", async () => {
     const value = makeHarness();
-    const normalizedArguments = Array.from({ length: 520 }, (_, index) => `-fixture-${index}`);
+    const normalizedArguments = Array.from({ length: 527 }, (_, index) => `-fixture-${index}`);
 
     const started = await value.start("max-normalized-arguments", normalizedArguments);
 
@@ -36,7 +36,7 @@ describe("OwnedRuntimeManager", () => {
 
   it("round-trips the maximum-escape launch-boundary aggregate at every descriptor bound", async () => {
     const windowsCommandLineMaxUtf16Units = 32_767;
-    const normalizedArgumentMaxCount = 520;
+    const normalizedArgumentMaxCount = 527;
     const worstCaseEscapedUnit = "\u0001";
     const unitsPerArgument = Math.floor(
       windowsCommandLineMaxUtf16Units / normalizedArgumentMaxCount

@@ -105,6 +105,58 @@ class EMCP_WB_ValidateResource : NetApiHandler
 	}
 
 	//------------------------------------------------------------------------------------------------
+	static void CheckMaterialTextureReferences(BaseContainer material, MaterialValidatorUtils validator, MaterialValidatorResponse checks)
+	{
+		// The stock MaterialValidatorUtils.CheckTextures implementation requires a
+		// source MetaFile only to derive an absolute source-texture path for its
+		// external follow-up consumer. This path-bound helper never consumes that
+		// array. Packed base-game textures can therefore be valid and resolvable
+		// while ResourceManager.GetMetaFile returns null. Validate the parts of the
+		// material contract that apply here without treating absent source metadata
+		// as a broken resource reference.
+		for (int i = 0; i < material.GetNumVars(); i++)
+		{
+			string slot = material.GetVarName(i);
+			ResourceName value;
+			material.Get(slot, value);
+			if (!value.Contains(".edds"))
+				continue;
+
+			// Animated texture ResourceNames may carry a trailing frame selector.
+			if (value.EndsWith(" 0"))
+				value = value.Substring(0, value.Length() - 2);
+
+			if (value.Length() < 18 || value.IndexOf("{") != 0 || value.Substring(17, 1) != "}")
+			{
+				checks.reports.Insert(material.GetResourceName() + " has a malformed texture reference in " + slot + ": " + value);
+				checks.severity.Insert(3);
+				continue;
+			}
+
+			string guid = value.Substring(0, 18);
+			ResourceName resolved = Workbench.GetResourceName(guid);
+			if (resolved == "" || resolved == guid)
+			{
+				checks.reports.Insert(material.GetResourceName() + " has an unresolved texture GUID in " + slot + ": " + value);
+				checks.severity.Insert(3);
+				continue;
+			}
+
+			// Slot compatibility depends only on the registered ResourceName suffix;
+			// it does not require loose source metadata.
+			string textureName = FilePath.StripPath(value);
+			int suffixStart = textureName.LastIndexOf("_");
+			int suffixEnd = textureName.LastIndexOf(".");
+			if (suffixStart < 0 || suffixEnd <= suffixStart + 1)
+				continue;
+			string suffix = textureName.Substring(suffixStart + 1, suffixEnd - suffixStart - 1);
+			if (suffix.Length() > 0 && suffix[suffix.Length() - 1].ToInt())
+				suffix = suffix.Substring(0, suffix.Length() - 1);
+			validator.CheckSlots(slot, suffix, checks);
+		}
+	}
+
+	//------------------------------------------------------------------------------------------------
 	static void Finalize(EMCP_WB_ValidateResourceResponse resp)
 	{
 		bool hasFatal = false;
@@ -208,7 +260,7 @@ class EMCP_WB_ValidateResource : NetApiHandler
 			validator.CheckDefaults(material, checks);
 			validator.CheckExtremes(material, 5, 95, checks);
 			validator.CheckDependencies(material, checks);
-			validator.CheckTextures(material, checks);
+			CheckMaterialTextureReferences(material, validator, checks);
 			if (!AppendMaterialReports(checks, resp))
 			{
 				Error(resp, "Material validator returned malformed report data");

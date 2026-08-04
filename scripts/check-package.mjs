@@ -675,6 +675,35 @@ if (missingFiles.length || missingPrefixes.length || legacyPackagedHandlers.leng
     }
   }
 
+  const installedRunnerPath = join(installedPackageRoot, "dist", "workbench", "runner.js");
+  const installedRunnerCliPath = join(installedPackageRoot, "dist", "workbench", "runner-cli.js");
+  const checkContractProbe = spawnSync(process.execPath, [
+    "--input-type=module",
+    "--eval",
+    `import { parseWorkbenchRunnerArguments } from ${JSON.stringify(pathToFileURL(installedRunnerPath).href)};
+import { receiptExitCode } from ${JSON.stringify(pathToFileURL(installedRunnerCliPath).href)};
+const intent = parseWorkbenchRunnerArguments([
+  "check", "--gproj", "C:\\\\mods\\\\Example\\\\Example.gproj",
+  "--configuration", "PC", "--timeout-ms", "120000",
+]);
+const receipt = {
+  intent: "check",
+  compilation: { status: "failed", code: "PROJECT_COMPILE_FAILED" },
+  exitStatus: { reason: "exited", exitCode: -1, signal: null, timedOut: false },
+};
+if (intent.kind !== "check" || intent.configuration !== "PC" || intent.timeoutMs !== 120000 ||
+    receiptExitCode(receipt) !== 1 || receipt.exitStatus.exitCode !== -1) process.exitCode = 1;`,
+  ], {
+    cwd: installRoot,
+    encoding: "utf8",
+    env: probeEnvironment,
+    timeout: 30_000,
+    maxBuffer: 8 * 1024 * 1024,
+  });
+  if (checkContractProbe.error || checkContractProbe.status !== 0) {
+    throw commandFailure("Installed Workbench check CLI contract probe", checkContractProbe);
+  }
+
   const installedAgentPath = join(
     installedPackageRoot,
     "dist",

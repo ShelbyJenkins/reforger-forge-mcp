@@ -5,7 +5,10 @@ import { z } from "zod";
 import { boundedOption } from "#foundation/bounded-option";
 import { DEFAULT_LIMITS, TRANSPORTS, type ObserverTransport, type SessionContract } from "../protocol/index.js";
 import { ObserverError, observerOptionError } from "./errors.js";
-import { mergeLaunchArguments } from "./launch-arguments.js";
+import {
+  assertNativeFullscreenArguments,
+  mergeLaunchArguments,
+} from "./launch-arguments.js";
 import {
   assertManagedPath,
   canonicalizeExistingDirectory,
@@ -28,8 +31,14 @@ import { StagingManager, verifySourceBundle } from "./staging.js";
 // The public MCP tool accepts at most 512 caller tokens. The host prepends one
 // `-addonsDir <configured roots>` pair before this private API normalizes the
 // launch, while the persisted prepared descriptor already allows the resulting
-// 520-token normalized maximum.
+// 527-token normalized maximum, including the exceptional five-token
+// non-native window-size override.
 const MAX_PREPARE_LAUNCH_ARGUMENTS = 512 + 2;
+const forceNonNativeWindowSizeSchema = z.object({
+  width: z.number().int().min(640).max(16_384),
+  height: z.number().int().min(480).max(16_384),
+  justification: z.string().trim().min(20).max(512),
+}).strict();
 
 const prepareLaunchSchema = z.object({
   runtimeKind: z.enum(["client", "listenServer", "dedicated", "testRunner"]),
@@ -39,6 +48,7 @@ const prepareLaunchSchema = z.object({
   transportPreference: z.array(z.enum(TRANSPORTS)).min(1).max(2).default(["rest", "mailbox"]),
   forceUpdate: z.boolean().default(true),
   noFocus: z.boolean().default(true),
+  forceNonNativeWindowSize: forceNonNativeWindowSizeSchema.optional(),
   idempotencyKey: z.string().min(1).max(128).optional(),
 });
 
@@ -220,6 +230,13 @@ export class ObserverControlApi {
   async prepareLaunch(input: PrepareLaunchRequest): Promise<PreparedLaunch> {
     if (!this.endpoint) throw new ObserverError("TRANSPORT_UNAVAILABLE", "Observer agent endpoint is not listening", 503);
     const request = prepareLaunchSchema.parse(input);
+    if (request.runtimeKind === "dedicated" && request.forceNonNativeWindowSize !== undefined) {
+      throw new ObserverError(
+        "INVALID_REQUEST",
+        "forceNonNativeWindowSize is valid only for a graphical runtime",
+      );
+    }
+    assertNativeFullscreenArguments(request.arguments);
     this.sweepPrepared(this.clock.now());
     const fingerprint = createHash("sha256").update(JSON.stringify(request)).digest("hex");
     if (request.idempotencyKey) {
@@ -244,6 +261,7 @@ export class ObserverControlApi {
       logsDirectoryName: runtimeLog.logsDirectoryName,
       forceUpdate: request.forceUpdate,
       noFocus: request.noFocus,
+      forceNonNativeWindowSize: request.forceNonNativeWindowSize,
     });
     const created = this.sessions.create({
       bundleDigest: staged.bundleDigest,

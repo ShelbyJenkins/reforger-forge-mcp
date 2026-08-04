@@ -249,7 +249,7 @@ function makeHarness(): ExitHarness {
       const profilePath = join(root, "profiles", "exit-retry");
       const input: ObserverLaunchInput = {
         runtimeKind: "listenServer",
-        arguments: ["-window", "-noSplash"],
+        arguments: ["-noSplash", "-forceUpdate"],
         profilePath,
         sessionTtlMs: 60_000,
         transportPreference: ["rest", "mailbox"],
@@ -369,8 +369,8 @@ describe("OwnedRuntimeManager child-exit retry", () => {
       creationTimeFileTime: String(900_000 + newChild.pid),
       ownerTokenArgument: newOwnerArgument,
       argvSha256: createHash("sha256").update(JSON.stringify([
-        "-window",
         "-noSplash",
+        "-forceUpdate",
         newOwnerArgument,
       ])).digest("hex"),
       startedAt: new Date(oldReceipt.launchedAtMs + 1).toISOString(),

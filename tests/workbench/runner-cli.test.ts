@@ -9,6 +9,7 @@ import {
 } from "../../src/workbench/runner-cli.js";
 import {
   classifyWorkbenchExitStatus,
+  type WorkbenchCheckReceipt,
   type WorkbenchEditorReceipt,
   type WorkbenchRunnerExitStatus,
 } from "../../src/workbench/runner.js";
@@ -46,6 +47,36 @@ function status(
     signal: null,
     timedOut: reason === "timed_out",
   });
+}
+
+function checkReceipt(): WorkbenchCheckReceipt {
+  return {
+    intent: "check",
+    scope: "enforceScripts",
+    engineValidated: true,
+    pid: 43,
+    executablePath: "C:\\tools\\Workbench.exe",
+    creationTime: "133900000000000043",
+    target: "C:\\target\\project.gproj",
+    targetAddon: {
+      addonId: "Example",
+      addonGuid: "1122334455667788",
+      sourceSha256: "a".repeat(64),
+    },
+    configuration: "PC",
+    lifecycleGeneration: "check-generation",
+    processOwnership: "verified",
+    endpointVacancy: "verified",
+    logDirectory: "C:\\logs\\check",
+    compilation: {
+      status: "failed",
+      code: "PROJECT_COMPILE_FAILED",
+      module: "Game",
+      diagnostics: ["Broken.c(1): error"],
+      logPath: "C:\\logs\\check\\script.log",
+    },
+    exitStatus: status("exited", -1),
+  };
 }
 
 function dependencies(
@@ -159,6 +190,40 @@ describe("Workbench runner CLI contract", () => {
       exceptionName: "STATUS_ACCESS_VIOLATION",
     });
     expect(receiptExitCode(receipt(exitStatus))).toBe(1);
+  });
+
+  it("maps Workbench compile-failure minus-one to portable exit 1 without losing the receipt", async () => {
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    const value = checkReceipt();
+    const runIntent = vi.fn(async (_config: Config, intent) => {
+      expect(intent).toEqual({
+        kind: "check",
+        gprojPath: "C:\\target\\project.gproj",
+        configuration: "PC",
+        timeoutMs: 120_000,
+      });
+      return value;
+    }) as NonNullable<WorkbenchRunnerCliDependencies["runIntent"]>;
+
+    await expect(executeWorkbenchRunnerCli([
+      "check",
+      "--gproj", "C:\\target\\project.gproj",
+      "--configuration", "PC",
+      "--timeout-ms", "120000",
+    ], {
+      loadConfiguration: () => ({} as Config),
+      runIntent,
+      assertSteamReady: () => undefined,
+      assertStateOwnerReady: () => undefined,
+      stdout: { write: (line) => stdout.push(line) },
+      stderr: { write: (line) => stderr.push(line) },
+    })).resolves.toBe(1);
+
+    expect(receiptExitCode(value)).toBe(1);
+    expect(JSON.parse(stdout[0])).toEqual(value);
+    expect(JSON.parse(stdout[0]).exitStatus.exitCode).toBe(-1);
+    expect(stderr).toEqual([]);
   });
 
   it("emits one redacted JSON error record and no success record", async () => {

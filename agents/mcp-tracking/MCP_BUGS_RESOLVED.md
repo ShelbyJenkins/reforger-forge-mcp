@@ -6,7 +6,7 @@ mixed tracker on 2026-07-28; same-day ties retain their migration order.
 
 ## Resolved defects
 
-### MCP-051 — `wb_launch` masks project compile failures as an undefined Ping API
+## MCP-051 — `wb_launch` masks project compile failures as an undefined Ping API
 
 **Status:** Resolved
 
@@ -33,7 +33,7 @@ typecheck, build, compiled MCP verification, unused-code check, manifest and
 protocol checks, and packed-package smoke install also passed. A live broken
 RainbowVeil launch followed by a fixed relaunch was not repeated.
 
-### MCP-050 — registered `.ptc` resources cannot be opened in Particle Editor
+## MCP-050 — registered `.ptc` resources cannot be opened in Particle Editor
 
 **Status:** Resolved
 
@@ -56,7 +56,7 @@ run, full repository suite, typecheck, build, manifest verification, and package
 smoke install passed. A live registered RainbowVeil particle was not opened in
 an attended Particle Editor during this close-out.
 
-### MCP-049 — `wb_launch` closes the MCP transport before starting Workbench
+## MCP-049 — `wb_launch` closes the MCP transport before starting Workbench
 
 **Status:** Resolved
 
@@ -81,7 +81,7 @@ passed 126/126 tests, and the full suite, typecheck, build, compiled MCP
 verification, unused-code check, and package smoke install passed. The original
 RainbowVeil transport-loss incident was not replayed live.
 
-### MCP-048 — failed Workbench pose capture retains an unreleasable camera lease
+## MCP-048 — failed Workbench pose capture retains an unreleasable camera lease
 
 **Status:** Resolved
 
@@ -112,7 +112,7 @@ manifest checks (Workbench helper digest
 full repository suite, typecheck, build, and package smoke install passed. No
 attended Workbench camera acceptance or native ScriptEditor compile was run.
 
-### MCP-045 — `game_duplicate` source lookup could escape configured data roots
+## MCP-045 — `game_duplicate` source lookup could escape configured data roots
 
 **Status:** Resolved
 
@@ -136,7 +136,7 @@ PAK-leaf and deferred-registration hardening approved under MCP-031. The full
 repository test suite, typecheck, unused-code analysis, compiled MCP build, and
 fresh-process MCP verification also pass.
 
-### MCP-042 - `wb_component` reports an added prefab component that `wb_save_resource` drops
+## MCP-042 - `wb_component` reports an added prefab component that `wb_save_resource` drops
 
 **Status:** Resolved
 
@@ -159,7 +159,7 @@ refused before native save; dispatch count and source bytes remained unchanged,
 and the tainted session rejected a second save. Focused and repository-wide
 offline tests also passed.
 
-### MCP-040 - loose-resource registration deadlocks behind World Editor edit mode
+## MCP-040 - loose-resource registration deadlocks behind World Editor edit mode
 
 **Status:** Resolved
 
@@ -178,7 +178,7 @@ without metadata, and verified distinct generated GUIDs plus responsive bridge
 ping. Fresh target-bound Workbench sessions then opened and saved both
 registered resources successfully, with final exact process vacancy.
 
-### MCP-036 - managed server launch is not borderless and steals foreground focus
+## MCP-036 - managed server launch is not borderless and steals foreground focus
 
 **Status:** Resolved
 
@@ -195,6 +195,10 @@ initialization. Explicit `noFocus: false` bypasses the guard, caller-supplied
 `-window` remains supported, and dedicated runtimes and test runners are not
 guarded.
 
+**Superseded window-size policy (2026-08-03):** MCP-053 subsequently removed
+the raw `-window` escape hatch. Non-native window sizing now requires the
+structured `forceNonNativeWindowSize` exception with a written justification.
+
 **Verification:** An isolated live probe showed that current Reforger still
 took focus even with `-noFocus` first, proving argument order was not the cause.
 The complete graphical observer acceptance then passed with a visible
@@ -202,7 +206,7 @@ borderless fullscreen popup covering the monitor, no foreground ownership
 during readiness, successful captures/restoration, and exact shutdown. The
 observed foreground PID remained the prior application rather than Reforger.
 
-### MCP-006 — resource registration can stall and disconnect Workbench
+## MCP-006 — resource registration can stall and disconnect Workbench
 
 **Status:** Resolved
 
@@ -222,7 +226,7 @@ and reopened/saved the prefab and world in fresh target-bound sessions. The run
 finished with exact process vacancy; focused and repository-wide offline tests
 also passed.
 
-### MCP-044 - MCP verification rejected the supported `mod.gprojPath` input
+## MCP-044 - MCP verification rejected the supported `mod.gprojPath` input
 
 **Status:** Resolved
 
@@ -240,7 +244,7 @@ arguments.
 The defect was discovered by the read-only `npm run mcp:verify` baseline; no
 Workbench or game process was launched.
 
-### MCP-041 — `wb_layers` advertised mutations that the staged helper did not implement
+## MCP-041 — `wb_layers` advertised mutations that the staged helper did not implement
 
 **Status:** Resolved
 
@@ -259,7 +263,7 @@ a false `Layer Updated` receipt.
 parity and a rejected helper action; the focused offline suite and TypeScript
 typecheck passed. No Workbench process was launched.
 
-### MCP-038 — `scenario_create_conflict` respects `patrolCount: 0`
+## MCP-038 — `scenario_create_conflict` respects `patrolCount: 0`
 
 **Status:** Resolved
 
@@ -275,7 +279,7 @@ default only when the value is omitted.
 `tests/templates/scenario.test.ts` passed in the focused offline suite. No
 Workbench process was launched.
 
-### MCP-037 — `prefab(action: "create")` corrupted inherited game-mode structure
+## MCP-037 — `prefab(action: "create")` corrupted inherited game-mode structure
 
 **Status:** Resolved
 
@@ -293,7 +297,7 @@ root, and `tests/utils/prefab-ancestry.test.ts` covers nested-container
 exclusion; both passed in the focused offline suite and TypeScript typecheck.
 No Workbench process was launched.
 
-### MCP-034 — `observer_run finalize` hid its required capture-label list
+## MCP-034 — `observer_run finalize` hid its required capture-label list
 
 **Status:** Resolved
 
@@ -310,7 +314,7 @@ requirement. This matches the existing handler validation.
 inspects the public schema and description through the MCP transport; it passed
 in the focused offline suite and TypeScript typecheck.
 
-### MCP-033 — owned `dedicated` runtime launched the game client executable
+## MCP-033 — owned `dedicated` runtime launched the game client executable
 
 **Status:** Resolved
 
@@ -330,7 +334,7 @@ selects `ArmaReforgerServerDiag.exe` when both executable families exist, and
 passes the prepared dedicated kind into the resolver. Both passed offline,
 along with TypeScript typecheck.
 
-### MCP-032 — Workbench launch and build disagreed on target-relative dependencies
+## MCP-032 — Workbench launch and build disagreed on target-relative dependencies
 
 **Status:** Resolved
 
@@ -348,7 +352,7 @@ MCP-owned editor launch resolves a sibling dependency and emits that root in
 `-addonsDir`. The focused offline suite and TypeScript typecheck passed; no
 Workbench process was launched.
 
-### MCP-010 — guarded build reported a non-vacant endpoint after its process exited
+## MCP-010 — guarded build reported a non-vacant endpoint after its process exited
 
 **Status:** Resolved
 
@@ -366,7 +370,7 @@ the actual PowerShell helper against a local loopback listener and then its
 vacant endpoint. It passed in the focused offline suite; no Workbench process
 was launched.
 
-### MCP-009 — TestContent MCP launch omitted the Core dependency root
+## MCP-009 — TestContent MCP launch omitted the Core dependency root
 
 **Status:** Resolved
 
@@ -383,7 +387,7 @@ addon root but omitted its sibling Core project.
 roots. The local stdio MCP host must be restarted through that launcher before
 retrying because an active host retains its startup configuration.
 
-### MCP-008 — target-bound launch resolved resources from the wrong root
+## MCP-008 — target-bound launch resolved resources from the wrong root
 
 **Status:** Resolved
 
@@ -406,7 +410,7 @@ build pass, including the TestContent-relative `.ent` case. The live launch
 reached the MCP but was safely refused because an independent MCP-owned
 Workbench lifecycle lease was active; no editor state or resource was changed.
 
-### MCP-005 — Observer opaque and legacy world expectations conflicted
+## MCP-005 — Observer opaque and legacy world expectations conflicted
 
 **Status:** Resolved
 
@@ -432,7 +436,7 @@ partial legacy requests.
 **Superseded contract:** MCP-029 later approved `expectedWorldRevision` as the
 only public capture binding and removed the temporary legacy and dual forms.
 
-### MCP-001 — Workbench helper staging rejected a normal generated file
+## MCP-001 — Workbench helper staging rejected a normal generated file
 
 **Status:** Resolved
 
@@ -458,7 +462,7 @@ allowlist in `src/workbench/helper-addon.ts` and extended
 TypeScript build passed. The exact stale generated cache file was removed so
 the observed Workbench session could launch.
 
-### MCP-025 — live acceptance recreated the removed validation-docs folder
+## MCP-025 — live acceptance recreated the removed validation-docs folder
 
 **Status:** Resolved
 
@@ -470,7 +474,7 @@ repository directory. They now default beneath their externally confined
 acceptance artifact root; callers can still choose an explicit publication
 directory with `--validation-root`.
 
-### MCP-024 — live guides linked from the README were omitted from packages
+## MCP-024 — live guides linked from the README were omitted from packages
 
 **Status:** Resolved
 
@@ -480,7 +484,7 @@ The npm package now includes the linked Observer guide, runner guide, and
 contribution guide, and package verification requires them. This keeps package
 README links usable after installation.
 
-### MCP-023 — verification parsed a removed README tool table
+## MCP-023 — verification parsed a removed README tool table
 
 **Status:** Resolved
 
@@ -492,7 +496,7 @@ registered MCP tools directly, rejects duplicate/refusal-only tools, and
 requires a nonempty runtime description. This makes the runtime registration,
 not prose, the source of truth for the verification check.
 
-### MCP-022 — case-sensitive package entry for `SETUP.md`
+## MCP-022 — case-sensitive package entry for `SETUP.md`
 
 **Status:** Resolved
 
@@ -501,7 +505,7 @@ not prose, the source of truth for the verification check.
 The documentation file is now `SETUP.md`; package metadata and package-contract
 coverage now use that same case, including on case-sensitive publish targets.
 
-### MCP-021 — removed validation path remains in configuration example
+## MCP-021 — removed validation path remains in configuration example
 
 **Status:** Resolved
 
@@ -511,7 +515,7 @@ coverage now use that same case, including on case-sensitive publish targets.
 removed `docs/validation` path. It now uses an explicit managed evidence-root
 example.
 
-### MCP-020 — model GUID availability in `asset_search`
+## MCP-020 — model GUID availability in `asset_search`
 
 **Status:** Resolved
 
@@ -521,7 +525,7 @@ example.
 references when the resource database contains them. Prefab and prompt guidance
 directs model discovery there rather than to `api_search`.
 
-### MCP-019 — residual `ObserverCoordinatorError` terminology
+## MCP-019 — residual `ObserverCoordinatorError` terminology
 
 **Status:** Resolved
 
@@ -533,7 +537,7 @@ composition root is `ObserverApplication`. The host boundary now uses
 deprecated constructor alias for import and `instanceof` compatibility; current
 host code, tests, and guidance use the application terminology.
 
-### MCP-016 — `wb_resources` advertised unsupported `browse`
+## MCP-016 — `wb_resources` advertised unsupported `browse`
 
 **Status:** Resolved
 
@@ -545,7 +549,7 @@ The MCP schema advertised `browse`, but the Workbench helper deliberately
 returned “not yet implemented.” The public action enum now omits `browse`
 until a tested helper implementation exists.
 
-### MCP-015 — model lookup guidance used the wrong discovery tool
+## MCP-015 — model lookup guidance used the wrong discovery tool
 
 **Status:** Resolved
 
@@ -558,7 +562,7 @@ Models are game assets, so discovery now uses `asset_search(type: "model")`;
 the asset index returns the GUID-prefixed model references used in that
 guidance.
 
-### MCP-014 — `wiki_read` claimed unlimited page text
+## MCP-014 — `wiki_read` claimed unlimited page text
 
 **Status:** Resolved
 
@@ -570,7 +574,7 @@ guidance.
 truncation notice. Its tool description and prompt guidance now advertise that
 cap consistently.
 
-### MCP-013 — `game_duplicate` overstated its supported resource scope
+## MCP-013 — `game_duplicate` overstated its supported resource scope
 
 **Status:** Resolved
 
@@ -583,7 +587,7 @@ implementation. It now supports `.et` prefabs only, validates both extensions,
 describes the source-data requirement accurately, and directs later
 registration through `wb_resources(action: "register")`.
 
-### MCP-012 — `game_duplicate(register=true)` could auto-launch Workbench
+## MCP-012 — `game_duplicate(register=true)` could auto-launch Workbench
 
 **Status:** Resolved
 
@@ -595,7 +599,7 @@ Registration now calls Workbench with `skipAutoLaunch: true`. It requires an
 already-running compatible Workbench; failures state that a copy may exist but
 is not registered, and non-`ok` helper receipts are MCP errors.
 
-### MCP-011 — configured `projectPath` was unsafe as a default write root
+## MCP-011 — configured `projectPath` was unsafe as a default write root
 
 **Status:** Resolved
 

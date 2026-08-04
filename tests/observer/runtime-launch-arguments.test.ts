@@ -11,14 +11,11 @@ describe("managed graphical runtime launch arguments", () => {
     expect(result).toContain("-server");
   });
 
-  it("preserves an explicit caller opt-in to windowed mode", () => {
-    const result = launchArguments("Worlds/Test.ent", null, [
-      "-window", "-screenWidth", "1280", "-screenHeight", "720",
-    ]);
-
-    expect(result).toContain("-window");
-    expect(result.slice(-5)).toEqual([
-      "-window", "-screenWidth", "1280", "-screenHeight", "720",
-    ]);
-  });
+  it.each(["-window", "-screenWidth", "-screenHeight", "-screenWidth=1280"])(
+    "refuses raw display override %s",
+    (argument) => {
+      expect(() => launchArguments("Worlds/Test.ent", null, [argument]))
+        .toThrow(/native fullscreen.*not accepted/i);
+    },
+  );
 });

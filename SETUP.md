@@ -327,6 +327,24 @@ not the generic MCP editor default; when explicitly selected by a low-level
 automation plan, each newly discovered top-level window is minimized at most
 once, so restoring that same window is not undone repeatedly.
 
+For a fast Enforce Script compilation preflight while the MCP owns the
+lifecycle, call `wb_check` with an exact absolute `gprojPath`, a configuration
+declared by that project (default `PC`), and a bounded timeout. The operation
+starts a hidden, helper-free Workbench, returns only after exact-child cleanup
+and endpoint vacancy, and produces no build artifacts. A successful receipt
+means only that Enforce Scripts compiled; it does not validate resources,
+materials, prefabs, worlds, packaging, or the whole add-on. `mod` with
+`action: "validate"` remains a separate static check.
+
+When no MCP server owns the Workbench lifecycle, the packaged equivalent is:
+
+```powershell
+reforger-forge-workbench check --gproj C:\path\to\Addon\Addon.gproj --configuration PC --timeout-ms 120000
+```
+
+See [the runner CLI reference](docs/runner-cli.md) for the JSON receipt and
+portable exit-code contract.
+
 Use `wb_log_query` with the `logDirectory` returned by `wb_build` to inspect
 only relevant managed Workbench log lines. It requires one or more addon,
 severity, channel, or case-insensitive text filters and never returns an

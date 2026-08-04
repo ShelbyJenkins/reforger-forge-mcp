@@ -39,6 +39,11 @@ describe("observer MCP tools", () => {
       transportPreference: ["rest"],
       forceUpdate: false,
       noFocus: false,
+      forceNonNativeWindowSize: {
+        width: 1280,
+        height: 720,
+        justification: "Native fullscreen is unavailable on the remote display.",
+      },
     }, { signal: new AbortController().signal });
 
     expect(result.isError).not.toBe(true);
@@ -47,8 +52,36 @@ describe("observer MCP tools", () => {
         "-addonsDir", "C:/game/addons,C:/workshop/addons",
         "-server", "-addonsDir", "C:/caller/addons",
       ],
+      forceNonNativeWindowSize: {
+        width: 1280,
+        height: 720,
+        justification: "Native fullscreen is unavailable on the remote display.",
+      },
     }));
   });
+
+  it.each(["-window", "-screenWidth", "-screenHeight=720"])(
+    "refuses raw display override %s before private launch preparation",
+    async (argument) => {
+      const prepareLaunch = vi.fn();
+      const registry = toolRegistry(toolApplication({ prepareLaunch }));
+
+      const result = await registry.get("observer_prepare_launch")!.handler({
+        runtimeKind: "client",
+        arguments: [argument],
+        profilePath: "C:/profiles/native-fullscreen",
+        sessionTtlMs: 60_000,
+        transportPreference: ["rest"],
+        forceUpdate: true,
+        noFocus: true,
+      }, { signal: new AbortController().signal });
+
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("ARGUMENT_CONFLICT");
+      expect(result.content[0].text).toContain("forceNonNativeWindowSize");
+      expect(prepareLaunch).not.toHaveBeenCalled();
+    },
+  );
 
   it("returns only the public launch descriptor and does not expose launch credentials", async () => {
     const coordinator = toolApplication({
@@ -106,6 +139,20 @@ describe("observer MCP tools", () => {
       "observer_setup",
     ]);
     for (const tool of tools.values()) expect(tool.definition.description?.length).toBeGreaterThan(40);
+    const prepare = tools.get("observer_prepare_launch")!;
+    expect(prepare.definition.description).toContain("native borderless-fullscreen window by default");
+    expect(prepare.definition.description).toContain("forceNonNativeWindowSize");
+    const override = prepare.definition.inputSchema!.forceNonNativeWindowSize;
+    expect(override.safeParse({
+      width: 1280,
+      height: 720,
+      justification: "Native fullscreen is unavailable on the remote display.",
+    }).success).toBe(true);
+    expect(override.safeParse({
+      width: 1280,
+      height: 720,
+      justification: "for screenshots",
+    }).success).toBe(false);
   });
 
   it("routes explicit observer_runtime actions without exposing owner-token receipt fields", async () => {

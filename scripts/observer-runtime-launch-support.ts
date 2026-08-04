@@ -272,6 +272,13 @@ export function launchArguments(
     if (typeof token !== "string" || token.length < 1 || token.length > 8_192 || /[\0\r\n]/.test(token)) {
       throw new Error("Additional runtime launch arguments must be bounded argument tokens");
     }
+    if (["-window", "-screenwidth", "-screenheight"].includes(
+      token.split("=", 1)[0].toLowerCase(),
+    )) {
+      throw new Error(
+        "Runtime acceptance uses native fullscreen; raw window-size launch arguments are not accepted",
+      );
+    }
     result.push(token);
   }
   return result;

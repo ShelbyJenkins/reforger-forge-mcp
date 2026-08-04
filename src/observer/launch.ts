@@ -8,6 +8,11 @@ export interface ObserverLaunchInput {
   transportPreference: Array<"rest" | "mailbox">;
   forceUpdate: boolean;
   noFocus: boolean;
+  forceNonNativeWindowSize?: {
+    width: number;
+    height: number;
+    justification: string;
+  };
   idempotencyKey?: string;
 }
 

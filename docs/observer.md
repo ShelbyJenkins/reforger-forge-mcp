@@ -80,9 +80,17 @@ does not start the game. It also assigns one relative, session-specific
 `<profilePath>/profile/logs/observer-<sessionId>/script.log`; caller-supplied
 `-logsDir` values are refused.
 
-Preparation defaults `noFocus` and `forceUpdate` to true. Leave `-window` out
-to retain the engine's fullscreen default without stealing startup focus; add
-`-window` and optional dimensions only for an intentional windowed run.
+Preparation defaults `noFocus` and `forceUpdate` to true. Graphical launches use
+the engine's native borderless fullscreen by default without stealing startup
+focus. Keep that default for normal Observer work. Raw `-window`, `-screenWidth`,
+and `-screenHeight` tokens in `arguments` are refused.
+
+`forceNonNativeWindowSize` is the only supported direct window-size override.
+It requires bounded `width` and `height` values plus a meaningful
+`justification`, and should be
+present only when native fullscreen cannot be used for a compelling external
+reason. Screenshot size is not such a reason: use the `observer_capture.image`
+output bounds described below while leaving the launched renderer fullscreen.
 
 You can pass the returned arguments unchanged to your own launcher. On Windows,
 you can instead call `observer_runtime action: "start"` with the

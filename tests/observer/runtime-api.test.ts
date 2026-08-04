@@ -80,6 +80,42 @@ describe("observer runtime HTTP API", () => {
     });
     expect(readFileSync(preparedThroughLiveAgent.session.contractPath, "utf8")).toContain("sessionToken");
 
+    await expect(requestObserverControl(descriptor, "/v1/control/prepare-launch", {
+      method: "POST",
+      body: {
+        runtimeKind: "client",
+        arguments: ["-client", "-window", "-screenWidth", "1280"],
+        profilePath: join(profileRoot, "raw-window-refused"),
+        sessionTtlMs: 60_000,
+        transportPreference: ["rest"],
+        forceUpdate: true,
+        noFocus: true,
+      },
+    })).rejects.toMatchObject({ code: "ARGUMENT_CONFLICT" });
+
+    const exceptionalWindow = await requestObserverControl<{
+      arguments: string[];
+    }>(descriptor, "/v1/control/prepare-launch", {
+      method: "POST",
+      body: {
+        runtimeKind: "client",
+        arguments: ["-client"],
+        profilePath: join(profileRoot, "exceptional-window"),
+        sessionTtlMs: 60_000,
+        transportPreference: ["rest"],
+        forceUpdate: true,
+        noFocus: true,
+        forceNonNativeWindowSize: {
+          width: 1280,
+          height: 720,
+          justification: "Native fullscreen is unavailable on the remote display.",
+        },
+      },
+    });
+    expect(exceptionalWindow.arguments.slice(-5)).toEqual([
+      "-window", "-screenWidth", "1280", "-screenHeight", "720",
+    ]);
+
       await agent.server.close();
       await expect(agent.control.prepareLaunch({
       runtimeKind: "client",

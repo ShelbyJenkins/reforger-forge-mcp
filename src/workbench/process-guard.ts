@@ -115,7 +115,8 @@ export interface WorkbenchLifecycleStateV3 {
 export type WorkbenchPlanSpawnPurpose =
   | "mcp_editor"
   | "cli_editor"
-  | "target_build";
+  | "target_build"
+  | "target_check";
 
 /**
  * @deprecated Remove in Stage 6 after version-3 spawn journals and the
@@ -487,6 +488,7 @@ function isWorkbenchSpawnMetadata(value: unknown): value is WorkbenchSpawnMetada
     "mcp_editor",
     "cli_editor",
     "target_build",
+    "target_check",
     "client_launch",
     "client_restart",
     "runner_editor",

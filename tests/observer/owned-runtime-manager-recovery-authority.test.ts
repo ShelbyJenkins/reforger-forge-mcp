@@ -46,14 +46,14 @@ describe("OwnedRuntimeManager", () => {
     const profilePath = "p".repeat(32_769);
     await expect(oversizedProfile.manager.recordPreparedLaunch({
       runtimeKind: "listenServer",
-      arguments: ["-window"],
+      arguments: ["-noSplash"],
       profilePath,
       sessionTtlMs: 60_000,
       transportPreference: ["rest", "mailbox"],
       forceUpdate: false,
       noFocus: false,
     }, {
-      arguments: ["-window"],
+      arguments: ["-noSplash"],
       sessionId: "session-oversized-profile",
       expiresAt: new Date("2026-07-18T12:01:00.000Z").toISOString(),
       bundleDigest: "a".repeat(64),

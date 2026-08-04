@@ -383,7 +383,7 @@ async function captureOwnedCut(cut: OwnedSpawnCrashCut): Promise<OwnedCrashSnaps
 
   const input: ObserverLaunchInput = {
     runtimeKind: "listenServer",
-    arguments: ["-window", "-noSplash"],
+    arguments: ["-noSplash", "-forceUpdate"],
     profilePath: join(root, "profiles", "f8"),
     sessionTtlMs: 60_000,
     transportPreference: ["rest", "mailbox"],

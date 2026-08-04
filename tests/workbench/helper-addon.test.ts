@@ -207,6 +207,27 @@ describe("MCP-managed Workbench helper add-on", () => {
     expect(explicitHandler).not.toContain("GetContainer(");
   });
 
+  it("validates material texture references without requiring packed dependencies to expose source metadata", () => {
+    const handler = readFileSync(join(
+      defaultWorkbenchHelperSource(),
+      "Scripts",
+      "WorkbenchGame",
+      "EnfusionMCP",
+      "EMCP_WB_ValidateResource.c"
+    ), "utf8");
+
+    expect(handler).toContain("CheckMaterialTextureReferences(material, validator, checks)");
+    expect(handler).toContain("ResourceName resolved = Workbench.GetResourceName(guid)");
+    expect(handler).toContain("validator.CheckSlots(slot, suffix, checks)");
+    expect(handler).not.toContain("validator.CheckTextures(material, checks)");
+    expect(handler).not.toContain("resourceManager.GetMetaFile(value.GetPath())");
+
+    // Standalone texture import validation still requires registered source
+    // metadata because it inspects the import configuration itself.
+    expect(handler).toContain("Resource metadata not found for texture");
+    expect(handler).toContain('metaFile.GetObjectArray("Configurations")');
+  });
+
   it("expires old digest roots and orphaned profile captures without touching the current bundle", async () => {
     await withTemporaryDirectory((root) => {
     const stager = new WorkbenchHelperStager({ managedRoot: join(root, "managed") });

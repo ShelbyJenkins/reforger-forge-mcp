@@ -127,6 +127,7 @@ import {
   type McpEditorLaunchPlan,
   type McpTargetResourceLaunchPlan,
   type TargetBuildLaunchPlan,
+  type TargetCheckLaunchPlan,
 } from "./launch-plan.js";
 import {
   ResourceTargetError,
@@ -195,7 +196,7 @@ export interface WorkbenchShutdownResult {
 export type WorkbenchForegroundExitReason = "exited" | "timed_out" | "aborted";
 
 export interface WorkbenchRunResult<Qualification = unknown> {
-  readonly planKind: "cli_editor" | "target_build";
+  readonly planKind: "cli_editor" | "target_build" | "target_check";
   readonly process: Readonly<WorkbenchIdentity>;
   readonly lifecycleGeneration: string;
   readonly qualification: Qualification;
@@ -248,6 +249,18 @@ export interface WorkbenchTargetBuildRunResult<Snapshot>
   extends WorkbenchRunResult<null> {
   readonly planKind: "target_build";
   readonly beforeOutput: Snapshot;
+}
+
+export interface WorkbenchTargetCheckRunResult extends WorkbenchRunResult<null> {
+  readonly planKind: "target_check";
+}
+
+type BoundedTargetLaunchPlan = TargetBuildLaunchPlan | TargetCheckLaunchPlan;
+
+interface BoundedTargetHooks<Snapshot> {
+  beforeReservation?(): void;
+  afterReservation?(): void;
+  captureBeforeSpawn(): Snapshot;
 }
 
 export type WorkbenchRunErrorCode =
@@ -395,7 +408,7 @@ interface ManagedRunningAuthority {
   readonly snapshot: WorkbenchObserverSnapshot;
 }
 
-type CoordinatedLifecycleKind = LifecycleOperationKind | "target_build";
+type CoordinatedLifecycleKind = LifecycleOperationKind | "target_build" | "target_check";
 
 interface ActiveLifecycleOperation {
   kind: CoordinatedLifecycleKind;
@@ -407,6 +420,8 @@ interface ActiveLifecycleOperation {
 export interface OwnerScopedTargetBuildOptions {
   readonly signal?: AbortSignal;
 }
+
+export type OwnerScopedTargetCheckOptions = OwnerScopedTargetBuildOptions;
 
 export interface WorkbenchClientDependencies {
   companionProvider?: WorkbenchCompanionProvider;
@@ -552,15 +567,54 @@ export class WorkbenchSessionController {
     ) => Promise<T>,
     options: OwnerScopedTargetBuildOptions = {}
   ): Promise<T> {
+    return this.runOwnerScopedTargetOperation(
+      "target_build",
+      "owner-scoped target build",
+      gprojPath,
+      action,
+      options,
+      (project) => this.reconcileOwnerScopedTargetBuildEntry(project)
+    );
+  }
+
+  async runOwnerScopedTargetCheck<T>(
+    gprojPath: string,
+    action: (
+      lifecycleExecution: WorkbenchLifecycleExecutionPort,
+      signal: AbortSignal
+    ) => Promise<T>,
+    options: OwnerScopedTargetCheckOptions = {}
+  ): Promise<T> {
+    return this.runOwnerScopedTargetOperation(
+      "target_check",
+      "owner-scoped Enforce Script check",
+      gprojPath,
+      action,
+      options,
+      (project) => this.reconcileOwnerScopedTargetOperationEntry(project, "Enforce Script check")
+    );
+  }
+
+  private async runOwnerScopedTargetOperation<T>(
+    kind: "target_build" | "target_check",
+    activityName: string,
+    gprojPath: string,
+    action: (
+      lifecycleExecution: WorkbenchLifecycleExecutionPort,
+      signal: AbortSignal
+    ) => Promise<T>,
+    options: OwnerScopedTargetBuildOptions,
+    reconcile: (project: CanonicalProjectIdentity) => Promise<void>
+  ): Promise<T> {
     if (this.targetBuildClosing) {
       throw new WorkbenchError(
-        "Workbench target build is unavailable because the MCP server is shutting down.",
+        "Workbench target operation is unavailable because the MCP server is shutting down.",
         "LIFECYCLE_BUSY"
       );
     }
     if (this.activeTargetBuildPromise) {
       throw new WorkbenchError(
-        "Another owner-scoped Workbench target build is already active.",
+        "Another owner-scoped Workbench target operation is already active.",
         "LIFECYCLE_BUSY"
       );
     }
@@ -580,12 +634,12 @@ export class WorkbenchSessionController {
     if (options.signal?.aborted) forwardRequestAbort();
 
     const promise = this.coordinateLifecycle(
-      "target_build",
+      kind,
       project.comparisonKey,
       () => this.activityGate.runLifecycle(
-        "owner-scoped target build",
+        activityName,
         async () => {
-          await this.reconcileOwnerScopedTargetBuildEntry(project);
+          await reconcile(project);
           return action(this.runnerLifecycleExecution, operationAbort.signal);
         },
         { signal: operationAbort.signal }
@@ -610,6 +664,10 @@ export class WorkbenchSessionController {
    * shared process guard is closed.
    */
   async closeOwnerScopedTargetBuild(): Promise<void> {
+    return this.closeOwnerScopedTargetOperations();
+  }
+
+  async closeOwnerScopedTargetOperations(): Promise<void> {
     this.targetBuildClosing = true;
     const active = this.activeTargetBuildPromise;
     this.activeTargetBuildAbort?.abort(
@@ -630,20 +688,27 @@ export class WorkbenchSessionController {
   private async reconcileOwnerScopedTargetBuildEntry(
     project: CanonicalProjectIdentity
   ): Promise<void> {
+    return this.reconcileOwnerScopedTargetOperationEntry(project, "target build");
+  }
+
+  private async reconcileOwnerScopedTargetOperationEntry(
+    project: CanonicalProjectIdentity,
+    operationName: string
+  ): Promise<void> {
     const state = await this.processGuard.withLifecycleLock((session) =>
       this.claimState(session, null)
     );
     await this.recoverUnpublishedSpawn(state, { terminateLive: false });
     if (await this.inspectRecordedWorkbench(state) === "live") {
       throw new WorkbenchError(
-        "Owner-scoped target build refused because an exact Workbench process is still live. " +
+        `Owner-scoped ${operationName} refused because an exact Workbench process is still live. ` +
           "Use wb_shutdown for an owned editor or wait for the active lifecycle to finish.",
         "LIFECYCLE_BUSY"
       );
     }
     await this.assertNoWorkbenchProcesses(
       this.processGuard,
-      "Owner-scoped target-build recovery"
+      `Owner-scoped ${operationName} recovery`
     );
     await this.waitForPortRelease();
     // Make the final process/endpoint proof and vacant publication under one
@@ -654,7 +719,7 @@ export class WorkbenchSessionController {
       const current = await this.requireReservedLifecycle(session, state);
       await this.assertNoWorkbenchProcesses(
         session,
-        "Owner-scoped target-build recovery"
+        `Owner-scoped ${operationName} recovery`
       );
       const vacancy = await session.verifyEndpointVacant({
         host: this.host,
@@ -665,14 +730,14 @@ export class WorkbenchSessionController {
           ? `listener PID ${vacancy.listenerPid}: ${vacancy.message}`
           : `${vacancy.reason}: ${vacancy.message}`;
         throw new WorkbenchError(
-          `RECOVERY_REQUIRED: owner-scoped target-build recovery preserved its busy ` +
+          `RECOVERY_REQUIRED: owner-scoped ${operationName} recovery preserved its busy ` +
             `reservation because final endpoint vacancy was not proven (${detail}).`,
           "RECOVERY_REQUIRED"
         );
       }
       await this.assertNoWorkbenchProcesses(
         session,
-        "Owner-scoped target-build recovery"
+        `Owner-scoped ${operationName} recovery`
       );
       await session.transitionToVacant(stateExpected(current), {
         target: toLifecycleTarget(project),
@@ -991,39 +1056,82 @@ export class WorkbenchSessionController {
   ): Promise<WorkbenchTargetBuildRunResult<Snapshot>> {
     return this.activityGate.runLifecycle(
       "target build",
-      () => this.runTargetBuildExclusive(plan, reservation, options),
+      async () => {
+        if (pathKey(reservation.root) !== pathKey(plan.outputPath)) {
+          throw new WorkbenchRunError(
+            "Target build output reservation does not match the launch plan output.",
+            "INCOMPLETE_PROOF"
+          );
+        }
+        const run = await this.runBoundedTargetOperationExclusive(
+          plan,
+          options,
+          {
+            beforeReservation: () => { reservation.assertStillReservedAndSnapshot(); },
+            afterReservation: () => { reservation.assertStillReservedAndSnapshot(); },
+            captureBeforeSpawn: () => reservation.assertStillReservedAndSnapshot(),
+          }
+        );
+        return Object.freeze({
+          ...run,
+          planKind: "target_build" as const,
+          beforeOutput: run.beforeSpawnSnapshot,
+        });
+      },
       { signal: options.signal }
     );
   }
 
-  private async runTargetBuildExclusive<Snapshot>(
-    plan: TargetBuildLaunchPlan,
-    reservation: WorkbenchBuildOutputReservation<Snapshot>,
+  /** Execute one helper-free compile-only check through the same bounded lifecycle cut. */
+  async runTargetCheck(
+    plan: TargetCheckLaunchPlan,
     options: BoundedRunOptions
-  ): Promise<WorkbenchTargetBuildRunResult<Snapshot>> {
-    if (plan.kind !== "target_build" || plan.helper !== null || plan.readiness.kind !== "none") {
+  ): Promise<WorkbenchTargetCheckRunResult> {
+    return this.activityGate.runLifecycle(
+      "Enforce Script check",
+      async () => {
+        const run = await this.runBoundedTargetOperationExclusive(
+          plan,
+          options,
+          { captureBeforeSpawn: () => undefined }
+        );
+        return Object.freeze({
+          planKind: "target_check" as const,
+          process: run.process,
+          lifecycleGeneration: run.lifecycleGeneration,
+          qualification: null,
+          endpointVacancy: run.endpointVacancy,
+          exitStatus: run.exitStatus,
+        });
+      },
+      { signal: options.signal }
+    );
+  }
+
+  private async runBoundedTargetOperationExclusive<Snapshot>(
+    plan: BoundedTargetLaunchPlan,
+    options: BoundedRunOptions,
+    hooks: BoundedTargetHooks<Snapshot>
+  ): Promise<WorkbenchRunResult<null> & { readonly beforeSpawnSnapshot: Snapshot }> {
+    if (!(["target_build", "target_check"] as const).includes(plan.kind) ||
+        plan.helper !== null || plan.readiness.kind !== "none") {
       throw new WorkbenchRunError(
-        "Target build execution requires one helper-free target_build launch plan.",
-        "INCOMPLETE_PROOF"
-      );
-    }
-    if (pathKey(reservation.root) !== pathKey(plan.outputPath)) {
-      throw new WorkbenchRunError(
-        "Target build output reservation does not match the launch plan output.",
+        "Bounded target execution requires one helper-free target launch plan.",
         "INCOMPLETE_PROOF"
       );
     }
     if (!Number.isFinite(options.deadlineMs)) {
-      throw new TypeError("Target build absolute deadline must be finite.");
+      throw new TypeError("Bounded target-operation absolute deadline must be finite.");
     }
+    const operationName = plan.kind === "target_build" ? "target build" : "Enforce Script check";
     const execution = this.runnerLifecycleExecution;
     const endpoint = { host: this.host, port: this.port };
     const terminationTimeoutMs = options.terminationTimeoutMs ?? OWNED_PROCESS_EXIT_TIMEOUT_MS;
     const recoveryTimeoutMs = options.recoveryTimeoutMs ?? OWNED_PROCESS_EXIT_TIMEOUT_MS;
     await execution.assertSpawnJournalReplaceable();
-    await execution.assertNoWorkbenchBeforeReservation("Workbench target-build reservation");
-    await execution.assertEndpointVacantBeforeSpawn(endpoint, "Workbench target-build reservation");
-    reservation.assertStillReservedAndSnapshot();
+    await execution.assertNoWorkbenchBeforeReservation(`Workbench ${operationName} reservation`);
+    await execution.assertEndpointVacantBeforeSpawn(endpoint, `Workbench ${operationName} reservation`);
+    hooks.beforeReservation?.();
     let lifecycle = await execution.reserve({
       endpoint,
       target: plan.lifecycleTarget,
@@ -1033,7 +1141,7 @@ export class WorkbenchSessionController {
     // The claim is the serialization point. A failed immediate recheck owns
     // enough durable authority to return the child-free reservation to vacant.
     try {
-      reservation.assertStillReservedAndSnapshot();
+      hooks.afterReservation?.();
     } catch (error) {
       await execution.vacate(lifecycle, {
         endpoint,
@@ -1045,7 +1153,8 @@ export class WorkbenchSessionController {
     let supervised: WorkbenchLifecycleSupervisedChild | null = null;
     let identity: WorkbenchIdentity | null = null;
     let lifecycleGeneration: string | null = null;
-    let beforeOutput: Snapshot | null = null;
+    let beforeSpawnSnapshot!: Snapshot;
+    let snapshotCaptured = false;
     let reason: WorkbenchForegroundExitReason | null = null;
     let exit: SupervisedChildExit | null = null;
     let primaryError: unknown = null;
@@ -1054,22 +1163,23 @@ export class WorkbenchSessionController {
     let endpointVacant = false;
 
     try {
-      this.assertBoundedRunCanContinue(options, "before target-build spawn");
+      this.assertBoundedRunCanContinue(options, operationName, "before spawn");
       await execution.assertNoWorkbenchProcesses();
       options.beforeFinalVacancyCheck?.();
-      await execution.assertEndpointVacantBeforeSpawn(endpoint, "Workbench target-build spawn");
+      await execution.assertEndpointVacantBeforeSpawn(endpoint, `Workbench ${operationName} spawn`);
       const spawned = await execution.spawnRecoverable({
         lifecycle,
-        purpose: "target_build",
+        purpose: plan.kind,
         executablePath: plan.executablePath,
         launchArguments: plan.argv,
         spawnOptions: plan.spawnOptions,
         ownerArgument: plan.ownerArgument,
         launchedAtMs: Date.now(),
         beforeSpawn: () => {
-          this.assertBoundedRunCanContinue(options, "immediately before target-build spawn");
+          this.assertBoundedRunCanContinue(options, operationName, "immediately before spawn");
           options.beforeSpawn?.();
-          beforeOutput = reservation.assertStillReservedAndSnapshot();
+          beforeSpawnSnapshot = hooks.captureBeforeSpawn();
+          snapshotCaptured = true;
         },
         onSupervisedChild: (observed) => { supervised = observed; },
       });
@@ -1131,7 +1241,7 @@ export class WorkbenchSessionController {
         await this.waitForRunEndpointVacancy(
           execution,
           endpoint,
-          "Workbench target build",
+          `Workbench ${operationName}`,
           recoveryTimeoutMs
         );
         endpointVacant = true;
@@ -1152,19 +1262,19 @@ export class WorkbenchSessionController {
     }
     if (cleanupError) throw cleanupError;
     if (primaryError) throw primaryError;
-    if (!identity || !supervised || !lifecycleGeneration || beforeOutput === null ||
+    if (!identity || !supervised || !lifecycleGeneration || !snapshotCaptured ||
         !reason || !exit || !absenceProven || !endpointVacant) {
       throw new WorkbenchRunError(
-        "Workbench target build completed without a fully identity-bound process proof.",
+        `Workbench ${operationName} completed without a fully identity-bound process proof.`,
         "INCOMPLETE_PROOF"
       );
     }
     return Object.freeze({
-      planKind: "target_build" as const,
+      planKind: plan.kind,
       process: Object.freeze({ ...identity }),
       lifecycleGeneration,
       qualification: null,
-      beforeOutput,
+      beforeSpawnSnapshot,
       endpointVacancy: "verified" as const,
       exitStatus: Object.freeze({
         reason,
@@ -1201,13 +1311,17 @@ export class WorkbenchSessionController {
     }
   }
 
-  private assertBoundedRunCanContinue(options: BoundedRunOptions, stage: string): void {
+  private assertBoundedRunCanContinue(
+    options: BoundedRunOptions,
+    operationName: string,
+    stage: string
+  ): void {
     if (options.signal?.aborted) {
-      throw new WorkbenchRunError(`Workbench target build was aborted ${stage}.`, "ABORTED");
+      throw new WorkbenchRunError(`Workbench ${operationName} was aborted ${stage}.`, "ABORTED");
     }
     if (Date.now() >= options.deadlineMs) {
       throw new WorkbenchRunError(
-        `Workbench target build deadline expired ${stage}.`,
+        `Workbench ${operationName} deadline expired ${stage}.`,
         "DEADLINE_EXCEEDED"
       );
     }

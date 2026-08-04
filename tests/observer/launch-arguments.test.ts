@@ -116,6 +116,61 @@ describe("observer launch preparation", () => {
     });
   });
 
+  it.each(["-window", "-WINDOW", "-screenWidth", "-screenHeight", "-screenWidth=1280"])(
+    "refuses raw display override %s",
+    async (argument) => {
+      await withTemporaryDirectory((root) => {
+        const profile = join(root, "profiles", "run");
+        const search = join(root, "staged");
+        const addon = join(search, "ReforgerForgeObserver");
+        mkdirSync(profile, { recursive: true });
+        mkdirSync(addon, { recursive: true });
+
+        expect(() => mergeLaunchArguments({
+          arguments: [argument],
+          profilePath: profile,
+          addonSearchRoot: search,
+          stagedAddonPath: addon,
+          logsDirectoryName: "observer-test-session",
+          forceUpdate: false,
+          noFocus: false,
+        })).toThrowError(expect.objectContaining({
+          code: "ARGUMENT_CONFLICT",
+          message: expect.stringContaining("forceNonNativeWindowSize"),
+        }));
+      });
+    },
+  );
+
+  it("adds a non-native window size only through the exceptional structured override", async () => {
+    await withTemporaryDirectory((root) => {
+      const profile = join(root, "profiles", "run");
+      const search = join(root, "staged");
+      const addon = join(search, "ReforgerForgeObserver");
+      mkdirSync(profile, { recursive: true });
+      mkdirSync(addon, { recursive: true });
+
+      const result = mergeLaunchArguments({
+        arguments: ["-client"],
+        profilePath: profile,
+        addonSearchRoot: search,
+        stagedAddonPath: addon,
+        logsDirectoryName: "observer-test-session",
+        forceUpdate: true,
+        noFocus: true,
+        forceNonNativeWindowSize: {
+          width: 1280,
+          height: 720,
+          justification: "Native fullscreen is unavailable on the remote display.",
+        },
+      });
+
+      expect(result.slice(-5)).toEqual([
+        "-window", "-screenWidth", "1280", "-screenHeight", "720",
+      ]);
+    });
+  });
+
   it("keeps configured game and Workshop roots before caller roots and normalizes duplicates once", async () => {
     await withTemporaryDirectory((root) => {
       const profile = join(root, "profiles", "run");

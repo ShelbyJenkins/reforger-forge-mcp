@@ -11,6 +11,7 @@ import {
   buildMcpEditorLaunchPlan,
   buildMcpTargetResourceLaunchPlan,
   buildTargetBuildLaunchPlan,
+  buildTargetCheckLaunchPlan,
   buildWorkbenchLaunchPlan,
   canonicalizeWorkbenchAddonDirectories,
   ensureWorkbenchManagedBuildProfile,
@@ -74,6 +75,10 @@ function createHarness(root: string): LaunchHarness {
     "GameProject {",
     " ID ExampleMod",
     ' GUID "1122334455667788"',
+    " Configurations {",
+    "  GameProjectConfig PC {",
+    "  }",
+    " }",
     "}",
     "",
   ].join("\n"));
@@ -336,6 +341,51 @@ describe("canonical Workbench launch-plan policy", () => {
     expect(plan.argv.filter((arg) => arg.startsWith(WORKBENCH_OWNER_ARG_PREFIX))).toEqual([
       OWNER_ARGUMENT,
     ]);
+  });
+
+  scopedIt("builds a hidden compile-only Script Editor plan without build or helper arguments", (root) => {
+    const harness = createHarness(root);
+    const plan = buildTargetCheckLaunchPlan({
+      kind: "target_check",
+      config: harness.config,
+      project: harness.project,
+      ownerArgument: OWNER_ARGUMENT,
+      managedProfile: harness.buildProfile,
+      configuration: "PC",
+      timeoutMs: 120_000,
+    });
+
+    expect(plan).toMatchObject({
+      kind: "target_check",
+      window: "hidden",
+      process: "foreground",
+      helper: null,
+      readiness: { kind: "none" },
+      configuration: "PC",
+      lifetime: { kind: "bounded_exit", timeoutMs: 120_000, absoluteDeadline: true },
+      spawnOptions: { detached: false, windowsHide: true, shell: false },
+      targetAddon: { addonId: "ExampleMod", addonGuid: "1122334455667788" },
+    });
+    expect(plan.argv).toEqual([
+      "-addonsDir",
+      `${harness.baseAddonRoot},${harness.targetAddonRoot}`,
+      "-profile",
+      harness.buildProfile.profilePath,
+      "-noThrow",
+      "-scriptAuthorizeAll",
+      "-gproj",
+      harness.projectPath,
+      "-gprojConfig",
+      "PC",
+      OWNER_ARGUMENT,
+      "-wbModule=ScriptEditor",
+      "-validate",
+      "PC",
+      "-wbsilent",
+    ]);
+    expect(plan.argv).not.toContain("-run");
+    expect(plan.argv).not.toContain("-builddata");
+    expect(plan.argv).not.toContain("-addons");
   });
 
   scopedIt("returns deeply immutable policy objects and the one lifecycle target projection", (root) => {

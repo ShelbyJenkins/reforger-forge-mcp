@@ -6,6 +6,19 @@ import { canonicalizeExistingDirectory } from "./paths.js";
 
 const VALUE_FLAGS = new Set(["-profile", "-addonsdir", "-addons", "-logsdir"]);
 const OBSERVER_FLAGS = new Set([...VALUE_FLAGS, "-forceupdate", "-nofocus"]);
+const RAW_DISPLAY_ARGUMENTS = new Set(["-window", "-screenwidth", "-screenheight"]);
+
+export function assertNativeFullscreenArguments(argumentsArray: readonly string[]): void {
+  const conflicting = argumentsArray.find((token) =>
+    RAW_DISPLAY_ARGUMENTS.has(token.split("=", 1)[0].toLowerCase()),
+  );
+  if (conflicting) {
+    throw new ObserverError(
+      "ARGUMENT_CONFLICT",
+      `${conflicting} cannot be supplied through arguments. Omit display overrides for native fullscreen, or use forceNonNativeWindowSize with explicit dimensions and a compelling justification.`,
+    );
+  }
+}
 
 function key(path: string): string {
   const resolved = resolve(path);
@@ -39,9 +52,15 @@ export interface MergeLaunchArgumentsInput {
   logsDirectoryName: string;
   forceUpdate: boolean;
   noFocus: boolean;
+  forceNonNativeWindowSize?: {
+    width: number;
+    height: number;
+    justification: string;
+  };
 }
 
 export function mergeLaunchArguments(input: MergeLaunchArgumentsInput): string[] {
+  assertNativeFullscreenArguments(input.arguments);
   const profilePath = canonicalizeExistingDirectory(input.profilePath, "Observer profile");
   const addonSearchRoot = canonicalizeExistingDirectory(input.addonSearchRoot, "Observer addon search root");
   const stagedAddonPath = canonicalizeExistingDirectory(input.stagedAddonPath, "Staged observer addon");
@@ -129,5 +148,12 @@ export function mergeLaunchArguments(input: MergeLaunchArgumentsInput): string[]
   ];
   if (input.forceUpdate || forceUpdateSeen) result.push("-forceUpdate");
   if (input.noFocus || noFocusSeen) result.push("-noFocus");
+  if (input.forceNonNativeWindowSize) {
+    result.push(
+      "-window",
+      "-screenWidth", String(input.forceNonNativeWindowSize.width),
+      "-screenHeight", String(input.forceNonNativeWindowSize.height),
+    );
+  }
   return result;
 }

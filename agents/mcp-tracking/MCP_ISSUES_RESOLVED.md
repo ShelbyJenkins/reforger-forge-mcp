@@ -5,7 +5,96 @@ records. Move newly resolved or verified entries to the top. The legacy records
 below were migrated from the mixed tracker on 2026-07-28; same-day ties retain
 their migration order.
 
-### MCP-047 - project MCP launchers had no safe inspection or same-arguments verification path
+## MCP-004 - material validation could not resolve inherited stock dependencies
+
+**Status:** Resolved
+
+**Severity:** Non-breaking validation limitation
+
+**Observed:** 2026-07-28
+
+**Closed:** 2026-08-03
+
+**Resolution:** The path-bound material helper no longer delegates texture
+reference checks to the stock `MaterialValidatorUtils.CheckTextures` routine.
+That routine requires source metafiles only to derive absolute source-texture
+paths for a separate consumer, but this helper never consumes those paths.
+Packed base-game textures can therefore be registered and loadable without
+exposing the loose source metadata that routine expects.
+
+The helper now validates each effective `.edds` reference directly: malformed
+or unresolved GUIDs remain fatal, and the stock slot/suffix compatibility check
+still runs. Standalone `action: "texture"` validation continues to require
+registered source metadata because it actually inspects import configuration.
+The public tool description and focused response tests state the same split.
+
+**Verification:** Workbench 1.7.0.54 compiled the PC WorkbenchGame module with
+no script errors for helper build
+`080399d444e0815b73cedf1b7542e562361c55e88ccf28f8c28b12de873893d1`
+(bundle
+`5019e91efdc60776bbed454975d799d7d7d46dcf1ccc9bbc74aad693578a7d14`).
+Live validation of Arcade Vehicles' Sedan Body Blue, Body Red, Interior Blue,
+and Interior Red wrappers returned `status: "ok"`, `valid: true`, and no fatal
+or metafile findings. Each retained the same 14 inherited severity-2 material
+advisories, confirming the result still reports real nonfatal checks.
+
+Two isolated registered negative fixtures also remained fail-closed. A missing
+texture GUID returned exactly one severity-3 unresolved-GUID finding, while an
+NMO texture assigned to `BCRMap` returned exactly one severity-3 incompatible
+slot finding; both returned `valid: false`. Each acceptance transaction first
+qualified the exact new helper identity above. Final diagnostics confirmed that
+Workbench was absent, the endpoint refused connections, and the shared
+lifecycle was vacant after acceptance cleanup. TypeScript typecheck and build,
+helper manifest consistency, 21 focused helper/tool/Enforce-contract tests, and
+the packed production-install/CLI smoke check also pass. After cleanup, both
+real multi-process lifecycle ownership tests passed against the vacant endpoint.
+
+## MCP-053 - graphical launches could still opt into tiny windows casually
+
+**Status:** Resolved
+
+**Priority:** P1
+
+**Observed:** 2026-08-03
+
+**Closed:** 2026-08-03
+
+**Decision:** Native borderless fullscreen is the normal graphical Observer
+launch. Screenshot dimensions are an output concern handled by
+`observer_capture.image`; they are not a reason to shrink the renderer. A
+non-native window must be an explicit exception rather than an arbitrary launch
+argument.
+
+**Resolution:** `observer_prepare_launch` now refuses raw `-window`,
+`-screenWidth`, and `-screenHeight` tokens at both the public MCP boundary and
+the private launch normalizer. The only supported direct override is the
+deliberately named `forceNonNativeWindowSize` object, which requires bounded
+width and height plus a 20-to-512-character justification and is invalid for a
+dedicated runtime. `observer_runtime` preserves the prepared choice and exposes
+no second display-size control.
+
+The obsolete 1280x720 override was removed from the live Workbench Observer
+acceptance launcher, and its shared launch helper now rejects display-size
+tokens so the override cannot return accidentally. Runtime acceptance launch
+helpers follow the same policy. Public tool descriptions, the Observer guide,
+maintainer documentation, coding-agent guidance, release notes, and the older
+MCP-036 record now agree on the superseding contract.
+
+**Verification:** Seven focused schema, preparation, HTTP, persistence, runtime
+argument, and Workbench acceptance-contract suites pass 57/57 tests. TypeScript
+typecheck and both package builds pass. The packed tarball passes a fresh
+production-only install, both advertised CLI binaries, Enforce descriptors, and
+public-projection/mailbox import checks. After building the package, the
+complete offline suite passes with only
+`tests/workbench/multiprocess-lifecycle.test.ts` excluded; that unchanged
+Windows test independently refuses its initial idle lease claim in this
+environment. Every other test file passes, and an isolated rerun reproduces the
+same unrelated refusal. No live Workbench or game runtime was launched for this
+change; the retained live runtime procedure still asserts monitor coverage,
+popup style, and absence of caption/thick-frame chrome before accepting a
+graphical run.
+
+## MCP-047 - project MCP launchers had no safe inspection or same-arguments verification path
 
 **Status:** Resolved
 
@@ -48,7 +137,7 @@ installed-package smoke test passes with the shared launcher present. These
 checks launched bounded verifier processes only; they did not launch Workbench
 or a game runtime.
 
-### MCP-046 - generic `wb_launch` repeatedly minimizes the attended editor
+## MCP-046 - generic `wb_launch` repeatedly minimizes the attended editor
 
 **Status:** Resolved
 
@@ -82,7 +171,7 @@ endpoint, mutex, and exact-termination tests, while a source contract verifies
 per-window handle deduplication. No live Workbench process was launched during
 this offline verification.
 
-### MCP-035 — decide whether exact-owned runtime profile logs are supporting evidence
+## MCP-035 — decide whether exact-owned runtime profile logs are supporting evidence
 
 **Status:** Resolved
 
@@ -121,7 +210,7 @@ typecheck, unused-code analysis, both production builds, compiled MCP
 handshake/tool-registration verification, protocol check, and Observer source
 manifest checks also pass.
 
-### MCP-031 — review the implemented `game_duplicate` contract
+## MCP-031 — review the implemented `game_duplicate` contract
 
 **Status:** Resolved
 
@@ -151,7 +240,7 @@ invalid source traversal, and cross-project deferred-registration rejection.
 The full repository test suite, typecheck, unused-code analysis, compiled MCP
 build, and fresh-process MCP handshake/tool-registration verification also pass.
 
-### MCP-007 — guarded build did not classify a Workbench access violation
+## MCP-007 — guarded build did not classify a Workbench access violation
 
 **Status:** Resolved
 
@@ -190,7 +279,7 @@ The MCP tool coverage verifies that unsuccessful receipts remain `isError` and
 retain their structured classification, and CLI coverage verifies portable
 exit-code mapping and normalized access-violation metadata.
 
-### MCP-002 — a running stdio MCP does not reload a repaired local build
+## MCP-002 — a running stdio MCP does not reload a repaired local build
 
 **Status:** Verified — accepted behavior
 
@@ -216,7 +305,7 @@ original stale generated `UserMaps.desc` observation was the separate MCP-001
 helper-staging defect; its generated-file handling and cleanup were fixed and
 verified independently.
 
-### MCP-043 — fullscreen observer captures can exceed retained-image limits
+## MCP-043 — fullscreen observer captures can exceed retained-image limits
 
 **Status:** Resolved
 
@@ -276,7 +365,7 @@ Producer-side runtime raw-data capture remains a separate optional
 optimization. Runtime output is already bounded before durable artifact
 promotion, so that optimization is not required to resolve this issue.
 
-### MCP-003 — evidence runs may span a Workbench lifecycle restart
+## MCP-003 — evidence runs may span a Workbench lifecycle restart
 
 **Status:** Resolved
 
@@ -299,7 +388,7 @@ Workbench captures with distinct instance and world identities, then finalizes
 both in one reviewed bundle. The focused test suite passed (15 tests) without
 starting an MCP host, Workbench, or Arma client.
 
-### MCP-039 — provide a safe way to release or transfer an idle lifecycle lease
+## MCP-039 — provide a safe way to release or transfer an idle lifecycle lease
 
 **Status:** Resolved
 
@@ -369,7 +458,7 @@ TypeScript typecheck, and knip passed.
 
 ## Historical and verified records
 
-### MCP-030 — remove configured `projectPath` targeting
+## MCP-030 — remove configured `projectPath` targeting
 
 **Status:** Resolved
 
@@ -394,7 +483,7 @@ target-resolution, project-identity, generators, duplication, prompts, setup,
 and Workbench lifecycle tests cover exact and active targeting. The full
 Vitest suite, TypeScript typecheck, and production build passed.
 
-### MCP-029 — `observer_capture` uses only the opaque world revision
+## MCP-029 — `observer_capture` uses only the opaque world revision
 
 **Status:** Resolved
 
@@ -421,7 +510,7 @@ callers, package guidance, and MCP response tests use the canonical revision.
 The focused observer contract suite passed 97 tests; the full Vitest suite,
 TypeScript typecheck, MCP build, and Observer build also passed.
 
-### MCP-026 — old release notes describe their release-time API surface
+## MCP-026 — old release notes describe their release-time API surface
 
 **Status:** Verified
 
@@ -432,7 +521,7 @@ archived plans are not live API reference. Current MCP schemas and guides are
 the present-behavior source; historical material is not used by verification or
 package contracts as canonical documentation.
 
-### MCP-018 — explicit resource save workflow
+## MCP-018 — explicit resource save workflow
 
 **Status:** Verified
 
@@ -447,7 +536,7 @@ wb_save_resource(confirm: "save", resourcePath)
 
 The target must be the same `.ent` or `.et` resource supplied at launch.
 
-### MCP-017 — evidence roots are needed only for finalization
+## MCP-017 — evidence roots are needed only for finalization
 
 **Status:** Verified
 

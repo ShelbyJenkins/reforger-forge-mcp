@@ -647,7 +647,7 @@ export function makeHarness(options: {
   });
   openManagers.push(manager);
   const prepare = async (
-    argumentsArray = ["-window", "-noSplash"],
+    argumentsArray = ["-noSplash", "-forceUpdate"],
     idempotencyKey?: string,
     runtimeKind: ObserverLaunchInput["runtimeKind"] = "listenServer"
   ) => {

@@ -43,7 +43,7 @@ export function registerObserverRuntime(
     "observer_runtime",
     {
       description:
-        "Explicitly start, inspect, or stop one exact-owned graphical Arma Reforger runtime from an observer_prepare_launch descriptor. Start uses a visible structured spawn without a shell; status and stop require PID, canonical executable, Windows creation time, and an exact owner argument. Stop seals the observer session and refuses until camera restoration is proven.",
+        "Explicitly start, inspect, or stop one exact-owned graphical Arma Reforger runtime from an observer_prepare_launch descriptor. Start preserves that descriptor's native-fullscreen default or its exceptional forceNonNativeWindowSize choice; this tool has no independent display-size override. Start uses a visible structured spawn without a shell; status and stop require PID, canonical executable, Windows creation time, and an exact owner argument. Stop seals the observer session and refuses until camera restoration is proven.",
       inputSchema: {
         action: z.enum(["start", "status", "stop"]),
         preparedLaunchId: z.string().regex(/^pl-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/).optional(),

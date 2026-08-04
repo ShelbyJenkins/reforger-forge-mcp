@@ -83,6 +83,46 @@ const imageOutputSchema = z.object({
     value.maxWidth * value.maxHeight <= 32_000_000,
   { message: "requested image bounds exceed the 32000000-pixel limit" },
 );
+const forceNonNativeWindowSizeSchema = z.object({
+  width: z.number().int().min(640).max(16_384).describe(
+    "Exceptional window width in pixels.",
+  ),
+  height: z.number().int().min(480).max(16_384).describe(
+    "Exceptional window height in pixels.",
+  ),
+  justification: z.string().trim().min(20).max(512).describe(
+    "Why native fullscreen cannot be used. Screenshot size is not a valid reason; bound observer_capture image output instead.",
+  ),
+}).strict().describe(
+  "Exceptional opt-in to a non-native window size. Omit this field for the native fullscreen default.",
+);
+const RAW_DISPLAY_ARGUMENTS = new Set(["-window", "-screenwidth", "-screenheight"]);
+
+function rawDisplayArgument(argumentsArray: readonly string[]): string | undefined {
+  return argumentsArray.find((token) =>
+    RAW_DISPLAY_ARGUMENTS.has(token.split("=", 1)[0].toLowerCase()),
+  );
+}
+
+function assertNativeFullscreenLaunch(input: {
+  runtimeKind: string;
+  arguments: readonly string[];
+  forceNonNativeWindowSize?: unknown;
+}): void {
+  const conflicting = rawDisplayArgument(input.arguments);
+  if (conflicting) {
+    throw new ObserverApplicationError(
+      "ARGUMENT_CONFLICT",
+      `${conflicting} cannot be supplied through arguments. Omit display overrides for native fullscreen, or use forceNonNativeWindowSize with explicit dimensions and a compelling justification.`,
+    );
+  }
+  if (input.runtimeKind === "dedicated" && input.forceNonNativeWindowSize !== undefined) {
+    throw new ObserverApplicationError(
+      "INVALID_REQUEST",
+      "forceNonNativeWindowSize is valid only for a graphical runtime",
+    );
+  }
+}
 export interface ObserverToolDefaults {
   sessionTtlMs?: number;
   defaultCaptureTimeoutMs?: number;
@@ -243,21 +283,25 @@ export function registerObserverTools(
     "observer_prepare_launch",
     {
       description:
-        "Prepare an existing Arma Reforger argument array for the staged observer addon and an exclusive profile session. Returns tokens as a structured array and session metadata; never starts the game. Conflicting profile/addon arguments are refused. Defaults to launching fullscreen in the background (-noFocus -forceUpdate) so the game never steals window focus; pass noFocus: false / forceUpdate: false or include -window in arguments to opt out.",
+        "Prepare an Arma Reforger launch for the staged observer addon and an exclusive profile session; no process is started. Graphical launches use the engine's native borderless-fullscreen window by default. Raw -window, -screenWidth, and -screenHeight arguments are refused. Use forceNonNativeWindowSize only when native fullscreen cannot be used for a compelling reason; screenshot size is handled by observer_capture image bounds and is not a reason to shrink the launch. Defaults -noFocus and -forceUpdate keep the fullscreen runtime from stealing startup focus.",
       inputSchema: {
         runtimeKind: z.enum(["client", "listenServer", "dedicated", "testRunner"]),
-        arguments: z.array(z.string().max(32_768)).max(512).default([]),
+        arguments: z.array(z.string().max(32_768)).max(512).default([]).describe(
+          "Additional engine argument tokens. Do not include -window, -screenWidth, or -screenHeight; native fullscreen is the default.",
+        ),
         profilePath: z.string().min(1).max(32_768),
         sessionTtlMs: z.number().int().min(1_000).max(24 * 60 * 60 * 1_000)
           .default(sessionTtlMs),
         transportPreference: z.array(z.enum(["rest", "mailbox"])).min(1).max(2).default(["rest", "mailbox"]),
         forceUpdate: z.boolean().default(true),
         noFocus: z.boolean().default(true),
+        forceNonNativeWindowSize: forceNonNativeWindowSizeSchema.optional(),
         idempotencyKey: z.string().min(1).max(128).optional(),
       },
     },
     async (input) => {
       try {
+        assertNativeFullscreenLaunch(input);
         const prepared = await prepareObserverLaunch(
           application,
           {

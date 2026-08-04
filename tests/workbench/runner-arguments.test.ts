@@ -16,6 +16,15 @@ describe("standalone Workbench runner argument contract", () => {
       outputPath: "out",
       timeoutMs: 300_000,
     });
+    expect(parseWorkbenchRunnerArguments([
+      "check", "--gproj", "C:\\mods\\Example\\Example.gproj",
+      "--configuration", "PC", "--timeout-ms", "120000",
+    ])).toEqual({
+      kind: "check",
+      gprojPath: "C:\\mods\\Example\\Example.gproj",
+      configuration: "PC",
+      timeoutMs: 120_000,
+    });
   });
 
   it("rejects detached, arbitrary-argument, unbounded, and non-PC modes", () => {
@@ -32,6 +41,13 @@ describe("standalone Workbench runner argument contract", () => {
       "build", "--gproj", "Example.gproj", "--platform", "Console",
       "--output", "out", "--timeout-ms", "1000",
     ])).toThrow(/must be PC/i);
+    expect(() => parseWorkbenchRunnerArguments([
+      "check", "--gproj", "Example.gproj", "--configuration", "PC",
+      "--timeout-ms", "120000",
+    ])).toThrow(/absolute/i);
+    expect(() => parseWorkbenchRunnerArguments([
+      "check", "--gproj", "C:\\mods\\Example\\Example.gproj", "--configuration", "UNKNOWN CONFIG",
+      "--timeout-ms", "120000",
+    ])).toThrow(/configuration identifier/i);
   });
 });
-

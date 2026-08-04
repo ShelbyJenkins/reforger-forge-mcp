@@ -17,7 +17,7 @@ describe("OwnedRuntimeManager", () => {
   describe("spawn and receipt publication", () => {
   it("spawns exact structured arguments visibly without a shell and publishes a complete restrictive receipt", async () => {
     const value = makeHarness();
-    const argumentsArray = ["-window", "-screenWidth", "1280"];
+    const argumentsArray = ["-noSplash", "-server", "world"];
     const prepared = await value.prepare(argumentsArray, "prepare-1");
     argumentsArray.push("-mutated-after-recording");
 
@@ -27,7 +27,7 @@ describe("OwnedRuntimeManager", () => {
     expect(value.spawnCalls).toHaveLength(1);
     const call = value.spawnCalls[0];
     expect(call.executable).toBe(value.executable);
-    expect(call.arguments.slice(0, -1)).toEqual(["-window", "-screenWidth", "1280"]);
+    expect(call.arguments.slice(0, -1)).toEqual(["-noSplash", "-server", "world"]);
     expect(call.arguments.filter((argument) => argument.startsWith(OWNED_RUNTIME_OWNER_ARGUMENT_PREFIX))).toHaveLength(1);
     expect(call.options).toMatchObject({
       cwd: value.root,
@@ -147,7 +147,7 @@ describe("OwnedRuntimeManager", () => {
   it("makes prepared launches one-shot while replaying exact start idempotency", async () => {
     const value = makeHarness();
     const first = await value.prepare();
-    const second = await value.prepare(["-window", "-server", "world"]);
+    const second = await value.prepare(["-noSplash", "-server", "world"]);
     const started = await value.startPrepared(first.id, "start-key");
     const replay = await value.startPrepared(first.id, "start-key");
     expect(replay.runtimeId).toBe(started.runtimeId);

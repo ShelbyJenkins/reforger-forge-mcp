@@ -56,6 +56,7 @@ export type { WorkbenchLifecycleTarget } from "./session-state.js";
 
 const WORKBENCH_SUBDIRECTORY = "Workbench";
 const MAX_BUILD_TIMEOUT_MS = 60 * 60 * 1_000;
+const MAX_CHECK_TIMEOUT_MS = 10 * 60 * 1_000;
 const ADDON_ID_PATTERN = /^[A-Za-z0-9_.-]{1,128}$/;
 const ADDON_GUID_PATTERN = /^[A-Fa-f0-9]{16}$/;
 const SHA256_PATTERN = /^[a-f0-9]{64}$/;
@@ -67,6 +68,7 @@ export type WorkbenchLaunchPlanErrorCode =
   | "INVALID_ENDPOINT"
   | "INVALID_COMPANION"
   | "INVALID_BUILD"
+  | "INVALID_CHECK"
   | "PATH_OVERLAP"
   | "INVALID_COMBINATION";
 
@@ -120,11 +122,14 @@ export interface WorkbenchCompanionReadinessPolicy {
   }>;
 }
 
-export interface WorkbenchTargetBuildIdentity {
+export interface WorkbenchTargetAddonIdentity {
   readonly addonId: string;
   readonly addonGuid: string;
   readonly sourceSha256: string;
 }
+
+/** @deprecated Use the operation-neutral target add-on identity. */
+export type WorkbenchTargetBuildIdentity = WorkbenchTargetAddonIdentity;
 
 interface WorkbenchLaunchPlanBase {
   readonly executablePath: string;
@@ -193,14 +198,31 @@ export interface TargetBuildLaunchPlan extends WorkbenchLaunchPlanBase {
   readonly platform: "PC";
   readonly outputPath: string;
   readonly buildProfile: Readonly<WorkbenchManagedBuildProfile>;
-  readonly targetAddon: Readonly<WorkbenchTargetBuildIdentity>;
+  readonly targetAddon: Readonly<WorkbenchTargetAddonIdentity>;
+}
+
+export interface TargetCheckLaunchPlan extends WorkbenchLaunchPlanBase {
+  readonly kind: "target_check";
+  readonly window: "hidden";
+  readonly process: "foreground";
+  readonly helper: null;
+  readonly readiness: Readonly<{ kind: "none" }>;
+  readonly lifetime: Readonly<{
+    kind: "bounded_exit";
+    timeoutMs: number;
+    absoluteDeadline: true;
+  }>;
+  readonly configuration: string;
+  readonly managedProfile: Readonly<WorkbenchManagedBuildProfile>;
+  readonly targetAddon: Readonly<WorkbenchTargetAddonIdentity>;
 }
 
 export type WorkbenchLaunchPlan =
   | McpEditorLaunchPlan
   | McpTargetResourceLaunchPlan
   | CliEditorLaunchPlan
-  | TargetBuildLaunchPlan;
+  | TargetBuildLaunchPlan
+  | TargetCheckLaunchPlan;
 
 interface EditorLaunchPlanInputBase {
   readonly config: WorkbenchLaunchConfiguration;
@@ -236,11 +258,22 @@ export interface TargetBuildLaunchPlanInput {
   readonly timeoutMs: number;
 }
 
+export interface TargetCheckLaunchPlanInput {
+  readonly kind: "target_check";
+  readonly config: WorkbenchLaunchConfiguration;
+  readonly project: CanonicalProjectIdentity;
+  readonly ownerArgument: string;
+  readonly managedProfile: WorkbenchManagedBuildProfile;
+  readonly configuration: string;
+  readonly timeoutMs: number;
+}
+
 export type WorkbenchLaunchPlanInput =
   | McpEditorLaunchPlanInput
   | McpTargetResourceLaunchPlanInput
   | CliEditorLaunchPlanInput
-  | TargetBuildLaunchPlanInput;
+  | TargetBuildLaunchPlanInput
+  | TargetCheckLaunchPlanInput;
 
 export interface LegacyWorkbenchCompanionLaunchArguments {
   readonly addonGuid: string;
@@ -867,7 +900,7 @@ export function buildCliEditorLaunchPlan(
   });
 }
 
-function resolveTargetBuildIdentity(project: CanonicalProjectIdentity): WorkbenchTargetBuildIdentity {
+function resolveTargetAddonIdentity(project: CanonicalProjectIdentity): WorkbenchTargetAddonIdentity {
   let source: Buffer;
   let document;
   try {
@@ -876,7 +909,7 @@ function resolveTargetBuildIdentity(project: CanonicalProjectIdentity): Workbenc
   } catch (error) {
     throw planError(
       "INVALID_TARGET",
-      `Workbench build project could not be parsed: ${project.displayPath} ` +
+      `Workbench target project could not be parsed: ${project.displayPath} ` +
         `(${error instanceof Error ? error.message : String(error)})`
     );
   }
@@ -886,7 +919,7 @@ function resolveTargetBuildIdentity(project: CanonicalProjectIdentity): Workbenc
       typeof addonGuid !== "string" || !ADDON_GUID_PATTERN.test(addonGuid)) {
     throw planError(
       "INVALID_TARGET",
-      `Workbench build project must declare one safe GameProject ID and GUID: ` +
+      `Workbench target project must declare one safe GameProject ID and GUID: ` +
         `${project.displayPath}`
     );
   }
@@ -895,6 +928,50 @@ function resolveTargetBuildIdentity(project: CanonicalProjectIdentity): Workbenc
     addonGuid: addonGuid.toUpperCase(),
     sourceSha256: createHash("sha256").update(source).digest("hex"),
   });
+}
+
+function targetOnlyAddonDirectories(
+  config: WorkbenchLaunchConfiguration,
+  project: CanonicalProjectIdentity,
+  profile: Readonly<WorkbenchManagedBuildProfile>,
+  operation: "build" | "check"
+): readonly string[] {
+  const targetAddonSearchRoot = canonicalDirectory(
+    dirname(project.modDirectory),
+    "Workbench target add-on search root"
+  );
+  const addonDirectories = mergeAddonDirectories(
+    config.workbenchAddonDirs,
+    [targetAddonSearchRoot]
+  );
+  for (const addonDirectory of addonDirectories) {
+    if (pathsOverlap(addonDirectory, profile.managedRoot)) {
+      throw planError(
+        operation === "build" ? "INVALID_BUILD" : "INVALID_CHECK",
+        `Target-${operation} add-on roots must not include the private managed root or helper roots.`
+      );
+    }
+    const helperCandidate = basename(addonDirectory).toLowerCase() ===
+      WORKBENCH_HELPER_ADDON_ID.toLowerCase()
+      ? addonDirectory
+      : join(addonDirectory, WORKBENCH_HELPER_ADDON_ID);
+    try {
+      if (existsSync(helperCandidate) && statSync(helperCandidate).isDirectory()) {
+        throw planError(
+          operation === "build" ? "INVALID_BUILD" : "INVALID_CHECK",
+          `Target-${operation} add-on roots must not expose ${WORKBENCH_HELPER_ADDON_ID}.`
+        );
+      }
+    } catch (error) {
+      if (error instanceof WorkbenchLaunchPlanError) throw error;
+      throw planError(
+        operation === "build" ? "INVALID_BUILD" : "INVALID_CHECK",
+        `Target-${operation} helper exclusion could not be proven for ${addonDirectory}: ` +
+          `${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+  }
+  return addonDirectories;
 }
 
 function validateOutputPath(
@@ -954,46 +1031,13 @@ export function buildTargetBuildLaunchPlan(
     throw error;
   }
   const outputPath = validateOutputPath(input.outputPath, projectIdentity, buildProfile);
-  const targetAddon = resolveTargetBuildIdentity(projectIdentity);
-  const targetAddonSearchRoot = canonicalDirectory(
-    dirname(projectIdentity.modDirectory),
-    "Workbench target add-on search root"
+  const targetAddon = resolveTargetAddonIdentity(projectIdentity);
+  const addonDirectories = targetOnlyAddonDirectories(
+    input.config,
+    projectIdentity,
+    buildProfile,
+    "build"
   );
-  const addonDirectories = mergeAddonDirectories(
-    input.config.workbenchAddonDirs,
-    [targetAddonSearchRoot]
-  );
-  for (const addonDirectory of addonDirectories) {
-    if (pathsOverlap(addonDirectory, buildProfile.managedRoot)) {
-      throw planError(
-        "INVALID_BUILD",
-        "Target-build add-on roots must not include the private managed root or helper roots."
-      );
-    }
-    // The helper can also be supplied from an externally configured add-on
-    // search root that does not overlap this process's managed directory.
-    // Target-only plans must reject that capability by identity, not merely by
-    // checking the default managed path.
-    const helperCandidate = basename(addonDirectory).toLowerCase() ===
-      WORKBENCH_HELPER_ADDON_ID.toLowerCase()
-      ? addonDirectory
-      : join(addonDirectory, WORKBENCH_HELPER_ADDON_ID);
-    try {
-      if (existsSync(helperCandidate) && statSync(helperCandidate).isDirectory()) {
-        throw planError(
-          "INVALID_BUILD",
-          `Target-build add-on roots must not expose ${WORKBENCH_HELPER_ADDON_ID}.`
-        );
-      }
-    } catch (error) {
-      if (error instanceof WorkbenchLaunchPlanError) throw error;
-      throw planError(
-        "INVALID_BUILD",
-        `Target-build helper exclusion could not be proven for ${addonDirectory}: ` +
-          `${error instanceof Error ? error.message : String(error)}`
-      );
-    }
-  }
 
   const args: string[] = [];
   if (addonDirectories.length > 0) args.push("-addonsDir", addonDirectories.join(","));
@@ -1045,6 +1089,108 @@ export function buildTargetBuildLaunchPlan(
   });
 }
 
+export function buildTargetCheckLaunchPlan(
+  input: TargetCheckLaunchPlanInput
+): TargetCheckLaunchPlan {
+  assertNoFields(input, [
+    "companion",
+    "endpoint",
+    "managedRoot",
+    "outputPath",
+    "platform",
+    "argv",
+    "spawnOptions",
+    "foreground",
+    "detached",
+    "windowsHide",
+    "shell",
+    "noThrow",
+    "run",
+    "module",
+  ], input.kind);
+  if (!/^[A-Za-z0-9_.-]{1,64}$/.test(input.configuration)) {
+    throw planError(
+      "INVALID_CHECK",
+      "Target check configuration must be a safe non-empty configuration identifier."
+    );
+  }
+  if (!Number.isSafeInteger(input.timeoutMs) || input.timeoutMs <= 0 ||
+      input.timeoutMs > MAX_CHECK_TIMEOUT_MS) {
+    throw planError(
+      "INVALID_CHECK",
+      `Target check timeoutMs must be between 1 and ${MAX_CHECK_TIMEOUT_MS}.`
+    );
+  }
+
+  const projectIdentity = revalidateProjectIdentity(input.project);
+  const project = immutableProject(projectIdentity);
+  const executablePath = resolveWorkbenchExecutablePath(input.config);
+  const ownerArgument = validateOwnerArgument(input.ownerArgument);
+  let managedProfile: Readonly<WorkbenchManagedBuildProfile>;
+  try {
+    managedProfile = validateWorkbenchManagedBuildProfile(input.managedProfile, projectIdentity);
+  } catch (error) {
+    if (error instanceof WorkbenchManagedBuildProfileError) {
+      throw planError(error.code, error.message);
+    }
+    throw error;
+  }
+  const targetAddon = resolveTargetAddonIdentity(projectIdentity);
+  const addonDirectories = targetOnlyAddonDirectories(
+    input.config,
+    projectIdentity,
+    managedProfile,
+    "check"
+  );
+
+  const args: string[] = [];
+  if (addonDirectories.length > 0) args.push("-addonsDir", addonDirectories.join(","));
+  args.push("-profile", managedProfile.profilePath, "-noThrow");
+  if (input.config.workbenchScriptAuthorizeAll === true) args.push("-scriptAuthorizeAll");
+  args.push(
+    "-gproj",
+    projectIdentity.displayPath,
+    "-gprojConfig",
+    input.configuration,
+    ownerArgument,
+    "-wbModule=ScriptEditor",
+    "-validate",
+    input.configuration,
+    "-wbsilent"
+  );
+  const argv = immutableArguments(args, ownerArgument);
+  if (argv.includes("-run") || argv.includes("-addons") || argv.includes("-builddata") ||
+      argv.includes(WORKBENCH_HELPER_ADDON_GUID)) {
+    throw planError(
+      "INVALID_CHECK",
+      "Target-check arguments must remain helper-free and compile-only."
+    );
+  }
+
+  return Object.freeze({
+    kind: "target_check",
+    window: "hidden",
+    process: "foreground",
+    executablePath,
+    project,
+    lifecycleTarget: toLifecycleTarget(projectIdentity),
+    addonDirectories,
+    ownerArgument,
+    argv,
+    spawnOptions: spawnPolicy(dirname(executablePath), false, true, "normal"),
+    helper: null,
+    readiness: Object.freeze({ kind: "none" }),
+    lifetime: Object.freeze({
+      kind: "bounded_exit",
+      timeoutMs: input.timeoutMs,
+      absoluteDeadline: true,
+    }),
+    configuration: input.configuration,
+    managedProfile,
+    targetAddon,
+  });
+}
+
 export function buildWorkbenchLaunchPlan(
   input: WorkbenchLaunchPlanInput
 ): WorkbenchLaunchPlan {
@@ -1058,6 +1204,8 @@ export function buildWorkbenchLaunchPlan(
       return buildCliEditorLaunchPlan(input);
     case "target_build":
       return buildTargetBuildLaunchPlan(input);
+    case "target_check":
+      return buildTargetCheckLaunchPlan(input);
     default:
       throw planError(
         "INVALID_COMBINATION",

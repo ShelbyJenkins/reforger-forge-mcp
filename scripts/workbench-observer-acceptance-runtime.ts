@@ -243,6 +243,16 @@ export function workbenchObserverAcceptanceLaunchArguments(
   argumentsArray: readonly string[],
   additionalLaunchArguments: readonly string[] = []
 ): string[] {
+  const displayOverride = [...argumentsArray, ...additionalLaunchArguments].find((token) =>
+    ["-window", "-screenwidth", "-screenheight"].includes(
+      token.split("=", 1)[0].toLowerCase(),
+    ),
+  );
+  if (displayOverride) {
+    throw new Error(
+      `Workbench Observer acceptance does not permit forced window sizing; ${displayOverride} is not accepted`,
+    );
+  }
   const actualArguments = [...argumentsArray, "-forceUpdate"];
   actualArguments.push(...additionalLaunchArguments);
   return actualArguments;

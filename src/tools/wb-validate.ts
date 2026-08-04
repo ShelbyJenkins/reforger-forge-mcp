@@ -64,7 +64,7 @@ export function registerWbValidate(server: McpServer, client: WorkbenchClient): 
     "wb_validate",
     {
       description:
-        "Validate one registered material or texture resource through a path-bound Workbench helper. Fatal findings are returned as an error; advisory findings remain explicit.",
+        "Validate one registered material or texture resource through a path-bound Workbench helper. Material checks cover parameters, resolvable texture GUIDs, and slot/suffix compatibility without requiring loose source metadata for packed dependencies; texture checks cover registered source import metadata. Fatal findings are returned as an error; advisory findings remain explicit.",
       inputSchema: {
         action: z
           .enum(["material", "texture"])

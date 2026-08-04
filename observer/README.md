@@ -135,9 +135,12 @@ Launch preparation produces a one-shot, immutable descriptor bound to an
 Observer session, profile, and expiration. The descriptor contains one merged
 `-addonsDir`, one merged `-addons`, the matching `-profile`, a session-specific
 relative `-logsDir`, and defaults for `-forceUpdate` and `-noFocus` unless
-callers opt out. Caller-supplied `-logsDir` values are refused. Graphical launches retain
-the engine's fullscreen default; pass `-window` (and optional dimensions) only
-when a visible windowed launch is intentional.
+callers opt out. Caller-supplied `-logsDir` values are refused. Graphical
+launches use the engine's native borderless fullscreen by default. Raw
+`-window`, `-screenWidth`, and `-screenHeight` tokens are refused;
+`forceNonNativeWindowSize` is the exceptional opt-out and requires bounded
+dimensions plus a meaningful justification. Capture size belongs in
+`observer_capture.image`, not in the launch window.
 
 The optional Windows runtime manager resolves an allowlisted graphical
 executable beneath the configured game path and uses a visible direct spawn

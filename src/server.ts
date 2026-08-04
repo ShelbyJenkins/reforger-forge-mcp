@@ -32,6 +32,7 @@ import {
 import { WorkbenchObserverAdapter } from "./workbench/observer-adapter.js";
 import { registerWbLaunch } from "./tools/wb-launch.js";
 import { registerWbBuild } from "./tools/wb-build.js";
+import { registerWbCheck } from "./tools/wb-check.js";
 import { registerWbLogQuery } from "./tools/wb-log-query.js";
 import { registerWbConnect } from "./tools/wb-connect.js";
 import { registerWbDiagnose } from "./tools/wb-diagnose.js";
@@ -211,6 +212,10 @@ export function registerTools(server: McpServer, config: Config): RegisteredTool
   registerWbLaunch(server, wbClient);
   registerWbBuild(server, config, wbClient, {
     companionProvider: workbenchComposition.companionProvider,
+    managedRoot: observerConfig?.managedRoot ?? defaultWorkbenchHelperManagedRoot(),
+    processGuard: workbenchComposition.processGuard,
+  });
+  registerWbCheck(server, config, wbClient, {
     managedRoot: observerConfig?.managedRoot ?? defaultWorkbenchHelperManagedRoot(),
     processGuard: workbenchComposition.processGuard,
   });

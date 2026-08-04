@@ -8,10 +8,10 @@ This document is deliberately about coding-tool use and workflows. Installation,
 client registration, machine paths, and configuration troubleshooting belong in
 the setup documentation instead:
 
-- [Setup and configuration](https://github.com/wastelandgoats/reforger-forge-mcp/blob/main/SETUP.md)
-- [AI client registration and troubleshooting](https://github.com/wastelandgoats/reforger-forge-mcp/blob/main/agents/README.md)
-- [Observer usage guide](https://github.com/wastelandgoats/reforger-forge-mcp/blob/main/docs/observer.md)
-- [Standalone Workbench runner reference](https://github.com/wastelandgoats/reforger-forge-mcp/blob/main/docs/runner-cli.md)
+- [Setup and configuration](../SETUP.md)
+- [AI client registration and troubleshooting](README.md)
+- [Observer usage guide](../docs/observer.md)
+- [Standalone Workbench runner reference](../docs/runner-cli.md)
 
 Do not commit machine paths, account names, tokens, local MCP configuration, or
 generated logs in this file. Keep project-specific instructions alongside the
@@ -95,7 +95,8 @@ authoritative field-level contract.
 | Create or inspect vehicle animation graphs | **animation_graph** |
 | Generate destructible-building resources | **building_setup** |
 | Generate an offline Conflict scenario | **scenario_create_conflict** |
-| Create or validate an addon | **mod**; use **wb_build** to build |
+| Create or statically validate an addon | **mod** |
+| Compile-check Enforce Scripts without opening an editor | **wb_check** |
 | Start, inspect, diagnose, restart, or stop Workbench | **wb_launch**, **wb_state**, **wb_connect**, **wb_diagnose**, **wb_restart**, **wb_shutdown** |
 | Build and inspect a Workbench build | **wb_build**, **wb_log_query** |
 | Edit a live world or its entities | **wb_entity_\***, **wb_component**, **wb_layers**, **wb_terrain**, **wb_clipboard**, **scenario_create** |
@@ -176,10 +177,11 @@ template grants write access or replaces a tool call.
    inspect the resulting state.
 5. Save intentional edits through the supported target-bound save workflow
    below or through an attended editor action.
-6. After game-script changes, use **wb_restart** for a clean owner-scoped
-   compilation session. Its replacement also opens as a normal, focusable
-   attended window. **wb_reload** reloads Workbench plugins only; it is not a
-   game-script reload.
+6. After game-script changes, use **wb_check** with the exact absolute
+   gprojPath and declared configuration for a hidden compile-only preflight.
+   Use **wb_restart** when the task actually needs a clean attended editor
+   replacement after compilation. **wb_reload** reloads Workbench plugins
+   only; it is not a game-script reload.
 7. Restore or cancel active Observer captures and wait for terminal jobs before
    calling **wb_shutdown**.
 
@@ -211,6 +213,11 @@ minimal direct source edit and relaunch it before further live editing.
 
 ### Build, lifecycle, and diagnostics
 
+- While the MCP owns the lifecycle, use **wb_check** for a bounded Enforce
+  Script compile-only preflight. Treat only `compilation.status=compiled` as
+  script success. `PROJECT_COMPILE_FAILED` carries the exact module, bounded
+  diagnostics, and attributed log evidence. This result says nothing about
+  resources, materials, prefabs, worlds, packaging, or whole-addon validity.
 - While the MCP owns the Workbench lifecycle, use **wb_build** with an explicit
   .gproj and a caller-exclusive empty output directory.
 - Use **wb_diagnose** for launch, connection, helper, or target-identity
@@ -238,7 +245,12 @@ Inspect the capture itself and record what it proves and does not prove.
 
 1. Call **observer_prepare_launch** and retain its sessionId and
    preparedLaunchId. Preparation assigns a session-specific `-logsDir`; do not
-   replace it.
+   replace it. Graphical launches use native borderless fullscreen by default.
+   Do not pass `-window`, `-screenWidth`, or `-screenHeight`. Leave
+   `forceNonNativeWindowSize` unset unless native fullscreen cannot be used for
+   a compelling external reason; the exceptional field requires bounded width,
+   height, and a meaningful justification. Large screenshots are not a reason
+   to shrink the renderer—bound `observer_capture.image` output instead.
 2. To let the MCP own the runtime, call **observer_runtime** with action=start,
    preparedLaunchId, and a unique idempotencyKey; retain its runtimeId.
    External launching may use the prepared argument array instead.
@@ -315,8 +327,9 @@ Choose checks proportional to the change. A typical complete pass is:
 
 1. Run **mod** with action=validate for the explicit target addon.
 2. Reopen or inspect every changed prefab, config, and world resource.
-3. Launch the target project with all required dependency roots and check
-   compile output after script changes.
+3. Run **wb_check** for the exact project and declared configuration after
+   script changes. Launch an attended editor only when the task also needs
+   live inspection, editing, or Play testing.
 4. Run the project's targeted static checks and tests.
 5. For gameplay, have the user enter Play when required, verify the editor
    state, exercise concrete acceptance cases, and return to edit mode.
@@ -334,6 +347,8 @@ observed results, and remaining gaps. Never describe an unrun check as passed.
 |---|---|
 | **wb_connect** cannot reach Workbench | Confirm the NET API and target .gproj, then run **wb_diagnose**. |
 | **wb_build** reports `exitStatus.classification: "windows_exception"` | Treat it as a Workbench engine crash, not an output-attestation failure or usable build. Record `nativeStatus`/`exceptionName`, inspect the attributed log with **wb_log_query**, and do not retry automatically. |
+| **wb_check** returns `PROJECT_COMPILE_FAILED` | Fix the reported module and bounded compiler diagnostics, then rerun the exact compile-only check. Do not substitute `mod(action: "validate")`; it does not compile Enforce Scripts. |
+| **wb_check** returns `compilation.status: "indeterminate"` | Preserve the distinct timeout, abort, exception, or nonzero `exitStatus`; do not relabel it as a compiler error or retry automatically. |
 | A wb_* action reports an undefined API function | The companion is absent, stale, or incompatible. Run **wb_diagnose**, then launch the exact project through **wb_launch**. |
 | A component is Unknown or a script change is stale | Fix compile errors, save intentional work, and use **wb_restart**. Do not use **wb_reload** for game scripts. |
 | A duplicated resource has no usable GUID | Open the exact destination project in Workbench, then call **wb_resources** with `action: "register"` and the copied file's absolute path. Registration verifies that the file is inside that active project and creates its `.meta` GUID; no GUID is needed as input. |
