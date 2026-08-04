@@ -833,3 +833,134 @@ describe("CaptureService", () => {
     }
   });
 });
+
+describe("CaptureService shutdown quiescence", () => {
+  it("seals admissions, aborts work admitted immediately before shutdown, and cancels its retained job", async () => {
+    let submitEntered!: () => void;
+    const entered = new Promise<void>((resolve) => { submitEntered = resolve; });
+    const calls: string[] = [];
+    const instance: CaptureInstance = {
+      backend: "runtime",
+      instanceId: "runtime-quiesce",
+      sessionId: "session-quiesce",
+      capabilities: ["render.capture"],
+      worldRevision: nullRuntimeRevision,
+      worldId: null,
+      recoveryBinding: {},
+    };
+    const controlled: CaptureBackend = {
+      kind: "runtime",
+      async listInstances() { return [instance]; },
+      async submit(_input, context) {
+        calls.push("submit");
+        submitEntered();
+        await new Promise<void>((_resolve, reject) => {
+          const abort = (): void => reject(Object.assign(new Error("shutdown abort"), { code: "CANCELLED" }));
+          if (context.signal?.aborted) abort();
+          else context.signal?.addEventListener("abort", abort, { once: true });
+        });
+        throw new Error("unreachable");
+      },
+      async status(ref) { return { ref, state: "queued", restorationConfirmed: false }; },
+      async cancel(ref) {
+        calls.push("cancel");
+        return { ref, state: "cancelled", cameraLeaseHeld: false, restorationConfirmed: true };
+      },
+      async read() { throw new Error("not completed"); },
+      async release() { return { restorationConfirmed: true, artifactRemoved: true }; },
+    };
+    const service = new CaptureService({
+      backends: [controlled],
+      pollIntervalMs: 1,
+      createJobId: () => "job-admission-race",
+    });
+    const capture = service.capture({
+      sessionId: instance.sessionId,
+      instanceId: instance.instanceId,
+      idempotencyKey: "admission-before-shutdown",
+      view: { kind: "current" },
+      asynchronous: true,
+      timeoutMs: 1_000,
+      expectedWorldRevision: nullRuntimeRevision,
+    });
+    await entered;
+
+    const quiescence = service.quiesce(Date.now() + 1_000);
+    await expect(capture).rejects.toMatchObject({ code: "CANCELLED" });
+    await expect(quiescence).resolves.toMatchObject({
+      quiescent: true,
+      remainingJobIds: [],
+      remainingAdmissionScopes: [],
+    });
+    await expect(service.capture({
+      sessionId: instance.sessionId,
+      idempotencyKey: "after-shutdown",
+      view: { kind: "current" },
+      asynchronous: true,
+      timeoutMs: 1_000,
+      expectedWorldRevision: nullRuntimeRevision,
+    })).rejects.toMatchObject({ code: "TRANSPORT_UNAVAILABLE" });
+    expect(calls).toEqual(["submit", "cancel"]);
+    await service.close();
+  });
+
+  it("repeats cancellation until camera and restoration obligations converge", async () => {
+    const fake = backend();
+    let cancellations = 0;
+    fake.backend.cancel = async (ref) => {
+      cancellations += 1;
+      return cancellations === 1
+        ? { ref, state: "restoring", cameraLeaseHeld: true, restorationConfirmed: false }
+        : { ref, state: "cancelled", cameraLeaseHeld: false, restorationConfirmed: true };
+    };
+    const service = new CaptureService({
+      backends: [fake.backend],
+      pollIntervalMs: 1,
+      createJobId: () => "job-restoration-convergence",
+    });
+    await service.capture({
+      sessionId: "session-1",
+      idempotencyKey: "restoration-convergence",
+      view: { kind: "current" },
+      asynchronous: true,
+      timeoutMs: 1_000,
+      expectedWorldRevision: nullRuntimeRevision,
+    });
+
+    await expect(service.quiesce(Date.now() + 1_000)).resolves.toMatchObject({ quiescent: true });
+    expect(cancellations).toBe(2);
+    await service.close();
+  });
+
+  it("returns structured remaining obligations at expiry and safely resumes on retry", async () => {
+    const fake = backend();
+    let mayRestore = false;
+    fake.backend.cancel = async (ref) => mayRestore
+      ? { ref, state: "cancelled", cameraLeaseHeld: false, restorationConfirmed: true }
+      : { ref, state: "restoring", cameraLeaseHeld: true, restorationConfirmed: false };
+    const service = new CaptureService({
+      backends: [fake.backend],
+      pollIntervalMs: 1,
+      createJobId: () => "job-retry-quiescence",
+    });
+    await service.capture({
+      sessionId: "session-1",
+      idempotencyKey: "retry-quiescence",
+      view: { kind: "current" },
+      asynchronous: true,
+      timeoutMs: 1_000,
+      expectedWorldRevision: nullRuntimeRevision,
+    });
+
+    await expect(service.quiesce(Date.now() + 20)).resolves.toMatchObject({
+      quiescent: false,
+      remainingJobIds: ["job-retry-quiescence"],
+    });
+    mayRestore = true;
+    await expect(service.quiesce(Date.now() + 1_000)).resolves.toMatchObject({
+      quiescent: true,
+      remainingJobIds: [],
+    });
+    await service.close();
+  });
+});

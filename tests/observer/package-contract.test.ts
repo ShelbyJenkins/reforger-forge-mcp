@@ -379,15 +379,18 @@ describe("observer package and source contracts", () => {
     expect(server).not.toMatch(/new ObserverCoordinator\(|new OwnedRuntimeManager\(/);
     expect(server.match(/registerObserverTools\(/g)).toHaveLength(1);
     expect(server).toContain("return disposeObserverLifecycle");
-    expect(server).toContain("observerShutdown ??=");
+    expect(server).toContain("activeObserverShutdown");
+    expect(server).toContain("terminalObserverShutdown");
+    expect(server).toContain("emergencyTerminate");
     expect(server).not.toContain(".server.onclose");
     expect(server).not.toContain("protocolServer");
     const entrypoint = readFileSync(join(repositoryRoot, "src", "index.ts"), "utf8");
     expect(entrypoint).toContain("process.stdin.once(\"end\", onStdinEnd)");
     expect(entrypoint).toContain("process.once(\"SIGINT\", onSigint)");
     expect(entrypoint).toContain("process.once(\"SIGTERM\", onSigterm)");
-    expect(entrypoint.indexOf("reportSealResult(await disposeTools())"))
-      .toBeLessThan(entrypoint.indexOf("await server.close()"));
+    expect(entrypoint.indexOf("closeProtocol: () => server.close()"))
+      .toBeLessThan(entrypoint.indexOf("disposeTools: (deadlineAtMs) => disposeTools(deadlineAtMs)"));
+    expect(entrypoint).not.toContain("shutdownHold");
     const integrationSource = filesRecursively(observerSource)
       .map((path) => readFileSync(path, "utf8"))
       .join("\n");

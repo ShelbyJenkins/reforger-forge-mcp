@@ -37,6 +37,23 @@ list and needs a new durable revise operation to get past `reserveCapture`'s
 fingerprint 409; Task 1.1 leaves the live acceptance harness bypassing the new
 derivation; and Task 2.4 must also touch `application-operations.ts`.
 
+The completed Phase 0/1/2 work in
+`2026-08-03-mcp-lifecycle-option-a.md` was reviewed after implementation. The
+API simplification remains compatible, with one implementation constraint now
+made explicit: capture admission and job-lifecycle refactors must preserve
+`CaptureService.quiesce(deadlineAtMs)`, its shutdown abort signal, and its
+tracking of admissions that can become active jobs. New public operations must
+also remain behind the application's `open` lifecycle gate; only the narrow
+internal cancellation and exact-runtime seal path may run while the
+application is quiescing, sealing, or `retryable_unsafe`. The CLI now closes
+the MCP protocol before quiescence and enforces one 30-second absolute
+deadline, so no task below may introduce a fresh per-phase shutdown budget or
+an unconditional terminal Observer close. Phase 2 moved API-index loading
+behind `SearchEngine` itself without changing Observer schemas or lifecycle
+ownership. The simplification tasks must continue to consume the engine only
+through its public operations; registration must not introduce an eager index
+read or a handler-specific initialization bypass.
+
 ## Goal
 
 Make the common Observer operation a one-call capture without moving existing
@@ -863,4 +880,3 @@ changes runtime job submission or recovery behavior.
   safety tests continue to pass.
 - Registered schemas, handlers, tests, package contracts, and current operator
   guidance describe the same API.
-

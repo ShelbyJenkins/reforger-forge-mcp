@@ -8,9 +8,10 @@ const dataDir = resolve(dirname(fileURLToPath(import.meta.url)), "../../data");
 describe("SearchEngine", () => {
   const engine = new SearchEngine(dataDir);
 
-  it("loads the index", () => {
-    expect(engine.isLoaded()).toBe(true);
+  it("loads the index on first use", () => {
+    expect(engine.isLoaded()).toBe(false);
     const stats = engine.getStats();
+    expect(engine.isLoaded()).toBe(true);
     expect(stats.totalClasses).toBeGreaterThan(8000);
   });
 

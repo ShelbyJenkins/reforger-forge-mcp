@@ -1,4 +1,4 @@
-import { loadIndex } from "./loader.js";
+import { loadIndex, type IndexData } from "./loader.js";
 import type { ClassInfo, MethodInfo, EnumInfo, PropertyInfo, WikiPage, GroupInfo } from "./types.js";
 import { levenshtein, trigramSimilarity } from "../utils/fuzzy.js";
 
@@ -39,6 +39,47 @@ export interface ComponentSearchResult {
   score: number;
 }
 
+type SearchEngineLoadState = "unloaded" | "loading" | "loaded" | "failed";
+type IndexLoader = (dataDir: string) => IndexData;
+
+interface SearchIndexSnapshot {
+  classByName: Map<string, ClassInfo>;
+  classNames: string[];
+  methodIndex: Map<string, MethodSearchResult[]>;
+  enumIndex: Map<string, EnumSearchResult[]>;
+  propertyIndex: Map<string, PropertySearchResult[]>;
+  wikiPages: WikiPage[];
+  wikiPageByTitle: Map<string, WikiPage>;
+  groups: GroupInfo[];
+  componentIndex: ClassInfo[];
+}
+
+const SEARCH_INDEX_LOAD_FAILURE_MESSAGE = "Search index initialization failed";
+
+function emptySnapshot(): SearchIndexSnapshot {
+  return {
+    classByName: new Map(),
+    classNames: [],
+    methodIndex: new Map(),
+    enumIndex: new Map(),
+    propertyIndex: new Map(),
+    wikiPages: [],
+    wikiPageByTitle: new Map(),
+    groups: [],
+    componentIndex: [],
+  };
+}
+
+function searchIndexLoadFailure(): Error & { code: "SEARCH_INDEX_LOAD_FAILED" } {
+  const error = Object.assign(new Error(SEARCH_INDEX_LOAD_FAILURE_MESSAGE), {
+    code: "SEARCH_INDEX_LOAD_FAILED" as const,
+  });
+  error.name = "SearchIndexLoadError";
+  // Do not retain loader exceptions, file paths, or arbitrarily large values.
+  error.stack = `${error.name}: ${error.message}`;
+  return error;
+}
+
 export class SearchEngine {
   private classByName: Map<string, ClassInfo> = new Map();
   private classNames: string[] = [];
@@ -49,26 +90,46 @@ export class SearchEngine {
   private wikiPageByTitle: Map<string, WikiPage> = new Map();
   private groups: GroupInfo[] = [];
   private componentIndex: ClassInfo[] = [];
-  private loaded = false;
+  private loadState: SearchEngineLoadState = "unloaded";
+  private loadFailure: (Error & { code: "SEARCH_INDEX_LOAD_FAILED" }) | null = null;
 
-  constructor(private dataDir: string) {
-    this.load();
+  constructor(
+    private readonly dataDir: string,
+    private readonly indexLoader: IndexLoader = loadIndex
+  ) {}
+
+  private ensureLoaded(): void {
+    if (this.loadState === "loaded") return;
+    if (this.loadState === "failed") throw this.loadFailure!;
+    if (this.loadState === "loading") throw searchIndexLoadFailure();
+
+    this.loadState = "loading";
+    try {
+      const snapshot = this.buildSnapshot(this.indexLoader(this.dataDir));
+      this.publishSnapshot(snapshot);
+      this.loadState = "loaded";
+    } catch {
+      this.publishSnapshot(emptySnapshot());
+      this.loadFailure ??= searchIndexLoadFailure();
+      this.loadState = "failed";
+      throw this.loadFailure;
+    }
   }
 
-  private load(): void {
-    const data = loadIndex(this.dataDir);
-    this.wikiPages = data.wikiPages;
-    for (const page of this.wikiPages) {
-      this.wikiPageByTitle.set(page.title.toLowerCase(), page);
+  private buildSnapshot(data: IndexData): SearchIndexSnapshot {
+    const snapshot = emptySnapshot();
+    snapshot.wikiPages = data.wikiPages;
+    for (const page of snapshot.wikiPages) {
+      snapshot.wikiPageByTitle.set(page.title.toLowerCase(), page);
     }
-    this.groups = data.groups;
+    snapshot.groups = data.groups;
 
     const allClasses = [...data.enfusionClasses, ...data.armaClasses];
 
     for (const cls of allClasses) {
       const key = cls.name.toLowerCase();
-      this.classByName.set(key, cls);
-      this.classNames.push(cls.name);
+      snapshot.classByName.set(key, cls);
+      snapshot.classNames.push(cls.name);
 
       // Index methods (public + protected + static)
       const allMethods = [
@@ -78,10 +139,10 @@ export class SearchEngine {
       ];
       for (const method of allMethods) {
         const methodKey = method.name.toLowerCase();
-        let entries = this.methodIndex.get(methodKey);
+        let entries = snapshot.methodIndex.get(methodKey);
         if (!entries) {
           entries = [];
-          this.methodIndex.set(methodKey, entries);
+          snapshot.methodIndex.set(methodKey, entries);
         }
         entries.push({
           className: cls.name,
@@ -94,10 +155,10 @@ export class SearchEngine {
       // Index enums
       for (const enumInfo of cls.enums || []) {
         const enumKey = enumInfo.name.toLowerCase();
-        let entries = this.enumIndex.get(enumKey);
+        let entries = snapshot.enumIndex.get(enumKey);
         if (!entries) {
           entries = [];
-          this.enumIndex.set(enumKey, entries);
+          snapshot.enumIndex.set(enumKey, entries);
         }
         entries.push({
           className: cls.name,
@@ -109,10 +170,10 @@ export class SearchEngine {
         // Also index by enum value names for searching
         for (const val of enumInfo.values) {
           const valKey = val.name.toLowerCase();
-          let valEntries = this.enumIndex.get(valKey);
+          let valEntries = snapshot.enumIndex.get(valKey);
           if (!valEntries) {
             valEntries = [];
-            this.enumIndex.set(valKey, valEntries);
+            snapshot.enumIndex.set(valKey, valEntries);
           }
           // Only add if not already referencing same enum
           if (!valEntries.some((e) => e.enumInfo.name === enumInfo.name && e.className === cls.name)) {
@@ -129,10 +190,10 @@ export class SearchEngine {
       // Index properties (public + protected)
       for (const prop of [...(cls.properties || []), ...(cls.protectedProperties || [])]) {
         const propKey = prop.name.toLowerCase();
-        let entries = this.propertyIndex.get(propKey);
+        let entries = snapshot.propertyIndex.get(propKey);
         if (!entries) {
           entries = [];
-          this.propertyIndex.set(propKey, entries);
+          snapshot.propertyIndex.set(propKey, entries);
         }
         entries.push({
           className: cls.name,
@@ -172,20 +233,20 @@ export class SearchEngine {
 
       // Index by class name
       const classKey = cls.name.toLowerCase();
-      let entries = this.enumIndex.get(classKey);
+      let entries = snapshot.enumIndex.get(classKey);
       if (!entries) {
         entries = [];
-        this.enumIndex.set(classKey, entries);
+        snapshot.enumIndex.set(classKey, entries);
       }
       entries.push(enumEntry);
 
       // Index by each property/value name
       for (const prop of allProps) {
         const valKey = prop.name.toLowerCase();
-        let valEntries = this.enumIndex.get(valKey);
+        let valEntries = snapshot.enumIndex.get(valKey);
         if (!valEntries) {
           valEntries = [];
-          this.enumIndex.set(valKey, valEntries);
+          snapshot.enumIndex.set(valKey, valEntries);
         }
         if (!valEntries.some((e) => e.enumInfo.name === syntheticEnum.name && e.className === cls.name)) {
           valEntries.push(enumEntry);
@@ -199,14 +260,14 @@ export class SearchEngine {
 
     // Strategy 1: Walk descendants from known component base classes
     for (const baseName of ["ScriptComponent", "GenericComponent", "GameComponent", "ScriptGameComponent"]) {
-      if (this.classByName.has(baseName.toLowerCase())) {
-        const tree = this.getClassTree(baseName);
+      if (snapshot.classByName.has(baseName.toLowerCase())) {
+        const tree = this.getClassTreeFrom(snapshot.classByName, baseName);
         for (const name of tree.descendants) {
           const key = name.toLowerCase();
           if (!componentKeys.has(key)) {
             componentKeys.add(key);
-            const cls = this.classByName.get(key);
-            if (cls) this.componentIndex.push(cls);
+            const cls = snapshot.classByName.get(key);
+            if (cls) snapshot.componentIndex.push(cls);
           }
         }
       }
@@ -218,15 +279,28 @@ export class SearchEngine {
         const key = cls.name.toLowerCase();
         if (!componentKeys.has(key)) {
           componentKeys.add(key);
-          this.componentIndex.push(cls);
+          snapshot.componentIndex.push(cls);
         }
       }
     }
 
-    this.loaded = true;
+    return snapshot;
+  }
+
+  private publishSnapshot(snapshot: SearchIndexSnapshot): void {
+    this.classByName = snapshot.classByName;
+    this.classNames = snapshot.classNames;
+    this.methodIndex = snapshot.methodIndex;
+    this.enumIndex = snapshot.enumIndex;
+    this.propertyIndex = snapshot.propertyIndex;
+    this.wikiPages = snapshot.wikiPages;
+    this.wikiPageByTitle = snapshot.wikiPageByTitle;
+    this.groups = snapshot.groups;
+    this.componentIndex = snapshot.componentIndex;
   }
 
   getClass(name: string): ClassInfo | undefined {
+    this.ensureLoaded();
     return this.classByName.get(name.toLowerCase());
   }
 
@@ -235,6 +309,7 @@ export class SearchEngine {
     source: "enfusion" | "arma" | "all" = "all",
     limit = 10
   ): ClassInfo[] {
+    this.ensureLoaded();
     const q = query.toLowerCase();
     const results: Array<{ cls: ClassInfo; score: number }> = [];
 
@@ -301,6 +376,7 @@ export class SearchEngine {
     source: "enfusion" | "arma" | "all" = "all",
     limit = 10
   ): MethodSearchResult[] {
+    this.ensureLoaded();
     const q = query.toLowerCase();
     const results: Array<{ result: MethodSearchResult; score: number }> = [];
 
@@ -355,6 +431,7 @@ export class SearchEngine {
     source: "enfusion" | "arma" | "all" = "all",
     limit = 10
   ): EnumSearchResult[] {
+    this.ensureLoaded();
     const q = query.toLowerCase();
     const results: Array<{ result: EnumSearchResult; score: number }> = [];
     const seen = new Set<string>();
@@ -417,6 +494,7 @@ export class SearchEngine {
     source: "enfusion" | "arma" | "all" = "all",
     limit = 10
   ): PropertySearchResult[] {
+    this.ensureLoaded();
     const q = query.toLowerCase();
     const results: Array<{ result: PropertySearchResult; score: number }> = [];
 
@@ -473,6 +551,7 @@ export class SearchEngine {
     source: "enfusion" | "arma" | "all" = "all",
     limit = 10
   ): SearchResult[] {
+    this.ensureLoaded();
     const q = query.toLowerCase();
     const combined: SearchResult[] = [];
 
@@ -529,6 +608,7 @@ export class SearchEngine {
   }
 
   searchWiki(query: string, limit = 5): WikiPage[] {
+    this.ensureLoaded();
     const tokens = query.toLowerCase().split(/\s+/);
     const results: Array<{ page: WikiPage; score: number }> = [];
 
@@ -553,19 +633,23 @@ export class SearchEngine {
 
   /** Look up a wiki page by exact title (case-insensitive). */
   getWikiPage(title: string): WikiPage | undefined {
+    this.ensureLoaded();
     return this.wikiPageByTitle.get(title.toLowerCase());
   }
 
   getGroups(): GroupInfo[] {
+    this.ensureLoaded();
     return this.groups;
   }
 
   getGroup(name: string): GroupInfo | undefined {
+    this.ensureLoaded();
     return this.groups.find((g) => g.name.toLowerCase() === name.toLowerCase());
   }
 
   /** Get all class names (for resource listing) */
   getAllClassNames(): string[] {
+    this.ensureLoaded();
     return this.classNames;
   }
 
@@ -574,13 +658,21 @@ export class SearchEngine {
    * Walks up through parents[] and down through children[].
    */
   getClassTree(name: string): { ancestors: string[]; descendants: string[] } {
+    this.ensureLoaded();
+    return this.getClassTreeFrom(this.classByName, name);
+  }
+
+  private getClassTreeFrom(
+    classByName: ReadonlyMap<string, ClassInfo>,
+    name: string
+  ): { ancestors: string[]; descendants: string[] } {
     const ancestors: string[] = [];
     const descendants: string[] = [];
 
     // Walk up to ancestors
     const visited = new Set<string>();
     const walkUp = (className: string) => {
-      const cls = this.getClass(className);
+      const cls = classByName.get(className.toLowerCase());
       if (!cls) return;
       for (const parent of cls.parents) {
         if (visited.has(parent.toLowerCase())) continue;
@@ -594,7 +686,7 @@ export class SearchEngine {
     // Walk down to descendants
     visited.clear();
     const walkDown = (className: string) => {
-      const cls = this.getClass(className);
+      const cls = classByName.get(className.toLowerCase());
       if (!cls) return;
       for (const child of cls.children) {
         if (visited.has(child.toLowerCase())) continue;
@@ -613,6 +705,7 @@ export class SearchEngine {
    * Returns [root, ..., parent, className].
    */
   getInheritanceChain(name: string): string[] {
+    this.ensureLoaded();
     const chain: string[] = [name];
     const visited = new Set<string>([name.toLowerCase()]);
     let current = name;
@@ -639,6 +732,7 @@ export class SearchEngine {
     properties: PropertySearchResult[];
     enums: EnumSearchResult[];
   } {
+    this.ensureLoaded();
     const methods: MethodSearchResult[] = [];
     const properties: PropertySearchResult[] = [];
     const enums: EnumSearchResult[] = [];
@@ -703,6 +797,7 @@ export class SearchEngine {
     enums: EnumSearchResult[];
     parentClassNames: string[];
   } {
+    this.ensureLoaded();
     const methods: MethodSearchResult[] = [];
     const properties: PropertySearchResult[] = [];
     const enums: EnumSearchResult[] = [];
@@ -763,6 +858,7 @@ export class SearchEngine {
    * Useful for finding available components to attach to entities.
    */
   getComponents(): ClassInfo[] {
+    this.ensureLoaded();
     const tree = this.getClassTree("ScriptComponent");
     const results: ClassInfo[] = [];
     for (const name of tree.descendants) {
@@ -827,6 +923,7 @@ export class SearchEngine {
     source?: "enfusion" | "arma" | "all";
     limit?: number;
   } = {}): ComponentSearchResult[] {
+    this.ensureLoaded();
     const { query, category = "any", event, source = "all", limit = 20 } = options;
     const q = query?.toLowerCase();
     const eventLower = event?.toLowerCase();
@@ -881,11 +978,12 @@ export class SearchEngine {
    * Check if a class name exists in the index (case-insensitive).
    */
   hasClass(name: string): boolean {
+    this.ensureLoaded();
     return this.classByName.has(name.toLowerCase());
   }
 
   isLoaded(): boolean {
-    return this.loaded;
+    return this.loadState === "loaded";
   }
 
   getStats(): {
@@ -896,6 +994,7 @@ export class SearchEngine {
     totalWikiPages: number;
     totalComponents: number;
   } {
+    this.ensureLoaded();
     return {
       totalClasses: this.classByName.size,
       totalMethods: this.methodIndex.size,

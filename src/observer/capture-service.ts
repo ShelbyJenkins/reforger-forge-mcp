@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { redactText } from "../foundation/redact.js";
 import {
   CaptureError,
   hasRestorationObligation,
@@ -57,6 +58,20 @@ export interface CaptureInstanceList {
   warnings?: string[];
 }
 
+export interface CaptureQuiesceFailure {
+  jobId: string;
+  code: string;
+  summary: string;
+}
+
+export interface CaptureQuiesceResult {
+  quiescent: boolean;
+  remainingJobIds: string[];
+  remainingAdmissionScopes: string[];
+  remainingActiveOperationIds: string[];
+  failures: CaptureQuiesceFailure[];
+}
+
 interface ActiveCapture {
   promise: Promise<BackendJob>;
 }
@@ -94,6 +109,11 @@ function defaultSleep(milliseconds: number, signal?: AbortSignal): Promise<void>
     };
     signal?.addEventListener("abort", abort, { once: true });
   });
+}
+
+function combinedSignal(left: AbortSignal | undefined, right: AbortSignal): AbortSignal {
+  if (!left) return right;
+  return AbortSignal.any([left, right]);
 }
 
 function isCompatible(instance: CaptureInstance, request: ReturnType<typeof normalizeCaptureRequest>): boolean {
@@ -151,7 +171,9 @@ export class CaptureService {
   private readonly active = new Map<string, ActiveCapture>();
   private readonly admissions = new Map<string, Promise<CaptureResult>>();
   private readonly sweepTimer: NodeJS.Timeout;
+  private readonly shutdownAbort = new AbortController();
   private sealed = false;
+  private terminalClosed = false;
 
   constructor(options: CaptureServiceOptions) {
     if (!options.backends.length) throw new TypeError("CaptureService requires at least one backend");
@@ -223,7 +245,10 @@ export class CaptureService {
     }
     const inFlight = this.admissions.get(scope);
     if (inFlight) return inFlight;
-    const admitted = this.admit(input, request, scope);
+    const admitted = this.admit({
+      ...input,
+      signal: combinedSignal(input.signal, this.shutdownAbort.signal),
+    }, request, scope);
     this.admissions.set(scope, admitted);
     try { return await admitted; } finally { this.admissions.delete(scope); }
   }
@@ -572,13 +597,96 @@ export class CaptureService {
     }
   }
 
-  async close(): Promise<void> {
-    if (this.sealed) return;
+  async quiesce(deadlineAtMs: number): Promise<CaptureQuiesceResult> {
+    if (!Number.isFinite(deadlineAtMs)) throw new TypeError("Capture quiescence deadline is invalid");
     this.sealed = true;
+    if (!this.shutdownAbort.signal.aborted) this.shutdownAbort.abort();
+    const failures = new Map<string, CaptureQuiesceFailure>();
+
+    while (this.now() < deadlineAtMs) {
+      const admissions = [...this.admissions.values()];
+      const activeOperations = [...this.active.values()].map((entry) => entry.promise);
+      if (!await this.settleBeforeDeadline([...admissions, ...activeOperations], deadlineAtMs)) break;
+
+      const obligations = this.shutdownObligations();
+      if (this.admissions.size === 0 && this.active.size === 0 && obligations.length === 0) {
+        return {
+          quiescent: true,
+          remainingJobIds: [],
+          remainingAdmissionScopes: [],
+          remainingActiveOperationIds: [],
+          failures: [],
+        };
+      }
+
+      const attempts = obligations.map(async (record) => {
+        try {
+          await this.cancelOnce(record, deadlineAtMs);
+          failures.delete(record.jobId);
+        } catch (error) {
+          failures.set(record.jobId, {
+            jobId: record.jobId.slice(0, 96),
+            code: errorCode(error),
+            summary: redactText(error instanceof Error ? error.message : String(error), {
+              profile: "diagnostic",
+              maxLength: 240,
+            }),
+          });
+        }
+      });
+      if (!await this.settleBeforeDeadline(attempts, deadlineAtMs)) break;
+      if (this.shutdownObligations().length > 0 && this.now() < deadlineAtMs) {
+        await this.delayBeforeDeadline(deadlineAtMs);
+      }
+    }
+
+    return {
+      quiescent: false,
+      remainingJobIds: this.shutdownObligations().map((record) => record.jobId).slice(0, 32),
+      remainingAdmissionScopes: [...this.admissions.keys()].slice(0, 16),
+      remainingActiveOperationIds: [...this.active.keys()].slice(0, 16),
+      failures: [...failures.values()].slice(0, 16),
+    };
+  }
+
+  async close(): Promise<void> {
+    if (this.terminalClosed) return;
+    this.sealed = true;
+    if (!this.shutdownAbort.signal.aborted) this.shutdownAbort.abort();
     clearInterval(this.sweepTimer);
-    await Promise.allSettled(this.store.entries()
-      .filter((record) => !record.releaseReceipt && (!isTerminalJob(record.lastBackendJob) || hasRestorationObligation(record.lastBackendJob)))
-      .map((record) => this.cancelOnce(record)));
+    // Application shutdown calls quiesce() before this terminal cleanup. Keep
+    // direct service disposal backward-compatible and bounded to one
+    // best-effort cancellation pass for isolated/unit consumers.
+    await Promise.allSettled(this.shutdownObligations().map((record) => this.cancelOnce(record)));
+    this.terminalClosed = true;
+  }
+
+  private shutdownObligations(): CaptureJobRecord[] {
+    return this.store.entries().filter((record) =>
+      !record.releaseReceipt && hasRestorationObligation(record.lastBackendJob));
+  }
+
+  private async settleBeforeDeadline(promises: readonly Promise<unknown>[], deadlineAtMs: number): Promise<boolean> {
+    if (promises.length === 0) return true;
+    const remaining = deadlineAtMs - this.now();
+    if (remaining <= 0) return false;
+    let timer: NodeJS.Timeout | undefined;
+    const expired = new Promise<false>((resolve) => {
+      timer = setTimeout(() => resolve(false), remaining);
+      timer.unref();
+    });
+    const settled = Promise.allSettled(promises).then(() => true as const);
+    try { return await Promise.race([settled, expired]); }
+    finally { if (timer) clearTimeout(timer); }
+  }
+
+  private async delayBeforeDeadline(deadlineAtMs: number): Promise<void> {
+    const remaining = deadlineAtMs - this.now();
+    if (remaining <= 0) return;
+    await new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, Math.min(this.pollIntervalMs, remaining));
+      timer.unref();
+    });
   }
 
   private async selectInstance(request: ReturnType<typeof normalizeCaptureRequest>, deadlineAtMs: number, signal?: AbortSignal): Promise<CaptureInstance> {
@@ -684,12 +792,12 @@ export class CaptureService {
     return this.store.getById(record.jobId)!.lastBackendJob;
   }
 
-  private async cancelOnce(record: CaptureJobRecord): Promise<BackendJob> {
+  private async cancelOnce(record: CaptureJobRecord, deadlineAtMs = this.operationDeadline()): Promise<BackendJob> {
     if (record.cancelRequested) return record.lastBackendJob;
     this.store.update(record.jobId, (stored) => { stored.cancelRequested = true; });
     const backend = this.backends.get(record.ref.backend)!;
     try {
-      const job = await backend.cancel(record.ref, this.context(this.operationDeadline()));
+      const job = await backend.cancel(record.ref, this.context(deadlineAtMs));
       this.store.update(record.jobId, (stored) => {
         stored.lastBackendJob = { ...job, ref: { ...stored.ref, ...job.ref, jobId: stored.jobId } };
         stored.lastProjection = publicJob(stored.lastBackendJob);

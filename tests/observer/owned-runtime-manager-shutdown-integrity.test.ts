@@ -65,6 +65,42 @@ describe("OwnedRuntimeManager", () => {
     }
   });
 
+  it("clamps its aggregate seal budget to the caller's earlier absolute deadline", async () => {
+    const value = makeHarness({
+      inspectionTimeoutMs: 5_000,
+      terminationTimeoutMs: 5_000,
+      lockTimeoutMs: 5_000,
+    });
+    const started = await value.start("outer-deadline-close-start");
+    await value.stop(started.runtimeId, "outer-deadline-close-stop");
+    let markReleaseEntered!: () => void;
+    const releaseEntered = new Promise<void>((resolve) => { markReleaseEntered = resolve; });
+    value.gate.releaseRuntimeLifecycle = vi.fn(async () => {
+      markReleaseEntered();
+      return new Promise<unknown>(() => undefined);
+    });
+
+    vi.useFakeTimers();
+    try {
+      const beganAt = Date.now();
+      const closing = value.manager.close(beganAt + 1_000) as Promise<{
+        applicationCloseSafe: boolean;
+        errorRuntimes: Array<{ runtimeId: string; reason: string }>;
+      }>;
+      await releaseEntered;
+      await vi.advanceTimersByTimeAsync(1_000);
+      const result = await closing;
+
+      expect(Date.now() - beganAt).toBe(1_000);
+      expect(result.applicationCloseSafe).toBe(false);
+      expect(result.errorRuntimes).toEqual(expect.arrayContaining([
+        expect.objectContaining({ runtimeId: started.runtimeId }),
+      ]));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("reports one bounded inventory remainder after the aggregate shutdown deadline", async () => {
     const value = makeHarness({
       inspectionTimeoutMs: 5_000,

@@ -73,7 +73,18 @@ import { registerObserverTools } from "./observer/tools.js";
  * Embedders must await this disposer before closing their MCP server so owned
  * observer runtime lifecycle state can be sealed through supported APIs.
  */
-export type RegisteredToolsDisposer = () => Promise<Record<string, unknown>>;
+export interface RegisteredToolsDisposer {
+  (deadlineAtMs?: number): Promise<Record<string, unknown>>;
+  /** CLI-only synchronous crash path; never terminates Workbench or runtimes. */
+  emergencyTerminate(): void;
+  /** Starts idempotent local handle cleanup before the CLI exits. */
+  emergencyCleanup(): void;
+}
+
+export interface RegisterToolsOptions {
+  /** Internal composition seam used by lifecycle probes and hermetic tests. */
+  searchEngine?: SearchEngine;
+}
 
 /**
  * The process-wide Workbench lifecycle object graph owned by the MCP server.
@@ -133,8 +144,12 @@ export function createWorkbenchServerComposition(config: Config): WorkbenchServe
   });
 }
 
-export function registerTools(server: McpServer, config: Config): RegisteredToolsDisposer {
-  const searchEngine = new SearchEngine(config.dataDir);
+export function registerTools(
+  server: McpServer,
+  config: Config,
+  options: RegisterToolsOptions = {}
+): RegisteredToolsDisposer {
+  const searchEngine = options.searchEngine ?? new SearchEngine(config.dataDir);
   const patterns = new PatternLibrary(config.patternsDir);
   const observerConfig = config.observer;
   const workbenchComposition = createWorkbenchServerComposition(config);
@@ -193,22 +208,44 @@ export function registerTools(server: McpServer, config: Config): RegisteredTool
     evidenceRoots: observerConfig?.evidenceRoots,
     ownedRuntimeManager,
   });
-  let observerShutdown: Promise<Record<string, unknown>> | null = null;
-  const disposeObserverLifecycle = (): Promise<Record<string, unknown>> => {
-    // Seal owned-runtime lifecycle state, then always release the Workbench
-    // process guard's LMDB environment. The composition's guard is otherwise
-    // never closed on the embedded-server disposal path, leaking its handle
-    // (and, on Windows, the memory map) until process exit.
-    observerShutdown ??= (async () => {
-      await wbClient.closeOwnerScopedTargetBuild();
-      try {
-        return await observerApplication.closeRuntimeLifecycle();
-      } finally {
-        await workbenchComposition.processGuard.close();
-      }
-    })();
-    return observerShutdown;
+  let activeObserverShutdown: Promise<Record<string, unknown>> | null = null;
+  let terminalObserverShutdown: Record<string, unknown> | null = null;
+  let processGuardClose: Promise<void> | null = null;
+  const closeProcessGuard = (): Promise<void> => {
+    if (!processGuardClose) {
+      const attempt = workbenchComposition.processGuard.close();
+      let tracked!: Promise<void>;
+      tracked = attempt.catch((error) => {
+        if (processGuardClose === tracked) processGuardClose = null;
+        throw error;
+      });
+      processGuardClose = tracked;
+    }
+    return processGuardClose;
   };
+  const disposeObserverAttempt = (deadlineAtMs?: number): Promise<Record<string, unknown>> => {
+    if (terminalObserverShutdown) return Promise.resolve(terminalObserverShutdown);
+    if (activeObserverShutdown) return activeObserverShutdown;
+    const attempt = (async () => {
+      await wbClient.closeOwnerScopedTargetBuild();
+      const result = await observerApplication.closeRuntimeLifecycle(deadlineAtMs);
+      if (result.applicationCloseSafe === true) {
+        await closeProcessGuard();
+        terminalObserverShutdown = result;
+      }
+      return result;
+    })();
+    let tracked!: Promise<Record<string, unknown>>;
+    tracked = attempt.finally(() => {
+      if (activeObserverShutdown === tracked) activeObserverShutdown = null;
+    });
+    activeObserverShutdown = tracked;
+    return tracked;
+  };
+  const disposeObserverLifecycle = Object.assign(disposeObserverAttempt, {
+    emergencyTerminate: (): void => observerApplication.emergencyTerminatePrivateChildren(),
+    emergencyCleanup: (): void => { void closeProcessGuard().catch(() => undefined); },
+  }) satisfies RegisteredToolsDisposer;
   registerWbLaunch(server, wbClient);
   registerWbBuild(server, config, wbClient, {
     companionProvider: workbenchComposition.companionProvider,

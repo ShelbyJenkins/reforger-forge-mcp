@@ -58,7 +58,19 @@ export class FakeChild extends EventEmitter {
         const responder = this.responders.get(request.operation);
         const result = responder
           ? responder(payload)
-          : request.operation === "instances" ? { instances: this.instances } : { operation: request.operation };
+          : request.operation === "instances" ? { instances: this.instances }
+          : request.operation === "cancelJob" ? {
+              sessionId: payload.sessionId,
+              jobId: payload.jobId,
+              instanceId: "runtime-instance-1",
+              state: "cancelled",
+              cameraLease: {
+                everHeld: false,
+                held: false,
+                restorationConfirmed: true,
+              },
+            }
+          : { operation: request.operation };
         this.emit("message", { protocol: CHILD_PROTOCOL, type: "response",
           requestId: request.requestId, ok: true, result });
       } catch (error) {
