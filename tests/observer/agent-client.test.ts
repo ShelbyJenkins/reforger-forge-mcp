@@ -12,6 +12,7 @@ class TransportChild extends EventEmitter {
   signalCode: NodeJS.Signals | null = null;
   stderr = new PassThrough();
   hold = false;
+  killCalls = 0;
   sent: Array<Record<string, unknown>> = [];
 
   ready(): void {
@@ -33,7 +34,7 @@ class TransportChild extends EventEmitter {
     return true;
   }
   disconnect(): void { this.connected = false; }
-  kill(): boolean { this.exit(1); return true; }
+  kill(): boolean { this.killCalls += 1; this.exit(1); return true; }
   exit(code: number): void {
     if (this.exitCode !== null) return;
     this.exitCode = code;
@@ -132,5 +133,38 @@ describe("ObserverAgentClient", () => {
     requestDeadline = undefined;
     child.hold = false;
     await transport.close();
+  });
+
+  it("emergency termination rejects pending IPC and kills the tracked child exactly once", async () => {
+    const child = new TransportChild();
+    const transport = client(child);
+    await transport.ensureStarted();
+    child.hold = true;
+    const pending = transport.request("held-during-emergency");
+
+    transport.emergencyTerminatePrivateChildren();
+    transport.emergencyTerminatePrivateChildren();
+
+    await expect(pending).rejects.toMatchObject({ code: "TRANSPORT_UNAVAILABLE" });
+    expect(child.killCalls).toBe(1);
+    expect(transport.diagnosticPrivateChildCount()).toBe(0);
+  });
+
+  it("emergency termination kills a private child that never completed its ready handshake", async () => {
+    const child = new TransportChild();
+    const forkChild = (() => child as unknown as ChildProcess) as typeof fork;
+    const transport = new ObserverAgentClient({
+      agentPath: "private-child.js",
+      forkChild,
+      startupTimeoutMs: 1_000,
+      requestTimeoutMs: 1_000,
+    });
+    const starting = transport.ensureStarted();
+
+    transport.emergencyTerminatePrivateChildren();
+
+    await expect(starting).rejects.toMatchObject({ code: "TRANSPORT_UNAVAILABLE" });
+    expect(child.killCalls).toBe(1);
+    expect(transport.diagnosticPrivateChildCount()).toBe(0);
   });
 });

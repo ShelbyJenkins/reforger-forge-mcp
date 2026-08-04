@@ -50,6 +50,7 @@ describe("observer application", () => {
     let forkArguments: readonly string[] = [];
     const forkChild = ((_modulePath: string, argumentsArray?: readonly string[]) => {
       forkArguments = argumentsArray ?? [];
+      child.announceReady();
       return child as unknown as ChildProcess;
     }) as typeof fork;
     const coordinator = createObserverApplication({ defaultManagedRoot: managedRoot,
@@ -109,7 +110,7 @@ describe("observer application", () => {
       runId,
       captures: [expect.objectContaining({ state: "completed", artifactAvailable: true })],
     });
-    await expect(coordinator.jobStatus(capture.sessionId, capture.jobId)).resolves.toMatchObject({
+    await expect(coordinator.jobStatus(capture.jobId)).resolves.toMatchObject({
       state: "completed",
       managedArtifactAvailable: true,
       recoveredFromManagedArtifact: true,
@@ -310,16 +311,16 @@ describe("observer application", () => {
     const jobId = submitted.job.jobId as string;
     expect(jobId).toMatch(/^[0-9a-f-]{36}$/);
 
-    expect(await coordinator.jobStatus(undefined, jobId)).toMatchObject({ state: "queued" });
-    expect(await coordinator.cancelJob(undefined, jobId)).toMatchObject({ state: "cancelled" });
+    expect(await coordinator.jobStatus(jobId)).toMatchObject({ state: "queued" });
+    expect(await coordinator.cancelJob(jobId)).toMatchObject({ state: "cancelled" });
     const released = {
       backend: "workbench",
       jobId,
       restorationConfirmed: true,
       artifactRemoved: true,
     };
-    expect(await coordinator.releaseJob(undefined, jobId)).toMatchObject(released);
-    expect(await coordinator.releaseJob(undefined, jobId)).toMatchObject(released);
+    expect(await coordinator.releaseJob(jobId)).toMatchObject(released);
+    expect(await coordinator.releaseJob(jobId)).toMatchObject(released);
     expect(adapter.recover).toHaveBeenCalledWith({ jobId, expectedInstanceId: "workbench-generation-1" });
     expect(adapter.cancel).toHaveBeenCalledWith(jobId);
     expect(adapter.release).toHaveBeenCalledOnce();
@@ -353,8 +354,8 @@ describe("observer application", () => {
       view: { kind: "lookAt", position: [0, 0, 0], target: [1, 0, 0], fov: 60 },
     })).rejects.toMatchObject({ code: "IDEMPOTENCY_CONFLICT" });
     const jobId = first.job.jobId as string;
-    await coordinator.cancelJob(undefined, jobId);
-    await coordinator.releaseJob(undefined, jobId);
+    await coordinator.cancelJob(jobId);
+    await coordinator.releaseJob(jobId);
     await expect(coordinator.capture(request)).rejects.toMatchObject({ code: "JOB_RELEASED" });
     expect(adapter.submit).toHaveBeenCalledOnce();
     await coordinator.close();
@@ -398,18 +399,16 @@ describe("observer application", () => {
     await coordinator.close();
   });
 
-  it("returns the same retained completed Workbench PNG for a synchronous response retry", async () => {
+  it("returns a released-job receipt when a delivered runless capture is retried", async () => {
     const { adapter, coordinator } = createWorkbenchHarness();
     adapter.complete();
     const request = workbenchCaptureInput("sync-retry-key");
 
     const first = await coordinator.capture(request);
-    const retry = await coordinator.capture(request);
-
     expect(first).toMatchObject({ asynchronous: false, job: { jobId: expect.stringMatching(/^[0-9a-f-]{36}$/) } });
-    expect(retry).toMatchObject({ asynchronous: false, job: { jobId: first.job.jobId } });
+    await expect(coordinator.capture(request)).rejects.toMatchObject({ code: "JOB_RELEASED" });
     expect(adapter.submit).toHaveBeenCalledOnce();
-    expect(adapter.readCompletedArtifact).toHaveBeenCalledTimes(2);
+    expect(adapter.readCompletedArtifact).toHaveBeenCalledOnce();
     await coordinator.close();
   });
 

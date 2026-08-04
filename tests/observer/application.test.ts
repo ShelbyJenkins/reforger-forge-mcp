@@ -219,7 +219,10 @@ describe("observer application composition roots", () => {
           "observer_capture",
           "observer_job",
           "observer_runtime",
-          "observer_run",
+          "observer_run_begin",
+          "observer_run_status",
+          "observer_run_finalize",
+          "observer_run_discard",
         ]);
       } finally {
         await app.close();

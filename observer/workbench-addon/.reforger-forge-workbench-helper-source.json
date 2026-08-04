@@ -5,8 +5,8 @@
   "protocolVersion": "2.0",
   "addonId": "ReforgerForgeWorkbenchHelper",
   "addonGuid": "4D74249D90703F46",
-  "buildIdentity": "080399d444e0815b73cedf1b7542e562361c55e88ccf28f8c28b12de873893d1",
-  "bundleDigest": "5019e91efdc60776bbed454975d799d7d7d46dcf1ccc9bbc74aad693578a7d14",
+  "buildIdentity": "d1be66f8dbf3f23d80dfac833bc0b3aeaeccf9de7f0525850b78985a117b0fb7",
+  "bundleDigest": "66c1df91914fcc0507fc301baf23769b9baf05dba184768e72214a6cd47440ab",
   "files": [
     {
       "path": "addon.gproj",
@@ -74,7 +74,7 @@
     },
     {
       "path": "Scripts/WorkbenchGame/EnfusionMCP/EMCP_WB_ObserverCommon.c",
-      "sha256": "6c2ab5cbea252bcc99f18726850a8c34da72e60bc2a6f9bea91d8434bee4b3fe"
+      "sha256": "a63a41ae017270f6bb3bb672297ef4f32ba12979b27cef39a9d1ee02bc69f17c"
     },
     {
       "path": "Scripts/WorkbenchGame/EnfusionMCP/EMCP_WB_ObserverPing.c",
@@ -94,7 +94,7 @@
     },
     {
       "path": "Scripts/WorkbenchGame/EnfusionMCP/EMCP_WB_ObserverSubmit.c",
-      "sha256": "b0cb63ccd5b24377f8cc74ee61d07e5874ea65b7286cd7c8182df70e955a86bf"
+      "sha256": "a5dfd83e8dc99b2594a2c9f3f2841e547bba0f6a960aeb5101d111699130a7ed"
     },
     {
       "path": "Scripts/WorkbenchGame/EnfusionMCP/EMCP_WB_Ping.c",
@@ -130,7 +130,7 @@
     },
     {
       "path": "Scripts/WorkbenchGame/EnfusionMCP/RFWB_HelperBuild.c",
-      "sha256": "fbe8ba888c2647aa0820cd90aca5f25fcca5700beb46335238474ee15de0e3f9"
+      "sha256": "116611b6938ea2752d47cefb677412f97b352a4160862b29716c0093cb4ebf34"
     }
   ]
 }

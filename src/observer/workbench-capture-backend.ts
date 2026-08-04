@@ -18,7 +18,7 @@ import {
 } from "./capture-contract.js";
 import type { CanonicalImageOutputPolicy } from "../foundation/image-output.js";
 import { canonicalPublicObserverErrorCode } from "./public-contract.js";
-import { legacyWorldFields, sameWorldRevision, workbenchWorldRevision } from "./world-revision.js";
+import { legacyWorldFields, sameWorldRevision, workbenchWorldIdentity, workbenchWorldRevision } from "./world-revision.js";
 
 function mapError(error: unknown): CaptureError {
   if (error instanceof CaptureError) return error;
@@ -96,6 +96,7 @@ export class WorkbenchCaptureBackend implements CaptureBackend {
     try {
       const status = await within(() => this.adapter.submit({
         jobId: input.jobId,
+        expectedWorldIdentity: workbenchWorldIdentity(input.request.expectedWorldRevision),
         view: input.request.view,
         settlePolls: input.request.settleFrames,
         image: input.request.image,

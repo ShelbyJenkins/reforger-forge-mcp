@@ -29,6 +29,7 @@ import {
   closeObserverRuntimeLifecycle,
   OwnedRuntimeManager,
 } from "../src/observer/owned-runtime-manager.js";
+import { deriveObserverRuntimeIdempotencyKey } from "../src/tools/observer-runtime.js";
 import {
   OperationalBaselineRecorder,
   analyzePngMaterial,
@@ -671,7 +672,6 @@ function verifyEvidenceBundle(
 
 async function cancelRunJobs(
   application: ObserverApplication,
-  sessionId: string,
   runId: string,
   deadline: number
 ): Promise<void> {
@@ -681,10 +681,10 @@ async function cancelRunJobs(
     if (!raw || typeof raw !== "object" || Array.isArray(raw)) continue;
     const capture = raw as Record<string, unknown>;
     if (typeof capture.jobId !== "string" || TERMINAL_STATES.has(String(capture.state))) continue;
-    let job = await application.cancelJob(sessionId, capture.jobId);
+    let job = await application.cancelJob(capture.jobId);
     while (!TERMINAL_STATES.has(String(job.state)) && Date.now() < deadline) {
       await delay(250);
-      job = await application.jobStatus(sessionId, capture.jobId);
+      job = await application.jobStatus(capture.jobId);
     }
     const lease = job.cameraLease && typeof job.cameraLease === "object"
       ? job.cameraLease as Record<string, unknown>
@@ -892,7 +892,7 @@ export async function runRuntimeObserverAcceptance(
       async () => {
         const startedRuntime = await runtimeManager.start({
           preparedLaunchId,
-          idempotencyKey: `runtime-start-${randomUUID()}`,
+          idempotencyKey: deriveObserverRuntimeIdempotencyKey({ action: "start", preparedLaunchId }),
         });
         runtimeId = startedRuntime.runtimeId;
         if (startedRuntime.state !== "running" || startedRuntime.exactOwned !== true ||
@@ -1352,7 +1352,7 @@ export async function runRuntimeObserverAcceptance(
       let safeToDiscard = sessionId === null;
       if (sessionId) {
         try {
-          await cancelRunJobs(application, sessionId, managedRunId, Date.now() + 30_000);
+          await cancelRunJobs(application, managedRunId, Date.now() + 30_000);
           summary.jobCleanup = "restored";
           safeToDiscard = true;
         } catch (error) {
@@ -1392,7 +1392,11 @@ export async function runRuntimeObserverAcceptance(
         const stoppedRuntime = await runtimeManager.stop({
           runtimeId,
           waitForRestorationMs: 20_000,
-          idempotencyKey: `runtime-stop-${randomUUID()}`,
+          idempotencyKey: deriveObserverRuntimeIdempotencyKey({
+            action: "stop",
+            runtimeId,
+            waitForRestorationMs: 20_000,
+          }),
         });
         summary.runtimeShutdown = stoppedRuntime;
         if (stoppedRuntime.state !== "exited" || stoppedRuntime.exactOwned !== true ||

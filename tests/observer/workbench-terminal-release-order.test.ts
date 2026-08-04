@@ -219,7 +219,7 @@ describe("Workbench terminal-release owner shutdown ordering", () => {
       const runPort: CaptureRunPort = {
         async reserve(input) {
           events.push("reserve");
-          return { runId: input.runId, captureLabel: input.captureLabel, jobId: input.jobId };
+          return { runId: input.runId, captureLabel: input.captureLabel ?? "current-1", jobId: input.jobId };
         },
         async bind() { events.push("bind"); },
         async complete(input: CompletedRunCapture) {
@@ -274,7 +274,7 @@ describe("Workbench terminal-release owner shutdown ordering", () => {
           return { exactOwnerVacant: true };
         });
 
-        const completed = await service.status(undefined, jobId);
+        const completed = await service.status(jobId);
         expect(completed).toMatchObject({
           state: "completed",
           restorationConfirmed: true,
@@ -284,7 +284,7 @@ describe("Workbench terminal-release owner shutdown ordering", () => {
         expect(events.indexOf("promote")).toBeLessThan(events.indexOf("exact-shutdown"));
         expect(client.calls).not.toContain("EMCP_WB_ObserverRelease");
 
-        const retained = await service.read(undefined, jobId);
+        const retained = await service.read(jobId);
         expect(retained.job.state).toBe("completed");
         expect(retained.image.subarray(0, 8)).toEqual(
           Buffer.from([137, 80, 78, 71, 13, 10, 26, 10])

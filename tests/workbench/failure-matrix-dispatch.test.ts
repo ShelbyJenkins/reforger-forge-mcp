@@ -223,13 +223,13 @@ describe("complete Workbench failure-matrix dispatch", () => {
       ...harness.input,
       application: {
         ...harness.input.application,
-        jobStatus: async (sessionId, jobId) => {
+        jobStatus: async (jobId) => {
           statusCalls += 1;
           if (jobId === "job-primary" && statusCalls === 1) {
             return { state: "capturing" };
           }
           try {
-            return await jobStatus(sessionId, jobId);
+            return await jobStatus(jobId);
           } finally {
             if (jobId === "job-primary") mutationInvoked = true;
           }
@@ -260,8 +260,8 @@ describe("complete Workbench failure-matrix dispatch", () => {
       ...harness.input,
       application: {
         ...harness.input.application,
-        jobStatus: async (sessionId, jobId) => {
-          const status = await jobStatus(sessionId, jobId);
+        jobStatus: async (jobId) => {
+          const status = await jobStatus(jobId);
           const actualCamera = status.actualCamera as Record<string, unknown>;
           return {
             ...status,
@@ -279,8 +279,8 @@ describe("complete Workbench failure-matrix dispatch", () => {
       ...harness.input,
       application: {
         ...harness.input.application,
-        jobStatus: async (sessionId, jobId) => {
-          const status = await jobStatus(sessionId, jobId);
+        jobStatus: async (jobId) => {
+          const status = await jobStatus(jobId);
           return jobId === "job-followup"
             ? { ...status, ownerCameraId: 999 }
             : status;

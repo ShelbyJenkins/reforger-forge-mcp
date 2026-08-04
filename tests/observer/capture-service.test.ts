@@ -114,7 +114,7 @@ describe("CaptureService", () => {
         view: { kind: "current" },
         asynchronous: true,
         timeoutMs: 1_000,
-        expectedWorldRevision: nullRuntimeRevision,
+        expectedWorldRevision: workbenchWorldRevision("unavailable-workbench-world"),
       })).rejects.toMatchObject({ code: "TRANSPORT_UNAVAILABLE" });
       expect(calls).toEqual(["EMCP_WB_ObserverPing"]);
     } finally {
@@ -153,6 +153,81 @@ describe("CaptureService", () => {
     expect(fake.calls.filter((call) => call === "submit")).toHaveLength(1);
   });
 
+  it("returns cleanup recovery information when runless automatic release fails", async () => {
+    const fake = backend();
+    fake.backend.release = async () => {
+      fake.calls.push("release");
+      throw new Error("fixture artifact release remained unavailable");
+    };
+    const service = new CaptureService({
+      backends: [fake.backend],
+      pollIntervalMs: 1,
+      sleep: async () => undefined,
+      createJobId: () => "job-cleanup-required",
+    });
+
+    try {
+      await expect(service.capture({
+        sessionId: "session-1",
+        idempotencyKey: "cleanup-required",
+        view: { kind: "current" },
+        timeoutMs: 1_000,
+        expectedWorldRevision: nullRuntimeRevision,
+      })).resolves.toMatchObject({
+        asynchronous: false,
+        job: { jobId: "job-cleanup-required", state: "completed" },
+        cleanupRequired: true,
+        cleanupWarning: "fixture artifact release remained unavailable",
+      });
+      await expect(service.status("job-cleanup-required")).resolves.toMatchObject({
+        jobId: "job-cleanup-required",
+        state: "completed",
+      });
+      expect(fake.calls.filter((call) => call === "release")).toHaveLength(1);
+    } finally {
+      await service.close();
+    }
+  });
+
+  it("automatically releases an oversized runless capture before reporting its inline limit", async () => {
+    const fake = backend();
+    fake.backend.read = async () => {
+      fake.calls.push("read");
+      return { image: Buffer.alloc(16, 7), metadata: { contentSha256: "a".repeat(64) } };
+    };
+    const service = new CaptureService({
+      backends: [fake.backend],
+      pollIntervalMs: 1,
+      sleep: async () => undefined,
+      maxInlineImageBytes: 8,
+      createJobId: () => "job-oversized-runless",
+    });
+
+    try {
+      await expect(service.capture({
+        sessionId: "session-1",
+        idempotencyKey: "oversized-runless",
+        view: { kind: "current" },
+        timeoutMs: 1_000,
+        expectedWorldRevision: nullRuntimeRevision,
+      })).rejects.toMatchObject({
+        code: "ARTIFACT_TOO_LARGE",
+        details: {
+          job: { jobId: "job-oversized-runless", state: "completed" },
+          cleanupRequired: false,
+          cleanup: { jobId: "job-oversized-runless" },
+        },
+      });
+      await expect(service.status("job-oversized-runless")).resolves.toMatchObject({
+        jobId: "job-oversized-runless",
+        state: "released",
+      });
+      expect(fake.calls.filter((call) => call === "release")).toHaveLength(1);
+    } finally {
+      await service.close();
+    }
+  });
+
   it("keeps bounded cancellation retryable after a restoration attempt fails", async () => {
     const fake = backend();
     let attempts = 0;
@@ -185,9 +260,9 @@ describe("CaptureService", () => {
         timeoutMs: 1_000,
         expectedWorldRevision: nullRuntimeRevision,
       });
-      await expect(service.cancel("session-1", "job-cancel-retry"))
+      await expect(service.cancel("job-cancel-retry"))
         .rejects.toMatchObject({ code: "RESTORATION_UNCONFIRMED" });
-      await expect(service.cancel("session-1", "job-cancel-retry"))
+      await expect(service.cancel("job-cancel-retry"))
         .resolves.toMatchObject({ state: "cancelled", restorationConfirmed: true });
       expect(fake.calls.filter((call) => call === "cancel")).toHaveLength(2);
     } finally {
@@ -251,7 +326,7 @@ describe("CaptureService", () => {
         expiredJobIds: [],
         removedJobIds: [],
       });
-      await expect(service.status(undefined, "job-held-terminal")).resolves.toMatchObject({
+      await expect(service.status("job-held-terminal")).resolves.toMatchObject({
         state: "failed",
         cameraLeaseHeld: true,
         restorationConfirmed: false,
@@ -320,13 +395,13 @@ describe("CaptureService", () => {
         expiredJobIds: [],
         removedJobIds: [],
       });
-      await expect(service.status(undefined, "job-restored-terminal")).resolves.toMatchObject({
+      await expect(service.status("job-restored-terminal")).resolves.toMatchObject({
         state: "completed",
         cameraLeaseHeld: false,
         restorationConfirmed: true,
       });
 
-      await service.release(undefined, "job-restored-terminal");
+      await service.release("job-restored-terminal");
       expect(releaseCalls).toBe(1);
       await expect(service.sweep(now)).resolves.toEqual({
         expiredJobIds: [],
@@ -343,8 +418,8 @@ describe("CaptureService", () => {
     const result = await service.capture({ sessionId: "session-1", idempotencyKey: "sync", view: { kind: "current" }, timeoutMs: 1_000, expectedWorldRevision: nullRuntimeRevision });
     expect(result.asynchronous).toBe(false);
     if (!result.asynchronous) expect(result.image).toEqual(Buffer.from("png"));
-    const receipt = await service.release("session-1", "job-2");
-    expect(await service.release("session-1", "job-2")).toEqual(receipt);
+    const receipt = await service.release("job-2");
+    expect(await service.release("job-2")).toEqual(receipt);
     expect(fake.calls).toEqual(["submit", "status", "read", "release"]);
   });
 
@@ -362,7 +437,7 @@ describe("CaptureService", () => {
       async reserve(input) {
         return {
           runId: input.runId,
-          captureLabel: input.captureLabel,
+          captureLabel: input.captureLabel ?? "current-1",
           jobId: input.jobId,
         };
       },
@@ -467,7 +542,7 @@ describe("CaptureService", () => {
       },
     };
     const runPort: CaptureRunPort = {
-      async reserve(input) { return { runId: input.runId, captureLabel: input.captureLabel, jobId: input.jobId }; },
+      async reserve(input) { return { runId: input.runId, captureLabel: input.captureLabel ?? "current-1", jobId: input.jobId }; },
       async bind() {},
       async complete() {},
       async fail() {},
@@ -508,7 +583,7 @@ describe("CaptureService", () => {
       });
 
       expect(calls).toEqual(["submit", "status", "cancel", "release"]);
-      await expect(service.status(undefined, ref.jobId)).resolves.toMatchObject({
+      await expect(service.status(ref.jobId)).resolves.toMatchObject({
         state: "released",
         cameraLeaseHeld: false,
         restorationConfirmed: false,
@@ -520,7 +595,7 @@ describe("CaptureService", () => {
         removedJobIds: [ref.jobId],
       });
       expect(calls).toEqual(["submit", "status", "cancel", "release"]);
-      await expect(service.status(undefined, ref.jobId)).rejects.toMatchObject({ code: "JOB_NOT_FOUND" });
+      await expect(service.status(ref.jobId)).rejects.toMatchObject({ code: "JOB_NOT_FOUND" });
     } finally {
       await service.close();
     }
@@ -584,7 +659,7 @@ describe("CaptureService", () => {
       },
     };
     const runPort: CaptureRunPort = {
-      async reserve(input) { return { runId: input.runId, captureLabel: input.captureLabel, jobId: input.jobId }; },
+      async reserve(input) { return { runId: input.runId, captureLabel: input.captureLabel ?? "current-1", jobId: input.jobId }; },
       async bind() {},
       async complete() {},
       async fail() {},
@@ -635,12 +710,12 @@ describe("CaptureService", () => {
       expect(calls).toEqual(["submit", "status"]);
 
       transportHealthy = true;
-      await expect(service.cancel(undefined, ref.jobId)).resolves.toMatchObject({
+      await expect(service.cancel(ref.jobId)).resolves.toMatchObject({
         state: "failed",
         cameraLeaseHeld: false,
         restorationConfirmed: false,
       });
-      await expect(service.release(undefined, ref.jobId)).resolves.toMatchObject({
+      await expect(service.release(ref.jobId)).resolves.toMatchObject({
         backend: "workbench",
         jobId: ref.jobId,
         restorationConfirmed: false,
@@ -700,7 +775,7 @@ describe("CaptureService", () => {
       },
     };
     const runPort: CaptureRunPort = {
-      async reserve(input) { return { runId: input.runId, captureLabel: input.captureLabel, jobId: input.jobId }; },
+      async reserve(input) { return { runId: input.runId, captureLabel: input.captureLabel ?? "current-1", jobId: input.jobId }; },
       async bind() {},
       async complete() {},
       async fail() {},
@@ -744,12 +819,12 @@ describe("CaptureService", () => {
       });
       expect(calls).toEqual(["submit", "status", "cancel"]);
 
-      await expect(service.cancel(undefined, ref.jobId)).resolves.toMatchObject({
+      await expect(service.cancel(ref.jobId)).resolves.toMatchObject({
         state: "failed",
         cameraLeaseHeld: false,
         restorationConfirmed: false,
       });
-      await service.release(undefined, ref.jobId);
+      await service.release(ref.jobId);
       expect(calls).toEqual(["submit", "status", "cancel", "cancel", "release"]);
     } finally {
       await service.close();
@@ -787,7 +862,7 @@ describe("CaptureService", () => {
     const completed: Array<{ runId: string; captureLabel: string }> = [];
     const failed: Array<{ runId: string; captureLabel: string; code: string }> = [];
     const runPort: CaptureRunPort = {
-      async reserve(input) { return { runId: input.runId, captureLabel: input.captureLabel, jobId: input.jobId }; },
+      async reserve(input) { return { runId: input.runId, captureLabel: input.captureLabel ?? "current-1", jobId: input.jobId }; },
       async bind() {},
       async complete(input) { completed.push({ runId: input.runId, captureLabel: input.captureLabel }); },
       async fail(input) { failed.push({ runId: input.runId, captureLabel: input.captureLabel, code: input.code }); },
@@ -831,5 +906,594 @@ describe("CaptureService", () => {
     } finally {
       await service.close();
     }
+  });
+
+  it("delegates targetless capture only to one compatible renderer and reports opaque ambiguity targets", async () => {
+    const runtime = backend();
+    const workbenchRevision = workbenchWorldRevision("project|world-a|0|false");
+    const workbenchInstance: CaptureInstance = {
+      backend: "workbench",
+      instanceId: "workbench-ambiguous",
+      capabilities: ["render.capture", "camera.editor"],
+      worldRevision: workbenchRevision,
+      worldId: "project|world-a|0|false",
+      recoveryBinding: { lifecycleGeneration: "generation-a" },
+    };
+    const workbench: CaptureBackend = {
+      kind: "workbench",
+      async listInstances() { return [workbenchInstance]; },
+      async submit(input) { return { ref: { ...workbenchInstance, jobId: input.jobId }, state: "queued" } as never; },
+      async status(ref) { return { ref, state: "queued" }; },
+      async cancel(ref) { return { ref, state: "cancelled", cameraLeaseHeld: false, restorationConfirmed: true }; },
+      async read() { throw new Error("not completed"); },
+      async release() { return { restorationConfirmed: true, artifactRemoved: true }; },
+    };
+    const sole = new CaptureService({ backends: [runtime.backend], createJobId: () => "job-delegated-sole" });
+    const ambiguous = new CaptureService({ backends: [runtime.backend, workbench], createJobId: () => "job-delegated-ambiguous" });
+    try {
+      await expect(sole.capture({
+        idempotencyKey: "delegated-sole",
+        view: { kind: "current" },
+        asynchronous: true,
+        timeoutMs: 1_000,
+      })).resolves.toMatchObject({ asynchronous: true, job: { instanceId: "runtime-1" } });
+      await expect(ambiguous.capture({
+        idempotencyKey: "delegated-ambiguous",
+        view: { kind: "current" },
+        asynchronous: true,
+        timeoutMs: 1_000,
+      })).rejects.toMatchObject({
+        code: "AMBIGUOUS_INSTANCE",
+        details: { candidates: [
+          expect.objectContaining({ backend: "runtime", target: expect.stringMatching(/^ct1\./) }),
+          expect.objectContaining({ backend: "workbench", target: expect.stringMatching(/^ct1\./) }),
+        ] },
+      });
+    } finally {
+      await sole.close();
+      await ambiguous.close();
+    }
+  });
+
+  it("revises one delegated admission after a submit-time world change on the same exact instance", async () => {
+    const firstRevision = runtimeWorldRevision("world-a", 1);
+    const secondRevision = runtimeWorldRevision("world-b", 2);
+    let revision = firstRevision;
+    let submitCount = 0;
+    const requests: string[] = [];
+    const events: string[] = [];
+    const instance = (): CaptureInstance => ({
+      backend: "runtime",
+      instanceId: "runtime-refresh",
+      sessionId: "session-refresh",
+      capabilities: ["render.capture", "camera.runtime"],
+      worldRevision: revision,
+      worldId: revision === firstRevision ? "world-a" : "world-b",
+      recoveryBinding: { instanceNonce: "same-nonce" },
+    });
+    const dynamic: CaptureBackend = {
+      kind: "runtime",
+      async listInstances() { events.push("inventory"); return [instance()]; },
+      async submit(input) {
+        submitCount += 1;
+        requests.push(input.request.expectedWorldRevision);
+        events.push(`submit-${submitCount}`);
+        if (submitCount === 1) {
+          revision = secondRevision;
+          throw Object.assign(new Error("world changed before admission"), { code: "WORLD_CHANGED" });
+        }
+        return { ref: { ...input.instance, backend: "runtime", jobId: input.jobId } as never, state: "queued" };
+      },
+      async status(ref) { return { ref, state: "queued" }; },
+      async cancel(ref) { return { ref, state: "cancelled", cameraLeaseHeld: false, restorationConfirmed: true }; },
+      async read() { throw new Error("not completed"); },
+      async release() { return { restorationConfirmed: true, artifactRemoved: true }; },
+    };
+    const runPort: CaptureRunPort = {
+      async reserve(input) { events.push("reserve"); return { runId: input.runId, captureLabel: "current-1", jobId: input.jobId }; },
+      async bind() { events.push("bind"); },
+      async reviseAdmission(input) { events.push(`revise-${input.retryCount}`); },
+      async submitted() { events.push("submitted"); },
+      async complete() {},
+      async fail() {},
+      async assertReleaseAllowed() {},
+    };
+    const service = new CaptureService({ backends: [dynamic], runPort, createJobId: () => "job-world-refresh" });
+    try {
+      await expect(service.capture({
+        runId: "20260804T120000Z-a1b2c3d4",
+        idempotencyKey: "delegated-world-refresh",
+        view: { kind: "current" },
+        asynchronous: true,
+        timeoutMs: 1_000,
+      })).resolves.toMatchObject({
+        asynchronous: true,
+        job: { jobId: "job-world-refresh", worldRevision: secondRevision, captureLabel: "current-1" },
+      });
+      expect(requests).toEqual([firstRevision, secondRevision]);
+      expect(events).toEqual(["inventory", "reserve", "bind", "submit-1", "inventory", "revise-1", "submit-2", "submitted"]);
+    } finally {
+      await service.close();
+    }
+  });
+
+  it("refuses delegated world refresh when the instance recovery binding was replaced", async () => {
+    let inventoryCount = 0;
+    let submitCount = 0;
+    const dynamic: CaptureBackend = {
+      kind: "runtime",
+      async listInstances() {
+        inventoryCount += 1;
+        return [{
+          backend: "runtime", instanceId: "runtime-reused", sessionId: "session-reused",
+          capabilities: ["render.capture"],
+          worldRevision: runtimeWorldRevision(`world-${inventoryCount}`, inventoryCount),
+          worldId: `world-${inventoryCount}`,
+          recoveryBinding: { instanceNonce: `nonce-${inventoryCount}` },
+        }];
+      },
+      async submit() {
+        submitCount += 1;
+        throw Object.assign(new Error("world changed before admission"), { code: "WORLD_CHANGED" });
+      },
+      async status(ref) { return { ref, state: "queued" }; },
+      async cancel(ref) { return { ref, state: "cancelled", cameraLeaseHeld: false, restorationConfirmed: true }; },
+      async read() { throw new Error("not completed"); },
+      async release() { return { restorationConfirmed: true, artifactRemoved: true }; },
+    };
+    const service = new CaptureService({ backends: [dynamic], createJobId: () => "job-replaced-instance" });
+    try {
+      await expect(service.capture({
+        idempotencyKey: "replaced-instance",
+        view: { kind: "current" },
+        asynchronous: true,
+        timeoutMs: 1_000,
+      })).rejects.toMatchObject({ code: "STALE_INSTANCE" });
+      expect(submitCount).toBe(1);
+    } finally {
+      await service.close();
+    }
+  });
+
+  it("primes and releases the same Workbench lifecycle before an explicit pose without reserving prime evidence", async () => {
+    const revision = workbenchWorldRevision("project|world-prime|0|false");
+    let primed = false;
+    const events: string[] = [];
+    const ids = ["job-pose", "job-prime"];
+    const instance = (): CaptureInstance => ({
+      backend: "workbench",
+      instanceId: "workbench-prime",
+      capabilities: primed ? ["render.capture", "camera.editor"] : ["render.capture"],
+      restorationApiAvailable: true,
+      worldRevision: revision,
+      worldId: "project|world-prime|0|false",
+      recoveryBinding: { lifecycleGeneration: "generation-prime" },
+    });
+    const workbench: CaptureBackend = {
+      kind: "workbench",
+      async listInstances() { events.push("inventory"); return [instance()]; },
+      async submit(input) {
+        events.push(`submit-${input.request.view.kind}`);
+        return {
+          ref: { ...input.instance, backend: "workbench", jobId: input.jobId } as never,
+          state: input.request.view.kind === "current" ? "completed" : "queued",
+          cameraLeaseHeld: input.request.view.kind !== "current",
+          restorationConfirmed: input.request.view.kind === "current",
+        };
+      },
+      async status(ref) { return { ref, state: "completed", cameraLeaseHeld: false, restorationConfirmed: true }; },
+      async cancel(ref) { return { ref, state: "cancelled", cameraLeaseHeld: false, restorationConfirmed: true }; },
+      async read() { events.push("read-current"); return { image: Buffer.from("png"), metadata: {} }; },
+      async release() { events.push("release-current"); primed = true; return { restorationConfirmed: true, artifactRemoved: true }; },
+    };
+    const reservations: Array<{ runId: string; view: string }> = [];
+    const runPort: CaptureRunPort = {
+      async reserve(input) {
+        reservations.push({ runId: input.runId, view: input.request.view.kind });
+        return { runId: input.runId, captureLabel: "pose-1", jobId: input.jobId };
+      },
+      async bind() {},
+      async submitted() {},
+      async complete() {},
+      async fail() {},
+      async assertReleaseAllowed() {},
+    };
+    const service = new CaptureService({ backends: [workbench], runPort, createJobId: () => ids.shift()! });
+    try {
+      await expect(service.capture({
+        instanceId: "workbench-prime",
+        expectedWorldRevision: revision,
+        idempotencyKey: "workbench-pose-with-prime",
+        runId: "20260804T130000Z-a1b2c3d4",
+        view: { kind: "pose", position: [1, 2, 3], orientation: [0, 0, 0, 1], fov: 60 },
+        asynchronous: true,
+        timeoutMs: 5_000,
+      })).resolves.toMatchObject({ asynchronous: true, job: { jobId: "job-pose", state: "queued", captureLabel: "pose-1" } });
+      expect(events).toEqual([
+        "inventory", "inventory", "submit-current", "read-current", "release-current", "inventory", "submit-pose",
+      ]);
+      expect(reservations).toEqual([{ runId: "20260804T130000Z-a1b2c3d4", view: "pose" }]);
+    } finally {
+      await service.close();
+    }
+  });
+
+  it("skips a second prime on the proven editor but primes again after a Workbench restart", async () => {
+    let generation = 1;
+    const proven = new Set<number>();
+    const events: string[] = [];
+    let nextJob = 0;
+    const revision = (): ReturnType<typeof workbenchWorldRevision> => workbenchWorldRevision(`project|world-prime-${generation}|0|false`);
+    const instance = (): CaptureInstance => ({
+      backend: "workbench",
+      instanceId: `workbench-generation-${generation}`,
+      capabilities: proven.has(generation) ? ["render.capture", "camera.editor"] : ["render.capture"],
+      restorationApiAvailable: true,
+      worldRevision: revision(),
+      worldId: `project|world-prime-${generation}|0|false`,
+      recoveryBinding: { lifecycleGeneration: `generation-${generation}` },
+    });
+    const workbench: CaptureBackend = {
+      kind: "workbench",
+      async listInstances() { return [instance()]; },
+      async submit(input) {
+        events.push(`submit-${input.request.view.kind}-g${generation}`);
+        return {
+          ref: { ...input.instance, backend: "workbench", jobId: input.jobId } as never,
+          state: input.request.view.kind === "current" ? "completed" : "queued",
+          cameraLeaseHeld: input.request.view.kind !== "current",
+          restorationConfirmed: input.request.view.kind === "current",
+        };
+      },
+      async status(ref) { return { ref, state: "completed", cameraLeaseHeld: false, restorationConfirmed: true }; },
+      async cancel(ref) { return { ref, state: "cancelled", cameraLeaseHeld: false, restorationConfirmed: true }; },
+      async read() { return { image: Buffer.from("png"), metadata: {} }; },
+      async release(ref) {
+        const releasedGeneration = Number(ref.instanceId.split("-").at(-1));
+        proven.add(releasedGeneration);
+        events.push(`release-current-g${releasedGeneration}`);
+        return { restorationConfirmed: true, artifactRemoved: true };
+      },
+    };
+    const service = new CaptureService({
+      backends: [workbench],
+      createJobId: () => `job-prime-generation-${++nextJob}`,
+    });
+    const pose = (key: string) => service.capture({
+      instanceId: instance().instanceId,
+      expectedWorldRevision: revision(),
+      idempotencyKey: key,
+      view: { kind: "pose" as const, position: [1, 2, 3] as [number, number, number], orientation: [0, 0, 0, 1] as [number, number, number, number], fov: 60 },
+      asynchronous: true,
+      timeoutMs: 5_000,
+    });
+
+    try {
+      await expect(pose("first-generation-pose")).resolves.toMatchObject({ asynchronous: true });
+      await expect(pose("same-generation-pose")).resolves.toMatchObject({ asynchronous: true });
+      generation = 2;
+      await expect(pose("restarted-generation-pose")).resolves.toMatchObject({ asynchronous: true });
+      expect(events).toEqual([
+        "submit-current-g1", "release-current-g1", "submit-pose-g1",
+        "submit-pose-g1",
+        "submit-current-g2", "release-current-g2", "submit-pose-g2",
+      ]);
+    } finally {
+      await service.close();
+    }
+  });
+
+  it("cancels and releases a retained prime when the caller aborts, without submitting the pose", async () => {
+    const controller = new AbortController();
+    const revision = workbenchWorldRevision("project|world-prime-cancel|0|false");
+    const events: string[] = [];
+    const instance: CaptureInstance = {
+      backend: "workbench",
+      instanceId: "workbench-prime-cancel",
+      capabilities: ["render.capture"],
+      restorationApiAvailable: true,
+      worldRevision: revision,
+      worldId: "project|world-prime-cancel|0|false",
+      recoveryBinding: { lifecycleGeneration: "generation-prime-cancel" },
+    };
+    const workbench: CaptureBackend = {
+      kind: "workbench",
+      async listInstances() { events.push("inventory"); return [instance]; },
+      async submit(input) {
+        events.push(`submit-${input.request.view.kind}`);
+        return { ref: { ...input.instance, jobId: input.jobId } as never, state: "queued", cameraLeaseHeld: true, restorationConfirmed: false };
+      },
+      async status(ref) { return { ref, state: "queued", cameraLeaseHeld: true, restorationConfirmed: false }; },
+      async cancel(ref) {
+        events.push("cancel-current");
+        return { ref, state: "cancelled", cameraLeaseHeld: false, restorationConfirmed: true };
+      },
+      async read() { throw new Error("cancelled prime has no artifact"); },
+      async release() { events.push("release-current"); return { restorationConfirmed: true, artifactRemoved: true }; },
+    };
+    const ids = ["job-unused-outer", "job-prime-cancel"];
+    const service = new CaptureService({
+      backends: [workbench],
+      createJobId: () => ids.shift()!,
+      sleep: async () => {
+        controller.abort();
+        throw Object.assign(new Error("caller cancelled during prime"), { code: "CANCELLED" });
+      },
+    });
+
+    try {
+      await expect(service.capture({
+        instanceId: instance.instanceId,
+        expectedWorldRevision: revision,
+        idempotencyKey: "cancel-during-prime",
+        view: { kind: "pose", position: [1, 2, 3], orientation: [0, 0, 0, 1], fov: 60 },
+        asynchronous: true,
+        timeoutMs: 5_000,
+        signal: controller.signal,
+      })).rejects.toMatchObject({
+        code: "CANCELLED",
+        details: {
+          job: { jobId: "job-prime-cancel", state: "released" },
+          cleanupRequired: false,
+          cleanup: { jobId: "job-prime-cancel" },
+        },
+      });
+      expect(events).toEqual(["inventory", "inventory", "submit-current", "cancel-current", "release-current"]);
+      expect(events).not.toContain("submit-pose");
+    } finally {
+      await service.close();
+    }
+  });
+
+  it("fails closed with a recovery job when prime release cannot be proven", async () => {
+    const revision = workbenchWorldRevision("project|world-prime-release-failure|0|false");
+    const events: string[] = [];
+    const instance: CaptureInstance = {
+      backend: "workbench",
+      instanceId: "workbench-prime-release-failure",
+      capabilities: ["render.capture"],
+      restorationApiAvailable: true,
+      worldRevision: revision,
+      worldId: "project|world-prime-release-failure|0|false",
+      recoveryBinding: { lifecycleGeneration: "generation-prime-release-failure" },
+    };
+    const workbench: CaptureBackend = {
+      kind: "workbench",
+      async listInstances() { return [instance]; },
+      async submit(input) {
+        events.push(`submit-${input.request.view.kind}`);
+        return { ref: { ...input.instance, jobId: input.jobId } as never, state: "completed", cameraLeaseHeld: false, restorationConfirmed: true };
+      },
+      async status(ref) { return { ref, state: "completed", cameraLeaseHeld: false, restorationConfirmed: true }; },
+      async cancel(ref) { return { ref, state: "cancelled", cameraLeaseHeld: false, restorationConfirmed: true }; },
+      async read() { return { image: Buffer.from("png"), metadata: {} }; },
+      async release() { throw Object.assign(new Error("prime restoration receipt unavailable"), { code: "RESTORATION_UNCONFIRMED" }); },
+    };
+    const ids = ["job-unused-release-outer", "job-prime-release-failure"];
+    const service = new CaptureService({ backends: [workbench], createJobId: () => ids.shift()! });
+
+    try {
+      await expect(service.capture({
+        instanceId: instance.instanceId,
+        expectedWorldRevision: revision,
+        idempotencyKey: "prime-release-failure",
+        view: { kind: "pose", position: [1, 2, 3], orientation: [0, 0, 0, 1], fov: 60 },
+        asynchronous: true,
+        timeoutMs: 5_000,
+      })).rejects.toMatchObject({
+        code: "RESTORATION_UNCONFIRMED",
+        details: {
+          job: { jobId: "job-prime-release-failure", state: "completed" },
+          cleanupRequired: true,
+          recovery: expect.stringContaining("job-prime-release-failure"),
+        },
+      });
+      expect(events).toEqual(["submit-current"]);
+    } finally {
+      await service.close();
+    }
+  });
+
+  it("adopts a world changed by priming only for delegated selection", async () => {
+    const exercise = async (selection: "explicit" | "delegated") => {
+      const firstRevision = workbenchWorldRevision(`project|world-prime-${selection}-a|0|false`);
+      const secondRevision = workbenchWorldRevision(`project|world-prime-${selection}-b|0|false`);
+      let currentRevision = firstRevision;
+      let primed = false;
+      const events: string[] = [];
+      let nextJob = 0;
+      const instance = (): CaptureInstance => ({
+        backend: "workbench",
+        instanceId: `workbench-prime-world-${selection}`,
+        capabilities: primed ? ["render.capture", "camera.editor"] : ["render.capture"],
+        restorationApiAvailable: true,
+        worldRevision: currentRevision,
+        worldId: `project|world-prime-${selection}`,
+        recoveryBinding: { lifecycleGeneration: `generation-prime-world-${selection}` },
+      });
+      const workbench: CaptureBackend = {
+        kind: "workbench",
+        async listInstances() { return [instance()]; },
+        async submit(input) {
+          events.push(`submit-${input.request.view.kind}`);
+          return {
+            ref: { ...input.instance, jobId: input.jobId } as never,
+            state: input.request.view.kind === "current" ? "completed" : "queued",
+            cameraLeaseHeld: input.request.view.kind !== "current",
+            restorationConfirmed: input.request.view.kind === "current",
+          };
+        },
+        async status(ref) { return { ref, state: "completed", cameraLeaseHeld: false, restorationConfirmed: true }; },
+        async cancel(ref) { return { ref, state: "cancelled", cameraLeaseHeld: false, restorationConfirmed: true }; },
+        async read() { return { image: Buffer.from("png"), metadata: {} }; },
+        async release() {
+          currentRevision = secondRevision;
+          primed = true;
+          return { restorationConfirmed: true, artifactRemoved: true };
+        },
+      };
+      const service = new CaptureService({
+        backends: [workbench],
+        createJobId: () => `job-prime-world-${selection}-${++nextJob}`,
+      });
+      const binding = selection === "explicit"
+        ? { instanceId: instance().instanceId, expectedWorldRevision: firstRevision }
+        : {};
+      try {
+        const capture = service.capture({
+          ...binding,
+          idempotencyKey: `prime-world-${selection}`,
+          view: { kind: "pose", position: [1, 2, 3], orientation: [0, 0, 0, 1], fov: 60 },
+          asynchronous: true,
+          timeoutMs: 5_000,
+        });
+        if (selection === "explicit") {
+          await expect(capture).rejects.toMatchObject({ code: "WORLD_CHANGED" });
+          expect(events).toEqual(["submit-current"]);
+        } else {
+          await expect(capture).resolves.toMatchObject({
+            asynchronous: true,
+            job: { worldRevision: secondRevision },
+          });
+          expect(events).toEqual(["submit-current", "submit-pose"]);
+        }
+      } finally {
+        await service.close();
+      }
+    };
+
+    await exercise("explicit");
+    await exercise("delegated");
+  });
+});
+
+describe("CaptureService shutdown quiescence", () => {
+  it("seals admissions, aborts work admitted immediately before shutdown, and cancels its retained job", async () => {
+    let submitEntered!: () => void;
+    const entered = new Promise<void>((resolve) => { submitEntered = resolve; });
+    const calls: string[] = [];
+    const instance: CaptureInstance = {
+      backend: "runtime",
+      instanceId: "runtime-quiesce",
+      sessionId: "session-quiesce",
+      capabilities: ["render.capture"],
+      worldRevision: nullRuntimeRevision,
+      worldId: null,
+      recoveryBinding: {},
+    };
+    const controlled: CaptureBackend = {
+      kind: "runtime",
+      async listInstances() { return [instance]; },
+      async submit(_input, context) {
+        calls.push("submit");
+        submitEntered();
+        await new Promise<void>((_resolve, reject) => {
+          const abort = (): void => reject(Object.assign(new Error("shutdown abort"), { code: "CANCELLED" }));
+          if (context.signal?.aborted) abort();
+          else context.signal?.addEventListener("abort", abort, { once: true });
+        });
+        throw new Error("unreachable");
+      },
+      async status(ref) { return { ref, state: "queued", restorationConfirmed: false }; },
+      async cancel(ref) {
+        calls.push("cancel");
+        return { ref, state: "cancelled", cameraLeaseHeld: false, restorationConfirmed: true };
+      },
+      async read() { throw new Error("not completed"); },
+      async release() { return { restorationConfirmed: true, artifactRemoved: true }; },
+    };
+    const service = new CaptureService({
+      backends: [controlled],
+      pollIntervalMs: 1,
+      createJobId: () => "job-admission-race",
+    });
+    const capture = service.capture({
+      sessionId: instance.sessionId,
+      instanceId: instance.instanceId,
+      idempotencyKey: "admission-before-shutdown",
+      view: { kind: "current" },
+      asynchronous: true,
+      timeoutMs: 1_000,
+      expectedWorldRevision: nullRuntimeRevision,
+    });
+    await entered;
+
+    const quiescence = service.quiesce(Date.now() + 1_000);
+    await expect(capture).rejects.toMatchObject({ code: "CANCELLED" });
+    await expect(quiescence).resolves.toMatchObject({
+      quiescent: true,
+      remainingJobIds: [],
+      remainingAdmissionScopes: [],
+    });
+    await expect(service.capture({
+      sessionId: instance.sessionId,
+      idempotencyKey: "after-shutdown",
+      view: { kind: "current" },
+      asynchronous: true,
+      timeoutMs: 1_000,
+      expectedWorldRevision: nullRuntimeRevision,
+    })).rejects.toMatchObject({ code: "TRANSPORT_UNAVAILABLE" });
+    expect(calls).toEqual(["submit", "cancel"]);
+    await service.close();
+  });
+
+  it("repeats cancellation until camera and restoration obligations converge", async () => {
+    const fake = backend();
+    let cancellations = 0;
+    fake.backend.cancel = async (ref) => {
+      cancellations += 1;
+      return cancellations === 1
+        ? { ref, state: "restoring", cameraLeaseHeld: true, restorationConfirmed: false }
+        : { ref, state: "cancelled", cameraLeaseHeld: false, restorationConfirmed: true };
+    };
+    const service = new CaptureService({
+      backends: [fake.backend],
+      pollIntervalMs: 1,
+      createJobId: () => "job-restoration-convergence",
+    });
+    await service.capture({
+      sessionId: "session-1",
+      idempotencyKey: "restoration-convergence",
+      view: { kind: "current" },
+      asynchronous: true,
+      timeoutMs: 1_000,
+      expectedWorldRevision: nullRuntimeRevision,
+    });
+
+    await expect(service.quiesce(Date.now() + 1_000)).resolves.toMatchObject({ quiescent: true });
+    expect(cancellations).toBe(2);
+    await service.close();
+  });
+
+  it("returns structured remaining obligations at expiry and safely resumes on retry", async () => {
+    const fake = backend();
+    let mayRestore = false;
+    fake.backend.cancel = async (ref) => mayRestore
+      ? { ref, state: "cancelled", cameraLeaseHeld: false, restorationConfirmed: true }
+      : { ref, state: "restoring", cameraLeaseHeld: true, restorationConfirmed: false };
+    const service = new CaptureService({
+      backends: [fake.backend],
+      pollIntervalMs: 1,
+      createJobId: () => "job-retry-quiescence",
+    });
+    await service.capture({
+      sessionId: "session-1",
+      idempotencyKey: "retry-quiescence",
+      view: { kind: "current" },
+      asynchronous: true,
+      timeoutMs: 1_000,
+      expectedWorldRevision: nullRuntimeRevision,
+    });
+
+    await expect(service.quiesce(Date.now() + 20)).resolves.toMatchObject({
+      quiescent: false,
+      remainingJobIds: ["job-retry-quiescence"],
+    });
+    mayRestore = true;
+    await expect(service.quiesce(Date.now() + 1_000)).resolves.toMatchObject({
+      quiescent: true,
+      remainingJobIds: [],
+    });
+    await service.close();
   });
 });

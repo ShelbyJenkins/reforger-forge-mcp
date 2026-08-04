@@ -1,4 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
+import { redactText } from "../foundation/redact.js";
 import {
   CaptureError,
   hasRestorationObligation,
@@ -13,17 +15,21 @@ import {
   type CaptureInput,
   type CaptureErrorCode,
   type CaptureInstance,
+  type CanonicalCaptureIntent,
+  type CanonicalCaptureRequest,
   type CaptureResult,
   type CaptureRunPort,
   type ListInstancesInput,
   type PublicCaptureJob,
 } from "./capture-contract.js";
 import { canonicalPublicObserverErrorCode } from "./public-contract.js";
+import { encodeCaptureTarget } from "./capture-target.js";
 import { CaptureJobStore, type CaptureJobRecord } from "./capture-job-store.js";
 import {
   DEFAULT_IMAGE_POLICY_LIMITS,
   idempotencyScope,
-  normalizeCaptureRequest,
+  materializeCaptureRequest,
+  normalizeCaptureIntent,
   type ImagePolicyDefaults,
 } from "./capture-request.js";
 import {
@@ -32,6 +38,7 @@ import {
   legacyWorldFields,
   runtimeWorldRevision,
   sameWorldRevision,
+  worldRevisionKind,
   workbenchWorldRevision,
   type WorldRevision,
 } from "./world-revision.js";
@@ -55,6 +62,20 @@ export interface CaptureInstanceList {
   waitedMs: number;
   timedOut: boolean;
   warnings?: string[];
+}
+
+export interface CaptureQuiesceFailure {
+  jobId: string;
+  code: string;
+  summary: string;
+}
+
+export interface CaptureQuiesceResult {
+  quiescent: boolean;
+  remainingJobIds: string[];
+  remainingAdmissionScopes: string[];
+  remainingActiveOperationIds: string[];
+  failures: CaptureQuiesceFailure[];
 }
 
 interface ActiveCapture {
@@ -96,11 +117,18 @@ function defaultSleep(milliseconds: number, signal?: AbortSignal): Promise<void>
   });
 }
 
-function isCompatible(instance: CaptureInstance, request: ReturnType<typeof normalizeCaptureRequest>): boolean {
-  if (instance.stale === true || instance.transportHealthy === false) return false;
+function combinedSignal(left: AbortSignal | undefined, right: AbortSignal): AbortSignal {
+  if (!left) return right;
+  return AbortSignal.any([left, right]);
+}
+
+function isCompatible(instance: CaptureInstance, request: CanonicalCaptureIntent): boolean {
+  if (instance.stale === true || instance.transportHealthy === false || instance.headless === true) return false;
   const capabilities = new Set(instance.capabilities);
   if (!capabilities.has("render.capture")) return false;
-  if (request.view.kind !== "current" && !capabilities.has(instance.backend === "workbench" ? "camera.editor" : "camera.runtime")) return false;
+  if (request.view.kind !== "current" && !capabilities.has(instance.backend === "workbench" ? "camera.editor" : "camera.runtime")) {
+    return instance.backend === "workbench" && instance.restorationApiAvailable === true;
+  }
   return true;
 }
 
@@ -151,7 +179,9 @@ export class CaptureService {
   private readonly active = new Map<string, ActiveCapture>();
   private readonly admissions = new Map<string, Promise<CaptureResult>>();
   private readonly sweepTimer: NodeJS.Timeout;
+  private readonly shutdownAbort = new AbortController();
   private sealed = false;
+  private terminalClosed = false;
 
   constructor(options: CaptureServiceOptions) {
     if (!options.backends.length) throw new TypeError("CaptureService requires at least one backend");
@@ -204,8 +234,11 @@ export class CaptureService {
       const compatible = all.filter((instance) => isQueryCompatible(instance, query));
       const elapsed = this.now() - started;
       if (waitMs <= 0 || compatible.length > 0 || this.now() >= deadlineAtMs) {
-        const projected = all.map(({ recoveryBinding: _recoveryBinding, ...instance }) => ({ ...instance }));
-        return { instances: projected as CaptureInstance[], compatibleCount: compatible.length, waitedMs: elapsed, timedOut: waitMs > 0 && compatible.length === 0, ...(warnings.length ? { warnings } : {}) };
+        const projected = all.map(({ recoveryBinding: _recoveryBinding, ...instance }) => ({
+          ...instance,
+          target: encodeCaptureTarget(instance),
+        }));
+        return { instances: projected as unknown as CaptureInstance[], compatibleCount: compatible.length, waitedMs: elapsed, timedOut: waitMs > 0 && compatible.length === 0, ...(warnings.length ? { warnings } : {}) };
       }
       await this.sleep(Math.min(this.pollIntervalMs, Math.max(1, deadlineAtMs - this.now())), query.signal);
     }
@@ -213,41 +246,67 @@ export class CaptureService {
 
   async capture(input: CaptureInput): Promise<CaptureResult> {
     if (this.sealed) throw new CaptureError("TRANSPORT_UNAVAILABLE", "Observer capture admission is closed");
-    const request = normalizeCaptureRequest(input, this.defaultTimeoutMs, this.imagePolicyDefaults);
+    const intent = normalizeCaptureIntent(input, this.defaultTimeoutMs, this.imagePolicyDefaults);
     const scope = idempotencyScope(input);
     const retained = this.store.get(scope);
     if (retained) {
-      if (retained.fingerprint !== request.fingerprint) throw new CaptureError("IDEMPOTENCY_CONFLICT", "Capture idempotency key was reused with a different request");
+      if ((retained.request.intentFingerprint ?? retained.fingerprint) !== intent.fingerprint) throw new CaptureError("IDEMPOTENCY_CONFLICT", "Capture idempotency key was reused with a different request");
       if (retained.releaseReceipt) throw new CaptureError("JOB_RELEASED", "Capture idempotency key belongs to a released job", { release: retained.releaseReceipt });
       return this.finishExisting(retained, input);
     }
     const inFlight = this.admissions.get(scope);
     if (inFlight) return inFlight;
-    const admitted = this.admit(input, request, scope);
+    const admitted = this.admit({
+      ...input,
+      signal: combinedSignal(input.signal, this.shutdownAbort.signal),
+    }, intent, scope);
     this.admissions.set(scope, admitted);
     try { return await admitted; } finally { this.admissions.delete(scope); }
   }
 
-  private async admit(input: CaptureInput, request: ReturnType<typeof normalizeCaptureRequest>, scope: string): Promise<CaptureResult> {
+  private async admit(input: CaptureInput, intent: CanonicalCaptureIntent, scope: string): Promise<CaptureResult> {
     if (input.signal?.aborted) throw new CaptureError("CANCELLED", "Observer capture was cancelled");
-    const deadlineAtMs = this.now() + request.timeoutMs;
+    const deadlineAtMs = this.now() + intent.timeoutMs;
     let reservation: Awaited<ReturnType<NonNullable<CaptureRunPort["reserve"]>>> | undefined;
     const generatedJobId = this.validatedJobId(this.createJobId());
     let jobId = generatedJobId;
     try {
-      if (request.runId && request.captureLabel) {
+      let instance = await this.selectInstance(input, intent, deadlineAtMs, input.signal);
+      instance = await this.primeWorkbenchIfNeeded(input, intent, instance, deadlineAtMs);
+      if (!instance.sessionId && instance.backend === "runtime") throw new CaptureError("INVALID_REQUEST", "Selected runtime capture has no session binding");
+      let request = materializeCaptureRequest(intent, {
+        ...(instance.sessionId ? { sessionId: instance.sessionId } : {}),
+        instanceId: instance.instanceId,
+        expectedWorldRevision: instance.worldRevision,
+      });
+      if (intent.runId) {
         if (!this.runPort) throw new CaptureError("CAPABILITY_UNAVAILABLE", "Durable capture runs are unavailable");
-        reservation = await this.runPort.reserve({ runId: request.runId, captureLabel: request.captureLabel, ...(request.purpose ? { purpose: request.purpose } : {}), idempotencyKey: input.idempotencyKey, request, jobId: generatedJobId });
+        reservation = await this.runPort.reserve({
+          runId: intent.runId,
+          ...(intent.captureLabel ? { captureLabel: intent.captureLabel } : {}),
+          ...(intent.purpose ? { purpose: intent.purpose } : {}),
+          idempotencyKey: input.idempotencyKey,
+          request,
+          jobId: generatedJobId,
+        });
+        if (!reservation.captureLabel) throw new CaptureError("TRANSPORT_UNAVAILABLE", "Run reservation did not return a capture label");
+        request = materializeCaptureRequest(intent, {
+          ...(instance.sessionId ? { sessionId: instance.sessionId } : {}),
+          instanceId: instance.instanceId,
+          expectedWorldRevision: instance.worldRevision,
+        }, reservation.captureLabel);
       }
-      const instance = await this.selectInstance(request, deadlineAtMs, input.signal);
-      if (!instance.sessionId && instance.backend === "runtime") throw new CaptureError("INVALID_REQUEST", "sessionId is required for runtime capture");
-      this.assertExpectedWorld(input, instance);
       const reservedJobId = reservation?.jobId ??
         (reservation && typeof reservation.capture === "object" && reservation.capture !== null && typeof (reservation.capture as Record<string, unknown>).jobId === "string"
           ? (reservation.capture as Record<string, unknown>).jobId as string : undefined);
       jobId = this.validatedJobId(reservedJobId ?? generatedJobId);
       const ref = refFor(instance, jobId);
-      const queued: BackendJob = { ref, state: "queued" };
+      const queued: BackendJob = {
+        ref,
+        state: "queued",
+        ...(request.runId ? { runId: request.runId } : {}),
+        ...(request.captureLabel ? { captureLabel: request.captureLabel } : {}),
+      };
       const initial: Omit<CaptureJobRecord, "estimatedBytes"> = {
         jobId,
         idempotencyScope: scope,
@@ -265,8 +324,15 @@ export class CaptureService {
         pinned: Boolean(request.runId),
       };
       this.store.add(initial);
-      if (request.runId && request.captureLabel) await this.runPort!.bind({ runId: request.runId, captureLabel: request.captureLabel, ref });
-      const backend = this.backends.get(instance.backend)!;
+      if (request.runId && request.captureLabel) await this.runPort!.bind({
+        runId: request.runId,
+        captureLabel: request.captureLabel,
+        ref,
+        request,
+        selectionDelegated: intent.selectionMode === "delegated",
+        retryCount: 0,
+      });
+      let backend = this.backends.get(instance.backend)!;
       let submitted: BackendJob;
       if (reservation?.state === "submitted" || reservation?.state === "completed" ||
           (reservation && typeof reservation.capture === "object" && reservation.capture !== null &&
@@ -275,14 +341,29 @@ export class CaptureService {
           submitted = await backend.status(ref, this.context(deadlineAtMs, input.signal));
         } catch (error) {
           if (errorCode(error) !== "JOB_NOT_FOUND") throw error;
-          submitted = await backend.submit({ jobId, idempotencyKey: input.idempotencyKey, request, instance }, this.context(deadlineAtMs, input.signal));
+          ({ submitted, instance, request, backend } = await this.submitWithDelegatedRetry({
+            backend, input, intent, instance, request, jobId, deadlineAtMs,
+          }));
         }
       } else {
-        submitted = await backend.submit({ jobId, idempotencyKey: input.idempotencyKey, request, instance }, this.context(deadlineAtMs, input.signal));
+        ({ submitted, instance, request, backend } = await this.submitWithDelegatedRetry({
+          backend, input, intent, instance, request, jobId, deadlineAtMs,
+        }));
       }
       this.store.update(jobId, (record) => {
-        record.lastBackendJob = { ...submitted, ref: { ...submitted.ref, jobId } };
+        record.lastBackendJob = {
+          ...record.lastBackendJob,
+          ...submitted,
+          ref: { ...submitted.ref, jobId },
+          ...(record.runId ? { runId: record.runId } : {}),
+          ...(record.captureLabel ? { captureLabel: record.captureLabel } : {}),
+        };
         record.lastProjection = publicJob(record.lastBackendJob);
+      });
+      if (request.runId && request.captureLabel) await this.runPort!.submitted?.({
+        runId: request.runId,
+        captureLabel: request.captureLabel,
+        ref: this.store.getById(jobId)!.ref,
       });
       if (request.asynchronous) {
         if (isTerminalJob(submitted)) await this.completeIfNeeded(this.store.getById(jobId)!);
@@ -293,7 +374,10 @@ export class CaptureService {
       const artifact = await this.readArtifact(this.store.getById(jobId)!, deadlineAtMs, input.signal);
       await this.completeArtifact(this.store.getById(jobId)!, terminal, artifact);
       if (artifact.image.length <= this.maxInlineImageBytes) {
-        return { asynchronous: false, job: this.store.getById(jobId)!.lastProjection, image: artifact.image, metadata: artifact.metadata };
+        const record = this.store.getById(jobId)!;
+        const job = record.lastProjection;
+        const cleanup = await this.autoReleaseRunless(record);
+        return { asynchronous: false, job, image: artifact.image, metadata: artifact.metadata, ...cleanup };
       }
     } catch (error) {
       const mapped = asCaptureError(error);
@@ -312,11 +396,15 @@ export class CaptureService {
     // returns or throws). Being too large to return inline is not a capture
     // failure: it must not flow through the catch block above, which would
     // otherwise incorrectly re-mark an already completed run capture as failed.
-    throw new CaptureError("ARTIFACT_TOO_LARGE", "Validated capture exceeds the configured inline limit", { job: this.store.getById(jobId)!.lastProjection });
+    const oversized = this.store.getById(jobId)!;
+    throw new CaptureError("ARTIFACT_TOO_LARGE", "Validated capture exceeds the configured inline limit", {
+      job: oversized.lastProjection,
+      ...await this.autoReleaseRunless(oversized),
+    });
   }
 
-  async status(sessionId: string | undefined, jobId: string): Promise<PublicCaptureJob> {
-    const record = this.requireJob(sessionId, jobId);
+  async status(jobId: string): Promise<PublicCaptureJob> {
+    const record = this.requireJob(jobId);
     if (record.releaseReceipt) return record.lastProjection;
     if (isTerminalJob(record.lastBackendJob)) {
       await this.completeIfNeeded(record);
@@ -331,32 +419,42 @@ export class CaptureService {
     return this.store.getById(jobId)!.lastProjection;
   }
 
-  async cancel(sessionId: string | undefined, jobId: string): Promise<PublicCaptureJob> {
-    const record = this.requireJob(sessionId, jobId);
+  async cancel(jobId: string): Promise<PublicCaptureJob> {
+    const record = this.requireJob(jobId);
     if (record.releaseReceipt) return record.lastProjection;
     const active = this.active.get(`cancel:${jobId}`);
     if (active) { await active.promise; return this.store.getById(jobId)!.lastProjection; }
     const promise = this.cancelOnce(record);
     this.active.set(`cancel:${jobId}`, { promise });
     try { await promise; } finally { this.active.delete(`cancel:${jobId}`); }
-    return this.store.getById(jobId)!.lastProjection;
+    const terminal = this.store.getById(jobId)!;
+    const job = terminal.lastProjection;
+    if (!terminal.runId && isTerminalJob(terminal.lastBackendJob) && !hasRestorationObligation(terminal.lastBackendJob)) {
+      return { ...job, ...await this.autoReleaseRunless(terminal) };
+    }
+    return job;
   }
 
-  async read(sessionId: string | undefined, jobId: string): Promise<{ job: PublicCaptureJob; image: Buffer; metadata: Record<string, unknown> }> {
-    const record = this.requireJob(sessionId, jobId);
+  async read(jobId: string): Promise<{ job: PublicCaptureJob; image: Buffer; metadata: Record<string, unknown>; cleanup?: Record<string, unknown>; cleanupRequired?: boolean; cleanupWarning?: string }> {
+    const record = this.requireJob(jobId);
     const operationDeadline = this.operationDeadline();
     const job = isTerminalJob(record.lastBackendJob) ? record.lastBackendJob : await this.refresh(record, operationDeadline);
     if (job.state !== "completed") throw new CaptureError("ARTIFACT_INCOMPLETE", "Capture is not completed", { job: publicJob(job) });
     const artifact = await this.readArtifact(record, operationDeadline);
     await this.completeArtifact(this.store.getById(jobId)!, job, artifact);
-    if (artifact.image.length > this.maxInlineImageBytes) throw new CaptureError("ARTIFACT_TOO_LARGE", "Validated capture exceeds the configured inline limit", { job: publicJob(job) });
-    return { job: this.store.getById(jobId)!.lastProjection, image: artifact.image, metadata: artifact.metadata };
+    const completed = this.store.getById(jobId)!;
+    if (artifact.image.length > this.maxInlineImageBytes) throw new CaptureError("ARTIFACT_TOO_LARGE", "Validated capture exceeds the configured inline limit", {
+      job: completed.lastProjection,
+      ...await this.autoReleaseRunless(completed),
+    });
+    const projection = completed.lastProjection;
+    return { job: projection, image: artifact.image, metadata: artifact.metadata, ...await this.autoReleaseRunless(completed) };
   }
 
-  async release(sessionId: string | undefined, jobId: string): Promise<Record<string, unknown>> {
-    const record = this.requireJob(sessionId, jobId);
+  async release(jobId: string): Promise<Record<string, unknown>> {
+    const record = this.requireJob(jobId);
     if (record.releaseReceipt) return { ...record.releaseReceipt };
-    if (this.runPort) await this.runPort.assertReleaseAllowed({ jobId, backend: record.ref.backend, sessionId: record.ref.sessionId });
+    if (this.runPort && record.runId) await this.runPort.assertReleaseAllowed({ jobId, backend: record.ref.backend, sessionId: record.ref.sessionId });
     let current = record.lastBackendJob;
     const workbenchLeaseResolved = (): boolean =>
       record.ref.backend === "workbench" && isTerminalJob(current) && current.cameraLeaseHeld === false;
@@ -442,6 +540,8 @@ export class CaptureService {
           runId,
           ...(typeof capture.captureLabel === "string" ? { captureLabel: capture.captureLabel } : {}),
           asynchronous: true,
+          selectionMode: "explicit" as const,
+          intentFingerprint: fingerprint,
           fingerprint,
         };
         const completed = capture.artifactAvailable === true && capture.missingArtifact !== true;
@@ -572,23 +672,112 @@ export class CaptureService {
     }
   }
 
-  async close(): Promise<void> {
-    if (this.sealed) return;
+  async quiesce(deadlineAtMs: number): Promise<CaptureQuiesceResult> {
+    if (!Number.isFinite(deadlineAtMs)) throw new TypeError("Capture quiescence deadline is invalid");
     this.sealed = true;
-    clearInterval(this.sweepTimer);
-    await Promise.allSettled(this.store.entries()
-      .filter((record) => !record.releaseReceipt && (!isTerminalJob(record.lastBackendJob) || hasRestorationObligation(record.lastBackendJob)))
-      .map((record) => this.cancelOnce(record)));
+    if (!this.shutdownAbort.signal.aborted) this.shutdownAbort.abort();
+    const failures = new Map<string, CaptureQuiesceFailure>();
+
+    while (this.now() < deadlineAtMs) {
+      const admissions = [...this.admissions.values()];
+      const activeOperations = [...this.active.values()].map((entry) => entry.promise);
+      if (!await this.settleBeforeDeadline([...admissions, ...activeOperations], deadlineAtMs)) break;
+
+      const obligations = this.shutdownObligations();
+      if (this.admissions.size === 0 && this.active.size === 0 && obligations.length === 0) {
+        return {
+          quiescent: true,
+          remainingJobIds: [],
+          remainingAdmissionScopes: [],
+          remainingActiveOperationIds: [],
+          failures: [],
+        };
+      }
+
+      const attempts = obligations.map(async (record) => {
+        try {
+          await this.cancelOnce(record, deadlineAtMs);
+          failures.delete(record.jobId);
+        } catch (error) {
+          failures.set(record.jobId, {
+            jobId: record.jobId.slice(0, 96),
+            code: errorCode(error),
+            summary: redactText(error instanceof Error ? error.message : String(error), {
+              profile: "diagnostic",
+              maxLength: 240,
+            }),
+          });
+        }
+      });
+      if (!await this.settleBeforeDeadline(attempts, deadlineAtMs)) break;
+      if (this.shutdownObligations().length > 0 && this.now() < deadlineAtMs) {
+        await this.delayBeforeDeadline(deadlineAtMs);
+      }
+    }
+
+    return {
+      quiescent: false,
+      remainingJobIds: this.shutdownObligations().map((record) => record.jobId).slice(0, 32),
+      remainingAdmissionScopes: [...this.admissions.keys()].slice(0, 16),
+      remainingActiveOperationIds: [...this.active.keys()].slice(0, 16),
+      failures: [...failures.values()].slice(0, 16),
+    };
   }
 
-  private async selectInstance(request: ReturnType<typeof normalizeCaptureRequest>, deadlineAtMs: number, signal?: AbortSignal): Promise<CaptureInstance> {
+  async close(): Promise<void> {
+    if (this.terminalClosed) return;
+    this.sealed = true;
+    if (!this.shutdownAbort.signal.aborted) this.shutdownAbort.abort();
+    clearInterval(this.sweepTimer);
+    // Application shutdown calls quiesce() before this terminal cleanup. Keep
+    // direct service disposal backward-compatible and bounded to one
+    // best-effort cancellation pass for isolated/unit consumers.
+    await Promise.allSettled(this.shutdownObligations().map((record) => this.cancelOnce(record)));
+    this.terminalClosed = true;
+  }
+
+  private shutdownObligations(): CaptureJobRecord[] {
+    return this.store.entries().filter((record) =>
+      !record.releaseReceipt && hasRestorationObligation(record.lastBackendJob));
+  }
+
+  private async settleBeforeDeadline(promises: readonly Promise<unknown>[], deadlineAtMs: number): Promise<boolean> {
+    if (promises.length === 0) return true;
+    const remaining = deadlineAtMs - this.now();
+    if (remaining <= 0) return false;
+    let timer: NodeJS.Timeout | undefined;
+    const expired = new Promise<false>((resolve) => {
+      timer = setTimeout(() => resolve(false), remaining);
+      timer.unref();
+    });
+    const settled = Promise.allSettled(promises).then(() => true as const);
+    try { return await Promise.race([settled, expired]); }
+    finally { if (timer) clearTimeout(timer); }
+  }
+
+  private async delayBeforeDeadline(deadlineAtMs: number): Promise<void> {
+    const remaining = deadlineAtMs - this.now();
+    if (remaining <= 0) return;
+    await new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, Math.min(this.pollIntervalMs, remaining));
+      timer.unref();
+    });
+  }
+
+  private async selectInstance(input: CaptureInput, request: CanonicalCaptureIntent, deadlineAtMs: number, signal?: AbortSignal): Promise<CaptureInstance> {
+    if (request.selectionMode === "explicit" && input.expectedWorldRevision === undefined) {
+      throw new CaptureError("INVALID_REQUEST", "Explicit observer selection requires expectedWorldRevision");
+    }
     const candidates: CaptureInstance[] = [];
     const errors: string[] = [];
     const failures: CaptureError[] = [];
+    const expectedBackend = request.selectionMode === "explicit" && input.expectedWorldRevision
+      ? worldRevisionKind(input.expectedWorldRevision)
+      : undefined;
     for (const backend of this.backends.values()) {
-      if (!request.sessionId && backend.kind === "runtime") continue;
+      if (expectedBackend && backend.kind !== expectedBackend) continue;
       try {
-        candidates.push(...await backend.listInstances({ sessionId: request.sessionId }, this.context(deadlineAtMs, signal)));
+        candidates.push(...await backend.listInstances({ sessionId: input.sessionId }, this.context(deadlineAtMs, signal)));
       } catch (error) {
         const failure = asCaptureError(error);
         failures.push(failure);
@@ -596,21 +785,22 @@ export class CaptureService {
       }
     }
     const eligible = candidates.filter((instance) => {
-      if (request.instanceId && instance.instanceId !== request.instanceId) return false;
-      if (request.sessionId && instance.backend === "runtime" && instance.sessionId !== request.sessionId) return false;
-      if (!request.sessionId && instance.backend !== "workbench") return false;
+      if (input.instanceId && instance.instanceId !== input.instanceId) return false;
+      if (input.sessionId && instance.backend === "runtime" && instance.sessionId !== input.sessionId) return false;
+      if (request.selectionMode === "explicit" && input.expectedWorldRevision &&
+          instance.backend !== worldRevisionKind(input.expectedWorldRevision)) return false;
       return isCompatible(instance, request);
     });
     if (eligible.length !== 1) {
-      if (request.instanceId && eligible.length === 0) {
-        const selected = candidates.find((instance) => instance.instanceId === request.instanceId);
+      if (input.instanceId && eligible.length === 0) {
+        const selected = candidates.find((instance) => instance.instanceId === input.instanceId);
         const selectedWasObserved = selected !== undefined;
         // An explicit instance can be declared stale only after the relevant
         // inventories answered. If selection itself lost transport, absence
         // from the partial inventory is not evidence that the instance left.
         if (!selectedWasObserved && failures.length > 0) throw failures[0];
         if (selected && selected.stale !== true && selected.transportHealthy !== false &&
-            (!request.sessionId || selected.backend !== "runtime" || selected.sessionId === request.sessionId)) {
+            (!input.sessionId || selected.backend !== "runtime" || selected.sessionId === input.sessionId)) {
           const requiredCapability = request.view.kind === "current"
             ? "render.capture"
             : selected.backend === "workbench" ? "camera.editor" : "camera.runtime";
@@ -624,12 +814,17 @@ export class CaptureService {
         }
         throw new CaptureError("STALE_INSTANCE", "Selected observer instance is unavailable");
       }
-      if (eligible.length > 1) throw new CaptureError("AMBIGUOUS_INSTANCE", "Multiple compatible observer instances are available", { instanceIds: eligible.map((entry) => entry.instanceId) });
+      if (eligible.length > 1) throw new CaptureError("AMBIGUOUS_INSTANCE", "Multiple compatible observer instances are available", {
+        candidates: eligible.slice(0, 16).map((entry) => ({
+          backend: entry.backend,
+          instanceId: entry.instanceId,
+          target: encodeCaptureTarget(entry),
+        })),
+      });
       if (request.view.kind !== "current") {
         const capability = candidates.find((instance) => {
           if (instance.stale === true || instance.transportHealthy === false || !instance.capabilities.includes("render.capture")) return false;
-          if (request.sessionId && instance.backend === "runtime" && instance.sessionId !== request.sessionId) return false;
-          if (!request.sessionId && instance.backend !== "workbench") return false;
+          if (input.sessionId && instance.backend === "runtime" && instance.sessionId !== input.sessionId) return false;
           const required = instance.backend === "workbench" ? "camera.editor" : "camera.runtime";
           return !instance.capabilities.includes(required);
         });
@@ -644,14 +839,171 @@ export class CaptureService {
       }
       throw new CaptureError("NO_RENDER_ENDPOINT", errors[0] ?? "No compatible observer renderer is available");
     }
-    return eligible[0];
+    const selected = eligible[0];
+    if (request.selectionMode === "explicit") this.assertExpectedWorld(input, selected);
+    return selected;
   }
 
   private assertExpectedWorld(input: CaptureInput, instance: CaptureInstance): void {
-    if (!sameWorldRevision(input.expectedWorldRevision, instance.worldRevision)) {
+    if (!input.expectedWorldRevision || !sameWorldRevision(input.expectedWorldRevision, instance.worldRevision)) {
       throw new CaptureError("WORLD_CHANGED", "Selected observer no longer matches the expected world revision", { expectedWorldRevision: input.expectedWorldRevision, actualWorldRevision: instance.worldRevision });
     }
-    if (instance.worldId === null && input.view.kind !== "current") throw new CaptureError("WORLD_UNAVAILABLE", "Camera views require an active world");
+    if (instance.worldId === null && (input.view?.kind ?? "current") !== "current") throw new CaptureError("WORLD_UNAVAILABLE", "Camera views require an active world");
+  }
+
+  private async primeWorkbenchIfNeeded(
+    input: CaptureInput,
+    intent: CanonicalCaptureIntent,
+    instance: CaptureInstance,
+    deadlineAtMs: number,
+  ): Promise<CaptureInstance> {
+    if (intent.view.kind === "current" || instance.backend !== "workbench" || instance.capabilities.includes("camera.editor")) return instance;
+    if (instance.backend !== "workbench" || instance.restorationApiAvailable !== true) {
+      const requiredCapability = instance.backend === "workbench" ? "camera.editor" : "camera.runtime";
+      throw new CaptureError("CAPABILITY_UNAVAILABLE", `Selected observer cannot prove required capability: ${requiredCapability}`, {
+        instanceId: instance.instanceId,
+        requiredCapability,
+      });
+    }
+    const remaining = deadlineAtMs - this.now();
+    if (remaining < 1_000) throw new CaptureError("CAPTURE_TIMEOUT", "Capture deadline expired before Workbench priming");
+    const primeInput: CaptureInput = {
+      instanceId: instance.instanceId,
+      expectedWorldRevision: instance.worldRevision,
+      selectionMode: "explicit",
+      view: { kind: "current" },
+      settleFrames: 0,
+      performancePolicy: "evidence",
+      image: intent.image,
+      timeoutMs: Math.min(5 * 60_000, remaining),
+      asynchronous: false,
+      idempotencyKey: `workbench-prime-${randomUUID()}`,
+      signal: input.signal,
+    };
+    let prime: CaptureResult;
+    try {
+      prime = await this.capture(primeInput);
+    } catch (error) {
+      const retained = this.store.get(idempotencyScope(primeInput));
+      if (!retained) throw error;
+      const details: Record<string, unknown> = { job: retained.lastProjection };
+      try {
+        await this.cancel(retained.jobId);
+        const recovered = this.store.getById(retained.jobId)!;
+        details.job = recovered.lastProjection;
+        if (recovered.releaseReceipt) {
+          details.cleanup = recovered.releaseReceipt;
+          details.cleanupRequired = false;
+        } else {
+          details.cleanupRequired = true;
+          details.recovery = `Retry observer_job cancel/release for retained Workbench prime job ${retained.jobId}`;
+        }
+      } catch (cleanupError) {
+        const recovered = this.store.getById(retained.jobId) ?? retained;
+        details.job = recovered.lastProjection;
+        details.cleanupRequired = true;
+        details.cleanupWarning = redactText(asCaptureError(cleanupError).message, { profile: "diagnostic", maxLength: 240 });
+        details.recovery = `Retry observer_job cancel/release for retained Workbench prime job ${retained.jobId}`;
+      }
+      throw asCaptureError(error, details);
+    }
+    if (prime.asynchronous) {
+      throw new CaptureError("RESTORATION_UNCONFIRMED", "Workbench priming did not complete synchronously", {
+        job: prime.job,
+        cleanupRequired: true,
+        recovery: `Retry observer_job cancel/release for retained Workbench prime job ${prime.job.jobId}`,
+      });
+    }
+    if (prime.cleanupRequired === true) {
+      const jobId = prime.job.jobId;
+      throw new CaptureError("RESTORATION_UNCONFIRMED", "Workbench priming cleanup could not be proven", {
+        job: prime.job,
+        cleanupRequired: true,
+        ...(prime.cleanupWarning ? { cleanupWarning: prime.cleanupWarning } : {}),
+        recovery: `Retry observer_job release for retained Workbench prime job ${jobId}`,
+      });
+    }
+    const backend = this.backends.get("workbench")!;
+    const refreshed = (await backend.listInstances({}, this.context(deadlineAtMs, input.signal)))
+      .find((candidate) => candidate.instanceId === instance.instanceId);
+    if (!refreshed) throw new CaptureError("STALE_INSTANCE", "Workbench changed while the selected renderer was being primed");
+    if (intent.selectionMode === "explicit" && input.expectedWorldRevision &&
+        !sameWorldRevision(input.expectedWorldRevision, refreshed.worldRevision)) {
+      throw new CaptureError("WORLD_CHANGED", "Workbench world changed during current-view priming", {
+        expectedWorldRevision: input.expectedWorldRevision,
+        actualWorldRevision: refreshed.worldRevision,
+      });
+    }
+    if (!refreshed.capabilities.includes("camera.editor")) {
+      throw new CaptureError("RESTORATION_UNCONFIRMED", "Workbench priming did not prove exact current-view restoration", {
+        instanceId: refreshed.instanceId,
+      });
+    }
+    return refreshed;
+  }
+
+  private async submitWithDelegatedRetry(input: {
+    backend: CaptureBackend;
+    input: CaptureInput;
+    intent: CanonicalCaptureIntent;
+    instance: CaptureInstance;
+    request: CanonicalCaptureRequest;
+    jobId: string;
+    deadlineAtMs: number;
+  }): Promise<{ submitted: BackendJob; backend: CaptureBackend; instance: CaptureInstance; request: CanonicalCaptureRequest }> {
+    try {
+      const submitted = await input.backend.submit({
+        jobId: input.jobId,
+        idempotencyKey: input.input.idempotencyKey,
+        request: input.request,
+        instance: input.instance,
+      }, this.context(input.deadlineAtMs, input.input.signal));
+      return { submitted, backend: input.backend, instance: input.instance, request: input.request };
+    } catch (error) {
+      if (errorCode(error) !== "WORLD_CHANGED" || input.intent.selectionMode !== "delegated") throw error;
+    }
+    const refreshed = (await input.backend.listInstances({}, this.context(input.deadlineAtMs, input.input.signal)))
+      .find((candidate) => candidate.instanceId === input.instance.instanceId);
+    if (!refreshed || !isDeepStrictEqual(refreshed.recoveryBinding, input.instance.recoveryBinding) ||
+        !isCompatible(refreshed, input.intent)) {
+      throw new CaptureError("STALE_INSTANCE", "Delegated observer was replaced before its one allowed world refresh", {
+        backend: input.instance.backend,
+        instanceId: input.instance.instanceId,
+      });
+    }
+    if (sameWorldRevision(refreshed.worldRevision, input.instance.worldRevision)) {
+      throw new CaptureError("WORLD_CHANGED", "Delegated observer rejected its unchanged inventory world revision");
+    }
+    const request = materializeCaptureRequest(input.intent, {
+      ...(refreshed.sessionId ? { sessionId: refreshed.sessionId } : {}),
+      instanceId: refreshed.instanceId,
+      expectedWorldRevision: refreshed.worldRevision,
+    }, input.request.captureLabel);
+    const ref = refFor(refreshed, input.jobId);
+    if (request.runId && request.captureLabel) {
+      await this.runPort?.reviseAdmission?.({
+        runId: request.runId,
+        captureLabel: request.captureLabel,
+        ref,
+        request,
+        selectionDelegated: true,
+        retryCount: 1,
+      });
+    }
+    this.store.update(input.jobId, (record) => {
+      record.ref = ref;
+      record.request = request;
+      record.fingerprint = request.fingerprint;
+      record.lastBackendJob = { ...record.lastBackendJob, ref };
+      record.lastProjection = publicJob(record.lastBackendJob);
+    });
+    const submitted = await input.backend.submit({
+      jobId: input.jobId,
+      idempotencyKey: input.input.idempotencyKey,
+      request,
+      instance: refreshed,
+    }, this.context(input.deadlineAtMs, input.input.signal));
+    return { submitted, backend: input.backend, instance: refreshed, request };
   }
 
   private context(deadlineAtMs: number, signal?: AbortSignal): BackendCallContext {
@@ -678,20 +1030,20 @@ export class CaptureService {
     if (!backend) throw new CaptureError("TRANSPORT_UNAVAILABLE", `Capture backend ${record.ref.backend} is unavailable`);
     const job = await backend.status(record.ref, this.context(deadlineAtMs));
     this.store.update(record.jobId, (stored) => {
-      stored.lastBackendJob = { ...job, ref: { ...stored.ref, ...job.ref, jobId: stored.jobId } };
+      stored.lastBackendJob = { ...stored.lastBackendJob, ...job, ref: { ...stored.ref, ...job.ref, jobId: stored.jobId } };
       stored.lastProjection = publicJob(stored.lastBackendJob);
     });
     return this.store.getById(record.jobId)!.lastBackendJob;
   }
 
-  private async cancelOnce(record: CaptureJobRecord): Promise<BackendJob> {
+  private async cancelOnce(record: CaptureJobRecord, deadlineAtMs = this.operationDeadline()): Promise<BackendJob> {
     if (record.cancelRequested) return record.lastBackendJob;
     this.store.update(record.jobId, (stored) => { stored.cancelRequested = true; });
     const backend = this.backends.get(record.ref.backend)!;
     try {
-      const job = await backend.cancel(record.ref, this.context(this.operationDeadline()));
+      const job = await backend.cancel(record.ref, this.context(deadlineAtMs));
       this.store.update(record.jobId, (stored) => {
-        stored.lastBackendJob = { ...job, ref: { ...stored.ref, ...job.ref, jobId: stored.jobId } };
+        stored.lastBackendJob = { ...stored.lastBackendJob, ...job, ref: { ...stored.ref, ...job.ref, jobId: stored.jobId } };
         stored.lastProjection = publicJob(stored.lastBackendJob);
         // A bounded cancellation attempt that still reports an active
         // restoration obligation must remain retryable. The backend command is
@@ -769,16 +1121,15 @@ export class CaptureService {
     return new CaptureError(code, job.terminalMessage ?? job.message ?? `Capture ended in ${job.state}`, { job: publicJob(job) });
   }
 
-  private requireJob(sessionId: string | undefined, jobId: string): CaptureJobRecord {
+  private requireJob(jobId: string): CaptureJobRecord {
     const record = this.store.getById(jobId);
     if (!record) throw new CaptureError("JOB_NOT_FOUND", `Capture job ${jobId} is not retained`);
-    if (record.ref.sessionId && sessionId && record.ref.sessionId !== sessionId) throw new CaptureError("SESSION_MISMATCH", "Capture job belongs to a different session");
     return record;
   }
 
   private async finishExisting(record: CaptureJobRecord, input: CaptureInput): Promise<CaptureResult> {
     if (input.asynchronous) return { asynchronous: true, job: record.lastProjection };
-    const result = await this.read(record.ref.sessionId, record.jobId);
+    const result = await this.read(record.jobId);
     return { asynchronous: false, ...result };
   }
 
@@ -789,6 +1140,23 @@ export class CaptureService {
 
   private operationDeadline(): number {
     return this.now() + this.defaultTimeoutMs;
+  }
+
+  private async autoReleaseRunless(record: CaptureJobRecord): Promise<{
+    cleanup?: Record<string, unknown>;
+    cleanupRequired?: boolean;
+    cleanupWarning?: string;
+  }> {
+    if (record.runId) return {};
+    try {
+      return { cleanup: await this.release(record.jobId), cleanupRequired: false };
+    } catch (error) {
+      const mapped = asCaptureError(error);
+      return {
+        cleanupRequired: true,
+        cleanupWarning: redactText(mapped.message, { profile: "diagnostic", maxLength: 240 }),
+      };
+    }
   }
 
   private async readArtifact(record: CaptureJobRecord, deadlineAtMs: number, signal?: AbortSignal): Promise<CaptureArtifact> {

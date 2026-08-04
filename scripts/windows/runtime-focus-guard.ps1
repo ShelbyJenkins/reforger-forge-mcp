@@ -95,7 +95,7 @@ public static class RuntimeFocusGuard
     [DllImport("user32.dll")]
     private static extern bool IsWindow(IntPtr window);
 
-    [DllImport("user32.dll")]
+    [DllImport("kernel32.dll")]
     private static extern uint GetCurrentThreadId();
 
     [DllImport("user32.dll")]

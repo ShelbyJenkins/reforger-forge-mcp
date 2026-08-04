@@ -9,6 +9,7 @@ import {
   type Config,
 } from "./config.js";
 import { registerTools } from "./server.js";
+import { runCliShutdown } from "./mcp-lifecycle.js";
 import {
   discoverSteamInstallations,
   STEAM_DISCOVERY_EXIT_CODES,
@@ -52,37 +53,24 @@ async function runServer(config: Config): Promise<void> {
   const transport = new StdioServerTransport();
   let shutdownPromise: Promise<void> | null = null;
 
-  const reportSealResult = (result: Record<string, unknown>): void => {
-    const errors = Array.isArray(result.errorRuntimes) ? result.errorRuntimes.length : 0;
-    const busy = Array.isArray(result.busyRuntimeIds) ? result.busyRuntimeIds.length : 0;
-    if (errors > 0 || busy > 0) {
-      logger.warn(`shutdown left ${busy} busy and ${errors} unverifiable runtime lifecycle(s) unsealed`);
-    }
-  };
-
   const shutdown = (reason: string): Promise<void> => {
     if (shutdownPromise) return shutdownPromise;
     shutdownPromise = (async () => {
-      // An unresolved Promise does not keep Node's event loop alive. Retain
-      // one referenced handle while lifecycle cleanup is running so ordinary
-      // EOF/signal shutdown cannot exit between durable `stopping` and
-      // `vacant` publication. A parent transport may still enforce its own
-      // shorter kill deadline; the next MCP owner safely reconciles that cut.
-      const shutdownHold = setInterval(() => undefined, 1_000);
       process.stdin.off("end", onStdinEnd);
       process.stdin.off("close", onStdinClose);
       process.off("SIGINT", onSigint);
       process.off("SIGTERM", onSigterm);
-      try {
-        try {
-          reportSealResult(await disposeTools());
-        } finally {
-          await server.close();
-        }
-        logger.info(`ReforgerForge MCP server stopped (${reason})`);
-      } finally {
-        clearInterval(shutdownHold);
-      }
+      await runCliShutdown({
+        reason,
+        closeProtocol: () => server.close(),
+        disposeTools: (deadlineAtMs) => disposeTools(deadlineAtMs),
+        emergencyTerminate: disposeTools.emergencyTerminate,
+        emergencyCleanup: disposeTools.emergencyCleanup,
+        info: logger.info,
+        warn: logger.warn,
+        error: logger.error,
+        exit: (code) => process.exit(code),
+      });
     })();
     return shutdownPromise;
   };
@@ -90,7 +78,7 @@ async function runServer(config: Config): Promise<void> {
   const requestShutdown = (reason: string): void => {
     void shutdown(reason).catch((error) => {
       process.exitCode = 1;
-      logger.error(`MCP shutdown failed: ${error instanceof Error ? error.message : String(error)}`);
+      logger.error(`MCP shutdown orchestration failed: ${error instanceof Error ? error.message : String(error)}`);
     });
   };
   function onStdinEnd(): void { requestShutdown("stdin EOF"); }

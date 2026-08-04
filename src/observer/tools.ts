@@ -4,6 +4,8 @@ import { resolve } from "node:path";
 import { z } from "zod";
 import type { ObserverApplication, ObserverCaptureResult } from "./application.js";
 import { CaptureError } from "./capture-contract.js";
+import { ActiveRunContext } from "./active-run-context.js";
+import { decodeCaptureTarget } from "./capture-target.js";
 import { resolveExpectedWorldRevision } from "./capture-request.js";
 import { ObserverApplicationError } from "./errors.js";
 import { prepareObserverLaunch } from "./launch.js";
@@ -83,6 +85,30 @@ const imageOutputSchema = z.object({
     value.maxWidth * value.maxHeight <= 32_000_000,
   { message: "requested image bounds exceed the 32000000-pixel limit" },
 );
+const runIdSchema = z.string().regex(/^\d{8}T\d{6}Z-[a-f0-9]{8}$/);
+const reviewSchema = z.object({
+  imagesReviewed: z.boolean(),
+  reviewer: z.string().min(1).max(256).optional(),
+  outcome: z.enum(["Passed", "Failed", "Inconclusive", "Unreviewed"]),
+  summary: z.string().min(1).max(2_048),
+  limitations: z.array(z.string().min(1).max(512)).max(32).optional(),
+});
+const runtimeConfigSchema = z.object({
+  configurationId: z.string().min(1).max(128),
+  values: z.record(z.string(), z.union([z.string(), z.number().finite(), z.boolean(), z.null()])),
+});
+const supportingFilesSchema = z.array(z.union([
+  z.object({
+    kind: z.literal("relevantLog"),
+    label: z.string().min(1).max(128),
+    path: z.string().min(1).max(32_768),
+  }).strict(),
+  z.object({
+    kind: z.literal("relevantLog"),
+    label: z.string().min(1).max(128),
+    sourceCaptureLabel: z.string().min(1).max(128),
+  }).strict(),
+])).max(16);
 const forceNonNativeWindowSizeSchema = z.object({
   width: z.number().int().min(640).max(16_384).describe(
     "Exceptional window width in pixels.",
@@ -199,6 +225,8 @@ function capturePresentation(result: Extract<ObserverCaptureResult, { asynchrono
   const metadata = result.metadata;
   return {
     jobId: result.job.jobId,
+    runId: result.job.runId ?? null,
+    captureLabel: result.job.captureLabel ?? null,
     instanceId: result.job.instanceId,
     worldRevision: result.job.worldRevision,
     worldId: result.job.worldId,
@@ -218,6 +246,9 @@ function capturePresentation(result: Extract<ObserverCaptureResult, { asynchrono
     sha256: metadata.contentSha256 ?? null,
     warnings: metadata.warnings ?? artifact.warnings ?? [],
     contaminated: metadata.contaminated ?? artifact.contaminated ?? false,
+    cleanup: result.cleanup ?? null,
+    cleanupRequired: result.cleanupRequired === true,
+    cleanupWarning: result.cleanupWarning ?? null,
   };
 }
 
@@ -244,6 +275,7 @@ export function registerObserverTools(
   defaults: ObserverToolDefaults = {}
 ): void {
   const sessionTtlMs = defaults.sessionTtlMs ?? 20 * 60 * 1_000;
+  const activeRun = new ActiveRunContext();
   if (!Number.isSafeInteger(sessionTtlMs) || sessionTtlMs < 1_000 || sessionTtlMs > 24 * 60 * 60 * 1_000) {
     throw new ObserverApplicationError("INVALID_REQUEST", "Observer session TTL must be from 1000 through 86400000 milliseconds");
   }
@@ -346,21 +378,22 @@ export function registerObserverTools(
     "observer_capture",
     {
       description:
-        "Capture candidate evidence into an open managed observer run. runId and a unique normalized captureLabel are required. sessionId is required for a runtime renderer and optional for an explicitly selected already-running Workbench renderer. Bind the selected renderer to the immediately preceding observer_instances inventory with its opaque expectedWorldRevision. Optional image bounds preserve aspect ratio and never enlarge; png is lossless while jpeg/webp accept quality. Omit image for native-resolution PNG. Synchronous mode returns one validated image; asynchronous mode returns a job ID that observer_job read can retrieve after completion.",
+        "Capture the current view by default. With one compatible renderer, an empty request delegates selection; otherwise pass one opaque target from observer_instances. A process-local active run is used when runId is omitted, capture labels are allocated durably when omitted, and captures with no run are automatically released after delivery. Legacy sessionId/instanceId/expectedWorldRevision selection remains mutually exclusive with target.",
       inputSchema: {
-        runId: z.string().regex(/^\d{8}T\d{6}Z-[a-f0-9]{8}$/),
-        captureLabel: z.string().min(1).max(128),
+        runId: z.string().regex(/^\d{8}T\d{6}Z-[a-f0-9]{8}$/).optional(),
+        captureLabel: z.string().min(1).max(128).optional(),
         purpose: z.string().min(1).max(512).optional(),
+        target: z.string().min(5).max(8_192).optional(),
         sessionId: z.string().min(1).max(96).optional(),
-        view: viewSchema,
+        view: viewSchema.default({ kind: "current" }),
         instanceId: z.string().min(1).max(96).optional(),
         idempotencyKey: z.string().min(1).max(128).optional(),
         asynchronous: z.boolean().default(false),
         timeoutMs: z.number().int().min(1_000).max(5 * 60 * 1_000)
           .default(defaults.defaultCaptureTimeoutMs ?? application.defaultCaptureTimeoutMs),
         settleFrames: z.number().int().min(0).max(30).default(0),
-        expectedWorldRevision: z.string().regex(/^wr1\.(?:runtime|workbench)\.[A-Za-z0-9_-]+$/).describe(
-          "Required opaque exact world revision from the immediately preceding observer_instances inventory."
+        expectedWorldRevision: z.string().regex(/^wr1\.(?:runtime|workbench)\.[A-Za-z0-9_-]+$/).optional().describe(
+          "Legacy compatibility binding from observer_instances. Prefer target."
         ),
         performancePolicy: z.enum(["evidence", "instrumented"]).default("evidence"),
         image: imageOutputSchema.optional(),
@@ -368,9 +401,31 @@ export function registerObserverTools(
     },
     async (input, extra) => {
       try {
-        assertCaptureWorldBinding(input);
+        const legacySupplied = input.sessionId !== undefined || input.instanceId !== undefined || input.expectedWorldRevision !== undefined;
+        if (input.target && legacySupplied) {
+          throw new ObserverApplicationError("INVALID_REQUEST", "target cannot be combined with legacy sessionId, instanceId, or expectedWorldRevision fields");
+        }
+        let target: ReturnType<typeof decodeCaptureTarget> | undefined;
+        try { target = input.target ? decodeCaptureTarget(input.target) : undefined; }
+        catch (error) {
+          if (error instanceof CaptureError) throw new ObserverApplicationError(error.code, error.message, error.details);
+          throw error;
+        }
+        if (!target && legacySupplied) assertCaptureWorldBinding(input as { expectedWorldRevision: string });
+        const runId = activeRun.resolve(input.runId);
+        if (input.captureLabel && !runId) {
+          throw new ObserverApplicationError("INVALID_REQUEST", "captureLabel requires an explicit or active run");
+        }
+        const { target: _target, ...captureInput } = input;
         const result = await application.capture({
-          ...input,
+          ...captureInput,
+          ...(target ? {
+            ...(target.sessionId ? { sessionId: target.sessionId } : {}),
+            instanceId: target.instanceId,
+            expectedWorldRevision: target.expectedWorldRevision,
+            selectionMode: "explicit" as const,
+          } : { selectionMode: legacySupplied ? "explicit" as const : "delegated" as const }),
+          ...(runId ? { runId } : {}),
           idempotencyKey: input.idempotencyKey ?? `mcp-${randomUUID()}`,
           signal: extra.signal,
         });
@@ -401,17 +456,16 @@ export function registerObserverTools(
     "observer_job",
     {
       description:
-        "Inspect, read, cancel, or release an observer capture job. read returns one completed validated image when it fits the inline limit; larger images stay managed and must be exported by observer_run finalize. sessionId is required for runtime jobs and optional for Workbench jobs. Artifacts retained by an open run cannot be released independently.",
+        "Inspect, read, cancel, or release an observer capture job by its process-local job handle. Successful reads and safe cancellation automatically release runless transactions; artifacts retained by an open run cannot be released independently.",
       inputSchema: {
         action: z.enum(["status", "read", "cancel", "release"]),
-        sessionId: z.string().min(1).max(96).optional(),
         jobId: z.string().min(1).max(96),
       },
     },
-    async ({ action, sessionId, jobId }) => {
+    async ({ action, jobId }) => {
       try {
         if (action === "read") {
-          const result = await application.readJob(sessionId, jobId);
+          const result = await application.readJob(jobId);
           const mimeType = validatedImageMimeType(result.image, result.metadata);
           return {
             content: [
@@ -421,10 +475,10 @@ export function registerObserverTools(
           };
         }
         const result = action === "status"
-          ? await application.jobStatus(sessionId, jobId)
+          ? await application.jobStatus(jobId)
           : action === "cancel"
-            ? await application.cancelJob(sessionId, jobId)
-            : await application.releaseJob(sessionId, jobId);
+            ? await application.cancelJob(jobId)
+            : await application.releaseJob(jobId);
         return { content: [{ type: "text" as const, text: jsonText(`Observer job ${action} completed.`, result) }] };
       } catch (error) {
         return toolError(error);
@@ -437,106 +491,98 @@ export function registerObserverTools(
   }
 
   server.registerTool(
-    "observer_run",
+    "observer_run_begin",
     {
-      description:
-        "Manage a bounded observation run. begin creates external managed run storage; status reports capture labels and artifact availability; finalize requires runId, includeCaptureLabels, and review, then writes a standardized reviewed bundle beneath an allowlisted configured evidence root without overwriting. Relevant logs may use an allowlisted path or the private exact-owned runtime grant of a selected completed capture. discard releases retained artifacts and removes run work.",
+      description: "Begin a durable evidence run and make it the active run in this MCP process. Captures can then omit runId and captureLabel; review remains mandatory at finalization.",
       inputSchema: {
-        action: z.enum(["begin", "status", "finalize", "discard"]),
-        runId: z.string().regex(/^\d{8}T\d{6}Z-[a-f0-9]{8}$/).optional(),
-        title: z.string().min(1).max(256).optional(),
+        title: z.string().min(1).max(256),
         caseIds: z.array(z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,95}$/)).max(64).optional(),
         sourceRevision: z.string().min(1).max(256).optional(),
         procedureRevision: z.string().min(1).max(256).optional(),
         idempotencyKey: z.string().min(1).max(128).optional(),
+      },
+    },
+    async (input) => {
+      try {
+        const result = await application.beginRun(input);
+        if (typeof result.runId !== "string") throw new ObserverApplicationError("TRANSPORT_UNAVAILABLE", "Run begin did not return a run ID");
+        activeRun.activate(result.runId);
+        return { content: [{ type: "text" as const, text: jsonText("Observer run begun and activated.", result) }] };
+      } catch (error) { return toolError(error); }
+    },
+  );
+
+  server.registerTool(
+    "observer_run_status",
+    {
+      description: "Report the explicit run or this MCP process's active run, including allocated capture labels and artifact availability.",
+      inputSchema: { runId: runIdSchema.optional() },
+    },
+    async ({ runId }) => {
+      try {
+        const resolved = activeRun.resolve(runId);
+        if (!resolved) throw new ObserverApplicationError("INVALID_REQUEST", "runId is required when this MCP process has no active run");
+        const result = await application.runStatus(resolved);
+        return { content: [{ type: "text" as const, text: jsonText("Observer run status.", result) }] };
+      } catch (error) { return toolError(error); }
+    },
+  );
+
+  server.registerTool(
+    "observer_run_finalize",
+    {
+      description: "Finalize the explicit or active run into an allowlisted evidence root. A non-empty set of reviewed capture labels and an explicit review are always required.",
+      inputSchema: {
+        runId: runIdSchema.optional(),
         evidenceRoot: z.string().min(1).max(32_768).optional(),
-        includeCaptureLabels: z.array(z.string().min(1).max(128)).min(1).max(64).optional().describe(
-          "(finalize) Required non-empty list of reviewed capture labels to export."
-        ),
-        review: z.object({
-          imagesReviewed: z.boolean(),
-          reviewer: z.string().min(1).max(256).optional(),
-          outcome: z.enum(["Passed", "Failed", "Inconclusive", "Unreviewed"]),
-          summary: z.string().min(1).max(2_048),
-          limitations: z.array(z.string().min(1).max(512)).max(32).optional(),
-        }).optional(),
-        runtimeConfig: z.object({
-          configurationId: z.string().min(1).max(128),
-          values: z.record(z.string(), z.union([z.string(), z.number().finite(), z.boolean(), z.null()])),
-        }).optional(),
-        supportingFiles: z.array(z.union([
-          z.object({
-            kind: z.literal("relevantLog"),
-            label: z.string().min(1).max(128),
-            path: z.string().min(1).max(32_768),
-          }).strict(),
-          z.object({
-            kind: z.literal("relevantLog"),
-            label: z.string().min(1).max(128),
-            sourceCaptureLabel: z.string().min(1).max(128),
-          }).strict(),
-        ])).max(16).optional().describe(
-          "Relevant logs: use path only beneath a configured supportingLogRoot, or sourceCaptureLabel for the exact assigned script.log of a selected completed exact-owned runtime capture."
-        ),
+        includeCaptureLabels: z.array(z.string().min(1).max(128)).min(1).max(64),
+        review: reviewSchema,
+        runtimeConfig: runtimeConfigSchema.optional(),
+        supportingFiles: supportingFilesSchema.optional(),
         releaseManagedArtifacts: z.boolean().default(true),
       },
     },
     async (input) => {
       try {
-        let result: Record<string, unknown>;
-        if (input.action === "begin") {
-          if (!input.title) throw new ObserverApplicationError("INVALID_REQUEST", "title is required for observer_run begin");
-          result = await application.beginRun({
-            title: input.title,
-            ...(input.caseIds ? { caseIds: input.caseIds } : {}),
-            ...(input.sourceRevision ? { sourceRevision: input.sourceRevision } : {}),
-            ...(input.procedureRevision ? { procedureRevision: input.procedureRevision } : {}),
-            ...(input.idempotencyKey ? { idempotencyKey: input.idempotencyKey } : {}),
-          });
-        } else if (input.action === "status") {
-          if (!input.runId) throw new ObserverApplicationError("INVALID_REQUEST", "runId is required for observer_run status");
-          result = await application.runStatus(input.runId);
-        } else if (input.action === "discard") {
-          if (!input.runId) throw new ObserverApplicationError("INVALID_REQUEST", "runId is required for observer_run discard");
-          result = await application.discardRun(input.runId);
-        } else {
-          if (!input.runId || !input.includeCaptureLabels || !input.review) {
-            throw new ObserverApplicationError(
-              "INVALID_REQUEST",
-              "runId, includeCaptureLabels, and review are required for observer_run finalize"
-            );
-          }
-          const evidenceRoots = uniqueEvidenceRoots(defaults.evidenceRoots);
-          if (evidenceRoots.length === 0) {
-            throw new ObserverApplicationError(
-              "CAPABILITY_UNAVAILABLE",
-              "observer_run finalize requires an evidence destination; supply --observer-evidence-root or observer.evidenceRoots in an optional --config file"
-            );
-          }
-          const evidenceRoot = input.evidenceRoot ??
-            (evidenceRoots.length === 1
-              ? evidenceRoots[0]
-              : undefined);
-          if (!evidenceRoot) {
-            throw new ObserverApplicationError(
-              "INVALID_REQUEST",
-              "observer_run finalize is ambiguous because multiple evidence roots are configured; provide evidenceRoot explicitly"
-            );
-          }
-          result = await application.finalizeRun({
-            runId: input.runId,
-            evidenceRoot,
-            includeCaptureLabels: input.includeCaptureLabels,
-            review: input.review,
-            ...(input.runtimeConfig ? { runtimeConfig: input.runtimeConfig } : {}),
-            ...(input.supportingFiles ? { supportingFiles: input.supportingFiles } : {}),
-            releaseManagedArtifacts: input.releaseManagedArtifacts,
-          });
+        const runId = activeRun.resolve(input.runId);
+        if (!runId) throw new ObserverApplicationError("INVALID_REQUEST", "runId is required when this MCP process has no active run");
+        const evidenceRoots = uniqueEvidenceRoots(defaults.evidenceRoots);
+        if (evidenceRoots.length === 0) {
+          throw new ObserverApplicationError("CAPABILITY_UNAVAILABLE", "observer_run_finalize requires an evidence destination; supply --observer-evidence-root or observer.evidenceRoots in an optional --config file");
         }
-        return { content: [{ type: "text" as const, text: jsonText(`Observer run ${input.action} completed.`, result) }] };
-      } catch (error) {
-        return toolError(error);
-      }
-    }
+        const evidenceRoot = input.evidenceRoot ?? (evidenceRoots.length === 1 ? evidenceRoots[0] : undefined);
+        if (!evidenceRoot) {
+          throw new ObserverApplicationError("INVALID_REQUEST", "observer_run_finalize is ambiguous because multiple evidence roots are configured; provide evidenceRoot explicitly");
+        }
+        const result = await application.finalizeRun({
+          runId,
+          evidenceRoot,
+          includeCaptureLabels: input.includeCaptureLabels,
+          review: input.review,
+          ...(input.runtimeConfig ? { runtimeConfig: input.runtimeConfig } : {}),
+          ...(input.supportingFiles ? { supportingFiles: input.supportingFiles } : {}),
+          releaseManagedArtifacts: input.releaseManagedArtifacts,
+        });
+        activeRun.clearIf(runId);
+        return { content: [{ type: "text" as const, text: jsonText("Observer run finalized.", result) }] };
+      } catch (error) { return toolError(error); }
+    },
+  );
+
+  server.registerTool(
+    "observer_run_discard",
+    {
+      description: "Discard the explicit or active unfinalized run, release its retained artifacts, and clear it only if it is this process's active run.",
+      inputSchema: { runId: runIdSchema.optional() },
+    },
+    async ({ runId: explicitRunId }) => {
+      try {
+        const runId = activeRun.resolve(explicitRunId);
+        if (!runId) throw new ObserverApplicationError("INVALID_REQUEST", "runId is required when this MCP process has no active run");
+        const result = await application.discardRun(runId);
+        activeRun.clearIf(runId);
+        return { content: [{ type: "text" as const, text: jsonText("Observer run discarded.", result) }] };
+      } catch (error) { return toolError(error); }
+    },
   );
 }

@@ -51,15 +51,17 @@ export function isWorldRevision(value: unknown): value is WorldRevision {
   if (!match) return false;
   const decoded = decode(match[2]);
   if (match[1] === "runtime") {
+    const worldId = (decoded as { worldId?: unknown } | null)?.worldId;
     return !!decoded && typeof decoded === "object" &&
       Object.prototype.hasOwnProperty.call(decoded, "worldId") &&
-      (typeof (decoded as { worldId?: unknown }).worldId === "string" || (decoded as { worldId?: unknown }).worldId === null) &&
+      ((typeof worldId === "string" && worldId.length > 0 && worldId.length <= 512) || worldId === null) &&
       Number.isSafeInteger((decoded as { worldEpoch?: unknown }).worldEpoch) &&
       ((decoded as { worldEpoch: number }).worldEpoch >= 0);
   }
   return !!decoded && typeof decoded === "object" &&
     typeof (decoded as { worldIdentity?: unknown }).worldIdentity === "string" &&
-    ((decoded as { worldIdentity: string }).worldIdentity.length > 0);
+    ((decoded as { worldIdentity: string }).worldIdentity.length > 0) &&
+    ((decoded as { worldIdentity: string }).worldIdentity.length <= 2_048);
 }
 
 export function assertWorldRevision(value: unknown, label = "World revision"): WorldRevision {

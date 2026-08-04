@@ -155,7 +155,6 @@ function measurePilotPhase<T>(
 
 async function pollJobTerminal(
   application: MatrixPilotCaseApplication,
-  sessionId: string,
   jobId: string,
   deadlineMs: number,
   signal?: AbortSignal,
@@ -167,7 +166,7 @@ async function pollJobTerminal(
     intervalMs: 100,
     signal,
     probe: async () => {
-      const job = record(await application.jobStatus(sessionId, jobId), "matrix pilot job status");
+      const job = record(await application.jobStatus(jobId), "matrix pilot job status");
       return PUBLIC_TERMINAL_JOB_STATES.has(String(job.state)) ? job : undefined;
     },
   });
@@ -225,7 +224,6 @@ function assertPilotBarrierPublicStatus(
 
 async function pollPilotBarrierPublicStatus(
   application: MatrixPilotCaseApplication,
-  sessionId: string,
   expected: {
     readonly jobId: string;
     readonly instanceId: string;
@@ -242,7 +240,7 @@ async function pollPilotBarrierPublicStatus(
     intervalMs: 100,
     probe: async () => {
       const job = record(
-        await application.jobStatus(sessionId, expected.jobId),
+        await application.jobStatus(expected.jobId),
         "matrix pilot public status at barrier",
       );
       lastState = String(job.state ?? "");
@@ -406,7 +404,6 @@ export async function runPilotCancellationCase(
   const terminalPollAbort = new AbortController();
   const terminalPromise = pollJobTerminal(
     application,
-    sessionId,
     jobId,
     caseDeadlineMs,
     terminalPollAbort.signal,
@@ -467,7 +464,6 @@ export async function runPilotCancellationCase(
   // check crosses the private-agent transport.
   const barrierJob = await pollPilotBarrierPublicStatus(
     application,
-    sessionId,
     { jobId, instanceId, worldId, worldEpoch },
     caseDeadlineMs,
   );
@@ -492,7 +488,7 @@ export async function runPilotCancellationCase(
     "ObserverApplication.cancelJob/FaultMatrixScheduler.releaseBarrier",
     "action_acknowledgement",
     async () => {
-      await application.cancelJob(sessionId, jobId);
+      await application.cancelJob(jobId);
       return scheduler.releaseBarrier("cancel");
     },
     (result) => ({ disposition: result.disposition }),
@@ -504,7 +500,7 @@ export async function runPilotCancellationCase(
     "ObserverApplication.jobStatus(terminal)",
     "public_terminal",
     async () => {
-      const finalJob = await pollJobTerminal(application, sessionId, jobId, caseDeadlineMs);
+      const finalJob = await pollJobTerminal(application, jobId, caseDeadlineMs);
       const publicTerminal = publicTerminalFromJob(finalJob, "Matrix pilot job");
       input.onPublicTerminal?.(publicTerminal);
       if (publicTerminal.state !== matrixCase.expectedTerminal.state ||
@@ -577,7 +573,7 @@ export async function runPilotCancellationCase(
       if (followUpJob.state === "completed" && followUpJobId) {
         try {
           const released = record(
-            await application.releaseJob(sessionId, followUpJobId),
+            await application.releaseJob(followUpJobId),
             "matrix pilot follow-up release",
           );
           if (released.artifactRemoved !== true) {

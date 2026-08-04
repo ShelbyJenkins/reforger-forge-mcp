@@ -284,13 +284,16 @@ describe("observer package and source contracts", () => {
     }
   });
 
-  it("publishes the exact seven-tool observer surface and keeps current operator guidance aligned", () => {
+  it("publishes the exact ten-tool observer surface and keeps current operator guidance aligned", () => {
     const expected = [
       "observer_capture",
       "observer_instances",
       "observer_job",
       "observer_prepare_launch",
-      "observer_run",
+      "observer_run_begin",
+      "observer_run_discard",
+      "observer_run_finalize",
+      "observer_run_status",
       "observer_runtime",
       "observer_setup",
     ];
@@ -320,7 +323,7 @@ describe("observer package and source contracts", () => {
     expect(observerGuide).not.toContain("expectedWorldEpoch");
 
     const observerReadme = readFileSync(join(repositoryRoot, "observer", "README.md"), "utf8");
-    expect(observerReadme).toContain("Observer exposes seven related MCP tools");
+    expect(observerReadme).toContain("Observer exposes ten related MCP tools");
     expect(observerReadme).toContain("observer_runtime");
     expect(observerReadme).toContain("terminal restoration");
     expect(observerReadme).toContain("exact matching persisted receipt");
@@ -379,15 +382,18 @@ describe("observer package and source contracts", () => {
     expect(server).not.toMatch(/new ObserverCoordinator\(|new OwnedRuntimeManager\(/);
     expect(server.match(/registerObserverTools\(/g)).toHaveLength(1);
     expect(server).toContain("return disposeObserverLifecycle");
-    expect(server).toContain("observerShutdown ??=");
+    expect(server).toContain("activeObserverShutdown");
+    expect(server).toContain("terminalObserverShutdown");
+    expect(server).toContain("emergencyTerminate");
     expect(server).not.toContain(".server.onclose");
     expect(server).not.toContain("protocolServer");
     const entrypoint = readFileSync(join(repositoryRoot, "src", "index.ts"), "utf8");
     expect(entrypoint).toContain("process.stdin.once(\"end\", onStdinEnd)");
     expect(entrypoint).toContain("process.once(\"SIGINT\", onSigint)");
     expect(entrypoint).toContain("process.once(\"SIGTERM\", onSigterm)");
-    expect(entrypoint.indexOf("reportSealResult(await disposeTools())"))
-      .toBeLessThan(entrypoint.indexOf("await server.close()"));
+    expect(entrypoint.indexOf("closeProtocol: () => server.close()"))
+      .toBeLessThan(entrypoint.indexOf("disposeTools: (deadlineAtMs) => disposeTools(deadlineAtMs)"));
+    expect(entrypoint).not.toContain("shutdownHold");
     const integrationSource = filesRecursively(observerSource)
       .map((path) => readFileSync(path, "utf8"))
       .join("\n");

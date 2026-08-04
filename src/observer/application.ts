@@ -4,9 +4,8 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { boundedOption, type BoundedOptionErrorFactory } from "../foundation/bounded-option.js";
 import { redactDiagnostic, redactText } from "../foundation/redact.js";
-import { logger } from "../utils/logger.js";
 import type { WorkbenchObserverAdapter } from "../workbench/observer-adapter.js";
-import { ObserverAgentClient, type ObserverAgentClientOptions, type ObserverChildDescriptor, redactChildLine } from "./agent-client.js";
+import { ObserverAgentClient, type ObserverAgentClientOptions, type ObserverChildDescriptor } from "./agent-client.js";
 import type { CaptureInput, CaptureResult } from "./capture-contract.js";
 import { resolveExpectedWorldRevision } from "./capture-request.js";
 import { CaptureService } from "./capture-service.js";
@@ -39,15 +38,32 @@ export interface ObserverInstanceList {
   warnings?: string[];
 }
 
-export type ObserverCaptureView = CaptureInput["view"];
+export type ObserverCaptureView = NonNullable<CaptureInput["view"]>;
 
-export interface ObserverCaptureInput extends Omit<CaptureInput, "expectedWorldRevision"> {
-  expectedWorldRevision: string;
+export interface ObserverCaptureInput extends Omit<CaptureInput, "view" | "expectedWorldRevision"> {
+  view: ObserverCaptureView;
+  expectedWorldRevision?: string;
 }
 
 export type ObserverCaptureResult =
   | { asynchronous: true; job: Record<string, unknown> }
-  | { asynchronous: false; job: Record<string, unknown>; image: Buffer; metadata: Record<string, unknown> };
+  | {
+      asynchronous: false;
+      job: Record<string, unknown>;
+      image: Buffer;
+      metadata: Record<string, unknown>;
+      cleanup?: Record<string, unknown>;
+      cleanupRequired?: boolean;
+      cleanupWarning?: string;
+    };
+
+export type ObserverApplicationLifecycleState =
+  | "open"
+  | "quiescing"
+  | "sealing"
+  | "retryable_unsafe"
+  | "closing"
+  | "closed";
 
 export interface CreateObserverApplicationOptions {
   debug?: boolean;
@@ -87,6 +103,7 @@ export interface ObserverApplication {
   readonly evidenceRuns: EvidenceRunService;
   readonly ownedRuntimeManager?: OwnedRuntimeManager;
   readonly child: unknown;
+  readonly lifecycleState: ObserverApplicationLifecycleState;
   diagnosticPrivateChildCount(): number;
   ensureStarted(): Promise<ObserverChildDescriptor>;
   status(): Promise<Record<string, unknown>>;
@@ -106,11 +123,12 @@ export interface ObserverApplication {
   runStatus(runId: string): Promise<Record<string, unknown>>;
   finalizeRun(input: Record<string, unknown>): Promise<Record<string, unknown>>;
   discardRun(runId: string): Promise<Record<string, unknown>>;
-  jobStatus(sessionId: string | undefined, jobId: string): Promise<Record<string, unknown>>;
-  cancelJob(sessionId: string | undefined, jobId: string): Promise<Record<string, unknown>>;
-  releaseJob(sessionId: string | undefined, jobId: string): Promise<Record<string, unknown>>;
-  readJob(sessionId: string | undefined, jobId: string): Promise<{ job: Record<string, unknown>; image: Buffer; metadata: Record<string, unknown> }>;
-  closeRuntimeLifecycle(): Promise<Record<string, unknown>>;
+  jobStatus(jobId: string): Promise<Record<string, unknown>>;
+  cancelJob(jobId: string): Promise<Record<string, unknown>>;
+  releaseJob(jobId: string): Promise<Record<string, unknown>>;
+  readJob(jobId: string): Promise<{ job: Record<string, unknown>; image: Buffer; metadata: Record<string, unknown>; cleanup?: Record<string, unknown>; cleanupRequired?: boolean; cleanupWarning?: string }>;
+  closeRuntimeLifecycle(deadlineAtMs?: number): Promise<Record<string, unknown>>;
+  emergencyTerminatePrivateChildren(): void;
   close(): Promise<void>;
 }
 
@@ -156,9 +174,10 @@ class DefaultObserverApplication implements ObserverApplication {
   private readonly diagnostics: ObserverHostDiagnostics;
   private readonly requestTimeoutMs: number;
   private readonly workbenchAdapter?: CreateObserverApplicationOptions["workbenchAdapter"];
-  private closing = false;
-  private closed = false;
-  private closePromise: Promise<void> | null = null;
+  private state: ObserverApplicationLifecycleState = "open";
+  private closeAttempt: Promise<Record<string, unknown>> | null = null;
+  private terminalResult: Record<string, unknown> | null = null;
+  private terminalClosePromise: Promise<void> | null = null;
 
   constructor(options: CreateObserverApplicationOptions) {
     const managedRoot = resolve(options.managedRoot ?? options.defaultManagedRoot ?? defaultObserverManagedRoot());
@@ -243,17 +262,23 @@ class DefaultObserverApplication implements ObserverApplication {
   }
 
   get child(): unknown { return this.agentClient.childProcess; }
+  get lifecycleState(): ObserverApplicationLifecycleState { return this.state; }
   diagnosticPrivateChildCount(): number { return this.agentClient.diagnosticPrivateChildCount(); }
-  ensureStarted(): Promise<ObserverChildDescriptor> { return this.agentClient.ensureStarted(); }
+  ensureStarted(): Promise<ObserverChildDescriptor> {
+    this.assertPublicOpen();
+    return this.agentClient.ensureStarted();
+  }
   async status(): Promise<Record<string, unknown>> {
+    this.assertPublicOpen();
     return {
-      ...await this.diagnostics.inspect("status", this.closing, this.closed),
+      ...await this.diagnostics.inspect("status", false, false),
       imageOutput: this.imageOutputDiagnostics(),
     };
   }
   async doctor(): Promise<Record<string, unknown>> {
+    this.assertPublicOpen();
     return {
-      ...await this.diagnostics.inspect("doctor", this.closing, this.closed),
+      ...await this.diagnostics.inspect("doctor", false, false),
       imageOutput: this.imageOutputDiagnostics(),
     };
   }
@@ -263,14 +288,14 @@ class DefaultObserverApplication implements ObserverApplication {
   async revokeSession(sessionId: string): Promise<Record<string, unknown>> { return asRecord(await this.request("revoke", { sessionId }), "Observer session revocation"); }
 
   async retainRuntimeLifecycle(sessionId: string, runtimeId: string, generation: string, authority: OwnedRuntimeLifecycleAuthority): Promise<Record<string, unknown>> {
-    return asRecord(await this.request("runtimeLifecycleRetain", { sessionId, runtimeId, generation, authority }), "Observer runtime lifecycle retention");
+    return asRecord(await this.lifecycleRequest("runtimeLifecycleRetain", { sessionId, runtimeId, generation, authority }), "Observer runtime lifecycle retention");
   }
   async releaseRuntimeLifecycle(sessionId: string, runtimeId: string, generation: string): Promise<Record<string, unknown>> {
-    return asRecord(await this.request("runtimeLifecycleRelease", { sessionId, runtimeId, generation }), "Observer runtime lifecycle release");
+    return asRecord(await this.lifecycleRequest("runtimeLifecycleRelease", { sessionId, runtimeId, generation }), "Observer runtime lifecycle release");
   }
   async reserveRuntimeStop(sessionId: string, reservationId: string, exactRuntimeVacant = false, lifecycle?: OwnedRuntimeLifecycleIdentity): Promise<RuntimeStopPreflight> {
     if (!lifecycle) throw new ObserverApplicationError("INVALID_REQUEST", "Observer runtime stop reservation requires an exact lifecycle generation");
-    const value = asRecord(await this.request("runtimeStopPreflight", { sessionId, reservationId, exactRuntimeVacant, runtimeId: lifecycle.runtimeId, generation: lifecycle.generation }), "Observer runtime stop preflight");
+    const value = asRecord(await this.lifecycleRequest("runtimeStopPreflight", { sessionId, reservationId, exactRuntimeVacant, runtimeId: lifecycle.runtimeId, generation: lifecycle.generation }), "Observer runtime stop preflight");
     const strings = (input: unknown): string[] => Array.isArray(input) ? input.filter((entry): entry is string => typeof entry === "string") : [];
     return {
       sessionKnown: value.sessionKnown === true,
@@ -288,88 +313,166 @@ class DefaultObserverApplication implements ObserverApplication {
   }
   async releaseRuntimeStop(sessionId: string, reservationId: string, lifecycle?: OwnedRuntimeLifecycleIdentity): Promise<Record<string, unknown>> {
     if (!lifecycle) throw new ObserverApplicationError("INVALID_REQUEST", "Observer runtime stop release requires an exact lifecycle generation");
-    return asRecord(await this.request("runtimeStopRelease", { sessionId, reservationId, runtimeId: lifecycle.runtimeId, generation: lifecycle.generation }), "Observer runtime stop release");
+    return asRecord(await this.lifecycleRequest("runtimeStopRelease", { sessionId, reservationId, runtimeId: lifecycle.runtimeId, generation: lifecycle.generation }), "Observer runtime stop release");
   }
   async completeRuntimeStop(sessionId: string, reservationId?: string, exactRuntimeVacant = false, lifecycle?: OwnedRuntimeLifecycleIdentity): Promise<Record<string, unknown>> {
     if (!lifecycle) throw new ObserverApplicationError("INVALID_REQUEST", "Observer runtime stop completion requires an exact lifecycle generation");
-    return asRecord(await this.request("runtimeStopComplete", { sessionId, ...(reservationId ? { reservationId } : {}), exactRuntimeVacant, runtimeId: lifecycle.runtimeId, generation: lifecycle.generation }), "Observer runtime stop completion");
+    return asRecord(await this.lifecycleRequest("runtimeStopComplete", { sessionId, ...(reservationId ? { reservationId } : {}), exactRuntimeVacant, runtimeId: lifecycle.runtimeId, generation: lifecycle.generation }), "Observer runtime stop completion");
   }
 
   async instances(query: ObserverInstanceQuery = {}): Promise<ObserverInstanceList> {
+    this.assertPublicOpen();
     try { return await this.captureService.instances(query) as ObserverInstanceList; }
     catch (error) { throw this.mapError(error); }
   }
   async capture(input: ObserverCaptureInput): Promise<ObserverCaptureResult> {
+    this.assertPublicOpen();
     try {
       const { expectedWorldRevision: rawRevision, ...captureInput } = input;
-      const expectedWorldRevision = resolveExpectedWorldRevision({ expectedWorldRevision: rawRevision });
-      return await this.captureService.capture({ ...captureInput, expectedWorldRevision }) as CaptureResult;
+      const expectedWorldRevision = rawRevision === undefined
+        ? undefined
+        : resolveExpectedWorldRevision({ expectedWorldRevision: rawRevision });
+      return await this.captureService.capture({
+        ...captureInput,
+        ...(expectedWorldRevision ? { expectedWorldRevision } : {}),
+      }) as CaptureResult;
     } catch (error) { throw this.mapError(error); }
   }
   async beginRun(input: Record<string, unknown>): Promise<Record<string, unknown>> {
+    this.assertPublicOpen();
     try { return await this.evidenceRuns.begin(input); } catch (error) { throw this.mapError(error); }
   }
   async runStatus(runId: string): Promise<Record<string, unknown>> {
+    this.assertPublicOpen();
     try { return await this.evidenceRuns.status(runId); } catch (error) { throw this.mapError(error); }
   }
   async finalizeRun(input: Record<string, unknown>): Promise<Record<string, unknown>> {
+    this.assertPublicOpen();
     try { return await this.evidenceRuns.finalize(input); } catch (error) { throw this.mapError(error); }
   }
   async discardRun(runId: string): Promise<Record<string, unknown>> {
+    this.assertPublicOpen();
     try { return await this.evidenceRuns.discard(runId); } catch (error) { throw this.mapError(error); }
   }
-  async jobStatus(sessionId: string | undefined, jobId: string): Promise<Record<string, unknown>> {
-    try { return await this.captureService.status(sessionId, jobId); } catch (error) { throw this.mapError(error); }
+  async jobStatus(jobId: string): Promise<Record<string, unknown>> {
+    this.assertPublicOpen();
+    try { return await this.captureService.status(jobId); } catch (error) { throw this.mapError(error); }
   }
-  async cancelJob(sessionId: string | undefined, jobId: string): Promise<Record<string, unknown>> {
-    try { return await this.captureService.cancel(sessionId, jobId); } catch (error) { throw this.mapError(error); }
+  async cancelJob(jobId: string): Promise<Record<string, unknown>> {
+    this.assertPublicOpen();
+    try { return await this.captureService.cancel(jobId); } catch (error) { throw this.mapError(error); }
   }
-  async releaseJob(sessionId: string | undefined, jobId: string): Promise<Record<string, unknown>> {
-    try { return await this.captureService.release(sessionId, jobId); } catch (error) { throw this.mapError(error); }
+  async releaseJob(jobId: string): Promise<Record<string, unknown>> {
+    this.assertPublicOpen();
+    try { return await this.captureService.release(jobId); } catch (error) { throw this.mapError(error); }
   }
-  async readJob(sessionId: string | undefined, jobId: string): Promise<{ job: Record<string, unknown>; image: Buffer; metadata: Record<string, unknown> }> {
-    try { return await this.captureService.read(sessionId, jobId); } catch (error) { throw this.mapError(error); }
+  async readJob(jobId: string): Promise<{ job: Record<string, unknown>; image: Buffer; metadata: Record<string, unknown>; cleanup?: Record<string, unknown>; cleanupRequired?: boolean; cleanupWarning?: string }> {
+    this.assertPublicOpen();
+    try { return await this.captureService.read(jobId); } catch (error) { throw this.mapError(error); }
   }
 
-  async closeRuntimeLifecycle(): Promise<Record<string, unknown>> {
-    if (!this.ownedRuntimeManager) {
-      await this.closeServices();
-      return { sealedRuntimeIds: [], busyRuntimeIds: [], errorRuntimes: [], applicationCloseSafe: true };
+  closeRuntimeLifecycle(deadlineAtMs = Date.now() + 30_000): Promise<Record<string, unknown>> {
+    if (!Number.isFinite(deadlineAtMs) || deadlineAtMs <= 0) {
+      return Promise.reject(new TypeError("Observer application shutdown deadline is invalid"));
     }
-    const result = await this.ownedRuntimeManager.close();
-    if (result.applicationCloseSafe !== true) {
-      throw new OwnedRuntimeError(
-        "SHUTDOWN_SEAL_FAILED",
-        "Observer application remains live because one or more exact runtimes were not safely sealed",
-        result
-      );
-    }
-    await this.closeServices();
-    return result;
+    if (this.terminalResult) return Promise.resolve(this.terminalResult);
+    if (this.closeAttempt) return this.closeAttempt;
+    const attempt = this.performCloseAttempt(deadlineAtMs);
+    let tracked!: Promise<Record<string, unknown>>;
+    tracked = attempt.finally(() => {
+      if (this.closeAttempt === tracked) this.closeAttempt = null;
+    });
+    this.closeAttempt = tracked;
+    return tracked;
   }
 
   async close(): Promise<void> {
     await this.closeRuntimeLifecycle();
   }
 
+  emergencyTerminatePrivateChildren(): void {
+    this.agentClient.emergencyTerminatePrivateChildren();
+  }
+
+  private async performCloseAttempt(deadlineAtMs: number): Promise<Record<string, unknown>> {
+    try {
+      this.state = "quiescing";
+      const quiescence = await this.captureService.quiesce(deadlineAtMs);
+      if (!quiescence.quiescent) {
+        throw new OwnedRuntimeError(
+          "SHUTDOWN_SEAL_FAILED",
+          "Observer capture work did not quiesce before the shutdown deadline",
+          {
+            state: "quiescing",
+            applicationCloseSafe: false,
+            busyRuntimeIds: [],
+            errorRuntimes: quiescence.remainingJobIds.map((jobId) => ({
+              runtimeId: jobId,
+              reason: "Capture job still has an active or restoration-pending obligation",
+            })),
+            ...quiescence,
+          },
+        );
+      }
+
+      this.state = "sealing";
+      const result = this.ownedRuntimeManager
+        ? await this.ownedRuntimeManager.close(deadlineAtMs)
+        : { sealedRuntimeIds: [], busyRuntimeIds: [], errorRuntimes: [], applicationCloseSafe: true };
+      if (result.applicationCloseSafe !== true) {
+        throw new OwnedRuntimeError(
+          "SHUTDOWN_SEAL_FAILED",
+          "Observer application remains live because one or more exact runtimes were not safely sealed",
+          result,
+        );
+      }
+
+      this.state = "closing";
+      await this.closeServices();
+      this.state = "closed";
+      this.terminalResult = result;
+      return result;
+    } catch (error) {
+      if (this.state !== "closed") this.state = "retryable_unsafe";
+      throw error;
+    }
+  }
+
   private async closeServices(): Promise<void> {
-    if (this.closed) return;
-    if (this.closePromise) return this.closePromise;
-    this.closing = true;
-    this.closePromise = (async () => {
-      await this.captureService.close().catch((error) => logger.warn(`Observer capture convergence failed: ${redactChildLine(error instanceof Error ? error.message : String(error))}`));
+    if (this.state === "closed") return;
+    if (this.terminalClosePromise) return this.terminalClosePromise;
+    const attempt = (async () => {
+      await this.captureService.close();
       if (this.workbenchAdapter) {
-        await this.workbenchAdapter.restoreAll().catch((error) => logger.warn(`Workbench observer shutdown restoration failed: ${redactChildLine(error instanceof Error ? error.message : String(error))}`));
+        await this.workbenchAdapter.restoreAll();
       }
       await this.agentClient.close();
-    })().finally(() => { this.closed = true; this.closing = false; });
-    return this.closePromise;
+    })();
+    this.terminalClosePromise = attempt.catch((error) => {
+      this.terminalClosePromise = null;
+      throw error;
+    });
+    return this.terminalClosePromise;
   }
 
   private async request(operation: string, payload: Record<string, unknown>, timeoutMs = this.requestTimeoutMs): Promise<unknown> {
-    if (this.closing || this.closed) throw new ObserverApplicationError("TRANSPORT_UNAVAILABLE", "Observer application is unavailable");
-    await this.ensureStarted();
+    this.assertPublicOpen();
+    await this.agentClient.ensureStarted();
     return this.agentClient.request(operation, payload, { timeoutMs });
+  }
+
+  private async lifecycleRequest(operation: string, payload: Record<string, unknown>, timeoutMs = this.requestTimeoutMs): Promise<unknown> {
+    if (this.state === "closing" || this.state === "closed") {
+      throw new ObserverApplicationError("TRANSPORT_UNAVAILABLE", "Observer application is unavailable");
+    }
+    await this.agentClient.ensureStarted();
+    return this.agentClient.request(operation, payload, { timeoutMs });
+  }
+
+  private assertPublicOpen(): void {
+    if (this.state !== "open") {
+      throw new ObserverApplicationError("TRANSPORT_UNAVAILABLE", "Observer application is unavailable");
+    }
   }
 
   private imageOutputDiagnostics(): Record<string, unknown> {

@@ -31,7 +31,7 @@ function serviceHarness(kind: CaptureBackendKind) {
     async release(_ref, context) { events.push("backend-release"); deadlines.push(context.deadlineAtMs); return { restorationConfirmed: true, artifactRemoved: true }; },
   };
   const runPort: CaptureRunPort = {
-    async reserve(input) { events.push("reserve"); return { runId: input.runId, captureLabel: input.captureLabel, jobId: input.jobId }; },
+    async reserve(input) { events.push("reserve"); return { runId: input.runId, captureLabel: input.captureLabel ?? "current-1", jobId: input.jobId }; },
     async bind() { events.push("bind"); },
     async complete() { events.push("promote"); },
     async fail() { events.push("fail"); },
@@ -83,7 +83,7 @@ export function captureServiceContract(kind: CaptureBackendKind): void {
         const request = { ...harness.input, runId: "20260719T120000Z-a1b2c3d4", captureLabel: "overview" };
         const submitted = await harness.service.capture(request);
         harness.complete();
-        await harness.service.status(undefined, submitted.job.jobId);
+        await harness.service.status(submitted.job.jobId);
         expect(harness.events.indexOf("bind")).toBeLessThan(harness.events.indexOf("submit"));
         expect(harness.events.indexOf("read")).toBeLessThan(harness.events.indexOf("promote"));
         if (kind === "workbench") expect(harness.events.indexOf("promote")).toBeLessThan(harness.events.indexOf("backend-release"));

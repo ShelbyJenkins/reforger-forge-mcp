@@ -64,8 +64,8 @@ describe("Workbench failure-matrix world replacement", () => {
       ...harness.input,
       application: {
         ...harness.input.application,
-        jobStatus: async (sessionId, jobId) => {
-          const status = await jobStatus(sessionId, jobId);
+        jobStatus: async (jobId) => {
+          const status = await jobStatus(jobId);
           if (jobId !== "job-followup") return status;
           return {
             ...status,
@@ -107,8 +107,8 @@ describe("Workbench failure-matrix world replacement", () => {
       ...harness.input,
       application: {
         ...harness.input.application,
-        jobStatus: async (sessionId, jobId) => {
-          const status = await jobStatus(sessionId, jobId);
+        jobStatus: async (jobId) => {
+          const status = await jobStatus(jobId);
           return jobId === "job-followup"
             ? { ...status, worldIdentity: "world-1" }
             : status;

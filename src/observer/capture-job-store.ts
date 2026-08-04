@@ -3,9 +3,9 @@ import { CaptureError, type BackendJob, type BackendJobRef, type CanonicalCaptur
 export interface CaptureJobRecord {
   readonly jobId: string;
   readonly idempotencyScope: string;
-  readonly fingerprint: string;
-  readonly request: CanonicalCaptureRequest;
-  readonly ref: BackendJobRef;
+  fingerprint: string;
+  request: CanonicalCaptureRequest;
+  ref: BackendJobRef;
   readonly deadlineAtMs: number;
   readonly createdAtMs: number;
   readonly retentionUntilMs: number;

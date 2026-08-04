@@ -8,6 +8,20 @@ import {
 } from "./observer-adapter-fixture.js";
 
 describe("Workbench observer adapter", () => {
+  scopedIt("projects a submit-time expected-world mismatch before handler job creation", async (root) => {
+    const client = fakeClient(root, { submitWorldIdentity: "changed-world" });
+    const adapter = new WorkbenchObserverAdapter(client);
+
+    await expect(adapter.submit({
+      expectedWorldIdentity: `${client.project}|world-a|0|false`,
+      view: { kind: "current" },
+    })).rejects.toMatchObject({ code: "WORLD_CHANGED" });
+
+    expect(client.submitMutations).toBe(0);
+    expect(client.active).toBeNull();
+    expect(client.releaseCaptureActivity).toHaveBeenCalledOnce();
+  });
+
   scopedIt("recovers a lost submit acknowledgement by replaying the exact idempotent command once", async (root) => {
     const client = fakeClient(root, { loseFirstSubmitAcknowledgement: true });
     const adapter = new WorkbenchObserverAdapter(client, {
@@ -15,7 +29,7 @@ describe("Workbench observer adapter", () => {
       createLeaseId: () => "ack-lease",
     });
 
-    await expect(adapter.submit({ view: { kind: "current" } })).resolves.toMatchObject({
+    await expect(adapter.submit({ expectedWorldIdentity: `${client.project}|world-a|0|false`, view: { kind: "current" } })).resolves.toMatchObject({
       jobId: "ack-job",
       state: "settling",
     });
@@ -29,7 +43,7 @@ describe("Workbench observer adapter", () => {
   scopedIt("recovers a retained handler transaction after an adapter restart with the durable lifecycle binding", async (root) => {
     const client = fakeClient(root, { completeOnStatus: true });
     const original = new WorkbenchObserverAdapter(client, { createJobId: () => "restart-job" });
-    const submitted = await original.submit({ view: { kind: "current" } });
+    const submitted = await original.submit({ expectedWorldIdentity: `${client.project}|world-a|0|false`, view: { kind: "current" } });
     const submitCall = client.calls.find((call) => call.apiFunc === "EMCP_WB_ObserverSubmit");
     expect(submitCall?.params).toMatchObject({
       jobId: "restart-job",
@@ -65,7 +79,7 @@ describe("Workbench observer adapter", () => {
   scopedIt("refuses restart recovery when the durable Workbench instance binding is stale", async (root) => {
     const client = fakeClient(root);
     const original = new WorkbenchObserverAdapter(client, { createJobId: () => "stale-restart-job" });
-    await original.submit({ view: { kind: "current" } });
+    await original.submit({ expectedWorldIdentity: `${client.project}|world-a|0|false`, view: { kind: "current" } });
 
     const restarted = new WorkbenchObserverAdapter(client);
     await expect(restarted.recover({
@@ -78,7 +92,7 @@ describe("Workbench observer adapter", () => {
   scopedIt("refuses public release while camera state is held and replays a lost terminal release acknowledgement", async (root) => {
     const client = fakeClient(root, { loseFirstReleaseAcknowledgement: true });
     const adapter = new WorkbenchObserverAdapter(client, { createJobId: () => "release-job" });
-    await adapter.submit({ view: { kind: "current" } });
+    await adapter.submit({ expectedWorldIdentity: `${client.project}|world-a|0|false`, view: { kind: "current" } });
 
     await expect(adapter.release("release-job")).rejects.toMatchObject({ code: "CAMERA_BUSY" });
     expect(client.calls.filter((call) => call.apiFunc === "EMCP_WB_ObserverRelease")).toHaveLength(0);
@@ -95,7 +109,7 @@ describe("Workbench observer adapter", () => {
   scopedIt("graceful restoreAll cancels active jobs and exactly releases restored handler transactions", async (root) => {
     const client = fakeClient(root);
     const adapter = new WorkbenchObserverAdapter(client, { createJobId: () => "shutdown-job" });
-    await adapter.submit({ view: { kind: "current" } });
+    await adapter.submit({ expectedWorldIdentity: `${client.project}|world-a|0|false`, view: { kind: "current" } });
 
     await expect(adapter.restoreAll()).resolves.toBeUndefined();
 
@@ -111,7 +125,7 @@ describe("Workbench observer adapter", () => {
     const adapter = new WorkbenchObserverAcceptanceAdapter(client, {
       createJobId: () => "retry-shutdown-job",
     });
-    await adapter.submit({ view: { kind: "current" } });
+    await adapter.submit({ expectedWorldIdentity: `${client.project}|world-a|0|false`, view: { kind: "current" } });
 
     await expect(adapter.restoreAll()).rejects.toThrow(
       "One or more Workbench observer camera leases could not be restored"
@@ -132,7 +146,7 @@ describe("Workbench observer adapter", () => {
   scopedIt("keeps terminal release replay disabled by default", async (root) => {
     const client = fakeClient(root);
     const adapter = new WorkbenchObserverAdapter(client, { createJobId: () => "ordinary-release" });
-    await adapter.submit({ view: { kind: "current" } });
+    await adapter.submit({ expectedWorldIdentity: `${client.project}|world-a|0|false`, view: { kind: "current" } });
     await adapter.cancel("ordinary-release");
 
     await expect(adapter.release("ordinary-release")).resolves.toEqual({
@@ -154,7 +168,7 @@ describe("Workbench observer adapter", () => {
       createLeaseId: () => "duplicate-release-lease",
       verifyIdempotentReleaseReplay: true,
     });
-    await adapter.submit({ view: { kind: "current" } });
+    await adapter.submit({ expectedWorldIdentity: `${client.project}|world-a|0|false`, view: { kind: "current" } });
     await adapter.cancel("duplicate-release");
 
     await expect(adapter.release("duplicate-release")).resolves.toEqual({
@@ -189,7 +203,7 @@ describe("Workbench observer adapter", () => {
       createJobId: () => "mismatched-release",
       verifyIdempotentReleaseReplay: true,
     });
-    await adapter.submit({ view: { kind: "current" } });
+    await adapter.submit({ expectedWorldIdentity: `${client.project}|world-a|0|false`, view: { kind: "current" } });
     await adapter.status("mismatched-release");
 
     await expect(adapter.release("mismatched-release")).rejects.toMatchObject({
@@ -216,7 +230,7 @@ describe("Workbench observer adapter", () => {
       createJobId: () => "failed-release-replay",
       verifyIdempotentReleaseReplay: true,
     });
-    await adapter.submit({ view: { kind: "current" } });
+    await adapter.submit({ expectedWorldIdentity: `${client.project}|world-a|0|false`, view: { kind: "current" } });
     await adapter.cancel("failed-release-replay");
 
     await expect(adapter.release("failed-release-replay")).rejects.toMatchObject({
@@ -231,4 +245,3 @@ describe("Workbench observer adapter", () => {
     });
   });
 });
-

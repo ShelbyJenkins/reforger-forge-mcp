@@ -32,13 +32,15 @@ carried from one call to the next.
 
 Every evidence capture follows this sequence:
 
-1. Begin a managed evidence run with `observer_run action: "begin"`.
+1. Begin a managed evidence run with `observer_run_begin`. It becomes the
+   active run for this MCP process.
 2. Make a renderer available: launch an instrumented runtime or launch
    Workbench.
-3. Inventory renderers with `observer_instances` and choose one explicit,
-   healthy `instanceId`.
-4. Submit `observer_capture`, binding it to the world reported by that exact
-   inventory result.
+3. Submit `observer_capture`. If exactly one compatible renderer exists,
+   selection is automatic; otherwise inventory with `observer_instances` and
+   pass one returned opaque `target`.
+4. Let Observer allocate the capture label, or provide a meaningful label when
+   the evidence procedure requires one.
 5. Inspect the image and job result. For async work, wait for a terminal job
    before cleanup.
 6. Finalize reviewed labels to an allowlisted evidence root, or discard the
@@ -46,8 +48,10 @@ Every evidence capture follows this sequence:
 7. If you used a managed runtime, stop it only after every capture has reached
    terminal camera restoration.
 
-Do not reuse an inventory result after a renderer changes world, restarts, or
-becomes stale. Inventory again and submit a new world binding.
+Do not reuse a target after a renderer restarts or becomes stale. Inventory
+again and use the new opaque target. A targetless delegated capture may refresh
+one submit-time world change on the same exact renderer; it never switches
+instances during that retry.
 
 ## Start an evidence run
 
@@ -56,7 +60,6 @@ revision, and procedure revision make the final bundle easier to audit.
 
 ```json
 {
-  "action": "begin",
   "title": "Vehicle damage-state verification",
   "caseIds": ["VEH-DAMAGE-01"],
   "sourceRevision": "<commit-or-working-tree-id>",
@@ -65,8 +68,10 @@ revision, and procedure revision make the final bundle easier to audit.
 }
 ```
 
-Keep the returned `runId`. Every capture belongs to one open run and every
-`captureLabel` must be meaningful and unique within that run.
+The returned run becomes active in this MCP process, so later captures and run
+status/finalize/discard calls may omit `runId`. Capture labels may also be
+omitted; Observer allocates durable labels such as `current-1` or `pose-2`.
+Pass an explicit run ID when intentionally operating on another run.
 
 ## Choose and prepare a backend
 
@@ -94,13 +99,14 @@ output bounds described below while leaving the launched renderer fullscreen.
 
 You can pass the returned arguments unchanged to your own launcher. On Windows,
 you can instead call `observer_runtime action: "start"` with the
-`preparedLaunchId` and a unique `idempotencyKey`; retain the returned `runtimeId`
+`preparedLaunchId`; retain the returned `runtimeId`
 for later status and stop calls.
 
-Retain the **`sessionId` returned by launch preparation**. A runtime
-`observer_capture` or `observer_job` call requires that `sessionId`. A
-`runtimeId` identifies an exact-owned process for lifecycle operations; it does
-not replace the runtime session ID used by capture operations.
+Retain the **`sessionId` returned by launch preparation** for inventory and the
+legacy explicit-capture form. The preferred opaque inventory target carries
+that binding internally, and `observer_job` requires only its `jobId`. A
+`runtimeId` identifies an exact-owned process for lifecycle operations; it is
+not a capture-session identifier.
 
 After the runtime registers, query it with:
 
@@ -132,31 +138,34 @@ and then inventory renderers:
 
 Select the Workbench instance returned by inventory. Omit `sessionId` for this
 backend. A newly launched editor may initially support only `current` capture.
-Complete one successful current-view capture after each Workbench restart before
-requesting `pose` or `lookAt`; the restoration proof enables the
-`camera.editor` capability.
+When an explicit view is requested and the helper exposes the restoration API,
+Observer automatically performs and releases one internal current-view capture,
+re-inventories the same editor, and proceeds only after `camera.editor` is
+proven. This priming repeats after an editor restart.
 
 Observer does not start Workbench, enter Play mode, save resources, reload
 scripts, or shut down the editor as part of capture. Follow the normal
 Workbench workflow in [agents/AGENTS.md](../agents/AGENTS.md) for those
 operations.
 
-## Inventory and world binding
+If internal priming fails, Observer never submits the requested pose or
+look-at view. It attempts the same restoration and release path as any other
+runless capture; when cleanup cannot be proved, the error includes the retained
+prime job ID so `observer_job` can be used to recover it before retrying.
 
-Capture requests must identify the chosen renderer and bind it to the world
-from the immediately preceding `observer_instances` result. Carry forward:
+## Inventory and renderer targets
 
-- `instanceId`
-- `worldRevision`
+For the common case, omit renderer-selection fields. Observer inventories both
+backends and delegates only when exactly one compatible renderer exists. With
+multiple candidates it returns `AMBIGUOUS_INSTANCE` and bounded candidate
+records containing opaque `target` values.
 
-Use the opaque `expectedWorldRevision` from inventory for every new capture.
-The public capture input does not accept separate world-ID or epoch fields. A
-runtime revision may represent no loaded world; `current` capture remains
-available for that rendered state, while `pose` and `lookAt` require an active
-world.
-
-If the tool reports `WORLD_CHANGED`, inventory again. Do not reuse a world
-binding from a different renderer.
+Use one `ct1...` target returned by `observer_instances` when selection must be
+explicit. The token binds backend, exact instance, runtime session when
+applicable, and world revision. Treat it as opaque and short-lived. `target`
+cannot be combined with legacy `sessionId`, `instanceId`, or
+`expectedWorldRevision` fields. Those legacy fields remain a compatibility
+path and must be supplied as one complete explicit binding.
 
 ## Capture an image
 
@@ -165,18 +174,25 @@ intrusive choice. Use `pose` only when you have a known position, normalized
 quaternion, and field of view. Use `lookAt` for a reproducible position, target,
 and field of view; its position and target must differ.
 
-The following is a synchronous runtime current-view capture. For Workbench,
-omit `sessionId` but use the selected Workbench `instanceId` and its inventory
-world revision.
+When exactly one compatible renderer is available, the ordinary screenshot
+request is simply:
+
+```json
+{}
+```
+
+With an active evidence run it receives the next durable `current-N` label.
+Without an active or explicit run it is runless and automatically attempts to
+release the validated artifact after delivery.
+
+The following is a synchronous capture in the active run. Omit `target` when
+there is exactly one compatible renderer; otherwise copy one target from
+inventory.
 
 ```json
 {
-  "runId": "<managed-run-id>",
-  "captureLabel": "vehicle-damaged-runtime-current",
   "purpose": "Show the vehicle after the damage sequence.",
-  "sessionId": "<prepared-session-id>",
-  "instanceId": "<selected-runtime-instance-id>",
-  "expectedWorldRevision": "<inventory-world-revision>",
+  "target": "<opaque-inventory-target-if-selection-is-ambiguous>",
   "view": { "kind": "current" },
   "asynchronous": false,
   "timeoutMs": 30000,
@@ -205,14 +221,18 @@ camera restoration; it does not prove the assertion depicted by the image.
 
 Use `asynchronous: true` when you need to avoid an inline wait. Keep the
 returned `jobId`, then call `observer_job action: "status"`. Once complete,
-call `observer_job action: "read"` if the image fits the inline limit. Runtime
-job calls use the same `sessionId` as capture; Workbench job calls omit it.
+call `observer_job action: "read"` if the image fits the inline limit. Every
+job operation takes only `action` and `jobId`; backend and runtime session
+authority remain internal.
 If an image is too large to return inline, leave it managed for run
 finalization—do not seek a private artifact path.
 
 Use `observer_job action: "cancel"` for unwanted work and wait until the job is
 terminal. `observer_job action: "release"` cannot release an artifact retained
-by an open run; finalize or discard that run instead.
+by an open run; finalize or discard that run instead. Runless synchronous
+captures, successful asynchronous reads, safe terminal cancellations, and
+oversized inline deliveries automatically attempt release. If cleanup cannot
+be proven, the result retains the job and reports `cleanupRequired`.
 
 ## Review and finalize
 
@@ -223,8 +243,6 @@ been reviewed or cannot support a conclusion.
 
 ```json
 {
-  "action": "finalize",
-  "runId": "<managed-run-id>",
   "evidenceRoot": "<configured-allowlisted-evidence-root>",
   "includeCaptureLabels": ["vehicle-damaged-runtime-current"],
   "review": {
@@ -260,7 +278,7 @@ explicitly configured `observer.supportingLogRoots` entry. Use that form for
 external launches and operator-managed logs. Both forms receive the same size,
 UTF-8, redaction, regular-file, link, and identity-change checks before the
 copied log is hashed into `manifest.json`. If the run should produce no bundle,
-use `observer_run action: "discard"` instead.
+use `observer_run_discard` instead.
 
 ## Clean up safely
 
@@ -269,8 +287,8 @@ Before stopping an exact-owned runtime:
 1. Cancel unwanted jobs.
 2. Poll each job until its camera restoration is terminal.
 3. Finalize or discard the evidence run.
-4. Call `observer_runtime action: "stop"` with its `runtimeId`, a unique
-   `idempotencyKey`, and a bounded `waitForRestorationMs`.
+4. Call `observer_runtime action: "stop"` with its `runtimeId` and a bounded
+   `waitForRestorationMs`.
 
 `observer_runtime` stops only a process it started and exactly verified. Do not
 substitute a PID, executable name, `taskkill`, or a broad process-tree command
@@ -286,9 +304,10 @@ then follow the normal owner-scoped editor shutdown process.
 |---|---|
 | `observer_setup` reports a missing or unsuitable root | Run `observer_setup action: "doctor"`, then correct the explicit Observer configuration in [SETUP.md](../SETUP.md). |
 | No renderer appears | Confirm the runtime was launched from the prepared arguments, or that the exact Workbench `.gproj` is running through `wb_launch`; then inventory again with a bounded `waitMs`. |
-| `CAPABILITY_UNAVAILABLE` for `pose` or `lookAt` | Use `current`, or choose an instance advertising `camera.runtime` or `camera.editor`. A new Workbench instance needs one successful current-view capture first. |
-| `WORLD_CHANGED` | Run `observer_instances` again and copy the new world binding into a new capture request. |
-| Runtime capture rejects a missing session | Supply the `sessionId` from `observer_prepare_launch`; do not use the runtime lifecycle ID as a substitute. |
+| `CAPABILITY_UNAVAILABLE` for `pose` or `lookAt` | Use `current`, or choose an instance advertising `camera.runtime`. Workbench priming is automatic when its exact restoration API is available. |
+| `AMBIGUOUS_INSTANCE` | Choose one candidate `target` from the error details or from `observer_instances`. |
+| `WORLD_CHANGED` or stale target | Run `observer_instances` again and use the new opaque target. |
+| Legacy runtime capture rejects a missing session | Prefer the opaque runtime target, or supply the complete legacy binding from inventory; do not use the runtime lifecycle ID as a substitute. |
 | An image cannot be read inline | Leave it managed and finalize the run; oversized images are intentionally not exposed by private path. |
 | Finalization is unavailable or ambiguous | Configure an evidence root, or provide the chosen root when several are allowlisted. |
 | Semantic runtime log admission is refused | Select the completed runtime capture for export and confirm it came from the exact process started by `observer_runtime`. For external launches, configure a narrow supporting-log root and use the `path` form. |
@@ -303,9 +322,12 @@ then follow the normal owner-scoped editor shutdown process.
 | `observer_prepare_launch` | Produce instrumented runtime arguments and a runtime capture session. |
 | `observer_runtime` | Start, inspect, or stop an exact-owned Windows runtime. |
 | `observer_instances` | Find compatible runtime or Workbench renderers and obtain world bindings. |
-| `observer_capture` | Submit a current, pose, or look-at capture to an open run. |
+| `observer_capture` | Submit a current, pose, or look-at capture, optionally attached to an active or explicit run. |
 | `observer_job` | Inspect, read, cancel, or release a capture job. |
-| `observer_run` | Begin, inspect, finalize, or discard a managed evidence run. |
+| `observer_run_begin` | Begin and activate a managed evidence run. |
+| `observer_run_status` | Inspect an explicit or active run. |
+| `observer_run_finalize` | Export reviewed labels from an explicit or active run. |
+| `observer_run_discard` | Discard an explicit or active unfinalized run. |
 
 For exhaustive field descriptions, use the schemas and descriptions supplied by
 your MCP client. For technical implementation details and maintainer validation,

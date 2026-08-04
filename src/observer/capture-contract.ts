@@ -99,9 +99,24 @@ export interface CaptureBackend {
   release(ref: BackendJobRef, context: BackendCallContext): Promise<BackendReleaseResult>;
 }
 
+export interface CanonicalCaptureIntent {
+  selectionMode: "explicit" | "delegated";
+  view: CaptureView;
+  settleFrames: number;
+  performancePolicy: "evidence" | "instrumented";
+  image: CanonicalImageOutputPolicy;
+  timeoutMs: number;
+  runId?: string;
+  captureLabel?: string;
+  purpose?: string;
+  asynchronous: boolean;
+  /** Caller-controlled semantic identity before renderer resolution. */
+  fingerprint: string;
+}
+
 export interface CanonicalCaptureRequest {
   sessionId?: string;
-  instanceId?: string;
+  instanceId: string;
   view: CaptureView;
   settleFrames: number;
   performancePolicy: "evidence" | "instrumented";
@@ -112,6 +127,8 @@ export interface CanonicalCaptureRequest {
   captureLabel?: string;
   purpose?: string;
   asynchronous: boolean;
+  selectionMode: "explicit" | "delegated";
+  intentFingerprint: string;
   /** Complete logical identity used for idempotency, excluding transport values. */
   fingerprint: string;
 }
@@ -119,17 +136,18 @@ export interface CanonicalCaptureRequest {
 export interface CaptureInput {
   sessionId?: string;
   instanceId?: string;
-  view: CaptureView;
+  view?: CaptureView;
   settleFrames?: number;
   performancePolicy?: "evidence" | "instrumented" | "performance";
   image?: ImageOutputRequest;
   timeoutMs?: number;
-  expectedWorldRevision: WorldRevision;
+  expectedWorldRevision?: WorldRevision;
   runId?: string;
   captureLabel?: string;
   purpose?: string;
   asynchronous?: boolean;
   idempotencyKey: string;
+  selectionMode?: "explicit" | "delegated";
   signal?: AbortSignal;
 }
 
@@ -157,13 +175,16 @@ export interface CaptureResultSync {
   job: PublicCaptureJob;
   image: Buffer;
   metadata: Record<string, unknown>;
+  cleanup?: Record<string, unknown>;
+  cleanupRequired?: boolean;
+  cleanupWarning?: string;
 }
 
 export type CaptureResult = CaptureResultAsync | CaptureResultSync;
 
 export interface RunCaptureReservation {
   runId: string;
-  captureLabel: string;
+  captureLabel?: string;
   purpose?: string;
   idempotencyKey: string;
   request: CanonicalCaptureRequest;
@@ -186,6 +207,9 @@ export interface BoundRunCapture {
   runId: string;
   captureLabel: string;
   ref: BackendJobRef;
+  request?: CanonicalCaptureRequest;
+  selectionDelegated?: boolean;
+  retryCount?: number;
 }
 
 export interface CompletedRunCapture {
@@ -213,6 +237,8 @@ export interface PublicCaptureJobRef {
 export interface CaptureRunPort {
   reserve(input: RunCaptureReservation): Promise<ReservedRunCapture>;
   bind(input: BoundRunCapture): Promise<void>;
+  submitted?(input: BoundRunCapture): Promise<void>;
+  reviseAdmission?(input: BoundRunCapture & { request: CanonicalCaptureRequest; retryCount: number }): Promise<void>;
   complete(input: CompletedRunCapture): Promise<void>;
   fail(input: FailedRunCapture): Promise<void>;
   assertReleaseAllowed(ref: PublicCaptureJobRef): Promise<void>;

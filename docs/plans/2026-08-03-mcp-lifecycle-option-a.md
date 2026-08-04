@@ -2,10 +2,14 @@
 
 ## Status
 
-Ready for implementation as of 2026-08-03, subject to the diagnostic
-checkpoint in Phase 0. This document covers only Option A: make MCP shutdown
-bounded and retry-correct, quiesce Observer work before sealing owned runtimes,
-and load the API search index on first use.
+Phases 0, 1, and 2 were implemented and validated on 2026-08-04. The full
+hermetic suite, guarded real Workbench lifecycle acceptance, and built
+MCP/private-child process-tree acceptance all passed. Per the explicit no-game
+constraint, no game runtime was launched; the persistent unsafe owned-runtime
+path was exercised by the real-child black-box test instead. This document
+covers only Option A: make MCP shutdown bounded and retry-correct, quiesce
+Observer work before sealing owned runtimes, and load the API search index on
+first use.
 
 The diagnostics change must land before the shutdown redesign. The current
 15-second failure drops the structured `OwnedRuntimeError.details`, so the
@@ -82,6 +86,25 @@ The following targeted baseline passed before this plan was written:
 ```
 
 Result: 2 test files and 61 tests passed.
+
+### Phase 0 diagnostic checkpoint (implemented 2026-08-03)
+
+The controlled lifecycle characterization did not reproduce a 15-second
+failure in either clean state. An application with no Workbench, private child,
+jobs, or owned runtimes closed without starting a child. A real started private
+child with no jobs or owned runtimes also closed cleanly and its PID was no
+longer alive afterward. A started child alone is therefore not sufficient to
+produce the failure.
+
+The controlled unsafe state did reproduce the source-backed convergence
+cycle: an exact owned runtime with an active/restoration-pending capture was
+reported with `applicationCloseSafe: false`, its exact runtime ID, and the
+active-job/camera-lease obligation category. Ordinary close retained the same
+private child for retry. This evidence supports the Phase 1 order implemented
+below: quiesce admitted capture work before exact-runtime sealing, and retain
+the agent connection whenever the seal remains unsafe. The earlier unexplained
+clean-idle symptom is not being relabeled as this active-work case; it remains
+unreproduced by the hermetic three-state fixture.
 
 ## Goal
 
@@ -435,6 +458,52 @@ npm.cmd run test:stage4
 
 ## Phase 2: Lazily initialize the API search index
 
+### Phase 2 memory and startup checkpoint (implemented 2026-08-03)
+
+Run from a built checkout with:
+
+```powershell
+node --expose-gc scripts/measure-search-index-memory.mjs
+```
+
+The probe runs each mode in three fresh child processes, forces GC at the
+measurement checkpoint, uses temporary Observer managed/profile roots, and
+reports medians without enforcing an absolute RSS threshold. Results on the
+reference Windows x64 machine with Node v26.4.0 were:
+
+| Mode | RSS MiB | Heap MiB | Registration ms | First load ms |
+|---|---:|---:|---:|---:|
+| Bare Node | 55.7 | 4.5 | 0 | 0 |
+| Production module imports | 88.6 | 19.9 | 0 | 0 |
+| Registered tools, empty index | 89.4 | 21.6 | 11.2 | 0 |
+| Registered tools, full index idle | 89.4 | 21.6 | 11.1 | 0 |
+| Full index after first use | 208.1 | 103.4 | 11.5 | 249.1 |
+
+Full-data idle registration was indistinguishable from empty-index
+registration at the reported precision (0.0 MiB median RSS difference). First
+use paid the parse/index cost once. Comparing the loaded state, which has the
+same index allocations as the former eager-construction baseline, with the
+full-data idle state showed a 118.7 MiB median RSS reduction. This exceeds the
+100 MiB acceptance target. The roughly 89 MiB idle floor is primarily Node and
+the imported production module graph; lazily parsing the API data is not
+expected to reduce that irreducible startup cost.
+
+The focused search/resource suites (99 tests), typecheck, Stage 4 (129 tests),
+cross-cutting baseline (55 tests), build, 59-tool MCP handshake, and fresh
+packed installation all passed without launching Workbench or the game. After
+the external Workbench was released on 2026-08-04, the default full suite also
+passed. Guarded real Workbench acceptance then passed resource registration,
+target reopen/save, launch/reuse/restart, and final exact-process vacancy.
+
+A disposable harness subsequently drove the real built MCP entry point through
+Observer private-child startup and an active Workbench capture, then closed
+stdin. The MCP exited with code 0, its exact private child was gone, Workbench
+remained alive as the ordinary-shutdown invariant requires, and a fresh MCP
+owner reconciled the durable state and safely shut down the exact Workbench
+PID. The persistent-unsafe fault-injection black-box test also passed: it
+removed the MCP and its real disposable child while preserving an unrelated
+process. No game runtime was launched for these checks.
+
 ### Task 2.1: Move the load boundary into `SearchEngine`
 
 **Files:**
@@ -562,6 +631,10 @@ entry point:
 5. with a fault-injected persistent unsafe seal, confirm the MCP parent and its
    disposable private child are both gone after the 30-second deadline while
    the next owner can reconcile durable state.
+
+Completed on 2026-08-04 with the no-game constraint recorded above. The live
+built-MCP run used an active Workbench capture for the orderly path; the
+persistent unsafe owned-runtime path used the real-child black-box fixture.
 
 After implementation and validation are complete, review
 `docs/plans/2026-08-03-observer-api-simplification.md` against the final changes

@@ -1,10 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
 import { EvidenceRunService } from "../../src/observer/evidence-run-service.js";
 import { normalizeCaptureRequest } from "../../src/observer/capture-request.js";
+import { workbenchWorldRevision } from "../../src/observer/world-revision.js";
 import { contractInstance, contractJob, contractPng, contractRef } from "./capture-policy-fixture.js";
 
 describe("EvidenceRunService", () => {
-  it("passes complete request identity through reserve, bind, and promotion operations", async () => {
+  it("passes complete request identity through reserve, admission revision, submission, and promotion", async () => {
     const instance = contractInstance("workbench");
     const calls: Array<{ operation: string; payload: Record<string, unknown> }> = [];
     const agent = { async request(operation: string, payload: Record<string, unknown> = {}) {
@@ -26,14 +27,36 @@ describe("EvidenceRunService", () => {
     await service.reserve({ runId: request.runId!, captureLabel: request.captureLabel!, idempotencyKey: "run-capture", request, jobId: "job-workbench" });
     const ref = contractRef(instance, "job-workbench");
     await service.bind({ runId: request.runId!, captureLabel: request.captureLabel!, ref });
+    const revisedWorldRevision = workbenchWorldRevision("project/world#8");
+    const revisedRequest = normalizeCaptureRequest({
+      idempotencyKey: "run-capture",
+      instanceId: instance.instanceId,
+      expectedWorldRevision: revisedWorldRevision,
+      view: { kind: "current" },
+      timeoutMs: 1_000,
+      asynchronous: true,
+      runId: request.runId,
+      captureLabel: request.captureLabel,
+    });
+    const revisedRef = { ...ref, worldRevision: revisedWorldRevision };
+    await service.reviseAdmission({
+      runId: request.runId!, captureLabel: request.captureLabel!, ref: revisedRef,
+      request: revisedRequest, selectionDelegated: true, retryCount: 1,
+    });
+    await service.submitted({ runId: request.runId!, captureLabel: request.captureLabel!, ref: revisedRef });
     await service.complete({
-      runId: request.runId!, captureLabel: request.captureLabel!, ref,
+      runId: request.runId!, captureLabel: request.captureLabel!, ref: revisedRef,
       artifact: { image: contractPng, metadata: { contentSha256: "a".repeat(64) } },
-      job: contractJob(instance, "completed", ref.jobId),
+      job: { ...contractJob(instance, "completed", ref.jobId), ref: revisedRef },
     });
     expect(calls[0]).toMatchObject({ operation: "runReserveCapture", payload: { jobId: "job-workbench", requestFingerprint: request.fingerprint, expectedWorldRevision: instance.worldRevision } });
     expect(calls[1]).toMatchObject({ operation: "runBindCapture", payload: { backend: "workbench", worldRevision: instance.worldRevision } });
-    expect(calls[2]).toMatchObject({ operation: "importWorkbenchArtifact", payload: { jobId: "job-workbench", image: contractPng } });
+    expect(calls[2]).toMatchObject({
+      operation: "runReviseCaptureAdmission",
+      payload: { jobId: "job-workbench", worldRevision: revisedWorldRevision, requestFingerprint: revisedRequest.fingerprint, selectionDelegated: true, retryCount: 1 },
+    });
+    expect(calls[3]).toMatchObject({ operation: "runSubmitCapture", payload: { runId: request.runId, captureLabel: request.captureLabel } });
+    expect(calls[4]).toMatchObject({ operation: "importWorkbenchArtifact", payload: { jobId: "job-workbench", image: contractPng } });
   });
 
   it("converges durable snapshots before returning status and around finalization", async () => {

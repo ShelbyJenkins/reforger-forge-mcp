@@ -67,7 +67,8 @@ const PRIVATE_ALLOWLIST = new Set<ObserverApplicationOperationName>([
   "runtimeStopRelease", "runtimeStopComplete", "submitJob", "jobStatus",
   "cancelJob", "readArtifact", "readWorkbenchArtifact", "inspectWorkbenchArtifact",
   "importWorkbenchArtifact", "runBegin", "runStatus", "runReserveCapture",
-  "runBindCapture", "runCompleteCapture", "runFailCapture", "runFinalize",
+  "runBindCapture", "runSubmitCapture", "runReviseCaptureAdmission",
+  "runCompleteCapture", "runFailCapture", "runFinalize",
   "runDiscard", "assertJobReleaseAllowed", "releaseJob", "releaseWorkbenchArtifact",
   "uninstall", "shutdown",
 ]);

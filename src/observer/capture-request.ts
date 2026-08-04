@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { assertWorldRevision, type WorldRevision } from "./world-revision.js";
-import { CaptureError, type CaptureInput, type CanonicalCaptureRequest, type CaptureView } from "./capture-contract.js";
+import { CaptureError, type CaptureInput, type CanonicalCaptureIntent, type CanonicalCaptureRequest, type CaptureView } from "./capture-contract.js";
 import {
   IMAGE_OUTPUT_FORMATS,
   type CanonicalImageOutputPolicy,
@@ -108,12 +108,12 @@ export function resolveExpectedWorldRevision(input: ExpectedWorldBindingInput): 
   }
 }
 
-/** Normalize all semantic input before routing or idempotency lookup. */
-export function normalizeCaptureRequest(
+/** Normalize only caller intent; renderer binding is deliberately resolved later. */
+export function normalizeCaptureIntent(
   input: CaptureInput,
   defaultTimeoutMs = 30_000,
   imageDefaults: ImagePolicyDefaults = DEFAULT_IMAGE_POLICY_LIMITS,
-): CanonicalCaptureRequest {
+): CanonicalCaptureIntent {
   if (typeof input.idempotencyKey !== "string" || input.idempotencyKey.length < 1 || input.idempotencyKey.length > 128) {
     throw new CaptureError("INVALID_REQUEST", "idempotencyKey is required and must be bounded");
   }
@@ -130,19 +130,20 @@ export function normalizeCaptureRequest(
   }
   const runId = boundedString(input.runId, "runId", 128);
   const captureLabel = boundedString(input.captureLabel, "captureLabel", 128);
-  if ((runId === undefined) !== (captureLabel === undefined)) {
-    throw new CaptureError("INVALID_REQUEST", "runId and captureLabel must be supplied together");
+  if (!runId && captureLabel) {
+    throw new CaptureError("INVALID_REQUEST", "captureLabel requires an explicit or active run");
   }
-  const expectedWorldRevision = resolveExpectedWorldRevision(input);
-  const normalized: Omit<CanonicalCaptureRequest, "fingerprint"> = {
-    ...(input.sessionId !== undefined ? { sessionId: boundedString(input.sessionId, "sessionId", 96) } : {}),
-    ...(input.instanceId !== undefined ? { instanceId: boundedString(input.instanceId, "instanceId", 96) } : {}),
-    view: view(input.view),
+  const selectionMode = input.selectionMode ??
+    (input.expectedWorldRevision !== undefined || input.sessionId !== undefined || input.instanceId !== undefined
+      ? "explicit"
+      : "delegated");
+  const normalized: Omit<CanonicalCaptureIntent, "fingerprint"> = {
+    selectionMode,
+    view: view(input.view ?? { kind: "current" }),
     settleFrames,
     performancePolicy: input.performancePolicy ?? "evidence",
     image: normalizeImagePolicy(input.image, imageDefaults),
     timeoutMs,
-    expectedWorldRevision,
     ...(runId ? { runId } : {}),
     ...(captureLabel ? { captureLabel } : {}),
     ...(input.purpose !== undefined ? { purpose: boundedString(input.purpose, "purpose", 512) } : {}),
@@ -150,6 +151,53 @@ export function normalizeCaptureRequest(
   };
   const canonical = JSON.stringify(normalized);
   return { ...normalized, fingerprint: createHash("sha256").update(canonical, "utf8").digest("hex") };
+}
+
+export interface ResolvedCaptureBinding {
+  sessionId?: string;
+  instanceId: string;
+  expectedWorldRevision: WorldRevision;
+}
+
+export function materializeCaptureRequest(
+  intent: CanonicalCaptureIntent,
+  binding: ResolvedCaptureBinding,
+  captureLabel = intent.captureLabel,
+): CanonicalCaptureRequest {
+  const normalized = {
+    ...(binding.sessionId !== undefined ? { sessionId: boundedString(binding.sessionId, "sessionId", 96) } : {}),
+    instanceId: boundedString(binding.instanceId, "instanceId", 96)!,
+    view: intent.view,
+    settleFrames: intent.settleFrames,
+    performancePolicy: intent.performancePolicy,
+    image: intent.image,
+    timeoutMs: intent.timeoutMs,
+    expectedWorldRevision: assertWorldRevision(binding.expectedWorldRevision, "expectedWorldRevision"),
+    ...(intent.runId ? { runId: intent.runId } : {}),
+    ...(captureLabel ? { captureLabel: boundedString(captureLabel, "captureLabel", 128) } : {}),
+    ...(intent.purpose ? { purpose: intent.purpose } : {}),
+    asynchronous: intent.asynchronous,
+    selectionMode: intent.selectionMode,
+    intentFingerprint: intent.fingerprint,
+  };
+  const canonical = JSON.stringify(normalized);
+  return { ...normalized, fingerprint: createHash("sha256").update(canonical, "utf8").digest("hex") };
+}
+
+/** Compatibility helper for already-resolved internal callers and tests. */
+export function normalizeCaptureRequest(
+  input: CaptureInput,
+  defaultTimeoutMs = 30_000,
+  imageDefaults: ImagePolicyDefaults = DEFAULT_IMAGE_POLICY_LIMITS,
+): CanonicalCaptureRequest {
+  const intent = normalizeCaptureIntent(input, defaultTimeoutMs, imageDefaults);
+  const expectedWorldRevision = resolveExpectedWorldRevision(input);
+  if (!input.instanceId) throw new CaptureError("INVALID_REQUEST", "instanceId is required for a resolved capture request");
+  return materializeCaptureRequest(intent, {
+    ...(input.sessionId ? { sessionId: input.sessionId } : {}),
+    instanceId: input.instanceId,
+    expectedWorldRevision,
+  });
 }
 
 export function idempotencyScope(input: Pick<CaptureInput, "idempotencyKey" | "sessionId" | "instanceId">): string {

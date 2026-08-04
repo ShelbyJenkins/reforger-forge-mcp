@@ -7,6 +7,7 @@ const base = {
   idempotencyKey: "request-key",
   view: { kind: "pose" as const, position: [-0, 1, 2] as [number, number, number], orientation: [0, 0, 0, 1] as [number, number, number, number], fov: 60 },
   timeoutMs: 1_000,
+  instanceId: "instance-1",
   expectedWorldRevision: runtimeWorldRevision("world", 3),
 };
 

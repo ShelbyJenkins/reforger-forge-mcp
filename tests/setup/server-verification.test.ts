@@ -70,7 +70,10 @@ const observerNames = [
   "observer_instances",
   "observer_capture",
   "observer_job",
-  "observer_run",
+  "observer_run_begin",
+  "observer_run_status",
+  "observer_run_finalize",
+  "observer_run_discard",
 ] as const;
 
 const validTools = [

@@ -77,6 +77,7 @@ export class ObserverAgentClient {
   private rejectStartup: ((error: Error) => void) | null = null;
   private closed = false;
   private closing = false;
+  private emergencyTerminated = false;
   private closePromise: Promise<void> | null = null;
 
   constructor(private readonly options: ObserverAgentClientOptions) {
@@ -208,6 +209,32 @@ export class ObserverAgentClient {
       }
     })().finally(() => { this.closed = true; this.closing = false; });
     return this.closePromise;
+  }
+
+  /**
+   * CLI crash-path only. This synchronously severs every disposable private
+   * child tracked by this client, including a child still in its ready
+   * handshake. It deliberately publishes no clean observer/runtime state.
+   */
+  emergencyTerminatePrivateChildren(): void {
+    if (this.emergencyTerminated) return;
+    this.emergencyTerminated = true;
+    this.closing = true;
+    const error = new ObserverApplicationError(
+      "TRANSPORT_UNAVAILABLE",
+      "Observer agent was terminated by the MCP emergency shutdown path",
+    );
+    this.rejectStartup?.(error);
+    this.rejectStartup = null;
+    this.rejectAll(error);
+    for (const child of [...this.liveChildren]) {
+      try { if (child.connected) child.disconnect(); } catch { /* crash-path best effort */ }
+      try {
+        if (child.exitCode === null && child.signalCode === null) child.kill();
+      } catch { /* crash-path best effort */ }
+    }
+    this.child = null;
+    this.descriptor = null;
   }
 
   private attachChild(child: ChildProcess): void {

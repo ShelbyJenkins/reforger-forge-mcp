@@ -1586,10 +1586,13 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
    * on which a later MCP instance may stop a still-running exact receipt when
    * the old in-memory observer session no longer exists.
    */
-  close(): Promise<Record<string, unknown>> {
+  close(deadlineAtMs?: number): Promise<Record<string, unknown>> {
+    if (deadlineAtMs !== undefined && (!Number.isFinite(deadlineAtMs) || deadlineAtMs <= 0)) {
+      return Promise.reject(new OwnedRuntimeError("INVALID_REQUEST", "Owned runtime shutdown deadline is invalid"));
+    }
     if (this.closePromise) return this.closePromise;
     this.closing = true;
-    const attempt = this.closeOwnedRuntimes();
+    const attempt = this.closeOwnedRuntimes(deadlineAtMs);
     this.closePromise = attempt.then(async (result) => {
       if (result.applicationCloseSafe !== true) {
         this.closing = false;
@@ -1644,12 +1647,15 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
     this.recordStoreInstance = null;
   }
 
-  private async closeOwnedRuntimes(): Promise<Record<string, unknown>> {
+  private async closeOwnedRuntimes(deadlineAtMs?: number): Promise<Record<string, unknown>> {
     // Shutdown uses the configured lifecycle lock timeout as one aggregate
     // budget, including inventory, observer release/reservation IPC, sealing,
     // and the final inventory CAS. It is deliberately not reset per runtime.
     const wallDeadline: OwnedRuntimeWallDeadline = {
-      expiresAtMs: Date.now() + this.lockTimeoutMs,
+      expiresAtMs: Math.min(
+        Date.now() + this.lockTimeoutMs,
+        deadlineAtMs ?? Number.POSITIVE_INFINITY,
+      ),
       code: "SHUTDOWN_SEAL_FAILED",
       message: "Owned runtime shutdown sealing exceeded its aggregate wall-clock deadline",
       details: { state: "shutdown_sealing" },

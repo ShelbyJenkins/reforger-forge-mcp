@@ -10,7 +10,7 @@ describe("Workbench observer adapter", () => {
   scopedIt("marks one retained job for exact owner exit without claiming ordinary gate release", async (root) => {
     const client = fakeClient(root);
     const adapter = new WorkbenchObserverAcceptanceAdapter(client, { createJobId: () => "exit-required-job" });
-    await adapter.submit({ view: { kind: "current" } });
+    await adapter.submit({ expectedWorldIdentity: `${client.project}|world-a|0|false`, view: { kind: "current" } });
     const activityLease = client.acquireCaptureActivity.mock.results[0]!.value;
 
     adapter.requireExactOwnerExit("exit-required-job");
@@ -35,7 +35,7 @@ describe("Workbench observer adapter", () => {
     });
     adapter.armOneShotBeforeSubmitDelivery(beforeSubmit);
 
-    await expect(adapter.submit({ view: { kind: "current" } })).rejects.toMatchObject({
+    await expect(adapter.submit({ expectedWorldIdentity: `${client.project}|world-a|0|false`, view: { kind: "current" } })).rejects.toMatchObject({
       code: "WORKBENCH_EXITED",
     });
     expect(beforeSubmit).toHaveBeenCalledOnce();
@@ -54,7 +54,7 @@ describe("Workbench observer adapter", () => {
     });
     adapter.armOneShotBeforeSubmitDelivery(beforeSubmit);
 
-    await expect(adapter.submit({ view: { kind: "current" } })).rejects.toThrow(
+    await expect(adapter.submit({ expectedWorldIdentity: `${client.project}|world-a|0|false`, view: { kind: "current" } })).rejects.toThrow(
       "injected before-submit failure"
     );
     expect(beforeSubmit).toHaveBeenCalledOnce();
@@ -66,7 +66,7 @@ describe("Workbench observer adapter", () => {
   scopedIt("converges retained adapter state only after affirmative exact owner vacancy", async (root) => {
     const client = fakeClient(root);
     const adapter = new WorkbenchObserverAcceptanceAdapter(client, { createJobId: () => "confirmed-exit-job" });
-    await adapter.submit({ view: { kind: "current" } });
+    await adapter.submit({ expectedWorldIdentity: `${client.project}|world-a|0|false`, view: { kind: "current" } });
 
     expect(() => adapter.confirmExactOwnerExit("confirmed-exit-job", true)).toThrow(
       expect.objectContaining({ code: "INVALID_REQUEST" })
@@ -102,7 +102,7 @@ describe("Workbench observer adapter", () => {
   scopedIt("graceful restoreAll releases a completed gate-released handler job", async (root) => {
     const client = fakeClient(root, { completeOnStatus: true });
     const adapter = new WorkbenchObserverAdapter(client, { createJobId: () => "completed-shutdown-job" });
-    await adapter.submit({ view: { kind: "current" } });
+    await adapter.submit({ expectedWorldIdentity: `${client.project}|world-a|0|false`, view: { kind: "current" } });
     await adapter.status("completed-shutdown-job");
 
     await expect(adapter.restoreAll()).resolves.toBeUndefined();
@@ -116,7 +116,7 @@ describe("Workbench observer adapter", () => {
     const client = fakeClient(root, { cameraEditor: false });
     const adapter = new WorkbenchObserverAdapter(client);
 
-    await expect(adapter.submit({
+    await expect(adapter.submit({ expectedWorldIdentity: `${client.project}|world-a|0|false`,
       view: { kind: "pose", position: [1, 2, 3], orientation: [0, 0, 0, 1], fov: 60 },
     })).rejects.toMatchObject({ code: "CAPABILITY_UNAVAILABLE" });
     expect(client.acquireCaptureActivity).not.toHaveBeenCalled();
@@ -125,7 +125,7 @@ describe("Workbench observer adapter", () => {
   scopedIt("binds explicit camera jobs to generation and target and restores on lifecycle cancellation", async (root) => {
     const client = fakeClient(root, { cameraEditor: true });
     const adapter = new WorkbenchObserverAdapter(client, { createJobId: () => "pose-job" });
-    await adapter.submit({
+    await adapter.submit({ expectedWorldIdentity: `${client.project}|world-a|0|false`,
       view: { kind: "pose", position: [1, 2, 3], orientation: [0, 0, 0, 1], fov: 55 },
     });
 
@@ -163,7 +163,7 @@ describe("Workbench observer adapter", () => {
       createJobId: () => "relinquished-submit-job",
     });
 
-    await expect(adapter.submit({
+    await expect(adapter.submit({ expectedWorldIdentity: `${client.project}|world-a|0|false`,
       view: { kind: "pose", position: [1, 2, 3], orientation: [0, 0, 0, 1], fov: 55 },
     })).resolves.toMatchObject({
       state: "failed",
@@ -186,7 +186,7 @@ describe("Workbench observer adapter", () => {
     const adapter = new WorkbenchObserverAdapter(client, {
       createJobId: () => "missing-camera-lease-field-job",
     });
-    await adapter.submit({ view: { kind: "current" } });
+    await adapter.submit({ expectedWorldIdentity: `${client.project}|world-a|0|false`, view: { kind: "current" } });
 
     await expect(adapter.status("missing-camera-lease-field-job")).rejects.toMatchObject({
       code: "HANDLER_UNAVAILABLE",
@@ -217,7 +217,7 @@ describe("Workbench observer adapter", () => {
     const adapter = new WorkbenchObserverAdapter(client, {
       createJobId: () => "relinquished-pose-job",
     });
-    await adapter.submit({
+    await adapter.submit({ expectedWorldIdentity: `${client.project}|world-a|0|false`,
       view: { kind: "pose", position: [1, 2, 3], orientation: [0, 0, 0, 1], fov: 55 },
     });
 
@@ -240,7 +240,7 @@ describe("Workbench observer adapter", () => {
   scopedIt("rejects an old lifecycle generation and requests handler restoration", async (root) => {
     const client = fakeClient(root, { cameraEditor: true });
     const adapter = new WorkbenchObserverAdapter(client, { createJobId: () => "stale-job" });
-    await adapter.submit({ view: { kind: "current" } });
+    await adapter.submit({ expectedWorldIdentity: `${client.project}|world-a|0|false`, view: { kind: "current" } });
     client.failRevalidation = true;
 
     await expect(adapter.status("stale-job")).rejects.toMatchObject({ code: "STALE_LIFECYCLE" });
@@ -250,7 +250,7 @@ describe("Workbench observer adapter", () => {
   scopedIt("records exact process exit as terminal invalidation without claiming restoration", async (root) => {
     const client = fakeClient(root, { cameraEditor: true });
     const adapter = new WorkbenchObserverAdapter(client, { createJobId: () => "exit-job" });
-    await adapter.submit({ view: { kind: "current" } });
+    await adapter.submit({ expectedWorldIdentity: `${client.project}|world-a|0|false`, view: { kind: "current" } });
 
     client.controller?.abort({
       code: "WORKBENCH_EXITED",
@@ -297,7 +297,7 @@ describe("Workbench observer adapter", () => {
         readinessMessage: diagnostic,
       }),
     ]);
-    await expect(adapter.submit({ view: { kind: "current" } })).rejects.toMatchObject({
+    await expect(adapter.submit({ expectedWorldIdentity: `${client.project}|world-a|0|false`, view: { kind: "current" } })).rejects.toMatchObject({
       code: "CAPABILITY_UNAVAILABLE",
     });
     expect(client.acquireCaptureActivity).not.toHaveBeenCalled();
