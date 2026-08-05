@@ -7,6 +7,7 @@ import {
   type SupervisedChildExit,
   type SupervisedChildHandle,
 } from "../foundation/child-supervisor.js";
+import type { McpHostAdmissionGate } from "../mcp-host-admission.js";
 import {
   RecoverableSpawnPreSpawnCleanupError,
   runRecoverableSpawn,
@@ -86,6 +87,8 @@ export interface WorkbenchLifecycleExecutionDependencies {
     options: SpawnOptions
   ) => ChildProcess;
   failure?: WorkbenchLifecycleExecutionFailureFactory;
+  /** Shared process-wide admission gate; child/reconciliation work inherits it. */
+  admissionGate?: McpHostAdmissionGate;
 }
 
 export interface WorkbenchLifecycleSpawnRequest {
@@ -220,7 +223,9 @@ export class WorkbenchLifecycleExecution implements WorkbenchLifecycleExecutionP
     this.guard = dependencies.processGuard ??
       dependencies.processGuardFactory?.() ??
       new WorkbenchProcessGuard();
-    this.childSupervisor = dependencies.childSupervisor ?? new ChildSupervisor();
+    this.childSupervisor = dependencies.childSupervisor ?? new ChildSupervisor({
+      admissionGate: dependencies.admissionGate,
+    });
     this.spawnProcess = dependencies.spawnProcess ?? ((command, args, options) =>
       spawnChild(command, [...args], options));
     this.makeFailure = dependencies.failure ?? ((message, code) =>

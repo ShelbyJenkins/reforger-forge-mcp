@@ -70,6 +70,24 @@ export interface LmdbRecordUsage {
   byId: Map<string, { id: string; family: string; bytes: number }>;
 }
 
+export type LmdbExistingRecordResult<T> =
+  | { readonly kind: "missing" }
+  | { readonly kind: "available"; readonly value: T };
+
+export interface LmdbExistingRecord {
+  readonly family: string;
+  readonly id: string;
+  /** Null means the value was not stored as LMDB binary data. */
+  readonly bytes: Uint8Array | null;
+}
+
+export interface LmdbExistingRecordSnapshot {
+  readonly records: readonly LmdbExistingRecord[];
+  readonly usage: LmdbRecordUsage;
+  /** False when an undecodable or structurally unexpected namespace key was observed. */
+  readonly complete: boolean;
+}
+
 export interface LmdbRecordStoreOptions {
   /** Existing private directory; the env opens at storageRoot/databaseDirectory. */
   readonly storageRoot: string;
@@ -199,6 +217,43 @@ function openEnvironmentDirectory(storageRoot: string, databaseDirectory: string
   return canonicalEnvironment;
 }
 
+function existingEnvironmentDirectory(
+  storageRoot: string,
+  databaseDirectory: string,
+): LmdbExistingRecordResult<string> {
+  const root = resolve(storageRoot);
+  try {
+    lstatSync(root);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { kind: "missing" };
+    throw new LmdbRecordStoreError("INVALID_ROOT", `Could not inspect LMDB storage root: ${root}`, { cause: error });
+  }
+  const canonicalRoot = assertExistingPrivateDirectory(root, "LMDB storage root");
+  const candidate = resolveManagedPath(root, join(root, databaseDirectory), "no-links");
+  try {
+    lstatSync(candidate);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { kind: "missing" };
+    throw new LmdbRecordStoreError("INVALID_ROOT", `Could not inspect LMDB environment: ${candidate}`, { cause: error });
+  }
+  const canonicalEnvironment = assertExistingPrivateDirectory(candidate, "LMDB environment");
+  if (!isPathContained(canonicalRoot, canonicalEnvironment)) {
+    throw new LmdbRecordStoreError("INVALID_ROOT", "LMDB environment escapes the configured storage root.");
+  }
+  const dataPath = join(canonicalEnvironment, "data.mdb");
+  try {
+    const data = lstatSync(dataPath);
+    if (data.isSymbolicLink() || !data.isFile()) {
+      throw new LmdbRecordStoreError("INVALID_ROOT", `LMDB data file must be a non-linked regular file: ${dataPath}`);
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { kind: "missing" };
+    if (error instanceof LmdbRecordStoreError) throw error;
+    throw new LmdbRecordStoreError("INVALID_ROOT", `Could not inspect LMDB data file: ${dataPath}`, { cause: error });
+  }
+  return { kind: "available", value: canonicalEnvironment };
+}
+
 function recordKey(keyPrefix: readonly string[], family: string, id: string): Uint8Array {
   let key: string;
   try {
@@ -260,6 +315,22 @@ export class LmdbRecordStore {
     return value === undefined ? null : new Uint8Array(value);
   }
 
+  async hasExisting(family: string, id: string): Promise<LmdbExistingRecordResult<boolean>> {
+    const key = recordKey(this.keyPrefix, family, id);
+    return this.withExistingDatabase((database) => database.doesExist(key));
+  }
+
+  async getRawExisting(
+    family: string,
+    id: string,
+  ): Promise<LmdbExistingRecordResult<Uint8Array | null>> {
+    const key = recordKey(this.keyPrefix, family, id);
+    return this.withExistingDatabase((database) => {
+      const value = database.getBinary(key);
+      return value === undefined ? null : new Uint8Array(value);
+    });
+  }
+
   /**
    * Store bytes verbatim under (family, id). With `exclusive`, the create is
    * atomic: throw `RECORD_EXISTS` if the key already exists, else write —
@@ -312,6 +383,11 @@ export class LmdbRecordStore {
     return ids.sort();
   }
 
+  async listIdsExisting(family: string): Promise<LmdbExistingRecordResult<string[]>> {
+    const prefix = [...this.keyPrefix, family];
+    return this.withExistingDatabase((database) => this.listIdsFrom(database, prefix));
+  }
+
   /**
    * Σ records/bytes across the requested families, plus a per-record map keyed
    * by the encoded key. Corrupt values still count (parity with a corrupt file
@@ -341,6 +417,58 @@ export class LmdbRecordStore {
       byId.set(Buffer.from(entry.key).toString("utf8"), { id, family, bytes: valueBytes });
     }
     return { records, bytes, byId };
+  }
+
+  async usageExisting(
+    families: readonly string[],
+  ): Promise<LmdbExistingRecordResult<LmdbRecordUsage>> {
+    return this.withExistingDatabase((database) => this.usageFrom(database, families));
+  }
+
+  /**
+   * One existing-only read snapshot for a bounded set of record families.
+   * This is the idle-readiness inventory primitive: it never opens the writer
+   * accessor and reports malformed/non-binary entries instead of mutating or
+   * quarantining them.
+   */
+  async snapshotExisting(
+    families: readonly string[],
+  ): Promise<LmdbExistingRecordResult<LmdbExistingRecordSnapshot>> {
+    const wanted = new Set(families);
+    return this.withExistingDatabase((database) => {
+      const range = this.namespaceRange(this.keyPrefix);
+      const records: LmdbExistingRecord[] = [];
+      const byId = new Map<string, { id: string; family: string; bytes: number }>();
+      let bytes = 0;
+      let complete = true;
+      for (const entry of database.getRange({ start: range.start, end: range.end, snapshot: true })) {
+        const segments = decodeMatchingKey(entry.key, this.keyPrefix);
+        if (segments === null || segments.length !== this.keyPrefix.length + 2) {
+          complete = false;
+          continue;
+        }
+        const family = segments[this.keyPrefix.length];
+        if (!wanted.has(family)) continue;
+        if (records.length >= this.maxScanRecords) {
+          throw new LmdbRecordStoreError(
+            "SCAN_LIMIT_EXCEEDED",
+            `LMDB snapshot exceeded its ${this.maxScanRecords}-record bound.`,
+          );
+        }
+        const id = segments[this.keyPrefix.length + 1];
+        const raw = entry.value instanceof Uint8Array ? new Uint8Array(entry.value) : null;
+        const valueBytes = raw?.byteLength ?? 0;
+        bytes += valueBytes;
+        records.push({ family, id, bytes: raw });
+        byId.set(Buffer.from(entry.key).toString("utf8"), { id, family, bytes: valueBytes });
+      }
+      records.sort((left, right) => left.family.localeCompare(right.family) || left.id.localeCompare(right.id));
+      return {
+        records,
+        usage: { records: records.length, bytes, byId },
+        complete,
+      };
+    });
   }
 
   async close(): Promise<void> {
@@ -379,11 +507,45 @@ export class LmdbRecordStore {
     return this.database;
   }
 
+  private async withExistingDatabase<T>(
+    action: (database: LmdbBinaryDatabase) => T,
+  ): Promise<LmdbExistingRecordResult<T>> {
+    if (this.closed) throw new LmdbRecordStoreError("CLOSED", "LMDB record store is closed.");
+    if (this.database) return { kind: "available", value: action(this.database) };
+    const environment = existingEnvironmentDirectory(this.storageRoot, this.databaseDirectory);
+    if (environment.kind === "missing") return environment;
+    let database: LmdbBinaryDatabase;
+    try {
+      database = open<unknown, Uint8Array>(environment.value, {
+        encoding: "binary",
+        keyEncoding: "binary",
+        maxDbs: 1,
+        readOnly: true,
+      }) as unknown as LmdbBinaryDatabase;
+    } catch (error) {
+      throw new LmdbRecordStoreError(
+        "INVALID_ROOT",
+        `Could not open existing LMDB environment: ${environment.value}`,
+        { cause: error },
+      );
+    }
+    try {
+      return { kind: "available", value: action(database) };
+    } finally {
+      await database.close();
+    }
+  }
+
   private namespaceScan(prefix: readonly string[]): {
     database: LmdbBinaryDatabase;
     start: Uint8Array;
     end: Uint8Array;
   } {
+    const range = this.namespaceRange(prefix);
+    return { database: this.db(), ...range };
+  }
+
+  private namespaceRange(prefix: readonly string[]): { start: Uint8Array; end: Uint8Array } {
     let encoded: string;
     try {
       encoded = encodeDurableKey(...prefix);
@@ -395,6 +557,49 @@ export class LmdbRecordStore {
       );
     }
     const start = Buffer.from(encoded, "utf8");
-    return { database: this.db(), start, end: namespaceUpperBound(start) };
+    return { start, end: namespaceUpperBound(start) };
+  }
+
+  private listIdsFrom(database: LmdbBinaryDatabase, prefix: readonly string[]): string[] {
+    const range = this.namespaceRange(prefix);
+    const ids: string[] = [];
+    for (const entry of database.getRange({ start: range.start, end: range.end, snapshot: true })) {
+      const segments = decodeMatchingKey(entry.key, prefix);
+      if (segments === null) continue;
+      if (ids.length >= this.maxScanRecords) {
+        throw new LmdbRecordStoreError(
+          "SCAN_LIMIT_EXCEEDED",
+          `LMDB family scan exceeded its ${this.maxScanRecords}-record bound.`,
+        );
+      }
+      ids.push(segments[prefix.length]);
+    }
+    return ids.sort();
+  }
+
+  private usageFrom(database: LmdbBinaryDatabase, families: readonly string[]): LmdbRecordUsage {
+    const wanted = new Set(families);
+    const range = this.namespaceRange(this.keyPrefix);
+    let records = 0;
+    let bytes = 0;
+    const byId = new Map<string, { id: string; family: string; bytes: number }>();
+    for (const entry of database.getRange({ start: range.start, end: range.end, snapshot: true })) {
+      const segments = decodeMatchingKey(entry.key, this.keyPrefix);
+      if (segments === null || segments.length !== this.keyPrefix.length + 2) continue;
+      const family = segments[this.keyPrefix.length];
+      if (!wanted.has(family)) continue;
+      if (records >= this.maxScanRecords) {
+        throw new LmdbRecordStoreError(
+          "SCAN_LIMIT_EXCEEDED",
+          `LMDB usage scan exceeded its ${this.maxScanRecords}-record bound.`,
+        );
+      }
+      const id = segments[this.keyPrefix.length + 1];
+      const valueBytes = entry.value instanceof Uint8Array ? entry.value.byteLength : 0;
+      records += 1;
+      bytes += valueBytes;
+      byId.set(Buffer.from(entry.key).toString("utf8"), { id, family, bytes: valueBytes });
+    }
+    return { records, bytes, byId };
   }
 }

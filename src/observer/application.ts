@@ -9,6 +9,7 @@ import {
   validateMcpHostIdentity,
   type McpHostIdentity,
 } from "../mcp-host-identity.js";
+import type { McpHostAdmissionGate } from "../mcp-host-admission.js";
 import type { WorkbenchObserverAdapter } from "../workbench/observer-adapter.js";
 import { ObserverAgentClient, type ObserverAgentClientOptions, type ObserverChildDescriptor } from "./agent-client.js";
 import type { CaptureInput, CaptureResult } from "./capture-contract.js";
@@ -73,6 +74,8 @@ export type ObserverApplicationLifecycleState =
 export interface CreateObserverApplicationOptions {
   /** Trusted identity shared with the Workbench lifecycle in MCP composition. */
   hostIdentity?: McpHostIdentity;
+  /** Shared process-wide host admission gate. */
+  admissionGate?: McpHostAdmissionGate;
   debug?: boolean;
   agentPath?: string;
   managedRoot?: string;
@@ -253,6 +256,7 @@ class DefaultObserverApplication implements ObserverApplication {
       requestTimeoutMs: options.requestTimeoutMs,
       requestDeadlineAtMs: options.requestDeadlineAtMs,
       forkChild: options.forkChild,
+      admissionGate: options.admissionGate,
     });
     this.diagnostics = new ObserverHostDiagnostics(this.agentClient, managedRoot, profileRoot, sourceAddon, this.requestTimeoutMs);
     this.workbenchAdapter = options.workbenchAdapter;
@@ -280,6 +284,7 @@ class DefaultObserverApplication implements ObserverApplication {
         minimumLossyQuality: minimumLossyImageQuality,
         maximumLossyQuality: maximumLossyImageQuality,
       },
+      admissionGate: options.admissionGate,
     });
     this.captureService = captureService;
     if (options.gamePath) {
@@ -290,6 +295,7 @@ class DefaultObserverApplication implements ObserverApplication {
         ...(hostIdentity === undefined
           ? {}
           : { managerInstanceId: hostIdentity.instanceId }),
+        admissionGate: options.admissionGate,
       });
     }
   }

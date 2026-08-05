@@ -1,7 +1,9 @@
 import { EventEmitter } from "node:events";
+import { performance } from "node:perf_hooks";
 import type { ChildProcess } from "node:child_process";
 import { describe, expect, it, vi } from "vitest";
 import { ChildSupervisor } from "../../src/foundation/child-supervisor.js";
+import { McpHostAdmissionGate } from "../../src/mcp-host-admission.js";
 
 function child(
   exitCode: number | null = null,
@@ -20,6 +22,27 @@ function child(
 }
 
 describe("ChildSupervisor terminal reconciliation", () => {
+  it("transfers one shared admission from child lifetime through exit reconciliation", async () => {
+    const gate = new McpHostAdmissionGate();
+    const supervisor = new ChildSupervisor({ admissionGate: gate });
+    const process = child(null, null, 100);
+    let finish!: () => void;
+    const reconciliation = new Promise<void>((resolve) => { finish = resolve; });
+    supervisor.supervise("owned-child", process, { onExit: () => reconciliation });
+    expect(gate.snapshot().activeTokens).toBe(1);
+    process.emit("exit", 0, null);
+    expect(supervisor.counts()).toEqual({ active: 0, reconciling: 1, total: 1 });
+    expect(gate.snapshot().activeTokens).toBe(1);
+    await expect(supervisor.inspectIdleShutdownReadiness({
+      deadlineTick: performance.now() + 1_000,
+      signal: new AbortController().signal,
+      probeGeneration: 1,
+    })).resolves.toMatchObject({ blockers: ["WORKBENCH_RECOVERY"] });
+    finish();
+    await vi.waitFor(() => expect(supervisor.reconciliationSize).toBe(0));
+    expect(gate.snapshot().activeTokens).toBe(0);
+  });
+
   it("returns an exit handle that remains observable by late listeners", async () => {
     const supervisor = new ChildSupervisor();
     const process = child(null, null, 101);
@@ -40,17 +63,25 @@ describe("ChildSupervisor terminal reconciliation", () => {
   });
 
   it("drains an error-only child that never received a PID or exit event", async () => {
-    const supervisor = new ChildSupervisor();
+    const gate = new McpHostAdmissionGate();
+    const supervisor = new ChildSupervisor({ admissionGate: gate });
     const process = child();
-    const handle = supervisor.supervise("failed-spawn", process);
+    let finishReconciliation!: () => void;
+    const reconciliation = new Promise<void>((resolve) => { finishReconciliation = resolve; });
+    const handle = supervisor.supervise("failed-spawn", process, {
+      onError: () => reconciliation,
+    });
     const failure = new Error("spawn ENOENT");
 
     process.emit("error", failure);
 
     await expect(handle.terminal).resolves.toEqual({ kind: "error", error: failure });
     expect(supervisor.counts()).toEqual({ active: 0, reconciling: 0, total: 0 });
+    expect(gate.snapshot().activeTokens).toBe(1);
     expect(process.listenerCount("error")).toBe(0);
     expect(process.listenerCount("exit")).toBe(0);
+    finishReconciliation();
+    await vi.waitFor(() => expect(gate.snapshot().activeTokens).toBe(0));
     process.emit("close", -2, null);
     expect(supervisor.counts().total).toBe(0);
   });

@@ -1,5 +1,6 @@
 import { EventEmitter } from "node:events";
 import type { ChildProcess } from "node:child_process";
+import { performance } from "node:perf_hooks";
 import { describe, expect, it, vi } from "vitest";
 import { ChildSupervisor } from "../../src/foundation/child-supervisor.js";
 import { WorkbenchClient } from "../../src/workbench/client.js";
@@ -7,6 +8,7 @@ import { WorkbenchLifecycleExecution } from "../../src/workbench/lifecycle-execu
 import {
   WorkbenchSessionController,
 } from "../../src/workbench/session-controller.js";
+import type { WorkbenchProcessGuard } from "../../src/workbench/process-guard.js";
 import {
   WorkbenchNetApiError,
   type WorkbenchNetApiCallOptions,
@@ -36,6 +38,64 @@ class StubNetApi implements WorkbenchNetApiPort {
 }
 
 describe("WorkbenchSessionController public contract", () => {
+  it("projects exact current/foreign/legacy Workbench ownership without mutation", async () => {
+    const current = "11111111-1111-4111-8111-111111111111";
+    const foreign = "22222222-2222-4222-8222-222222222222";
+    const workbench = {
+      pid: 44,
+      executablePath: "C:\\Workbench.exe",
+      creationTime: "444",
+      ownerTokenArgument: "-reforgerForgeOwnerToken=fixture",
+      launchedAtMs: 1,
+    };
+    let owner = current;
+    let legacyJournal = false;
+    const inspectOwnedWorkbench = vi.fn(async () => "live" as const);
+    const guard = {
+      mcpInstanceId: current,
+      readLifecycleStateExistingOnly: async () => ({
+        kind: "valid" as const,
+        state: {
+          phase: "running",
+          mcpOwner: { instanceId: owner },
+          workbench,
+          operation: null,
+        },
+      }),
+      readSpawnJournalExistingOnly: async () => legacyJournal
+        ? ({
+            kind: "valid" as const,
+            generation: "journal",
+            record: {
+              phase: "pre_spawn",
+              metadata: {},
+            },
+          })
+        : ({ kind: "missing" as const }),
+      inspectOwnedWorkbench,
+    } as unknown as WorkbenchProcessGuard;
+    const controller = new WorkbenchSessionController(
+      "127.0.0.1",
+      5775,
+      undefined,
+      "idle-readiness",
+      guard,
+      { netApi: new StubNetApi({}) },
+    );
+    const inspect = () => controller.inspectIdleShutdownReadiness({
+      deadlineTick: performance.now() + 1_000,
+      signal: new AbortController().signal,
+      probeGeneration: 1,
+    });
+
+    await expect(inspect()).resolves.toMatchObject({ blockers: ["WORKBENCH_OWNERSHIP"] });
+    owner = foreign;
+    await expect(inspect()).resolves.toMatchObject({ complete: true, blockers: [] });
+    expect(inspectOwnedWorkbench).toHaveBeenCalledTimes(1);
+    legacyJournal = true;
+    await expect(inspect()).resolves.toMatchObject({ blockers: ["WORKBENCH_RECOVERY"] });
+  });
+
   it("keeps WorkbenchClient as the stable compatibility constructor", () => {
     expect(WorkbenchClient).toBe(WorkbenchSessionController);
   });

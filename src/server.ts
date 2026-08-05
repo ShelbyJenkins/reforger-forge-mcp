@@ -73,6 +73,15 @@ import {
   validateMcpHostIdentity,
   type McpHostIdentity,
 } from "./mcp-host-identity.js";
+import {
+  McpHostAdmissionGate,
+  type McpIdleSealProof,
+} from "./mcp-host-admission.js";
+import {
+  McpIdleReadinessInspector,
+  type IdleShutdownInspectionOptions,
+  type IdleShutdownReadiness,
+} from "./mcp-idle-readiness.js";
 
 /**
  * Explicit application shutdown contract returned by {@link registerTools}.
@@ -85,6 +94,10 @@ export interface RegisteredToolsDisposer {
   emergencyTerminate(): void;
   /** Starts idempotent local handle cleanup before the CLI exits. */
   emergencyCleanup(): void;
+  /** Bounded, read-only proof; it never quiesces, repairs, or closes anything. */
+  inspectIdleShutdownReadiness(options: IdleShutdownInspectionOptions): Promise<IdleShutdownReadiness>;
+  /** Commit 14 test seam; production does not seal admissions until Commit 15. */
+  trySealIdleAdmissions(proof: McpIdleSealProof | null | undefined): boolean;
 }
 
 export interface RegisterToolsOptions {
@@ -101,6 +114,7 @@ export interface RegisterToolsOptions {
  */
 export interface WorkbenchServerComposition {
   readonly hostIdentity: McpHostIdentity;
+  readonly admissionGate: McpHostAdmissionGate;
   readonly processGuard: WorkbenchProcessGuard;
   readonly netApi: WorkbenchNetApiClient;
   readonly activityGate: WorkbenchActivityGate;
@@ -120,7 +134,8 @@ function fallbackHostIdentity(): McpHostIdentity {
 
 export function createWorkbenchServerComposition(
   config: Config,
-  hostIdentity: McpHostIdentity = fallbackHostIdentity()
+  hostIdentity: McpHostIdentity = fallbackHostIdentity(),
+  admissionGate: McpHostAdmissionGate = new McpHostAdmissionGate(),
 ): WorkbenchServerComposition {
   const trustedHostIdentity = validateMcpHostIdentity(hostIdentity);
   const observerConfig = config.observer;
@@ -128,14 +143,15 @@ export function createWorkbenchServerComposition(
     mcpInstanceId: trustedHostIdentity.instanceId,
   });
   const netApi = new WorkbenchNetApiClient(config.workbenchHost, config.workbenchPort);
-  const activityGate = new WorkbenchActivityGate();
-  const childSupervisor = new ChildSupervisor();
+  const activityGate = new WorkbenchActivityGate({ admissionGate });
+  const childSupervisor = new ChildSupervisor({ admissionGate });
   const companionProvider = new WorkbenchHelperStager({
     managedRoot: observerConfig?.managedRoot ?? defaultWorkbenchHelperManagedRoot(),
   });
   const lifecycleExecution = WorkbenchSessionController.composeLifecycleExecution({
     processGuard,
     childSupervisor,
+    admissionGate,
   });
   const diagnostics = diagnoseWorkbench;
   const client = new WorkbenchSessionController(
@@ -152,11 +168,13 @@ export function createWorkbenchServerComposition(
       lifecycleExecution,
       diagnostics,
       hostIdentity: trustedHostIdentity,
+      admissionGate,
     }
   );
 
   return Object.freeze({
     hostIdentity: trustedHostIdentity,
+    admissionGate,
     processGuard,
     netApi,
     activityGate,
@@ -179,7 +197,8 @@ export function registerTools(
   const searchEngine = options.searchEngine ?? new SearchEngine(config.dataDir);
   const patterns = new PatternLibrary(config.patternsDir);
   const observerConfig = config.observer;
-  const workbenchComposition = createWorkbenchServerComposition(config, hostIdentity);
+  const admissionGate = new McpHostAdmissionGate();
+  const workbenchComposition = createWorkbenchServerComposition(config, hostIdentity, admissionGate);
   const wbClient = workbenchComposition.client;
 
   // Phase 0 tools
@@ -226,6 +245,7 @@ export function registerTools(
     supportingLogRoots: observerConfig?.supportingLogRoots,
     workbenchAdapter: workbenchObserver,
     hostIdentity,
+    admissionGate,
   });
   const ownedRuntimeManager = observerApplication.ownedRuntimeManager!;
   registerObserverTools(server, observerApplication, {
@@ -270,9 +290,24 @@ export function registerTools(
     activeObserverShutdown = tracked;
     return tracked;
   };
+  const idleReadiness = new McpIdleReadinessInspector({
+    admissionGate,
+    providers: [
+      workbenchComposition.activityGate,
+      workbenchComposition.childSupervisor,
+      workbenchComposition.client,
+      observerApplication.agentClient,
+      observerApplication.captureService,
+      ...(observerApplication.ownedRuntimeManager ? [observerApplication.ownedRuntimeManager] : []),
+    ],
+  });
   const disposeObserverLifecycle = Object.assign(disposeObserverAttempt, {
     emergencyTerminate: (): void => observerApplication.emergencyTerminatePrivateChildren(),
     emergencyCleanup: (): void => { void closeProcessGuard().catch(() => undefined); },
+    inspectIdleShutdownReadiness: (inspectionOptions: IdleShutdownInspectionOptions) =>
+      idleReadiness.inspectIdleShutdownReadiness(inspectionOptions),
+    trySealIdleAdmissions: (proof: McpIdleSealProof | null | undefined): boolean =>
+      admissionGate.trySealIdleAdmissions(proof),
   }) satisfies RegisteredToolsDisposer;
   registerWbLaunch(server, wbClient);
   registerWbBuild(server, config, wbClient, {

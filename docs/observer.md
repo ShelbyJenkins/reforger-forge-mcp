@@ -338,6 +338,16 @@ or identity issues first.
 For Workbench, restore or cancel all captures before ending live automation,
 then follow the normal owner-scoped editor shutdown process.
 
+The MCP host also maintains an internal, host-scoped idle-readiness projection.
+It checks the exact host UUID against Workbench journals, private-child and
+capture activity, and the complete owned-runtime record inventory. That check
+is bounded, read-only, and existing-only: it does not create missing state,
+start the observer child, sweep or repair evidence, revoke a session, or stop a
+Workbench/game process. Unknown, legacy-unattributed, malformed, timed-out, or
+racing evidence fails closed. In this foundation release the admission fence
+remains open and no idle timer, transport close, signal, or automatic process
+exit is enabled; automatic shutdown is a separate lifecycle feature.
+
 ## Common operator problems
 
 | Symptom | What to do |

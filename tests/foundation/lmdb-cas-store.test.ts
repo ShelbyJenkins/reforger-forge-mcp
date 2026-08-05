@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { asBinary, open } from "lmdb";
 import { describe, expect, it } from "vitest";
@@ -47,6 +47,31 @@ function writeRawBytes(root: string, bytes: Uint8Array, version = 1): Promise<vo
 }
 
 describe("LmdbCasStore", () => {
+  it("keeps missing LMDB and corrupt-archive paths absent during existing-only inspection", async () => {
+    await withTemporaryDirectory(async (root) => {
+      const stateRoot = join(root, "state");
+      const store = createStore(stateRoot);
+      await expect(store.inspectExisting()).resolves.toEqual({ kind: "missing" });
+      expect(existsSync(stateRoot)).toBe(false);
+      expect(existsSync(join(stateRoot, "corrupt"))).toBe(false);
+      await store.close();
+    }, { prefix: "rfo-lmdb-cas-existing-" });
+  });
+
+  it("reports existing corruption without materializing an archive directory", async () => {
+    await withTemporaryDirectory(async (root) => {
+      const writer = createStore(root);
+      await writer.compareAndSwap(null, { generation: "g1", state: "valid" });
+      await writer.close();
+      await writeRawBytes(root, Buffer.from("not-json"));
+      const reader = createStore(root);
+      const result = await reader.inspectExisting();
+      expect(result).toMatchObject({ kind: "available", value: { kind: "corrupt" } });
+      expect(existsSync(join(root, "corrupt"))).toBe(false);
+      await reader.close();
+    }, { prefix: "rfo-lmdb-cas-corrupt-readonly-" });
+  });
+
   it("reports missing state and inspects a fresh write", async () => {
     await withTemporaryDirectory(async (root) => {
       const store = createStore(root);

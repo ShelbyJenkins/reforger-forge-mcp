@@ -1,6 +1,13 @@
 import { fork, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { performance } from "node:perf_hooks";
 import { redactText } from "#foundation/redact";
+import type { McpHostAdmissionGate } from "../mcp-host-admission.js";
+import type {
+  IdleShutdownInspectionOptions,
+  McpIdleProviderReadiness,
+  McpIdleReadinessProvider,
+} from "../mcp-idle-readiness.js";
 import { logger } from "../utils/logger.js";
 import { canonicalPublicObserverErrorCode } from "./public-contract.js";
 import { ObserverApplicationError } from "./errors.js";
@@ -34,6 +41,7 @@ export interface ObserverAgentClientOptions {
   /** Optional absolute cap shared by startup and every ordinary request. */
   requestDeadlineAtMs?: () => number | undefined;
   forkChild?: typeof fork;
+  admissionGate?: McpHostAdmissionGate;
 }
 
 interface PendingRequest {
@@ -63,12 +71,13 @@ function abortError(): ObserverApplicationError {
 }
 
 /** Fork/request lifecycle only. No observer domain policy belongs here. */
-export class ObserverAgentClient {
+export class ObserverAgentClient implements McpIdleReadinessProvider {
   private readonly startupTimeoutMs: number;
   private readonly requestTimeoutMs: number;
   private readonly requestDeadlineAtMs: (() => number | undefined) | undefined;
   private readonly spawnChild: typeof fork;
   private readonly argumentsArray: string[];
+  private readonly admissionGate: McpHostAdmissionGate | undefined;
   private readonly liveChildren = new Set<ChildProcess>();
   private readonly pending = new Map<string, PendingRequest>();
   private child: ChildProcess | null = null;
@@ -79,6 +88,7 @@ export class ObserverAgentClient {
   private closing = false;
   private emergencyTerminated = false;
   private closePromise: Promise<void> | null = null;
+  private idleRevision = 0;
 
   constructor(private readonly options: ObserverAgentClientOptions) {
     this.startupTimeoutMs = bounded(options.startupTimeoutMs, 10_000, 1_000, 60_000, "Observer startup timeout");
@@ -86,6 +96,7 @@ export class ObserverAgentClient {
     this.requestDeadlineAtMs = options.requestDeadlineAtMs;
     this.spawnChild = options.forkChild ?? fork;
     this.argumentsArray = [...(options.arguments ?? [])];
+    this.admissionGate = options.admissionGate;
   }
 
   diagnosticPrivateChildCount(): number { return this.liveChildren.size; }
@@ -95,6 +106,14 @@ export class ObserverAgentClient {
   get state(): "closed" | "closing" | "starting" | "ready" | "idle" { return this.closed ? "closed" : this.closing ? "closing" : this.startPromise ? "starting" : this.descriptor ? "ready" : "idle"; }
 
   async ensureStarted(deadlineAtMs?: number): Promise<ObserverChildDescriptor> {
+    if (this.admissionGate) {
+      return this.admissionGate.run("observer private child startup", () =>
+        this.ensureStartedInternal(deadlineAtMs));
+    }
+    return this.ensureStartedInternal(deadlineAtMs);
+  }
+
+  private async ensureStartedInternal(deadlineAtMs?: number): Promise<ObserverChildDescriptor> {
     if (this.closed || this.closing) throw new ObserverApplicationError("TRANSPORT_UNAVAILABLE", "Observer agent is shutting down");
     const hardDeadline = this.hardDeadline();
     const deadline = deadlineAtMs === undefined
@@ -115,6 +134,7 @@ export class ObserverAgentClient {
       env: { ...process.env },
       serialization: "advanced",
     });
+    this.bumpIdleRevision();
     this.liveChildren.add(child);
     this.child = child;
     this.descriptor = null;
@@ -136,6 +156,7 @@ export class ObserverAgentClient {
           const descriptor = this.parseDescriptor(message.descriptor);
           clearTimeout(timer);
           child.off("message", ready);
+          this.bumpIdleRevision();
           this.descriptor = descriptor;
           this.rejectStartup = null;
           resolve(descriptor);
@@ -157,6 +178,18 @@ export class ObserverAgentClient {
     payload: Record<string, unknown> = {},
     options: ObserverAgentClientRequestOptions = {}
   ): Promise<unknown> {
+    if (this.admissionGate) {
+      return this.admissionGate.run("observer ready-child request", () =>
+        this.requestIfReadyInternal(operation, payload, options));
+    }
+    return this.requestIfReadyInternal(operation, payload, options);
+  }
+
+  private async requestIfReadyInternal(
+    operation: string,
+    payload: Record<string, unknown>,
+    options: ObserverAgentClientRequestOptions,
+  ): Promise<unknown> {
     if (this.closed || this.closing) throw new ObserverApplicationError("TRANSPORT_UNAVAILABLE", "Observer agent is unavailable");
     const child = this.child;
     if (!child?.connected || !this.descriptor) throw new ObserverApplicationError("TRANSPORT_UNAVAILABLE", "Private observer agent is not ready");
@@ -171,17 +204,37 @@ export class ObserverAgentClient {
     payload: Record<string, unknown> = {},
     options: ObserverAgentClientRequestOptions = {}
   ): Promise<unknown> {
+    if (this.admissionGate && !options.allowClosing) {
+      return this.admissionGate.run("observer private child request", () =>
+        this.requestInternal(operation, payload, options));
+    }
+    return this.requestInternal(operation, payload, options);
+  }
+
+  private async requestInternal(
+    operation: string,
+    payload: Record<string, unknown>,
+    options: ObserverAgentClientRequestOptions,
+  ): Promise<unknown> {
     if (!options.allowClosing && (this.closed || this.closing)) throw new ObserverApplicationError("TRANSPORT_UNAVAILABLE", "Observer agent is unavailable");
     const deadlineAtMs = this.requestDeadline(options);
-    if (!options.allowClosing) await this.ensureStarted(deadlineAtMs);
+    if (!options.allowClosing) await this.ensureStartedInternal(deadlineAtMs);
     const child = this.child;
     if (!child?.connected) throw new ObserverApplicationError("TRANSPORT_UNAVAILABLE", "Private observer agent is unavailable");
     return this.sendRequest(child, operation, payload, { ...options, deadlineAtMs });
   }
 
   async close(): Promise<void> {
+    if (this.admissionGate) {
+      return this.admissionGate.runPrivilegedCleanup(() => this.closeInternal());
+    }
+    return this.closeInternal();
+  }
+
+  private async closeInternal(): Promise<void> {
     if (this.closed) return;
     if (this.closePromise) return this.closePromise;
+    this.bumpIdleRevision();
     this.closing = true;
     this.closePromise = (async () => {
       const child = this.child;
@@ -203,11 +256,16 @@ export class ObserverAgentClient {
           child.once("exit", exited);
         });
       } finally {
+        this.bumpIdleRevision();
         this.child = null;
         this.descriptor = null;
         this.rejectAll(new ObserverApplicationError("TRANSPORT_UNAVAILABLE", "Observer agent stopped"));
       }
-    })().finally(() => { this.closed = true; this.closing = false; });
+    })().finally(() => {
+      this.bumpIdleRevision();
+      this.closed = true;
+      this.closing = false;
+    });
     return this.closePromise;
   }
 
@@ -218,6 +276,7 @@ export class ObserverAgentClient {
    */
   emergencyTerminatePrivateChildren(): void {
     if (this.emergencyTerminated) return;
+    this.bumpIdleRevision();
     this.emergencyTerminated = true;
     this.closing = true;
     const error = new ObserverApplicationError(
@@ -252,6 +311,7 @@ export class ObserverAgentClient {
     });
     child.on("message", (message: unknown) => this.onMessage(message));
     child.once("error", (error) => {
+      this.bumpIdleRevision();
       if (child.pid === undefined) this.liveChildren.delete(child);
       if (this.child !== child) return;
       this.rejectStartup?.(new ObserverApplicationError("TRANSPORT_UNAVAILABLE", redactText(`Private observer agent failed: ${error.message}`, { profile: "diagnostic", maxLength: 1_024 })));
@@ -260,6 +320,7 @@ export class ObserverAgentClient {
       child.kill();
     });
     child.once("exit", (code, signal) => {
+      this.bumpIdleRevision();
       this.liveChildren.delete(child);
       if (this.child !== child) return;
       if (stderrBuffer.trim()) logger.warn(`observer child: ${redactChildLine(stderrBuffer.trim())}`);
@@ -288,6 +349,7 @@ export class ObserverAgentClient {
     if (message.type !== "response" || typeof message.requestId !== "string") return;
     const pending = this.pending.get(message.requestId);
     if (!pending) return;
+    this.bumpIdleRevision();
     this.pending.delete(message.requestId);
     clearTimeout(pending.timer);
     if (pending.abort && pending.signal) pending.signal.removeEventListener("abort", pending.abort);
@@ -312,6 +374,7 @@ export class ObserverAgentClient {
       const finish = (error?: Error, result?: unknown): void => {
         const pending = this.pending.get(requestId);
         if (!pending) return;
+        this.bumpIdleRevision();
         this.pending.delete(requestId);
         clearTimeout(pending.timer);
         if (pending.abort && pending.signal) pending.signal.removeEventListener("abort", pending.abort);
@@ -321,6 +384,7 @@ export class ObserverAgentClient {
       timer.unref();
       abort = () => finish(abortError());
       const pending: PendingRequest = { resolve, reject, timer, abort, signal: options.signal };
+      this.bumpIdleRevision();
       this.pending.set(requestId, pending);
       if (options.signal) {
         if (options.signal.aborted) return finish(abortError());
@@ -390,8 +454,34 @@ export class ObserverAgentClient {
       clearTimeout(pending.timer);
       if (pending.abort && pending.signal) pending.signal.removeEventListener("abort", pending.abort);
       pending.reject(error);
+      this.bumpIdleRevision();
       this.pending.delete(requestId);
     }
+  }
+
+  currentIdleRevision(): number {
+    return this.idleRevision;
+  }
+
+  async inspectIdleShutdownReadiness(
+    options: IdleShutdownInspectionOptions,
+  ): Promise<McpIdleProviderReadiness> {
+    const currentIsSoleReady = this.liveChildren.size === 1 &&
+      this.child !== null && this.liveChildren.has(this.child) &&
+      this.child.connected && this.descriptor !== null && !this.startPromise && !this.closing;
+    const childBlocks = this.startPromise !== null || this.closing || this.pending.size > 0 ||
+      (this.liveChildren.size > 0 && !currentIsSoleReady);
+    const expired = options.signal.aborted || performance.now() > options.deadlineTick;
+    return {
+      complete: !expired,
+      blockers: childBlocks ? ["OBSERVER_CHILD"] : [],
+      revision: this.idleRevision,
+    };
+  }
+
+  private bumpIdleRevision(): void {
+    if (this.idleRevision === Number.MAX_SAFE_INTEGER) throw new Error("Observer agent idle revision exhausted");
+    this.idleRevision += 1;
   }
 }
 

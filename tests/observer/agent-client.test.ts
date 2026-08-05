@@ -1,6 +1,7 @@
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import type { ChildProcess, fork } from "node:child_process";
+import { performance } from "node:perf_hooks";
 import { describe, expect, it } from "vitest";
 import { ObserverAgentClient, redactChildLine } from "../../src/observer/agent-client.js";
 
@@ -49,6 +50,32 @@ function client(child: TransportChild, count = { value: 0 }): ObserverAgentClien
 }
 
 describe("ObserverAgentClient", () => {
+  it("projects idle, starting, pending, sole-ready, and extra-child states without lazy startup", async () => {
+    const child = new TransportChild();
+    const count = { value: 0 };
+    const transport = client(child, count);
+    const inspect = () => transport.inspectIdleShutdownReadiness({
+      deadlineTick: performance.now() + 1_000,
+      signal: new AbortController().signal,
+      probeGeneration: 1,
+    });
+    await expect(inspect()).resolves.toMatchObject({ complete: true, blockers: [] });
+    expect(count.value).toBe(0);
+    await transport.ensureStarted();
+    await expect(inspect()).resolves.toMatchObject({ blockers: [] });
+    child.hold = true;
+    const pending = transport.request("held");
+    await Promise.resolve();
+    await expect(inspect()).resolves.toMatchObject({ blockers: ["OBSERVER_CHILD"] });
+    const extra = new TransportChild();
+    (transport as unknown as { liveChildren: Set<ChildProcess> }).liveChildren.add(extra as unknown as ChildProcess);
+    await expect(inspect()).resolves.toMatchObject({ blockers: ["OBSERVER_CHILD"] });
+    (transport as unknown as { liveChildren: Set<ChildProcess> }).liveChildren.delete(extra as unknown as ChildProcess);
+    child.exit(0);
+    await expect(pending).rejects.toMatchObject({ code: "TRANSPORT_UNAVAILABLE" });
+    await transport.close();
+  });
+
   it("deduplicates concurrent lazy startup and closes the exact child", async () => {
     const child = new TransportChild();
     const count = { value: 0 };

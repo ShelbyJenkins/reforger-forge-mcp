@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { performance } from "node:perf_hooks";
 import {
   type BackendJob,
   type CaptureBackend,
@@ -50,6 +51,37 @@ function backend(capabilities: string[] = ["render.capture", "camera.runtime"]):
 }
 
 describe("CaptureService", () => {
+  it("projects capture/restoration obligations while completed clean evidence is nonblocking", async () => {
+    const fake = backend();
+    const service = new CaptureService({
+      backends: [fake.backend],
+      createJobId: () => "job-readiness",
+    });
+    const inspect = () => service.inspectIdleShutdownReadiness({
+      deadlineTick: performance.now() + 1_000,
+      signal: new AbortController().signal,
+      probeGeneration: 1,
+    });
+    try {
+      await service.capture({
+        sessionId: "session-1",
+        idempotencyKey: "readiness",
+        view: { kind: "current" },
+        asynchronous: true,
+        timeoutMs: 1_000,
+        expectedWorldRevision: nullRuntimeRevision,
+      });
+      await expect(inspect()).resolves.toMatchObject({
+        complete: true,
+        blockers: ["OBSERVER_CAPTURE", "OBSERVER_RESTORATION"],
+      });
+      await service.status("job-readiness");
+      await expect(inspect()).resolves.toMatchObject({ complete: true, blockers: [] });
+    } finally {
+      await service.close();
+    }
+  });
+
   it("keeps current capture available while refusing explicit views without camera.runtime", async () => {
     const currentOnly = backend(["render.capture"]);
     const service = new CaptureService({ backends: [currentOnly.backend], createJobId: () => "job-current-only" });

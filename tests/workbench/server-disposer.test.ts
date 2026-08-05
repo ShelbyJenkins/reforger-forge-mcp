@@ -1,5 +1,6 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { dirname, resolve } from "node:path";
+import { performance } from "node:perf_hooks";
 import { fileURLToPath } from "node:url";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Config } from "../../src/config.js";
@@ -12,11 +13,17 @@ const lifecycle = vi.hoisted(() => ({
     applicationCloseSafe: true,
   })),
   emergencyTerminate: vi.fn(),
+  idleProvider: {
+    currentIdleRevision: () => 0,
+    inspectIdleShutdownReadiness: async () => ({ complete: true, blockers: [], revision: 0 }),
+  },
 }));
 
 vi.mock("../../src/observer/application.js", () => ({
   createObserverApplication: () => ({
-    ownedRuntimeManager: {},
+    ownedRuntimeManager: lifecycle.idleProvider,
+    agentClient: lifecycle.idleProvider,
+    captureService: lifecycle.idleProvider,
     closeRuntimeLifecycle: lifecycle.close,
     emergencyTerminatePrivateChildren: lifecycle.emergencyTerminate,
   }),
@@ -62,6 +69,30 @@ describe("project-neutral registerTools shutdown ownership", () => {
     expect(first).toEqual(simultaneous);
     await expect(disposeTools()).resolves.toEqual(first);
     expect(lifecycle.close).toHaveBeenCalledOnce();
+  });
+
+  it("exposes a bounded read-only idle proof without invoking lifecycle cleanup", async () => {
+    const lifecycleRead = vi.spyOn(WorkbenchProcessGuard.prototype, "readLifecycleStateExistingOnly")
+      .mockResolvedValue({ kind: "missing" });
+    const journalRead = vi.spyOn(WorkbenchProcessGuard.prototype, "readSpawnJournalExistingOnly")
+      .mockResolvedValue({ kind: "missing" });
+    try {
+      const server = new McpServer({ name: "idle-proof-test", version: "1.0.0" });
+      const disposeTools = registerTools(server, config());
+      const readiness = await disposeTools.inspectIdleShutdownReadiness({
+        deadlineTick: performance.now() + 1_000,
+        signal: new AbortController().signal,
+        probeGeneration: 7,
+      });
+      expect(readiness).toMatchObject({ complete: true, blockers: [], probeGeneration: 7 });
+      expect(readiness.sealProof).not.toBeNull();
+      expect(lifecycle.close).not.toHaveBeenCalled();
+      expect(disposeTools.trySealIdleAdmissions(readiness.sealProof)).toBe(true);
+      await expect(disposeTools()).resolves.toMatchObject({ applicationCloseSafe: true });
+    } finally {
+      lifecycleRead.mockRestore();
+      journalRead.mockRestore();
+    }
   });
 
   it("registers the complete server without loading an injected full search index", async () => {

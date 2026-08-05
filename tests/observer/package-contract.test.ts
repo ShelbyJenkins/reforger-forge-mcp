@@ -189,6 +189,8 @@ describe("observer package and source contracts", () => {
     expect(sharedConfig.include).toEqual([
       "src/foundation/**/*.ts",
       "src/companions/**/*.ts",
+      "src/mcp-host-admission.ts",
+      "src/mcp-idle-readiness.ts",
     ]);
     const mcpConfig = JSON.parse(readFileSync(join(repositoryRoot, "tsconfig.build.json"), "utf8"));
     expect(mcpConfig.include).toEqual(["src/**/*"]);

@@ -9,6 +9,7 @@
 
 import { createHash, randomUUID } from "node:crypto";
 import { spawn, type ChildProcess, type SpawnOptions } from "node:child_process";
+import { performance } from "node:perf_hooks";
 import {
   accessSync,
   constants as fsConstants,
@@ -18,6 +19,13 @@ import {
 } from "node:fs";
 import { basename, dirname, extname, join, relative, resolve } from "node:path";
 import type { Config } from "../config.js";
+import { McpHostAdmissionGate } from "../mcp-host-admission.js";
+import type {
+  IdleShutdownInspectionOptions,
+  McpIdleBlockerCode,
+  McpIdleProviderReadiness,
+  McpIdleReadinessProvider,
+} from "../mcp-idle-readiness.js";
 import { redactArguments } from "../foundation/redact.js";
 import {
   createMcpHostIdentity,
@@ -458,6 +466,8 @@ export interface WorkbenchClientDependencies {
   requestDeadlineAtMs?: () => number | undefined;
   launchPollIntervalMs?: number;
   activityGate?: WorkbenchActivityGate;
+  /** Shared process-wide host admission gate. */
+  admissionGate?: McpHostAdmissionGate;
   captureRestoreTimeoutMs?: number;
   activityGateTiming?: WorkbenchActivityGateTiming;
   qualificationIntervalMs?: number;
@@ -522,7 +532,7 @@ function explicitResourceLaunchArguments(resource: CanonicalResourceTarget): rea
   return Object.freeze(args);
 }
 
-export class WorkbenchSessionController {
+export class WorkbenchSessionController implements McpIdleReadinessProvider {
   private activeLifecycle: ActiveLifecycleOperation | null = null;
   private activeTargetBuildAbort: AbortController | null = null;
   private activeTargetBuildPromise: Promise<unknown> | null = null;
@@ -558,6 +568,7 @@ export class WorkbenchSessionController {
     authority: ManagedRunningAuthority;
     qualifiedAtMs: number;
   } | null = null;
+  private idleRevision = 0;
 
   get state(): Readonly<WorkbenchState> {
     return this._state;
@@ -671,6 +682,7 @@ export class WorkbenchSessionController {
         { signal: operationAbort.signal }
       )
     );
+    this.bumpIdleRevision();
     this.activeTargetBuildAbort = operationAbort;
     this.activeTargetBuildPromise = promise;
     try {
@@ -678,6 +690,7 @@ export class WorkbenchSessionController {
     } finally {
       options.signal?.removeEventListener("abort", forwardRequestAbort);
       if (this.activeTargetBuildPromise === promise) {
+        this.bumpIdleRevision();
         this.activeTargetBuildPromise = null;
         this.activeTargetBuildAbort = null;
       }
@@ -694,12 +707,113 @@ export class WorkbenchSessionController {
   }
 
   async closeOwnerScopedTargetOperations(): Promise<void> {
+    this.bumpIdleRevision();
     this.targetBuildClosing = true;
     const active = this.activeTargetBuildPromise;
     this.activeTargetBuildAbort?.abort(
       new Error("The MCP server is shutting down.")
     );
     if (active) await active.catch(() => undefined);
+  }
+
+  currentIdleRevision(): number {
+    return this.idleRevision;
+  }
+
+  /** Host-scoped, noncreating Workbench lifecycle projection for MCP idle exit. */
+  async inspectIdleShutdownReadiness(
+    options: IdleShutdownInspectionOptions,
+  ): Promise<McpIdleProviderReadiness> {
+    const blockers = new Set<McpIdleBlockerCode>();
+    let complete = true;
+    if (this.activeLifecycle || this.activeTargetBuildPromise) blockers.add("WORKBENCH_ACTIVITY");
+    if (this.ownedChild) blockers.add("WORKBENCH_OWNERSHIP");
+    if (options.signal.aborted || performance.now() > options.deadlineTick) {
+      return { complete: false, blockers: ["INCOMPLETE_PROOF"], revision: this.idleRevision };
+    }
+
+    const [lifecycle, journal] = await Promise.all([
+      this.processGuard.readLifecycleStateExistingOnly(),
+      this.processGuard.readSpawnJournalExistingOnly(),
+    ]);
+    if (options.signal.aborted || performance.now() > options.deadlineTick) {
+      return { complete: false, blockers: ["INCOMPLETE_PROOF"], revision: this.idleRevision };
+    }
+
+    const inspected = new Map<string, "live" | "absent" | "unknown">();
+    const inspectExact = async (identity: WorkbenchIdentity): Promise<"live" | "absent" | "unknown"> => {
+      const key = `${identity.pid}\0${identity.creationTime}\0${identity.executablePath.toLowerCase()}`;
+      const retained = inspected.get(key);
+      if (retained) return retained;
+      try {
+        const result = await this.processGuard.inspectOwnedWorkbench(identity);
+        inspected.set(key, result);
+        return result;
+      } catch {
+        inspected.set(key, "unknown");
+        return "unknown";
+      }
+    };
+
+    if (lifecycle.kind === "malformed") {
+      complete = false;
+      blockers.add("INCOMPLETE_PROOF");
+    } else if (lifecycle.kind === "valid") {
+      const owner = lifecycle.state.mcpOwner;
+      if (!owner && (lifecycle.state.phase !== "vacant" || lifecycle.state.workbench || lifecycle.state.operation)) {
+        blockers.add("WORKBENCH_RECOVERY");
+      } else if (owner?.instanceId === this.processGuard.mcpInstanceId) {
+        const workbench = lifecycle.state.workbench;
+        if (workbench) {
+          const status = await inspectExact(workbench);
+          if (status === "live") blockers.add("WORKBENCH_OWNERSHIP");
+          else if (status === "unknown") {
+            complete = false;
+            blockers.add("INCOMPLETE_PROOF");
+          } else if (lifecycle.state.phase !== "vacant") {
+            blockers.add("WORKBENCH_RECOVERY");
+          }
+        } else if (lifecycle.state.phase !== "vacant" || lifecycle.state.operation) {
+          blockers.add("WORKBENCH_RECOVERY");
+        }
+      }
+    }
+
+    if (journal.kind === "malformed") {
+      complete = false;
+      blockers.add("INCOMPLETE_PROOF");
+    } else if (journal.kind === "valid") {
+      const origin = journal.record.metadata.originMcpInstanceId;
+      if (origin === undefined) {
+        blockers.add("WORKBENCH_RECOVERY");
+      } else if (origin === this.processGuard.mcpInstanceId) {
+        const record = journal.record;
+        if (record.phase === "pre_spawn" || record.phase === "spawned_unverified") {
+          blockers.add("WORKBENCH_RECOVERY");
+        } else if (record.identity) {
+          const status = await inspectExact(record.identity);
+          if (status === "live") blockers.add("WORKBENCH_OWNERSHIP");
+          else if (status === "unknown") {
+            complete = false;
+            blockers.add("INCOMPLETE_PROOF");
+          } else if (record.phase !== "published") {
+            blockers.add("WORKBENCH_RECOVERY");
+          }
+        } else {
+          blockers.add("WORKBENCH_RECOVERY");
+        }
+      }
+    }
+
+    if (options.signal.aborted || performance.now() > options.deadlineTick) {
+      complete = false;
+      blockers.add("INCOMPLETE_PROOF");
+    }
+    return {
+      complete,
+      blockers: [...blockers].sort(),
+      revision: this.idleRevision,
+    };
   }
 
   /**
@@ -833,11 +947,13 @@ export class WorkbenchSessionController {
     this.companionReadiness = dependencies.companionReadiness ?? awaitCompanionReadiness;
     this.vacancyWait = dependencies.vacancyWait ?? waitForVacancy;
     this.diagnosticsService = dependencies.diagnostics ?? diagnoseWorkbench;
-    this.childSupervisor = dependencies.childSupervisor ?? new ChildSupervisor();
+    const admissionGate = dependencies.admissionGate ?? new McpHostAdmissionGate();
+    this.childSupervisor = dependencies.childSupervisor ?? new ChildSupervisor({ admissionGate });
     this.runnerLifecycleExecution = dependencies.lifecycleExecution ??
       WorkbenchSessionController.composeLifecycleExecution({
         processGuard: this.processGuard,
         childSupervisor: this.childSupervisor,
+        admissionGate,
         spawnProcess: (command, args, options) =>
           this.spawnProcess!(command, [...args], options),
       });
@@ -851,6 +967,7 @@ export class WorkbenchSessionController {
     this.activityGate = dependencies.activityGate ?? new WorkbenchActivityGate({
       restoreTimeoutMs: dependencies.captureRestoreTimeoutMs,
       timing: dependencies.activityGateTiming,
+      admissionGate,
     });
     this.qualificationIntervalMs = dependencies.qualificationIntervalMs ??
       DEFAULT_QUALIFICATION_INTERVAL_MS;
@@ -2704,8 +2821,12 @@ export class WorkbenchSessionController {
     }
     let promise!: Promise<T>;
     promise = started.finally(() => {
-      if (this.activeLifecycle?.promise === promise) this.activeLifecycle = null;
+      if (this.activeLifecycle?.promise === promise) {
+        this.bumpIdleRevision();
+        this.activeLifecycle = null;
+      }
     });
+    this.bumpIdleRevision();
     this.activeLifecycle = { kind, operationId, targetKey, promise };
     return promise;
   }
@@ -3506,6 +3627,7 @@ export class WorkbenchSessionController {
         generation: state.generation,
         targetKey: preflight.project.comparisonKey,
       };
+      this.bumpIdleRevision();
       this.ownedChild = childObservation;
       settleOwnedObservation(childObservation);
       child.unref();
@@ -3753,7 +3875,10 @@ export class WorkbenchSessionController {
       key: observation.supervisionKey,
       handle: observation.handle,
     }, true);
-    if (this.ownedChild === observation) this.ownedChild = null;
+    if (this.ownedChild === observation) {
+      this.bumpIdleRevision();
+      this.ownedChild = null;
+    }
   }
 
   private async reconcileOwnedChildExit(
@@ -3765,6 +3890,7 @@ export class WorkbenchSessionController {
     // and the durable generation checks below independently reject it.
     if (this.ownedChild && this.ownedChild !== observation) return;
     if (this.ownedChild === observation) {
+      this.bumpIdleRevision();
       this.activityGate.invalidateForUnexpectedExit({
         generation: observation.generation,
         targetKey: observation.targetKey,
@@ -3924,5 +4050,12 @@ export class WorkbenchSessionController {
             : "PROTOCOL_ERROR";
       throw new WorkbenchError(error.message, code);
     });
+  }
+
+  private bumpIdleRevision(): void {
+    if (this.idleRevision === Number.MAX_SAFE_INTEGER) {
+      throw new Error("Workbench session idle revision exhausted");
+    }
+    this.idleRevision += 1;
   }
 }

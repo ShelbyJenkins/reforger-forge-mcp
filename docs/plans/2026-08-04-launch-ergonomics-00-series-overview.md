@@ -43,7 +43,7 @@
 | 11 | Not started | 2026-08-04 | Deferred follow-up. |
 | 12 | Not started | 2026-08-04 | Deferred follow-up. |
 | 13 | Implementation complete; non-live validated | 2026-08-05 | Focused tests 172/172, stage 3 tests 345/345, stage 4 tests 228/228, and cross-cutting baseline tests 55/55 passed; typecheck, build, package smoke, and unused-code analysis passed. A Windows black-box acceptance concurrently attested two built MCP hosts with distinct client labels and UUIDs while preserving the configured Node image and byte-clean stdout. Task Manager UI confirmation remains an operator shipping check because no live client was available. |
-| 14 | Not started | 2026-08-04 | Depends on Commit 13. |
+| 14 | Implementation complete; non-live validated | 2026-08-05 | Focused tests 189/189, stage 3 tests 351/351, stage 4 tests 254/254, cross-cutting baseline tests 56/56, and the full repository suite 2211/2211 passed with one intentionally skipped integration file; typecheck, build, package smoke, and unused-code analysis passed. Existing-only durable inspection, typed provider revisions, and the shared admission gate remain default-open and behavior-neutral; no live gate applies. |
 | 15 | Not started | 2026-08-04 | Depends on Commit 14. |
 
 Update this table after each numbered commit is completed. Mark a commit

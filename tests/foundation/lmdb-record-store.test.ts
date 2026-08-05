@@ -1,4 +1,6 @@
 import { describe, expect, it } from "vitest";
+import { existsSync, statSync } from "node:fs";
+import { join } from "node:path";
 import {
   LmdbRecordStore,
   LmdbRecordStoreError,
@@ -26,6 +28,44 @@ async function withStore<T>(
 }
 
 describe("LmdbRecordStore", () => {
+  it("returns exact absence without creating a missing owned-runtime root", async () => {
+    await withTemporaryDirectory(async (root) => {
+      const missingRoot = join(root, "state", "owned-runtimes-v1");
+      const store = new LmdbRecordStore({ storageRoot: missingRoot, maxRecordBytes: 4_096 });
+      await expect(store.snapshotExisting(FAMILIES)).resolves.toEqual({ kind: "missing" });
+      await expect(store.hasExisting("runtimes", "rt-1")).resolves.toEqual({ kind: "missing" });
+      expect(existsSync(missingRoot)).toBe(false);
+      await store.close();
+    }, { prefix: "rfo-record-existing-absent-" });
+  });
+
+  it("takes one existing-only inventory through open and temporary read-only handles", async () => {
+    await withTemporaryDirectory(async (root) => {
+      const writer = new LmdbRecordStore({ storageRoot: root, maxRecordBytes: 4_096 });
+      const runtime = serialize({ runtimeId: "rt-1", state: "running" });
+      writer.putRaw("runtimes", "rt-1", runtime, { exclusive: true });
+      await expect(writer.snapshotExisting(FAMILIES)).resolves.toMatchObject({
+        kind: "available",
+        value: { complete: true, usage: { records: 1, bytes: runtime.byteLength } },
+      });
+      await writer.close();
+      const dataPath = join(root, "records-v1", "data.mdb");
+      const before = statSync(dataPath).mtimeMs;
+      const reader = new LmdbRecordStore({ storageRoot: root, maxRecordBytes: 4_096 });
+      const snapshot = await reader.snapshotExisting(FAMILIES);
+      expect(snapshot).toMatchObject({
+        kind: "available",
+        value: {
+          complete: true,
+          records: [{ family: "runtimes", id: "rt-1" }],
+        },
+      });
+      await expect(reader.getRawExisting("runtimes", "rt-1")).resolves.toMatchObject({ kind: "available" });
+      await reader.close();
+      expect(statSync(dataPath).mtimeMs).toBe(before);
+    }, { prefix: "rfo-record-existing-readonly-" });
+  });
+
   it("round-trips exact bytes with byte parity against serialized JSON", async () => {
     await withStore((store) => {
       const bytes = serialize({ runtimeId: "rt-1", state: "running" });

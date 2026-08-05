@@ -140,6 +140,8 @@ export interface WorkbenchSpawnMetadata {
   purpose: WorkbenchSpawnPurpose;
   lifecycleGeneration: string;
   targetKey: string;
+  /** Trusted process-wide host UUID. Optional only for retained v3 compatibility. */
+  originMcpInstanceId?: string;
 }
 
 export type WorkbenchSpawnRecord = RecoverableSpawnRecord<
@@ -414,7 +416,7 @@ function isMcpOwner(value: unknown): value is McpOwnerIdentity {
   if (!value || typeof value !== "object") return false;
   const owner = value as Partial<McpOwnerIdentity>;
   return parseExactIdentity(owner) !== null &&
-    isString(owner.instanceId) && isString(owner.leaseId) && isString(owner.userSid) &&
+    isValidMcpInstanceId(owner.instanceId) && isString(owner.leaseId) && isString(owner.userSid) &&
     typeof owner.claimedAtMs === "number" && Number.isFinite(owner.claimedAtMs) && owner.claimedAtMs > 0;
 }
 
@@ -499,7 +501,18 @@ function isWorkbenchSpawnMetadata(value: unknown): value is WorkbenchSpawnMetada
     "runner_target_build",
   ].includes(String(metadata.purpose)) &&
     isString(metadata.lifecycleGeneration) &&
-    isString(metadata.targetKey);
+    isString(metadata.targetKey) &&
+    (metadata.originMcpInstanceId === undefined || isValidMcpInstanceId(metadata.originMcpInstanceId));
+}
+
+function isValidMcpInstanceId(value: unknown): value is string {
+  if (typeof value !== "string") return false;
+  try {
+    parseMcpInstanceId(value, "Workbench spawn-journal MCP instance ID");
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function parseWorkbenchSpawnRecord(value: unknown): WorkbenchSpawnRecord | null {
@@ -1048,6 +1061,24 @@ export class WorkbenchProcessGuard {
     return this.lifecycleCasStore;
   }
 
+  private lifecycleExistingStore(): LmdbCasStore<WorkbenchLifecycleStateV3> {
+    return new LmdbCasStore({
+      storageRoot: this.stateDir,
+      environment: this.durableEnvironment ?? new LmdbEnvironment(this.stateDir),
+      key: encodeDurableKey("workbench", "lifecycle"),
+      recordLabel: "lifecycle",
+      schema: "workbench-lifecycle-v3",
+      maxRecordBytes: MAX_LIFECYCLE_STATE_BYTES,
+      corruptArchiveDir: this.corruptDir,
+      codec: jsonDurableRecordCodec((value) => {
+        const parsed = parseLifecycleState(value);
+        if (!parsed) throw new TypeError("Lifecycle state does not satisfy the strict version-3 schema.");
+        return parsed;
+      }),
+      generationOf: (state) => state.generation,
+    });
+  }
+
   private spawnStore(): LmdbCasStore<WorkbenchSpawnJournalStateV3> {
     this.spawnCasStore ??= new LmdbCasStore({
       storageRoot: this.stateDir,
@@ -1063,6 +1094,20 @@ export class WorkbenchProcessGuard {
       afterCompareAndSwap: this.afterSpawnJournalReplace,
     });
     return this.spawnCasStore;
+  }
+
+  private spawnExistingStore(): LmdbCasStore<WorkbenchSpawnJournalStateV3> {
+    return new LmdbCasStore({
+      storageRoot: this.stateDir,
+      environment: this.durableEnvironment ?? new LmdbEnvironment(this.stateDir),
+      key: encodeDurableKey("workbench", "spawn-journal"),
+      recordLabel: "spawn-journal",
+      schema: "workbench-spawn-journal-v3",
+      maxRecordBytes: MAX_SPAWN_JOURNAL_BYTES,
+      corruptArchiveDir: this.corruptDir,
+      codec: jsonDurableRecordCodec(parseWorkbenchSpawnJournalState),
+      generationOf: (state) => state.generation,
+    });
   }
 
   async readLifecycleState(): Promise<LifecycleStateRead> {
@@ -1085,6 +1130,28 @@ export class WorkbenchProcessGuard {
       rawSha256: inspected.rawSha256,
       message: inspected.message,
     };
+  }
+
+  /** Read lifecycle evidence without creating a missing state or LMDB path. */
+  async readLifecycleStateExistingOnly(): Promise<LifecycleStateRead> {
+    try {
+      const existing = await this.lifecycleExistingStore().inspectExisting();
+      if (existing.kind === "missing" || existing.value.kind === "missing") return { kind: "missing" };
+      if (existing.value.kind === "versioned") return { kind: "valid", state: existing.value.value };
+      return {
+        kind: "malformed",
+        path: existing.value.path,
+        rawSha256: existing.value.rawSha256,
+        message: existing.value.message,
+      };
+    } catch (error) {
+      return {
+        kind: "malformed",
+        path: join(this.corruptDir, "lifecycle.json"),
+        rawSha256: "unreadable",
+        message: `Lifecycle state cannot be inspected: ${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
   }
 
   async readSpawnJournal(): Promise<WorkbenchSpawnJournalRead> {
@@ -1115,6 +1182,36 @@ export class WorkbenchProcessGuard {
       rawSha256: inspected.rawSha256,
       message: inspected.message,
     };
+  }
+
+  /** Read spawn evidence without creating a missing state or LMDB path. */
+  async readSpawnJournalExistingOnly(): Promise<WorkbenchSpawnJournalRead> {
+    try {
+      const existing = await this.spawnExistingStore().inspectExisting();
+      if (existing.kind === "missing" || existing.value.kind === "missing") return { kind: "missing" };
+      if (existing.value.kind === "versioned") {
+        return {
+          kind: "valid",
+          generation: existing.value.generation,
+          record: existing.value.value.record,
+        };
+      }
+      return {
+        kind: "malformed",
+        path: existing.value.path,
+        rawSha256: existing.value.rawSha256,
+        message: existing.value.message,
+      };
+    } catch (error) {
+      return {
+        kind: "malformed",
+        path: join(this.corruptDir, "spawn-journal.json"),
+        rawSha256: "unreadable",
+        message: `Workbench spawn journal cannot be inspected: ${error instanceof Error
+          ? error.message
+          : String(error)}`,
+      };
+    }
   }
 
   async assertSpawnJournalReplaceable(): Promise<void> {
@@ -1169,6 +1266,13 @@ export class WorkbenchProcessGuard {
     let expectedGeneration: string | null | undefined;
     return {
       persist: async (previous, next) => {
+        const attributedNext: WorkbenchSpawnRecord = {
+          ...next,
+          metadata: {
+            ...next.metadata,
+            originMcpInstanceId: this.mcpInstanceId,
+          },
+        };
         let initialGeneration: string | null | undefined;
         if (previous === null) {
           const current = await this.readSpawnJournal();
@@ -1191,16 +1295,16 @@ export class WorkbenchProcessGuard {
             current.mcpOwner.instanceId === lifecycleAuthority.mcpOwner.instanceId &&
             current.mcpOwner.leaseId === lifecycleAuthority.mcpOwner.leaseId &&
             current.mcpOwner.userSid === lifecycleAuthority.mcpOwner.userSid;
-          const sameTarget = current?.target?.comparisonKey === next.metadata.targetKey &&
-            lifecycleAuthority.target?.comparisonKey === next.metadata.targetKey;
-          const publishedIdentityMatches = next.phase === "published" && current?.workbench &&
-            next.identity && processMatches(current.workbench, next.identity) &&
-            current.workbench.ownerTokenArgument === next.identity.ownerTokenArgument &&
-            current.workbench.launchedAtMs === next.identity.launchedAtMs;
-          const reservedGenerationMatches = next.phase !== "published" &&
+          const sameTarget = current?.target?.comparisonKey === attributedNext.metadata.targetKey &&
+            lifecycleAuthority.target?.comparisonKey === attributedNext.metadata.targetKey;
+          const publishedIdentityMatches = attributedNext.phase === "published" && current?.workbench &&
+            attributedNext.identity && processMatches(current.workbench, attributedNext.identity) &&
+            current.workbench.ownerTokenArgument === attributedNext.identity.ownerTokenArgument &&
+            current.workbench.launchedAtMs === attributedNext.identity.launchedAtMs;
+          const reservedGenerationMatches = attributedNext.phase !== "published" &&
             current?.generation === lifecycleAuthority.generation &&
-            next.metadata.lifecycleGeneration === lifecycleAuthority.generation;
-          if (next.metadata.lifecycleGeneration !== lifecycleAuthority.generation ||
+            attributedNext.metadata.lifecycleGeneration === lifecycleAuthority.generation;
+          if (attributedNext.metadata.lifecycleGeneration !== lifecycleAuthority.generation ||
               !sameOwner || !sameTarget ||
               (!reservedGenerationMatches && !publishedIdentityMatches)) {
             throw new LifecycleGuardError(
@@ -1225,7 +1329,7 @@ export class WorkbenchProcessGuard {
           const envelope: WorkbenchSpawnJournalStateV3 = {
             version: 3,
             generation: randomUUID(),
-            record: next,
+            record: attributedNext,
           };
           assertLeaseActive();
           const result = await this.spawnStore().compareAndSwap(

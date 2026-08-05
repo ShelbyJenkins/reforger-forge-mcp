@@ -1,4 +1,4 @@
-import { mkdirSync } from "node:fs";
+import { existsSync, mkdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
@@ -92,6 +92,43 @@ function writeRawAt(root: string, encodedKey: string, value: Uint8Array, version
 durableKvStoreContract("LMDB", (root) => createStore(root));
 
 describe("LMDB durable KV store", () => {
+    it("inspects absent storage without creating a root or environment", async () => {
+        await withTemporaryDirectory(async (root) => {
+            const missingRoot = join(root, "missing-state");
+            const store = createStore(missingRoot);
+            await expect(store.inspectExisting(key)).resolves.toEqual({ kind: "missing" });
+            await expect(store.listExisting(["observer", "runtime"], 10)).resolves.toEqual({ kind: "missing" });
+            await expect(store.statsExisting(["observer", "runtime"])).resolves.toEqual({ kind: "missing" });
+            expect(existsSync(missingRoot)).toBe(false);
+            await store.close();
+        }, { prefix: "rfo-lmdb-existing-absent-" });
+    });
+
+    it("uses existing-only temporary and already-open handles without changing data.mdb", async () => {
+        await withTemporaryDirectory(async (root) => {
+            const writer = createStore(root);
+            await writer.put(key, { generation: "g1", state: "ready" }, null);
+            await expect(writer.inspectExisting(key)).resolves.toMatchObject({
+                kind: "available",
+                value: { kind: "valid", value: { state: "ready" } },
+            });
+            await writer.close();
+            const dataPath = join(root, "durable-kv-v1", "data.mdb");
+            const before = statSync(dataPath).mtimeMs;
+            const reader = createStore(root);
+            await expect(reader.inspectExisting(key)).resolves.toMatchObject({
+                kind: "available",
+                value: { kind: "valid", value: { generation: "g1" } },
+            });
+            await expect(reader.listExisting(["observer", "runtime"], 10)).resolves.toMatchObject({
+                kind: "available",
+                value: { truncated: false },
+            });
+            await reader.close();
+            expect(statSync(dataPath).mtimeMs).toBe(before);
+        }, { prefix: "rfo-lmdb-existing-readonly-" });
+    });
+
     it("opens lazily and reports missing state", async () => {
         await withTemporaryDirectory(async (root) => {
             const store = createStore(root);

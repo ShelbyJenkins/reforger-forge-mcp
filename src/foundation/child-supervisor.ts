@@ -1,4 +1,14 @@
 import type { ChildProcess } from "node:child_process";
+import { performance } from "node:perf_hooks";
+import type {
+  McpHostAdmissionGate,
+  McpHostAdmissionToken,
+} from "../mcp-host-admission.js";
+import type {
+  IdleShutdownInspectionOptions,
+  McpIdleProviderReadiness,
+  McpIdleReadinessProvider,
+} from "../mcp-idle-readiness.js";
 
 export interface SupervisedChildExit {
   code: number | null;
@@ -32,6 +42,8 @@ export interface ChildSupervisorOptions {
   /** Total attempts for a failed terminal reconciliation, including the first. */
   reconciliationAttempts?: number;
   reconciliationRetryMs?: number;
+  /** Shared process-wide host admission gate. */
+  admissionGate?: McpHostAdmissionGate;
 }
 
 export interface SupervisedChildCounts {
@@ -47,6 +59,7 @@ interface SupervisedChild {
   onError: (error: Error) => void;
   onExit: (code: number | null, signal: NodeJS.Signals | null) => void;
   handle: SupervisedChildHandle;
+  admission: McpHostAdmissionToken | null;
 }
 
 interface MutableChildObservation {
@@ -58,6 +71,7 @@ interface MutableChildObservation {
 interface PendingReconciliation {
   readonly token: object;
   timer: NodeJS.Timeout | null;
+  admission: McpHostAdmissionToken | null;
 }
 
 function createChildObservation(child: ChildProcess): MutableChildObservation {
@@ -109,15 +123,18 @@ function createChildObservation(child: ChildProcess): MutableChildObservation {
  * Keeps process listeners alive for the full child lifetime and removes every
  * terminal child from its registry before durable reconciliation runs.
  */
-export class ChildSupervisor {
+export class ChildSupervisor implements McpIdleReadinessProvider {
   private readonly children = new Map<string, SupervisedChild>();
   private readonly reconciliations = new Map<string, PendingReconciliation>();
   private readonly reconciliationAttempts: number;
   private readonly reconciliationRetryMs: number;
+  private readonly admissionGate: McpHostAdmissionGate | undefined;
+  private idleRevision = 0;
 
   constructor(options: ChildSupervisorOptions = {}) {
     this.reconciliationAttempts = options.reconciliationAttempts ?? 3;
     this.reconciliationRetryMs = options.reconciliationRetryMs ?? 100;
+    this.admissionGate = options.admissionGate;
     if (!Number.isSafeInteger(this.reconciliationAttempts) || this.reconciliationAttempts < 1 ||
         this.reconciliationAttempts > 100) {
       throw new TypeError("Child reconciliation attempts must be an integer from 1 through 100.");
@@ -133,25 +150,43 @@ export class ChildSupervisor {
     child: ChildProcess,
     callbacks: ChildSupervisorCallbacks = {}
   ): SupervisedChildHandle {
+    const admission = this.admissionGate?.acquire("supervised child lifetime") ?? null;
     this.forget(key);
     const observation = createChildObservation(child);
-    const report = (work: void | Promise<void>): void => {
-      void Promise.resolve(work).catch((error) => callbacks.onCallbackError?.(error));
+    const report = async (work: void | Promise<void>): Promise<void> => {
+      try {
+        await work;
+      } catch (error) {
+        try { callbacks.onCallbackError?.(error); } catch { /* diagnostics cannot escape supervision */ }
+      }
     };
     const onError = (error: Error): void => {
       observation.observeError(error);
       const current = this.children.get(key);
       if (!current || current.child !== child) return;
-      if (callbacks.onError) report(callbacks.onError(error));
+      const callbackWork = callbacks.onError
+        ? Promise.resolve().then(() => callbacks.onError!(error))
+        : null;
       // Node does not guarantee an `exit` event when process creation fails.
       // A child without a PID never crossed the process-identity boundary, so
       // retaining it would leak the registry and both listeners forever. A
       // post-spawn error with a PID remains supervised until exact exit/absence
       // is established by its owner.
       if (child.pid == null) {
+        this.bumpIdleRevision();
         this.children.delete(key);
         child.off("error", onError);
         child.off("exit", onExit);
+        if (callbackWork) {
+          const reconciliationAdmission = current.admission?.transfer(
+            "supervised child error reconciliation",
+          ) ?? null;
+          void report(callbackWork).finally(() => reconciliationAdmission?.release());
+        } else {
+          current.admission?.release();
+        }
+      } else if (callbackWork) {
+        void report(callbackWork);
       }
     };
     const onExit = (code: number | null, signal: NodeJS.Signals | null): void => {
@@ -159,14 +194,23 @@ export class ChildSupervisor {
       observation.observeExit(exit);
       const current = this.children.get(key);
       if (!current || current.child !== child) return;
+      this.bumpIdleRevision();
       this.children.delete(key);
       child.off("error", onError);
       child.off("exit", onExit);
       if (callbacks.onExit) {
-        this.beginExitReconciliation(key, callbacks, exit);
+        this.beginExitReconciliation(
+          key,
+          callbacks,
+          exit,
+          current.admission?.transfer("supervised child exit reconciliation") ?? null,
+        );
+      } else {
+        current.admission?.release();
       }
     };
-    this.children.set(key, { child, onError, onExit, handle: observation.handle });
+    this.bumpIdleRevision();
+    this.children.set(key, { child, onError, onExit, handle: observation.handle, admission });
     child.on("error", onError);
     child.on("exit", onExit);
     if (child.exitCode != null || child.signalCode != null) {
@@ -187,6 +231,8 @@ export class ChildSupervisor {
     current.child.off("error", current.onError);
     current.child.off("exit", current.onExit);
     this.cancelReconciliation(key);
+    current.admission?.release();
+    this.bumpIdleRevision();
     return true;
   }
 
@@ -209,13 +255,32 @@ export class ChildSupervisor {
     return { active, reconciling, total: active + reconciling };
   }
 
+  currentIdleRevision(): number {
+    return this.idleRevision;
+  }
+
+  async inspectIdleShutdownReadiness(
+    options: IdleShutdownInspectionOptions,
+  ): Promise<McpIdleProviderReadiness> {
+    const expired = options.signal.aborted || performance.now() > options.deadlineTick;
+    return {
+      complete: !expired,
+      blockers: this.children.size > 0 || this.reconciliations.size > 0
+        ? ["WORKBENCH_RECOVERY"]
+        : [],
+      revision: this.idleRevision,
+    };
+  }
+
   private beginExitReconciliation(
     key: string,
     callbacks: ChildSupervisorCallbacks,
-    exit: SupervisedChildExit
+    exit: SupervisedChildExit,
+    admission: McpHostAdmissionToken | null,
   ): void {
     this.cancelReconciliation(key);
-    const pending: PendingReconciliation = { token: {}, timer: null };
+    const pending: PendingReconciliation = { token: {}, timer: null, admission };
+    this.bumpIdleRevision();
     this.reconciliations.set(key, pending);
     void this.runExitReconciliation(key, pending, callbacks, exit, 1);
   }
@@ -231,13 +296,19 @@ export class ChildSupervisor {
     try {
       await callbacks.onExit(exit);
       if (this.reconciliations.get(key)?.token === pending.token) {
+        this.bumpIdleRevision();
         this.reconciliations.delete(key);
+        pending.admission?.release();
+        pending.admission = null;
       }
     } catch (error) {
       try { callbacks.onCallbackError?.(error); } catch { /* diagnostics cannot disable retry */ }
       if (this.reconciliations.get(key)?.token !== pending.token) return;
       if (attempt >= this.reconciliationAttempts) {
+        this.bumpIdleRevision();
         this.reconciliations.delete(key);
+        pending.admission?.release();
+        pending.admission = null;
         return;
       }
       pending.timer = setTimeout(() => {
@@ -253,5 +324,13 @@ export class ChildSupervisor {
     if (!pending) return;
     if (pending.timer) clearTimeout(pending.timer);
     this.reconciliations.delete(key);
+    pending.admission?.release();
+    pending.admission = null;
+    this.bumpIdleRevision();
+  }
+
+  private bumpIdleRevision(): void {
+    if (this.idleRevision === Number.MAX_SAFE_INTEGER) throw new Error("Child supervisor idle revision exhausted");
+    this.idleRevision += 1;
   }
 }

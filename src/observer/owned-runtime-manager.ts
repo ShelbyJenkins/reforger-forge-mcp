@@ -1,5 +1,6 @@
 import { spawn as nodeSpawn, type ChildProcess } from "node:child_process";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { performance } from "node:perf_hooks";
 import {
   closeSync,
   existsSync,
@@ -12,6 +13,13 @@ import {
 import { basename, dirname, join, parse, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseMcpInstanceId } from "../mcp-host-identity.js";
+import type { McpHostAdmissionGate } from "../mcp-host-admission.js";
+import type {
+  IdleShutdownInspectionOptions,
+  McpIdleBlockerCode,
+  McpIdleProviderReadiness,
+  McpIdleReadinessProvider,
+} from "../mcp-idle-readiness.js";
 import { z } from "zod";
 import { redactText } from "../foundation/redact.js";
 import type {
@@ -267,6 +275,7 @@ export interface OwnedRuntimeManagerOptions {
   maxStoreBytes?: number;
   /** Hard serialized byte bound for every individual durable record. */
   maxRecordBytes?: number;
+  admissionGate?: McpHostAdmissionGate;
 }
 
 export interface OwnedRuntimeStorageStats {
@@ -940,7 +949,7 @@ export function resolveGraphicalRuntimeExecutable(gamePath: string): string {
   return resolveRuntimeExecutable(gamePath, "client");
 }
 
-export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
+export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder, McpIdleReadinessProvider {
   readonly managerInstanceId: string;
   readonly installationId: string;
   readonly storageRoot: string;
@@ -962,15 +971,19 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
   private readonly maxStoreBytes: number;
   private readonly maxRecordBytes: number;
   private readonly managedRoot: string;
-  private readonly children = new ChildSupervisor();
+  private readonly children: ChildSupervisor;
+  private readonly admissionGate: McpHostAdmissionGate | undefined;
   private recordStoreInstance: LmdbRecordStore | null = null;
   private closing = false;
   private closePromise: Promise<Record<string, unknown>> | null = null;
+  private idleRevision = 0;
 
   constructor(private readonly options: OwnedRuntimeManagerOptions) {
     this.managerInstanceId = options.managerInstanceId === undefined
       ? randomUUID()
       : parseMcpInstanceId(options.managerInstanceId, "Owned runtime manager instance ID");
+    this.admissionGate = options.admissionGate;
+    this.children = new ChildSupervisor({ admissionGate: options.admissionGate });
     this.backend = options.backend ?? defaultOwnedRuntimeBackend();
     const machineMutex = options.machineMutex ??
       (providesMachineMutex(this.backend) ? this.backend : null);
@@ -1510,6 +1523,14 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
     input: ObserverLaunchInput,
     prepared: ObserverPreparedLaunch
   ): Promise<string> {
+    return this.withAdmission("owned runtime preparation", () =>
+      this.recordPreparedLaunchInternal(input, prepared));
+  }
+
+  private async recordPreparedLaunchInternal(
+    input: ObserverLaunchInput,
+    prepared: ObserverPreparedLaunch,
+  ): Promise<string> {
     this.assertOpenForMutation();
     try {
       return await this.machineMutex.withMachineMutex({
@@ -1530,6 +1551,13 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
    * across MCP/private-child processes. No nested mutex acquisition occurs.
    */
   async prepareInitialOwnedGameLaunch(
+    request: PrepareInitialOwnedGameLaunchInput,
+  ): Promise<ObserverPreparedLaunch> {
+    return this.withAdmission("owned game launch preparation", () =>
+      this.prepareInitialOwnedGameLaunchInternal(request));
+  }
+
+  private async prepareInitialOwnedGameLaunchInternal(
     request: PrepareInitialOwnedGameLaunchInput,
   ): Promise<ObserverPreparedLaunch> {
     this.assertOpenForMutation();
@@ -1832,6 +1860,10 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
   }
 
   async start(input: OwnedRuntimeStartInput): Promise<OwnedRuntimePublicStatus> {
+    return this.withAdmission("owned runtime start", () => this.startInternal(input));
+  }
+
+  private async startInternal(input: OwnedRuntimeStartInput): Promise<OwnedRuntimePublicStatus> {
     this.assertOpenForMutation();
     preparedLaunchIdSchema.parse(input.preparedLaunchId);
     const keyHash = sha256(boundedIdempotencyKey(input.idempotencyKey));
@@ -1851,6 +1883,10 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
   }
 
   async status(runtimeId: string): Promise<OwnedRuntimePublicStatus> {
+    return this.withAdmission("owned runtime status", () => this.statusInternal(runtimeId));
+  }
+
+  private async statusInternal(runtimeId: string): Promise<OwnedRuntimePublicStatus> {
     runtimeIdSchema.parse(runtimeId);
     try {
       const receipt = this.readRuntimeReceipt(runtimeId);
@@ -1883,6 +1919,11 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
 
   /** Return the exact durable lifecycle identity for a currently owned runtime. */
   async lifecycleIdentity(runtimeId: string): Promise<OwnedRuntimeLifecycleIdentity> {
+    return this.withAdmission("owned runtime lifecycle identity", () =>
+      this.lifecycleIdentityInternal(runtimeId));
+  }
+
+  private async lifecycleIdentityInternal(runtimeId: string): Promise<OwnedRuntimeLifecycleIdentity> {
     runtimeIdSchema.parse(runtimeId);
     const receipt = this.readRuntimeReceipt(runtimeId);
     await this.reconcileRuntimeLifecycleLease(receipt);
@@ -1906,8 +1947,301 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
     return this.children.counts();
   }
 
+  currentIdleRevision(): number {
+    return this.idleRevision;
+  }
+
+  /**
+   * Validate the complete existing LMDB inventory without opening the creating
+   * writer accessor, sweeping receipts, revoking sessions, or starting the
+   * private observer child.
+   */
+  async inspectIdleShutdownReadiness(
+    options: IdleShutdownInspectionOptions,
+  ): Promise<McpIdleProviderReadiness> {
+    const blockers = new Set<McpIdleBlockerCode>();
+    let complete = true;
+    const childCounts = this.children.counts();
+    if (childCounts.active > 0) blockers.add("OWNED_RUNTIME_LIVE");
+    if (childCounts.reconciling > 0) blockers.add("OWNED_RUNTIME_RECOVERY");
+    if (options.signal.aborted || performance.now() > options.deadlineTick) {
+      return { complete: false, blockers: ["INCOMPLETE_PROOF"], revision: this.idleRevision };
+    }
+
+    const store = this.recordStoreInstance ?? new LmdbRecordStore({
+      storageRoot: this.storageRoot,
+      databaseDirectory: "records-v1",
+      maxRecordBytes: this.maxRecordBytes,
+      maxScanRecords: this.maxStoreRecords,
+    });
+    let existing;
+    try {
+      existing = await store.snapshotExisting(OWNED_RUNTIME_RECORD_DIRECTORIES);
+    } catch {
+      return { complete: false, blockers: ["INCOMPLETE_PROOF"], revision: this.idleRevision };
+    }
+    if (existing.kind === "missing") {
+      return {
+        complete: !options.signal.aborted && performance.now() <= options.deadlineTick,
+        blockers: [...blockers].sort(),
+        revision: this.idleRevision,
+      };
+    }
+    const snapshot = existing.value;
+    if (!snapshot.complete || snapshot.usage.records > this.maxStoreRecords ||
+        snapshot.usage.bytes > this.maxStoreBytes) {
+      complete = false;
+    }
+
+    const prepared = new Map<string, PreparedDescriptor>();
+    const indexes = new Map<string, PreparedSessionIndex>();
+    const invalidations = new Map<string, PreparedInvalidation>();
+    const consumptions = new Map<string, z.infer<typeof consumptionSchema>>();
+    const pending = new Map<string, PendingStart>();
+    const runtimes = new Map<string, OwnedRuntimeReceipt>();
+    const exits = new Map<string, ChildExitReceipt>();
+    const stops = new Map<string, StopReceipt>();
+    const completions = new Map<string, StopCompletion>();
+    const restorations = new Map<string, RestorationProof>();
+    const idempotency = new Map<string, z.infer<typeof idempotencySchema>>();
+
+    const decode = (bytes: Uint8Array | null): unknown => {
+      if (!bytes || bytes.byteLength < LIFECYCLE_RECORD_MIN_BYTES || bytes.byteLength > this.maxRecordBytes) {
+        throw new Error("invalid record bytes");
+      }
+      return JSON.parse(Buffer.from(bytes).toString("utf8").replace(/^\uFEFF/, ""));
+    };
+    try {
+      for (const record of snapshot.records) {
+        const value = decode(record.bytes);
+        switch (record.family as OwnedRuntimeRecordDirectory) {
+          case "prepared": {
+            const parsed = preparedDescriptorSchema.parse(value);
+            if (parsed.preparedLaunchId !== record.id ||
+                (record.bytes?.byteLength ?? 0) > (parsed.gameLaunchEvidence
+                  ? this.maxRecordBytes : this.preparedDescriptorMaxBytes())) throw new Error("prepared binding");
+            if (parsed.gameLaunchEvidence) validatedGameLaunchEvidence(parsed.gameLaunchEvidence);
+            prepared.set(record.id, parsed);
+            break;
+          }
+          case "prepared-index": {
+            const parsed = preparedSessionIndexSchema.parse(value);
+            if (sha256(parsed.sessionId) !== record.id) throw new Error("index binding");
+            indexes.set(record.id, parsed);
+            break;
+          }
+          case "prepared-invalidations": {
+            const parsed = preparedInvalidationSchema.parse(value);
+            if (parsed.preparedLaunchId !== record.id) throw new Error("invalidation binding");
+            invalidations.set(record.id, parsed);
+            break;
+          }
+          case "consumed": {
+            const parsed = consumptionSchema.parse(value);
+            if (parsed.preparedLaunchId !== record.id) throw new Error("consumption binding");
+            consumptions.set(record.id, parsed);
+            break;
+          }
+          case "pending-starts": {
+            const parsed = pendingStartSchema.parse(value);
+            if (parsed.runtimeId !== record.id) throw new Error("pending binding");
+            pending.set(record.id, parsed);
+            break;
+          }
+          case "runtimes": {
+            const parsed = runtimeReceiptSchema.parse(value);
+            if (parsed.runtimeId !== record.id) throw new Error("runtime binding");
+            runtimes.set(record.id, parsed);
+            break;
+          }
+          case "child-exits": {
+            const parsed = childExitReceiptSchema.parse(value);
+            if (parsed.runtimeId !== record.id) throw new Error("child-exit binding");
+            exits.set(record.id, parsed);
+            break;
+          }
+          case "stops": {
+            const parsed = stopReceiptSchema.parse(value);
+            if (parsed.runtimeId !== record.id) throw new Error("stop binding");
+            stops.set(record.id, parsed);
+            break;
+          }
+          case "stop-completions": {
+            const parsed = stopCompletionSchema.parse(value);
+            if (parsed.runtimeId !== record.id) throw new Error("completion binding");
+            completions.set(record.id, parsed);
+            break;
+          }
+          case "restoration-proofs": {
+            const parsed = restorationProofSchema.parse(value);
+            if (parsed.runtimeId !== record.id) throw new Error("restoration binding");
+            restorations.set(record.id, parsed);
+            break;
+          }
+          case "idempotency": {
+            const parsed = idempotencySchema.parse(value);
+            if (`${parsed.action}-${parsed.keyHash}` !== record.id) throw new Error("idempotency binding");
+            idempotency.set(record.id, parsed);
+            break;
+          }
+          default:
+            throw new Error("unknown record family");
+        }
+      }
+
+      for (const index of indexes.values()) {
+        const descriptor = prepared.get(index.preparedLaunchId);
+        if (!descriptor || descriptor.sessionId !== index.sessionId ||
+            descriptor.expiresAt !== index.expiresAt ||
+            this.preparedFingerprint(descriptor) !== index.descriptorFingerprint) throw new Error("unlinked index");
+      }
+      for (const invalidation of invalidations.values()) {
+        const descriptor = prepared.get(invalidation.preparedLaunchId);
+        if (!descriptor || invalidation.sessionId !== descriptor.sessionId ||
+            invalidation.managerInstanceId !== descriptor.managerInstanceId ||
+            !descriptor.gameLaunchEvidence || invalidation.gameLaunchEvidenceDigest !==
+              descriptor.gameLaunchEvidence.gameLaunchEvidenceDigest) throw new Error("unlinked invalidation");
+      }
+      for (const consumption of consumptions.values()) {
+        const descriptor = prepared.get(consumption.preparedLaunchId);
+        const runtime = runtimes.get(consumption.runtimeId);
+        const starting = pending.get(consumption.runtimeId);
+        if (!descriptor || (!runtime && !starting)) throw new Error("unlinked consumption");
+        if (runtime?.preparedLaunchId !== descriptor.preparedLaunchId ||
+            starting?.preparedLaunchId !== descriptor.preparedLaunchId) throw new Error("mixed consumption");
+      }
+      for (const runtime of runtimes.values()) {
+        const descriptor = prepared.get(runtime.preparedLaunchId);
+        const consumption = consumptions.get(runtime.preparedLaunchId);
+        if (!descriptor || !consumption || consumption.runtimeId !== runtime.runtimeId ||
+            descriptor.managerInstanceId !== runtime.mcpOwner.managerInstanceId ||
+            descriptor.sessionId !== runtime.sessionId || descriptor.profilePath !== runtime.profilePath ||
+            descriptor.runtimeKind !== runtime.runtimeKind || descriptor.expiresAt !== runtime.preparedExpiresAt ||
+            sha256(JSON.stringify([...descriptor.arguments, runtime.ownerTokenArgument])) !== runtime.argvSha256) {
+          throw new Error("unlinked runtime");
+        }
+      }
+      for (const starting of pending.values()) {
+        const descriptor = prepared.get(starting.preparedLaunchId);
+        const consumption = consumptions.get(starting.preparedLaunchId);
+        if (!descriptor || !consumption || consumption.runtimeId !== starting.runtimeId ||
+            descriptor.managerInstanceId !== starting.mcpOwner.managerInstanceId ||
+            descriptor.sessionId !== starting.sessionId) throw new Error("unlinked pending start");
+      }
+      for (const exit of exits.values()) {
+        const runtime = runtimes.get(exit.runtimeId);
+        const starting = pending.get(exit.runtimeId);
+        if (!runtime && !starting) throw new Error("unlinked child exit");
+        if (runtime && (exit.sessionId !== runtime.sessionId || exit.pid !== runtime.pid ||
+            pathKey(exit.executablePath) !== pathKey(runtime.executablePath) ||
+            exit.creationTimeFileTime !== runtime.creationTimeFileTime)) throw new Error("mixed child exit");
+      }
+      for (const stopped of stops.values()) {
+        const runtime = runtimes.get(stopped.runtimeId);
+        if (!runtime || stopped.sessionId !== runtime.sessionId ||
+            stopped.mcpActor.managerInstanceId !== runtime.mcpOwner.managerInstanceId) throw new Error("unlinked stop");
+      }
+      for (const completion of completions.values()) {
+        const runtime = runtimes.get(completion.runtimeId);
+        const stopped = stops.get(completion.runtimeId);
+        if (!runtime || !stopped || completion.sessionId !== runtime.sessionId ||
+            completion.preparedLaunchId !== runtime.preparedLaunchId ||
+            stopped.sessionId !== completion.sessionId) throw new Error("unlinked completion");
+      }
+      for (const proof of restorations.values()) {
+        const runtime = runtimes.get(proof.runtimeId);
+        if (!runtime || proof.sessionId !== runtime.sessionId ||
+            proof.managerInstanceId !== runtime.mcpOwner.managerInstanceId) throw new Error("unlinked restoration");
+      }
+      for (const attempt of idempotency.values()) {
+        if (!runtimes.has(attempt.runtimeId) && !pending.has(attempt.runtimeId)) {
+          throw new Error("unlinked idempotency");
+        }
+      }
+    } catch {
+      complete = false;
+    }
+
+    if (complete) {
+      const now = this.clock();
+      for (const descriptor of prepared.values()) {
+        if (descriptor.managerInstanceId !== this.managerInstanceId) continue;
+        const consumption = consumptions.get(descriptor.preparedLaunchId);
+        if (!consumption) {
+          const referenced = [...runtimes.values(), ...pending.values()]
+            .some((value) => value.preparedLaunchId === descriptor.preparedLaunchId);
+          if (referenced) {
+            complete = false;
+            break;
+          }
+          if (Date.parse(descriptor.expiresAt) > now) blockers.add("OWNED_RUNTIME_PREPARATION");
+          continue;
+        }
+        const runtime = runtimes.get(consumption.runtimeId);
+        const starting = pending.get(consumption.runtimeId);
+        if (!runtime && !starting) {
+          complete = false;
+          break;
+        }
+        if (starting && starting.mcpOwner.managerInstanceId !== this.managerInstanceId) {
+          complete = false;
+          break;
+        }
+        if (runtime && runtime.mcpOwner.managerInstanceId !== this.managerInstanceId) {
+          complete = false;
+          break;
+        }
+        if (starting && !runtime) {
+          const releaseComplete = starting.state === "release_acknowledged" ||
+            (starting.state === "cleanup_verified" && !starting.lifecycleGeneration);
+          if (!releaseComplete) {
+            blockers.add(["pre_spawn", "spawned_unverified", "identity_verified"].includes(starting.state)
+              ? "OWNED_RUNTIME_START" : "OWNED_RUNTIME_RECOVERY");
+          }
+          continue;
+        }
+        if (!runtime) continue;
+        if (stops.has(runtime.runtimeId) && completions.has(runtime.runtimeId)) continue;
+        if (exits.has(runtime.runtimeId) || stops.has(runtime.runtimeId) ||
+            restorations.has(runtime.runtimeId)) {
+          blockers.add("OWNED_RUNTIME_RECOVERY");
+          continue;
+        }
+        try {
+          const inspection = await this.backend.inspectProcess(runtime.pid, runtime.ownerTokenArgument);
+          if (inspection && this.inspectionMatches(runtime, inspection)) blockers.add("OWNED_RUNTIME_LIVE");
+          else blockers.add("OWNED_RUNTIME_RECOVERY");
+        } catch {
+          complete = false;
+          break;
+        }
+      }
+      for (const attempt of idempotency.values()) {
+        const owner = runtimes.get(attempt.runtimeId)?.mcpOwner.managerInstanceId ??
+          pending.get(attempt.runtimeId)?.mcpOwner.managerInstanceId;
+        if (owner !== this.managerInstanceId || attempt.state !== "starting") continue;
+        if (stops.has(attempt.runtimeId) && completions.has(attempt.runtimeId)) continue;
+        blockers.add(attempt.action === "start" ? "OWNED_RUNTIME_START" : "OWNED_RUNTIME_RECOVERY");
+      }
+    }
+
+    if (!complete || options.signal.aborted || performance.now() > options.deadlineTick) {
+      complete = false;
+      blockers.add("INCOMPLETE_PROOF");
+    }
+    return {
+      complete,
+      blockers: [...blockers].sort(),
+      revision: this.idleRevision,
+    };
+  }
+
   /** Explicit bounded retention hook for controlled shutdown and diagnostics. */
   async sweep(now = this.clock()): Promise<OwnedRuntimeSweepResult> {
+    return this.withAdmission("owned runtime retention", () => this.sweepInternal(now));
+  }
+
+  private async sweepInternal(now: number): Promise<OwnedRuntimeSweepResult> {
     try {
       return await this.machineMutex.withMachineMutex({
         name: OWNED_RUNTIME_LIFECYCLE_MUTEX,
@@ -1929,6 +2263,10 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
   }
 
   async stop(input: OwnedRuntimeStopInput): Promise<OwnedRuntimePublicStatus> {
+    return this.withAdmission("owned runtime stop", () => this.stopInternal(input));
+  }
+
+  private async stopInternal(input: OwnedRuntimeStopInput): Promise<OwnedRuntimePublicStatus> {
     this.assertOpenForMutation();
     runtimeIdSchema.parse(input.runtimeId);
     boundedIdempotencyKey(input.idempotencyKey);
@@ -2038,6 +2376,10 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
    * the old in-memory observer session no longer exists.
    */
   close(deadlineAtMs?: number): Promise<Record<string, unknown>> {
+    return this.withPrivilegedCleanup(() => this.closeInternal(deadlineAtMs));
+  }
+
+  private closeInternal(deadlineAtMs?: number): Promise<Record<string, unknown>> {
     if (deadlineAtMs !== undefined && (!Number.isFinite(deadlineAtMs) || deadlineAtMs <= 0)) {
       return Promise.reject(new OwnedRuntimeError("INVALID_REQUEST", "Owned runtime shutdown deadline is invalid"));
     }
@@ -4545,6 +4887,7 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
     // the "must be a managed record" key-validity check.
     if (!existsSync(this.storageRoot)) return;
     const { family, id } = this.recordCoordinates(target);
+    this.bumpIdleRevision();
     this.recordStore().remove(family, id);
   }
 
@@ -4912,6 +5255,7 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
     if (!capacityPreflighted) this.assertBatchCapacity(root, [{ target, value, exclusive }]);
     const serialized = this.serializeRecord(value);
     try {
+      this.bumpIdleRevision();
       this.recordStore().putRaw(family, id, Buffer.from(serialized, "utf8"), { exclusive });
     } catch (error) {
       if (error instanceof LmdbRecordStoreError && error.code === "RECORD_EXISTS") {
@@ -4933,6 +5277,37 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
       ? String((error as { code: string }).code)
       : fallbackCode;
     return new OwnedRuntimeError(code, error instanceof Error ? this.message(error) : fallbackMessage);
+  }
+
+  private async withAdmission<T>(description: string, action: () => Promise<T>): Promise<T> {
+    this.bumpIdleRevision();
+    if (!this.admissionGate) {
+      try { return await action(); }
+      finally { this.bumpIdleRevision(); }
+    }
+    const token = this.admissionGate.acquire(description);
+    try {
+      return await action();
+    } finally {
+      this.bumpIdleRevision();
+      token.release();
+    }
+  }
+
+  private async withPrivilegedCleanup<T>(action: () => Promise<T>): Promise<T> {
+    this.bumpIdleRevision();
+    try {
+      return this.admissionGate
+        ? await this.admissionGate.runPrivilegedCleanup(action)
+        : await action();
+    } finally {
+      this.bumpIdleRevision();
+    }
+  }
+
+  private bumpIdleRevision(): void {
+    if (this.idleRevision === Number.MAX_SAFE_INTEGER) throw new Error("Owned runtime idle revision exhausted");
+    this.idleRevision += 1;
   }
 
   private assertOpenForMutation(): void {

@@ -1,6 +1,14 @@
 import { createHash, randomUUID } from "node:crypto";
+import { performance } from "node:perf_hooks";
 import { isDeepStrictEqual } from "node:util";
 import { redactText } from "../foundation/redact.js";
+import type { McpHostAdmissionGate } from "../mcp-host-admission.js";
+import type {
+  IdleShutdownInspectionOptions,
+  McpIdleBlockerCode,
+  McpIdleProviderReadiness,
+  McpIdleReadinessProvider,
+} from "../mcp-idle-readiness.js";
 import {
   CaptureError,
   hasRestorationObligation,
@@ -54,6 +62,7 @@ export interface CaptureServiceOptions {
   clock?: () => number;
   sleep?: (milliseconds: number, signal?: AbortSignal) => Promise<void>;
   createJobId?: () => string;
+  admissionGate?: McpHostAdmissionGate;
 }
 
 export interface CaptureInstanceList {
@@ -165,7 +174,7 @@ function refFor(instance: CaptureInstance, jobId: string): BackendJobRef {
   };
 }
 
-export class CaptureService {
+export class CaptureService implements McpIdleReadinessProvider {
   readonly store: CaptureJobStore;
   readonly defaultTimeoutMs: number;
   readonly maxInlineImageBytes: number;
@@ -176,12 +185,14 @@ export class CaptureService {
   private readonly now: () => number;
   private readonly sleep: (milliseconds: number, signal?: AbortSignal) => Promise<void>;
   private readonly createJobId: () => string;
+  private readonly admissionGate: McpHostAdmissionGate | undefined;
   private readonly active = new Map<string, ActiveCapture>();
   private readonly admissions = new Map<string, Promise<CaptureResult>>();
   private readonly sweepTimer: NodeJS.Timeout;
   private readonly shutdownAbort = new AbortController();
   private sealed = false;
   private terminalClosed = false;
+  private idleRevision = 0;
 
   constructor(options: CaptureServiceOptions) {
     if (!options.backends.length) throw new TypeError("CaptureService requires at least one backend");
@@ -205,6 +216,7 @@ export class CaptureService {
     this.now = options.clock ?? Date.now;
     this.sleep = options.sleep ?? defaultSleep;
     this.createJobId = options.createJobId ?? (() => randomUUID());
+    this.admissionGate = options.admissionGate;
     this.runPort = options.runPort;
     for (const backend of options.backends) {
       if (this.backends.has(backend.kind)) throw new TypeError(`Duplicate capture backend: ${backend.kind}`);
@@ -215,6 +227,10 @@ export class CaptureService {
   }
 
   async instances(query: ListInstancesInput & { waitMs?: number; signal?: AbortSignal } = {}): Promise<CaptureInstanceList> {
+    return this.withAdmission("observer instance inventory", () => this.instancesInternal(query));
+  }
+
+  private async instancesInternal(query: ListInstancesInput & { waitMs?: number; signal?: AbortSignal }): Promise<CaptureInstanceList> {
     const started = this.now();
     const waitMs = query.waitMs ?? 0;
     const deadlineAtMs = started + waitMs;
@@ -245,6 +261,10 @@ export class CaptureService {
   }
 
   async capture(input: CaptureInput): Promise<CaptureResult> {
+    return this.withAdmission("observer capture", () => this.captureInternal(input));
+  }
+
+  private async captureInternal(input: CaptureInput): Promise<CaptureResult> {
     if (this.sealed) throw new CaptureError("TRANSPORT_UNAVAILABLE", "Observer capture admission is closed");
     const intent = normalizeCaptureIntent(input, this.defaultTimeoutMs, this.imagePolicyDefaults);
     const scope = idempotencyScope(input);
@@ -404,6 +424,10 @@ export class CaptureService {
   }
 
   async status(jobId: string): Promise<PublicCaptureJob> {
+    return this.withAdmission("observer capture status", () => this.statusInternal(jobId));
+  }
+
+  private async statusInternal(jobId: string): Promise<PublicCaptureJob> {
     const record = this.requireJob(jobId);
     if (record.releaseReceipt) return record.lastProjection;
     if (isTerminalJob(record.lastBackendJob)) {
@@ -420,6 +444,10 @@ export class CaptureService {
   }
 
   async cancel(jobId: string): Promise<PublicCaptureJob> {
+    return this.withAdmission("observer capture cancellation", () => this.cancelInternal(jobId));
+  }
+
+  private async cancelInternal(jobId: string): Promise<PublicCaptureJob> {
     const record = this.requireJob(jobId);
     if (record.releaseReceipt) return record.lastProjection;
     const active = this.active.get(`cancel:${jobId}`);
@@ -436,6 +464,10 @@ export class CaptureService {
   }
 
   async read(jobId: string): Promise<{ job: PublicCaptureJob; image: Buffer; metadata: Record<string, unknown>; cleanup?: Record<string, unknown>; cleanupRequired?: boolean; cleanupWarning?: string }> {
+    return this.withAdmission("observer capture read", () => this.readInternal(jobId));
+  }
+
+  private async readInternal(jobId: string): Promise<{ job: PublicCaptureJob; image: Buffer; metadata: Record<string, unknown>; cleanup?: Record<string, unknown>; cleanupRequired?: boolean; cleanupWarning?: string }> {
     const record = this.requireJob(jobId);
     const operationDeadline = this.operationDeadline();
     const job = isTerminalJob(record.lastBackendJob) ? record.lastBackendJob : await this.refresh(record, operationDeadline);
@@ -452,6 +484,10 @@ export class CaptureService {
   }
 
   async release(jobId: string): Promise<Record<string, unknown>> {
+    return this.withAdmission("observer capture release", () => this.releaseInternal(jobId));
+  }
+
+  private async releaseInternal(jobId: string): Promise<Record<string, unknown>> {
     const record = this.requireJob(jobId);
     if (record.releaseReceipt) return { ...record.releaseReceipt };
     if (this.runPort && record.runId) await this.runPort.assertReleaseAllowed({ jobId, backend: record.ref.backend, sessionId: record.ref.sessionId });
@@ -490,6 +526,10 @@ export class CaptureService {
   }
 
   async sweep(now = this.now()): Promise<{ expiredJobIds: string[]; removedJobIds: string[] }> {
+    return this.withAdmission("observer capture retention", () => this.sweepInternal(now));
+  }
+
+  private async sweepInternal(now: number): Promise<{ expiredJobIds: string[]; removedJobIds: string[] }> {
     const expiredJobIds: string[] = [];
     for (const record of this.store.entries()) {
       if (record.releaseReceipt || isTerminalJob(record.lastBackendJob) || record.deadlineAtMs > now) continue;
@@ -507,6 +547,10 @@ export class CaptureService {
    * backend is asked to recover from a bare job ID.
    */
   async convergeRun(run: Record<string, unknown>): Promise<void> {
+    return this.withAdmission("observer capture recovery", () => this.convergeRunInternal(run));
+  }
+
+  private async convergeRunInternal(run: Record<string, unknown>): Promise<void> {
     const runId = typeof run.runId === "string" ? run.runId : undefined;
     const captures = Array.isArray(run.captures)
       ? run.captures.filter((value): value is Record<string, unknown> => !!value && typeof value === "object" && !Array.isArray(value))
@@ -673,6 +717,10 @@ export class CaptureService {
   }
 
   async quiesce(deadlineAtMs: number): Promise<CaptureQuiesceResult> {
+    return this.withPrivilegedCleanup(() => this.quiesceInternal(deadlineAtMs));
+  }
+
+  private async quiesceInternal(deadlineAtMs: number): Promise<CaptureQuiesceResult> {
     if (!Number.isFinite(deadlineAtMs)) throw new TypeError("Capture quiescence deadline is invalid");
     this.sealed = true;
     if (!this.shutdownAbort.signal.aborted) this.shutdownAbort.abort();
@@ -725,6 +773,10 @@ export class CaptureService {
   }
 
   async close(): Promise<void> {
+    return this.withPrivilegedCleanup(() => this.closeInternal());
+  }
+
+  private async closeInternal(): Promise<void> {
     if (this.terminalClosed) return;
     this.sealed = true;
     if (!this.shutdownAbort.signal.aborted) this.shutdownAbort.abort();
@@ -739,6 +791,61 @@ export class CaptureService {
   private shutdownObligations(): CaptureJobRecord[] {
     return this.store.entries().filter((record) =>
       !record.releaseReceipt && hasRestorationObligation(record.lastBackendJob));
+  }
+
+  currentIdleRevision(): number {
+    return this.idleRevision;
+  }
+
+  async inspectIdleShutdownReadiness(
+    options: IdleShutdownInspectionOptions,
+  ): Promise<McpIdleProviderReadiness> {
+    const blockers = new Set<McpIdleBlockerCode>();
+    if (this.admissions.size > 0 || this.active.size > 0) blockers.add("OBSERVER_CAPTURE");
+    for (const record of this.store.entries()) {
+      const job = record.lastBackendJob;
+      if (!isTerminalJob(job)) blockers.add("OBSERVER_CAPTURE");
+      if (job.cameraLeaseHeld === true || job.restorationConfirmed === false) {
+        blockers.add("OBSERVER_RESTORATION");
+      }
+    }
+    const expired = options.signal.aborted || performance.now() > options.deadlineTick;
+    return {
+      complete: !expired,
+      blockers: [...blockers].sort(),
+      revision: this.idleRevision,
+    };
+  }
+
+  private async withAdmission<T>(description: string, action: () => Promise<T>): Promise<T> {
+    this.bumpIdleRevision();
+    if (!this.admissionGate) {
+      try { return await action(); }
+      finally { this.bumpIdleRevision(); }
+    }
+    const token = this.admissionGate.acquire(description);
+    try {
+      return await action();
+    } finally {
+      this.bumpIdleRevision();
+      token.release();
+    }
+  }
+
+  private async withPrivilegedCleanup<T>(action: () => Promise<T>): Promise<T> {
+    this.bumpIdleRevision();
+    try {
+      return this.admissionGate
+        ? await this.admissionGate.runPrivilegedCleanup(action)
+        : await action();
+    } finally {
+      this.bumpIdleRevision();
+    }
+  }
+
+  private bumpIdleRevision(): void {
+    if (this.idleRevision === Number.MAX_SAFE_INTEGER) throw new Error("Capture service idle revision exhausted");
+    this.idleRevision += 1;
   }
 
   private async settleBeforeDeadline(promises: readonly Promise<unknown>[], deadlineAtMs: number): Promise<boolean> {

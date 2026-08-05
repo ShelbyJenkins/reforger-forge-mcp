@@ -63,6 +63,13 @@ identity only. They never authorize killing, preempting, or taking over a host
 or child process; use the owning client's refresh/shutdown surface and the exact
 supported lifecycle tools.
 
+Host lifecycle code can form a bounded internal idle-readiness proof from the
+same UUID. The proof is host-scoped and existing-only: it never starts a child,
+creates state, repairs/sweeps receipts, revokes a session, or stops Workbench or
+the game. Legacy-unattributed, malformed, incomplete, timed-out, or racing
+evidence blocks the proof. The admission gate is intentionally default-open in
+this foundation; it does not itself add an idle timer or automatic MCP exit.
+
 Start attended Workbench only through **wb_launch** while an MCP session owns
 the lifecycle. The standalone `reforger-forge-workbench editor` runner is for a
 foreground project script or operator session when no live MCP owns the lease;

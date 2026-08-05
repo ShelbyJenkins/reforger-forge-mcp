@@ -12,6 +12,7 @@ import { WorkbenchLifecycleExecution } from "../../src/workbench/lifecycle-execu
 import { WorkbenchHelperStager } from "../../src/workbench/helper-addon.js";
 import { diagnoseWorkbench } from "../../src/workbench/diagnostics.js";
 import { createMcpHostIdentity } from "../../src/mcp-host-identity.js";
+import { McpHostAdmissionGate } from "../../src/mcp-host-admission.js";
 
 function config(): Config {
   return {
@@ -31,7 +32,8 @@ describe("Workbench server composition", () => {
       instanceId: "00112233-4455-4677-8899-aabbccddeeff",
       startedAt: "2026-08-05T12:34:56.789Z",
     });
-    const composition = createWorkbenchServerComposition(config(), hostIdentity);
+    const admissionGate = new McpHostAdmissionGate();
+    const composition = createWorkbenchServerComposition(config(), hostIdentity, admissionGate);
     const controller = composition.client as unknown as {
       processGuard: WorkbenchProcessGuard;
       netApi: WorkbenchNetApiClient;
@@ -44,6 +46,7 @@ describe("Workbench server composition", () => {
 
     expect(composition.client).toBeInstanceOf(WorkbenchSessionController);
     expect(composition.hostIdentity).toEqual(hostIdentity);
+    expect(composition.admissionGate).toBe(admissionGate);
     expect(composition.processGuard).toBeInstanceOf(WorkbenchProcessGuard);
     expect(composition.netApi).toBeInstanceOf(WorkbenchNetApiClient);
     expect(composition.activityGate).toBeInstanceOf(WorkbenchActivityGate);
@@ -59,6 +62,10 @@ describe("Workbench server composition", () => {
     expect(controller.diagnosticsService).toBe(composition.diagnostics);
     expect(controller.hostIdentity).toEqual(hostIdentity);
     expect(composition.processGuard.mcpInstanceId).toBe(hostIdentity.instanceId);
+    expect((composition.activityGate as unknown as { admissionGate: McpHostAdmissionGate }).admissionGate)
+      .toBe(admissionGate);
+    expect((composition.childSupervisor as unknown as { admissionGate: McpHostAdmissionGate }).admissionGate)
+      .toBe(admissionGate);
     expect(Object.isFrozen(composition)).toBe(true);
   });
 });
