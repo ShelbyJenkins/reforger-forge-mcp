@@ -8,7 +8,14 @@
 
 import { existsSync } from "node:fs";
 import { join } from "node:path";
-import type { Config } from "../config.js";
+import {
+  MCP_IDLE_SHUTDOWN_DEFAULT_MS,
+  type Config,
+} from "../config.js";
+import {
+  externallyManagedMcpLifecycleDiagnostic,
+  type McpLifecycleDiagnostic,
+} from "../mcp-idle-shutdown.js";
 import {
   validateMcpHostIdentity,
   type McpHostIdentity,
@@ -62,6 +69,7 @@ export interface LifecycleDiagnostic {
 
 export interface DiagnosticReport {
   mcpHost: McpHostIdentity;
+  mcpLifecycle: McpLifecycleDiagnostic;
   host: string;
   port: number;
   workbenchExe: { path: string; exists: boolean } | null;
@@ -89,6 +97,7 @@ export interface WorkbenchDiagnosticOptions {
   readonly host: string;
   readonly port: number;
   readonly config?: Config;
+  readonly mcpLifecycle?: () => McpLifecycleDiagnostic;
   readonly lifecycle: Pick<WorkbenchProcessGuard, "mcpInstanceId" | "readLifecycleState">;
   readonly callNetApi: <T = Record<string, unknown>>(
     apiFunc: string,
@@ -248,6 +257,10 @@ export async function diagnoseWorkbench(
 
   return {
     mcpHost: hostIdentity,
+    mcpLifecycle: options.mcpLifecycle?.() ?? externallyManagedMcpLifecycleDiagnostic(
+      hostIdentity,
+      options.config?.mcpIdleShutdownMs ?? MCP_IDLE_SHUTDOWN_DEFAULT_MS,
+    ),
     host: options.host,
     port: options.port,
     workbenchExe: workbenchExePath

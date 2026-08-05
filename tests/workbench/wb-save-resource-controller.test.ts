@@ -16,6 +16,7 @@ function config(): Config {
     patternsDir: "C:\\Patterns",
     workbenchHost: "127.0.0.1",
     workbenchPort: 5775,
+    mcpIdleShutdownMs: 1_800_000,
   };
 }
 

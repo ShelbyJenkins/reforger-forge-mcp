@@ -22,7 +22,7 @@ function report(
   overrides: Partial<ServerVerificationReport> = {}
 ): ServerVerificationReport {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     generatedAt: "2026-07-24T00:00:00.000Z",
     success: true,
     nodeVersion: "v22.0.0",
@@ -51,6 +51,7 @@ function report(
       workbenchAddonDirs: ["D:\\Arma Reforger\\addons"],
       workbenchHost: "127.0.0.1",
       workbenchPort: 5775,
+      mcpIdleShutdownMs: 1_800_000,
       issues: [],
     },
     serverHandshake: { status: "passed", issues: [] },
@@ -99,7 +100,7 @@ describe("serialized verification report gate", () => {
   it("rejects schema drift and a forged success bit", () => {
     expect(() => parseServerVerificationReport({
       ...report(),
-      schemaVersion: 99,
+      schemaVersion: 1,
     })).toThrow("Unsupported verification report schema");
 
     expect(() => parseServerVerificationReport({
@@ -110,6 +111,26 @@ describe("serialized verification report gate", () => {
         issues: ["Handshake failed."],
       },
     })).toThrow("success does not agree");
+  });
+
+  it("requires a bounded idle timeout whenever effective settings passed", () => {
+    const complete = report();
+    const { mcpIdleShutdownMs: _missing, ...withoutIdleTimeout } =
+      complete.effectiveSettings;
+    expect(() => parseServerVerificationReport({
+      ...complete,
+      effectiveSettings: withoutIdleTimeout,
+    })).toThrow("effectiveSettings.mcpIdleShutdownMs is invalid");
+
+    for (const mcpIdleShutdownMs of [59_999, 60_000.5, 86_400_001]) {
+      expect(() => parseServerVerificationReport({
+        ...complete,
+        effectiveSettings: {
+          ...complete.effectiveSettings,
+          mcpIdleShutdownMs,
+        },
+      })).toThrow("effectiveSettings.mcpIdleShutdownMs is invalid");
+    }
   });
 
   it("rejects a successful report that does not prove the package version", () => {

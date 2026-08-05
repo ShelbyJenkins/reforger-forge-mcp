@@ -323,6 +323,7 @@ export async function runDoctor(
       workbenchAddonDirs: [
         ...(report?.effectiveSettings.workbenchAddonDirs ?? []),
       ],
+      mcpIdleShutdownMs: report?.effectiveSettings.mcpIdleShutdownMs ?? null,
       startupArguments:
         report?.startupArguments ?? startupArguments,
       steamCandidates: {

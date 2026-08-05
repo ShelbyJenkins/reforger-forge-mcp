@@ -1,21 +1,16 @@
 #!/usr/bin/env node
 
 import { randomUUID } from "node:crypto";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { performance } from "node:perf_hooks";
 import {
   CONFIGURATION_USAGE,
   loadConfig,
   partitionConfigurationArguments,
-  type Config,
 } from "./config.js";
-import { registerTools } from "./server.js";
-import { runCliShutdown } from "./mcp-lifecycle.js";
 import {
   createMcpHostIdentity,
   formatMcpProcessTitle,
   partitionMcpHostArguments,
-  type McpHostIdentity,
 } from "./mcp-host-identity.js";
 import {
   discoverSteamInstallations,
@@ -28,8 +23,12 @@ import {
   parseCheckAddonDirsArguments,
 } from "./workbench/addon-dirs-diagnostic.js";
 import { logger, setDebugEnabled } from "./utils/logger.js";
+import {
+  MCP_SERVER_VERSION,
+  runMcpStdioServer,
+} from "./mcp-stdio-server.js";
 
-const SERVER_VERSION = "1.2.0";
+const SERVER_VERSION = MCP_SERVER_VERSION;
 
 function usage(): string {
   return [
@@ -49,65 +48,6 @@ function usage(): string {
     "  --version                                Show the package version.",
     "",
   ].join("\n");
-}
-
-async function runServer(config: Config, hostIdentity: McpHostIdentity): Promise<void> {
-  const server = new McpServer({
-    name: "reforger-forge-mcp",
-    version: SERVER_VERSION,
-  });
-  const disposeTools = registerTools(server, config, { hostIdentity });
-  const transport = new StdioServerTransport();
-  let shutdownPromise: Promise<void> | null = null;
-
-  const shutdown = (reason: string): Promise<void> => {
-    if (shutdownPromise) return shutdownPromise;
-    shutdownPromise = (async () => {
-      process.stdin.off("end", onStdinEnd);
-      process.stdin.off("close", onStdinClose);
-      process.off("SIGINT", onSigint);
-      process.off("SIGTERM", onSigterm);
-      await runCliShutdown({
-        reason,
-        closeProtocol: () => server.close(),
-        disposeTools: (deadlineAtMs) => disposeTools(deadlineAtMs),
-        emergencyTerminate: disposeTools.emergencyTerminate,
-        emergencyCleanup: disposeTools.emergencyCleanup,
-        info: logger.info,
-        warn: logger.warn,
-        error: logger.error,
-        exit: (code) => process.exit(code),
-      });
-    })();
-    return shutdownPromise;
-  };
-
-  const requestShutdown = (reason: string): void => {
-    void shutdown(reason).catch((error) => {
-      process.exitCode = 1;
-      logger.error(`MCP shutdown orchestration failed: ${error instanceof Error ? error.message : String(error)}`);
-    });
-  };
-  function onStdinEnd(): void { requestShutdown("stdin EOF"); }
-  function onStdinClose(): void { requestShutdown("stdin closed"); }
-  function onSigint(): void { requestShutdown("SIGINT"); }
-  function onSigterm(): void { requestShutdown("SIGTERM"); }
-
-  process.stdin.once("end", onStdinEnd);
-  process.stdin.once("close", onStdinClose);
-  process.once("SIGINT", onSigint);
-  process.once("SIGTERM", onSigterm);
-
-  try {
-    await server.connect(transport);
-    logger.info(
-      `MCP host started product=${hostIdentity.product} client=${hostIdentity.clientLabel} ` +
-      `instanceId=${hostIdentity.instanceId} pid=${hostIdentity.pid}`
-    );
-  } catch (error) {
-    await shutdown("startup failure").catch(() => undefined);
-    throw error;
-  }
 }
 
 async function main(argv: readonly string[]): Promise<void> {
@@ -168,7 +108,21 @@ async function main(argv: readonly string[]): Promise<void> {
     startedAt: new Date().toISOString(),
   });
   process.title = formatMcpProcessTitle(hostIdentity);
-  await runServer(config, hostIdentity);
+  await runMcpStdioServer({
+    config,
+    hostIdentity,
+    stdin: process.stdin,
+    stdout: process.stdout,
+    signals: process,
+    logger,
+    nowTick: () => performance.now(),
+    nowWall: () => new Date(),
+    scheduleTurn: (callback) => setImmediate(callback),
+    setTimer: (callback, milliseconds) => setTimeout(callback, milliseconds),
+    clearTimer: (handle) => clearTimeout(handle as NodeJS.Timeout),
+    exit: (code) => process.exit(code),
+    setExitCode: (code) => { process.exitCode = code; },
+  });
 }
 
 try {

@@ -24,6 +24,13 @@ the normal shared configuration flags, including repeated
 for configuration precedence, add-on-root discovery, and the full flag
 reference.
 
+The shared parser accepts `mcpIdleShutdownMs` and
+`--mcp-idle-shutdown-ms` so one explicit configuration has the same validated
+shape everywhere. The standalone Workbench runner does not start an MCP
+transport or an inactivity timer and never acts on that value; its lifetime is
+controlled only by the selected editor/build/check intent and that intent's
+documented timeout or foreground policy.
+
 ## Output and exit codes
 
 On a completed invocation, the runner writes exactly one JSON receipt to

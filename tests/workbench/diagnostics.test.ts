@@ -159,11 +159,58 @@ describe("Workbench diagnostics", () => {
     expect(lifecycle.readLifecycleState).toHaveBeenCalledOnce();
     expect(report).toMatchObject({
       mcpHost: hostIdentity,
+      mcpLifecycle: {
+        schemaVersion: 1,
+        instanceId: hostIdentity.instanceId,
+        idleShutdownMs: 1_800_000,
+        state: "externally_managed",
+        activeRequestCount: null,
+        lastActivityAt: null,
+        eligibleAt: null,
+        readinessComplete: null,
+        blockerCodes: [],
+      },
       host: "127.0.0.1",
       port: 5775,
       workbenchExe: null,
       netApi: "up_with_companion",
       lifecycle: { state: "missing", lease: "vacant" },
+    });
+  });
+
+  it("reports a bounded CLI lifecycle snapshot for the same immutable host identity", async () => {
+    const report = await diagnoseWorkbench({
+      hostIdentity,
+      host: "127.0.0.1",
+      port: 5775,
+      lifecycle: lifecycleReader({ kind: "missing" }),
+      callNetApi: async <T = Record<string, unknown>>() =>
+        WORKBENCH_HELPER_PING_RESPONSE as unknown as T,
+      classifyNetError: () => null,
+      mcpLifecycle: () => ({
+        schemaVersion: 1,
+        instanceId: hostIdentity.instanceId,
+        idleShutdownMs: 60_000,
+        state: "blocked",
+        activeRequestCount: 0,
+        lastActivityAt: "2026-08-05T12:34:56.789Z",
+        eligibleAt: "2026-08-05T12:35:56.789Z",
+        readinessComplete: true,
+        blockerCodes: ["OBSERVER_CHILD"],
+      }),
+    });
+
+    expect(report.mcpHost.instanceId).toBe(hostIdentity.instanceId);
+    expect(report.mcpLifecycle).toEqual({
+      schemaVersion: 1,
+      instanceId: hostIdentity.instanceId,
+      idleShutdownMs: 60_000,
+      state: "blocked",
+      activeRequestCount: 0,
+      lastActivityAt: "2026-08-05T12:34:56.789Z",
+      eligibleAt: "2026-08-05T12:35:56.789Z",
+      readinessComplete: true,
+      blockerCodes: ["OBSERVER_CHILD"],
     });
   });
 

@@ -85,7 +85,7 @@ describe("observer package and source contracts", () => {
     );
 
     for (const source of [enforce, mailbox]) {
-      expect(source).toContain("EXPLICIT_CONFIGURATION_CONTRACT_VERSION !== 2");
+      expect(source).toContain("EXPLICIT_CONFIGURATION_CONTRACT_VERSION !== 3");
       expect(source).toContain("Compiled configuration loader is older than src/config.ts");
       expect(source).toContain('loadConfig(argumentsArray)');
     }
@@ -205,7 +205,14 @@ describe("observer package and source contracts", () => {
     const packageCheck = readFileSync(join(repositoryRoot, "scripts", "check-package.mjs"), "utf8");
     expect(packageCheck).toContain("docs/release-notes/RELEASE_NOTES_v1.2.0.md");
     const serverEntry = readFileSync(join(repositoryRoot, "src", "index.ts"), "utf8");
-    expect(serverEntry).toContain(`const SERVER_VERSION = "${packageJson.version}"`);
+    const stdioComposition = readFileSync(
+      join(repositoryRoot, "src", "mcp-stdio-server.ts"),
+      "utf8",
+    );
+    expect(stdioComposition).toContain(
+      `export const MCP_SERVER_VERSION = "${packageJson.version}"`
+    );
+    expect(serverEntry).toContain("const SERVER_VERSION = MCP_SERVER_VERSION");
     expect(packageCheck).toContain("dist/observer/agent/private-child.js");
     expect(packageCheck).toContain("dist/observer/agent/application.js");
     expect(packageCheck).toContain("dist/observer/agent/application-operations.js");
@@ -397,12 +404,17 @@ describe("observer package and source contracts", () => {
     expect(server).not.toContain(".server.onclose");
     expect(server).not.toContain("protocolServer");
     const entrypoint = readFileSync(join(repositoryRoot, "src", "index.ts"), "utf8");
-    expect(entrypoint).toContain("process.stdin.once(\"end\", onStdinEnd)");
-    expect(entrypoint).toContain("process.once(\"SIGINT\", onSigint)");
-    expect(entrypoint).toContain("process.once(\"SIGTERM\", onSigterm)");
-    expect(entrypoint.indexOf("closeProtocol: () => server.close()"))
-      .toBeLessThan(entrypoint.indexOf("disposeTools: (deadlineAtMs) => disposeTools(deadlineAtMs)"));
-    expect(entrypoint).not.toContain("shutdownHold");
+    const stdioComposition = readFileSync(
+      join(repositoryRoot, "src", "mcp-stdio-server.ts"),
+      "utf8",
+    );
+    expect(entrypoint).toContain("runMcpStdioServer({");
+    expect(stdioComposition).toContain("options.stdin.once(\"end\", onStdinEnd)");
+    expect(stdioComposition).toContain("options.signals.once(\"SIGINT\", onSigint)");
+    expect(stdioComposition).toContain("options.signals.once(\"SIGTERM\", onSigterm)");
+    expect(stdioComposition.indexOf("closeProtocol: () => server.close()"))
+      .toBeLessThan(stdioComposition.indexOf("disposeTools: (deadlineAtMs) => disposeTools(deadlineAtMs)"));
+    expect(stdioComposition).not.toContain("shutdownHold");
     const integrationSource = filesRecursively(observerSource)
       .map((path) => readFileSync(path, "utf8"))
       .join("\n");

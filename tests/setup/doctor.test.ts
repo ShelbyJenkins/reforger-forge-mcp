@@ -26,7 +26,7 @@ function verificationReport(
   overrides: Partial<ServerVerificationReport> = {}
 ): ServerVerificationReport {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     generatedAt: "2026-07-24T00:00:00.000Z",
     success: true,
     nodeVersion: "v22.0.0",
@@ -55,6 +55,7 @@ function verificationReport(
       workbenchAddonDirs: ["D:\\Arma Reforger\\addons"],
       workbenchHost: "127.0.0.1",
       workbenchPort: 5775,
+      mcpIdleShutdownMs: 1_800_000,
       issues: [],
     },
     serverHandshake: { status: "passed", issues: [] },

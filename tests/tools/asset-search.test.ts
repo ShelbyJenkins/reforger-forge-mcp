@@ -89,6 +89,7 @@ describe("asset_search resource GUIDs", () => {
         patternsDir: join(root, "patterns"),
         workbenchHost: "127.0.0.1",
         workbenchPort: 5775,
+        mcpIdleShutdownMs: 1_800_000,
       });
       const result = await handler({
         query: "GameMode_Plain",
@@ -125,6 +126,7 @@ describe("asset_search resource GUIDs", () => {
         patternsDir: join(root, "patterns"),
         workbenchHost: "127.0.0.1",
         workbenchPort: 5775,
+        mcpIdleShutdownMs: 1_800_000,
       });
       const result = await handler({
         query: "BarrelGreen_01",

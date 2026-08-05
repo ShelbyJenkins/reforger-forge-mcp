@@ -12,6 +12,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Config } from "../../src/config.js";
 import type { SteamDiscoveryResult } from "../../src/platform/windows/steam-discovery.js";
 import {
+  formatServerVerificationReport,
   inspectToolRegistration,
   isServerVerificationSuccessful,
   serializeServerVerificationReport,
@@ -60,6 +61,7 @@ const config: Config = {
   patternsDir: "C:\\Package\\data\\patterns",
   workbenchHost: "127.0.0.1",
   workbenchPort: 5775,
+  mcpIdleShutdownMs: 1_800_000,
   debug: false,
 };
 
@@ -168,7 +170,7 @@ describe("server verification core", () => {
     const report = await verify(fixture, root, startupArguments, "codex");
 
     expect(report).toMatchObject({
-      schemaVersion: 1,
+      schemaVersion: 2,
       generatedAt: "2026-07-24T12:00:00.000Z",
       success: true,
       nodeVersion: "v22.17.0",
@@ -188,6 +190,7 @@ describe("server verification core", () => {
         workbenchAddonDirs: config.workbenchAddonDirs,
         workbenchHost: "127.0.0.1",
         workbenchPort: 5775,
+        mcpIdleShutdownMs: 1_800_000,
       },
       serverHandshake: { status: "passed" },
       toolRegistration: {
@@ -196,6 +199,9 @@ describe("server verification core", () => {
       },
     });
     expect(report.startupArguments).toEqual(startupArguments);
+    expect(formatServerVerificationReport(report)).toContain(
+      "MCP idle:   1800000 ms"
+    );
     expect(fixture.discoverSteam).toHaveBeenCalledOnce();
     expect(fixture.loadConfiguration).toHaveBeenCalledOnce();
     expect(fixture.loadConfiguration.mock.calls[0][0]).toEqual(startupArguments);

@@ -45,6 +45,11 @@ function readServerEntry(
 }
 
 describe("standard MCP client configuration contract", () => {
+  it("keeps the example timeout explicit and within the server-only bounds", () => {
+    const example = JSON.parse(read("reforger-forge.config.example.json")) as Record<string, unknown>;
+    expect(example.mcpIdleShutdownMs).toBe(1_800_000);
+  });
+
   it.each(clientTemplates)(
     "$path launches a labeled Node host with no configuration overrides",
     ({ path, rootKey, clientLabel }) => {

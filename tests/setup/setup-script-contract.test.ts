@@ -168,7 +168,7 @@ describe("one-command setup orchestration contract", () => {
       expect(output).toContain(
         "-CheckWorkbench is valid only with -Doctor"
       );
-      expect(result.stdout).toContain("Receipt schema: 1");
+      expect(result.stdout).toContain("Receipt schema: 2");
       expect(result.stdout).toContain("Overall status: failed");
       for (const label of [
         "Steam discovery:",
@@ -219,7 +219,7 @@ describe("one-command setup orchestration contract", () => {
         managedChanges?: unknown[];
       };
       expect(receipt).toMatchObject({
-        schemaVersion: 1,
+        schemaVersion: 2,
         operation: "setup",
         overallStatus: "failed",
       });

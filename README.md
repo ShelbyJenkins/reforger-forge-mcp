@@ -60,8 +60,15 @@ reference is in [SETUP.md](SETUP.md#optional-configuration).
 | Tool input `gprojPath` | Select the exact addon for writes; when omitted, supported tools use the verified project in the running Workbench lifecycle. |
 | `workbenchPath`, `gamePath` / `--workbench-path`, `--game-path` | Override automatic Steam discovery for a nonstandard installation. |
 | `workbenchAddonDirs` / repeat `--workbench-addon-dir` | Add nonstandard dependency roots while retaining normal discovered roots. |
+| `mcpIdleShutdownMs` / `--mcp-idle-shutdown-ms` | Set safe stdio-host inactivity shutdown from 60000 through 86400000 ms; the default is 1800000 ms (30 minutes). |
 | `observer.evidenceRoots` / repeat `--observer-evidence-root` | Allowlist where reviewed Observer evidence may be finalized. |
 | `debug` / `--debug` | Enable diagnostic logging for the explicitly configured server process. |
+
+The CLI stdio host exits after the configured interval only when protocol work
+has settled and its bounded Workbench/Observer readiness proof is complete.
+Live, busy, foreign, malformed, or uncertain lifecycle evidence keeps that host
+open. Client disconnect, stdin close, and process signals still begin shutdown
+immediately; the inactivity interval has no disable value.
 
 ## Documentation
 

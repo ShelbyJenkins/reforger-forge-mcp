@@ -60,8 +60,8 @@ function assertRevision(revision: number): number {
 /**
  * One process-wide, default-open admission fence.
  *
- * Commit 14 never seals this gate in production. It provides the synchronous
- * token and proof mechanics used by Commit 15's protocol/activity transaction.
+ * Embedded compositions leave this gate open. The CLI idle controller is the
+ * sole production actor that may consume a complete proof and seal it.
  */
 export class McpHostAdmissionGate implements McpAdmissionRevisionSource {
   private readonly slots = new Map<symbol, AdmissionSlot>();

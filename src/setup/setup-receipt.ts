@@ -10,7 +10,7 @@ import type {
   VerificationStage,
 } from "./server-verification.js";
 
-export const SETUP_RECEIPT_SCHEMA_VERSION = 1 as const;
+export const SETUP_RECEIPT_SCHEMA_VERSION = 2 as const;
 
 export type SetupReceiptOperation = "setup" | "doctor";
 export type SetupReceiptOverallStatus =
@@ -58,6 +58,7 @@ export interface SetupSettingsReceipt {
   readonly gamePath: string | null;
   readonly workbenchPath: string | null;
   readonly workbenchAddonDirs: readonly string[];
+  readonly mcpIdleShutdownMs: number | null;
   readonly startupArguments: readonly string[];
   readonly steamCandidates: SteamCandidateReceipt;
 }
@@ -341,6 +342,7 @@ export function composeSetupReceiptFromReports(
       workbenchAddonDirs: [
         ...(report.effectiveSettings.workbenchAddonDirs ?? []),
       ],
+      mcpIdleShutdownMs: report.effectiveSettings.mcpIdleShutdownMs ?? null,
       startupArguments: [...report.startupArguments],
       steamCandidates: {
         game: [...report.steamDiscovery.gameCandidates],
@@ -412,6 +414,7 @@ export function createSetupFailureReceipt(
       gamePath: null,
       workbenchPath: null,
       workbenchAddonDirs: [],
+      mcpIdleShutdownMs: null,
       startupArguments: [],
       steamCandidates: { game: [], workbench: [] },
     },
@@ -553,6 +556,9 @@ export function formatSetupReceipt(receipt: SetupReceipt): string {
         ? settings.workbenchAddonDirs.join(", ")
         : "none"
     }`,
+    `MCP idle exit:  ${settings.mcpIdleShutdownMs === null
+      ? "not resolved"
+      : `${settings.mcpIdleShutdownMs} ms`}`,
     `Startup args:   ${
       settings.startupArguments.length > 0
         ? JSON.stringify(settings.startupArguments)

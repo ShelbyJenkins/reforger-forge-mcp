@@ -67,8 +67,13 @@ Host lifecycle code can form a bounded internal idle-readiness proof from the
 same UUID. The proof is host-scoped and existing-only: it never starts a child,
 creates state, repairs/sweeps receipts, revokes a session, or stops Workbench or
 the game. Legacy-unattributed, malformed, incomplete, timed-out, or racing
-evidence blocks the proof. The admission gate is intentionally default-open in
-this foundation; it does not itself add an idle timer or automatic MCP exit.
+evidence blocks the proof. The admission gate remains default-open in embedded
+compositions. In the CLI stdio composition, a 30-minute-default bounded
+inactivity controller uses the proof to atomically seal new host and protocol
+admissions before normal shutdown. Active or uncertain lifecycle work keeps
+the host open; a sole ready private Observer child with no pending work is
+closed by the normal disposer. This controller is process-local and never
+reaps another host or terminates an unowned Workbench or game process.
 
 Start attended Workbench only through **wb_launch** while an MCP session owns
 the lifecycle. The standalone `reforger-forge-workbench editor` runner is for a

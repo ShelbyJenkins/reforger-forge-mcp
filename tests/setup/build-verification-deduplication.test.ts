@@ -37,7 +37,7 @@ function canonicalReceiptJson(
     issues: [],
   });
   return JSON.stringify({
-    schemaVersion: 1,
+    schemaVersion: 2,
     operation,
     overallStatus,
     runtime: {
@@ -53,6 +53,7 @@ function canonicalReceiptJson(
       gamePath: "fixture-game",
       workbenchPath: "fixture-tools",
       workbenchAddonDirs: [],
+      mcpIdleShutdownMs: overallStatus === "passed" ? 1_800_000 : null,
       startupArguments: [],
       steamCandidates: { game: [], workbench: [] },
     },
@@ -96,6 +97,22 @@ function canonicalReceiptWithoutManagedChanges(): string {
     canonicalReceiptJson("setup", "passed")
   ) as Record<string, unknown>;
   delete receipt.managedChanges;
+  return JSON.stringify(receipt);
+}
+
+function canonicalReceiptWithoutIdleTimeout(): string {
+  const receipt = JSON.parse(
+    canonicalReceiptJson("setup", "passed")
+  ) as { settings: Record<string, unknown> };
+  delete receipt.settings.mcpIdleShutdownMs;
+  return JSON.stringify(receipt);
+}
+
+function canonicalUnresolvedReceiptWithIdleTimeout(): string {
+  const receipt = JSON.parse(
+    canonicalReceiptJson("setup", "failed")
+  ) as { settings: Record<string, unknown> };
+  receipt.settings.mcpIdleShutdownMs = 1_800_000;
   return JSON.stringify(receipt);
 }
 
@@ -147,6 +164,14 @@ function setupHarness(): {
       '  if /I "%ISSUE05_REGISTRATION_RECEIPT_MODE%"=="missing-managed" (',
       `    echo ${canonicalReceiptWithoutManagedChanges()}`,
       "    exit /b 0",
+      "  )",
+      '  if /I "%ISSUE05_REGISTRATION_RECEIPT_MODE%"=="missing-idle-timeout" (',
+      `    echo ${canonicalReceiptWithoutIdleTimeout()}`,
+      "    exit /b 0",
+      "  )",
+      '  if /I "%ISSUE05_REGISTRATION_RECEIPT_MODE%"=="unresolved-idle-timeout" (',
+      `    echo ${canonicalUnresolvedReceiptWithIdleTimeout()}`,
+      "    exit /b 1",
       "  )",
       '  if /I "%ISSUE05_REGISTRATION_RECEIPT_MODE%"=="managed-change" (',
       `    echo ${canonicalReceiptJson("setup", "passed", [{
@@ -385,7 +410,7 @@ describe("Issue 04 build and verification lifecycle", () => {
       expect(result.error).toBeUndefined();
       expect(result.status).toBe(0);
       expect(JSON.parse(result.stdout)).toMatchObject({
-        schemaVersion: 1,
+        schemaVersion: 2,
         operation: "doctor",
       });
       expect(calls(harness)).toHaveLength(1);
@@ -409,7 +434,7 @@ describe("Issue 04 build and verification lifecycle", () => {
       expect(result.error).toBeUndefined();
       expect(result.status).toBe(1);
       expect(result.stdout).toContain("ReforgerForge doctor failed");
-      expect(result.stdout).toContain("Receipt schema: 1");
+      expect(result.stdout).toContain("Receipt schema: 2");
       expect(result.stdout).toContain("Overall status: failed");
       expect(result.stdout).toContain("Failed layer:   doctor");
       for (const label of [
@@ -461,7 +486,7 @@ describe("Issue 04 build and verification lifecycle", () => {
       expect(result.error).toBeUndefined();
       expect(result.status).toBe(0);
       expect(JSON.parse(result.stdout)).toMatchObject({
-        schemaVersion: 1,
+        schemaVersion: 2,
         operation: "setup",
         overallStatus: "passed",
       });
@@ -498,7 +523,7 @@ describe("Issue 04 build and verification lifecycle", () => {
       expect(result.error).toBeUndefined();
       expect(result.status).toBe(1);
       expect(result.stdout).toContain("ReforgerForge setup failed");
-      expect(result.stdout).toContain("Receipt schema: 1");
+      expect(result.stdout).toContain("Receipt schema: 2");
       expect(result.stdout).toContain("Failed layer:   registration");
       expect(result.stdout).toContain(
         "Client registration exited without a valid receipt."
@@ -506,6 +531,22 @@ describe("Issue 04 build and verification lifecycle", () => {
       expect(calls(harness).at(-1)).toMatch(
         /register-clients-cli\.js .* --json$/
       );
+    }
+  );
+
+  windowsIt(
+    "rejects receipts that omit a resolved idle timeout or invent one before settings resolve",
+    () => {
+      for (const mode of ["missing-idle-timeout", "unresolved-idle-timeout"]) {
+        const harness = setupHarness();
+        harness.environment.ISSUE05_REGISTRATION_RECEIPT_MODE = mode;
+        const result = runSetup(harness);
+
+        expect(result.error, mode).toBeUndefined();
+        expect(result.status, mode).toBe(1);
+        expect(result.stdout, mode).toContain("ReforgerForge setup failed");
+        expect(result.stdout, mode).toContain("Failed layer:   registration");
+      }
     }
   );
 

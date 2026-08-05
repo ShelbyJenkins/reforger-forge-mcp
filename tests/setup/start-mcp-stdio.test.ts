@@ -231,6 +231,74 @@ describe("shared project MCP stdio launcher", () => {
     expect(serveInvocation).toContain("--mcp-client-label cursor");
     expect(serveInvocation).not.toContain("verify-mcp-server.mjs");
     expect(serveInvocation).toContain(resolve(addonRoot));
+    const sharedMarker = "--mcp-client-label cursor";
+    expect(serveInvocation.slice(serveInvocation.indexOf(sharedMarker))).toBe(
+      verifyInvocation.slice(verifyInvocation.indexOf(sharedMarker))
+    );
+  });
+
+  windowsIt("forwards an explicit bounded idle timeout identically without inventing a default", () => {
+    const root = temporaryRoot();
+    const nodePath = fakeNode(root);
+    const capturePath = join(root, "capture.txt");
+    const environment = {
+      REFORGER_FORGE_NODE_PATH: nodePath,
+      LAUNCHER_CAPTURE_PATH: capturePath,
+    };
+
+    const described = runScript(sharedLauncher, [
+      "-Mode", "Describe",
+      "-McpIdleShutdownMs", "60000",
+    ], environment);
+    expect(described.status, described.stderr).toBe(0);
+    expect((JSON.parse(described.stdout) as LauncherDescriptor).configurationArguments).toEqual([
+      "--mcp-idle-shutdown-ms",
+      "60000",
+    ]);
+
+    const describedMaximum = runScript(sharedLauncher, [
+      "-Mode", "Describe",
+      "-McpIdleShutdownMs", "86400000",
+    ], environment);
+    expect(describedMaximum.status, describedMaximum.stderr).toBe(0);
+    expect((JSON.parse(describedMaximum.stdout) as LauncherDescriptor).configurationArguments).toEqual([
+      "--mcp-idle-shutdown-ms",
+      "86400000",
+    ]);
+
+    const verified = runScript(sharedLauncher, [
+      "-Mode", "Verify",
+      "-McpIdleShutdownMs", "60000",
+    ], environment);
+    expect(verified.status, verified.stderr).toBe(0);
+    const verifyInvocation = readFileSync(capturePath, "utf8");
+    expect(verifyInvocation).toContain(
+      "--mcp-idle-shutdown-ms 60000"
+    );
+
+    rmSync(capturePath, { force: true });
+    const served = runScript(sharedLauncher, [
+      "-McpIdleShutdownMs", "60000",
+    ], environment);
+    expect(served.status, served.stderr).toBe(0);
+    const serveInvocation = readFileSync(capturePath, "utf8");
+    expect(serveInvocation).toContain(
+      "--mcp-idle-shutdown-ms 60000"
+    );
+    const sharedMarker = "--mcp-idle-shutdown-ms 60000";
+    expect(serveInvocation.slice(serveInvocation.indexOf(sharedMarker))).toBe(
+      verifyInvocation.slice(verifyInvocation.indexOf(sharedMarker))
+    );
+
+    for (const rejectedValue of ["59999", "86400001"]) {
+      const rejected = runScript(sharedLauncher, [
+        "-Mode", "Describe",
+        "-McpIdleShutdownMs", rejectedValue,
+      ], environment);
+      expect(rejected.status, rejectedValue).not.toBe(0);
+      expect(rejected.stdout, rejectedValue).toBe("");
+      expect(rejected.stderr, rejectedValue).toContain(rejectedValue);
+    }
   });
 
   windowsIt("fails closed when the authoritative Node override is older than v24", () => {

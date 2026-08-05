@@ -82,6 +82,7 @@ import {
   type IdleShutdownInspectionOptions,
   type IdleShutdownReadiness,
 } from "./mcp-idle-readiness.js";
+import type { McpLifecycleDiagnostic } from "./mcp-idle-shutdown.js";
 
 /**
  * Explicit application shutdown contract returned by {@link registerTools}.
@@ -96,7 +97,7 @@ export interface RegisteredToolsDisposer {
   emergencyCleanup(): void;
   /** Bounded, read-only proof; it never quiesces, repairs, or closes anything. */
   inspectIdleShutdownReadiness(options: IdleShutdownInspectionOptions): Promise<IdleShutdownReadiness>;
-  /** Commit 14 test seam; production does not seal admissions until Commit 15. */
+  /** Synchronously seals host admissions after a complete idle proof. */
   trySealIdleAdmissions(proof: McpIdleSealProof | null | undefined): boolean;
 }
 
@@ -105,6 +106,8 @@ export interface RegisterToolsOptions {
   searchEngine?: SearchEngine;
   /** One trusted process-wide identity shared by all lifecycle subsystems. */
   hostIdentity?: McpHostIdentity;
+  /** CLI-only dynamic lifecycle diagnostics; embedders omit this callback. */
+  mcpLifecycleDiagnostic?: () => McpLifecycleDiagnostic;
 }
 
 /**
@@ -136,6 +139,7 @@ export function createWorkbenchServerComposition(
   config: Config,
   hostIdentity: McpHostIdentity = fallbackHostIdentity(),
   admissionGate: McpHostAdmissionGate = new McpHostAdmissionGate(),
+  mcpLifecycleDiagnostic?: () => McpLifecycleDiagnostic,
 ): WorkbenchServerComposition {
   const trustedHostIdentity = validateMcpHostIdentity(hostIdentity);
   const observerConfig = config.observer;
@@ -169,6 +173,7 @@ export function createWorkbenchServerComposition(
       diagnostics,
       hostIdentity: trustedHostIdentity,
       admissionGate,
+      mcpLifecycleDiagnostic,
     }
   );
 
@@ -198,7 +203,12 @@ export function registerTools(
   const patterns = new PatternLibrary(config.patternsDir);
   const observerConfig = config.observer;
   const admissionGate = new McpHostAdmissionGate();
-  const workbenchComposition = createWorkbenchServerComposition(config, hostIdentity, admissionGate);
+  const workbenchComposition = createWorkbenchServerComposition(
+    config,
+    hostIdentity,
+    admissionGate,
+    options.mcpLifecycleDiagnostic,
+  );
   const wbClient = workbenchComposition.client;
 
   // Phase 0 tools

@@ -22,6 +22,16 @@ export function registerWbDiagnose(server: McpServer, client: WorkbenchClient): 
       lines.push(`- **PID:** ${report.mcpHost.pid}`);
       lines.push(`- **Started:** ${report.mcpHost.startedAt}`);
 
+      lines.push("\n### MCP Lifecycle");
+      lines.push(`- **Instance:** ${report.mcpLifecycle.instanceId}`);
+      lines.push(`- **Mode:** ${report.mcpLifecycle.state}`);
+      lines.push(`- **Idle shutdown:** ${report.mcpLifecycle.idleShutdownMs} ms`);
+      lines.push(`- **Active request slots:** ${report.mcpLifecycle.activeRequestCount ?? "externally managed"}`);
+      lines.push(`- **Last activity:** ${report.mcpLifecycle.lastActivityAt ?? "externally managed"}`);
+      lines.push(`- **Eligible at:** ${report.mcpLifecycle.eligibleAt ?? "externally managed"}`);
+      lines.push(`- **Readiness complete:** ${report.mcpLifecycle.readinessComplete ?? "not checked"}`);
+      lines.push(`- **Blockers:** ${report.mcpLifecycle.blockerCodes.join(", ") || "none"}`);
+
       lines.push("\n### Configuration");
       lines.push(`- **NET API:** ${report.host}:${report.port}`);
       lines.push(report.workbenchExe

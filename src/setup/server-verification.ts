@@ -12,6 +12,8 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import {
   loadConfig,
+  MCP_IDLE_SHUTDOWN_MAX_MS,
+  MCP_IDLE_SHUTDOWN_MIN_MS,
   type Config,
   type LoadConfigOptions,
 } from "../config.js";
@@ -29,7 +31,7 @@ import {
 
 const execFileAsync = promisify(execFile);
 
-export const SERVER_VERIFICATION_REPORT_SCHEMA_VERSION = 1 as const;
+export const SERVER_VERIFICATION_REPORT_SCHEMA_VERSION = 2 as const;
 
 export type VerificationStatus =
   | "passed"
@@ -61,6 +63,7 @@ export interface EffectiveSettingsVerification extends VerificationStage {
   workbenchAddonDirs?: string[];
   workbenchHost?: string;
   workbenchPort?: number;
+  mcpIdleShutdownMs?: number;
 }
 
 export interface ToolRegistrationVerification extends VerificationStage {
@@ -542,6 +545,18 @@ export function parseServerVerificationReport(
       "Verification report field effectiveSettings.workbenchPort is invalid."
     );
   }
+  const idleShutdownMs = effectiveSettingsRecord.mcpIdleShutdownMs;
+  if (
+    (effectiveSettingsRecord.status === "passed" && idleShutdownMs === undefined) ||
+    (idleShutdownMs !== undefined &&
+      (!Number.isSafeInteger(idleShutdownMs) ||
+        Number(idleShutdownMs) < MCP_IDLE_SHUTDOWN_MIN_MS ||
+        Number(idleShutdownMs) > MCP_IDLE_SHUTDOWN_MAX_MS))
+  ) {
+    throw new Error(
+      "Verification report field effectiveSettings.mcpIdleShutdownMs is invalid."
+    );
+  }
 
   requireStage(value.serverHandshake, "serverHandshake");
   requireStage(value.toolRegistration, "toolRegistration");
@@ -700,6 +715,7 @@ export async function verifyMcpServer(
       workbenchAddonDirs: [...(effectiveConfig.workbenchAddonDirs ?? [])],
       workbenchHost: effectiveConfig.workbenchHost,
       workbenchPort: effectiveConfig.workbenchPort,
+      mcpIdleShutdownMs: effectiveConfig.mcpIdleShutdownMs,
       issues: [],
     };
   } else if (discovery.status === "success" && discoveryThrown === undefined) {
@@ -852,7 +868,8 @@ export function formatServerVerificationReport(
       "",
       `Tools path: ${report.effectiveSettings.workbenchPath}`,
       `Game path:  ${report.effectiveSettings.gamePath}`,
-      `Addons:     ${(report.effectiveSettings.workbenchAddonDirs ?? []).join(", ") || "none"}`
+      `Addons:     ${(report.effectiveSettings.workbenchAddonDirs ?? []).join(", ") || "none"}`,
+      `MCP idle:   ${report.effectiveSettings.mcpIdleShutdownMs} ms`
     );
   }
   if (report.toolRegistration.names.length > 0) {

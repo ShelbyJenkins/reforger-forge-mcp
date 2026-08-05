@@ -24,7 +24,10 @@ param(
 
     [string[]]$ObserverSupportingLogRoot = @(),
 
-    [switch]$WorkbenchScriptAuthorizeAll
+    [switch]$WorkbenchScriptAuthorizeAll,
+
+    [ValidateRange(60000, 86400000)]
+    [long]$McpIdleShutdownMs
 )
 
 Set-StrictMode -Version Latest
@@ -174,6 +177,9 @@ try {
     }
     if ($WorkbenchScriptAuthorizeAll) {
         $ServerArguments += "--workbench-script-authorize-all"
+    }
+    if ($PSBoundParameters.ContainsKey("McpIdleShutdownMs")) {
+        $ServerArguments += "--mcp-idle-shutdown-ms", ([string]$McpIdleShutdownMs)
     }
     foreach ($path in $EvidenceRoots) {
         $ServerArguments += "--observer-evidence-root", $path

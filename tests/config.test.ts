@@ -9,8 +9,12 @@ import {
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import {
+  CONFIGURATION_USAGE,
   ConfigurationError,
   loadConfig,
+  MCP_IDLE_SHUTDOWN_DEFAULT_MS,
+  MCP_IDLE_SHUTDOWN_MAX_MS,
+  MCP_IDLE_SHUTDOWN_MIN_MS,
   partitionConfigurationArguments,
 } from "../src/config.js";
 import type { SteamDiscoveryResult } from "../src/platform/windows/steam-discovery.js";
@@ -151,6 +155,7 @@ describe("effective configuration contract", () => {
       workbenchAddonDirs: [join(fixturePaths.game, "addons")],
       workbenchHost: "127.0.0.1",
       workbenchPort: 5775,
+      mcpIdleShutdownMs: MCP_IDLE_SHUTDOWN_DEFAULT_MS,
     });
     expect(config.observer!.evidenceRoots).toBeUndefined();
   });
@@ -218,6 +223,7 @@ describe("effective configuration contract", () => {
       workbenchHost: "127.0.0.1",
       workbenchPort: 5775,
       workbenchScriptAuthorizeAll: false,
+      mcpIdleShutdownMs: 1_800_000,
       debug: false,
       observer: {
         startupTimeoutMs: 10_000,
@@ -298,6 +304,7 @@ describe("effective configuration contract", () => {
       workbenchAddonDirs: ["./file-addon"],
       workbenchHost: "file-host",
       workbenchPort: 6000,
+      mcpIdleShutdownMs: 60_000,
       workbenchScriptAuthorizeAll: true,
       debug: true,
       observer: {
@@ -313,6 +320,7 @@ describe("effective configuration contract", () => {
       "--workbench-addon-dir", "cli-addon-two",
       "--workbench-host", "cli-host",
       "--workbench-port", "7000",
+      "--mcp-idle-shutdown-ms", "86400000",
       "--no-workbench-script-authorize-all",
       "--no-debug",
       "--observer-evidence-root", "cli-evidence-one",
@@ -329,6 +337,7 @@ describe("effective configuration contract", () => {
     ]);
     expect(config.workbenchHost).toBe("cli-host");
     expect(config.workbenchPort).toBe(7000);
+    expect(config.mcpIdleShutdownMs).toBe(86_400_000);
     expect(config.workbenchScriptAuthorizeAll).toBe(false);
     expect(config.debug).toBe(false);
     expect(config.observer!.evidenceRoots).toEqual([cliEvidenceOne, cliEvidenceTwo]);
@@ -385,6 +394,7 @@ describe("effective configuration contract", () => {
       "--workbench-script-authorize-all",
       "--workbench-host", "cli-host",
       "--workbench-port", "6001",
+      "--mcp-idle-shutdown-ms", "60000",
       "--extracted-path", extracted,
       "--observer-managed-root", managedRoot,
       "--observer-profile-root", profileRoot,
@@ -412,6 +422,7 @@ describe("effective configuration contract", () => {
       workbenchScriptAuthorizeAll: true,
       workbenchHost: "cli-host",
       workbenchPort: 6001,
+      mcpIdleShutdownMs: 60_000,
       extractedPath: extracted,
       debug: true,
       observer: {
@@ -525,6 +536,50 @@ describe("effective configuration contract", () => {
     const config = loadConfig(["--config", configPath]);
 
     expect(config.observer!.evidenceRoots).toEqual([]);
+  });
+
+  it("propagates the MCP idle setting through file resolution and accepts both endpoints", () => {
+    const minimumPath = writeConfig(requiredFileValues({
+      mcpIdleShutdownMs: MCP_IDLE_SHUTDOWN_MIN_MS,
+    }), "minimum.json");
+    expect(loadConfig(["--config", minimumPath]).mcpIdleShutdownMs).toBe(60_000);
+
+    const maximumPath = writeConfig(requiredFileValues({
+      mcpIdleShutdownMs: MCP_IDLE_SHUTDOWN_MAX_MS,
+    }), "maximum.json");
+    expect(loadConfig(["--config", maximumPath]).mcpIdleShutdownMs).toBe(86_400_000);
+
+    expect(() => loadConfig(["--mcp-idle-shutdown-ms"])).toThrowError(
+      /--mcp-idle-shutdown-ms requires one value/
+    );
+    expect(() => loadConfig([
+      "--mcp-idle-shutdown-ms", "60000",
+      "--mcp-idle-shutdown-ms", "86400000",
+    ])).toThrowError(/may be supplied only once/);
+  });
+
+  it.each([null, 0, -1, 59_999, 60_000.5, 86_400_001])(
+    "rejects invalid JSON mcpIdleShutdownMs %j",
+    (mcpIdleShutdownMs) => {
+      const configPath = writeConfig(requiredFileValues({ mcpIdleShutdownMs }), "invalid-idle.json");
+      expect(() => loadConfig(["--config", configPath])).toThrowError(/mcpIdleShutdownMs/);
+    }
+  );
+
+  it.each(["0", "-1", "59999", "60000.5", "86400001"])(
+    "rejects invalid CLI MCP idle timeout %s",
+    (value) => {
+      expect(() => loadConfig([
+        "--workbench-path", fixturePaths.workbench,
+        "--game-path", fixturePaths.game,
+        "--mcp-idle-shutdown-ms", value,
+      ])).toThrowError(/integer from 60000 through 86400000/);
+    }
+  );
+
+  it("documents the MCP-only bounded configuration flag", () => {
+    expect(CONFIGURATION_USAGE).toContain("--mcp-idle-shutdown-ms <60000..86400000>");
+    expect(CONFIGURATION_USAGE).toContain("MCP server idle-exit interval");
   });
 
   it("lets CLI clear flags express empty array overrides", () => {
@@ -737,6 +792,7 @@ describe("partitionConfigurationArguments", () => {
       "--gproj", "target.gproj",
       "--workbench-addon-dir", "first",
       "--workbench-addon-dir", "second",
+      "--mcp-idle-shutdown-ms", "60000",
       "--debug",
       "--foreground",
     ])).toEqual({
@@ -744,6 +800,7 @@ describe("partitionConfigurationArguments", () => {
         "--config", "instance.json",
         "--workbench-addon-dir", "first",
         "--workbench-addon-dir", "second",
+        "--mcp-idle-shutdown-ms", "60000",
         "--debug",
       ],
       remainingArguments: [

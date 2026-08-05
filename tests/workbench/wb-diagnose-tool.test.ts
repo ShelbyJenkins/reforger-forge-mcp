@@ -21,6 +21,17 @@ describe("wb_diagnose MCP tool", () => {
           pid: process.pid,
           startedAt: "2026-08-05T12:34:56.789Z",
         },
+        mcpLifecycle: {
+          schemaVersion: 1 as const,
+          instanceId: "00112233-4455-4677-8899-aabbccddeeff",
+          idleShutdownMs: 60_000,
+          state: "blocked" as const,
+          activeRequestCount: 0,
+          lastActivityAt: "2026-08-05T12:34:56.789Z",
+          eligibleAt: "2026-08-05T12:35:56.789Z",
+          readinessComplete: true,
+          blockerCodes: ["OBSERVER_CHILD" as const],
+        },
         host: "127.0.0.1",
         port: 5775,
         workbenchExe: null,
@@ -56,6 +67,10 @@ describe("wb_diagnose MCP tool", () => {
     expect(text).toContain("### Last Launch Compiler Failure");
     expect(text).toContain("### MCP Host");
     expect(text).toContain("00112233-4455-4677-8899-aabbccddeeff");
+    expect(text).toContain("### MCP Lifecycle");
+    expect(text.match(/00112233-4455-4677-8899-aabbccddeeff/g)).toHaveLength(2);
+    expect(text).toContain("60000 ms");
+    expect(text).toContain("OBSERVER_CHILD");
     expect(text).toContain("PROJECT_COMPILE_FAILED");
     expect(text).toContain("Scripts/Game/Broken.c(7): Syntax error");
     expect(text).toContain("logs-current\\script.log");

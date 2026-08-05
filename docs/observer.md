@@ -344,9 +344,16 @@ capture activity, and the complete owned-runtime record inventory. That check
 is bounded, read-only, and existing-only: it does not create missing state,
 start the observer child, sweep or repair evidence, revoke a session, or stop a
 Workbench/game process. Unknown, legacy-unattributed, malformed, timed-out, or
-racing evidence fails closed. In this foundation release the admission fence
-remains open and no idle timer, transport close, signal, or automatic process
-exit is enabled; automatic shutdown is a separate lifecycle feature.
+racing evidence fails closed. The CLI stdio host evaluates that proof after
+the configured inactivity interval (30 minutes by default, bounded from 60
+seconds through 24 hours). It seals new host and protocol admissions only when
+the protocol activity epoch, provider revisions, and readiness proof still
+agree in one synchronous turn, then uses the normal close-first disposer. A
+sole ready private child with no pending request is safe and is closed by that
+disposer; child startup, requests, shutdown, captures, restorations, runtime
+operations, and uncertain lifecycle evidence block automatic exit. No host may
+use this mechanism to signal another host or to stop an unowned Workbench or
+game process.
 
 ## Common operator problems
 

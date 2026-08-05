@@ -30,6 +30,7 @@ function options(
       gamePath: "D:\\Arma Reforger",
       workbenchPath: "D:\\Arma Reforger Tools",
       workbenchAddonDirs: ["D:\\Arma Reforger\\addons"],
+      mcpIdleShutdownMs: 1_800_000,
       startupArguments: [],
       steamCandidates: {
         game: ["D:\\Arma Reforger"],
@@ -76,7 +77,7 @@ describe("canonical setup receipt", () => {
   it("defaults live Workbench and observer checks to not tested", () => {
     const receipt = composeSetupReceipt(options());
 
-    expect(receipt.schemaVersion).toBe(1);
+    expect(receipt.schemaVersion).toBe(2);
     expect(receipt.operation).toBe("doctor");
     expect(receipt.overallStatus).toBe("passed");
     expect(receipt.verification.workbenchNetApi.status).toBe("not_tested");
@@ -180,7 +181,8 @@ describe("canonical setup receipt", () => {
     expect(parsed).toEqual(receipt);
 
     const human = formatSetupReceipt(receipt);
-    expect(human).toContain("Receipt schema: 1");
+    expect(human).toContain("Receipt schema: 2");
+    expect(human).toContain("MCP idle exit:  1800000 ms");
     expect(human).toContain("Operation:      doctor");
     expect(human).toContain("Workbench NET API:  not tested");
     expect(human).toContain("Observer capture:   not tested");
@@ -250,6 +252,8 @@ describe("canonical setup receipt", () => {
     const human = formatSetupReceipt(receipt);
     expect(human).toContain("Failed layer:   build");
     expect(human).toContain("Config:         not resolved");
+    expect(human).toContain("MCP idle exit:  not resolved");
+    expect(receipt.settings.mcpIdleShutdownMs).toBeNull();
     expect(human).not.toContain("automatic discovery and internal defaults");
     expect(human).not.toContain("project-independent mode");
   });

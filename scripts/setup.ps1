@@ -100,7 +100,7 @@ function New-CoreSetupFailureReceipt {
             -Detail "Live Workbench connectivity was not requested."
     }
     return [ordered]@{
-        schemaVersion = 1
+        schemaVersion = 2
         operation = $operation
         overallStatus = "failed"
         runtime = [ordered]@{
@@ -116,6 +116,7 @@ function New-CoreSetupFailureReceipt {
             gamePath = $null
             workbenchPath = $null
             workbenchAddonDirs = @()
+            mcpIdleShutdownMs = $null
             startupArguments = @()
             steamCandidates = [ordered]@{
                 game = @()
@@ -332,6 +333,9 @@ function Write-HumanSetupReceipt {
         "Addon roots:    $(if ($addonRoots.Count -gt 0) { $addonRoots -join ', ' } else { 'none' })"
     )
     [Console]::Out.WriteLine(
+        "MCP idle exit:  $(if ($null -eq $Receipt.settings.mcpIdleShutdownMs) { 'not resolved' } else { [string]$Receipt.settings.mcpIdleShutdownMs + ' ms' })"
+    )
+    [Console]::Out.WriteLine(
         "Startup args:   $(if ($startupArguments.Count -gt 0) { $startupArguments | ConvertTo-Json -Compress } else { 'none' })"
     )
     [Console]::Out.WriteLine(
@@ -453,7 +457,7 @@ function Test-CanonicalSetupReceipt {
         }
     }
     if (
-        $Receipt.schemaVersion -ne 1 -or
+        $Receipt.schemaVersion -ne 2 -or
         [string]$Receipt.operation -ne $ExpectedOperation -or
         [string]$Receipt.overallStatus -notin @(
             "passed",
@@ -486,6 +490,7 @@ function Test-CanonicalSetupReceipt {
         "gamePath",
         "workbenchPath",
         "workbenchAddonDirs",
+        "mcpIdleShutdownMs",
         "startupArguments",
         "steamCandidates"
     )
@@ -541,6 +546,26 @@ function Test-CanonicalSetupReceipt {
         ) {
             return $false
         }
+    }
+
+    $settingsPassed =
+        [string]$Receipt.verification.effectiveSettings.status -eq "passed"
+    $idleShutdownMs = $Receipt.settings.mcpIdleShutdownMs
+    if ($settingsPassed) {
+        if (
+            $null -eq $idleShutdownMs -or
+            -not ($idleShutdownMs -is [byte] -or
+                $idleShutdownMs -is [int16] -or
+                $idleShutdownMs -is [int32] -or
+                $idleShutdownMs -is [int64]) -or
+            [long]$idleShutdownMs -lt 60000 -or
+            [long]$idleShutdownMs -gt 86400000
+        ) {
+            return $false
+        }
+    }
+    elseif ($null -ne $idleShutdownMs) {
+        return $false
     }
 
     $expectedExitCode = switch ([string]$Receipt.overallStatus) {

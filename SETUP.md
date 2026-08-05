@@ -201,6 +201,16 @@ also reports the same product, client label, process UUID, PID, and start time.
 These fields help identify a host; they do not authorize termination or any
 lifecycle action.
 
+The direct CLI stdio host defaults to safe auto-shutdown after 1,800,000 ms
+(30 minutes) of inactivity. Decoded client traffic and request completion reset
+the interval, and in-flight protocol or application work prevents exit. At the
+deadline the host also requires a complete, unchanged readiness proof: live or
+uncertain Workbench, Observer capture, owned-runtime, recovery, or external
+activation state keeps the host open and is reported by `wb_diagnose`. A ready
+private Observer child with no pending work does not block; normal shutdown
+closes it through the supported disposer. Stdin EOF/close, SIGINT, SIGTERM, and
+startup failure remain immediate and do not wait for the interval.
+
 ### Identifying MCP hosts on Windows
 
 In Task Manager, open **Details**, right-click a column heading, choose
@@ -324,6 +334,7 @@ array with `[]`. A clear flag cannot be combined with its repeated value flag.
 | `extractedPath` | `--extracted-path` | Optional existing directory |
 | `workbenchHost` | `--workbench-host` | `127.0.0.1` |
 | `workbenchPort` | `--workbench-port` | `5775` |
+| `mcpIdleShutdownMs` | `--mcp-idle-shutdown-ms` | `1800000`; required finite integer from `60000` through `86400000`, with no disable value |
 | `workbenchScriptAuthorizeAll` | paired authorize flags above | `false` |
 | `debug` | `--debug` / `--no-debug` | `false` |
 | `observer.managedRoot` | `--observer-managed-root` | Platform-local application/state directory |
@@ -346,6 +357,12 @@ array with `[]`. A clear flag cannot be combined with its repeated value flag.
 `workbenchScriptAuthorizeAll` suppresses prompts for protected `RunCmd`,
 `RunProcess`, `KillProcess`, and out-of-profile `FileIO` operations. Leave it
 disabled unless you trust the active project and all of its dependencies.
+
+The optional shared PowerShell stdio launcher accepts the same bounded override
+as `-McpIdleShutdownMs`. It forwards `--mcp-idle-shutdown-ms` only when that
+parameter was explicitly supplied; omission preserves the server's internal
+30-minute default. Describe, Verify, and Serve use the same normalized
+configuration argument list.
 
 Automated Workbench launches enforce `-noThrow`. Assertions remain in the
 Workbench log and can still fail a validation gate, but they cannot block an

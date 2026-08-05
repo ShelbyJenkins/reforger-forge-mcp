@@ -102,6 +102,7 @@ import {
   diagnoseWorkbench,
   type DiagnosticReport,
 } from "./diagnostics.js";
+import type { McpLifecycleDiagnostic } from "../mcp-idle-shutdown.js";
 import {
   findWorkbenchCompileFailure,
   formatWorkbenchCompileFailure,
@@ -458,6 +459,8 @@ export interface WorkbenchClientDependencies {
   diagnostics?: typeof diagnoseWorkbench;
   /** Trusted process identity projected through read-only diagnostics. */
   hostIdentity?: McpHostIdentity;
+  /** Dynamic CLI lifecycle projection; embedders omit it and report externally managed. */
+  mcpLifecycleDiagnostic?: () => McpLifecycleDiagnostic;
   /** A callback is evaluated at the actual launch boundary for absolute-deadline callers. */
   launchTimeoutMs?: number | (() => number);
   /** Optional absolute cap for exact termination and endpoint-release waits. */
@@ -559,6 +562,7 @@ export class WorkbenchSessionController implements McpIdleReadinessProvider {
   private readonly vacancyWait: typeof waitForVacancy;
   private readonly diagnosticsService: typeof diagnoseWorkbench;
   private readonly hostIdentity: McpHostIdentity;
+  private readonly mcpLifecycleDiagnostic: (() => McpLifecycleDiagnostic) | undefined;
   private readonly qualificationIntervalMs: number;
   private readonly now: () => number;
   private readonly onExplicitSaveModal: WorkbenchClientDependencies["onExplicitSaveModal"];
@@ -947,6 +951,7 @@ export class WorkbenchSessionController implements McpIdleReadinessProvider {
     this.companionReadiness = dependencies.companionReadiness ?? awaitCompanionReadiness;
     this.vacancyWait = dependencies.vacancyWait ?? waitForVacancy;
     this.diagnosticsService = dependencies.diagnostics ?? diagnoseWorkbench;
+    this.mcpLifecycleDiagnostic = dependencies.mcpLifecycleDiagnostic;
     const admissionGate = dependencies.admissionGate ?? new McpHostAdmissionGate();
     this.childSupervisor = dependencies.childSupervisor ?? new ChildSupervisor({ admissionGate });
     this.runnerLifecycleExecution = dependencies.lifecycleExecution ??
@@ -1952,6 +1957,7 @@ export class WorkbenchSessionController implements McpIdleReadinessProvider {
       host: this.host,
       port: this.port,
       config: this.config,
+      mcpLifecycle: this.mcpLifecycleDiagnostic,
       lifecycle: this.processGuard,
       callNetApi: (apiFunc, params, options) => this.rawCall(apiFunc, params, options),
       classifyNetError: (error) => error instanceof WorkbenchError ? error : null,

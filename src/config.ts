@@ -19,7 +19,10 @@ import {
 import { discoverStandardWorkshopAddonRoot } from "./platform/windows/workshop-discovery.js";
 
 /** Bump whenever native JavaScript harnesses must reject an older compiled loader. */
-export const EXPLICIT_CONFIGURATION_CONTRACT_VERSION = 2;
+export const EXPLICIT_CONFIGURATION_CONTRACT_VERSION = 3;
+export const MCP_IDLE_SHUTDOWN_DEFAULT_MS = 1_800_000;
+export const MCP_IDLE_SHUTDOWN_MIN_MS = 60_000;
+export const MCP_IDLE_SHUTDOWN_MAX_MS = 86_400_000;
 
 export interface ObserverConfig {
   /** Optional managed observer root. */
@@ -64,6 +67,8 @@ export interface Config {
   workbenchHost: string;
   /** Workbench NET API port. */
   workbenchPort: number;
+  /** CLI MCP-server inactivity interval; standalone runners parse but do not act on it. */
+  mcpIdleShutdownMs: number;
   /** Optional observer overrides plus bounded MCP/agent defaults. */
   observer?: ObserverConfig;
   /** Enable diagnostic logging for the MCP and private observer child. */
@@ -135,6 +140,10 @@ const configFileSchema = z.object({
   extractedPath: pathValue.optional(),
   workbenchHost: z.string().trim().min(1).max(255).optional(),
   workbenchPort: z.number().int().min(1).max(65_535).optional(),
+  mcpIdleShutdownMs: z.number().int()
+    .min(MCP_IDLE_SHUTDOWN_MIN_MS)
+    .max(MCP_IDLE_SHUTDOWN_MAX_MS)
+    .optional(),
   observer: observerFileSchema.optional(),
   debug: z.boolean().optional(),
 }).strict();
@@ -186,6 +195,7 @@ const VALUE_FLAGS = new Set([
   "--extracted-path",
   "--workbench-host",
   "--workbench-port",
+  "--mcp-idle-shutdown-ms",
   "--observer-managed-root",
   "--observer-profile-root",
   "--observer-agent-path",
@@ -238,6 +248,7 @@ export const CONFIGURATION_USAGE = [
   "  --no-workbench-addon-dirs               Disable automatic and explicit workbenchAddonDirs.",
   "  --workbench-host <host>                 Override the NET API host.",
   "  --workbench-port <1..65535>             Override the NET API port.",
+  "  --mcp-idle-shutdown-ms <60000..86400000> Override the MCP server idle-exit interval.",
   "  --workbench-script-authorize-all        Enable protected Workbench script operations.",
   "  --no-workbench-script-authorize-all     Disable protected Workbench script operations.",
   "  --extracted-path <directory>            Override the optional extracted-data root.",
@@ -362,6 +373,14 @@ function parseConfigurationArguments(
         break;
       case "--workbench-port":
         overrides.workbenchPort = numericFlag(flag, raw!, 1, 65_535);
+        break;
+      case "--mcp-idle-shutdown-ms":
+        overrides.mcpIdleShutdownMs = numericFlag(
+          flag,
+          raw!,
+          MCP_IDLE_SHUTDOWN_MIN_MS,
+          MCP_IDLE_SHUTDOWN_MAX_MS,
+        );
         break;
       case "--workbench-script-authorize-all":
       case "--no-workbench-script-authorize-all":
@@ -517,6 +536,9 @@ function resolveFileConfigPaths(config: ConfigFile, configPath: string): ConfigO
       : {}),
     ...(config.workbenchHost !== undefined ? { workbenchHost: config.workbenchHost } : {}),
     ...(config.workbenchPort !== undefined ? { workbenchPort: config.workbenchPort } : {}),
+    ...(config.mcpIdleShutdownMs !== undefined
+      ? { mcpIdleShutdownMs: config.mcpIdleShutdownMs }
+      : {}),
     ...(config.debug !== undefined ? { debug: config.debug } : {}),
     ...(observer ? { observer } : {}),
   };
@@ -730,6 +752,13 @@ function validateConfig(config: Config): Config {
       || config.workbenchPort > 65_535) {
     throw new ConfigurationError("workbenchPort must be an integer from 1 through 65535.");
   }
+  if (!Number.isSafeInteger(config.mcpIdleShutdownMs) ||
+      config.mcpIdleShutdownMs < MCP_IDLE_SHUTDOWN_MIN_MS ||
+      config.mcpIdleShutdownMs > MCP_IDLE_SHUTDOWN_MAX_MS) {
+    throw new ConfigurationError(
+      `mcpIdleShutdownMs must be an integer from ${MCP_IDLE_SHUTDOWN_MIN_MS} through ${MCP_IDLE_SHUTDOWN_MAX_MS}.`
+    );
+  }
   return config;
 }
 
@@ -801,6 +830,7 @@ export function loadConfig(
     patternsDir: resolve(packageDirectory, "data", "patterns"),
     workbenchHost: "127.0.0.1",
     workbenchPort: 5775,
+    mcpIdleShutdownMs: MCP_IDLE_SHUTDOWN_DEFAULT_MS,
     workbenchScriptAuthorizeAll: false,
     debug: false,
     ...discoveryDefaults,
