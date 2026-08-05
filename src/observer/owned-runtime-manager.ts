@@ -864,6 +864,20 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
     this.installationId = sha256(pathKey(installationRoot));
   }
 
+  /**
+   * Resolve the configured runtime executable through the same final-file
+   * identity boundary used by start. This read-only query creates no profile
+   * or lifecycle storage.
+   */
+  resolveRuntimeExecutablePath(
+    runtimeKind: ObserverLaunchInput["runtimeKind"],
+  ): string {
+    return canonicalFile(
+      this.resolveExecutable(runtimeKind),
+      `${runtimeKind} runtime executable`,
+    );
+  }
+
   private withFencedMachineMutex<T>(
     action: (fence: OwnedRuntimeLeaseFence) => Promise<T>,
     deadline?: OwnedRuntimeWallDeadline

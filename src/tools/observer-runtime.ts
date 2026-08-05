@@ -1,5 +1,4 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { createHash } from "node:crypto";
 import { z } from "zod";
 import {
   OwnedRuntimeError,
@@ -7,21 +6,31 @@ import {
 } from "../observer/owned-runtime-manager.js";
 import {
   projectPublicObserverToolError,
-  type PublicObserverErrorCandidate,
 } from "../observer/public-contract.js";
 import { resolveObserverRefusalRemedy } from "../observer/refusal-remedy.js";
+import {
+  deriveObserverRuntimeIdempotencyKey,
+  executeOwnedRuntimeOperation,
+  extractOwnedRuntimeError,
+  ownedRuntimeIdSchema,
+  ownedRuntimeSuccessHeading,
+  preparedLaunchIdSchema,
+  type ObserverRuntimeLifecycleOperation,
+  type OwnedRuntimeOperation,
+} from "./owned-runtime-operations.js";
+
+export {
+  deriveObserverRuntimeIdempotencyKey,
+  executeOwnedRuntimeOperation,
+  extractOwnedRuntimeError,
+  ownedRuntimeIdSchema,
+  ownedRuntimeSuccessHeading,
+  preparedLaunchIdSchema,
+};
+export type { ObserverRuntimeLifecycleOperation, OwnedRuntimeOperation };
 
 function jsonText(heading: string, value: unknown): string {
   return `${heading}\n\n\`\`\`json\n${JSON.stringify(value, null, 2)}\n\`\`\``;
-}
-
-function extractOwnedRuntimeError(error: unknown): PublicObserverErrorCandidate | undefined {
-  if (!(error instanceof OwnedRuntimeError)) return undefined;
-  return {
-    code: error.code,
-    readDiagnosticMessage: () => error.message,
-    readDetails: () => error.details,
-  };
 }
 
 function toolError(
@@ -51,25 +60,6 @@ function toolError(
   };
 }
 
-export type ObserverRuntimeLifecycleOperation =
-  | { action: "start"; preparedLaunchId: string }
-  | { action: "stop"; runtimeId: string; waitForRestorationMs: number };
-
-/** Stable private key for retrying one canonical public lifecycle mutation. */
-export function deriveObserverRuntimeIdempotencyKey(
-  operation: ObserverRuntimeLifecycleOperation,
-): string {
-  const canonical = operation.action === "start"
-    ? JSON.stringify({ action: "start", preparedLaunchId: operation.preparedLaunchId })
-    : JSON.stringify({
-        action: "stop",
-        runtimeId: operation.runtimeId,
-        waitForRestorationMs: operation.waitForRestorationMs,
-      });
-  const digest = createHash("sha256").update(canonical, "utf8").digest("hex");
-  return `mcp-runtime-${operation.action}-v1-${digest}`;
-}
-
 export function registerObserverRuntime(
   server: McpServer,
   manager: OwnedRuntimeManager
@@ -81,13 +71,14 @@ export function registerObserverRuntime(
         "Explicitly start, inspect, or stop one exact-owned graphical Arma Reforger runtime from an observer_prepare_launch descriptor. Start preserves that descriptor's native-fullscreen default or its exceptional forceNonNativeWindowSize choice; this tool has no independent display-size override. Start uses a visible structured spawn without a shell; status and stop require PID, canonical executable, Windows creation time, and an exact owner argument. Stop seals the observer session and refuses until camera restoration is proven.",
       inputSchema: {
         action: z.enum(["start", "status", "stop"]),
-        preparedLaunchId: z.string().regex(/^pl-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/).optional(),
-        runtimeId: z.string().regex(/^rt-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/).optional(),
+        preparedLaunchId: preparedLaunchIdSchema.optional(),
+        runtimeId: ownedRuntimeIdSchema.optional(),
         waitForRestorationMs: z.number().int().min(0).max(5 * 60 * 1_000).default(20_000),
       },
     },
     async (input, extra) => {
       try {
+        let operation: OwnedRuntimeOperation;
         if (input.action === "start") {
           if (!input.preparedLaunchId) {
             throw new OwnedRuntimeError(
@@ -95,33 +86,21 @@ export function registerObserverRuntime(
               "preparedLaunchId is required for observer_runtime start"
             );
           }
-          const result = await manager.start({
-            preparedLaunchId: input.preparedLaunchId,
-            idempotencyKey: deriveObserverRuntimeIdempotencyKey({
-              action: "start",
-              preparedLaunchId: input.preparedLaunchId,
-            }),
-          });
-          return { content: [{ type: "text" as const, text: jsonText("Exact-owned observer runtime started.", result) }] };
-        }
-        if (!input.runtimeId) {
+          operation = { action: "start", preparedLaunchId: input.preparedLaunchId };
+        } else {
+          if (!input.runtimeId) {
           throw new OwnedRuntimeError("INVALID_REQUEST", "runtimeId is required for observer_runtime status and stop");
+          }
+          operation = input.action === "status"
+            ? { action: "status", runtimeId: input.runtimeId }
+            : {
+                action: "stop",
+                runtimeId: input.runtimeId,
+                waitForRestorationMs: input.waitForRestorationMs,
+              };
         }
-        if (input.action === "status") {
-          const result = await manager.status(input.runtimeId);
-          return { content: [{ type: "text" as const, text: jsonText("Exact-owned observer runtime status.", result) }] };
-        }
-        const result = await manager.stop({
-          runtimeId: input.runtimeId,
-          waitForRestorationMs: input.waitForRestorationMs,
-          idempotencyKey: deriveObserverRuntimeIdempotencyKey({
-            action: "stop",
-            runtimeId: input.runtimeId,
-            waitForRestorationMs: input.waitForRestorationMs,
-          }),
-          signal: extra.signal,
-        });
-        return { content: [{ type: "text" as const, text: jsonText("Exact-owned observer runtime stopped.", result) }] };
+        const result = await executeOwnedRuntimeOperation(manager, operation, extra.signal);
+        return { content: [{ type: "text" as const, text: jsonText(ownedRuntimeSuccessHeading(operation.action), result) }] };
       } catch (error) {
         return toolError(error, input.action);
       }
