@@ -10,11 +10,11 @@ export interface ParsedLogLine {
   readonly raw: string;
 }
 
-const LOG_LINE_PATTERN = /^(\S+)\s+\(([IWE])\):\s?(.*)$/;
+const LOG_LINE_PATTERN = /^(?:(?:\d{2}:){2}\d{2}\.\d{3}\s+)?\s*(\S+?)\s*\(([IWE])\):\s?(.*)$/;
 
 /**
- * Parse the standard Workbench log-line shape:
- * `<CHANNEL> (<LEVEL>): <message>`.
+ * Parse the Workbench log-line shapes emitted by build and editor logs:
+ * `[HH:mm:ss.SSS] [alignment] <CHANNEL>[alignment](<LEVEL>): <message>`.
  *
  * Banner and noise lines that do not carry a channel/level marker are
  * intentionally returned as `null`.

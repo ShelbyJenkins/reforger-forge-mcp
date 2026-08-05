@@ -6,6 +6,39 @@ mixed tracker on 2026-07-28; same-day ties retain their migration order.
 
 ## Resolved defects
 
+## MCP-054 — `wb_log_query` misses error-level editor diagnostics
+
+**Status:** Resolved
+
+**Severity:** P2 — hides relevant diagnostics and forces raw-log fallback
+
+**Observed:** 2026-08-04
+
+**Closed:** 2026-08-04
+
+**Observed behavior:** In a live exact-owned Workbench editor session,
+`wb_log_query` found all three attributed log files but returned zero matches
+for `levels: ["E"]`, while the same directory's raw `error.log` contained
+ordinary `SCRIPT (E)` and compact `PATHFINDING(E)` records.
+
+**Cause:** The shared Enfusion line parser expected the channel at column zero
+and required whitespace before the level marker. Editor records carry an
+`HH:mm:ss.SSS` prefix, may align the channel with additional leading spaces,
+and may omit the gap before `(E)`.
+
+**Resolution:** Severity and channel parsing now accepts the timestamped,
+alignment-padded, and compact Workbench spellings while preserving the full
+original line for redacted presentation. The registered tool and level-filter
+descriptions now state that editor severity is normalized.
+
+**Verification:** Parser and MCP-tool regressions pass 17/17 tests, including
+timestamped `SCRIPT    (E):`, `PATHFINDING(E):`, and `RESOURCES (E):` records
+distributed across `console.log`, `error.log`, and `script.log`. The full
+repository suite, TypeScript typecheck, compiled MCP build and verification
+with all 62 tools registered, and unused-code analysis passed. A read-only
+inspection of the attributed editor logs confirmed the covered record shapes;
+no new Workbench process was launched.
+
 ## MCP-051 — `wb_launch` masks project compile failures as an undefined Ping API
 
 **Status:** Resolved

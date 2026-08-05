@@ -27,6 +27,24 @@ describe("Enfusion log parser", () => {
     });
   });
 
+  it("normalizes timestamped editor records with leading alignment or no marker gap", () => {
+    const aligned = "00:54:59.734   SCRIPT    (E): compile failed";
+    const compact = "00:26:44.802 PATHFINDING(E): navmesh generation failed";
+
+    expect(parseLogLine(aligned)).toEqual({
+      channel: "SCRIPT",
+      level: "E",
+      message: "compile failed",
+      raw: aligned,
+    });
+    expect(parseLogLine(compact)).toEqual({
+      channel: "PATHFINDING",
+      level: "E",
+      message: "navmesh generation failed",
+      raw: compact,
+    });
+  });
+
   it("returns null for banner or noise lines without a level marker", () => {
     expect(parseLogLine("Workbench 1.7.0.54 started")).toBeNull();
   });

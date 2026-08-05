@@ -294,9 +294,9 @@ export function registerWbLogQuery(server: McpServer, config: Config): void {
     "wb_log_query",
     {
       description:
-        "Filter attributed Workbench build/editor log files by addon reference, severity level, " +
+        "Filter attributed Workbench build/editor log files by addon reference, normalized severity level, " +
         "channel, and/or a case-insensitive text substring, returning only matching lines instead of " +
-        "the full raw log.",
+        "the full raw log. Timestamped and alignment-padded editor records are recognized.",
       inputSchema: {
         logDirectory: z.string().trim().min(1).describe(
           "An exact managed Workbench log directory, such as one returned by a prior wb_build receipt."
@@ -304,7 +304,9 @@ export function registerWbLogQuery(server: McpServer, config: Config): void {
         addonIds: z.array(z.string().trim().min(1).max(MAX_FILTER_VALUE_LENGTH)).max(16).optional().describe(
           "Return only lines that reference at least one add-on ID by name, $<AddonId>: resource prefix, or addons/<AddonId>/ path."
         ),
-        levels: z.array(z.enum(["I", "W", "E"])).max(3).optional(),
+        levels: z.array(z.enum(["I", "W", "E"])).max(3).optional().describe(
+          "Return records whose normalized Workbench severity is informational (I), warning (W), or error (E)."
+        ),
         channels: z.array(z.string().trim().min(1).max(MAX_FILTER_VALUE_LENGTH)).max(16).optional(),
         pattern: z.string().trim().min(1).max(512).optional().describe(
           "Case-insensitive literal substring applied to each line's raw text."
