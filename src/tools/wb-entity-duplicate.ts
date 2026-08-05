@@ -16,6 +16,7 @@ import {
 } from "../utils/game-paths.js";
 import { validateProjectPath } from "../utils/safe-path.js";
 import { requireEditMode, formatConnectionStatus } from "../workbench/status.js";
+import { tryReadResourceMetaGuid } from "../workbench/resource-meta.js";
 
 /**
  * wb_entity_duplicate — duplicate a scene entity into the mod folder.
@@ -163,7 +164,7 @@ export function registerWbEntityDuplicate(
       }
 
       // Step 4: Read the new GUID from the .meta file
-      const newGuid = readMetaGuid(absDestPath + ".meta");
+      const newGuid = tryReadResourceMetaGuid(absDestPath + ".meta");
       const prefabRef = newGuid ? `{${newGuid}}${destPath}` : destPath;
 
       if (!replaceInScene) {
@@ -268,15 +269,4 @@ export function registerWbEntityDuplicate(
       };
     }
   );
-}
-
-/** Read the GUID from a Workbench .meta file. Returns null if not found. */
-function readMetaGuid(metaPath: string): string | null {
-  try {
-    const content = readFileSync(metaPath, "utf-8");
-    const match = content.match(/Name\s+"(?:\{([0-9A-Fa-f]{16})\})[^"]+"/);
-    return match ? match[1] : null;
-  } catch {
-    return null;
-  }
 }

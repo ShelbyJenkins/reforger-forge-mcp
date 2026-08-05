@@ -37,12 +37,22 @@ describe("MCP Workbench launch compile-failure triage", () => {
       },
     });
 
-    await expect(harness.client.ensureRunning(harness.projectPath)).rejects.toMatchObject({
+    const launchError = await harness.client.ensureRunning(harness.projectPath).then(
+      () => null,
+      (error: unknown) => error
+    );
+    expect(launchError).toMatchObject({
       code: "PROJECT_COMPILE_FAILED",
       message: expect.stringContaining(
         "Scripts/Game/Presentation/RV_BoundaryCurtainComponent.c(581): method exceeds VM stack"
       ),
+      remedyDecision: { kind: "message_owns_recovery" },
     });
+    expect((launchError as WorkbenchError).message).toContain("call wb_check with");
+    expect((launchError as WorkbenchError).message).toContain(
+      JSON.stringify({ gprojPath: harness.projectPath })
+    );
+    expect((launchError as WorkbenchError).message.match(/wb_check/g)).toHaveLength(1);
     expect(harness.backend.terminationCalls).toHaveLength(1);
     expect(harness.backend.workbenchPids.size).toBe(0);
 

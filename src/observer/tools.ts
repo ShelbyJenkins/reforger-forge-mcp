@@ -18,6 +18,10 @@ import {
   PUBLIC_OBSERVER_CAPABILITIES,
   type PublicObserverErrorCandidate,
 } from "./public-contract.js";
+import {
+  resolveObserverRefusalRemedy,
+  type ObserverRefusalContext,
+} from "./refusal-remedy.js";
 
 const finite = () => z.number().finite();
 
@@ -187,13 +191,18 @@ function extractObserverApplicationError(error: unknown): PublicObserverErrorCan
   };
 }
 
-function toolError(error: unknown) {
+function toolError(error: unknown, context: ObserverRefusalContext) {
   return {
     content: [{
       type: "text" as const,
       text: projectPublicObserverToolError(error, {
         subject: "Observer error",
         extract: extractObserverApplicationError,
+        remedyContext: context,
+        resolveRemedy: resolveObserverRefusalRemedy,
+        readRemedyContext: () => error instanceof ObserverApplicationError
+          ? error.details
+          : undefined,
       }),
     }],
     isError: true,
@@ -306,7 +315,7 @@ export function registerObserverTools(
           }],
         };
       } catch (error) {
-        return toolError(error);
+        return toolError(error, { tool: "observer_setup", action });
       }
     }
   );
@@ -332,6 +341,9 @@ export function registerObserverTools(
       },
     },
     async (input) => {
+      const remedyReason = rawDisplayArgument(input.arguments) === undefined
+        ? undefined
+        : "display_arguments" as const;
       try {
         assertNativeFullscreenLaunch(input);
         const prepared = await prepareObserverLaunch(
@@ -347,7 +359,11 @@ export function registerObserverTools(
         );
         return { content: [{ type: "text" as const, text: jsonText("Observer launch arguments prepared; no process was started.", prepared) }] };
       } catch (error) {
-        return toolError(error);
+        return toolError(error, {
+          tool: "observer_prepare_launch",
+          action: "prepare",
+          ...(remedyReason === undefined ? {} : { reason: remedyReason }),
+        });
       }
     }
   );
@@ -369,7 +385,11 @@ export function registerObserverTools(
         const result = await application.instances({ ...input, signal: extra.signal });
         return { content: [{ type: "text" as const, text: jsonText("Observer instance inventory.", result) }] };
       } catch (error) {
-        return toolError(error);
+        return toolError(error, {
+          tool: "observer_instances",
+          action: "list",
+          ...(input.sessionId === undefined ? {} : { sessionId: input.sessionId }),
+        });
       }
     }
   );
@@ -400,6 +420,7 @@ export function registerObserverTools(
       },
     },
     async (input, extra) => {
+      let remedySessionId = input.sessionId;
       try {
         const legacySupplied = input.sessionId !== undefined || input.instanceId !== undefined || input.expectedWorldRevision !== undefined;
         if (input.target && legacySupplied) {
@@ -411,6 +432,7 @@ export function registerObserverTools(
           if (error instanceof CaptureError) throw new ObserverApplicationError(error.code, error.message, error.details);
           throw error;
         }
+        remedySessionId = target?.sessionId ?? remedySessionId;
         if (!target && legacySupplied) assertCaptureWorldBinding(input as { expectedWorldRevision: string });
         const runId = activeRun.resolve(input.runId);
         if (input.captureLabel && !runId) {
@@ -447,7 +469,11 @@ export function registerObserverTools(
           ],
         };
       } catch (error) {
-        return toolError(error);
+        return toolError(error, {
+          tool: "observer_capture",
+          action: "capture",
+          ...(remedySessionId === undefined ? {} : { sessionId: remedySessionId }),
+        });
       }
     }
   );
@@ -481,7 +507,7 @@ export function registerObserverTools(
             : await application.releaseJob(jobId);
         return { content: [{ type: "text" as const, text: jsonText(`Observer job ${action} completed.`, result) }] };
       } catch (error) {
-        return toolError(error);
+        return toolError(error, { tool: "observer_job", action });
       }
     }
   );
@@ -508,7 +534,9 @@ export function registerObserverTools(
         if (typeof result.runId !== "string") throw new ObserverApplicationError("TRANSPORT_UNAVAILABLE", "Run begin did not return a run ID");
         activeRun.activate(result.runId);
         return { content: [{ type: "text" as const, text: jsonText("Observer run begun and activated.", result) }] };
-      } catch (error) { return toolError(error); }
+      } catch (error) {
+        return toolError(error, { tool: "observer_run_begin", action: "begin" });
+      }
     },
   );
 
@@ -524,7 +552,9 @@ export function registerObserverTools(
         if (!resolved) throw new ObserverApplicationError("INVALID_REQUEST", "runId is required when this MCP process has no active run");
         const result = await application.runStatus(resolved);
         return { content: [{ type: "text" as const, text: jsonText("Observer run status.", result) }] };
-      } catch (error) { return toolError(error); }
+      } catch (error) {
+        return toolError(error, { tool: "observer_run_status", action: "status" });
+      }
     },
   );
 
@@ -565,7 +595,9 @@ export function registerObserverTools(
         });
         activeRun.clearIf(runId);
         return { content: [{ type: "text" as const, text: jsonText("Observer run finalized.", result) }] };
-      } catch (error) { return toolError(error); }
+      } catch (error) {
+        return toolError(error, { tool: "observer_run_finalize", action: "finalize" });
+      }
     },
   );
 
@@ -582,7 +614,9 @@ export function registerObserverTools(
         const result = await application.discardRun(runId);
         activeRun.clearIf(runId);
         return { content: [{ type: "text" as const, text: jsonText("Observer run discarded.", result) }] };
-      } catch (error) { return toolError(error); }
+      } catch (error) {
+        return toolError(error, { tool: "observer_run_discard", action: "discard" });
+      }
     },
   );
 }

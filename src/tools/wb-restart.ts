@@ -1,5 +1,6 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { WorkbenchError, type WorkbenchClient } from "../workbench/client.js";
+import type { WorkbenchClient } from "../workbench/client.js";
+import { formatWorkbenchRefusal } from "../workbench/refusal-remedy.js";
 import { formatConnectionStatus } from "../workbench/status.js";
 
 export function registerWbRestart(server: McpServer, client: WorkbenchClient): void {
@@ -32,9 +33,7 @@ export function registerWbRestart(server: McpServer, client: WorkbenchClient): v
           ],
         };
       } catch (error) {
-        const message = error instanceof WorkbenchError
-          ? `\`${error.code}\` — ${error.message}`
-          : error instanceof Error ? error.message : String(error);
+        const message = formatWorkbenchRefusal(error, { operation: "wb_restart" });
         return {
           content: [
             {

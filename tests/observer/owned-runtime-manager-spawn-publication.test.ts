@@ -153,7 +153,10 @@ describe("OwnedRuntimeManager", () => {
     expect(replay.runtimeId).toBe(started.runtimeId);
     expect(value.spawnCalls).toHaveLength(1);
     await expect(value.startPrepared(first.id, "different-key"))
-      .rejects.toMatchObject({ code: "PREPARED_LAUNCH_CONSUMED" });
+      .rejects.toMatchObject({
+        code: "PREPARED_LAUNCH_CONSUMED",
+        details: { runtimeId: started.runtimeId },
+      });
     await expect(value.startPrepared(second.id, "start-key"))
       .rejects.toMatchObject({ code: "IDEMPOTENCY_CONFLICT" });
   });

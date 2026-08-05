@@ -118,6 +118,7 @@ import {
   waitForVacancy,
   type WorkbenchCompanionIdentity,
 } from "./readiness.js";
+import type { WorkbenchProducerRemedyDecision } from "./refusal-remedy.js";
 import {
   WorkbenchLaunchPlanError,
   buildLegacyWorkbenchLaunchArguments,
@@ -349,12 +350,20 @@ export type WorkbenchErrorCode =
 export class WorkbenchError extends Error {
   constructor(
     message: string,
-    public readonly code: WorkbenchErrorCode = "API_ERROR"
+    public readonly code: WorkbenchErrorCode = "API_ERROR",
+    public readonly remedyDecision?: WorkbenchProducerRemedyDecision
   ) {
     super(message);
     this.name = "WorkbenchError";
   }
 }
+
+const MESSAGE_OWNS_RECOVERY = Object.freeze({
+  kind: "message_owns_recovery" as const,
+});
+const NO_SAFE_REMEDY = Object.freeze({
+  kind: "no_safe_remedy" as const,
+});
 
 class ProvenPreSignalTerminationRefusal extends WorkbenchError {}
 
@@ -609,13 +618,22 @@ export class WorkbenchSessionController {
     if (this.targetBuildClosing) {
       throw new WorkbenchError(
         "Workbench target operation is unavailable because the MCP server is shutting down.",
-        "LIFECYCLE_BUSY"
+        "LIFECYCLE_BUSY",
+        NO_SAFE_REMEDY
       );
     }
     if (this.activeTargetBuildPromise) {
       throw new WorkbenchError(
         "Another owner-scoped Workbench target operation is already active.",
-        "LIFECYCLE_BUSY"
+        "LIFECYCLE_BUSY",
+        {
+          kind: "remedy",
+          remedy: {
+            kind: "retry",
+            when: "after the active owner-scoped target operation finishes",
+            why: "Concurrent lifecycle mutations remain serialized.",
+          },
+        }
       );
     }
 
@@ -703,7 +721,8 @@ export class WorkbenchSessionController {
       throw new WorkbenchError(
         `Owner-scoped ${operationName} refused because an exact Workbench process is still live. ` +
           "Use wb_shutdown for an owned editor or wait for the active lifecycle to finish.",
-        "LIFECYCLE_BUSY"
+        "LIFECYCLE_BUSY",
+        MESSAGE_OWNS_RECOVERY
       );
     }
     await this.assertNoWorkbenchProcesses(
@@ -1387,7 +1406,8 @@ export class WorkbenchSessionController {
             "Explicit save refused before invoking Workbench because the inherited prefab contains " +
               `load-bearing empty override block(s): ${listed}${extra}. Preserve these overrides with a ` +
               "minimal direct prefab edit, then relaunch the exact target.",
-            "TARGET_SESSION_TAINTED"
+            "TARGET_SESSION_TAINTED",
+            MESSAGE_OWNS_RECOVERY
           );
         }
       }
@@ -1412,7 +1432,8 @@ export class WorkbenchSessionController {
       if (existingDialog || disabledMain) {
         throw new WorkbenchError(
           "Explicit save refused because the target-bound Workbench already has a native dialog or disabled main window.",
-          "SAVE_OUTCOME_UNCERTAIN"
+          "SAVE_OUTCOME_UNCERTAIN",
+          NO_SAFE_REMEDY
         );
       }
     } catch (error) {
@@ -1466,7 +1487,8 @@ export class WorkbenchSessionController {
       );
       throw new WorkbenchError(
         "Explicit save outcome is uncertain because native-dialog monitoring failed. Shut down and relaunch the target.",
-        "SAVE_OUTCOME_UNCERTAIN"
+        "SAVE_OUTCOME_UNCERTAIN",
+        MESSAGE_OWNS_RECOVERY
       );
     }
     if (firstOutcome.kind === "modal") {
@@ -1496,7 +1518,8 @@ export class WorkbenchSessionController {
       throw new WorkbenchError(
         "Explicit save outcome is uncertain because Workbench requested native user feedback (" + detail + "). " +
           "The target session is tainted; shut it down and relaunch the explicit target before any further save.",
-        "SAVE_OUTCOME_UNCERTAIN"
+        "SAVE_OUTCOME_UNCERTAIN",
+        MESSAGE_OWNS_RECOVERY
       );
     }
     if (firstOutcome.kind === "save_error") {
@@ -1509,7 +1532,8 @@ export class WorkbenchSessionController {
       throw new WorkbenchError(
         "Explicit save outcome is uncertain because Workbench did not return a trusted completion result. " +
           `Cause: ${cause}. Shut down and relaunch the target before any further save.`,
-        "SAVE_OUTCOME_UNCERTAIN"
+        "SAVE_OUTCOME_UNCERTAIN",
+        MESSAGE_OWNS_RECOVERY
       );
     }
 
@@ -1521,14 +1545,16 @@ export class WorkbenchSessionController {
           typeof result.message === "string" && result.message.length > 0
             ? result.message
             : "Workbench did not confirm the explicit resource save.",
-          "SAVE_OUTCOME_UNCERTAIN"
+          "SAVE_OUTCOME_UNCERTAIN",
+          NO_SAFE_REMEDY
         );
       }
       if (result.startupLoadPath !== binding.resource.displayPath) {
         this.taintExplicitResourceSession("The helper startup target attestation changed during save.");
         throw new WorkbenchError(
           "Explicit resource save refused because Workbench no longer attested the expected startup target.",
-          "SAVE_OUTCOME_UNCERTAIN"
+          "SAVE_OUTCOME_UNCERTAIN",
+          NO_SAFE_REMEDY
         );
       }
     } catch (error) {
@@ -2414,7 +2440,16 @@ export class WorkbenchSessionController {
     if (apiFunc === "EMCP_WB_ExplicitResourceSave") {
       throw new WorkbenchError(
         "Target-bound save requests must use wb_save_resource so the startup binding and disk evidence are verified.",
-        "TARGET_SESSION_REQUIRED"
+        "TARGET_SESSION_REQUIRED",
+        {
+          kind: "remedy",
+          remedy: {
+            kind: "tool",
+            tool: "wb_save_resource",
+            input: { confirm: "save", resourcePath: binding.resource.displayPath },
+            why: "It verifies the recorded startup binding and resulting disk evidence.",
+          },
+        }
       );
     }
     const documentSwitch = (apiFunc === "EMCP_WB_EditorControl" && params.action === "openResource") ||
@@ -2427,7 +2462,8 @@ export class WorkbenchSessionController {
     throw new WorkbenchError(
       "TARGET_SESSION_TAINTED: resource-opening tools are unavailable in a target-bound save session because they could " +
         "switch the document away from the startup target. Shut down and launch the desired explicit .ent instead.",
-      "TARGET_SESSION_TAINTED"
+      "TARGET_SESSION_TAINTED",
+      MESSAGE_OWNS_RECOVERY
     );
   }
 
@@ -2455,13 +2491,15 @@ export class WorkbenchSessionController {
     if (!binding) {
       throw new WorkbenchError(
         "TARGET_SESSION_REQUIRED: start a fresh Workbench with wb_launch { gprojPath, resourcePath } before saving.",
-        "TARGET_SESSION_REQUIRED"
+        "TARGET_SESSION_REQUIRED",
+        MESSAGE_OWNS_RECOVERY
       );
     }
     if (binding.taintedReason) {
       throw new WorkbenchError(
         `TARGET_SESSION_TAINTED: ${binding.taintedReason} Shut down and relaunch the explicit target before saving.`,
-        "TARGET_SESSION_TAINTED"
+        "TARGET_SESSION_TAINTED",
+        MESSAGE_OWNS_RECOVERY
       );
     }
     const expected = canonicalizeResourceTarget(expectedPath, binding.project);
@@ -2469,7 +2507,16 @@ export class WorkbenchSessionController {
         expected.metaComparisonKey !== binding.resource.metaComparisonKey) {
       throw new WorkbenchError(
         "TARGET_SESSION_REQUIRED: the requested save path does not match the resource supplied at Workbench startup.",
-        "TARGET_SESSION_REQUIRED"
+        "TARGET_SESSION_REQUIRED",
+        {
+          kind: "remedy",
+          remedy: {
+            kind: "tool",
+            tool: "wb_save_resource",
+            input: { confirm: "save", resourcePath: binding.resource.displayPath },
+            why: "Only the exact resource bound at startup can be saved automatically.",
+          },
+        }
       );
     }
     const authority = await this.readManagedRunningAuthoritySnapshot(
@@ -2482,7 +2529,16 @@ export class WorkbenchSessionController {
       this.clearExplicitResourceSession();
       throw new WorkbenchError(
         "TARGET_SESSION_REQUIRED: the exact target-bound Workbench process or lifecycle generation changed.",
-        "TARGET_SESSION_REQUIRED"
+        "TARGET_SESSION_REQUIRED",
+        {
+          kind: "remedy",
+          remedy: {
+            kind: "tool",
+            tool: "wb_diagnose",
+            input: {},
+            why: "The prior save binding is no longer authoritative and must not be retried blindly.",
+          },
+        }
       );
     }
     return binding;
@@ -2923,7 +2979,19 @@ export class WorkbenchSessionController {
     state = reconciled.state;
     if (reconciled.live) {
       if (!state.workbench || !state.target || state.target.comparisonKey !== project.comparisonKey) {
-        throw new WorkbenchError("Recorded Workbench target does not match the requested project.", "TARGET_CONFLICT");
+        throw new WorkbenchError(
+          "Recorded Workbench target does not match the requested project.",
+          "TARGET_CONFLICT",
+          {
+            kind: "remedy",
+            remedy: {
+              kind: "tool",
+              tool: "wb_shutdown",
+              input: {},
+              why: "The producer proved that the conflicting editor is the exact process owned by this MCP.",
+            },
+          }
+        );
       }
       const authority = await this.processGuard.withLifecycleLock(async (session) => {
         await this.requireReservedLifecycle(session, state);
@@ -3018,7 +3086,8 @@ export class WorkbenchSessionController {
       throw new WorkbenchError(
         "TARGET_SESSION_REQUIRED: a Workbench process is already running, but this MCP cannot prove it is " +
           "the requested fresh target-bound resource session. Shut it down before launching an explicit target.",
-        "TARGET_SESSION_REQUIRED"
+        "TARGET_SESSION_REQUIRED",
+        MESSAGE_OWNS_RECOVERY
       );
     }
 
@@ -3474,8 +3543,9 @@ export class WorkbenchSessionController {
       }
       if (compileFailure) {
         throw new WorkbenchError(
-          formatWorkbenchCompileFailure(compileFailure),
-          "PROJECT_COMPILE_FAILED"
+          formatWorkbenchCompileFailure(compileFailure, preflight.project.displayPath),
+          "PROJECT_COMPILE_FAILED",
+          { kind: "message_owns_recovery" }
         );
       }
       throw mapped;
@@ -3753,7 +3823,11 @@ export class WorkbenchSessionController {
       return new WorkbenchError(error.message, error.code);
     }
     if (error instanceof WorkbenchAddonDependencyPreflightError) {
-      return new WorkbenchError(error.message, error.code);
+      return new WorkbenchError(
+        error.message,
+        error.code,
+        error.code === "INVALID_CONFIG" ? MESSAGE_OWNS_RECOVERY : undefined
+      );
     }
     if (error instanceof ProjectIdentityError) {
       return new WorkbenchError(error.message, error.code);

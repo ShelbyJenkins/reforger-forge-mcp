@@ -210,10 +210,16 @@ export function readWorkbenchCompileFailureFromLogDirectory(
   }
 }
 
-export function formatWorkbenchCompileFailure(failure: WorkbenchCompileFailure): string {
+export function formatWorkbenchCompileFailure(
+  failure: WorkbenchCompileFailure,
+  gprojPath?: string
+): string {
   const detail = failure.diagnostics.length > 0
     ? ` First compiler diagnostic: ${failure.diagnostics[0]}`
     : "";
+  const next = gprojPath === undefined
+    ? ""
+    : ` Next action: call wb_check with ${JSON.stringify({ gprojPath })}.`;
   return `Workbench could not compile the \"${failure.module}\" project script module.${detail} ` +
-    `Exact Workbench script log: ${failure.logPath}`;
+    `Exact Workbench script log: ${failure.logPath}${next}`;
 }

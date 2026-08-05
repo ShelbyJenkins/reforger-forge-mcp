@@ -9,6 +9,7 @@ import {
   projectPublicObserverToolError,
   type PublicObserverErrorCandidate,
 } from "../observer/public-contract.js";
+import { resolveObserverRefusalRemedy } from "../observer/refusal-remedy.js";
 
 function jsonText(heading: string, value: unknown): string {
   return `${heading}\n\n\`\`\`json\n${JSON.stringify(value, null, 2)}\n\`\`\``;
@@ -23,13 +24,27 @@ function extractOwnedRuntimeError(error: unknown): PublicObserverErrorCandidate 
   };
 }
 
-function toolError(error: unknown) {
+function toolError(
+  error: unknown,
+  action: "start" | "status" | "stop"
+) {
   return {
     content: [{
       type: "text" as const,
       text: projectPublicObserverToolError(error, {
         subject: "Observer runtime error",
         extract: extractOwnedRuntimeError,
+        remedyContext: {
+          tool: "observer_runtime",
+          action,
+          ...(error instanceof OwnedRuntimeError && error.remedyReason !== undefined
+            ? { reason: error.remedyReason }
+            : {}),
+        },
+        resolveRemedy: resolveObserverRefusalRemedy,
+        readRemedyContext: () => error instanceof OwnedRuntimeError
+          ? error.details
+          : undefined,
       }),
     }],
     isError: true,
@@ -108,7 +123,7 @@ export function registerObserverRuntime(
         });
         return { content: [{ type: "text" as const, text: jsonText("Exact-owned observer runtime stopped.", result) }] };
       } catch (error) {
-        return toolError(error);
+        return toolError(error, input.action);
       }
     }
   );

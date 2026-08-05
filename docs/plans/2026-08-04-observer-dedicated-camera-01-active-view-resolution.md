@@ -1,9 +1,6 @@
 # Commit 1 plan: resolve the active runtime view from the world slot
 
-> **Execution constraint:** Do not launch Enfusion Workbench or the game client
-> while carrying out this plan. If testing reaches a point that requires either,
-> stop before launching it and wait for explicit confirmation that it is
-> available for use.
+
 
 > **Series overview:** [Step 0](2026-08-04-observer-dedicated-camera-00-series-overview.md).
 

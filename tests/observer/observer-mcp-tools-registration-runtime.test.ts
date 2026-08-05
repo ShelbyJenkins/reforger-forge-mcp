@@ -80,6 +80,8 @@ describe("observer MCP tools", () => {
       expect(result.isError).toBe(true);
       expect(result.content[0].text).toContain("ARGUMENT_CONFLICT");
       expect(result.content[0].text).toContain("forceNonNativeWindowSize");
+      expect(result.content[0].text).toContain("Next action: remove -window");
+      expect(result.content[0].text!.length).toBeLessThanOrEqual(512);
       expect(prepareLaunch).not.toHaveBeenCalled();
     },
   );
@@ -288,6 +290,106 @@ describe("observer MCP tools", () => {
     expect(text).not.toContain("bearer-sentinel");
     expect(text).not.toContain("token-sentinel");
     expect(text).not.toContain("C:\\Users\\name\\runtime-private");
+  });
+
+  it("projects a consumed preparation only to status for its exact bounded runtime", async () => {
+    const runtimeId = "rt-00000000-0000-4000-8000-000000000042";
+    const manager = {
+      start: vi.fn(async () => {
+        throw new OwnedRuntimeError(
+          "PREPARED_LAUNCH_CONSUMED",
+          "Prepared launch is one-shot and has already been consumed",
+          { runtimeId }
+        );
+      }),
+    } as unknown as OwnedRuntimeManager;
+    const { call } = createToolHarness({}, manager);
+
+    const result = await call("observer_runtime", {
+      action: "start",
+      preparedLaunchId: "pl-00000000-0000-4000-8000-000000000001",
+    });
+    const text = result.content[0].text!;
+
+    expect(result.isError).toBe(true);
+    expect(text).toContain("PREPARED_LAUNCH_CONSUMED");
+    expect(text).toContain(runtimeId);
+    expect(text).toContain(JSON.stringify({ action: "status", runtimeId }));
+    expect(text).not.toContain('"action":"start"');
+    expect(text).not.toContain("prepare and start again");
+    expect(text.length).toBeLessThanOrEqual(512);
+  });
+
+  it("suppresses consumed-launch status advice without an exact runtime ID", async () => {
+    const manager = {
+      start: vi.fn(async () => {
+        throw new OwnedRuntimeError(
+          "PREPARED_LAUNCH_CONSUMED",
+          "Prepared launch is one-shot and has already been consumed",
+          { runtimeId: "rt-malformed" }
+        );
+      }),
+    } as unknown as OwnedRuntimeManager;
+    const { call } = createToolHarness({}, manager);
+
+    const result = await call("observer_runtime", {
+      action: "start",
+      preparedLaunchId: "pl-00000000-0000-4000-8000-000000000001",
+    });
+
+    expect(result.content[0].text).not.toContain("Next action:");
+    expect(result.content[0].text!.length).toBeLessThanOrEqual(512);
+  });
+
+  it("keeps runtime-not-found recovery specific to start, status, and stop", async () => {
+    const manager = {
+      start: vi.fn(async () => {
+        throw new OwnedRuntimeError(
+          "RUNTIME_NOT_FOUND",
+          "graphical executable is unavailable",
+          undefined,
+          "runtime_executable_missing"
+        );
+      }),
+      status: vi.fn(async () => {
+        throw new OwnedRuntimeError("RUNTIME_NOT_FOUND", "runtime receipt is unavailable");
+      }),
+      stop: vi.fn(async () => {
+        throw new OwnedRuntimeError("RUNTIME_NOT_FOUND", "runtime receipt is unavailable");
+      }),
+    } as unknown as OwnedRuntimeManager;
+    const { call } = createToolHarness({}, manager);
+    const runtimeId = "rt-00000000-0000-4000-8000-000000000042";
+
+    const start = await call("observer_runtime", {
+      action: "start",
+      preparedLaunchId: "pl-00000000-0000-4000-8000-000000000001",
+    });
+    const status = await call("observer_runtime", { action: "status", runtimeId });
+    const stop = await call("observer_runtime", {
+      action: "stop",
+      runtimeId,
+      waitForRestorationMs: 0,
+    });
+
+    expect(start.content[0].text).toContain("correct the configured game path");
+    expect(status.content[0].text).toContain("runtimeId returned by a successful");
+    expect(stop.content[0].text).toContain("never stop a process by PID or name");
+  });
+
+  it("offers fresh inventory only when an instance failure owns a session ID", async () => {
+    const instances = vi.fn(async () => {
+      throw new ObserverApplicationError("NO_RENDER_ENDPOINT", "No compatible renderer is available");
+    });
+    const { call } = createToolHarness({ instances });
+
+    const owned = await call("observer_instances", { sessionId: "session-owned-1" });
+    const unscoped = await call("observer_instances", {});
+
+    expect(owned.content[0].text).toContain(
+      JSON.stringify({ sessionId: "session-owned-1" })
+    );
+    expect(unscoped.content[0].text).not.toContain("Next action:");
   });
 
 });

@@ -1,5 +1,10 @@
 # Step 0: dedicated runtime-camera series overview
 
+> **Execution constraint:** Do not launch Enfusion Workbench or the game client
+> while carrying out this plan. If testing reaches a point that requires either,
+> stop before launching it and wait for explicit confirmation that it is
+> available for use.
+
 > **Document role:** Series-wide navigation and sequencing metadata only. This
 > is not an implementation task and does not produce a commit.
 

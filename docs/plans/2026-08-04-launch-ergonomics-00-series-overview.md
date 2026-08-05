@@ -1,5 +1,10 @@
 # Step 0: launch ergonomics series overview
 
+> **Execution constraint:** Do not launch Enfusion Workbench or the game client
+> while carrying out this plan. If testing reaches a point that requires either,
+> stop before launching it and wait for explicit confirmation that it is
+> available for use.
+
 > **Document role:** Series-wide navigation and dependency metadata only. This
 > is not an implementation task and does not produce a commit.
 
@@ -20,6 +25,31 @@
 13. [Independent operator-visible MCP host identity](2026-08-04-launch-ergonomics-13-mcp-host-identity.md).
 14. [Host-scoped MCP idle readiness fencing](2026-08-04-launch-ergonomics-14-mcp-idle-readiness.md).
 15. [Bounded MCP idle auto-shutdown](2026-08-04-launch-ergonomics-15-mcp-idle-shutdown.md).
+
+## Implementation status
+
+| Commit | Status | Last updated | Notes |
+|---|---|---|---|
+| 1 | Implementation complete; live validated | 2026-08-04 | Required static gates and stage 3 tests 345/345 passed. Live compile-check, lifecycle, and explicit-save acceptances passed with final process vacancy. Not yet committed. |
+| 2 | Implementation complete; live validated | 2026-08-04 | Focused tests 40/40 and stage 4 tests 180/180 passed. Positive Workbench Observer acceptance passed with six captures, restoration, cleanup, and final process vacancy. Not yet committed. |
+| 3 | Implementation complete; live validated | 2026-08-04 | Focused tests 21/21, typecheck, and unused-code analysis passed. A real Workbench registration produced metadata that strict explicit/discovery resolution and evidence revalidation accepted. Not yet committed. |
+| 4 | Not started | 2026-08-04 | |
+| 5 | Not started | 2026-08-04 | |
+| 6 | Not started | 2026-08-04 | |
+| 7 | Not started | 2026-08-04 | |
+| 8 | Not started | 2026-08-04 | Optional. |
+| 9 | Not started | 2026-08-04 | Deferred follow-up. |
+| 10 | Not started | 2026-08-04 | Deferred follow-up. |
+| 11 | Not started | 2026-08-04 | Deferred follow-up. |
+| 12 | Not started | 2026-08-04 | Deferred follow-up. |
+| 13 | Not started | 2026-08-04 | Independent follow-up. |
+| 14 | Not started | 2026-08-04 | Depends on Commit 13. |
+| 15 | Not started | 2026-08-04 | Depends on Commit 14. |
+
+Update this table after each numbered commit is completed. Mark a commit
+complete only after its acceptance criteria are satisfied and its required
+non-live validation has passed; record any intentionally deferred live gate in
+the Notes column.
 
 ## Delivery groups
 

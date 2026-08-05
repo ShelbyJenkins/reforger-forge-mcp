@@ -59,6 +59,7 @@ import type {
   ObserverPreparedLaunch,
   ObserverPreparedLaunchRecorder,
 } from "./launch.js";
+import type { ObserverRemedyReason } from "./refusal-remedy.js";
 
 export const OWNED_RUNTIME_OWNER_ARGUMENT_PREFIX = "-reforgerForgeOwnerToken=";
 export const OWNED_RUNTIME_LIFECYCLE_MUTEX = "Global\\ReforgerForge.ObserverRuntimeLifecycle.v1";
@@ -305,7 +306,8 @@ export class OwnedRuntimeError extends Error {
   constructor(
     readonly code: string,
     message: string,
-    readonly details?: Record<string, unknown>
+    readonly details?: Record<string, unknown>,
+    readonly remedyReason?: ObserverRemedyReason
   ) {
     super(message);
     this.name = "OwnedRuntimeError";
@@ -629,7 +631,9 @@ function assertWindowsCommandLineFits(executablePath: string, argumentsArray: re
   if (lengthWithNull > WINDOWS_COMMAND_LINE_MAX_UTF16_UNITS) {
     throw new OwnedRuntimeError(
       "ARGUMENT_CONFLICT",
-      "Prepared arguments exceed the Windows CreateProcess command-line limit"
+      "Prepared arguments exceed the Windows CreateProcess command-line limit",
+      undefined,
+      "command_line_overflow"
     );
   }
 }
@@ -710,7 +714,9 @@ function assertNoOwnerArgument(argumentsArray: readonly string[]): void {
   })) {
     throw new OwnedRuntimeError(
       "ARGUMENT_CONFLICT",
-      "Prepared launch arguments already contain an owner-token argument"
+      "Prepared launch arguments already contain an owner-token argument",
+      undefined,
+      "owner_token_injection"
     );
   }
 }
@@ -760,7 +766,9 @@ export function resolveRuntimeExecutable(
   }
   throw new OwnedRuntimeError(
     "RUNTIME_NOT_FOUND",
-    `No allowlisted ${dedicated ? "dedicated-server" : "graphical"} Arma Reforger executable exists beneath the configured game path`
+    `No allowlisted ${dedicated ? "dedicated-server" : "graphical"} Arma Reforger executable exists beneath the configured game path`,
+    undefined,
+    "runtime_executable_missing"
   );
 }
 
@@ -2000,7 +2008,12 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
     }
     assertNoOwnerArgument(descriptor.arguments);
     if (descriptor.arguments.some((argument) => argument.includes("\0"))) {
-      throw new OwnedRuntimeError("ARGUMENT_CONFLICT", "Prepared launch arguments cannot contain NUL characters");
+      throw new OwnedRuntimeError(
+        "ARGUMENT_CONFLICT",
+        "Prepared launch arguments cannot contain NUL characters",
+        undefined,
+        "nul_argument"
+      );
     }
     // Reserve the complete ownership/recovery cluster before any consumption
     // receipt, spawn, or other irreversible action is attempted.
@@ -2019,7 +2032,12 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
     const argumentsArray = [...descriptor.arguments, ownerTokenArgument];
     if (argumentsArray.filter((argument) =>
       argument.toLowerCase().startsWith(OWNED_RUNTIME_OWNER_ARGUMENT_PREFIX.toLowerCase())).length !== 1) {
-      throw new OwnedRuntimeError("ARGUMENT_CONFLICT", "Owned runtime start did not produce exactly one owner argument");
+      throw new OwnedRuntimeError(
+        "ARGUMENT_CONFLICT",
+        "Owned runtime start did not produce exactly one owner argument",
+        undefined,
+        "managed_arguments"
+      );
     }
     assertWindowsCommandLineFits(executablePath, argumentsArray);
     const argvSha256 = sha256(JSON.stringify(argumentsArray));
@@ -2041,7 +2059,11 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
         }
         throw new OwnedRuntimeError("START_UNVERIFIABLE", "Prepared launch was consumed without a successful receipt");
       }
-      throw new OwnedRuntimeError("PREPARED_LAUNCH_CONSUMED", "Prepared launch is one-shot and has already been consumed");
+      throw new OwnedRuntimeError(
+        "PREPARED_LAUNCH_CONSUMED",
+        "Prepared launch is one-shot and has already been consumed",
+        { runtimeId: consumed.runtimeId }
+      );
     }
 
     const runtimeId = `rt-${this.createId()}`;
