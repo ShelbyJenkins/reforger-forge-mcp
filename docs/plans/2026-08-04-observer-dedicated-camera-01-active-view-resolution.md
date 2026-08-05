@@ -1,5 +1,12 @@
 # Commit 1 plan: resolve the active runtime view from the world slot
 
+> **Execution constraint:** Do not launch Enfusion Workbench or the game client
+> while carrying out this plan. If testing reaches a point that requires either,
+> stop before launching it and wait for explicit confirmation that it is
+> available for use.
+
+> **Series overview:** [Step 0](2026-08-04-observer-dedicated-camera-00-series-overview.md).
+
 > **Commit:** `fix(observer-runtime): resolve the camera publishing the active world slot`
 >
 > **Series position:** 1 of 7 required commits. This correction is independent
@@ -19,31 +26,6 @@ manager-first assumption exists in current-view preload/evidence snapshots.
 This is a source-backed bug independent of the proposed dedicated slot. Keeping
 the fix separate gives it a small regression surface and prevents the later
 feature commit from hiding a change in restore-target selection.
-
-## Commit-series map
-
-The implementation should not be one commit. Use this order:
-
-1. fix active-view resolution (this plan);
-2. [add the default-inert engine qualification harness and pass the manager
-   gate](2026-08-04-observer-dedicated-camera-02-engine-qualification.md);
-3. [make lease binding and outstanding-restoration status explicit without
-   changing camera behavior](2026-08-04-observer-dedicated-camera-03-lease-obligation-model.md);
-4. [implement the complete manager-owned dedicated-camera
-   transaction](2026-08-04-observer-dedicated-camera-04-manager-transaction.md);
-5. [optionally add narrowly qualified editor self-reselection
-   recovery](2026-08-04-observer-dedicated-camera-05-qualified-reselection-recovery.md);
-6. [separate stable support from per-attempt readiness and wait in
-   `RESOLVING`](2026-08-04-observer-dedicated-camera-06-capability-and-resolving.md);
-7. [add native restoration/takeover fault
-   acceptance](2026-08-04-observer-dedicated-camera-07-restoration-fault-acceptance.md);
-8. [publish final operator
-   documentation](2026-08-04-observer-dedicated-camera-08-operator-documentation.md);
-9. [optionally implement detached-camera hand-back after its separate
-   gate](2026-08-04-observer-dedicated-camera-09-detached-follow-up.md).
-
-Items 5 and 9 are omitted when their live gates do not pass. The manager
-release does not depend on detached-camera support.
 
 ## Goal
 

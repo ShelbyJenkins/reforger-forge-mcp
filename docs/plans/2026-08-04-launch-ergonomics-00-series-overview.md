@@ -1,0 +1,61 @@
+# Step 0: launch ergonomics series overview
+
+> **Document role:** Series-wide navigation and dependency metadata only. This
+> is not an implementation task and does not produce a commit.
+
+## Series map
+
+1. [Workbench contextual refusals](2026-08-04-launch-ergonomics-01-workbench-refusals.md).
+2. [Observer bounded remedies](2026-08-04-launch-ergonomics-02-observer-refusals.md).
+3. [Registered project-world resolution](2026-08-04-launch-ergonomics-03-world-resolution.md).
+4. [Dependency and add-on-root safety](2026-08-04-launch-ergonomics-04-dependency-root-safety.md).
+5. [Shared runtime launch policy](2026-08-04-launch-ergonomics-05-runtime-launch-policy.md).
+6. [Shared owned-runtime tool plumbing](2026-08-04-launch-ergonomics-06-runtime-plumbing.md).
+7. [Owned `game_launch` baseline](2026-08-04-launch-ergonomics-07-owned-game-launch.md).
+8. [Optional Workbench launch preview](2026-08-04-launch-ergonomics-08-workbench-preview.md).
+9. [Deferred fenced successor recovery](2026-08-04-launch-ergonomics-09-successor-recovery.md).
+10. [External PowerShell descriptor infrastructure](2026-08-04-launch-ergonomics-10-powershell-descriptor.md).
+11. [Deferred bounded runtime process inventory](2026-08-04-launch-ergonomics-11-runtime-process-inventory.md).
+12. [Deferred external-script activation](2026-08-04-launch-ergonomics-12-external-script-activation.md).
+13. [Independent operator-visible MCP host identity](2026-08-04-launch-ergonomics-13-mcp-host-identity.md).
+14. [Host-scoped MCP idle readiness fencing](2026-08-04-launch-ergonomics-14-mcp-idle-readiness.md).
+15. [Bounded MCP idle auto-shutdown](2026-08-04-launch-ergonomics-15-mcp-idle-shutdown.md).
+
+## Delivery groups
+
+Commits 1-7 are the required ergonomic baseline. Commit 8 is independent and
+optional. Commits 9-12 are follow-ups whose lifecycle and external-process cost
+must not block the baseline. Commit 13 is an independent setup/operability
+follow-up and may land without any game-launch commit.
+
+Commit 14 is a behavior-neutral host-lifecycle foundation: existing-only readers,
+typed readiness, provider revisions, and a default-open admission gate. It
+depends only on Commit 13. Commits 7, 9, and 12 each carry a compatibility
+obligation to extend its typed blocker projection when those features are present.
+Commit 15 is the atomic actor: the 30-minute-default configuration, protocol
+activity accounting, controller, diagnostics, and the sole production seal/exit
+path land and revert together.
+
+## Dependency map
+
+The numbering is recommended review order, not a claim that every commit is
+linearly dependent:
+
+    1 independent
+    2 independent
+    3 independent
+    4 -> 3
+    5 -> 3 + 4
+    6 behavior-independent, ordered after 5
+    7 -> 2 + 3 + 4 + 5 + 6
+    8 optional and independent
+    9 -> 7
+    10 -> 5 + 6
+    11 -> 6
+    12 -> 7 + 9 + 10 + 11
+    13 independent
+    14 -> 13; 7 + 9 + 12 extend its blocker projection when present
+    15 -> 14
+
+Each numbered document is the authoritative implementation task for that step,
+including its own scope, validation, and acceptance criteria.
