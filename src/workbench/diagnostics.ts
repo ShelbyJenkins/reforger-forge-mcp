@@ -10,6 +10,10 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import type { Config } from "../config.js";
 import {
+  validateMcpHostIdentity,
+  type McpHostIdentity,
+} from "../mcp-host-identity.js";
+import {
   WORKBENCH_HELPER_ADDON_GUID,
   WORKBENCH_HELPER_ADDON_ID,
   WORKBENCH_HELPER_ADDON_VERSION,
@@ -57,6 +61,7 @@ export interface LifecycleDiagnostic {
 }
 
 export interface DiagnosticReport {
+  mcpHost: McpHostIdentity;
   host: string;
   port: number;
   workbenchExe: { path: string; exists: boolean } | null;
@@ -80,6 +85,7 @@ export interface WorkbenchDiagnosticNetError {
 }
 
 export interface WorkbenchDiagnosticOptions {
+  readonly hostIdentity: McpHostIdentity;
   readonly host: string;
   readonly port: number;
   readonly config?: Config;
@@ -185,6 +191,7 @@ export async function diagnoseLifecycle(
 export async function diagnoseWorkbench(
   options: WorkbenchDiagnosticOptions
 ): Promise<DiagnosticReport> {
+  const hostIdentity = validateMcpHostIdentity(options.hostIdentity);
   const workbenchExePath = options.config ? workbenchExecutable(options.config) : null;
   let companionAddon: DiagnosticReport["companionAddon"] = null;
   try {
@@ -240,6 +247,7 @@ export async function diagnoseWorkbench(
   }
 
   return {
+    mcpHost: hostIdentity,
     host: options.host,
     port: options.port,
     workbenchExe: workbenchExePath

@@ -589,6 +589,7 @@ export function makeHarness(options: {
   preparedExpiresAt?: string;
   preparedProfilePath?: string;
   preserveForegroundDuringStartup?: (pid: number) => Promise<void>;
+  managerInstanceId?: string;
 } = {}): Harness {
   const root = options.root ?? mkdtempSync(join(tmpdir(), "rfo-owned-runtime-"));
   if (!options.root) roots.push(root);
@@ -623,6 +624,9 @@ export function makeHarness(options: {
     managedRoot: root,
     gamePath: root,
     observerGate: gate,
+    ...(options.managerInstanceId === undefined
+      ? {}
+      : { managerInstanceId: options.managerInstanceId }),
     backend,
     spawnProcess,
     preserveForegroundDuringStartup: async (targetPid) => {

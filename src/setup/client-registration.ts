@@ -29,6 +29,7 @@ import {
 } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { isMap, isSeq, parseDocument } from "yaml";
+import { buildManagedMcpServerArguments } from "../mcp-host-identity.js";
 
 export const SUPPORTED_CLIENT_IDS = [
   "codex",
@@ -252,11 +253,13 @@ interface ClientDefinition {
   ) => ClientRegistrationTarget;
   readonly register: (
     context: RegistrationContext,
-    detection: ClientDetection
+    detection: ClientDetection,
+    clientLabel: SupportedClientId
   ) => RegistrationResult;
   readonly inspect: (
     context: RegistrationContext,
-    detection: ClientDetection
+    detection: ClientDetection,
+    clientLabel: SupportedClientId
   ) => InspectionResult;
 }
 
@@ -1103,21 +1106,23 @@ function detectClient(
 }
 
 function expectedStdioEntry(
-  serverPath: string
+  serverPath: string,
+  clientLabel: SupportedClientId
 ): Readonly<Record<string, unknown>> {
   return {
     command: "node",
-    args: [serverPath],
+    args: buildManagedMcpServerArguments({ clientLabel, serverPath }),
   };
 }
 
 function expectedVsCodeEntry(
-  serverPath: string
+  serverPath: string,
+  clientLabel: SupportedClientId
 ): Readonly<Record<string, unknown>> {
   return {
     type: "stdio",
     command: "node",
-    args: [serverPath],
+    args: buildManagedMcpServerArguments({ clientLabel, serverPath }),
   };
 }
 
@@ -1530,14 +1535,18 @@ function yamlNodeValue(value: unknown): unknown {
 
 function codexRegistrationIsCurrent(
   value: unknown,
-  serverPath: string
+  serverPath: string,
+  clientLabel: SupportedClientId
 ): boolean {
   if (!isRecord(value) || !isRecord(value.transport)) return false;
   const transport = value.transport;
   return (
     transport.type === "stdio" &&
     transport.command === "node" &&
-    isDeepStrictEqual(transport.args, [serverPath]) &&
+    isDeepStrictEqual(
+      transport.args,
+      buildManagedMcpServerArguments({ clientLabel, serverPath })
+    ) &&
     !hasMeaningfulValue(transport.env) &&
     !hasMeaningfulValue(transport.env_vars) &&
     !hasMeaningfulValue(transport.cwd)
@@ -1616,7 +1625,8 @@ function codexRegistrationIsAbsent(
 
 function inspectCodexRegistration(
   context: RegistrationContext,
-  detection: ClientDetection
+  detection: ClientDetection,
+  clientLabel: SupportedClientId
 ): InspectionResult {
   const command = detection.commandPath ?? "codex";
   const target = clientCliTarget(command);
@@ -1657,7 +1667,7 @@ function inspectCodexRegistration(
     );
   }
   return {
-    status: codexRegistrationIsCurrent(parsed, context.serverPath)
+    status: codexRegistrationIsCurrent(parsed, context.serverPath, clientLabel)
       ? "current"
       : "different",
     detail: `Inspected through Codex CLI: ${detection.commandPath}`,
@@ -1667,7 +1677,8 @@ function inspectCodexRegistration(
 
 function registerCodex(
   context: RegistrationContext,
-  detection: ClientDetection
+  detection: ClientDetection,
+  clientLabel: SupportedClientId
 ): RegistrationResult {
   if (!detection.commandPath) {
     throw new Error(
@@ -1690,7 +1701,7 @@ function registerCodex(
         `Codex returned an invalid MCP registration: ${errorMessage(error)}`
       );
     }
-    if (codexRegistrationIsCurrent(parsed, context.serverPath)) {
+    if (codexRegistrationIsCurrent(parsed, context.serverPath, clientLabel)) {
       return {
         status: "already_current",
         detail: `Managed through Codex CLI: ${detection.commandPath}`,
@@ -1723,7 +1734,10 @@ function registerCodex(
     SERVER_NAME,
     "--",
     "node",
-    context.serverPath,
+    ...buildManagedMcpServerArguments({
+      clientLabel,
+      serverPath: context.serverPath,
+    }),
   ]);
   if (commandResultFailed(addition)) {
     const failure = commandFailure(
@@ -1801,9 +1815,10 @@ function readClaudeUserEntry(
 
 function claudeEntryIsCurrent(
   entry: Readonly<Record<string, unknown>>,
-  serverPath: string
+  serverPath: string,
+  clientLabel: SupportedClientId
 ): boolean {
-  return stdioTransportIsCurrent(entry, expectedStdioEntry(serverPath));
+  return stdioTransportIsCurrent(entry, expectedStdioEntry(serverPath, clientLabel));
 }
 
 function claudeRegistrationIsAbsent(
@@ -1837,7 +1852,8 @@ function claudeRegistrationScope(
 
 function inspectClaudeCodeRegistration(
   context: RegistrationContext,
-  detection: ClientDetection
+  detection: ClientDetection,
+  clientLabel: SupportedClientId
 ): InspectionResult {
   const command = detection.commandPath ?? "claude";
   const target = clientCliTarget(command);
@@ -1902,7 +1918,7 @@ function inspectClaudeCodeRegistration(
     );
   }
   return {
-    status: claudeEntryIsCurrent(userEntry, context.serverPath)
+    status: claudeEntryIsCurrent(userEntry, context.serverPath, clientLabel)
       ? "current"
       : "different",
     detail:
@@ -1914,7 +1930,8 @@ function inspectClaudeCodeRegistration(
 
 function registerClaudeCode(
   context: RegistrationContext,
-  detection: ClientDetection
+  detection: ClientDetection,
+  clientLabel: SupportedClientId
 ): RegistrationResult {
   if (!detection.commandPath) {
     throw new Error(
@@ -1966,7 +1983,7 @@ function registerClaudeCode(
     );
   }
 
-  if (userEntry && claudeEntryIsCurrent(userEntry, context.serverPath)) {
+  if (userEntry && claudeEntryIsCurrent(userEntry, context.serverPath, clientLabel)) {
     return {
       status: "already_current",
       detail: `Managed through Claude CLI: ${detection.commandPath}; config: ${userConfigPath}`,
@@ -1987,7 +2004,10 @@ function registerClaudeCode(
   const payload = JSON.stringify({
     type: "stdio",
     command: "node",
-    args: [context.serverPath],
+    args: buildManagedMcpServerArguments({
+      clientLabel,
+      serverPath: context.serverPath,
+    }),
   });
   const addition = context.runCommand(detection.commandPath, [
     "mcp",
@@ -2046,7 +2066,8 @@ function registerClaudeCode(
 
 function updateContinueConfig(
   context: RegistrationContext,
-  configPath: string
+  configPath: string,
+  clientLabel: SupportedClientId
 ): RegistrationResult {
   const original = readOriginalFile(configPath);
   if (!original) {
@@ -2106,7 +2127,10 @@ function updateContinueConfig(
   }
   const expectedTransport = {
     command: "node",
-    args: [context.serverPath],
+    args: buildManagedMcpServerArguments({
+      clientLabel,
+      serverPath: context.serverPath,
+    }),
   };
   const indexes = serversNode.items
     .map((item, index) => ({ index, value: yamlNodeValue(item) }))
@@ -2167,7 +2191,8 @@ function updateContinueConfig(
 
 function inspectContinueConfig(
   context: RegistrationContext,
-  configPath: string
+  configPath: string,
+  clientLabel: SupportedClientId
 ): InspectionResult {
   const target = configFileTarget(configPath);
   const original = readOriginalFile(configPath);
@@ -2243,7 +2268,10 @@ function inspectContinueConfig(
   return {
     status: stdioTransportIsCurrent(entries[0], {
       command: "node",
-      args: [context.serverPath],
+      args: buildManagedMcpServerArguments({
+        clientLabel,
+        serverPath: context.serverPath,
+      }),
     })
       ? "current"
       : "different",
@@ -2264,8 +2292,8 @@ function jsonDefinition(
 ): ClientDefinition {
   const entry = (serverPath: string) =>
     definition.vscodeEntry
-      ? expectedVsCodeEntry(serverPath)
-      : expectedStdioEntry(serverPath);
+      ? expectedVsCodeEntry(serverPath, definition.id)
+      : expectedStdioEntry(serverPath, definition.id);
   return {
     ...definition,
     fallbackTarget: configFileTarget(),
@@ -2329,7 +2357,7 @@ function clientDefinitions(): readonly ClientDefinition[] {
         ...directoryEvidence([join(paths.home, ".codex")]),
       ],
       manual:
-        "Run: codex mcp add reforger-forge -- node <absolute-dist-index.js>",
+        "Run: codex mcp add reforger-forge -- node --title=ReforgerForge-MCP-codex <absolute-dist-index.js> --mcp-client-label codex",
       fallbackTarget: clientCliTarget("codex"),
       target: (_context, detection) =>
         clientCliTarget(detection.commandPath ?? "codex"),
@@ -2451,7 +2479,7 @@ function clientDefinitions(): readonly ClientDefinition[] {
         },
       ],
       manual:
-        "Run 'claude mcp get reforger-forge'; remove or rename any conflicting local/project entry, then run 'claude mcp add-json --scope user reforger-forge <stdio-json>'.",
+        "Run 'claude mcp get reforger-forge'; remove or rename any conflicting local/project entry, then run 'claude mcp add-json --scope user reforger-forge <stdio-json with --title=ReforgerForge-MCP-claude-code and --mcp-client-label claude-code>'.",
       fallbackTarget: clientCliTarget("claude"),
       target: (_context, detection) =>
         clientCliTarget(detection.commandPath ?? "claude"),
@@ -2534,15 +2562,17 @@ function clientDefinitions(): readonly ClientDefinition[] {
         configFileTarget(
           join(context.paths.home, ".continue", "config.yaml")
         ),
-      register: (context) =>
+      register: (context, _detection, clientLabel) =>
         updateContinueConfig(
           context,
-          join(context.paths.home, ".continue", "config.yaml")
+          join(context.paths.home, ".continue", "config.yaml"),
+          clientLabel
         ),
-      inspect: (context) =>
+      inspect: (context, _detection, clientLabel) =>
         inspectContinueConfig(
           context,
-          join(context.paths.home, ".continue", "config.yaml")
+          join(context.paths.home, ".continue", "config.yaml"),
+          clientLabel
         ),
     },
     jsonDefinition({
@@ -2744,7 +2774,7 @@ export function registerDetectedClients(
       continue;
     }
     try {
-      const result = definition.register(context, detection);
+      const result = definition.register(context, detection, definition.id);
       receipts.push({
         id: definition.id,
         name: definition.name,
@@ -2835,7 +2865,7 @@ export function inspectDetectedClients(
       continue;
     }
     try {
-      const result = definition.inspect(context, detection);
+      const result = definition.inspect(context, detection, definition.id);
       receipts.push({
         id: definition.id,
         name: definition.name,

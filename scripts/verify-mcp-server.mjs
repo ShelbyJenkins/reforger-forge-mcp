@@ -15,9 +15,11 @@ import {
   verifyMcpServer,
   writeServerVerificationReportAtomic,
 } from "../dist/setup/server-verification.js";
+import { partitionMcpHostArguments } from "../dist/mcp-host-identity.js";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
-const serverArguments = process.argv.slice(2);
+const hostPartition = partitionMcpHostArguments(process.argv.slice(2));
+const serverArguments = hostPartition.remainingArguments;
 const packageDocument = JSON.parse(
   readFileSync(join(root, "package.json"), "utf8")
 );
@@ -36,6 +38,7 @@ try {
   const report = await verifyMcpServer({
     packageRoot: root,
     packageVersion: packageDocument.version,
+    hostClientLabel: hostPartition.clientLabel,
     startupArguments: serverArguments,
   });
 

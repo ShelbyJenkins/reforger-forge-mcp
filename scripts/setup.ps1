@@ -914,7 +914,8 @@ try {
         $null,
         "Process"
     )
-    & $nodeCommand.Source $verificationScriptPath
+    & $nodeCommand.Source --title=ReforgerForge-MCP-setup `
+        $verificationScriptPath --mcp-client-label setup
     $verificationExitCode = $LASTEXITCODE
 }
 finally {

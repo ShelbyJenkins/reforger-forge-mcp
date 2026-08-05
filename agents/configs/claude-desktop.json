@@ -3,7 +3,10 @@
     "reforger-forge": {
       "command": "node",
       "args": [
-        "C:\\path\\to\\reforger-forge-mcp\\dist\\index.js"
+        "--title=ReforgerForge-MCP-claude-desktop",
+        "C:\\path\\to\\reforger-forge-mcp\\dist\\index.js",
+        "--mcp-client-label",
+        "claude-desktop"
       ]
     }
   }

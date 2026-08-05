@@ -27,6 +27,7 @@ import {
   type CommandLookupResult,
 } from "../../src/setup/client-registration.js";
 import { afterEach, describe, expect, it } from "vitest";
+import { buildManagedMcpServerArguments } from "../../src/mcp-host-identity.js";
 
 interface Fixture {
   readonly root: string;
@@ -123,6 +124,13 @@ function options(
     now: () => new Date("2026-07-24T12:34:56.000Z"),
     ...overrides,
   };
+}
+
+function managedArgs(setup: Fixture, clientLabel: string): string[] {
+  return buildManagedMcpServerArguments({
+    clientLabel,
+    serverPath: setup.serverPath,
+  });
 }
 
 function findOnly(...commands: readonly string[]) {
@@ -331,7 +339,7 @@ describe("MCP client detection and standard registration", () => {
       >;
       const entry = document[rootKey]["reforger-forge"];
       expect(entry.command).toBe("node");
-      expect(entry.args).toEqual([setup.serverPath]);
+      expect(entry.args).toEqual(managedArgs(setup, id));
       expect(entry.type).toBe(expectedType);
       expect(JSON.stringify(entry)).not.toMatch(
         /--config|--project-path|REFORGER_FORGE_|ENFUSION_/
@@ -375,7 +383,7 @@ describe("MCP client detection and standard registration", () => {
       mcpServers: {
         "reforger-forge": {
           command: "node",
-          args: [setup.serverPath],
+          args: managedArgs(setup, "antigravity"),
         },
       },
     });
@@ -420,7 +428,7 @@ describe("MCP client detection and standard registration", () => {
       JSON.parse(readFileSync(canonicalPath, "utf8")).mcpServers[
         "reforger-forge"
       ].args
-    ).toEqual([setup.serverPath]);
+    ).toEqual(managedArgs(setup, "antigravity"));
   });
 
   it("does not treat a shared canonical Gemini config as Antigravity evidence by itself", () => {
@@ -501,7 +509,7 @@ describe("MCP client detection and standard registration", () => {
       {
         name: "reforger-forge",
         command: "node",
-        args: [setup.serverPath],
+        args: managedArgs(setup, "continue"),
         connectionTimeout: 30000,
         disabledTools: ["wb_shutdown"],
       },
@@ -528,7 +536,7 @@ describe("MCP client detection and standard registration", () => {
         {
           name: "reforger-forge",
           command: "node",
-          args: [setup.serverPath],
+          args: managedArgs(setup, "continue"),
         },
       ],
     });
@@ -579,7 +587,7 @@ describe("MCP client detection and standard registration", () => {
           "reforger-forge",
           "--",
           "node",
-          setup.serverPath,
+          ...managedArgs(setup, "codex"),
         ],
       },
     ]);
@@ -628,7 +636,7 @@ describe("MCP client detection and standard registration", () => {
           "utf8"
         )
       ).mcpServers["reforger-forge"].args
-    ).toEqual([setup.serverPath]);
+    ).toEqual(managedArgs(setup, "claude-desktop"));
     expect(calls).toEqual([
       {
         command: "claude.exe",
@@ -645,7 +653,7 @@ describe("MCP client detection and standard registration", () => {
           JSON.stringify({
             type: "stdio",
             command: "node",
-            args: [setup.serverPath],
+            args: managedArgs(setup, "claude-code"),
           }),
         ],
       },
@@ -661,7 +669,7 @@ describe("MCP client detection and standard registration", () => {
         "reforger-forge": {
           type: "stdio",
           command: "node",
-          args: [setup.serverPath],
+          args: managedArgs(setup, "claude-code"),
           env: null,
           cwd: null,
           description: "keep this client metadata",
@@ -704,7 +712,7 @@ describe("MCP client detection and standard registration", () => {
         mcpServers: {
           "reforger-forge": {
             command: "node",
-            args: [setup.serverPath],
+            args: managedArgs(setup, "claude-code"),
           },
         },
       })}\n`,
@@ -776,7 +784,7 @@ describe("MCP client detection and standard registration", () => {
       JSON.parse(readFileSync(configPath, "utf8")).mcpServers[
         "reforger-forge"
       ].args
-    ).toEqual([setup.serverPath]);
+    ).toEqual(managedArgs(setup, "kiro"));
     expect(
       existsSync(join(setup.home, ".kiro", "settings", "mcp.json"))
     ).toBe(false);
@@ -823,7 +831,7 @@ describe("MCP client detection and standard registration", () => {
       JSON.parse(
         readFileSync(join(setup.appData, "Code", "User", "mcp.json"), "utf8")
       ).servers["reforger-forge"].args
-    ).toEqual([setup.serverPath]);
+    ).toEqual(managedArgs(setup, "vscode"));
   });
 
   it("reports legacy-only Continue configuration for manual migration", () => {
@@ -882,7 +890,7 @@ describe("Claude Code VS Code extension CLI discovery", () => {
           JSON.stringify({
             type: "stdio",
             command: "node",
-            args: [setup.serverPath],
+            args: managedArgs(setup, "claude-code"),
           }),
         ],
       },
@@ -900,7 +908,7 @@ describe("Claude Code VS Code extension CLI discovery", () => {
         mcpServers: {
           "reforger-forge": {
             command: "node",
-            args: [setup.serverPath],
+            args: managedArgs(setup, "claude-code"),
           },
         },
       })}\n`,
@@ -1397,7 +1405,7 @@ describe("safe config updates and idempotency", () => {
             transport: {
               type: "stdio",
               command: "node",
-              args: [setup.serverPath],
+              args: managedArgs(setup, "codex"),
               env: null,
               cwd: null,
             },
@@ -1497,7 +1505,7 @@ describe("safe config updates and idempotency", () => {
         if (args[1] === "get") return success(JSON.stringify(previous));
         if (
           args[1] === "add" &&
-          args.at(-1) === setup.serverPath
+          args.includes(setup.serverPath)
         ) {
           return { status: 1, stdout: "", stderr: "add failed" };
         }
@@ -1558,7 +1566,7 @@ describe("safe config updates and idempotency", () => {
           status: 1,
           stdout: "",
           stderr:
-            args.at(-1) === setup.serverPath
+            args.includes(setup.serverPath)
               ? "replacement failed"
               : "restoration failed",
         };

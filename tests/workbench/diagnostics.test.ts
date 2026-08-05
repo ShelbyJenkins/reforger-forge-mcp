@@ -9,8 +9,15 @@ import type {
   WorkbenchProcessGuard,
 } from "../../src/workbench/process-guard.js";
 import { WORKBENCH_HELPER_PING_RESPONSE } from "./fake-companion.js";
+import { createMcpHostIdentity } from "../../src/mcp-host-identity.js";
 
 type LifecycleReader = Pick<WorkbenchProcessGuard, "mcpInstanceId" | "readLifecycleState">;
+
+const hostIdentity = createMcpHostIdentity({
+  clientLabel: "codex",
+  instanceId: "00112233-4455-4677-8899-aabbccddeeff",
+  startedAt: "2026-08-05T12:34:56.789Z",
+});
 
 function lifecycleReader(read: LifecycleStateRead | Error): LifecycleReader {
   return {
@@ -136,6 +143,7 @@ describe("Workbench diagnostics", () => {
     };
 
     const report = await diagnoseWorkbench({
+      hostIdentity,
       host: "127.0.0.1",
       port: 5775,
       lifecycle,
@@ -150,6 +158,7 @@ describe("Workbench diagnostics", () => {
     ]]);
     expect(lifecycle.readLifecycleState).toHaveBeenCalledOnce();
     expect(report).toMatchObject({
+      mcpHost: hostIdentity,
       host: "127.0.0.1",
       port: 5775,
       workbenchExe: null,
@@ -161,6 +170,7 @@ describe("Workbench diagnostics", () => {
   it("preserves historical NET error classification", async () => {
     const timeout = { code: "TIMEOUT", message: "diagnostic timeout" };
     const report = await diagnoseWorkbench({
+      hostIdentity,
       host: "127.0.0.1",
       port: 5775,
       lifecycle: lifecycleReader({ kind: "missing" }),

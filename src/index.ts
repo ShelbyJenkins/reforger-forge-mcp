@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import { randomUUID } from "node:crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
@@ -10,6 +11,12 @@ import {
 } from "./config.js";
 import { registerTools } from "./server.js";
 import { runCliShutdown } from "./mcp-lifecycle.js";
+import {
+  createMcpHostIdentity,
+  formatMcpProcessTitle,
+  partitionMcpHostArguments,
+  type McpHostIdentity,
+} from "./mcp-host-identity.js";
 import {
   discoverSteamInstallations,
   STEAM_DISCOVERY_EXIT_CODES,
@@ -44,12 +51,12 @@ function usage(): string {
   ].join("\n");
 }
 
-async function runServer(config: Config): Promise<void> {
+async function runServer(config: Config, hostIdentity: McpHostIdentity): Promise<void> {
   const server = new McpServer({
     name: "reforger-forge-mcp",
     version: SERVER_VERSION,
   });
-  const disposeTools = registerTools(server, config);
+  const disposeTools = registerTools(server, config, { hostIdentity });
   const transport = new StdioServerTransport();
   let shutdownPromise: Promise<void> | null = null;
 
@@ -93,7 +100,10 @@ async function runServer(config: Config): Promise<void> {
 
   try {
     await server.connect(transport);
-    logger.info("ReforgerForge MCP server started");
+    logger.info(
+      `MCP host started product=${hostIdentity.product} client=${hostIdentity.clientLabel} ` +
+      `instanceId=${hostIdentity.instanceId} pid=${hostIdentity.pid}`
+    );
   } catch (error) {
     await shutdown("startup failure").catch(() => undefined);
     throw error;
@@ -101,9 +111,16 @@ async function runServer(config: Config): Promise<void> {
 }
 
 async function main(argv: readonly string[]): Promise<void> {
-  const partitioned = partitionConfigurationArguments(argv);
+  const hostArguments = partitionMcpHostArguments(argv);
+  const partitioned = partitionConfigurationArguments(hostArguments.remainingArguments);
+  const rejectServerOnlyHostArguments = (): void => {
+    if (hostArguments.explicitlySupplied) {
+      throw new Error("--mcp-client-label is valid only when starting the MCP stdio server.");
+    }
+  };
   if (partitioned.remainingArguments.length === 1
       && partitioned.remainingArguments[0] === "discover-steam") {
+    rejectServerOnlyHostArguments();
     if (partitioned.configurationArguments.length > 0) {
       throw new Error("discover-steam does not accept server configuration arguments.");
     }
@@ -113,6 +130,7 @@ async function main(argv: readonly string[]): Promise<void> {
     return;
   }
   if (partitioned.remainingArguments[0] === CHECK_ADDON_DIRS_COMMAND) {
+    rejectServerOnlyHostArguments();
     if (partitioned.configurationArguments.length > 0) {
       throw new Error(`${CHECK_ADDON_DIRS_COMMAND} does not accept server configuration arguments.`);
     }
@@ -124,11 +142,13 @@ async function main(argv: readonly string[]): Promise<void> {
   }
   if (partitioned.remainingArguments.length === 1
       && ["-h", "--help"].includes(partitioned.remainingArguments[0])) {
+    rejectServerOnlyHostArguments();
     process.stdout.write(usage());
     return;
   }
   if (partitioned.remainingArguments.length === 1
       && partitioned.remainingArguments[0] === "--version") {
+    rejectServerOnlyHostArguments();
     process.stdout.write(`${SERVER_VERSION}\n`);
     return;
   }
@@ -141,7 +161,14 @@ async function main(argv: readonly string[]): Promise<void> {
 
   const config = loadConfig(partitioned.configurationArguments);
   setDebugEnabled(config.debug === true);
-  await runServer(config);
+  const hostIdentity = createMcpHostIdentity({
+    clientLabel: hostArguments.clientLabel,
+    instanceId: randomUUID(),
+    pid: process.pid,
+    startedAt: new Date().toISOString(),
+  });
+  process.title = formatMcpProcessTitle(hostIdentity);
+  await runServer(config, hostIdentity);
 }
 
 try {

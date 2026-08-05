@@ -5,6 +5,10 @@ import { fileURLToPath } from "node:url";
 import { boundedOption, type BoundedOptionErrorFactory } from "../foundation/bounded-option.js";
 import { canonicalizePotentialPath } from "../foundation/managed-path.js";
 import { redactDiagnostic, redactText } from "../foundation/redact.js";
+import {
+  validateMcpHostIdentity,
+  type McpHostIdentity,
+} from "../mcp-host-identity.js";
 import type { WorkbenchObserverAdapter } from "../workbench/observer-adapter.js";
 import { ObserverAgentClient, type ObserverAgentClientOptions, type ObserverChildDescriptor } from "./agent-client.js";
 import type { CaptureInput, CaptureResult } from "./capture-contract.js";
@@ -67,6 +71,8 @@ export type ObserverApplicationLifecycleState =
   | "closed";
 
 export interface CreateObserverApplicationOptions {
+  /** Trusted identity shared with the Workbench lifecycle in MCP composition. */
+  hostIdentity?: McpHostIdentity;
   debug?: boolean;
   agentPath?: string;
   managedRoot?: string;
@@ -185,6 +191,9 @@ class DefaultObserverApplication implements ObserverApplication {
   private terminalClosePromise: Promise<void> | null = null;
 
   constructor(options: CreateObserverApplicationOptions) {
+    const hostIdentity = options.hostIdentity === undefined
+      ? undefined
+      : validateMcpHostIdentity(options.hostIdentity);
     const managedRoot = canonicalizePotentialPath(
       resolve(options.managedRoot ?? options.defaultManagedRoot ?? defaultObserverManagedRoot()),
       {
@@ -278,6 +287,9 @@ class DefaultObserverApplication implements ObserverApplication {
         managedRoot,
         gamePath: options.gamePath,
         observerGate: this,
+        ...(hostIdentity === undefined
+          ? {}
+          : { managerInstanceId: hostIdentity.instanceId }),
       });
     }
   }

@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { registerApiSearch } from "./tools/api-search.js";
 import { registerComponentSearch } from "./tools/component-search.js";
@@ -67,6 +68,11 @@ import { registerBuildingSetup } from "./tools/building-setup.js";
 import type { Config } from "./config.js";
 import { createObserverApplication } from "./observer/application.js";
 import { registerObserverTools } from "./observer/tools.js";
+import {
+  createMcpHostIdentity,
+  validateMcpHostIdentity,
+  type McpHostIdentity,
+} from "./mcp-host-identity.js";
 
 /**
  * Explicit application shutdown contract returned by {@link registerTools}.
@@ -84,6 +90,8 @@ export interface RegisteredToolsDisposer {
 export interface RegisterToolsOptions {
   /** Internal composition seam used by lifecycle probes and hermetic tests. */
   searchEngine?: SearchEngine;
+  /** One trusted process-wide identity shared by all lifecycle subsystems. */
+  hostIdentity?: McpHostIdentity;
 }
 
 /**
@@ -92,6 +100,7 @@ export interface RegisterToolsOptions {
  * observer adapter to accidentally create a second observer application.
  */
 export interface WorkbenchServerComposition {
+  readonly hostIdentity: McpHostIdentity;
   readonly processGuard: WorkbenchProcessGuard;
   readonly netApi: WorkbenchNetApiClient;
   readonly activityGate: WorkbenchActivityGate;
@@ -102,9 +111,22 @@ export interface WorkbenchServerComposition {
   readonly client: WorkbenchSessionController;
 }
 
-export function createWorkbenchServerComposition(config: Config): WorkbenchServerComposition {
+function fallbackHostIdentity(): McpHostIdentity {
+  return createMcpHostIdentity({
+    clientLabel: "manual",
+    instanceId: randomUUID(),
+  });
+}
+
+export function createWorkbenchServerComposition(
+  config: Config,
+  hostIdentity: McpHostIdentity = fallbackHostIdentity()
+): WorkbenchServerComposition {
+  const trustedHostIdentity = validateMcpHostIdentity(hostIdentity);
   const observerConfig = config.observer;
-  const processGuard = new WorkbenchProcessGuard();
+  const processGuard = new WorkbenchProcessGuard({
+    mcpInstanceId: trustedHostIdentity.instanceId,
+  });
   const netApi = new WorkbenchNetApiClient(config.workbenchHost, config.workbenchPort);
   const activityGate = new WorkbenchActivityGate();
   const childSupervisor = new ChildSupervisor();
@@ -129,10 +151,12 @@ export function createWorkbenchServerComposition(config: Config): WorkbenchServe
       childSupervisor,
       lifecycleExecution,
       diagnostics,
+      hostIdentity: trustedHostIdentity,
     }
   );
 
   return Object.freeze({
+    hostIdentity: trustedHostIdentity,
     processGuard,
     netApi,
     activityGate,
@@ -149,10 +173,13 @@ export function registerTools(
   config: Config,
   options: RegisterToolsOptions = {}
 ): RegisteredToolsDisposer {
+  const hostIdentity = options.hostIdentity === undefined
+    ? fallbackHostIdentity()
+    : validateMcpHostIdentity(options.hostIdentity);
   const searchEngine = options.searchEngine ?? new SearchEngine(config.dataDir);
   const patterns = new PatternLibrary(config.patternsDir);
   const observerConfig = config.observer;
-  const workbenchComposition = createWorkbenchServerComposition(config);
+  const workbenchComposition = createWorkbenchServerComposition(config, hostIdentity);
   const wbClient = workbenchComposition.client;
 
   // Phase 0 tools
@@ -198,6 +225,7 @@ export function registerTools(
     evidenceRoots: observerConfig?.evidenceRoots,
     supportingLogRoots: observerConfig?.supportingLogRoots,
     workbenchAdapter: workbenchObserver,
+    hostIdentity,
   });
   const ownedRuntimeManager = observerApplication.ownedRuntimeManager!;
   registerObserverTools(server, observerApplication, {

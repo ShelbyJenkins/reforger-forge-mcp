@@ -4,6 +4,7 @@ import { homedir, platform } from "node:os";
 import { isIP } from "node:net";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { parseMcpInstanceId } from "../mcp-host-identity.js";
 import type {
   ExactProcessBackend,
   ExactProcessInspection,
@@ -292,6 +293,8 @@ export interface WorkbenchProcessGuardOptions {
   operationDeadlineAtMs?: () => number | undefined;
   backend?: WorkbenchLifecycleBackend;
   helperPath?: string;
+  /** Trusted process-wide MCP identity; standalone guards retain a random default. */
+  mcpInstanceId?: string;
   /**
    * Test-only injection seam fired immediately before the lifecycle record
    * is written. Returning an Error aborts the write, propagating exactly as
@@ -887,7 +890,7 @@ class LifecycleSession implements WorkbenchLifecycleSession {
 
 export class WorkbenchProcessGuard {
   readonly stateDir: string;
-  readonly mcpInstanceId = randomUUID();
+  readonly mcpInstanceId: string;
   readonly leaseId = randomUUID();
   readonly backend: WorkbenchLifecycleBackend;
   private readonly mutexName: string;
@@ -904,6 +907,9 @@ export class WorkbenchProcessGuard {
   private spawnCasStore: LmdbCasStore<WorkbenchSpawnJournalStateV3> | null = null;
 
   constructor(options: WorkbenchProcessGuardOptions = {}) {
+    this.mcpInstanceId = options.mcpInstanceId === undefined
+      ? randomUUID()
+      : parseMcpInstanceId(options.mcpInstanceId, "Workbench MCP instance ID");
     this.stateDir = resolve(options.stateDir ?? defaultStateDir());
     this.corruptDir = join(this.stateDir, "corrupt");
     this.mutexName = options.mutexName ?? DEFAULT_LIFECYCLE_MUTEX;

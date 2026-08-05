@@ -16,6 +16,11 @@ import {
   type LoadConfigOptions,
 } from "../config.js";
 import {
+  formatMcpNodeTitleArgument,
+  parseMcpClientLabel,
+  partitionMcpHostArguments,
+} from "../mcp-host-identity.js";
+import {
   discoverSteamInstallations,
   type SteamDiscoveryDiagnostic,
   type SteamDiscoveryResult,
@@ -85,6 +90,8 @@ export interface ServerVerificationOptions {
   startupArguments?: readonly string[];
   serverPath?: string;
   nodeVersion?: string;
+  /** Trusted verifier control; never passed to configuration loading or receipts. */
+  hostClientLabel?: string;
 }
 
 interface AdvertisedTool {
@@ -103,7 +110,10 @@ export interface ServerVerificationSession {
 
 export interface ServerVerificationSessionOptions {
   command: string;
+  nodeArguments: readonly string[];
   serverPath: string;
+  hostArguments: readonly string[];
+  /** Configuration-only arguments retained in the verification report. */
   startupArguments: readonly string[];
   cwd: string;
   packageVersion: string;
@@ -228,7 +238,12 @@ function defaultCreateSession(
 ): ServerVerificationSession {
   const transport = new StdioClientTransport({
     command: options.command,
-    args: [options.serverPath, ...options.startupArguments],
+    args: [
+      ...options.nodeArguments,
+      options.serverPath,
+      ...options.hostArguments,
+      ...options.startupArguments,
+    ],
     cwd: options.cwd,
     // Keep server diagnostics off structured stdout while also avoiding an
     // unread pipe that can backpressure a chatty server.
@@ -611,6 +626,9 @@ export async function verifyMcpServer(
       ? resolve(options.serverPath)
       : resolve(packageRoot, options.serverPath);
   const startupArguments = [...(options.startupArguments ?? [])];
+  const hostClientLabel = parseMcpClientLabel(options.hostClientLabel ?? "manual");
+  const hostPartition = partitionMcpHostArguments([], hostClientLabel);
+  const nodeArguments = [formatMcpNodeTitleArgument(hostClientLabel)];
   const discoverSteam =
     dependencies.discoverSteam ?? discoverSteamInstallations;
   const loadConfiguration = dependencies.loadConfiguration ?? loadConfig;
@@ -737,7 +755,9 @@ export async function verifyMcpServer(
       try {
         session = createSession({
           command: dependencies.nodeCommand ?? process.execPath,
+          nodeArguments,
           serverPath,
+          hostArguments: hostPartition.hostArguments,
           startupArguments,
           cwd: packageRoot,
           packageVersion: options.packageVersion,

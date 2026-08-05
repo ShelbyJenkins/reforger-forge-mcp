@@ -19,6 +19,11 @@ import {
 import { basename, dirname, extname, join, relative, resolve } from "node:path";
 import type { Config } from "../config.js";
 import { redactArguments } from "../foundation/redact.js";
+import {
+  createMcpHostIdentity,
+  validateMcpHostIdentity,
+  type McpHostIdentity,
+} from "../mcp-host-identity.js";
 import { logger } from "../utils/logger.js";
 import {
   WorkbenchActivityError,
@@ -443,6 +448,8 @@ export interface WorkbenchClientDependencies {
   lifecycleExecution?: WorkbenchLifecycleExecutionPort;
   /** Explicit read-only diagnostics service for server composition and tests. */
   diagnostics?: typeof diagnoseWorkbench;
+  /** Trusted process identity projected through read-only diagnostics. */
+  hostIdentity?: McpHostIdentity;
   /** A callback is evaluated at the actual launch boundary for absolute-deadline callers. */
   launchTimeoutMs?: number | (() => number);
   /** Optional absolute cap for exact termination and endpoint-release waits. */
@@ -541,6 +548,7 @@ export class WorkbenchSessionController {
   private readonly companionReadiness: typeof awaitCompanionReadiness;
   private readonly vacancyWait: typeof waitForVacancy;
   private readonly diagnosticsService: typeof diagnoseWorkbench;
+  private readonly hostIdentity: McpHostIdentity;
   private readonly qualificationIntervalMs: number;
   private readonly now: () => number;
   private readonly onExplicitSaveModal: WorkbenchClientDependencies["onExplicitSaveModal"];
@@ -803,6 +811,17 @@ export class WorkbenchSessionController {
     private readonly processGuard: WorkbenchProcessGuard = new WorkbenchProcessGuard(),
     dependencies: WorkbenchClientDependencies = {}
   ) {
+    this.hostIdentity = dependencies.hostIdentity === undefined
+      ? createMcpHostIdentity({
+          clientLabel: "manual",
+          instanceId: this.processGuard.mcpInstanceId,
+        })
+      : validateMcpHostIdentity(dependencies.hostIdentity);
+    if (this.hostIdentity.instanceId !== this.processGuard.mcpInstanceId) {
+      throw new TypeError(
+        "Workbench diagnostic host identity must match the process-guard MCP identity."
+      );
+    }
     this.companionProvider = dependencies.companionProvider ?? (config
       ? new WorkbenchHelperStager({
           managedRoot: config.observer?.managedRoot ?? defaultWorkbenchHelperManagedRoot(),
@@ -1812,6 +1831,7 @@ export class WorkbenchSessionController {
 
   async diagnose(): Promise<DiagnosticReport> {
     const report = await this.diagnosticsService({
+      hostIdentity: this.hostIdentity,
       host: this.host,
       port: this.port,
       config: this.config,

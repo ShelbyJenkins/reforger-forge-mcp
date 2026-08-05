@@ -11,6 +11,7 @@ import {
 } from "node:fs";
 import { basename, dirname, join, parse, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
+import { parseMcpInstanceId } from "../mcp-host-identity.js";
 import { z } from "zod";
 import { redactText } from "../foundation/redact.js";
 import type {
@@ -239,6 +240,8 @@ export interface OwnedRuntimeManagerOptions {
   managedRoot: string;
   gamePath: string;
   observerGate: OwnedRuntimeObserverGate;
+  /** Trusted process-wide MCP identity; standalone managers retain a random default. */
+  managerInstanceId?: string;
   backend?: ExactProcessBackend;
   /** Required when backend does not also implement the legacy combined adapter. */
   machineMutex?: MachineMutex;
@@ -965,7 +968,9 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
   private closePromise: Promise<Record<string, unknown>> | null = null;
 
   constructor(private readonly options: OwnedRuntimeManagerOptions) {
-    this.managerInstanceId = randomUUID();
+    this.managerInstanceId = options.managerInstanceId === undefined
+      ? randomUUID()
+      : parseMcpInstanceId(options.managerInstanceId, "Owned runtime manager instance ID");
     this.backend = options.backend ?? defaultOwnedRuntimeBackend();
     const machineMutex = options.machineMutex ??
       (providesMachineMutex(this.backend) ? this.backend : null);

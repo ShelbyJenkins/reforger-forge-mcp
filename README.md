@@ -26,6 +26,13 @@ The setup script installs, builds, verifies, and attempts registration in each
 detected supported MCP client. Restart or refresh the client afterwards, then
 confirm that its `reforger-forge` tools are available.
 
+Managed registrations identify the owning client in the Node command line, for
+example `ReforgerForge-MCP-codex`. In Windows Task Manager, enable the
+**Command line** column on the **Details** tab to distinguish MCP hosts. The
+ordinary package still runs as `node.exe`; its Image name is not renamed. Use
+the supported client refresh or shutdown workflow instead of terminating a
+process by its label, PID, or displayed instance UUID.
+
 ## Use it from your MCP client
 
 Ask the connected coding tool for the task you want to perform, for example:

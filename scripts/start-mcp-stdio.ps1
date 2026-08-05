@@ -15,6 +15,9 @@ param(
     [ValidateSet("Serve", "Verify", "Describe")]
     [string]$Mode = "Serve",
 
+    [ValidatePattern('^[a-z0-9][a-z0-9._-]{0,47}$')]
+    [string]$ClientLabel = "manual",
+
     [string[]]$WorkbenchAddonDir = @(),
 
     [string[]]$ObserverEvidenceRoot = @(),
@@ -151,6 +154,8 @@ try {
     $ServerPath = Resolve-LauncherFile -Path $ServerPath -Label "Built MCP server"
     $VerifierPath = Resolve-LauncherFile -Path $VerifierPath -Label "MCP verifier"
     $Node = Resolve-CompatibleNode
+    $NodeArguments = @("--title=ReforgerForge-MCP-$ClientLabel")
+    $HostArguments = @("--mcp-client-label", $ClientLabel)
 
     $AddonDirectories = @(Resolve-LauncherDirectories `
         -Paths $WorkbenchAddonDir `
@@ -179,26 +184,28 @@ try {
 
     if ($Mode -eq "Describe") {
         $descriptor = [ordered]@{
-            schemaVersion = 1
+            schemaVersion = 2
             mode = "Describe"
             command = $Node.path
             nodeVersion = $Node.version
+            nodeArguments = @($NodeArguments)
             serverPath = $ServerPath
             verifierPath = $VerifierPath
-            startupArguments = @($ServerArguments)
+            hostArguments = @($HostArguments)
+            configurationArguments = @($ServerArguments)
         }
         [Console]::Out.WriteLine(($descriptor | ConvertTo-Json -Depth 4))
         return
     }
 
     if ($Mode -eq "Verify") {
-        & $Node.path $VerifierPath @ServerArguments
+        & $Node.path @NodeArguments $VerifierPath @HostArguments @ServerArguments
         exit $LASTEXITCODE
     }
 
     # Serve writes no launcher diagnostics to stdout: stdout is the MCP stdio
     # protocol stream owned by the client that started this process.
-    & $Node.path $ServerPath @ServerArguments
+    & $Node.path @NodeArguments $ServerPath @HostArguments @ServerArguments
     exit $LASTEXITCODE
 }
 catch {

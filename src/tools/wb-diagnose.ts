@@ -14,7 +14,15 @@ export function registerWbDiagnose(server: McpServer, client: WorkbenchClient): 
       const report = await client.diagnose();
       const lines: string[] = ["## Reforger Forge Workbench Diagnostic\n"];
 
-      lines.push("### Configuration");
+      lines.push("### MCP Host");
+      lines.push(`- **Schema:** ${report.mcpHost.schemaVersion}`);
+      lines.push(`- **Product:** ${report.mcpHost.product}`);
+      lines.push(`- **Client:** ${report.mcpHost.clientLabel}`);
+      lines.push(`- **Instance:** ${report.mcpHost.instanceId}`);
+      lines.push(`- **PID:** ${report.mcpHost.pid}`);
+      lines.push(`- **Started:** ${report.mcpHost.startedAt}`);
+
+      lines.push("\n### Configuration");
       lines.push(`- **NET API:** ${report.host}:${report.port}`);
       lines.push(report.workbenchExe
         ? `- **Workbench executable:** ${report.workbenchExe.exists ? "FOUND" : "NOT FOUND"} — \`${report.workbenchExe.path}\``

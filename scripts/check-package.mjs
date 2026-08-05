@@ -306,6 +306,7 @@ const requiredFiles = [
   "docs/release-notes/RELEASE_NOTES_v1.2.0.md",
   "docs/runner-cli.md",
   "dist/index.js",
+  "dist/mcp-host-identity.js",
   "dist/observer/agent/artifacts.js",
   "dist/observer/agent/application.js",
   "dist/observer/agent/application-operations.js",

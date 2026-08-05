@@ -56,6 +56,13 @@ those exact arguments. Verification does not replace the server already owned
 by the client. After rebuilding ReforgerForge or changing a launcher, refresh
 the MCP server in the client or restart the client before testing it.
 
+Managed registrations carry a trusted client label in the Node command line,
+and `wb_diagnose` exposes the same process UUID, PID, and start time used by the
+Workbench and owned-runtime lifecycle components. These values are operator
+identity only. They never authorize killing, preempting, or taking over a host
+or child process; use the owning client's refresh/shutdown surface and the exact
+supported lifecycle tools.
+
 Start attended Workbench only through **wb_launch** while an MCP session owns
 the lifecycle. The standalone `reforger-forge-workbench editor` runner is for a
 foreground project script or operator session when no live MCP owns the lease;

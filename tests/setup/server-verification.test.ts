@@ -141,12 +141,14 @@ function harness(): Harness {
 async function verify(
   fixture: Harness,
   root = temporaryRoot(),
-  startupArguments: readonly string[] = []
+  startupArguments: readonly string[] = [],
+  hostClientLabel = "manual"
 ): Promise<ServerVerificationReport> {
   return verifyMcpServer({
     packageRoot: root,
     packageVersion: "1.1.0",
     startupArguments,
+    hostClientLabel,
     nodeVersion: "v22.17.0",
   }, fixture.dependencies);
 }
@@ -163,7 +165,7 @@ describe("server verification core", () => {
       "--debug",
     ];
 
-    const report = await verify(fixture, root, startupArguments);
+    const report = await verify(fixture, root, startupArguments, "codex");
 
     expect(report).toMatchObject({
       schemaVersion: 1,
@@ -203,7 +205,9 @@ describe("server verification core", () => {
     expect(fixture.loadConfiguration.mock.calls[0][1].discoverSteam()).toBe(discovery);
     expect(fixture.createSession).toHaveBeenCalledWith({
       command: "C:\\Node\\node.exe",
+      nodeArguments: ["--title=ReforgerForge-MCP-codex"],
       serverPath: resolve(root, "dist", "index.js"),
+      hostArguments: ["--mcp-client-label", "codex"],
       startupArguments,
       cwd: resolve(root),
       packageVersion: "1.1.0",
@@ -412,12 +416,25 @@ describe("verification report output", () => {
       [
         "import { writeFile } from 'node:fs/promises';",
         "export async function verifyMcpServer(options) {",
-        "  return { success: true, packageVersion: options.packageVersion, startupArguments: [...options.startupArguments] };",
+        "  return { success: true, packageVersion: options.packageVersion, hostClientLabel: options.hostClientLabel, startupArguments: [...options.startupArguments] };",
         "}",
         "export function serializeServerVerificationReport(report) { return JSON.stringify(report) + '\\n'; }",
         "export function formatServerVerificationReport() { return 'human output\\n'; }",
         "export function isServerVerificationSuccessful(report) { return report.success; }",
         "export async function writeServerVerificationReportAtomic(path, report) { await writeFile(path, serializeServerVerificationReport(report)); }",
+      ].join("\n")
+    );
+    writeFileSync(
+      join(root, "dist", "mcp-host-identity.js"),
+      [
+        "export function partitionMcpHostArguments(argv) {",
+        "  const remainingArguments = []; let clientLabel = 'manual';",
+        "  for (let index = 0; index < argv.length; index += 1) {",
+        "    if (argv[index] === '--mcp-client-label') { clientLabel = argv[++index]; }",
+        "    else remainingArguments.push(argv[index]);",
+        "  }",
+        "  return { clientLabel, remainingArguments };",
+        "}",
       ].join("\n")
     );
     const reportPath = join(root, "machine-report.json");
@@ -430,7 +447,12 @@ describe("verification report output", () => {
     ];
     const jsonRun = spawnSync(
       process.execPath,
-      [join(scripts, "verify-mcp-server.mjs"), ...opaqueArguments],
+      [
+        join(scripts, "verify-mcp-server.mjs"),
+        "--mcp-client-label",
+        "setup",
+        ...opaqueArguments,
+      ],
       {
         cwd: tmpdir(),
         encoding: "utf8",
@@ -447,11 +469,13 @@ describe("verification report output", () => {
     expect(jsonRun.stderr).toBe("");
     const parsed = JSON.parse(jsonRun.stdout) as {
       packageVersion: string;
+      hostClientLabel: string;
       startupArguments: string[];
     };
     expect(parsed).toEqual({
       success: true,
       packageVersion: "9.8.7",
+      hostClientLabel: "setup",
       startupArguments: opaqueArguments,
     });
     expect(readFileSync(reportPath, "utf8")).toBe(jsonRun.stdout);

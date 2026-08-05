@@ -51,8 +51,12 @@ client.
 Every standard registration runs:
 
 ```text
-node <absolute-package-path>\dist\index.js
+node --title=ReforgerForge-MCP-<client> <absolute-package-path>\dist\index.js --mcp-client-label <client>
 ```
+
+The client slug is supplied by setup from the supported-client definition. The
+Node title option is before the script path; the server-only identity option is
+after it and is not part of server configuration.
 
 Rerunning setup is supported. An exact existing registration is reported as
 already current without a material rewrite.
@@ -184,7 +188,34 @@ node dist/index.js
 ```
 
 The MCP client normally starts this process through its registration. Running
-it directly is primarily useful for diagnostics or development.
+it directly is primarily useful for diagnostics or development and receives
+the client label `manual`. To preserve the full managed command-line marker in
+a manual registration, use this exact argument layout:
+
+```powershell
+node --title=ReforgerForge-MCP-manual dist/index.js --mcp-client-label manual
+```
+
+At startup the server writes one identity-only record to stderr. `wb_diagnose`
+also reports the same product, client label, process UUID, PID, and start time.
+These fields help identify a host; they do not authorize termination or any
+lifecycle action.
+
+### Identifying MCP hosts on Windows
+
+In Task Manager, open **Details**, right-click a column heading, choose
+**Select columns**, and enable **Command line**. Managed hosts contain
+`--title=ReforgerForge-MCP-<client>` and `--mcp-client-label <client>`, so two
+supported clients can be distinguished there. The server also sets its runtime
+process title to `ReforgerForge-MCP-<client>-<eight-hex-instance-prefix>` and
+reports its complete instance UUID through diagnostics.
+
+The ordinary distribution still uses the installed Node executable, so Task
+Manager's **Image name** remains `node.exe`. Command line, runtime process
+title, PID, and instance UUID are separate identifiers. None is ownership proof
+for killing a process. Refresh or stop the server through the owning MCP client;
+use the exact supported Workbench and Observer lifecycle tools for child
+processes.
 
 ## Steam discovery
 

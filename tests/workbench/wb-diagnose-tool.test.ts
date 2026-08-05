@@ -13,6 +13,14 @@ describe("wb_diagnose MCP tool", () => {
     } as unknown as McpServer;
     const client = {
       diagnose: async () => ({
+        mcpHost: {
+          schemaVersion: 1 as const,
+          product: "reforger-forge-mcp" as const,
+          clientLabel: "codex",
+          instanceId: "00112233-4455-4677-8899-aabbccddeeff",
+          pid: process.pid,
+          startedAt: "2026-08-05T12:34:56.789Z",
+        },
         host: "127.0.0.1",
         port: 5775,
         workbenchExe: null,
@@ -46,6 +54,8 @@ describe("wb_diagnose MCP tool", () => {
     const text = result.content.map((entry) => entry.text).join("\n");
 
     expect(text).toContain("### Last Launch Compiler Failure");
+    expect(text).toContain("### MCP Host");
+    expect(text).toContain("00112233-4455-4677-8899-aabbccddeeff");
     expect(text).toContain("PROJECT_COMPILE_FAILED");
     expect(text).toContain("Scripts/Game/Broken.c(7): Syntax error");
     expect(text).toContain("logs-current\\script.log");

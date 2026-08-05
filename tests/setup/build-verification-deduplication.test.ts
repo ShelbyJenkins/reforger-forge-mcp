@@ -135,11 +135,8 @@ function setupHarness(): {
       "  exit /b 0",
       ")",
       'echo node^|%*>>"%ISSUE04_CALL_LOG%"',
-      'for %%F in ("%~1") do if /I "%%~nxF"=="verify-mcp-server.mjs" (',
-      '  echo verifier^|report=%REFORGER_FORGE_VERIFY_REPORT_PATH%^|quiet=%REFORGER_FORGE_VERIFY_QUIET%^|json=%REFORGER_FORGE_VERIFY_JSON%>>"%ISSUE05_ENV_LOG%"',
-      '  echo {}>"%REFORGER_FORGE_VERIFY_REPORT_PATH%"',
-      "  exit /b %ISSUE04_VERIFY_EXIT%",
-      ")",
+      'echo %*| findstr.exe /I /C:"verify-mcp-server.mjs" >nul',
+      "if not errorlevel 1 goto verifier",
       'for %%F in ("%~1") do if /I "%%~nxF"=="register-clients-cli.js" (',
       '  echo registration^|report=%REFORGER_FORGE_VERIFY_REPORT_PATH%^|quiet=%REFORGER_FORGE_VERIFY_QUIET%^|json=%REFORGER_FORGE_VERIFY_JSON%>>"%ISSUE05_ENV_LOG%"',
       '  if /I "%ISSUE05_REGISTRATION_RECEIPT_MODE%"=="empty" exit /b 0',
@@ -181,6 +178,10 @@ function setupHarness(): {
       "  exit /b 0",
       ")",
       "exit /b 0",
+      ":verifier",
+      'echo verifier^|report=%REFORGER_FORGE_VERIFY_REPORT_PATH%^|quiet=%REFORGER_FORGE_VERIFY_QUIET%^|json=%REFORGER_FORGE_VERIFY_JSON%>>"%ISSUE05_ENV_LOG%"',
+      'echo {}>"%REFORGER_FORGE_VERIFY_REPORT_PATH%"',
+      "exit /b %ISSUE04_VERIFY_EXIT%",
       "",
     ].join("\r\n")
   );
@@ -363,7 +364,7 @@ describe("Issue 04 build and verification lifecycle", () => {
       expect(calls(harness)[0]).toBe("npm|ci");
       expect(calls(harness)[1]).toBe("npm|run build");
       expect(calls(harness)[2]).toMatch(
-        /^node\|.*scripts[\\/]verify-mcp-server\.mjs$/
+        /^node\|--title=ReforgerForge-MCP-setup .*scripts[\\/]verify-mcp-server\.mjs --mcp-client-label setup$/
       );
       expect(calls(harness)[3]).toMatch(
         /^node\|.*dist[\\/]setup[\\/]register-clients-cli\.js --server .*dist[\\/]index\.js --verification-report .*reforger-forge-setup-[a-f0-9]+\.json --json$/
@@ -559,7 +560,7 @@ describe("Issue 04 build and verification lifecycle", () => {
     expect(recordedCalls[0]).toBe("npm|ci");
     expect(recordedCalls[1]).toBe("npm|run build");
     expect(recordedCalls[2]).toMatch(
-      /^node\|.*scripts[\\/]verify-mcp-server\.mjs$/
+      /^node\|--title=ReforgerForge-MCP-setup .*scripts[\\/]verify-mcp-server\.mjs --mcp-client-label setup$/
     );
     expect(recordedCalls[3]).toMatch(
       /^node\|.*dist[\\/]setup[\\/]setup-receipt-cli\.js --server .*dist[\\/]index\.js --verification-report .*reforger-forge-setup-[a-f0-9]+\.json --json$/
@@ -580,7 +581,7 @@ describe("Issue 04 build and verification lifecycle", () => {
       expect(result.status).toBe(0);
       expect(recordedCalls).toHaveLength(1);
       expect(recordedCalls[0]).toMatch(
-        /^node\|.*scripts[\\/]verify-mcp-server\.mjs --config .*[\\/]explicit-overrides\.json$/
+        /^node\|--title=ReforgerForge-MCP-agent-installer .*scripts[\\/]verify-mcp-server\.mjs --mcp-client-label agent-installer --config .*[\\/]explicit-overrides\.json$/
       );
       const cursorDocument = JSON.parse(
         readFileSync(harness.cursorConfigPath, "utf8")
@@ -593,7 +594,10 @@ describe("Issue 04 build and verification lifecycle", () => {
       expect(cursorDocument.mcpServers?.["reforger-forge"]).toEqual({
         command: "node",
         args: [
+          "--title=ReforgerForge-MCP-cursor",
           join(harness.root, "dist", "index.js"),
+          "--mcp-client-label",
+          "cursor",
           "--config",
           harness.configPath,
         ],
@@ -618,10 +622,16 @@ describe("Issue 04 build and verification lifecycle", () => {
     const verifier = read("scripts/verify-mcp-server.mjs");
     const verifierCore = read("src/setup/server-verification.ts");
 
-    expect(verifier).toContain("const serverArguments = process.argv.slice(2);");
+    expect(verifier).toContain(
+      "const hostPartition = partitionMcpHostArguments(process.argv.slice(2));"
+    );
+    expect(verifier).toContain(
+      "const serverArguments = hostPartition.remainingArguments;"
+    );
+    expect(verifier).toContain("hostClientLabel: hostPartition.clientLabel");
     expect(verifier).toContain("startupArguments: serverArguments");
     expect(verifierCore).toMatch(
-      /args:\s*\[\s*options\.serverPath,\s*\.\.\.options\.startupArguments\s*\]/
+      /args:\s*\[\s*\.\.\.options\.nodeArguments,\s*options\.serverPath,\s*\.\.\.options\.hostArguments,\s*\.\.\.options\.startupArguments,?\s*\]/
     );
     expect(verifier).not.toMatch(
       /serverArguments\.(?:length|at)\b[^]*?(?:throw|process\.exit|--config)/
@@ -654,11 +664,9 @@ describe("Issue 04 build and verification lifecycle", () => {
 
     expect(setup).not.toContain("install-agents.ps1");
     expect(registrationSources).not.toMatch(/verify-mcp-server/i);
-    expect(
-      installer.match(
-        /node\s+\(Join-Path \$Root "scripts\\verify-mcp-server\.mjs"\)/gi
-      )
-    ).toHaveLength(1);
+    expect(installer.match(/verify-mcp-server\.mjs/gi)).toHaveLength(1);
+    expect(installer).toContain("--title=ReforgerForge-MCP-agent-installer");
+    expect(installer).toContain("--mcp-client-label agent-installer");
     expect(installer).not.toMatch(
       /SkipVerification|VerificationReceipt|TrustVerification/i
     );

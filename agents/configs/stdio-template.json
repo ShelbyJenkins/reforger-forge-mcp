@@ -3,7 +3,10 @@
     "reforger-forge": {
       "command": "node",
       "args": [
-        "REPLACE_WITH_ABSOLUTE_PATH/dist/index.js"
+        "--title=ReforgerForge-MCP-REPLACE_WITH_CLIENT_LABEL",
+        "REPLACE_WITH_ABSOLUTE_PATH/dist/index.js",
+        "--mcp-client-label",
+        "REPLACE_WITH_CLIENT_LABEL"
       ]
     }
   }
