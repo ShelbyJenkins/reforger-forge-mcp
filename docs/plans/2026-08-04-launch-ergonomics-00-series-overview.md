@@ -30,10 +30,10 @@
 
 | Commit | Status | Last updated | Notes |
 |---|---|---|---|
-| 1 | Implementation complete; live validated | 2026-08-04 | Required static gates and stage 3 tests 345/345 passed. Live compile-check, lifecycle, and explicit-save acceptances passed with final process vacancy. Not yet committed. |
-| 2 | Implementation complete; live validated | 2026-08-04 | Focused tests 40/40 and stage 4 tests 180/180 passed. Positive Workbench Observer acceptance passed with six captures, restoration, cleanup, and final process vacancy. Not yet committed. |
-| 3 | Implementation complete; live validated | 2026-08-04 | Focused tests 21/21, typecheck, and unused-code analysis passed. A real Workbench registration produced metadata that strict explicit/discovery resolution and evidence revalidation accepted. Not yet committed. |
-| 4 | Not started | 2026-08-04 | |
+| 1 | Implementation complete; live validated | 2026-08-04 | Required static gates and stage 3 tests 345/345 passed. Live compile-check, lifecycle, and explicit-save acceptances passed with final process vacancy. Landed in grouped commit `ff71390`. |
+| 2 | Implementation complete; live validated | 2026-08-04 | Focused tests 40/40 and stage 4 tests 180/180 passed. Positive Workbench Observer acceptance passed with six captures, restoration, cleanup, and final process vacancy. Landed in grouped commit `ff71390`. |
+| 3 | Implementation complete; live validated | 2026-08-04 | Focused tests 21/21, typecheck, and unused-code analysis passed. A real Workbench registration produced metadata that strict explicit/discovery resolution and evidence revalidation accepted. Landed in grouped commit `ff71390`. |
+| 4 | Implementation complete; non-live validated | 2026-08-04 | Focused tests 14/14 and stage 3 tests 345/345 passed; typecheck and unused-code analysis passed. No live gate applies. |
 | 5 | Not started | 2026-08-04 | |
 | 6 | Not started | 2026-08-04 | |
 | 7 | Not started | 2026-08-04 | |

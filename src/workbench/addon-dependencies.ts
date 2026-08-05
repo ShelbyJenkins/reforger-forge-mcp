@@ -12,7 +12,9 @@ import {
 import { getProperty, parse } from "../formats/enfusion-text.js";
 import { pathComparisonKey } from "../foundation/managed-path.js";
 
-const ADDON_GUID_PATTERN = /^[0-9A-F]{16}$/;
+/** Shared Enfusion add-on GUID spelling. Workbench keeps its compatibility
+ * audit while the game planner applies the stricter bounded policy. */
+export const ADDON_GUID_PATTERN = /^[0-9A-F]{16}$/;
 
 interface AddonProjectDescriptor {
   readonly gprojPath: string;
