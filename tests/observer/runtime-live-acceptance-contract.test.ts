@@ -353,7 +353,10 @@ describe("live graphical runtime observer acceptance contract", () => {
 
   it("builds launch arguments and validates external roots in the shared launch-support module", () => {
     const source = readFileSync(resolve("scripts/observer-runtime-launch-support.ts"), "utf8");
-    expect(source).toContain('runtimeKind === "listenServer" ? "-server" : "-world", worldResource');
+    const policy = readFileSync(resolve("src/launch/game-runtime-arguments.ts"), "utf8");
+    expect(source).toContain('import { buildGraphicalRuntimeArguments } from "../src/launch/game-runtime-arguments.js"');
+    expect(source).toContain("return buildGraphicalRuntimeArguments({");
+    expect(policy).toContain('runtimeKind === "listenServer" ? "-server" : "-world"');
     expect(source).toContain("assertExternalRoot(root, label)");
     expect(source).toContain('loadConfig(["--config", configPath])');
     expect(source).not.toContain("loadConfig()");

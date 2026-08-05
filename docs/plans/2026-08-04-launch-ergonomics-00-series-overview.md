@@ -34,7 +34,7 @@
 | 2 | Implementation complete; live validated | 2026-08-04 | Focused tests 40/40 and stage 4 tests 180/180 passed. Positive Workbench Observer acceptance passed with six captures, restoration, cleanup, and final process vacancy. Landed in grouped commit `ff71390`. |
 | 3 | Implementation complete; live validated | 2026-08-04 | Focused tests 21/21, typecheck, and unused-code analysis passed. A real Workbench registration produced metadata that strict explicit/discovery resolution and evidence revalidation accepted. Landed in grouped commit `ff71390`. |
 | 4 | Implementation complete; non-live validated | 2026-08-04 | Focused tests 14/14 and stage 3 tests 345/345 passed; typecheck and unused-code analysis passed. No live gate applies. |
-| 5 | Not started | 2026-08-04 | |
+| 5 | Implementation complete; non-live validated | 2026-08-04 | Focused policy/compatibility tests 84/84 and stage 4 tests 180/180 passed; typecheck and unused-code analysis passed. No live gate applies. |
 | 6 | Not started | 2026-08-04 | |
 | 7 | Not started | 2026-08-04 | |
 | 8 | Not started | 2026-08-04 | Optional. |

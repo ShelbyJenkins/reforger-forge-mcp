@@ -25,6 +25,24 @@ import {
 } from "./application-diagnostics-fixture.js";
 
 describe("observer application", () => {
+  it("exposes canonical prospective roots without creating them", async () => {
+    await withTemporaryDirectory(async (root) => {
+      const managedRoot = join(root, "managed-not-created");
+      const profileRoot = join(root, "profiles-not-created");
+      const coordinator = createObserverApplication({ managedRoot, profileRoot });
+      try {
+        expect(coordinator.managedRoot).toBe(managedRoot);
+        expect(coordinator.profileRoot).toBe(profileRoot);
+        expect(existsSync(managedRoot)).toBe(false);
+        expect(existsSync(profileRoot)).toBe(false);
+      } finally {
+        await coordinator.close();
+      }
+      expect(existsSync(managedRoot)).toBe(false);
+      expect(existsSync(profileRoot)).toBe(false);
+    }, { prefix: "rfo-observer-root-properties-" });
+  });
+
   it("preserves sessions and staging while a cancelled job still requires restoration", () => {
     const cancel = vi.fn();
     const revoke = vi.fn();

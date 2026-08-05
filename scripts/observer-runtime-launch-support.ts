@@ -12,6 +12,7 @@ import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 import { loadConfig } from "../src/config.js";
+import { buildGraphicalRuntimeArguments } from "../src/launch/game-runtime-arguments.js";
 import type { ObserverCaptureView } from "../src/observer/application.js";
 import { inspectBlockingProcesses, type PngComparisonEvidence } from "./observer-live-acceptance-support.js";
 
@@ -259,15 +260,7 @@ export function launchArguments(
   additional: string[] | undefined,
   runtimeKind: "listenServer" | "client" = "listenServer"
 ): string[] {
-  const result = [
-    "-noSplash",
-    "-noThrow",
-    "-disableCrashReporter",
-    runtimeKind === "listenServer" ? "-server" : "-world", worldResource,
-  ];
-  if (fixture) {
-    result.push("-addonsDir", fixture.addonSearchRoot, "-addons", fixture.addonGuid);
-  }
+  const extraArguments: string[] = [];
   for (const token of additional ?? []) {
     if (typeof token !== "string" || token.length < 1 || token.length > 8_192 || /[\0\r\n]/.test(token)) {
       throw new Error("Additional runtime launch arguments must be bounded argument tokens");
@@ -279,9 +272,19 @@ export function launchArguments(
         "Runtime acceptance uses native fullscreen; raw window-size launch arguments are not accepted",
       );
     }
-    result.push(token);
+    extraArguments.push(token);
   }
-  return result;
+  return buildGraphicalRuntimeArguments({
+    runtimeKind,
+    worldResourceReference: worldResource,
+    ...(fixture ? {
+      addon: {
+        emittedAddonRoots: [fixture.addonSearchRoot],
+        targetAddonGuid: fixture.addonGuid,
+      },
+    } : {}),
+    extraArguments,
+  });
 }
 
 export function captureMatrix(

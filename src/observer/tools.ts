@@ -22,6 +22,19 @@ import {
   resolveObserverRefusalRemedy,
   type ObserverRefusalContext,
 } from "./refusal-remedy.js";
+import {
+  assertNativeFullscreenLaunch,
+  forceNonNativeWindowSizeSchema,
+  mergeConfiguredAddonDirectories,
+  rawDisplayArgument,
+} from "./launch-policy.js";
+
+export {
+  assertNativeFullscreenLaunch,
+  forceNonNativeWindowSizeSchema,
+  mergeConfiguredAddonDirectories,
+  rawDisplayArgument,
+} from "./launch-policy.js";
 
 const finite = () => z.number().finite();
 
@@ -113,46 +126,6 @@ const supportingFilesSchema = z.array(z.union([
     sourceCaptureLabel: z.string().min(1).max(128),
   }).strict(),
 ])).max(16);
-const forceNonNativeWindowSizeSchema = z.object({
-  width: z.number().int().min(640).max(16_384).describe(
-    "Exceptional window width in pixels.",
-  ),
-  height: z.number().int().min(480).max(16_384).describe(
-    "Exceptional window height in pixels.",
-  ),
-  justification: z.string().trim().min(20).max(512).describe(
-    "Why native fullscreen cannot be used. Screenshot size is not a valid reason; bound observer_capture image output instead.",
-  ),
-}).strict().describe(
-  "Exceptional opt-in to a non-native window size. Omit this field for the native fullscreen default.",
-);
-const RAW_DISPLAY_ARGUMENTS = new Set(["-window", "-screenwidth", "-screenheight"]);
-
-function rawDisplayArgument(argumentsArray: readonly string[]): string | undefined {
-  return argumentsArray.find((token) =>
-    RAW_DISPLAY_ARGUMENTS.has(token.split("=", 1)[0].toLowerCase()),
-  );
-}
-
-function assertNativeFullscreenLaunch(input: {
-  runtimeKind: string;
-  arguments: readonly string[];
-  forceNonNativeWindowSize?: unknown;
-}): void {
-  const conflicting = rawDisplayArgument(input.arguments);
-  if (conflicting) {
-    throw new ObserverApplicationError(
-      "ARGUMENT_CONFLICT",
-      `${conflicting} cannot be supplied through arguments. Omit display overrides for native fullscreen, or use forceNonNativeWindowSize with explicit dimensions and a compelling justification.`,
-    );
-  }
-  if (input.runtimeKind === "dedicated" && input.forceNonNativeWindowSize !== undefined) {
-    throw new ObserverApplicationError(
-      "INVALID_REQUEST",
-      "forceNonNativeWindowSize is valid only for a graphical runtime",
-    );
-  }
-}
 export interface ObserverToolDefaults {
   sessionTtlMs?: number;
   defaultCaptureTimeoutMs?: number;
@@ -161,21 +134,6 @@ export interface ObserverToolDefaults {
   workbenchAddonDirs?: readonly string[];
   evidenceRoots?: readonly string[];
   ownedRuntimeManager?: OwnedRuntimeManager;
-}
-
-/**
- * Put configuration-owned roots ahead of caller roots, then let the private
- * observer agent perform the single canonical `-addonsDir` normalization. Its
- * merger preserves this order and removes duplicates after resolving paths.
- */
-export function mergeConfiguredAddonDirectories(
-  argumentsArray: readonly string[],
-  configuredAddonDirs: readonly string[] | undefined,
-): string[] {
-  if (!configuredAddonDirs || configuredAddonDirs.length === 0) {
-    return [...argumentsArray];
-  }
-  return ["-addonsDir", configuredAddonDirs.join(","), ...argumentsArray];
 }
 
 function jsonText(heading: string, value: unknown): string {

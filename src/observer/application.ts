@@ -3,6 +3,7 @@ import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { boundedOption, type BoundedOptionErrorFactory } from "../foundation/bounded-option.js";
+import { canonicalizePotentialPath } from "../foundation/managed-path.js";
 import { redactDiagnostic, redactText } from "../foundation/redact.js";
 import type { WorkbenchObserverAdapter } from "../workbench/observer-adapter.js";
 import { ObserverAgentClient, type ObserverAgentClientOptions, type ObserverChildDescriptor } from "./agent-client.js";
@@ -96,6 +97,8 @@ export interface CreateObserverApplicationOptions {
 }
 
 export interface ObserverApplication {
+  readonly managedRoot: string;
+  readonly profileRoot: string;
   readonly maxInlineImageBytes: number;
   readonly defaultCaptureTimeoutMs: number;
   readonly agentClient: ObserverAgentClient;
@@ -165,6 +168,8 @@ function validateRoots(label: string, roots: string[] | undefined): void {
 }
 
 class DefaultObserverApplication implements ObserverApplication {
+  readonly managedRoot: string;
+  readonly profileRoot: string;
   readonly maxInlineImageBytes: number;
   readonly defaultCaptureTimeoutMs: number;
   readonly agentClient: ObserverAgentClient;
@@ -180,8 +185,24 @@ class DefaultObserverApplication implements ObserverApplication {
   private terminalClosePromise: Promise<void> | null = null;
 
   constructor(options: CreateObserverApplicationOptions) {
-    const managedRoot = resolve(options.managedRoot ?? options.defaultManagedRoot ?? defaultObserverManagedRoot());
-    const profileRoot = resolve(options.profileRoot ?? join(managedRoot, "profiles"));
+    const managedRoot = canonicalizePotentialPath(
+      resolve(options.managedRoot ?? options.defaultManagedRoot ?? defaultObserverManagedRoot()),
+      {
+        linkPolicy: "no-links",
+        existingAncestor: "directory",
+        label: "Observer managed root",
+      },
+    );
+    const profileRoot = canonicalizePotentialPath(
+      resolve(options.profileRoot ?? join(managedRoot, "profiles")),
+      {
+        linkPolicy: "no-links",
+        existingAncestor: "directory",
+        label: "Observer profile root",
+      },
+    );
+    this.managedRoot = managedRoot;
+    this.profileRoot = profileRoot;
     validateRoots("evidence root", options.evidenceRoots);
     validateRoots("supporting log root", options.supportingLogRoots);
     this.requestTimeoutMs = boundedOption(options.requestTimeoutMs, 30_000, 1_000, 5 * 60_000, "Observer request timeout", optionError);
