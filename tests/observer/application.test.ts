@@ -219,6 +219,7 @@ describe("observer application composition roots", () => {
           "observer_capture",
           "observer_job",
           "observer_runtime",
+          "game_launch",
           "observer_run_begin",
           "observer_run_status",
           "observer_run_finalize",

@@ -54,6 +54,17 @@ import {
   type SupervisedChildCounts,
   type SupervisedChildExit,
 } from "../foundation/child-supervisor.js";
+import {
+  computeGameAddonEvidenceDigest,
+  revalidateGameAddonPlan,
+  type GameAddonPlanSnapshot,
+} from "../launch/game-addon-plan.js";
+import { GameLaunchPlanError } from "../launch/game-launch-errors.js";
+import {
+  computeGameWorldEvidenceDigest,
+  revalidateGameWorldPlan,
+  type GameWorldPlanSnapshot,
+} from "../launch/game-world-plan.js";
 import type {
   ObserverLaunchInput,
   ObserverPreparedLaunch,
@@ -80,6 +91,7 @@ const DEFAULT_MAX_STORE_BYTES = 512 * 1024 * 1024;
 const MAX_CONFIGURABLE_RECORD_BYTES = 128 * 1024 * 1024;
 const DEFAULT_MAX_RECORD_BYTES = MAX_CONFIGURABLE_RECORD_BYTES;
 const START_LIFECYCLE_RESERVE_RECORDS = 9;
+const GAME_LAUNCH_START_LIFECYCLE_RESERVE_RECORDS = START_LIFECYCLE_RESERVE_RECORDS + 1;
 const START_LIFECYCLE_RESERVE_BYTES = 2 * 1024 * 1024;
 const CHILD_EXIT_RESERVE_BYTES = 256 * 1024;
 const SMALL_LIFECYCLE_RESERVE_BYTES = 8 * 1024;
@@ -106,6 +118,7 @@ const MAX_REALISTIC_PREPARED_DESCRIPTOR_BYTES =
 export const OWNED_RUNTIME_RECORD_DIRECTORIES = [
   "prepared",
   "prepared-index",
+  "prepared-invalidations",
   "consumed",
   "pending-starts",
   "runtimes",
@@ -278,6 +291,38 @@ export interface OwnedRuntimeStartInput {
   idempotencyKey: string;
 }
 
+export const OWNED_RUNTIME_EXECUTABLE_EVIDENCE_SCHEMA_VERSION = 1;
+
+export interface OwnedRuntimeExecutableEvidence {
+  readonly schemaVersion: typeof OWNED_RUNTIME_EXECUTABLE_EVIDENCE_SCHEMA_VERSION;
+  readonly runtimeKind: ObserverLaunchInput["runtimeKind"];
+  readonly executablePath: string;
+  readonly executableFile: {
+    readonly sha256: string;
+    readonly size: string;
+    readonly device: string;
+    readonly inode: string;
+  };
+  readonly executableEvidenceDigest: string;
+}
+
+export interface OwnedGameLaunchPreparationEvidence {
+  readonly schemaVersion: 1;
+  readonly prepareKey: string;
+  readonly projectComparisonKey: string;
+  readonly world: GameWorldPlanSnapshot;
+  readonly addons: GameAddonPlanSnapshot;
+  readonly executable: OwnedRuntimeExecutableEvidence;
+  readonly gameLaunchEvidenceDigest: string;
+}
+
+export interface PrepareInitialOwnedGameLaunchInput {
+  readonly launchInput: ObserverLaunchInput;
+  readonly evidence: OwnedGameLaunchPreparationEvidence;
+  readonly prepare: () => Promise<ObserverPreparedLaunch>;
+  readonly revokeSession: (sessionId: string) => Promise<unknown>;
+}
+
 export interface OwnedRuntimeStopInput {
   runtimeId: string;
   waitForRestorationMs: number;
@@ -314,6 +359,21 @@ export class OwnedRuntimeError extends Error {
   }
 }
 
+/** Exact proof that planning failed before descriptor consumption or spawn. */
+export class OwnedRuntimePreconsumptionError extends OwnedRuntimeError {
+  constructor(
+    readonly planningError: GameLaunchPlanError,
+    details: Record<string, unknown>,
+  ) {
+    super(
+      "PREPARED_LAUNCH_INVALIDATED",
+      "Prepared game launch evidence changed before runtime consumption",
+      details,
+    );
+    this.name = "OwnedRuntimePreconsumptionError";
+  }
+}
+
 const preparedDescriptorSchema = z.object({
   version: z.literal(STORAGE_VERSION),
   preparedLaunchId: preparedLaunchIdSchema,
@@ -329,6 +389,7 @@ const preparedDescriptorSchema = z.object({
   recordedAt: z.string().datetime(),
   managerInstanceId: z.string().uuid(),
   prepareIdempotencyHash: sha256Schema.optional(),
+  gameLaunchEvidence: z.lazy(() => gameLaunchEvidenceSchema).optional(),
 });
 type PreparedDescriptor = z.infer<typeof preparedDescriptorSchema>;
 
@@ -349,6 +410,35 @@ const executableFileIdentitySchema = z.object({
   inode: decimalSchema,
 });
 type ExecutableFileIdentity = z.infer<typeof executableFileIdentitySchema>;
+
+const runtimeExecutableEvidenceSchema = z.object({
+  schemaVersion: z.literal(OWNED_RUNTIME_EXECUTABLE_EVIDENCE_SCHEMA_VERSION),
+  runtimeKind: z.enum(["client", "listenServer", "dedicated", "testRunner"]),
+  executablePath: z.string().min(1).max(WINDOWS_PATH_MAX_CHARS),
+  executableFile: executableFileIdentitySchema,
+  executableEvidenceDigest: sha256Schema,
+});
+
+const gameLaunchEvidenceSchema = z.object({
+  schemaVersion: z.literal(1),
+  prepareKey: z.string().regex(/^mcp-game-launch-prepare-v1-[a-f0-9]{64}$/),
+  projectComparisonKey: z.string().min(1).max(WINDOWS_PATH_MAX_CHARS),
+  world: z.object({}).passthrough(),
+  addons: z.object({}).passthrough(),
+  executable: runtimeExecutableEvidenceSchema,
+  gameLaunchEvidenceDigest: sha256Schema,
+});
+const preparedInvalidationSchema = z.object({
+  version: z.literal(STORAGE_VERSION),
+  preparedLaunchId: preparedLaunchIdSchema,
+  sessionId: z.string().min(1).max(PREPARED_SESSION_ID_MAX_UTF16_UNITS),
+  invalidatedAt: z.string().datetime(),
+  planningCode: z.string().min(1).max(64),
+  gameLaunchEvidenceDigest: sha256Schema,
+  unconsumed: z.literal(true),
+  managerInstanceId: z.string().uuid(),
+});
+type PreparedInvalidation = z.infer<typeof preparedInvalidationSchema>;
 
 const mcpOwnerSchema = z.object({
   installationId: z.string().regex(/^[a-f0-9]{64}$/),
@@ -595,6 +685,76 @@ function inspectExecutableFile(filePath: string): ExecutableFileIdentity {
     });
   } finally {
     closeSync(descriptor);
+  }
+}
+
+export function computeOwnedRuntimeExecutableEvidenceDigest(
+  value: Omit<OwnedRuntimeExecutableEvidence, "executableEvidenceDigest">,
+): string {
+  return sha256(JSON.stringify([
+    "reforger-forge-owned-runtime-executable-evidence",
+    value.schemaVersion,
+    value.runtimeKind,
+    value.executablePath,
+    [
+      value.executableFile.sha256,
+      value.executableFile.size,
+      value.executableFile.device,
+      value.executableFile.inode,
+    ],
+  ]));
+}
+
+export function computeOwnedGameLaunchEvidenceDigest(
+  value: Omit<OwnedGameLaunchPreparationEvidence, "gameLaunchEvidenceDigest">,
+): string {
+  return sha256(JSON.stringify([
+    "reforger-forge-owned-game-launch-evidence",
+    value.schemaVersion,
+    value.prepareKey,
+    value.projectComparisonKey,
+    value.world.schemaVersion,
+    value.world.worldEvidenceDigest,
+    value.addons.schemaVersion,
+    value.addons.addonEvidenceDigest,
+    value.executable.schemaVersion,
+    value.executable.executableEvidenceDigest,
+  ]));
+}
+
+function validatedGameLaunchEvidence(value: unknown): OwnedGameLaunchPreparationEvidence {
+  try {
+    const parsed = gameLaunchEvidenceSchema.parse(value);
+    const world = parsed.world as unknown as GameWorldPlanSnapshot;
+    const addons = parsed.addons as unknown as GameAddonPlanSnapshot;
+    const executable = parsed.executable as OwnedRuntimeExecutableEvidence;
+    if (computeGameWorldEvidenceDigest(world) !== world.worldEvidenceDigest ||
+        computeGameAddonEvidenceDigest(addons) !== addons.addonEvidenceDigest ||
+        computeOwnedRuntimeExecutableEvidenceDigest(executable) !== executable.executableEvidenceDigest ||
+        parsed.projectComparisonKey !== world.project.comparisonKey ||
+        parsed.projectComparisonKey !== addons.project.comparisonKey ||
+        pathKey(addons.executablePath) !== pathKey(executable.executablePath)) {
+      throw new Error("nested evidence digest mismatch");
+    }
+    const candidate: OwnedGameLaunchPreparationEvidence = {
+      schemaVersion: 1,
+      prepareKey: parsed.prepareKey,
+      projectComparisonKey: parsed.projectComparisonKey,
+      world,
+      addons,
+      executable,
+      gameLaunchEvidenceDigest: parsed.gameLaunchEvidenceDigest,
+    };
+    if (computeOwnedGameLaunchEvidenceDigest(candidate) !== parsed.gameLaunchEvidenceDigest) {
+      throw new Error("aggregate evidence digest mismatch");
+    }
+    return candidate;
+  } catch (error) {
+    throw new OwnedRuntimeError(
+      "STORAGE_UNVERIFIABLE",
+      "Prepared game-launch evidence does not satisfy its persisted digest contract",
+      { cause: error instanceof Error ? error.message : String(error) },
+    );
   }
 }
 
@@ -876,6 +1036,30 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
       this.resolveExecutable(runtimeKind),
       `${runtimeKind} runtime executable`,
     );
+  }
+
+  resolveRuntimeExecutableEvidence(
+    runtimeKind: ObserverLaunchInput["runtimeKind"],
+  ): OwnedRuntimeExecutableEvidence {
+    try {
+      const executablePath = this.resolveRuntimeExecutablePath(runtimeKind);
+      const fields: Omit<OwnedRuntimeExecutableEvidence, "executableEvidenceDigest"> = {
+        schemaVersion: OWNED_RUNTIME_EXECUTABLE_EVIDENCE_SCHEMA_VERSION,
+        runtimeKind,
+        executablePath,
+        executableFile: Object.freeze({ ...inspectExecutableFile(executablePath) }),
+      };
+      return Object.freeze({
+        ...fields,
+        executableEvidenceDigest: computeOwnedRuntimeExecutableEvidenceDigest(fields),
+      });
+    } catch (error) {
+      if (error instanceof OwnedRuntimeError) throw error;
+      throw new OwnedRuntimeError(
+        "IDENTITY_UNVERIFIABLE",
+        "Configured runtime executable identity could not be verified",
+      );
+    }
   }
 
   private withFencedMachineMutex<T>(
@@ -1322,6 +1506,136 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
     prepared: ObserverPreparedLaunch
   ): Promise<string> {
     this.assertOpenForMutation();
+    try {
+      return await this.machineMutex.withMachineMutex({
+        name: OWNED_RUNTIME_LIFECYCLE_MUTEX,
+        timeoutMs: this.lockTimeoutMs,
+        action: async () => {
+          this.assertOpenForMutation();
+          return this.recordPreparedLaunchLocked(input, prepared);
+        },
+      });
+    } catch (error) {
+      throw this.normalizeError(error, "PREPARE_FAILED", "Prepared runtime launch could not be recorded");
+    }
+  }
+
+  /**
+   * Serialize the first game-launch preparation for one stable project profile
+   * across MCP/private-child processes. No nested mutex acquisition occurs.
+   */
+  async prepareInitialOwnedGameLaunch(
+    request: PrepareInitialOwnedGameLaunchInput,
+  ): Promise<ObserverPreparedLaunch> {
+    this.assertOpenForMutation();
+    const evidence = validatedGameLaunchEvidence(request.evidence);
+    if (request.launchInput.idempotencyKey !== evidence.prepareKey ||
+        request.launchInput.runtimeKind !== evidence.executable.runtimeKind ||
+        pathKey(request.launchInput.profilePath) !== pathKey(evidence.addons.profilePath) ||
+        pathKey(evidence.addons.managedRoot) !== pathKey(this.managedRoot)) {
+      throw new OwnedRuntimeError(
+        "INVALID_REQUEST",
+        "Initial game-launch preparation input does not match its canonical evidence",
+      );
+    }
+    try {
+      return await this.withFencedMachineMutex(async (fence) => {
+        this.assertOpenForMutation();
+        this.ensureStorage();
+        this.sweepLocked(this.clock());
+        const existing = this.findPreparedGameLaunchForProfile(
+          request.launchInput.profilePath,
+          evidence.prepareKey,
+        );
+        if (existing) {
+          if (existing.managerInstanceId !== this.managerInstanceId) {
+            throw new OwnedRuntimeError(
+              "PREPARED_LAUNCH_STALE",
+              "Matching game-launch preparation belongs to another MCP lifecycle",
+            );
+          }
+          const invalidation = this.readOptionalPreparedInvalidation(
+            existing.preparedLaunchId,
+            existing,
+          );
+          if (invalidation) {
+            throw new OwnedRuntimeError(
+              "PREPARED_LAUNCH_INVALIDATED",
+              "The retained baseline game-launch preparation was invalidated and cannot be reused",
+              { preparedLaunchId: existing.preparedLaunchId, sessionId: existing.sessionId },
+            );
+          }
+          this.assertGameLaunchRetryRecoverable(existing);
+          return this.publicPreparedDescriptor(existing);
+        }
+
+        this.assertInitialGamePreparationHeadroom(
+          this.storageRoot,
+          request.launchInput,
+          evidence,
+        );
+        let prepared: ObserverPreparedLaunch | null = null;
+        try {
+          prepared = await request.prepare();
+          fence.assertActive();
+          const preparedLaunchId = this.recordPreparedLaunchLocked(
+            request.launchInput,
+            prepared,
+            evidence,
+          );
+          return { ...prepared, preparedLaunchId };
+        } catch (error) {
+          if (prepared) {
+            // Lease loss releases the native mutex before this async callback
+            // can settle. Do not inspect shared state or revoke a session after
+            // mutation authority has been fenced away; another MCP may already
+            // be recovering the same private-child preparation.
+            fence.assertActive();
+            let descriptorAbsent = false;
+            try {
+              const index = this.readOptionalPreparedSessionIndex(prepared.sessionId);
+              descriptorAbsent = !index &&
+                this.findPreparedDescriptorForSession(prepared.sessionId) === null;
+            } catch {
+              throw new OwnedRuntimeError(
+                "RECOVERY_REQUIRED",
+                "Initial game-launch descriptor state could not be proven after preparation failure",
+              );
+            }
+            if (!descriptorAbsent) {
+              throw new OwnedRuntimeError(
+                "RECOVERY_REQUIRED",
+                "Initial game-launch preparation may retain a durable descriptor and was not revoked",
+              );
+            }
+            try {
+              await request.revokeSession(prepared.sessionId);
+            } catch {
+              throw new OwnedRuntimeError(
+                "RECOVERY_REQUIRED",
+                "Initial game-launch preparation was not recorded, and session revocation could not be confirmed",
+              );
+            }
+            fence.assertActive();
+          }
+          throw error;
+        }
+      });
+    } catch (error) {
+      throw this.normalizeError(
+        error,
+        "PREPARE_FAILED",
+        "Initial owned game launch could not be prepared",
+      );
+    }
+  }
+
+  private recordPreparedLaunchLocked(
+    input: ObserverLaunchInput,
+    prepared: ObserverPreparedLaunch,
+    gameLaunchEvidence?: OwnedGameLaunchPreparationEvidence,
+  ): string {
+    const root = this.ensureStorage();
     const descriptorFingerprint = this.preparedFingerprint({
       sessionId: prepared.sessionId,
       arguments: prepared.arguments,
@@ -1329,76 +1643,186 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
       runtimeKind: input.runtimeKind,
       expiresAt: prepared.expiresAt,
       bundleDigest: prepared.bundleDigest,
+      ...(gameLaunchEvidence ? { gameLaunchEvidence } : {}),
     });
-    try {
-      return await this.machineMutex.withMachineMutex({
-        name: OWNED_RUNTIME_LIFECYCLE_MUTEX,
-        timeoutMs: this.lockTimeoutMs,
-        action: async () => {
-          this.assertOpenForMutation();
-          const root = this.ensureStorage();
-          const existingIndex = this.readOptionalPreparedSessionIndex(prepared.sessionId);
-          if (existingIndex) {
-            if (existingIndex.descriptorFingerprint !== descriptorFingerprint) {
-              throw new OwnedRuntimeError(
-                "ARGUMENT_CONFLICT",
-                "Observer session was reused with a different prepared launch"
-              );
-            }
-            const existing = this.readPreparedDescriptor(existingIndex.preparedLaunchId);
-            if (existing.sessionId !== prepared.sessionId ||
-                existingIndex.expiresAt !== existing.expiresAt ||
-                this.preparedFingerprint(existing) !== descriptorFingerprint) {
-              throw new OwnedRuntimeError(
-                "STORAGE_UNVERIFIABLE",
-                "Prepared-launch session index does not match its descriptor"
-              );
-            }
-            return existing.preparedLaunchId;
-          }
+    const existingIndex = this.readOptionalPreparedSessionIndex(prepared.sessionId);
+    if (existingIndex) {
+      if (existingIndex.descriptorFingerprint !== descriptorFingerprint) {
+        throw new OwnedRuntimeError(
+          "ARGUMENT_CONFLICT",
+          "Observer session was reused with a different prepared launch",
+        );
+      }
+      const existing = this.readPreparedDescriptor(existingIndex.preparedLaunchId);
+      if (existing.sessionId !== prepared.sessionId ||
+          existingIndex.expiresAt !== existing.expiresAt ||
+          this.preparedFingerprint(existing) !== descriptorFingerprint) {
+        throw new OwnedRuntimeError(
+          "STORAGE_UNVERIFIABLE",
+          "Prepared-launch session index does not match its descriptor",
+        );
+      }
+      return existing.preparedLaunchId;
+    }
 
-          const preparedLaunchId = `pl-${this.createId()}`;
-          const recordedAt = nowIso(this.clock);
-          const descriptor = preparedDescriptorSchema.parse({
-            version: STORAGE_VERSION,
-            preparedLaunchId,
-            sessionId: prepared.sessionId,
-            arguments: [...prepared.arguments],
-            profilePath: prepared.profilePath,
-            runtimeKind: input.runtimeKind,
-            expiresAt: prepared.expiresAt,
-            bundleDigest: prepared.bundleDigest,
-            recordedAt,
-            managerInstanceId: this.managerInstanceId,
-            ...(input.idempotencyKey
-              ? { prepareIdempotencyHash: sha256(boundedIdempotencyKey(input.idempotencyKey)) }
-              : {}),
-          });
-          this.assertPreparedDescriptorCapacity(descriptor);
-          const index = preparedSessionIndexSchema.parse({
-            version: STORAGE_VERSION,
-            sessionId: prepared.sessionId,
-            preparedLaunchId,
-            descriptorFingerprint,
-            expiresAt: prepared.expiresAt,
-            updatedAt: recordedAt,
-          });
-          this.assertBatchCapacity(root, [
-            { target: this.preparedPath(preparedLaunchId), value: descriptor, exclusive: true },
-            { target: this.preparedSessionIndexPath(prepared.sessionId), value: index, exclusive: true },
-          ]);
-          this.atomicWrite(root, this.preparedPath(preparedLaunchId), descriptor, true, true);
-          try {
-            this.atomicWrite(root, this.preparedSessionIndexPath(prepared.sessionId), index, true, true);
-          } catch (error) {
-            this.unlinkOwnedFile(this.preparedPath(preparedLaunchId));
-            throw error;
-          }
-          return preparedLaunchId;
-        },
-      });
+    const preparedLaunchId = `pl-${this.createId()}`;
+    const recordedAt = nowIso(this.clock);
+    const descriptor = preparedDescriptorSchema.parse({
+      version: STORAGE_VERSION,
+      preparedLaunchId,
+      sessionId: prepared.sessionId,
+      arguments: [...prepared.arguments],
+      profilePath: prepared.profilePath,
+      runtimeKind: input.runtimeKind,
+      expiresAt: prepared.expiresAt,
+      bundleDigest: prepared.bundleDigest,
+      recordedAt,
+      managerInstanceId: this.managerInstanceId,
+      ...(input.idempotencyKey
+        ? { prepareIdempotencyHash: sha256(boundedIdempotencyKey(input.idempotencyKey)) }
+        : {}),
+      ...(gameLaunchEvidence ? { gameLaunchEvidence } : {}),
+    });
+    this.assertPreparedDescriptorCapacity(descriptor);
+    const index = preparedSessionIndexSchema.parse({
+      version: STORAGE_VERSION,
+      sessionId: prepared.sessionId,
+      preparedLaunchId,
+      descriptorFingerprint,
+      expiresAt: prepared.expiresAt,
+      updatedAt: recordedAt,
+    });
+    this.assertBatchCapacity(root, [
+      { target: this.preparedPath(preparedLaunchId), value: descriptor, exclusive: true },
+      { target: this.preparedSessionIndexPath(prepared.sessionId), value: index, exclusive: true },
+    ]);
+    this.atomicWrite(root, this.preparedPath(preparedLaunchId), descriptor, true, true);
+    try {
+      this.atomicWrite(root, this.preparedSessionIndexPath(prepared.sessionId), index, true, true);
     } catch (error) {
-      throw this.normalizeError(error, "PREPARE_FAILED", "Prepared runtime launch could not be recorded");
+      this.unlinkOwnedFile(this.preparedPath(preparedLaunchId));
+      throw error;
+    }
+    return preparedLaunchId;
+  }
+
+  private findPreparedGameLaunchForProfile(
+    profilePath: string,
+    prepareKey: string,
+  ): PreparedDescriptor | null {
+    let match: PreparedDescriptor | null = null;
+    for (const name of this.recordFileNames("prepared")) {
+      const preparedLaunchId = name.endsWith(".json") ? name.slice(0, -5) : "";
+      if (!preparedLaunchIdSchema.safeParse(preparedLaunchId).success) continue;
+      const descriptor = this.readPreparedDescriptor(preparedLaunchId);
+      if (pathKey(descriptor.profilePath) !== pathKey(profilePath)) continue;
+      if (!descriptor.gameLaunchEvidence || descriptor.gameLaunchEvidence.prepareKey !== prepareKey) {
+        throw new OwnedRuntimeError(
+          "ARGUMENT_CONFLICT",
+          "The derived project profile already retains a different baseline launch family",
+        );
+      }
+      if (match) {
+        throw new OwnedRuntimeError(
+          "STORAGE_UNVERIFIABLE",
+          "More than one retained preparation claims the same game-launch profile",
+        );
+      }
+      match = descriptor;
+    }
+    return match;
+  }
+
+  /** Bounded proof used only before revoking a preparation that failed to record. */
+  private findPreparedDescriptorForSession(sessionId: string): PreparedDescriptor | null {
+    let match: PreparedDescriptor | null = null;
+    for (const name of this.recordFileNames("prepared")) {
+      const preparedLaunchId = name.endsWith(".json") ? name.slice(0, -5) : "";
+      if (!preparedLaunchIdSchema.safeParse(preparedLaunchId).success) {
+        throw new OwnedRuntimeError(
+          "STORAGE_UNVERIFIABLE",
+          "Prepared-launch storage contains a noncanonical descriptor identity",
+        );
+      }
+      const descriptor = this.readPreparedDescriptor(preparedLaunchId);
+      if (descriptor.sessionId !== sessionId) continue;
+      if (match) {
+        throw new OwnedRuntimeError(
+          "STORAGE_UNVERIFIABLE",
+          "More than one prepared descriptor claims the failed session",
+        );
+      }
+      match = descriptor;
+    }
+    return match;
+  }
+
+  private publicPreparedDescriptor(descriptor: PreparedDescriptor): ObserverPreparedLaunch {
+    return {
+      arguments: [...descriptor.arguments],
+      preparedLaunchId: descriptor.preparedLaunchId,
+      sessionId: descriptor.sessionId,
+      expiresAt: descriptor.expiresAt,
+      bundleDigest: descriptor.bundleDigest,
+      profilePath: descriptor.profilePath,
+      warnings: [],
+    };
+  }
+
+  private assertGameLaunchRetryRecoverable(descriptor: PreparedDescriptor): void {
+    if (Date.parse(descriptor.expiresAt) <= this.clock()) {
+      throw new OwnedRuntimeError(
+        "PREPARED_LAUNCH_EXPIRED",
+        "The retained baseline game-launch preparation has expired and cannot be replaced without successor support",
+      );
+    }
+    const consumption = this.readOptionalConsumption(descriptor.preparedLaunchId);
+    const references = this.preparedRuntimeReferences();
+    if (!consumption) {
+      if (references.has(descriptor.preparedLaunchId)) {
+        throw new OwnedRuntimeError(
+          "STORAGE_UNVERIFIABLE",
+          "Retained game-launch runtime evidence has no matching consumption authority",
+        );
+      }
+      return;
+    }
+    const runtime = this.readOptionalRuntimeReceipt(consumption.runtimeId);
+    const pending = this.readOptionalPendingStart(consumption.runtimeId);
+    if (runtime && runtime.preparedLaunchId !== descriptor.preparedLaunchId) {
+      throw new OwnedRuntimeError(
+        "STORAGE_UNVERIFIABLE",
+        "Retained game-launch runtime evidence points at another preparation",
+      );
+    }
+    if (pending && pending.preparedLaunchId !== descriptor.preparedLaunchId) {
+      throw new OwnedRuntimeError(
+        "STORAGE_UNVERIFIABLE",
+        "Retained game-launch pending evidence points at another preparation",
+      );
+    }
+    if (runtime && (this.runtimeLifecycleIsTerminal(runtime.runtimeId) ||
+        this.readOptionalStopReceipt(runtime.runtimeId) ||
+        this.readOptionalRestorationProof(runtime.runtimeId))) {
+      throw new OwnedRuntimeError(
+        "PREPARED_LAUNCH_CONSUMED",
+        "The retained baseline game-launch runtime is terminal or stopping; a successor generation is required",
+        { runtimeId: runtime.runtimeId },
+      );
+    }
+    if (pending && ["cleanup_verified", "release_required", "release_acknowledged"].includes(pending.state)) {
+      throw new OwnedRuntimeError(
+        "START_UNVERIFIABLE",
+        "The retained baseline game-launch start terminated without a reusable runtime",
+        { runtimeId: pending.runtimeId, state: pending.state },
+      );
+    }
+    if (!runtime && !pending) {
+      throw new OwnedRuntimeError(
+        "START_UNVERIFIABLE",
+        "The retained baseline game-launch preparation was consumed without recoverable runtime evidence",
+        { runtimeId: consumption.runtimeId },
+      );
     }
   }
 
@@ -1970,6 +2394,96 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
     throw lastError;
   }
 
+  private revalidatePreparedGameLaunchLocked(
+    root: string,
+    descriptor: PreparedDescriptor,
+  ): { executablePath: string; executableFile: ExecutableFileIdentity } {
+    if (!descriptor.gameLaunchEvidence) {
+      throw new OwnedRuntimeError(
+        "STORAGE_UNVERIFIABLE",
+        "Game-launch revalidation requires retained preparation evidence",
+      );
+    }
+    const evidence = validatedGameLaunchEvidence(descriptor.gameLaunchEvidence);
+    let planningError: GameLaunchPlanError | null = null;
+    let executablePath = "";
+    let executableFile: ExecutableFileIdentity | null = null;
+    try {
+      revalidateGameWorldPlan(evidence.world);
+      revalidateGameAddonPlan(evidence.addons);
+      executablePath = canonicalFile(
+        this.resolveExecutable(descriptor.runtimeKind),
+        `${descriptor.runtimeKind} runtime executable`,
+      );
+      executableFile = inspectExecutableFile(executablePath);
+      const executableFields: Omit<OwnedRuntimeExecutableEvidence, "executableEvidenceDigest"> = {
+        schemaVersion: OWNED_RUNTIME_EXECUTABLE_EVIDENCE_SCHEMA_VERSION,
+        runtimeKind: descriptor.runtimeKind,
+        executablePath,
+        executableFile,
+      };
+      const currentExecutable: OwnedRuntimeExecutableEvidence = {
+        ...executableFields,
+        executableEvidenceDigest: computeOwnedRuntimeExecutableEvidenceDigest(executableFields),
+      };
+      if (pathKey(currentExecutable.executablePath) !== pathKey(evidence.executable.executablePath) ||
+          currentExecutable.executableEvidenceDigest !== evidence.executable.executableEvidenceDigest) {
+        throw new GameLaunchPlanError(
+          "EXECUTABLE_CHANGED",
+          "Configured runtime executable changed after game-launch planning.",
+        );
+      }
+    } catch (error) {
+      planningError = error instanceof GameLaunchPlanError
+        ? error
+        : new GameLaunchPlanError(
+            "EXECUTABLE_EVIDENCE_INVALID",
+            "Game-launch point-of-use evidence could not be revalidated safely.",
+            { cause: error },
+          );
+    }
+    if (!planningError && executableFile) return { executablePath, executableFile };
+    planningError ??= new GameLaunchPlanError(
+      "EXECUTABLE_EVIDENCE_INVALID",
+      "Game-launch point-of-use executable evidence could not be produced safely.",
+    );
+    if (this.readOptionalConsumption(descriptor.preparedLaunchId) ||
+        this.preparedRuntimeReferences().has(descriptor.preparedLaunchId)) {
+      throw new OwnedRuntimeError(
+        "STORAGE_UNVERIFIABLE",
+        "Prepared game launch changed after consumption or runtime evidence already existed",
+      );
+    }
+    const invalidation = preparedInvalidationSchema.parse({
+      version: STORAGE_VERSION,
+      preparedLaunchId: descriptor.preparedLaunchId,
+      sessionId: descriptor.sessionId,
+      invalidatedAt: nowIso(this.clock),
+      planningCode: planningError.code,
+      gameLaunchEvidenceDigest: evidence.gameLaunchEvidenceDigest,
+      unconsumed: true,
+      managerInstanceId: this.managerInstanceId,
+    });
+    this.assertBatchCapacity(root, [{
+      target: this.preparedInvalidationPath(descriptor.preparedLaunchId),
+      value: invalidation,
+      exclusive: true,
+    }]);
+    this.atomicWrite(
+      root,
+      this.preparedInvalidationPath(descriptor.preparedLaunchId),
+      invalidation,
+      true,
+      true,
+    );
+    throw new OwnedRuntimePreconsumptionError(planningError, {
+      preparedLaunchId: descriptor.preparedLaunchId,
+      sessionId: descriptor.sessionId,
+      invalidationRecorded: true,
+      unconsumed: true,
+    });
+  }
+
   private async startLocked(
     preparedLaunchId: string,
     keyHash: string,
@@ -2014,6 +2528,14 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
     }
 
     const descriptor = this.readPreparedDescriptor(preparedLaunchId);
+    const invalidation = this.readOptionalPreparedInvalidation(preparedLaunchId, descriptor);
+    if (invalidation) {
+      throw new OwnedRuntimeError(
+        "PREPARED_LAUNCH_INVALIDATED",
+        "Prepared game launch was invalidated before consumption and cannot be started",
+        { preparedLaunchId, sessionId: invalidation.sessionId },
+      );
+    }
     if (descriptor.managerInstanceId !== this.managerInstanceId) {
       throw new OwnedRuntimeError("PREPARED_LAUNCH_STALE", "Prepared launch belongs to a prior MCP lifecycle instance");
     }
@@ -2031,13 +2553,8 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
     }
     // Reserve the complete ownership/recovery cluster before any consumption
     // receipt, spawn, or other irreversible action is attempted.
-    this.assertStartLifecycleHeadroom(root);
+    this.assertStartLifecycleHeadroom(root, descriptor.gameLaunchEvidence !== undefined);
 
-    const executablePath = canonicalFile(
-      this.resolveExecutable(descriptor.runtimeKind),
-      `${descriptor.runtimeKind} runtime executable`
-    );
-    const executableFile = inspectExecutableFile(executablePath);
     const ownerNonce = this.createOwnerToken();
     if (!/^[A-Za-z0-9_-]{32,128}$/.test(ownerNonce)) {
       throw new OwnedRuntimeError("IDENTITY_UNVERIFIABLE", "Generated runtime owner token is not a bounded cryptographic nonce");
@@ -2053,12 +2570,25 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
         "managed_arguments"
       );
     }
-    assertWindowsCommandLineFits(executablePath, argumentsArray);
-    const argvSha256 = sha256(JSON.stringify(argumentsArray));
     const mcpOwner = await this.currentMcpOwner();
     leaseFence.assertActive();
 
     const consumptionPath = this.consumptionPath(preparedLaunchId);
+    let executablePath: string;
+    let executableFile: ExecutableFileIdentity;
+    if (descriptor.gameLaunchEvidence) {
+      ({ executablePath, executableFile } =
+        this.revalidatePreparedGameLaunchLocked(root, descriptor));
+    } else {
+      executablePath = canonicalFile(
+        this.resolveExecutable(descriptor.runtimeKind),
+        `${descriptor.runtimeKind} runtime executable`,
+      );
+      executableFile = inspectExecutableFile(executablePath);
+    }
+    leaseFence.assertActive();
+    assertWindowsCommandLineFits(executablePath, argumentsArray);
+    const argvSha256 = sha256(JSON.stringify(argumentsArray));
     const consumed = this.readOptionalConsumption(preparedLaunchId);
     if (consumed) {
       if (consumed.idempotencyHash === keyHash && consumed.requestFingerprint === requestFingerprint) {
@@ -3609,10 +4139,14 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
       try {
         const descriptor = this.readPreparedDescriptor(preparedLaunchId);
         if (now - Date.parse(descriptor.expiresAt) < this.receiptRetentionMs) continue;
+        // A malformed or descriptor-mismatched invalidation is retained with
+        // its preparation for explicit recovery rather than silently erased.
+        this.readOptionalPreparedInvalidation(preparedLaunchId, descriptor);
         const index = this.readOptionalPreparedSessionIndex(descriptor.sessionId);
         if (index?.preparedLaunchId === preparedLaunchId) {
           this.unlinkOwnedFile(this.preparedSessionIndexPath(descriptor.sessionId));
         }
+        this.unlinkOwnedFile(this.preparedInvalidationPath(preparedLaunchId));
         this.unlinkOwnedFile(this.preparedPath(preparedLaunchId));
         removedPreparedLaunchIds.add(preparedLaunchId);
       } catch {
@@ -3637,6 +4171,7 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
       this.pendingStartPath(completion.runtimeId),
       this.runtimePath(completion.runtimeId),
       this.consumptionPath(completion.preparedLaunchId),
+      this.preparedInvalidationPath(completion.preparedLaunchId),
     ]) this.unlinkOwnedFile(target);
     if (index?.preparedLaunchId === completion.preparedLaunchId) {
       this.unlinkOwnedFile(this.preparedSessionIndexPath(completion.sessionId));
@@ -3652,6 +4187,7 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
     this.removeIdempotencyForRuntime(runtimeId);
     for (const target of [
       this.consumptionPath(pending.preparedLaunchId),
+      this.preparedInvalidationPath(pending.preparedLaunchId),
     ]) this.unlinkOwnedFile(target);
     if (index?.preparedLaunchId === pending.preparedLaunchId) {
       this.unlinkOwnedFile(this.preparedSessionIndexPath(pending.sessionId));
@@ -3861,7 +4397,7 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
     return { records, bytes };
   }
 
-  private assertStartLifecycleHeadroom(root: string): void {
+  private assertStartLifecycleHeadroom(root: string, reservesPreparedInvalidation: boolean): void {
     if (this.maxRecordBytes < CHILD_EXIT_RESERVE_BYTES) {
       throw new OwnedRuntimeError(
         "STORE_CAPACITY_EXCEEDED",
@@ -3870,13 +4406,57 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
     }
     const usage = this.storeUsage(root);
     const existingReserve = this.mutationReserve(usage.byPath, []);
-    const nextRecords = usage.records + existingReserve.records + START_LIFECYCLE_RESERVE_RECORDS;
+    const reserveRecords = reservesPreparedInvalidation
+      ? GAME_LAUNCH_START_LIFECYCLE_RESERVE_RECORDS
+      : START_LIFECYCLE_RESERVE_RECORDS;
+    const nextRecords = usage.records + existingReserve.records + reserveRecords;
     const nextBytes = usage.bytes + existingReserve.bytes +
       Math.min(this.maxStoreBytes, START_LIFECYCLE_RESERVE_BYTES);
     if (nextRecords > this.maxStoreRecords || nextBytes > this.maxStoreBytes) {
       throw new OwnedRuntimeError(
         "STORE_CAPACITY_EXCEEDED",
         "Owned-runtime store cannot reserve a complete start/stop recovery lifecycle"
+      );
+    }
+  }
+
+  private assertInitialGamePreparationHeadroom(
+    root: string,
+    input: ObserverLaunchInput,
+    evidence: OwnedGameLaunchPreparationEvidence,
+  ): void {
+    const evidenceBytes = Buffer.byteLength(this.serializeRecord(evidence), "utf8");
+    const descriptorMaximum = MAX_REALISTIC_PREPARED_DESCRIPTOR_BYTES + evidenceBytes;
+    if (descriptorMaximum > this.maxRecordBytes) {
+      throw new OwnedRuntimeError(
+        "STORE_CAPACITY_EXCEEDED",
+        "Owned-runtime record budget cannot retain the bounded game-launch preparation evidence",
+      );
+    }
+    // The private child may append only its bounded observer-owned launch
+    // vector. Reserve the descriptor, session index, invalidation-capable start
+    // lifecycle, and every already-live runtime mutation before initiating IPC.
+    const usage = this.storeUsage(root);
+    const existingReserve = this.mutationReserve(usage.byPath, []);
+    const indexMaximum = SMALL_LIFECYCLE_RESERVE_BYTES;
+    const nextRecords = usage.records + existingReserve.records +
+      GAME_LAUNCH_START_LIFECYCLE_RESERVE_RECORDS + 2;
+    const nextBytes = usage.bytes + existingReserve.bytes +
+      Math.min(this.maxStoreBytes, START_LIFECYCLE_RESERVE_BYTES) +
+      descriptorMaximum + indexMaximum;
+    if (nextRecords > this.maxStoreRecords || nextBytes > this.maxStoreBytes) {
+      throw new OwnedRuntimeError(
+        "STORE_CAPACITY_EXCEEDED",
+        "Owned-runtime store cannot reserve the initial game-launch preparation and complete recovery lifecycle",
+      );
+    }
+    // Keep this check tied to the exact already-derived vector rather than a
+    // retry response that could expand the retained descriptor unexpectedly.
+    if (input.arguments.length > PREPARED_ARGUMENT_MAX_COUNT ||
+        input.profilePath.length > WINDOWS_PATH_MAX_CHARS) {
+      throw new OwnedRuntimeError(
+        "STORE_CAPACITY_EXCEEDED",
+        "Initial game-launch preparation exceeds its bounded descriptor shape",
       );
     }
   }
@@ -4045,6 +4625,9 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
   private preparedSessionIndexPath(sessionId: string): string {
     return join(this.directory("prepared-index"), `${sha256(sessionId)}.json`);
   }
+  private preparedInvalidationPath(preparedLaunchId: string): string {
+    return join(this.directory("prepared-invalidations"), `${preparedLaunchId}.json`);
+  }
   private consumptionPath(id: string): string { return join(this.directory("consumed"), `${id}.json`); }
   private pendingStartPath(id: string): string { return join(this.directory("pending-starts"), `${id}.json`); }
   private runtimePath(id: string): string { return join(this.directory("runtimes"), `${id}.json`); }
@@ -4063,11 +4646,13 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
       this.preparedPath(preparedLaunchId),
       preparedDescriptorSchema,
       "prepared-launch descriptor",
-      this.preparedDescriptorMaxBytes()
+      this.maxRecordBytes,
     );
     if (descriptor.preparedLaunchId !== preparedLaunchId) {
       throw new OwnedRuntimeError("STORAGE_UNVERIFIABLE", "Prepared-launch descriptor does not match its filename");
     }
+    this.assertPreparedDescriptorCapacity(descriptor);
+    if (descriptor.gameLaunchEvidence) validatedGameLaunchEvidence(descriptor.gameLaunchEvidence);
     return descriptor;
   }
 
@@ -4076,7 +4661,10 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
   }
 
   private assertPreparedDescriptorCapacity(descriptor: PreparedDescriptor): void {
-    if (Buffer.byteLength(this.serializeRecord(descriptor), "utf8") > this.preparedDescriptorMaxBytes()) {
+    const maximum = descriptor.gameLaunchEvidence
+      ? this.maxRecordBytes
+      : this.preparedDescriptorMaxBytes();
+    if (Buffer.byteLength(this.serializeRecord(descriptor), "utf8") > maximum) {
       throw new OwnedRuntimeError(
         "STORE_CAPACITY_EXCEEDED",
         "Prepared-launch descriptor exceeds its command-line-aligned byte budget"
@@ -4099,9 +4687,18 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
     return index;
   }
 
-  private preparedFingerprint(value: Pick<PreparedDescriptor,
-    "sessionId" | "arguments" | "profilePath" | "runtimeKind" | "expiresAt" | "bundleDigest"
-  >): string {
+  private preparedFingerprint(value: {
+    sessionId: string;
+    arguments: string[];
+    profilePath: string;
+    runtimeKind: ObserverLaunchInput["runtimeKind"];
+    expiresAt: string;
+    bundleDigest: string;
+    gameLaunchEvidence?: {
+      gameLaunchEvidenceDigest: string;
+      prepareKey: string;
+    };
+  }): string {
     return sha256(JSON.stringify({
       sessionId: value.sessionId,
       arguments: value.arguments,
@@ -4109,7 +4706,41 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
       runtimeKind: value.runtimeKind,
       expiresAt: value.expiresAt,
       bundleDigest: value.bundleDigest,
+      ...(value.gameLaunchEvidence ? {
+        gameLaunchEvidenceDigest: value.gameLaunchEvidence.gameLaunchEvidenceDigest,
+        prepareKey: value.gameLaunchEvidence.prepareKey,
+      } : {}),
     }));
+  }
+
+  private readOptionalPreparedInvalidation(
+    preparedLaunchId: string,
+    descriptor?: PreparedDescriptor,
+  ): PreparedInvalidation | null {
+    const invalidation = this.readOptionalParsed(
+      this.preparedInvalidationPath(preparedLaunchId),
+      preparedInvalidationSchema,
+      "prepared game-launch invalidation",
+    );
+    if (invalidation) {
+      if (invalidation.preparedLaunchId !== preparedLaunchId) {
+        throw new OwnedRuntimeError(
+          "STORAGE_UNVERIFIABLE",
+          "Prepared game-launch invalidation does not match its filename",
+        );
+      }
+      if (descriptor && (!descriptor.gameLaunchEvidence ||
+          invalidation.sessionId !== descriptor.sessionId ||
+          invalidation.gameLaunchEvidenceDigest !==
+            descriptor.gameLaunchEvidence.gameLaunchEvidenceDigest ||
+          invalidation.managerInstanceId !== descriptor.managerInstanceId)) {
+        throw new OwnedRuntimeError(
+          "STORAGE_UNVERIFIABLE",
+          "Prepared game-launch invalidation does not match its retained descriptor",
+        );
+      }
+    }
+    return invalidation;
   }
 
   private readOptionalConsumption(preparedLaunchId: string): z.infer<typeof consumptionSchema> | null {
@@ -4289,8 +4920,9 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder {
   }
 
   private normalizeError(error: unknown, fallbackCode: string, fallbackMessage: string): OwnedRuntimeError {
+    if (error instanceof OwnedRuntimePreconsumptionError) return error;
     if (error instanceof OwnedRuntimeError) {
-      return new OwnedRuntimeError(error.code, this.message(error), error.details);
+      return new OwnedRuntimeError(error.code, this.message(error), error.details, error.remedyReason);
     }
     const code = typeof (error as { code?: unknown })?.code === "string"
       ? String((error as { code: string }).code)

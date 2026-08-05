@@ -4,6 +4,7 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { Transformer } from "@napi-rs/image";
 import { ObserverApplicationError } from "../../src/observer/errors.js";
+import type { OwnedRuntimeManager } from "../../src/observer/owned-runtime-manager.js";
 import { runtimeWorldRevision } from "../../src/observer/world-revision.js";
 import { registerObserverTools } from "../../src/observer/tools.js";
 import {
@@ -18,7 +19,9 @@ describe("observer MCP tools", () => {
   it("publishes a portable fixed-length capture schema without positional items or nested refs", async () => {
     const coordinator = toolApplication({ capture: vi.fn() });
     const server = new McpServer({ name: "observer-schema-test", version: "1.0.0" });
-    registerObserverTools(server, coordinator);
+    registerObserverTools(server, coordinator, {
+      ownedRuntimeManager: {} as OwnedRuntimeManager,
+    });
     const client = new Client({ name: "observer-schema-client", version: "1.0.0" });
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
     try {
@@ -28,9 +31,16 @@ describe("observer MCP tools", () => {
       const prepare = listed.tools.find((tool) => tool.name === "observer_prepare_launch");
       const capture = listed.tools.find((tool) => tool.name === "observer_capture");
       const run = listed.tools.find((tool) => tool.name === "observer_run_finalize");
+      const gameLaunch = listed.tools.find((tool) => tool.name === "game_launch");
       expect(prepare).toBeDefined();
       expect(capture).toBeDefined();
       expect(run).toBeDefined();
+      expect(gameLaunch).toBeDefined();
+      expect(gameLaunch!.inputSchema.required ?? []).not.toContain("action");
+      expect(gameLaunch!.inputSchema.properties!.action).not.toHaveProperty("default");
+      expect(gameLaunch!.inputSchema.properties!.runtimeKind).not.toHaveProperty("default");
+      expect(gameLaunch!.inputSchema.properties!.waitForInstanceMs).not.toHaveProperty("default");
+      expect(gameLaunch!.inputSchema.additionalProperties).toBe(false);
       expect(capture!.inputSchema.required ?? []).not.toContain("expectedWorldRevision");
       expect(capture!.inputSchema.properties).toHaveProperty("target");
       expect(capture!.inputSchema.properties).toHaveProperty("expectedWorldRevision");

@@ -12,6 +12,7 @@ import { prepareObserverLaunch } from "./launch.js";
 import { runObserverSetup } from "./setup.js";
 import type { WorkbenchClient } from "../workbench/client.js";
 import type { OwnedRuntimeManager } from "./owned-runtime-manager.js";
+import { registerGameLaunch } from "../tools/game-launch.js";
 import { registerObserverRuntime } from "../tools/observer-runtime.js";
 import {
   projectPublicObserverToolError,
@@ -472,6 +473,12 @@ export function registerObserverTools(
 
   if (defaults.ownedRuntimeManager) {
     registerObserverRuntime(server, defaults.ownedRuntimeManager);
+    registerGameLaunch(server, application, {
+      manager: defaults.ownedRuntimeManager,
+      workbenchClient: defaults.workbenchClient,
+      configuredAddonRoots: defaults.workbenchAddonDirs,
+      defaultSessionTtlMs: sessionTtlMs,
+    });
   }
 
   server.registerTool(

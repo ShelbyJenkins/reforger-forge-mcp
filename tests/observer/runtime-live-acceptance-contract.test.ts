@@ -10,6 +10,8 @@ import {
   DEFAULT_RUNTIME_OBSERVER_POSE_ORIENTATION,
   DEFAULT_RUNTIME_OBSERVER_POSE_POSITION,
   DEFAULT_RUNTIME_OBSERVER_WORLD,
+  DEFAULT_GAME_LAUNCH_FIXTURE_DIRECTORY,
+  DEFAULT_GAME_LAUNCH_FIXTURE_WORLD,
   LIVE_RUNTIME_OBSERVER_ENVIRONMENT,
   assertCurrentViewReleasedFromDisplaced,
   assertMatrixClose,
@@ -232,19 +234,20 @@ describe("live graphical runtime observer acceptance contract", () => {
     });
   });
 
-  it("uses the public run workflow and exact-owned runtime lifecycle service", () => {
+  it("uses the public game_launch composite and exact-owned runtime lifecycle service", () => {
     const source = readFileSync(resolve("scripts/run-runtime-observer-acceptance.ts"), "utf8");
     expect(source).toContain("agentPath: PRIVATE_CHILD_PATH");
-    expect(source).toContain("await prepareObserverLaunch(application");
-    expect(source).toContain("}, runtimeManager);");
+    expect(source).toContain("registerGameLaunch(server, application");
+    expect(source).toContain("const startResult = await callGameLaunch({");
+    expect(source).toContain('action: "start"');
     expect(source).toContain("new OwnedRuntimeManager({");
     expect(source).toContain("executableResolver: () => executable");
     expect(source).toContain(
       "findRuntimeExecutable(options.executablePath, options.configPath)"
     );
-    expect(source).toContain("await runtimeManager.start({");
-    expect(source.match(/runtimeManager\.status\(/g)).toHaveLength(2);
-    expect(source).toContain("await runtimeManager.stop({");
+    expect(source.match(/const statusResult = await callGameLaunch\(/g)).toHaveLength(2);
+    expect(source).toContain("const stopResult = await callGameLaunch({");
+    expect(source).toContain('action: "stop"');
     expect(source).toContain("closeObserverRuntimeLifecycle(runtimeManager, application)");
     expect(source).toContain("stoppedRuntime.identityVacant !== true");
     expect(source).toContain("vacantRuntime.identityVacant !== true");
@@ -268,7 +271,7 @@ describe("live graphical runtime observer acceptance contract", () => {
     expect(source).toContain("--expect-current-only cannot be combined with --only");
     expect(source).toContain("await application.capture(");
     expect(source).toContain("await application.finalizeRun(");
-    const stopIndex = source.indexOf("await runtimeManager.stop({");
+    const stopIndex = source.indexOf("const stopResult = await callGameLaunch({");
     const revokeIndex = Math.max(
       source.indexOf("application.revokeSession(sessionId)"),
       source.indexOf("application.revokeSession(confirmedSessionId)")
@@ -304,7 +307,7 @@ describe("live graphical runtime observer acceptance contract", () => {
     expect(source).toContain('diagnostics: removeOwnedScratch(runDirectory, diagnosticsRoot');
     expect(source).toContain('maxRetries: 10');
     expect(source).toContain('retryDelay: 100');
-    expect(source).toContain('"OwnedRuntimeManager.start/status(running)"');
+    expect(source).toContain('"game_launch start/status(running)"');
     expect(source).toContain("stoppedRuntime.terminationComplete !== true");
     expect(source).toContain("stoppedRuntime.observerCleanupPending !== false");
     expect(source).toContain('baseline.sampleProcessCounts("rest.beforeLaunch")');
@@ -322,13 +325,30 @@ describe("live graphical runtime observer acceptance contract", () => {
     expect(scratchCleanupIndex).toBeGreaterThan(exitSettleIndex);
     expect(restAfterShutdownIndex).toBeGreaterThan(scratchCleanupIndex);
     expect(source).toContain("writeOperationalBaselineArtifact(validationRoot, artifact)");
-    expect(source).toContain('"runtime-observer-acceptance-v2"');
+    expect(source).toContain('"runtime-observer-game-launch-acceptance-v1"');
     expect(source).toContain("procedureRevision,");
-    expect(source).toContain("operationalBaselineDirectoryIdentity(fixture.addonDirectory");
+    expect(source).toContain("operationalBaselineDirectoryIdentity(");
+    expect(source).toContain("fixture.addonDirectory,");
     expect(source).toContain("operationalBaselineLaunchArgumentIdentity([");
     expect(source).toContain("configurationSha256: baselineCaptureConfigurationSha256");
     expect(source).not.toMatch(/spawnOwnedRuntime|stopOwnedRuntime|ChildProcess|\.kill\(/);
     expect(source).not.toMatch(/taskkill|Stop-Process|KillProcess|execSync|shell:\s*true/i);
+  });
+
+  it("ships a registered project-contained world for public game_launch acceptance", () => {
+    expect(DEFAULT_GAME_LAUNCH_FIXTURE_WORLD).toBe("Worlds/GameLaunchAcceptance.ent");
+    const project = join(DEFAULT_GAME_LAUNCH_FIXTURE_DIRECTORY, "addon.gproj");
+    const world = join(DEFAULT_GAME_LAUNCH_FIXTURE_DIRECTORY, DEFAULT_GAME_LAUNCH_FIXTURE_WORLD);
+    expect(existsSync(project)).toBe(true);
+    expect(existsSync(world)).toBe(true);
+    expect(existsSync(`${world}.meta`)).toBe(true);
+    expect(readFileSync(world, "utf8")).toContain(
+      'Parent "{96A8AF57260A7392}worlds/MP/MpTest/MpTest.ent"'
+    );
+    expect(readFileSync(`${world}.meta`, "utf8")).toContain("Worlds/GameLaunchAcceptance.ent");
+    const source = readFileSync(resolve("scripts/run-runtime-observer-acceptance.ts"), "utf8");
+    expect(source).toContain("decodeCaptureTarget(opaqueTarget)");
+    expect(source).toContain("targetBinding.expectedWorldRevision");
   });
 
   it("keeps the production observer launcher-neutral", () => {

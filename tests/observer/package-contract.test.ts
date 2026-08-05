@@ -284,7 +284,7 @@ describe("observer package and source contracts", () => {
     }
   });
 
-  it("publishes the exact ten-tool observer surface and keeps current operator guidance aligned", () => {
+  it("publishes ten observer primitives plus the separate owned game composite", () => {
     const expected = [
       "observer_capture",
       "observer_instances",
@@ -315,21 +315,28 @@ describe("observer package and source contracts", () => {
       .map((match) => match[1])
       .sort();
     expect(discovered).toEqual(expected);
+    const compositeBlock = serverVerifier.match(
+      /const REQUIRED_OBSERVER_COMPOSITES = \[([\s\S]*?)\] as const;/,
+    )?.[1] ?? "";
+    expect(compositeBlock).toContain('"game_launch"');
 
     const observerGuide = readFileSync(join(repositoryRoot, "docs", "observer.md"), "utf8");
     for (const name of expected) expect(observerGuide).toContain(`\`${name}\``);
+    expect(observerGuide).toContain("`game_launch`");
     expect(observerGuide).toContain("expectedWorldRevision");
     expect(observerGuide).not.toContain("expectedWorldId");
     expect(observerGuide).not.toContain("expectedWorldEpoch");
 
     const observerReadme = readFileSync(join(repositoryRoot, "observer", "README.md"), "utf8");
-    expect(observerReadme).toContain("Observer exposes ten related MCP tools");
+    expect(observerReadme).toContain("Observer exposes ten related `observer_*` primitives plus the separate");
     expect(observerReadme).toContain("observer_runtime");
+    expect(observerReadme).toContain("game_launch");
     expect(observerReadme).toContain("terminal restoration");
     expect(observerReadme).toContain("exact matching persisted receipt");
 
     const agentInstructions = readFileSync(join(repositoryRoot, "agents", "AGENTS.md"), "utf8");
     expect(agentInstructions).toContain("observer_runtime");
+    expect(agentInstructions).toContain("game_launch");
     expect(agentInstructions).toContain("preparedLaunchId");
   });
 

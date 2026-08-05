@@ -33,10 +33,10 @@
 | 1 | Implementation complete; live validated | 2026-08-04 | Required static gates and stage 3 tests 345/345 passed. Live compile-check, lifecycle, and explicit-save acceptances passed with final process vacancy. Landed in grouped commit `ff71390`. |
 | 2 | Implementation complete; live validated | 2026-08-04 | Focused tests 40/40 and stage 4 tests 180/180 passed. Positive Workbench Observer acceptance passed with six captures, restoration, cleanup, and final process vacancy. Landed in grouped commit `ff71390`. |
 | 3 | Implementation complete; live validated | 2026-08-04 | Focused tests 21/21, typecheck, and unused-code analysis passed. A real Workbench registration produced metadata that strict explicit/discovery resolution and evidence revalidation accepted. Landed in grouped commit `ff71390`. |
-| 4 | Implementation complete; non-live validated | 2026-08-04 | Focused tests 14/14 and stage 3 tests 345/345 passed; typecheck and unused-code analysis passed. No live gate applies. |
-| 5 | Implementation complete; non-live validated | 2026-08-04 | Focused policy/compatibility tests 84/84 and stage 4 tests 180/180 passed; typecheck and unused-code analysis passed. No live gate applies. |
-| 6 | Implementation complete; non-live validated | 2026-08-04 | Focused operation/executable tests 33/33 and stage 4 tests 180/180 passed; typecheck and unused-code analysis passed. No live gate applies. |
-| 7 | Not started | 2026-08-04 | |
+| 4 | Implementation complete; non-live validated | 2026-08-04 | Focused tests 14/14 and stage 3 tests 345/345 passed; typecheck and unused-code analysis passed. No live gate applies. Landed in `7a30eaf`. |
+| 5 | Implementation complete; non-live validated | 2026-08-04 | Focused policy/compatibility tests 84/84 and stage 4 tests 180/180 passed; typecheck and unused-code analysis passed. No live gate applies. Landed in `5b76653`. |
+| 6 | Implementation complete; non-live validated | 2026-08-04 | Focused operation/executable tests 33/33 and stage 4 tests 180/180 passed; typecheck and unused-code analysis passed. No live gate applies. Landed in `40dcabd`. |
+| 7 | Implementation complete; live validated | 2026-08-05 | Focused and live-support tests 105/105, stage 4 tests 208/208, and cross-cutting baseline tests 55/55 passed; the exact full repository suite, typecheck, build, MCP verification, manifest/protocol checks, and unused-code analysis passed. Separate fresh-root public `game_launch` listen-server and client cycles each resolved the registered project world, exposed one matching graphical observer, produced five material captures with pose/look-at restoration, terminated the exact-owned runtime, revoked the session, removed scratch state, and proved final process vacancy. |
 | 8 | Not started | 2026-08-04 | Optional. |
 | 9 | Not started | 2026-08-04 | Deferred follow-up. |
 | 10 | Not started | 2026-08-04 | Deferred follow-up. |

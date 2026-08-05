@@ -15,6 +15,7 @@ import { basename, dirname, join, relative, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { isDeepStrictEqual } from "node:util";
+import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { OBSERVER_TERMINAL_STATES } from "../observer/protocol/enforce-contract.js";
 import { OBSERVER_FAULT_MATRIX } from "../observer/protocol/fault-matrix.js";
 import { systemClock, systemSleeper } from "../src/foundation/time.js";
@@ -24,12 +25,13 @@ import {
   type ObserverCaptureResult,
   type ObserverCaptureView,
 } from "../src/observer/application.js";
-import { prepareObserverLaunch } from "../src/observer/launch.js";
+import { decodeCaptureTarget } from "../src/observer/capture-target.js";
 import {
   closeObserverRuntimeLifecycle,
   OwnedRuntimeManager,
+  type OwnedRuntimePublicStatus,
 } from "../src/observer/owned-runtime-manager.js";
-import { deriveObserverRuntimeIdempotencyKey } from "../src/tools/observer-runtime.js";
+import { registerGameLaunch } from "../src/tools/game-launch.js";
 import {
   OperationalBaselineRecorder,
   analyzePngMaterial,
@@ -69,10 +71,8 @@ import {
   DEFAULT_RUNTIME_OBSERVER_POSE_FOV,
   DEFAULT_RUNTIME_OBSERVER_POSE_ORIENTATION,
   DEFAULT_RUNTIME_OBSERVER_POSE_POSITION,
-  DEFAULT_RUNTIME_OBSERVER_WORLD,
   findRuntimeExecutable,
   inspectAddonFixture,
-  launchArguments,
   LIVE_RUNTIME_OBSERVER_ENVIRONMENT,
   OBSERVER_OPERATIONAL_BASELINE_SOURCE_CLOSURES,
   OBSERVER_SOURCE_PATH,
@@ -128,6 +128,14 @@ export {
 const SCRIPT_PATH = fileURLToPath(import.meta.url);
 const TERMINAL_STATES = new Set<string>(OBSERVER_TERMINAL_STATES);
 const ACCEPTANCE_CASE_ID = "RFO-LIVE-RUNTIME-SCREENSHOT";
+export const DEFAULT_GAME_LAUNCH_FIXTURE_DIRECTORY = join(
+  REPOSITORY_ROOT,
+  "tests",
+  "fixtures",
+  "runtime-observer-acceptance",
+  "Addon",
+);
+export const DEFAULT_GAME_LAUNCH_FIXTURE_WORLD = "Worlds/GameLaunchAcceptance.ent";
 const CAPTURE_LABELS = [
   "initial-current",
   "explicit-pose",
@@ -700,6 +708,55 @@ function writeSummary(path: string, value: Record<string, unknown>): void {
   writeFileSync(path, `${JSON.stringify(value, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
 }
 
+interface PublicGameLaunchToolResult {
+  readonly content: Array<{ readonly type: string; readonly text?: string }>;
+  readonly isError?: boolean;
+}
+
+type PublicGameLaunchHandler = (
+  input: Record<string, unknown>,
+  extra: { signal: AbortSignal },
+) => Promise<PublicGameLaunchToolResult>;
+
+function publicGameLaunchHandler(
+  application: ObserverApplication,
+  runtimeManager: OwnedRuntimeManager,
+  sessionTtlMs: number,
+): PublicGameLaunchHandler {
+  let handler: PublicGameLaunchHandler | null = null;
+  const server = {
+    registerTool(name: string, _definition: unknown, candidate: PublicGameLaunchHandler): void {
+      if (name === "game_launch") handler = candidate;
+    },
+  } as unknown as McpServer;
+  registerGameLaunch(server, application, {
+    manager: runtimeManager,
+    configuredAddonRoots: [],
+    defaultSessionTtlMs: sessionTtlMs,
+  });
+  if (!handler) throw new Error("Public game_launch handler was not registered");
+  return handler;
+}
+
+function publicGameLaunchPayload(
+  result: PublicGameLaunchToolResult,
+  operation: string,
+): Record<string, unknown> {
+  const text = result.content.find((item) => item.type === "text")?.text ?? "";
+  if (result.isError === true) {
+    throw new Error(`${operation} was refused by the public game_launch handler: ${text.slice(0, 512)}`);
+  }
+  const match = /```json\n([\s\S]+)\n```$/.exec(text);
+  if (!match) throw new Error(`${operation} returned no public JSON payload`);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(match[1]);
+  } catch {
+    throw new Error(`${operation} returned malformed public JSON`);
+  }
+  return record(parsed, `${operation} payload`);
+}
+
 export async function runRuntimeObserverAcceptance(
   options: RuntimeObserverAcceptanceOptions
 ): Promise<RuntimeObserverAcceptanceResult> {
@@ -714,7 +771,7 @@ export async function runRuntimeObserverAcceptance(
   }
   const procedureRevision = options.expectCurrentOnly
     ? "runtime-observer-current-only-containment-v1"
-    : "runtime-observer-acceptance-v2";
+    : "runtime-observer-game-launch-acceptance-v1";
   const acceptanceCaptureLabels = options.expectCurrentOnly
     ? [CAPTURE_LABELS[0]]
     : [...CAPTURE_LABELS];
@@ -722,25 +779,23 @@ export async function runRuntimeObserverAcceptance(
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 60_000 || timeoutMs > 900_000) {
     throw new Error("Live runtime observer timeout must be 60000..900000 ms");
   }
+  const fixture = inspectAddonFixture(
+    options.addonDirectory ?? DEFAULT_GAME_LAUNCH_FIXTURE_DIRECTORY,
+  );
+  if (!fixture) throw new Error("Public game_launch acceptance requires one exact add-on project fixture");
   const worldResource = boundedText(
-    options.worldResource ?? DEFAULT_RUNTIME_OBSERVER_WORLD,
-    "Runtime acceptance world resource",
+    options.worldResource ?? DEFAULT_GAME_LAUNCH_FIXTURE_WORLD,
+    "Runtime acceptance project world",
     1_024
   );
   const poseView = validatePose(options);
   const lookAtView = validateLookAt(options);
-  const fixture = inspectAddonFixture(options.addonDirectory);
   const executable = findRuntimeExecutable(options.executablePath, options.configPath);
-  const baseArguments = launchArguments(
-    worldResource,
-    fixture,
-    options.launchArguments,
-    runtimeKind
+  let baselineLaunchArguments = operationalBaselineLaunchArgumentIdentity([], false);
+  const baselineFixtureContent = operationalBaselineDirectoryIdentity(
+    fixture.addonDirectory,
+    RUNTIME_FIXTURE_SOURCE_EXTENSIONS,
   );
-  let baselineLaunchArguments = operationalBaselineLaunchArgumentIdentity(baseArguments, false);
-  const baselineFixtureContent = fixture
-    ? operationalBaselineDirectoryIdentity(fixture.addonDirectory, RUNTIME_FIXTURE_SOURCE_EXTENSIONS)
-    : null;
   const markerConfiguration = options.marker ? {
     color: [...options.marker.color],
     roi: options.marker.roi ? { ...options.marker.roi } : null,
@@ -795,6 +850,12 @@ export async function runRuntimeObserverAcceptance(
     observerGate: application,
     executableResolver: () => executable,
   });
+  const launchSessionTtlMs = Math.min(24 * 60 * 60_000, timeoutMs + 120_000);
+  const callGameLaunch = publicGameLaunchHandler(
+    application,
+    runtimeManager,
+    launchSessionTtlMs,
+  );
   const readBaselineProcessCounts = () => {
     const runtimeChildren = runtimeManager.diagnosticSupervisedChildCounts();
     const observerPrivateChildren = application.diagnosticPrivateChildCount();
@@ -856,64 +917,91 @@ export async function runRuntimeObserverAcceptance(
     managedRunId = begun.runId;
     summary.observerRunId = managedRunId;
 
-    const prepared = await prepareObserverLaunch(application, {
-      runtimeKind,
-      arguments: baseArguments,
-      profilePath: join(profileRoot, "graphical-runtime"),
-      sessionTtlMs: Math.min(24 * 60 * 60_000, timeoutMs + 120_000),
-      transportPreference: ["rest", "mailbox"],
-      forceUpdate: true,
-      noFocus: true,
-      idempotencyKey: `runtime-launch-${randomUUID()}`,
-    }, runtimeManager);
-    sessionId = prepared.sessionId;
-    if (!prepared.preparedLaunchId) {
-      throw new Error("Observer launch preparation returned no owned-runtime handle");
-    }
-    const preparedLaunchId = prepared.preparedLaunchId;
-    baselineLaunchArguments = operationalBaselineLaunchArgumentIdentity([
-      ...prepared.arguments,
-      "-reforgerForgeOwnerToken=<redacted>",
-    ]);
-    summary.preparedLaunch = {
-      preparedLaunchId,
-      sessionId,
-      expiresAt: prepared.expiresAt,
-      bundleDigest: prepared.bundleDigest,
-      profilePath: prepared.profilePath,
-      argumentCount: prepared.arguments.length,
-      warnings: prepared.warnings,
-    };
-
     assertArmaVacant("Live runtime observer acceptance launch");
     const launch = await baseline.measure(
       "launch",
-      "OwnedRuntimeManager.start/status(running)",
+      "game_launch start/status(running)",
       async () => {
-        const startedRuntime = await runtimeManager.start({
-          preparedLaunchId,
-          idempotencyKey: deriveObserverRuntimeIdempotencyKey({ action: "start", preparedLaunchId }),
-        });
+        const startResult = await callGameLaunch({
+          action: "start",
+          gprojPath: fixture.gprojPath,
+          world: worldResource,
+          runtimeKind,
+          arguments: options.launchArguments ?? [],
+          waitForInstanceMs: Math.max(0, Math.min(300_000, deadline - Date.now())),
+          sessionTtlMs: launchSessionTtlMs,
+          forceUpdate: true,
+          noFocus: true,
+        }, { signal: new AbortController().signal });
+        const startPayload = publicGameLaunchPayload(startResult, "game_launch start");
+        const startedRuntime = record(
+          startPayload.runtime,
+          "game_launch started runtime",
+        ) as unknown as OwnedRuntimePublicStatus;
+        const preparation = record(startPayload.preparation, "game_launch preparation");
+        const preparedArguments = startPayload.arguments;
+        if (!Array.isArray(preparedArguments) ||
+            preparedArguments.some((argument) => typeof argument !== "string")) {
+          throw new Error("game_launch start returned invalid prepared arguments");
+        }
+        if (typeof startPayload.runtimeId === "string" &&
+            startPayload.runtimeId !== startedRuntime.runtimeId) {
+          throw new Error("game_launch start returned conflicting runtime identities");
+        }
+        if (typeof startedRuntime.runtimeId !== "string" ||
+            typeof startPayload.sessionId !== "string" ||
+            typeof startPayload.preparedLaunchId !== "string" ||
+            typeof preparation.bundleDigest !== "string") {
+          throw new Error("game_launch start omitted exact public lifecycle authority");
+        }
         runtimeId = startedRuntime.runtimeId;
+        sessionId = startPayload.sessionId;
+        baselineLaunchArguments = operationalBaselineLaunchArgumentIdentity([
+          ...preparedArguments,
+          "-reforgerForgeOwnerToken=<redacted>",
+        ]);
+        summary.preparedLaunch = {
+          preparedLaunchId: startPayload.preparedLaunchId,
+          sessionId,
+          expiresAt: preparation.expiresAt,
+          bundleDigest: preparation.bundleDigest,
+          profilePath: startPayload.profilePath,
+          argumentCount: preparedArguments.length,
+          warnings: preparation.warnings,
+        };
         if (startedRuntime.state !== "running" || startedRuntime.exactOwned !== true ||
             startedRuntime.sessionId !== sessionId) {
           throw new Error("Owned runtime did not start with an exact session-bound identity");
         }
         const runningRuntime = await baseline.measure(
           "managed_call",
-          "OwnedRuntimeManager.status",
-          () => runtimeManager.status(startedRuntime.runtimeId),
+          "game_launch status",
+          async () => {
+            const statusResult = await callGameLaunch({
+              action: "status",
+              runtimeId: startedRuntime.runtimeId,
+            }, { signal: new AbortController().signal });
+            return record(
+              publicGameLaunchPayload(statusResult, "game_launch status").runtime,
+              "game_launch status runtime",
+            ) as unknown as OwnedRuntimePublicStatus;
+          },
           "representative_status_api"
         );
         if (runningRuntime.state !== "running" || runningRuntime.exactOwned !== true ||
             runningRuntime.sessionId !== sessionId) {
           throw new Error("Owned runtime status did not confirm the exact running process");
         }
-        return { startedRuntime, runningRuntime };
+        return {
+          startedRuntime,
+          runningRuntime,
+          preparedLaunchId: startPayload.preparedLaunchId,
+          bundleDigest: preparation.bundleDigest,
+        };
       },
       "running_confirmation"
     );
-    const { startedRuntime, runningRuntime } = launch;
+    const { startedRuntime, runningRuntime, preparedLaunchId, bundleDigest } = launch;
     summary.runtimeStart = startedRuntime;
     summary.ownedRuntimePid = startedRuntime.pid;
     summary.runtimeStatus = runningRuntime;
@@ -935,7 +1023,7 @@ export async function runRuntimeObserverAcceptance(
     const fixtureContentIdentity = baselineFixtureContent?.sha256 ?? operationalBaselineProcedureSha256({ fixture: "no-generated-addon" });
     const generatedProjectIdentity = operationalBaselineProcedureSha256({
       preparedLaunchId,
-      bundleDigest: prepared.bundleDigest,
+      bundleDigest,
     });
     const generatedAddonIdentity = fixture?.addonGuid ?? operationalBaselineProcedureSha256({ addon: "no-generated-addon" });
     const faultBinding = Object.freeze({
@@ -1015,19 +1103,25 @@ export async function runRuntimeObserverAcceptance(
     const worldRevision = String(selected.worldRevision ?? "");
     const worldId = typeof selected.worldId === "string" ? selected.worldId : "";
     const worldEpoch = selected.worldEpoch;
+    const opaqueTarget = typeof selected.target === "string" ? selected.target : "";
+    const targetBinding = decodeCaptureTarget(opaqueTarget);
     if (!/^[A-Za-z0-9_-]{1,96}$/.test(instanceId) ||
         !/^wr1\.runtime\.[A-Za-z0-9_-]+$/.test(worldRevision) || !worldId ||
-        !Number.isSafeInteger(worldEpoch) || (worldEpoch as number) < 0) {
+        !Number.isSafeInteger(worldEpoch) || (worldEpoch as number) < 0 ||
+        targetBinding.backend !== "runtime" || targetBinding.sessionId !== sessionId ||
+        targetBinding.instanceId !== instanceId ||
+        targetBinding.expectedWorldRevision !== worldRevision) {
       throw new Error("Selected graphical runtime has invalid instance/world identity");
     }
     summary.inventory = inventory;
+    summary.captureTarget = opaqueTarget;
 
     const captureTimeoutMs = Math.max(1_000, Math.min(120_000, deadline - Date.now()));
     const common = {
       runId: managedRunId,
-      sessionId,
-      instanceId,
-      worldRevision,
+      sessionId: targetBinding.sessionId,
+      instanceId: targetBinding.instanceId,
+      worldRevision: targetBinding.expectedWorldRevision,
       worldId,
       worldEpoch: worldEpoch as number,
       timeoutMs: captureTimeoutMs,
@@ -1378,26 +1472,26 @@ export async function runRuntimeObserverAcceptance(
       const ownedRuntimeId = runtimeId;
       const terminationSpan = baseline.start(
         "shutdown",
-        "OwnedRuntimeManager.stop",
+        "game_launch stop",
         "termination"
       );
       const observerCleanupSpan = baseline.start(
         "shutdown",
-        "OwnedRuntimeManager.stop",
+        "game_launch stop",
         "observer_cleanup"
       );
       let terminationRecorded = false;
       let observerCleanupRecorded = false;
       try {
-        const stoppedRuntime = await runtimeManager.stop({
+        const stopResult = await callGameLaunch({
+          action: "stop",
           runtimeId,
           waitForRestorationMs: 20_000,
-          idempotencyKey: deriveObserverRuntimeIdempotencyKey({
-            action: "stop",
-            runtimeId,
-            waitForRestorationMs: 20_000,
-          }),
-        });
+        }, { signal: new AbortController().signal });
+        const stoppedRuntime = record(
+          publicGameLaunchPayload(stopResult, "game_launch stop").runtime,
+          "game_launch stopped runtime",
+        ) as unknown as OwnedRuntimePublicStatus;
         summary.runtimeShutdown = stoppedRuntime;
         if (stoppedRuntime.state !== "exited" || stoppedRuntime.exactOwned !== true ||
             stoppedRuntime.identityVacant !== true || stoppedRuntime.terminationComplete !== true ||
@@ -1427,8 +1521,17 @@ export async function runRuntimeObserverAcceptance(
         observerCleanupRecorded = true;
         const vacantRuntime = await baseline.measure(
           "managed_call",
-          "OwnedRuntimeManager.status(after stop)",
-          () => runtimeManager.status(ownedRuntimeId),
+          "game_launch status(after stop)",
+          async () => {
+            const statusResult = await callGameLaunch({
+              action: "status",
+              runtimeId: ownedRuntimeId,
+            }, { signal: new AbortController().signal });
+            return record(
+              publicGameLaunchPayload(statusResult, "game_launch post-stop status").runtime,
+              "game_launch post-stop runtime",
+            ) as unknown as OwnedRuntimePublicStatus;
+          },
           "shutdown_status_confirmation"
         );
         summary.runtimeVacancy = vacantRuntime;
@@ -1743,8 +1846,10 @@ function usage(): string {
     "--runtime-kind client launches a direct graphical -world session; listenServer is the default.",
     "",
     `Required environment: ${LIVE_RUNTIME_OBSERVER_ENVIRONMENT}=1`,
-    `Default world: ${DEFAULT_RUNTIME_OBSERVER_WORLD}`,
-    "The default is an installed stock fixture; all harness roots are external to the current project.",
+    `Default project fixture: ${DEFAULT_GAME_LAUNCH_FIXTURE_DIRECTORY}`,
+    `Default project-contained world: ${DEFAULT_GAME_LAUNCH_FIXTURE_WORLD}`,
+    "Positive-path mode invokes public game_launch start/status/stop. Run listenServer and client as separate invocations so each gets a fresh managed/profile root and MCP lifecycle.",
+    "Fault-matrix mode retains its installed stock-world default and separate primitive lifecycle harness.",
     "",
   ].join("\n");
 }

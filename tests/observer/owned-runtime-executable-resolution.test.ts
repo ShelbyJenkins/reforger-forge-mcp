@@ -2,7 +2,10 @@ import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { resolveRuntimeExecutable } from "../../src/observer/owned-runtime-manager.js";
+import {
+  computeOwnedRuntimeExecutableEvidenceDigest,
+  resolveRuntimeExecutable,
+} from "../../src/observer/owned-runtime-manager.js";
 import {
   cleanupOwnedRuntimeManagerFixtures,
   makeHarness,
@@ -39,6 +42,32 @@ describe("owned runtime executable resolution", () => {
     expect(harness.manager.resolveRuntimeExecutablePath("testRunner")).toBe(harness.executable);
   });
 
+  it("returns frozen executable content and file-identity evidence from the start boundary", () => {
+    const harness = makeHarness();
+    const evidence = harness.manager.resolveRuntimeExecutableEvidence("listenServer");
+
+    expect(evidence).toMatchObject({
+      schemaVersion: 1,
+      runtimeKind: "listenServer",
+      executablePath: harness.executable,
+      executableFile: {
+        sha256: expect.stringMatching(/^[a-f0-9]{64}$/),
+        size: expect.stringMatching(/^\d+$/),
+        device: expect.stringMatching(/^\d+$/),
+        inode: expect.stringMatching(/^\d+$/),
+      },
+      executableEvidenceDigest: expect.stringMatching(/^[a-f0-9]{64}$/),
+    });
+    expect(Object.isFrozen(evidence)).toBe(true);
+    expect(Object.isFrozen(evidence.executableFile)).toBe(true);
+    expect(computeOwnedRuntimeExecutableEvidenceDigest(evidence))
+      .toBe(evidence.executableEvidenceDigest);
+
+    writeFileSync(harness.executable, "replacement fixture executable");
+    expect(harness.manager.resolveRuntimeExecutableEvidence("listenServer").executableEvidenceDigest)
+      .not.toBe(evidence.executableEvidenceDigest);
+  });
+
   it("rejects missing paths, directories, and a linked final executable", () => {
     const harness = makeHarness();
     harness.setExecutable(join(harness.root, "missing.exe"));
@@ -56,5 +85,16 @@ describe("owned runtime executable resolution", () => {
     harness.setExecutable(linked);
     expect(() => harness.manager.resolveRuntimeExecutablePath("dedicated"))
       .toThrowError(expect.objectContaining({ code: "IDENTITY_UNVERIFIABLE" }));
+  });
+
+  it("adapts executable-evidence failures to the trusted owned-runtime boundary", () => {
+    const harness = makeHarness();
+    harness.setExecutable(join(harness.root, "missing.exe"));
+
+    expect(() => harness.manager.resolveRuntimeExecutableEvidence("listenServer"))
+      .toThrowError(expect.objectContaining({
+        name: "OwnedRuntimeError",
+        code: "IDENTITY_UNVERIFIABLE",
+      }));
   });
 });

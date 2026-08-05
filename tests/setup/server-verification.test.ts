@@ -78,6 +78,7 @@ const observerNames = [
 
 const validTools = [
   ...observerNames.map((name) => ({ name, description: `${name} description` })),
+  { name: "game_launch", description: "Owned game launch composite description" },
   {
     name: "mod",
     description: "mod description",
@@ -341,6 +342,16 @@ describe("tool surface inspection", () => {
       status: "passed",
       issues: [],
     });
+  });
+
+  it("requires game_launch separately from the ten observer primitives", () => {
+    const result = inspectToolRegistration(
+      validTools.filter((tool) => tool.name !== "game_launch"),
+    );
+    expect(result.status).toBe("failed");
+    expect(result.issues).toContain(
+      "Required observer composites missing at runtime: game_launch",
+    );
   });
 
   it("returns sorted names and actionable contract issues", () => {

@@ -261,6 +261,8 @@ const REQUIRED_OBSERVER_TOOLS = [
   "observer_run_discard",
 ] as const;
 
+const REQUIRED_OBSERVER_COMPOSITES = ["game_launch"] as const;
+
 export function inspectToolRegistration(
   tools: readonly AdvertisedTool[]
 ): ToolRegistrationVerification {
@@ -335,6 +337,13 @@ export function inspectToolRegistration(
   if (missingObserverTools.length > 0) {
     issues.push(
       `Required observer tools missing at runtime: ${missingObserverTools.join(", ")}`
+    );
+  }
+  const missingObserverComposites = REQUIRED_OBSERVER_COMPOSITES
+    .filter((name) => !registeredNames.has(name));
+  if (missingObserverComposites.length > 0) {
+    issues.push(
+      `Required observer composites missing at runtime: ${missingObserverComposites.join(", ")}`
     );
   }
 

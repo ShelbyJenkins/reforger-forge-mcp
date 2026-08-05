@@ -7,6 +7,7 @@ export type ObserverRefusalTool =
   | "observer_capture"
   | "observer_job"
   | "observer_runtime"
+  | "game_launch"
   | "observer_run_begin"
   | "observer_run_status"
   | "observer_run_finalize"
@@ -110,7 +111,8 @@ export const resolveObserverRefusalRemedy: ObserverRefusalRemedyResolver = ({
     return null;
   }
 
-  if (code === "RUNTIME_NOT_FOUND" && context.tool === "observer_runtime") {
+  if (code === "RUNTIME_NOT_FOUND" &&
+      (context.tool === "observer_runtime" || context.tool === "game_launch")) {
     if (context.action === "start") {
       return context.reason === "runtime_executable_missing"
         ? { kind: "external", action: "configure_runtime_executable" }

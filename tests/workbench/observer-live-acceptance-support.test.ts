@@ -471,6 +471,27 @@ describe("live observer acceptance support", () => {
       "termination",
       "observer_cleanup",
     ]);
+    const publicMeasurements = input.measurements.map((item) => ({
+      ...item,
+      operation: item.operation === "OwnedRuntimeManager.start/status(running)"
+        ? "game_launch start/status(running)"
+        : item.operation === "OwnedRuntimeManager.status"
+          ? "game_launch status"
+          : item.operation === "OwnedRuntimeManager.stop"
+            ? "game_launch stop"
+            : item.operation,
+    }));
+    expect(() => buildOperationalBaselineArtifact({
+      ...input,
+      measurements: publicMeasurements,
+    })).not.toThrow();
+    expect(() => buildOperationalBaselineArtifact({
+      ...input,
+      measurements: publicMeasurements.map((item) =>
+        item.operation === "game_launch status"
+          ? { ...item, operation: "OwnedRuntimeManager.status" }
+          : item),
+    })).toThrow(/lifecycle\/cleanup evidence/);
     expect(() => buildOperationalBaselineArtifact({
       ...input,
       workload: { ...input.workload, runtimeKind: "client" },

@@ -1,0 +1,13 @@
+GameProject {
+ ID RFOGameLaunchAcceptance
+ GUID "C7A4E90D5B2168F3"
+ TITLE "RFO Owned Game Launch Acceptance"
+ Dependencies {
+ }
+ Configurations {
+  GameProjectConfig PC {
+  }
+  GameProjectConfig HEADLESS {
+  }
+ }
+}

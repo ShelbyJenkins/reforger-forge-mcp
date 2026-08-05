@@ -101,7 +101,7 @@ authoritative field-level contract.
 | Build and inspect a Workbench build | **wb_build**, **wb_log_query** |
 | Edit a live world or its entities | **wb_entity_\***, **wb_component**, **wb_layers**, **wb_terrain**, **wb_clipboard**, **scenario_create** |
 | Inspect or manage live resources | **wb_resources**, **wb_prefabs**, **wb_projects**, **wb_localization**, **wb_script_editor**, **wb_validate** |
-| Stage Observer, run captures, and export evidence | **observer_setup**, **observer_run_begin**, **observer_run_status**, **observer_run_finalize**, **observer_run_discard**, **observer_prepare_launch**, **observer_runtime**, **observer_instances**, **observer_capture**, **observer_job** |
+| Stage Observer, launch an exact-owned game, run captures, and export evidence | **observer_setup**, **game_launch**, **observer_run_begin**, **observer_run_status**, **observer_run_finalize**, **observer_run_discard**, **observer_prepare_launch**, **observer_runtime**, **observer_instances**, **observer_capture**, **observer_job** |
 
 Use game-data tools rather than ordinary filesystem commands to inspect the
 installed game. Use **game_duplicate** for a base-game `.et` prefab and
@@ -244,24 +244,40 @@ Inspect the capture itself and record what it proves and does not prove.
 
 ### Runtime capture
 
-1. Call **observer_prepare_launch** and retain its sessionId and
-   preparedLaunchId. Preparation assigns a session-specific `-logsDir`; do not
-   replace it. Graphical launches use native borderless fullscreen by default.
+1. Prefer **game_launch** action=start for a normal exact-owned renderer. Supply
+   an exact absolute gprojPath, or omit it only when the running owned Workbench
+   has the intended active project. Optionally select a project-contained world;
+   otherwise discovery must find exactly one registered `.ent`. Retain the
+   returned sessionId, runtimeId, canonical project/profile/world, and opaque
+   capture target. `listenServer` is the default; request `client` explicitly.
+   A readiness warning is partial success and still owns a runtimeId that must
+   be inspected or stopped.
+2. **game_launch** owns the world/server selector, add-on roots/GUIDs, profile,
+   observer policy flags, display policy, and process owner token. Do not pass
+   those through `arguments`. Graphical launches use native borderless
+   fullscreen by default.
    Do not pass `-window`, `-screenWidth`, or `-screenHeight`. Leave
    `forceNonNativeWindowSize` unset unless native fullscreen cannot be used for
    a compelling external reason; the exceptional field requires bounded width,
    height, and a meaningful justification. Large screenshots are not a reason
    to shrink the renderer—bound `observer_capture.image` output instead.
-2. To let the MCP own the runtime, call **observer_runtime** with action=start
-   and preparedLaunchId; retain its runtimeId. The host derives the stable
-   lifecycle idempotency key internally.
-   External launching may use the prepared argument array instead.
-3. Call **observer_instances** with the runtime sessionId when explicit
+3. The baseline supports one initial launch family for each retained derived
+   profile. Retry the exact same request to recover a lost response. Never vary
+   inputs to force a relaunch: changed, stale, invalidated, expired, or terminal
+   evidence requires a future successor workflow or a deliberately fresh
+   isolated managed/profile root and MCP lifecycle.
+4. For an external launcher or primitive diagnosis, call
+   **observer_prepare_launch** and retain its sessionId and preparedLaunchId.
+   Preparation is data-only and assigns a session-specific `-logsDir`; do not
+   replace it. **observer_runtime** action=start consumes preparedLaunchId and
+   returns runtimeId; external launching may instead use the prepared argument
+   array. These primitives remain public and are not replaced by the composite.
+5. Call **observer_instances** with the runtime sessionId when explicit
    selection is needed and retain its opaque target.
-4. Call **observer_capture** with the target and requested view. Omit runId to
+6. Call **observer_capture** with the target and requested view. Omit runId to
    use the active run and omit captureLabel for durable automatic allocation.
    With exactly one compatible renderer, omit target as well.
-5. **observer_job** operations require only action and jobId.
+7. **observer_job** operations require only action and jobId.
 
 For runtime preparation and explicit inventory, sessionId is required. The
 preferred capture target carries it internally. Do not replace session
@@ -310,8 +326,10 @@ authority with a PID, process name, or runtimeId.
   logs beneath explicitly configured `supportingLogRoots`, including external
   launches.
 - Before an MCP-owned runtime stop, wait for every job and camera restoration
-  to reach terminal state. Then call **observer_runtime** action=stop with its
-  runtimeId. Never stop by PID, process name, or broad process-tree action.
+  to reach terminal state. Then call **game_launch** action=stop for a
+  composite-started runtime or **observer_runtime** action=stop for a
+  primitive-started runtime, with its exact runtimeId. Never stop by PID,
+  process name, or broad process-tree action.
 
 ## Safety and Scope
 
@@ -360,7 +378,7 @@ observed results, and remaining gaps. Never describe an unrun check as passed.
 | A duplicated resource has no usable GUID | Open the exact destination project in Workbench, then call **wb_resources** with `action: "register"` and the copied file's absolute path. Registration verifies that the file is inside that active project and creates its `.meta` GUID; no GUID is needed as input. |
 | **game_duplicate** registration fails after copying | Keep the copied file, open its exact destination project, and register its absolute path with **wb_resources**. Do not rerun **game_duplicate** at the occupied destination. |
 | Observer capture is rejected for world binding | Re-run **observer_instances** immediately and use the renderer's new opaque target. |
-| **observer_runtime** reports identity mismatch or stop is blocked | Preserve the receipt. Finish or cancel captures and wait for restoration; never terminate the process by PID or name. |
+| **game_launch** or **observer_runtime** reports identity mismatch or stop is blocked | Preserve the receipt. Finish or cancel captures and wait for restoration; never terminate the process by PID or name. |
 
 ## Completion Notes
 

@@ -130,9 +130,10 @@ describe("observer MCP tools", () => {
     expect(externalOnly).not.toHaveProperty("preparedLaunchId");
   });
 
-  it("registers the ten exact public tools", () => {
+  it("registers the ten observer primitives plus the owned game composite", () => {
     const { tools } = createToolHarness();
     expect([...tools.keys()].sort()).toEqual([
+      "game_launch",
       "observer_capture",
       "observer_instances",
       "observer_job",
@@ -159,6 +160,11 @@ describe("observer MCP tools", () => {
       height: 720,
       justification: "for screenshots",
     }).success).toBe(false);
+    const gameLaunch = tools.get("game_launch")!;
+    expect(gameLaunch.definition.description).toContain("fail-closed");
+    expect(gameLaunch.definition.inputSchema!.action.safeParse(undefined).success).toBe(true);
+    expect(gameLaunch.definition.inputSchema!.runtimeKind.safeParse(undefined).success).toBe(true);
+    expect(gameLaunch.definition.inputSchema!.runtimeId.safeParse("rt-not-exact").success).toBe(false);
   });
 
   it("routes explicit observer_runtime actions without exposing owner-token receipt fields", async () => {
