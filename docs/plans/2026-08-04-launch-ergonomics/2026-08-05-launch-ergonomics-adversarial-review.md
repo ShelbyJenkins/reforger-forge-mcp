@@ -18,6 +18,43 @@
 > pass applies a desktop-release bar: responsive, repeatable, exact-process,
 > cancellation-aware, diagnosable behavior on supported Windows systems.
 
+## Phased implementation matrix
+
+This matrix expands the [recommended order of work](#recommended-order-of-work).
+Execute phases and rows from top to bottom except where a task is explicitly
+blocked or deferred. Initial status reflects the review's findings and tracker
+references as of 2026-08-05; it is not a live-synchronised tracker view.
+
+| Order | Phase | Task | Relevant section | Initial status |
+|---:|---|---|---|---|
+| 1 | 1 — Launch safety | Close the `MCP-058` Windows focus transaction: prove protection before activation, retain exact process identity, preserve the user's latest foreground choice, and add immediate/delayed real-GUI fixtures. | [H2](#h2), [M7](#m7), [M8](#m8) | Open — release blocker |
+| 2 | 1 — Launch safety | Establish the `MCP-059` same-handle Windows file-identity boundary and fail closed on zero or unavailable identity and reparse traversal. | [H3](#h3) | Open — release blocker |
+| 3 | 1 — Launch safety | Map late planner scan/stat failures to typed refusals and add deterministic race, metadata, manifest, cap, and replacement tests. | [H1](#h1) | Open — release blocker (`MCP-059`) |
+| 4 | 1 — Launch safety | Preserve case-sensitive Windows containment and provider identity, or return a typed unsupported-filesystem refusal. | [M2](#m2) | Open — release blocker (`MCP-066`) |
+| 5 | 1 — Launch safety | Move planning behind bounded admission and early coalescing, off the event loop, with elapsed deadlines, an executable-byte cap, cancellation, and latency tests. | [M6](#m6) | Open — release blocker (`MCP-060`) |
+| 6 | 1 — Launch safety | Implement fenced durable successor generations for same-root start → stop → start; until then, expose the one-generation limitation and recovery path machine-readably. | [H4](#h4) | Open — release blocker (`MCP-061`) |
+| 7 | 2 — Host lifecycle | Keep private-child shutdown pending until exact exit/close evidence is observed under the remaining absolute deadline, including delayed and failed kills. | [M10](#m10) | Open — release blocker (`MCP-063`) |
+| 8 | 2 — Host lifecycle | Persist the verified absolute Node executable in managed registrations and include it in drift checks and receipts. | [M9](#m9) | Open — release blocker (`MCP-062`) |
+| 9 | 2 — Host lifecycle | Thread one injected monotonic clock through the readiness inspector and every provider; prove it with a fake clock starting at zero. | [M1](#m1) | Open |
+| 10 | 3 — Reproducible acceptance | Make the default test command reproduce the claimed suite, including serial lifecycle handling and an explicit unowned-Workbench precondition. | [P1](#p1) | Open |
+| 11 | 3 — Reproducible acceptance | Resolve the live-root LMDB crash, then run and precisely label the exact default-root MCP-056 gate. | [P3](#p3) | Blocked by `MCP-057` |
+| 12 | 4 — Contract coherence | Extend the `PREPARED_LAUNCH_CONSUMED` remedy to `game_launch`. | [M3](#m3) | Open |
+| 13 | 4 — Contract coherence | Separate the fixed readiness warning from the bounded projected readiness error. | [M4](#m4) | Open |
+| 14 | 4 — Contract coherence | Make privileged cleanup observable and enforced, or rename it as a marker and constrain its call sites architecturally. | [M5](#m5) | Open — decision required |
+| 15 | 4 — Contract coherence | Pass the validated session ID into readiness-failure projection and assert agreement with structured `next`. | [L11](#l11) | Open |
+| 16 | 5 — MCP API compatibility | Add a discriminated `game_launch` success schema, matching `structuredContent` and text, property descriptions, and structure-based tests. | [P4](#p4) | Deferred — `MCP-027` |
+| 17 | 5 — MCP API compatibility | Declare and test supported MCP protocol eras by narrowing the compatibility claim or migrating and testing both openings. | [P5](#p5) | Open — `MCP-064`; decision required |
+| 18 | 6 — Low-risk cleanup | Preserve diagnosed blocker categories when the bounded blocker set saturates. | [L1](#l1) | Open — low severity |
+| 19 | 6 — Low-risk cleanup | Make dormant monitoring caused by a never-settled request diagnostically visible. | [L2](#l2) | Open — low severity |
+| 20 | 6 — Low-risk cleanup | Schedule dispatch-turn release after forwarding `onmessage` and cover an eager injected scheduler. | [L3](#l3) | Open — low severity |
+| 21 | 6 — Low-risk cleanup | Reject decimal `-McpIdleShutdownMs` values before PowerShell coercion. | [L4](#l4) | Open — low severity |
+| 22 | 6 — Low-risk cleanup | Resolve the contradictory `ownedRuntimeManager` nullability assumptions. | [L5](#l5) | Open — low severity |
+| 23 | 6 — Low-risk cleanup | Reject nil UUIDs at injected host and manager identity fences. | [L6](#l6) | Open — low severity |
+| 24 | 6 — Low-risk cleanup | Give `AMBIGUOUS_TARGET` a context-correct remedy reason. | [L7](#l7) | Open — low severity |
+| 25 | 6 — Low-risk cleanup | Document `history`/`recover`, clarify or rename standalone `runtimeKind`, and correct foreign-evidence idle semantics. | [L8](#l8), [L9](#l9), [L10](#l10) | Open — `MCP-065` |
+| 26 | 6 — Low-risk cleanup | Add the `EXTERNAL_ACTIVATION` producer with Commit 12, or exclude the dead member from current blocker bounds until then. | [P2](#p2) | Deferred — Commit 12 |
+| 27 | 7 — Final acceptance | Run the complete desktop black-box acceptance suite after its implementation and safety prerequisites close. | [Desktop-grade acceptance bar](#desktop-grade-acceptance-bar) | Pending prerequisites |
+
 ## Review basis and primary sources
 
 The source trace covered the project overview, all plans 01-15, MCP-056, the
