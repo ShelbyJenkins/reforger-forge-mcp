@@ -45,7 +45,8 @@ Shared transports, per-session configuration, public schema changes, and any
 weakening of exact-runtime or restoration authority remained out of scope.
 
 The full hermetic suite, guarded real Workbench lifecycle acceptance, built
-MCP/private-child process-tree acceptance, typecheck, build, MCP verification,
+MCP-plus-disposable-private-child topology acceptance, typecheck, build, MCP
+verification,
 package validation, and the comparative memory probe passed. No game runtime was
 launched under the original no-game constraint; the persistent unsafe path was
 covered by the real-child black-box fixture. The Observer API simplification
@@ -79,6 +80,12 @@ thresholds.
 The direct post-series recovery item is the resolved
 [MCP-056 bounded owned-runtime history recovery plan](2026-08-05-mcp-056-bounded-runtime-history-recovery.md).
 
+The delivered work was subsequently audited in the
+[launch ergonomics adversarial review](2026-08-05-launch-ergonomics-adversarial-review.md),
+which records four high, ten medium, eleven low, and five process/validation
+findings after extending the original pass through the source guides, current
+primary platform contracts, and Windows desktop-release behavior.
+
 ## Implementation status
 
 | Work item | Status | Last updated | Notes |
@@ -99,7 +106,7 @@ The direct post-series recovery item is the resolved
 | 13 | Implementation complete; live validated | 2026-08-05 | Focused tests 172/172, stage 3 tests 345/345, stage 4 tests 228/228, and cross-cutting baseline tests 55/55 passed; typecheck, build, package smoke, and unused-code analysis passed. Windows black-box and live OS attestation proved distinct operator-visible host identities. Landed in `5ed27f3`. |
 | 14 | Implementation complete; live validated | 2026-08-05 | Focused tests 189/189, stage 3 tests 351/351, stage 4 tests 254/254, cross-cutting baseline tests 56/56, and the full repository suite 2,211/2,211 passed with one intentional skip. A live Workbench session proved the default-open foundation remained behavior-neutral. Landed in `ba3b7ff`. |
 | 15 | Implementation complete; live validated | 2026-08-05 | Focused tests 212/212, stage 3 tests 352/352, stage 4 tests 284/284, cross-cutting baseline tests 56/56, and the full repository suite 2,259/2,259 passed with one intentional skip. Safe idle exit and fail-closed historical-state paths both passed. Landed in `cc6648a`. |
-| MCP-056 | Implementation complete; live validated | 2026-08-05 | Focused recovery tests 9/9 and the complete serial suite 2,278/2,278 passed with one intentional skip. Snapshot acceptance classified retained history, refused foreign authority without mutation, and proved controlled idle exit. Landed in `8b15049`. |
+| MCP-056 | Implementation complete; snapshot/live-composition validated; default-root gate blocked by MCP-057 | 2026-08-05 | Focused recovery tests 9/9 and the complete serial suite 2,278/2,278 passed with one intentional skip. Snapshot acceptance classified retained history, refused foreign authority without mutation, and proved controlled idle exit. The established default Observer root was not opened; MCP-057 must be resolved before that exact live-root gate is attempted. Landed in `8b15049`. |
 
 ## Delivery groups
 
