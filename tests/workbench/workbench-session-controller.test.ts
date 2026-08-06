@@ -1,7 +1,10 @@
 import { EventEmitter } from "node:events";
 import type { ChildProcess } from "node:child_process";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { performance } from "node:perf_hooks";
 import { describe, expect, it, vi } from "vitest";
+import type { Config } from "../../src/config.js";
 import { ChildSupervisor } from "../../src/foundation/child-supervisor.js";
 import { WorkbenchClient } from "../../src/workbench/client.js";
 import { WorkbenchLifecycleExecution } from "../../src/workbench/lifecycle-execution.js";
@@ -10,10 +13,16 @@ import {
 } from "../../src/workbench/session-controller.js";
 import type { WorkbenchProcessGuard } from "../../src/workbench/process-guard.js";
 import {
+  WORKBENCH_PROCESS_NAME,
+  WorkbenchProcessGuard as RealWorkbenchProcessGuard,
+} from "../../src/workbench/process-guard.js";
+import {
   WorkbenchNetApiError,
   type WorkbenchNetApiCallOptions,
   type WorkbenchNetApiPort,
 } from "../../src/workbench/net-api-client.js";
+import { withTemporaryDirectory } from "../support/temporary-directory.js";
+import { createFakeCompanionLaunch } from "./fake-companion.js";
 
 class StubNetApi implements WorkbenchNetApiPort {
   readonly calls: Array<{
@@ -96,8 +105,106 @@ describe("WorkbenchSessionController public contract", () => {
     await expect(inspect()).resolves.toMatchObject({ blockers: ["WORKBENCH_RECOVERY"] });
   });
 
+  it("serializes existing-only lifecycle reads that share the Workbench LMDB environment", async () => {
+    const order: string[] = [];
+    const guard = {
+      mcpInstanceId: "11111111-1111-4111-8111-111111111111",
+      readLifecycleStateExistingOnly: async () => {
+        order.push("lifecycle:start");
+        await Promise.resolve();
+        order.push("lifecycle:end");
+        return { kind: "missing" as const };
+      },
+      readSpawnJournalExistingOnly: async () => {
+        order.push("journal");
+        return { kind: "missing" as const };
+      },
+    } as unknown as WorkbenchProcessGuard;
+    const controller = new WorkbenchSessionController(
+      "127.0.0.1",
+      5775,
+      undefined,
+      "idle-readiness-lmdb-serialization",
+      guard,
+      { netApi: new StubNetApi({}) },
+    );
+
+    await expect(controller.inspectIdleShutdownReadiness({
+      deadlineTick: performance.now() + 1_000,
+      signal: new AbortController().signal,
+      probeGeneration: 1,
+    })).resolves.toMatchObject({ complete: true, blockers: [] });
+    expect(order).toEqual(["lifecycle:start", "lifecycle:end", "journal"]);
+  });
+
   it("keeps WorkbenchClient as the stable compatibility constructor", () => {
     expect(WorkbenchClient).toBe(WorkbenchSessionController);
+  });
+
+  it("builds an opt-in preview without staging, token generation, or process activity", async () => {
+    await withTemporaryDirectory((root) => {
+      const toolsRoot = join(root, "Arma Reforger Tools");
+      const executable = join(toolsRoot, "Workbench", WORKBENCH_PROCESS_NAME);
+      const projectPath = join(root, "addons", "ExampleMod", "ExampleMod.gproj");
+      const managedRoot = join(root, "managed-helper");
+      const gameRoot = join(root, "Arma Reforger");
+      mkdirSync(dirname(executable), { recursive: true });
+      mkdirSync(dirname(projectPath), { recursive: true });
+      mkdirSync(join(gameRoot, "addons"), { recursive: true });
+      writeFileSync(executable, "fixture", "utf8");
+      writeFileSync(projectPath, 'GameProject { ID ExampleMod GUID "1122334455667788" }\n', "utf8");
+      const companion = createFakeCompanionLaunch(root);
+      const ensureStaged = vi.fn(() => companion);
+      const readCurrentStaged = vi.fn(() => ({
+        kind: "available" as const,
+        companion,
+      }));
+      const spawnProcess = vi.fn();
+      const guard = new RealWorkbenchProcessGuard({
+        stateDir: join(root, "guard"),
+      });
+      const createOwnerToken = vi.spyOn(guard, "createOwnerToken");
+      const config = {
+        workbenchPath: toolsRoot,
+        gamePath: gameRoot,
+        dataDir: root,
+        patternsDir: root,
+        workbenchHost: "127.0.0.1",
+        workbenchPort: 5775,
+        mcpIdleShutdownMs: 60_000,
+        observer: { managedRoot },
+      } as Config;
+      const controller = new WorkbenchSessionController(
+        "127.0.0.1",
+        5775,
+        config,
+        "preview-contract",
+        guard,
+        {
+          companionProvider: {
+            ensureStaged,
+            readCurrentStaged,
+          },
+          spawnProcess: spawnProcess as never,
+          netApi: new StubNetApi({}),
+        }
+      );
+
+      const result = controller.workbenchLaunchPreview(projectPath);
+      expect(result).toMatchObject({
+        status: "available",
+        preview: {
+          kind: "workbench_editor",
+          ownership: "preview_only",
+          runnable: false,
+          readiness: { endpoint: { host: "127.0.0.1", port: 5775 } },
+        },
+      });
+      expect(ensureStaged).not.toHaveBeenCalled();
+      expect(readCurrentStaged).toHaveBeenCalledWith(expect.stringMatching(/ExampleMod\.gproj$/));
+      expect(createOwnerToken).not.toHaveBeenCalled();
+      expect(spawnProcess).not.toHaveBeenCalled();
+    }, { prefix: "reforger-forge-preview-controller-" });
   });
 
   it("delegates transport-only calls through the injected NET port and caches mode", async () => {

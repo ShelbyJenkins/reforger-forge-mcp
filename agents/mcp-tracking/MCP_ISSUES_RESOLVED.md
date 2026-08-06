@@ -5,6 +5,49 @@ records. Move newly resolved or verified entries to the top. The legacy records
 below were migrated from the mixed tracker on 2026-07-28; same-day ties retain
 their migration order.
 
+## MCP-056 - reconcile child-exit-only owned-runtime history within bounded lifecycle probes
+
+**Status:** Resolved
+
+**Priority:** P1
+
+**Observed:** 2026-08-05
+
+**Closed:** 2026-08-05
+
+**Decision:** Retained owned-runtime history remains fail closed and record age
+never grants authority. Diagnosis is a bounded, existing-only, read-only history
+classification. Mutation is available only through a separate explicit bounded
+recovery action that delegates to the ordinary idempotent stop transaction and
+retains exact process, prior-owner, installation/user, session, profile, and
+camera-restoration fences. Foreign-authority history stays visible and blocked
+but is not an idle obligation an unrelated host can never satisfy.
+
+**Resolution:** `observer_runtime history` now classifies retained records as
+completed, child-exit-only, cleanup-pending, active/unresolved, or indeterminate
+without creating storage or opening a writer. `observer_runtime recover`
+considers only the two process-vacant recoverable classes, releases the retained
+reader before writer activation, and returns stable bounded recovery/blocker
+receipts. Shutdown inventory filters well-formed foreign-manager history before
+per-runtime mutex work, while malformed evidence remains fail closed. The
+implementation and acceptance record is in the
+[MCP-056 plan](../../docs/plans/2026-08-05-mcp-056-bounded-runtime-history-recovery.md).
+
+**Verification:** Focused history recovery passes 9/9, LMDB record-store tests
+pass 15/15, and owned-runtime idle readiness passes 7/7. Stage 3 passes 42 files
+and 370 tests; Stage 4 passes 37 files and 296 tests; the cross-cutting baseline
+passes 10 files and 56 tests; the complete serial suite passes 251 files and
+2,278 tests, with one fixture file/test intentionally skipped. Typecheck,
+unused-code analysis, build, protocol/manifest checks, fresh packed production
+installation, and an isolated-state 63-tool MCP handshake pass. Production
+acceptance against an initially byte-exact copy of the active default Observer
+environment classified
+63 runtimes (22 completed, 41 child-exit-only) with no malformed evidence. A
+bounded recovery correctly blocked foreign installation/user authority with
+zero termination calls. The controlled host then had no ownable readiness
+blockers, committed its 60-second idle shutdown, and exited code 0 after 61.061
+seconds without launching or disturbing Workbench or deleting lifecycle state.
+
 ## MCP-055 - reclaim safely idle MCP host processes
 
 **Status:** Resolved

@@ -59,6 +59,47 @@ describe("OwnedRuntimeManager idle readiness", () => {
     await expect(inspect(foreign.manager)).resolves.toMatchObject({ complete: true, blockers: [] });
   });
 
+  it("keeps a foreign runtime as a stable recovery blocker until exact stop completion", async () => {
+    const owner = makeHarness({ managerInstanceId: "11111111-1111-4111-8111-111111111111" });
+    const runtime = await owner.start("foreign-readiness-runtime");
+    const foreign = makeHarness({
+      root: owner.root,
+      backend: owner.backend,
+      gate: owner.gate,
+      managerInstanceId: "22222222-2222-4222-8222-222222222222",
+    });
+    foreign.setExecutable(owner.executable);
+    await expect(inspect(foreign.manager)).resolves.toMatchObject({
+      complete: true,
+      blockers: ["OWNED_RUNTIME_RECOVERY"],
+    });
+    await foreign.stop(runtime.runtimeId, "foreign-readiness-stop");
+    await expect(inspect(foreign.manager)).resolves.toMatchObject({ complete: true, blockers: [] });
+  });
+
+  it("does not make another Windows user's retained runtime an idle obligation", async () => {
+    const owner = makeHarness({ managerInstanceId: "11111111-1111-4111-8111-111111111111" });
+    await owner.start("foreign-user-readiness-runtime");
+    owner.backend.currentUserSid = "S-1-5-21-different-current-user";
+    const foreign = makeHarness({
+      root: owner.root,
+      backend: owner.backend,
+      gate: owner.gate,
+      managerInstanceId: "22222222-2222-4222-8222-222222222222",
+    });
+    foreign.setExecutable(owner.executable);
+
+    await expect(inspect(foreign.manager)).resolves.toMatchObject({
+      complete: true,
+      blockers: [],
+    });
+    await expect(foreign.manager.inspectRuntimeHistory()).resolves.toMatchObject({
+      complete: true,
+      counts: { active_or_unresolved: 1 },
+      historicalManagerInstances: 1,
+    });
+  });
+
   it("fails closed for malformed or unlinked inventory without repairing it", async () => {
     const value = makeHarness();
     value.manager.recordStoreForTest();

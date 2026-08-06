@@ -1,11 +1,30 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { describe, expect, it } from "vitest";
-import { registerWbDiagnose } from "../../src/tools/wb-diagnose.js";
+import { describe, expect, it, vi } from "vitest";
+import {
+  registerWbDiagnose,
+  wbDiagnoseRawInputSchema,
+} from "../../src/tools/wb-diagnose.js";
 import type { WorkbenchClient } from "../../src/workbench/client.js";
 
 describe("wb_diagnose MCP tool", () => {
   it("surfaces the exact retained project compiler failure", async () => {
-    let handler: (() => Promise<{ content: Array<{ text: string }> }>) | undefined;
+    type Input = { gprojPath?: string; includeLaunchPlan?: boolean };
+    let handler: ((input: Input) => Promise<{ content: Array<{ text: string }> }>) | undefined;
+    const workbenchLaunchPreview = vi.fn(() => ({
+      status: "available" as const,
+      preview: {
+        kind: "workbench_editor" as const,
+        ownership: "preview_only" as const,
+        runnable: false as const,
+        presentation: "presentation_only" as const,
+        executablePath: "C:\\Arma Reforger Tools\\Workbench\\ArmaReforgerWorkbenchSteam.exe",
+        argv: [
+          "-gproj",
+          "C:\\Example Mod\\Example.gproj",
+          "-reforgerForgeOwnerToken=<MCP-generated-owner-token>",
+        ],
+      },
+    }));
     const server = {
       registerTool(_name: string, _definition: unknown, candidate: typeof handler): void {
         handler = candidate;
@@ -57,11 +76,12 @@ describe("wb_diagnose MCP tool", () => {
           logPath: "C:\\managed\\logs\\logs-current\\script.log",
         },
       }),
+      workbenchLaunchPreview,
     } as unknown as WorkbenchClient;
 
     registerWbDiagnose(server, client);
     expect(handler).toBeDefined();
-    const result = await handler!();
+    const result = await handler!({});
     const text = result.content.map((entry) => entry.text).join("\n");
 
     expect(text).toContain("### Last Launch Compiler Failure");
@@ -74,5 +94,45 @@ describe("wb_diagnose MCP tool", () => {
     expect(text).toContain("PROJECT_COMPILE_FAILED");
     expect(text).toContain("Scripts/Game/Broken.c(7): Syntax error");
     expect(text).toContain("logs-current\\script.log");
+    expect(text).not.toContain("Workbench Launch Preview");
+
+    const previewResult = await handler!({
+      includeLaunchPlan: true,
+      gprojPath: "C:\\Example Mod\\Example.gproj",
+    });
+    const previewText = previewResult.content.map((entry) => entry.text).join("\n");
+    expect(previewText).toContain("### Workbench Launch Preview");
+    expect(previewText).toContain("PRESENTATION ONLY");
+    expect(previewText).toContain('"-reforgerForgeOwnerToken=<MCP-generated-owner-token>"');
+    expect(workbenchLaunchPreview).toHaveBeenCalledWith("C:\\Example Mod\\Example.gproj");
+
+    workbenchLaunchPreview.mockImplementationOnce(() => {
+      throw new Error("preview fixture failure\nwith detail");
+    });
+    const failedPreview = await handler!({
+      includeLaunchPlan: true,
+      gprojPath: "C:\\Example Mod\\Example.gproj",
+    });
+    const failedText = failedPreview.content.map((entry) => entry.text).join("\n");
+    expect(failedText).toContain("### MCP Host");
+    expect(failedText).toContain("### Workbench Launch Preview");
+    expect(failedText).toContain("**Status:** ERROR");
+    expect(failedText).toContain("preview fixture failure with detail");
+  });
+
+  it("enforces the strict selected preview input branch", () => {
+    expect(wbDiagnoseRawInputSchema.safeParse({}).success).toBe(true);
+    expect(wbDiagnoseRawInputSchema.safeParse({ includeLaunchPlan: false }).success).toBe(true);
+    expect(wbDiagnoseRawInputSchema.safeParse({ gprojPath: "C:\\Example\\Example.gproj" }).success).toBe(false);
+    expect(wbDiagnoseRawInputSchema.safeParse({ includeLaunchPlan: true }).success).toBe(false);
+    expect(wbDiagnoseRawInputSchema.safeParse({
+      includeLaunchPlan: true,
+      gprojPath: "relative\\Example.gproj",
+    }).success).toBe(false);
+    expect(wbDiagnoseRawInputSchema.safeParse({
+      includeLaunchPlan: true,
+      gprojPath: "C:\\Example\\Example.gproj",
+      unexpected: true,
+    }).success).toBe(false);
   });
 });

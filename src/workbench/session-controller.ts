@@ -66,6 +66,7 @@ import {
   WorkbenchHelperStager,
   defaultWorkbenchHelperManagedRoot,
   type WorkbenchCompanionLaunch,
+  type WorkbenchCurrentCompanion,
   type WorkbenchCompanionManagedStatus,
   type WorkbenchCompanionProvider,
   type WorkbenchCompanionRetentionResult,
@@ -138,11 +139,13 @@ import {
   buildLegacyWorkbenchLaunchArguments,
   buildMcpEditorLaunchPlan,
   buildMcpTargetResourceLaunchPlan,
+  projectWorkbenchLaunchPreview,
   type CliEditorLaunchPlan,
   type McpEditorLaunchPlan,
   type McpTargetResourceLaunchPlan,
   type TargetBuildLaunchPlan,
   type TargetCheckLaunchPlan,
+  type WorkbenchLaunchPreview,
 } from "./launch-plan.js";
 import {
   ResourceTargetError,
@@ -160,6 +163,7 @@ const PORT_RELEASE_TIMEOUT_MS = 15_000;
 const PORT_RELEASE_POLL_MS = 200;
 const DEFAULT_QUALIFICATION_INTERVAL_MS = 2_000;
 const EXPLICIT_SAVE_MODAL_SETTLE_MS = 5_000;
+const PREVIEW_OWNER_ARGUMENT = "-reforgerForgeOwnerToken=launch-preview-placeholder";
 
 export type WorkbenchMode = "edit" | "play" | "unknown";
 
@@ -180,6 +184,16 @@ export interface WorkbenchLaunchResult {
   gprojPath: string;
   generation: string;
 }
+
+export type WorkbenchLaunchPreviewResult =
+  | Readonly<{
+      status: "available";
+      preview: WorkbenchLaunchPreview;
+    }>
+  | Readonly<{
+      status: "unavailable";
+      message: string;
+    }>;
 
 /** A running fresh Workbench whose initial World Editor resource is immutable by launch contract. */
 export interface WorkbenchTargetResourceLaunchResult extends WorkbenchLaunchResult {
@@ -736,10 +750,12 @@ export class WorkbenchSessionController implements McpIdleReadinessProvider {
       return { complete: false, blockers: ["INCOMPLETE_PROOF"], revision: this.idleRevision };
     }
 
-    const [lifecycle, journal] = await Promise.all([
-      this.processGuard.readLifecycleStateExistingOnly(),
-      this.processGuard.readSpawnJournalExistingOnly(),
-    ]);
+    // Both records share one Workbench LMDB environment. Existing-only reads
+    // use temporary read-only handles when this host has not opened its writer;
+    // keep those opens sequential so Windows never maps the same environment
+    // twice concurrently inside one readiness probe.
+    const lifecycle = await this.processGuard.readLifecycleStateExistingOnly();
+    const journal = await this.processGuard.readSpawnJournalExistingOnly();
     if (options.signal.aborted || performance.now() > options.deadlineTick) {
       return { complete: false, blockers: ["INCOMPLETE_PROOF"], revision: this.idleRevision };
     }
@@ -1965,6 +1981,47 @@ export class WorkbenchSessionController implements McpIdleReadinessProvider {
     return this.lastLaunchCompileFailure
       ? { ...report, lastLaunchFailure: this.lastLaunchCompileFailure }
       : report;
+  }
+
+  workbenchLaunchPreview(gprojPath: string): WorkbenchLaunchPreviewResult {
+    const config = this.requireConfig("preview a launch for");
+    let project: CanonicalProjectIdentity;
+    try {
+      project = revalidateProjectIdentity(canonicalizeGproj(gprojPath));
+    } catch (error) {
+      throw this.mapLifecycleError(error);
+    }
+    const read: WorkbenchCurrentCompanion = this.companionProvider?.readCurrentStaged
+      ? this.companionProvider.readCurrentStaged(project.displayPath)
+      : Object.freeze({
+          kind: "unavailable",
+          reason: "current_bundle_not_staged",
+        });
+    if (read.kind === "unavailable") {
+      return Object.freeze({
+        status: "unavailable",
+        message: "Launch preview is unavailable until wb_launch stages the exact current Workbench helper.",
+      });
+    }
+    try {
+      const plan = buildMcpEditorLaunchPlan({
+        kind: "mcp_editor",
+        config,
+        project,
+        companion: read.companion,
+        endpoint: { host: this.host, port: this.port },
+        ownerArgument: PREVIEW_OWNER_ARGUMENT,
+        ...(config.observer?.managedRoot
+          ? { managedRoot: config.observer.managedRoot }
+          : {}),
+      });
+      return Object.freeze({
+        status: "available",
+        preview: projectWorkbenchLaunchPreview(plan),
+      });
+    } catch (error) {
+      throw this.mapLifecycleError(error);
+    }
   }
 
   toString(): string {

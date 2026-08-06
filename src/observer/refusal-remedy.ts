@@ -26,6 +26,8 @@ export type ObserverRefusalAction =
   | "release"
   | "start"
   | "stop"
+  | "history"
+  | "recover"
   | "begin"
   | "finalize"
   | "discard";

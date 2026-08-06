@@ -208,6 +208,57 @@ describe("observer MCP tools", () => {
       .not.toHaveProperty("idempotencyKey");
   });
 
+  it("routes bounded history inspection and explicit recovery through strict selected branches", async () => {
+    const inspectRuntimeHistory = vi.fn(async () => ({
+      schemaVersion: 1,
+      complete: true,
+      recoverableRuntimeIds: [],
+    }));
+    const recoverRuntimeHistory = vi.fn(async () => ({
+      schemaVersion: 1,
+      attemptedRuntimeIds: [],
+      recoveredRuntimeIds: [],
+      blocked: [],
+    }));
+    const manager = { inspectRuntimeHistory, recoverRuntimeHistory } as unknown as OwnedRuntimeManager;
+    const { call, signal } = createToolHarness({}, manager);
+
+    const history = await call("observer_runtime", {
+      action: "history",
+      maxRuntimes: 7,
+      deadlineMs: 12_000,
+    });
+    expect(history.isError).not.toBe(true);
+    expect(history.content[0].text).toContain("Bounded owned-runtime history classification.");
+    expect(inspectRuntimeHistory).toHaveBeenCalledWith({
+      maxRuntimes: 7,
+      deadlineMs: 12_000,
+      signal,
+    });
+
+    const recovery = await call("observer_runtime", {
+      action: "recover",
+      maxRuntimes: 3,
+    });
+    expect(recovery.isError).not.toBe(true);
+    expect(recovery.content[0].text).toContain("Bounded owned-runtime history recovery.");
+    expect(recoverRuntimeHistory).toHaveBeenCalledWith({ maxRuntimes: 3, signal });
+
+    const runtimeId = "rt-00000000-0000-4000-8000-000000000001";
+    for (const input of [
+      { action: "history", runtimeId },
+      { action: "recover", preparedLaunchId: "pl-00000000-0000-4000-8000-000000000001" },
+      { action: "status", runtimeId, maxRuntimes: 2 },
+      { action: "start", preparedLaunchId: "pl-00000000-0000-4000-8000-000000000001", waitForRestorationMs: 0 },
+    ]) {
+      const invalid = await call("observer_runtime", input);
+      expect(invalid.isError).toBe(true);
+      expect(invalid.content[0].text).toContain("INVALID_REQUEST");
+    }
+    expect(inspectRuntimeHistory).toHaveBeenCalledOnce();
+    expect(recoverRuntimeHistory).toHaveBeenCalledOnce();
+  });
+
   it("reuses the same hidden lifecycle key when a start or stop response is lost", async () => {
     const observedStartKeys: string[] = [];
     const observedStopKeys: string[] = [];

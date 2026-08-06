@@ -154,6 +154,28 @@ export interface McpEditorLaunchPlan extends WorkbenchLaunchPlanBase {
 }
 
 /**
+ * Read-only diagnostic projection of the real MCP editor plan. It deliberately
+ * omits the private ownerArgument field and cannot be passed to a launch-plan
+ * executor without an explicit unsafe cast.
+ */
+export interface WorkbenchLaunchPreview {
+  readonly kind: "workbench_editor";
+  readonly ownership: "preview_only";
+  readonly runnable: false;
+  readonly presentation: "presentation_only";
+  readonly executablePath: string;
+  readonly project: Readonly<CanonicalProjectIdentity>;
+  readonly lifecycleTarget: Readonly<LifecycleProjectIdentity>;
+  readonly addonDirectories: readonly string[];
+  readonly argv: readonly string[];
+  readonly spawnOptions: Readonly<WorkbenchSpawnPolicy>;
+  readonly helper: Readonly<WorkbenchCompanionLaunch>;
+  readonly readiness: Readonly<WorkbenchCompanionReadinessPolicy>;
+}
+
+export const WORKBENCH_PREVIEW_OWNER_MARKER = "<MCP-generated-owner-token>" as const;
+
+/**
  * A fresh MCP-owned World Editor whose sole initial document is an explicit
  * canonical .ent.  This is deliberately distinct from the ordinary project
  * editor plan: callers use it only when they need a target-bound save
@@ -823,6 +845,37 @@ export function buildMcpEditorLaunchPlan(
     helper: prepared.companion,
     readiness: prepared.readiness,
     lifetime: Object.freeze({ kind: "return_after_ready", supervised: true }),
+  });
+}
+
+export function projectWorkbenchLaunchPreview(plan: McpEditorLaunchPlan): WorkbenchLaunchPreview {
+  if (plan.kind !== "mcp_editor" || plan.ownerArgument.length === 0) {
+    throw planError("INVALID_COMBINATION", "Workbench launch preview requires one MCP editor plan.");
+  }
+  const matchingOwnerArguments = plan.argv.filter((argument) => argument === plan.ownerArgument);
+  if (matchingOwnerArguments.length !== 1) {
+    throw planError(
+      "INVALID_OWNER_ARGUMENT",
+      "Workbench launch preview requires exactly one plan-bound owner argument."
+    );
+  }
+  const argv = Object.freeze(plan.argv.map((argument) =>
+    argument === plan.ownerArgument
+      ? `${WORKBENCH_OWNER_ARG_PREFIX}${WORKBENCH_PREVIEW_OWNER_MARKER}`
+      : argument));
+  return Object.freeze({
+    kind: "workbench_editor",
+    ownership: "preview_only",
+    runnable: false,
+    presentation: "presentation_only",
+    executablePath: plan.executablePath,
+    project: plan.project,
+    lifecycleTarget: plan.lifecycleTarget,
+    addonDirectories: plan.addonDirectories,
+    argv,
+    spawnOptions: plan.spawnOptions,
+    helper: plan.helper,
+    readiness: plan.readiness,
   });
 }
 

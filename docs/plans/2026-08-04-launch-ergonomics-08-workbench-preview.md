@@ -130,3 +130,36 @@ Prove:
 - Only an already staged and freshly re-attested companion can be previewed.
 - wb_diagnose remains useful when preview is unavailable.
 - No game tool, external descriptor/script, or owned-runtime behavior changes.
+
+## Implementation result
+
+Implemented on 2026-08-05. The companion provider can now re-attest and return
+only the current already-staged companion through a read-only probe. The launch
+plan layer projects the existing editor plan into a distinct
+`WorkbenchLaunchPreview`; the projection removes the real owner argument,
+inserts the literal `<MCP-generated-owner-token>` marker exactly once, and marks
+the result `workbench_editor`, `preview_only`, `runnable: false`, and
+presentation-only.
+
+The session controller owns project canonicalization, config/endpoint evidence,
+and companion access. `wb_diagnose` accepts the strict optional
+`includeLaunchPlan`/`gprojPath` branch, leaves its default response unchanged,
+and contains preview failures so the ordinary diagnostic report remains useful.
+No descriptor renderer, script writer, spawn closure, external activation path,
+or owned-game-runtime behavior accepts this preview type.
+
+## Verification and live acceptance
+
+The focused helper, launch-plan, session-controller, and `wb_diagnose` suites
+pass, including unstaged/tampered/linked evidence, zero-write construction,
+strict schema branches, error containment, owner-token redaction, and
+presentation-safe path cases. Stage 3 passes 42 files and 370 tests; typecheck
+and unused-code analysis pass. The complete serial suite passes 251 files and
+2,278 tests, with one fixture file/test intentionally skipped.
+
+Live acceptance used the already-running SaltLine Workbench project. The
+returned preview was available, `workbench_editor`, `preview_only`, non-runnable,
+and presentation-only. Its argv contained the presentation marker exactly once
+and no real owner token. The request used the existing staged companion and did
+not launch, stop, restart, or claim Workbench. Workbench was then released for
+other tasks and no later MCP-056 validation accessed it.

@@ -108,6 +108,14 @@ export interface LmdbRecordStoreOptions {
   readonly maxScanRecords?: number;
 }
 
+export interface LmdbExistingSnapshotOptions {
+  /**
+   * Keep the already-existing read-only environment open for later snapshots.
+   * This never creates an environment and never enables writer operations.
+   */
+  readonly retainOpen?: boolean;
+}
+
 interface LmdbRangeEntry {
   key: Uint8Array;
   value: unknown;
@@ -120,6 +128,7 @@ interface LmdbRangeOptions {
 }
 
 interface LmdbBinaryDatabase {
+  resetReadTxn(): void;
   doesExist(key: Uint8Array): boolean;
   getBinary(key: Uint8Array): Buffer | undefined;
   putSync(key: Uint8Array, value: unknown): void;
@@ -273,6 +282,7 @@ export class LmdbRecordStore {
   private readonly maxRecordBytes: number;
   private readonly maxScanRecords: number;
   private database: LmdbBinaryDatabase | null = null;
+  private existingDatabase: LmdbBinaryDatabase | null = null;
   private closed = false;
   private closePromise: Promise<void> | null = null;
 
@@ -433,6 +443,7 @@ export class LmdbRecordStore {
    */
   async snapshotExisting(
     families: readonly string[],
+    options: LmdbExistingSnapshotOptions = {},
   ): Promise<LmdbExistingRecordResult<LmdbExistingRecordSnapshot>> {
     const wanted = new Set(families);
     return this.withExistingDatabase((database) => {
@@ -468,19 +479,23 @@ export class LmdbRecordStore {
         usage: { records: records.length, bytes, byId },
         complete,
       };
-    });
+    }, options.retainOpen === true);
   }
 
   async close(): Promise<void> {
     if (this.closePromise) return this.closePromise;
     this.closed = true;
-    if (!this.database) {
+    if (!this.database && !this.existingDatabase) {
       this.closePromise = Promise.resolve();
       return this.closePromise;
     }
-    const database = this.database;
-    this.closePromise = database.close().finally(() => {
+    const databases = [...new Set([
+      this.database,
+      this.existingDatabase,
+    ].filter((database): database is LmdbBinaryDatabase => database !== null))];
+    this.closePromise = Promise.all(databases.map((database) => database.close())).then(() => undefined).finally(() => {
       this.database = null;
+      this.existingDatabase = null;
     });
     return this.closePromise;
   }
@@ -509,9 +524,17 @@ export class LmdbRecordStore {
 
   private async withExistingDatabase<T>(
     action: (database: LmdbBinaryDatabase) => T,
+    retainOpen = false,
   ): Promise<LmdbExistingRecordResult<T>> {
     if (this.closed) throw new LmdbRecordStoreError("CLOSED", "LMDB record store is closed.");
     if (this.database) return { kind: "available", value: action(this.database) };
+    if (this.existingDatabase) {
+      // lmdb intentionally reuses a read transaction through the current event
+      // turn. A retained diagnostic reader must explicitly renew between
+      // snapshots so commits from another process/handle become visible.
+      this.existingDatabase.resetReadTxn();
+      return { kind: "available", value: action(this.existingDatabase) };
+    }
     const environment = existingEnvironmentDirectory(this.storageRoot, this.databaseDirectory);
     if (environment.kind === "missing") return environment;
     let database: LmdbBinaryDatabase;
@@ -528,6 +551,10 @@ export class LmdbRecordStore {
         `Could not open existing LMDB environment: ${environment.value}`,
         { cause: error },
       );
+    }
+    if (retainOpen) {
+      this.existingDatabase = database;
+      return { kind: "available", value: action(database) };
     }
     try {
       return { kind: "available", value: action(database) };

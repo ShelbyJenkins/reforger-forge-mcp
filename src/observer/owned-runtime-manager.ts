@@ -95,6 +95,11 @@ const DEFAULT_LIFECYCLE_RECORD_MAX_BYTES = 4 * 1024 * 1024;
 const DEFAULT_RECEIPT_RETENTION_MS = 24 * 60 * 60_000;
 const DEFAULT_MAX_STORE_RECORDS = 16_384;
 const DEFAULT_MAX_STORE_BYTES = 512 * 1024 * 1024;
+const DEFAULT_HISTORY_MAX_RUNTIMES = 32;
+const MAX_HISTORY_MAX_RUNTIMES = 128;
+const DEFAULT_HISTORY_DEADLINE_MS = 60_000;
+const MAX_HISTORY_DEADLINE_MS = 5 * 60_000;
+const MAX_HISTORY_ISSUES = 32;
 // Keep the historical shared ceiling for unrelated lifecycle record kinds.
 // Prepared descriptors have the tighter, launch-derived bound below.
 const MAX_CONFIGURABLE_RECORD_BYTES = 128 * 1024 * 1024;
@@ -340,6 +345,66 @@ export interface OwnedRuntimeStopInput {
   waitForRestorationMs: number;
   idempotencyKey: string;
   signal?: AbortSignal;
+  /** Internal aggregate fence used by bounded recovery batches. */
+  deadlineAtMs?: number;
+  /** Internal history-recovery fence: do not run unrelated age-based retention. */
+  skipRetentionSweep?: boolean;
+}
+
+export type OwnedRuntimeHistoryDisposition =
+  | "completed"
+  | "child_exit_only"
+  | "cleanup_pending"
+  | "active_or_unresolved"
+  | "indeterminate";
+
+export interface OwnedRuntimeHistoryInspectionOptions {
+  readonly maxRuntimes?: number;
+  readonly deadlineMs?: number;
+  readonly signal?: AbortSignal;
+}
+
+export interface OwnedRuntimeHistoryIssue {
+  readonly runtimeId: string;
+  readonly reason: string;
+}
+
+export interface OwnedRuntimeHistoryInventory {
+  readonly schemaVersion: 1;
+  /** True only when the complete lifecycle namespace and classification were verified. */
+  readonly complete: boolean;
+  readonly recordsScanned: number;
+  readonly runtimesScanned: number;
+  readonly counts: Readonly<Record<OwnedRuntimeHistoryDisposition, number>>;
+  readonly recoverableCount: number;
+  readonly recoverableRuntimeIds: readonly string[];
+  readonly historicalManagerInstances: number;
+  readonly idleBlockers: readonly McpIdleBlockerCode[];
+  /** True when more recoverable IDs exist than this bounded result returns. */
+  readonly truncated: boolean;
+  readonly issues: readonly OwnedRuntimeHistoryIssue[];
+}
+
+export interface OwnedRuntimeHistoryRecoveryBlock {
+  readonly runtimeId: string;
+  readonly code: string;
+  readonly reason: string;
+}
+
+export interface OwnedRuntimeHistoryRecoveryResult {
+  readonly schemaVersion: 1;
+  readonly before: OwnedRuntimeHistoryInventory;
+  readonly attemptedRuntimeIds: readonly string[];
+  readonly recoveredRuntimeIds: readonly string[];
+  readonly blocked: readonly OwnedRuntimeHistoryRecoveryBlock[];
+  readonly after: OwnedRuntimeHistoryInventory | null;
+  readonly deadlineExceeded: boolean;
+}
+
+interface NormalizedOwnedRuntimeHistoryOptions {
+  readonly maxRuntimes: number;
+  readonly deadlineAtMs: number;
+  readonly signal: AbortSignal;
 }
 
 export interface OwnedRuntimePublicStatus {
@@ -974,6 +1039,8 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder, McpI
   private readonly children: ChildSupervisor;
   private readonly admissionGate: McpHostAdmissionGate | undefined;
   private recordStoreInstance: LmdbRecordStore | null = null;
+  private existingRecordReader: LmdbRecordStore | null = null;
+  private existingSnapshotAccessTail: Promise<void> = Promise.resolve();
   private closing = false;
   private closePromise: Promise<Record<string, unknown>> | null = null;
   private idleRevision = 0;
@@ -1951,6 +2018,406 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder, McpI
     return this.idleRevision;
   }
 
+  /** Read-only, bounded classification of the complete retained lifecycle namespace. */
+  async inspectRuntimeHistory(
+    options: OwnedRuntimeHistoryInspectionOptions = {},
+  ): Promise<OwnedRuntimeHistoryInventory> {
+    const normalized = this.normalizeRuntimeHistoryOptions(options);
+    return this.withAdmission(
+      "owned runtime history inspection",
+      () => this.inspectRuntimeHistoryInternal(normalized),
+    );
+  }
+
+  /**
+   * Explicitly complete semantic stop cleanup for exact process-vacant history.
+   * This actor has no deletion path and cannot select a lifecycle lacking a
+   * child-exit or exact stop receipt.
+   */
+  async recoverRuntimeHistory(
+    options: OwnedRuntimeHistoryInspectionOptions = {},
+  ): Promise<OwnedRuntimeHistoryRecoveryResult> {
+    const normalized = this.normalizeRuntimeHistoryOptions(options);
+    return this.withAdmission("owned runtime history recovery", async () => {
+      this.assertOpenForMutation();
+      const before = await this.inspectRuntimeHistoryInternal(normalized);
+      const attemptedRuntimeIds: string[] = [];
+      const recoveredRuntimeIds: string[] = [];
+      const blocked: OwnedRuntimeHistoryRecoveryBlock[] = [];
+      let mutationStoreReady = true;
+
+      if (!before.complete) {
+        blocked.push({
+          runtimeId: "inventory",
+          code: "INCOMPLETE_PROOF",
+          reason: "The complete owned-runtime lifecycle namespace was not verified; recovery made no changes.",
+        });
+      } else {
+        const firstRuntimeId = before.recoverableRuntimeIds[0];
+        if (firstRuntimeId) {
+          try {
+            await this.prepareRuntimeHistoryMutationStore(firstRuntimeId);
+          } catch (error) {
+            mutationStoreReady = false;
+            const normalizedError = this.normalizeError(
+              error,
+              "RECOVERY_REQUIRED",
+              "Owned runtime history storage could not enter recovery mode",
+            );
+            blocked.push({
+              runtimeId: "inventory",
+              code: normalizedError.code.slice(0, 64),
+              reason: this.message(normalizedError).slice(0, 512),
+            });
+          }
+        }
+      }
+
+      if (before.complete && mutationStoreReady) {
+        for (const runtimeId of before.recoverableRuntimeIds) {
+          if (normalized.signal.aborted || Date.now() >= normalized.deadlineAtMs) break;
+          attemptedRuntimeIds.push(runtimeId);
+          try {
+            await this.preflightRuntimeHistoryCandidate(runtimeId, normalized.deadlineAtMs);
+            const status = await this.stopInternal({
+              runtimeId,
+              waitForRestorationMs: 0,
+              idempotencyKey: `mcp-runtime-history-recovery-v1-${sha256(runtimeId)}`,
+              signal: normalized.signal,
+              deadlineAtMs: normalized.deadlineAtMs,
+              skipRetentionSweep: true,
+            });
+            if (status.terminationComplete !== true || status.observerCleanupPending === true) {
+              throw new OwnedRuntimeError(
+                "RECOVERY_REQUIRED",
+                "Runtime history did not reach durable observer stop completion",
+              );
+            }
+            recoveredRuntimeIds.push(runtimeId);
+          } catch (error) {
+            const normalizedError = this.normalizeError(
+              error,
+              "RECOVERY_REQUIRED",
+              "Owned runtime history recovery failed",
+            );
+            blocked.push({
+              runtimeId,
+              code: normalizedError.code.slice(0, 64),
+              reason: this.message(normalizedError).slice(0, 512),
+            });
+          }
+        }
+      }
+
+      let after: OwnedRuntimeHistoryInventory | null = null;
+      if (!normalized.signal.aborted && Date.now() < normalized.deadlineAtMs) {
+        try {
+          after = await this.inspectRuntimeHistoryInternal(normalized);
+        } catch {
+          // The aggregate batch deadline is authoritative. Durable per-runtime
+          // results remain retryable even when the final read-only view cannot
+          // be completed inside that same budget.
+        }
+      }
+      return {
+        schemaVersion: 1,
+        before,
+        attemptedRuntimeIds,
+        recoveredRuntimeIds,
+        blocked,
+        after,
+        deadlineExceeded: normalized.signal.aborted || Date.now() >= normalized.deadlineAtMs,
+      };
+    });
+  }
+
+  private async preflightRuntimeHistoryCandidate(
+    runtimeId: string,
+    deadlineAtMs: number,
+  ): Promise<void> {
+    const wallDeadline: OwnedRuntimeWallDeadline = {
+      expiresAtMs: deadlineAtMs,
+      code: "RECOVERY_REQUIRED",
+      message: "Owned runtime history recovery preflight exceeded its aggregate deadline",
+      details: { runtimeId, state: "history_recovery_preflight" },
+    };
+    await this.withFencedMachineMutex(async (fence) => {
+      const receipt = this.readRuntimeReceipt(runtimeId);
+      fence.assertActive();
+      const stopped = this.readOptionalStopReceipt(runtimeId);
+      const completion = this.readOptionalStopCompletion(runtimeId);
+      if (stopped) {
+        if (completion) {
+          throw new OwnedRuntimeError("INVALID_REQUEST", "Runtime history is already complete");
+        }
+        if (stopped.sessionId !== receipt.sessionId ||
+            stopped.mcpActor.installationId !== receipt.mcpOwner.installationId ||
+            stopped.mcpActor.userSid !== receipt.mcpOwner.userSid) {
+          throw new OwnedRuntimeError("STORAGE_UNVERIFIABLE", "Cleanup-pending stop evidence is cross-bound");
+        }
+        const authorityFailure = await this.inspectRecoveryAuthority(receipt, wallDeadline);
+        fence.assertActive();
+        if (authorityFailure) {
+          throw new OwnedRuntimeError("IDENTITY_UNVERIFIABLE", authorityFailure);
+        }
+        return;
+      }
+      if (!this.readOptionalChildExitReceipt(runtimeId)) {
+        throw new OwnedRuntimeError(
+          "INVALID_REQUEST",
+          "Runtime history has no exact process-vacancy disposition eligible for recovery",
+        );
+      }
+      const status = await this.inspectReceipt(receipt, wallDeadline);
+      fence.assertActive();
+      if (status.state !== "exited" || status.exactOwned !== true) {
+        throw new OwnedRuntimeError(
+          "IDENTITY_UNVERIFIABLE",
+          `Child-exit-only history is not exact-vacant: ${status.reason ?? status.state}`,
+        );
+      }
+    }, wallDeadline);
+  }
+
+  private normalizeRuntimeHistoryOptions(
+    options: OwnedRuntimeHistoryInspectionOptions,
+  ): NormalizedOwnedRuntimeHistoryOptions {
+    const maxRuntimes = options.maxRuntimes ?? DEFAULT_HISTORY_MAX_RUNTIMES;
+    const deadlineMs = options.deadlineMs ?? DEFAULT_HISTORY_DEADLINE_MS;
+    if (!Number.isSafeInteger(maxRuntimes) || maxRuntimes < 1 ||
+        maxRuntimes > MAX_HISTORY_MAX_RUNTIMES) {
+      throw new OwnedRuntimeError(
+        "INVALID_REQUEST",
+        `maxRuntimes must be from 1 through ${MAX_HISTORY_MAX_RUNTIMES}`,
+      );
+    }
+    if (!Number.isSafeInteger(deadlineMs) || deadlineMs < 100 ||
+        deadlineMs > MAX_HISTORY_DEADLINE_MS) {
+      throw new OwnedRuntimeError(
+        "INVALID_REQUEST",
+        `deadlineMs must be from 100 through ${MAX_HISTORY_DEADLINE_MS}`,
+      );
+    }
+    return {
+      maxRuntimes,
+      deadlineAtMs: Date.now() + deadlineMs,
+      signal: options.signal ?? new AbortController().signal,
+    };
+  }
+
+  private async inspectRuntimeHistoryInternal(
+    options: NormalizedOwnedRuntimeHistoryOptions,
+  ): Promise<OwnedRuntimeHistoryInventory> {
+    if (options.signal.aborted) {
+      throw new OwnedRuntimeError("CANCELLED", "Owned runtime history inspection was cancelled");
+    }
+    const wallDeadline: OwnedRuntimeWallDeadline = {
+      expiresAtMs: options.deadlineAtMs,
+      code: "RECOVERY_REQUIRED",
+      message: "Owned runtime history inspection exceeded its aggregate wall-clock deadline",
+      details: { state: "history_inspection" },
+    };
+    return this.withFencedMachineMutex(async (fence) => {
+      fence.assertActive();
+      const readiness = await this.inspectIdleShutdownReadiness({
+        signal: options.signal,
+        deadlineTick: performance.now() + Math.max(0, options.deadlineAtMs - Date.now()),
+        probeGeneration: this.idleRevision,
+      });
+      fence.assertActive();
+
+      const existing = await this.snapshotExistingOwnedRuntimeRecords();
+      fence.assertActive();
+      if (existing.kind === "missing") {
+        return this.emptyRuntimeHistoryInventory(readiness);
+      }
+
+      const snapshot = existing.value;
+      const runtimes = new Map<string, OwnedRuntimeReceipt>();
+      const exits = new Map<string, ChildExitReceipt>();
+      const stops = new Map<string, StopReceipt>();
+      const completions = new Map<string, StopCompletion>();
+      const restorations = new Map<string, RestorationProof>();
+      const invalidRuntimeIds = new Set<string>();
+      const issues: OwnedRuntimeHistoryIssue[] = [];
+      const noteIssue = (runtimeId: string, reason: string): void => {
+        invalidRuntimeIds.add(runtimeId);
+        if (issues.length < MAX_HISTORY_ISSUES) {
+          issues.push({ runtimeId, reason: reason.slice(0, 512) });
+        }
+      };
+      const decode = (bytes: Uint8Array | null): unknown => {
+        if (!bytes || bytes.byteLength < LIFECYCLE_RECORD_MIN_BYTES ||
+            bytes.byteLength > this.maxRecordBytes) {
+          throw new Error("record bytes are outside the lifecycle bound");
+        }
+        return JSON.parse(Buffer.from(bytes).toString("utf8").replace(/^\uFEFF/, ""));
+      };
+
+      for (const record of snapshot.records) {
+        if (!["runtimes", "child-exits", "stops", "stop-completions", "restoration-proofs"]
+          .includes(record.family)) continue;
+        try {
+          const value = decode(record.bytes);
+          switch (record.family) {
+            case "runtimes": {
+              const parsed = runtimeReceiptSchema.parse(value);
+              if (parsed.runtimeId !== record.id) throw new Error("runtime filename binding differs");
+              runtimes.set(record.id, parsed);
+              break;
+            }
+            case "child-exits": {
+              const parsed = childExitReceiptSchema.parse(value);
+              if (parsed.runtimeId !== record.id) throw new Error("child-exit filename binding differs");
+              exits.set(record.id, parsed);
+              break;
+            }
+            case "stops": {
+              const parsed = stopReceiptSchema.parse(value);
+              if (parsed.runtimeId !== record.id) throw new Error("stop filename binding differs");
+              stops.set(record.id, parsed);
+              break;
+            }
+            case "stop-completions": {
+              const parsed = stopCompletionSchema.parse(value);
+              if (parsed.runtimeId !== record.id) throw new Error("completion filename binding differs");
+              completions.set(record.id, parsed);
+              break;
+            }
+            case "restoration-proofs": {
+              const parsed = restorationProofSchema.parse(value);
+              if (parsed.runtimeId !== record.id) throw new Error("restoration filename binding differs");
+              restorations.set(record.id, parsed);
+              break;
+            }
+          }
+        } catch (error) {
+          noteIssue(record.id, `Lifecycle disposition is indeterminate: ${this.message(error)}`);
+        }
+      }
+
+      const allRuntimeIds = [...new Set([
+        ...runtimes.keys(),
+        ...exits.keys(),
+        ...stops.keys(),
+        ...completions.keys(),
+        ...restorations.keys(),
+        ...invalidRuntimeIds,
+      ])].sort();
+      const counts: Record<OwnedRuntimeHistoryDisposition, number> = {
+        completed: 0,
+        child_exit_only: 0,
+        cleanup_pending: 0,
+        active_or_unresolved: 0,
+        indeterminate: 0,
+      };
+      const recoverableRuntimeIds: string[] = [];
+      const historicalManagers = new Set<string>();
+
+      for (const runtimeId of allRuntimeIds) {
+        if (invalidRuntimeIds.has(runtimeId)) {
+          counts.indeterminate += 1;
+          continue;
+        }
+        const receipt = runtimes.get(runtimeId);
+        if (!receipt) {
+          counts.indeterminate += 1;
+          noteIssue(runtimeId, "Lifecycle disposition record has no matching runtime receipt.");
+          continue;
+        }
+        if (receipt.mcpOwner.managerInstanceId !== this.managerInstanceId) {
+          historicalManagers.add(receipt.mcpOwner.managerInstanceId);
+        }
+        const childExit = exits.get(runtimeId);
+        const stopped = stops.get(runtimeId);
+        const completion = completions.get(runtimeId);
+        const restoration = restorations.get(runtimeId);
+        let invalidReason: string | null = null;
+        if (childExit && (childExit.sessionId !== receipt.sessionId || childExit.pid !== receipt.pid ||
+            pathKey(childExit.executablePath) !== pathKey(receipt.executablePath) ||
+            childExit.creationTimeFileTime !== receipt.creationTimeFileTime)) {
+          invalidReason = "Child-exit evidence is cross-bound to the runtime receipt.";
+        } else if (stopped && (stopped.sessionId !== receipt.sessionId ||
+            stopped.mcpActor.installationId !== receipt.mcpOwner.installationId ||
+            stopped.mcpActor.userSid !== receipt.mcpOwner.userSid)) {
+          invalidReason = "Stop evidence is cross-bound to the runtime receipt.";
+        } else if (completion && (!stopped || completion.sessionId !== receipt.sessionId ||
+            completion.preparedLaunchId !== receipt.preparedLaunchId)) {
+          invalidReason = "Stop completion is cross-bound or lacks exact stop evidence.";
+        } else if (restoration && (restoration.sessionId !== receipt.sessionId ||
+            restoration.managerInstanceId !== receipt.mcpOwner.managerInstanceId)) {
+          invalidReason = "Restoration evidence is cross-bound to the runtime receipt.";
+        }
+        if (invalidReason) {
+          counts.indeterminate += 1;
+          noteIssue(runtimeId, invalidReason);
+        } else if (stopped && completion) {
+          counts.completed += 1;
+        } else if (stopped) {
+          counts.cleanup_pending += 1;
+          recoverableRuntimeIds.push(runtimeId);
+        } else if (childExit) {
+          counts.child_exit_only += 1;
+          recoverableRuntimeIds.push(runtimeId);
+        } else {
+          counts.active_or_unresolved += 1;
+        }
+      }
+
+      if (!readiness.complete) {
+        noteIssue("inventory", "The complete lifecycle namespace could not be verified by the idle-readiness probe.");
+      }
+      if (!snapshot.complete || snapshot.usage.records > this.maxStoreRecords ||
+          snapshot.usage.bytes > this.maxStoreBytes) {
+        noteIssue("inventory", "The lifecycle namespace exceeded or violated its bounded LMDB inventory contract.");
+      }
+      const deadlineExceeded = options.signal.aborted || Date.now() >= options.deadlineAtMs;
+      if (deadlineExceeded) {
+        noteIssue("inventory", "Lifecycle history classification exceeded its aggregate deadline or was cancelled.");
+      }
+      const returnedCandidates = recoverableRuntimeIds.slice(0, options.maxRuntimes);
+      return {
+        schemaVersion: 1,
+        complete: readiness.complete && snapshot.complete &&
+          snapshot.usage.records <= this.maxStoreRecords && snapshot.usage.bytes <= this.maxStoreBytes &&
+          issues.length === 0 && !deadlineExceeded,
+        recordsScanned: snapshot.usage.records,
+        runtimesScanned: allRuntimeIds.length,
+        counts,
+        recoverableCount: recoverableRuntimeIds.length,
+        recoverableRuntimeIds: returnedCandidates,
+        historicalManagerInstances: historicalManagers.size,
+        idleBlockers: readiness.blockers,
+        truncated: recoverableRuntimeIds.length > returnedCandidates.length,
+        issues,
+      };
+    }, wallDeadline);
+  }
+
+  private emptyRuntimeHistoryInventory(
+    readiness: McpIdleProviderReadiness,
+  ): OwnedRuntimeHistoryInventory {
+    return {
+      schemaVersion: 1,
+      complete: readiness.complete,
+      recordsScanned: 0,
+      runtimesScanned: 0,
+      counts: {
+        completed: 0,
+        child_exit_only: 0,
+        cleanup_pending: 0,
+        active_or_unresolved: 0,
+        indeterminate: 0,
+      },
+      recoverableCount: 0,
+      recoverableRuntimeIds: [],
+      historicalManagerInstances: 0,
+      idleBlockers: readiness.blockers,
+      truncated: false,
+      issues: [],
+    };
+  }
+
   /**
    * Validate the complete existing LMDB inventory without opening the creating
    * writer accessor, sweeping receipts, revoking sessions, or starting the
@@ -1968,15 +2435,9 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder, McpI
       return { complete: false, blockers: ["INCOMPLETE_PROOF"], revision: this.idleRevision };
     }
 
-    const store = this.recordStoreInstance ?? new LmdbRecordStore({
-      storageRoot: this.storageRoot,
-      databaseDirectory: "records-v1",
-      maxRecordBytes: this.maxRecordBytes,
-      maxScanRecords: this.maxStoreRecords,
-    });
     let existing;
     try {
-      existing = await store.snapshotExisting(OWNED_RUNTIME_RECORD_DIRECTORIES);
+      existing = await this.snapshotExistingOwnedRuntimeRecords();
     } catch {
       return { complete: false, blockers: ["INCOMPLETE_PROOF"], revision: this.idleRevision };
     }
@@ -2107,8 +2568,10 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder, McpI
         const runtime = runtimes.get(consumption.runtimeId);
         const starting = pending.get(consumption.runtimeId);
         if (!descriptor || (!runtime && !starting)) throw new Error("unlinked consumption");
-        if (runtime?.preparedLaunchId !== descriptor.preparedLaunchId ||
-            starting?.preparedLaunchId !== descriptor.preparedLaunchId) throw new Error("mixed consumption");
+        if ((runtime && runtime.preparedLaunchId !== descriptor.preparedLaunchId) ||
+            (starting && starting.preparedLaunchId !== descriptor.preparedLaunchId)) {
+          throw new Error("mixed consumption");
+        }
       }
       for (const runtime of runtimes.values()) {
         const descriptor = prepared.get(runtime.preparedLaunchId);
@@ -2139,7 +2602,8 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder, McpI
       for (const stopped of stops.values()) {
         const runtime = runtimes.get(stopped.runtimeId);
         if (!runtime || stopped.sessionId !== runtime.sessionId ||
-            stopped.mcpActor.managerInstanceId !== runtime.mcpOwner.managerInstanceId) throw new Error("unlinked stop");
+            stopped.mcpActor.installationId !== runtime.mcpOwner.installationId ||
+            stopped.mcpActor.userSid !== runtime.mcpOwner.userSid) throw new Error("unlinked stop");
       }
       for (const completion of completions.values()) {
         const runtime = runtimes.get(completion.runtimeId);
@@ -2164,6 +2628,27 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder, McpI
 
     if (complete) {
       const now = this.clock();
+      // Foreign history remains visible through observer_runtime history, but
+      // it is an idle obligation only when this host could lawfully recover it.
+      // A different installation or Windows user is deliberately outside this
+      // manager's mutation authority and must not keep an unrelated host alive
+      // forever merely because the evidence remains retained.
+      const sameInstallationForeignRuntimes = [...runtimes.values()].filter((runtime) =>
+        runtime.mcpOwner.managerInstanceId !== this.managerInstanceId &&
+        runtime.mcpOwner.installationId === this.installationId &&
+        !(stops.has(runtime.runtimeId) && completions.has(runtime.runtimeId))
+      );
+      if (sameInstallationForeignRuntimes.length > 0) {
+        try {
+          const currentOwner = await this.currentMcpOwner();
+          if (sameInstallationForeignRuntimes.some((runtime) =>
+            runtime.mcpOwner.userSid === currentOwner.userSid)) {
+            blockers.add("OWNED_RUNTIME_RECOVERY");
+          }
+        } catch {
+          complete = false;
+        }
+      }
       for (const descriptor of prepared.values()) {
         if (descriptor.managerInstanceId !== this.managerInstanceId) continue;
         const consumption = consumptions.get(descriptor.preparedLaunchId);
@@ -2274,12 +2759,19 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder, McpI
         input.waitForRestorationMs > 5 * 60_000) {
       throw new OwnedRuntimeError("INVALID_REQUEST", "waitForRestorationMs must be from 0 through 300000");
     }
+    if (input.deadlineAtMs !== undefined &&
+        (!Number.isFinite(input.deadlineAtMs) || input.deadlineAtMs <= 0)) {
+      throw new OwnedRuntimeError("INVALID_REQUEST", "Owned runtime aggregate recovery deadline is invalid");
+    }
     // One budget covers preparation, the requested restoration wait, exact
     // inspection/termination, observer completion, and the final CAS. Each
     // configured component contributes once; no sub-operation resets it.
     const wallDeadline: OwnedRuntimeWallDeadline = {
-      expiresAtMs: Date.now() + input.waitForRestorationMs +
-        this.lockTimeoutMs + this.inspectionTimeoutMs + this.terminationTimeoutMs,
+      expiresAtMs: Math.min(
+        Date.now() + input.waitForRestorationMs +
+          this.lockTimeoutMs + this.inspectionTimeoutMs + this.terminationTimeoutMs,
+        input.deadlineAtMs ?? Number.POSITIVE_INFINITY,
+      ),
       code: "RECOVERY_REQUIRED",
       message: "Owned runtime stop exceeded its total wall-clock deadline; exact durable state was preserved for retry",
       details: { runtimeId: input.runtimeId, state: "stopping" },
@@ -2393,8 +2885,7 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder, McpI
       } else {
         // A clean shutdown seal completed; release the LMDB environment. An
         // unsafe/retryable close deliberately keeps it open for the retry.
-        await this.recordStoreInstance?.close();
-        this.recordStoreInstance = null;
+        await this.closeRecordStores();
       }
       return result;
     }, (error) => {
@@ -2436,8 +2927,7 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder, McpI
    */
   async closeStorageForTest(): Promise<void> {
     this.assertTestSeam("closeStorageForTest");
-    await this.recordStoreInstance?.close();
-    this.recordStoreInstance = null;
+    await this.closeRecordStores();
   }
 
   private async closeOwnedRuntimes(deadlineAtMs?: number): Promise<Record<string, unknown>> {
@@ -2488,7 +2978,19 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder, McpI
               );
             }
             const runtimeId = name.endsWith(".json") ? name.slice(0, -5) : "";
-            if (runtimeIdSchema.safeParse(runtimeId).success) ids.push(runtimeId);
+            if (!runtimeIdSchema.safeParse(runtimeId).success) {
+              errors.push({
+                runtimeId: runtimeId || "inventory",
+                reason: "Owned runtime receipt has a non-canonical runtime ID",
+              });
+              continue;
+            }
+            try {
+              const receipt = this.readRuntimeReceipt(runtimeId);
+              if (receipt.mcpOwner.managerInstanceId === this.managerInstanceId) ids.push(runtimeId);
+            } catch (error) {
+              errors.push({ runtimeId, reason: this.message(error).slice(0, 512) });
+            }
           }
           return { kind: "ok" as const, runtimeIds: ids.sort(), errors };
         }, wallDeadline);
@@ -2519,7 +3021,6 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder, McpI
           const snapshot = await this.withFencedMachineMutex(async (fence) => {
               const receipt = this.readRuntimeReceipt(runtimeId);
               fence.assertActive();
-              if (receipt.mcpOwner.managerInstanceId !== this.managerInstanceId) return null;
               const stopped = this.readOptionalStopReceipt(runtimeId);
               if (stopped) {
                 if (stopped.sessionId !== receipt.sessionId) {
@@ -2651,7 +3152,6 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder, McpI
             fence.assertActive();
             try {
               const receipt = this.readRuntimeReceipt(runtimeId);
-              if (receipt.mcpOwner.managerInstanceId !== this.managerInstanceId) continue;
               const stopped = this.readOptionalStopReceipt(runtimeId);
               if (stopped) {
                 if (stopped.sessionId !== receipt.sessionId) {
@@ -3194,7 +3694,7 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder, McpI
     leaseFence.assertActive();
     this.assertOpenForMutation();
     const root = this.ensureStorage();
-    this.sweepLocked(this.clock());
+    if (input.skipRetentionSweep !== true) this.sweepLocked(this.clock());
     leaseFence.assertActive();
     const receipt = this.readRuntimeReceipt(input.runtimeId);
     const idempotencyPath = this.idempotencyPath("stop", keyHash);
@@ -3214,8 +3714,15 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder, McpI
     }
     const existingStop = this.readOptionalStopReceipt(input.runtimeId);
     if (existingStop) {
-      if (existingStop.sessionId !== receipt.sessionId) {
+      if (existingStop.sessionId !== receipt.sessionId ||
+          existingStop.mcpActor.installationId !== receipt.mcpOwner.installationId ||
+          existingStop.mcpActor.userSid !== receipt.mcpOwner.userSid) {
         throw new OwnedRuntimeError("STORAGE_UNVERIFIABLE", "Stop receipt session does not match its runtime receipt");
+      }
+      const authorityFailure = await this.inspectRecoveryAuthority(receipt, wallDeadline);
+      leaseFence.assertActive();
+      if (authorityFailure) {
+        throw new OwnedRuntimeError("IDENTITY_UNVERIFIABLE", authorityFailure);
       }
       return {
         receipt,
@@ -3513,6 +4020,33 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder, McpI
           "Natural child-exit receipt does not match the exact runtime lifecycle"
         );
       }
+      const authorityFailure = await this.inspectRecoveryAuthority(receipt, wallDeadline);
+      if (authorityFailure) {
+        return this.publicStatus(receipt, "unverifiable", false, authorityFailure);
+      }
+      let inspection: OwnedRuntimeInspection | null;
+      try {
+        inspection = wallDeadline
+          ? await this.beforeWallDeadline(wallDeadline, () =>
+            this.backend.inspectProcess(receipt.pid, receipt.ownerTokenArgument))
+          : await this.backend.inspectProcess(receipt.pid, receipt.ownerTokenArgument);
+      } catch (error) {
+        if (this.isWallDeadlineError(error)) throw error;
+        return this.publicStatus(
+          receipt,
+          "unverifiable",
+          false,
+          `Exact child-exit vacancy could not be re-inspected: ${this.message(error)}`
+        );
+      }
+      if (inspection && this.inspectionMatches(receipt, inspection)) {
+        return this.publicStatus(
+          receipt,
+          "unverifiable",
+          false,
+          "Exact runtime identity is still live despite its child-exit receipt"
+        );
+      }
       return this.publicStatus(
         receipt,
         "exited",
@@ -3542,39 +4076,8 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder, McpI
         observerCleanupPending: false,
       };
     }
-    let currentOwner: z.infer<typeof mcpOwnerSchema>;
-    try {
-      currentOwner = await this.currentMcpOwner(wallDeadline);
-    } catch (error) {
-      if (this.isWallDeadlineError(error)) throw error;
-      return this.publicStatus(receipt, "unverifiable", false, `MCP owner identity is unavailable: ${this.message(error)}`);
-    }
-    if (currentOwner.installationId !== receipt.mcpOwner.installationId ||
-        currentOwner.userSid !== receipt.mcpOwner.userSid) {
-      return this.publicStatus(receipt, "unverifiable", false, "Lifecycle receipt belongs to a different MCP installation or Windows owner");
-    }
-    if (currentOwner.managerInstanceId !== receipt.mcpOwner.managerInstanceId) {
-      let priorOwner: OwnedRuntimeInspection | null;
-      try {
-        priorOwner = wallDeadline
-          ? await this.beforeWallDeadline(wallDeadline, () =>
-            this.backend.inspectProcess(receipt.mcpOwner.pid))
-          : await this.backend.inspectProcess(receipt.mcpOwner.pid);
-      } catch (error) {
-        if (this.isWallDeadlineError(error)) throw error;
-        return this.publicStatus(receipt, "unverifiable", false, `Prior MCP owner identity is unavailable: ${this.message(error)}`);
-      }
-      if (priorOwner && priorOwner.identity.pid === receipt.mcpOwner.pid &&
-          pathKey(priorOwner.identity.executablePath) === pathKey(receipt.mcpOwner.executablePath) &&
-          priorOwner.identity.creationTime === receipt.mcpOwner.creationTimeFileTime) {
-        return this.publicStatus(
-          receipt,
-          "unverifiable",
-          false,
-          "Prior exact MCP owner is still live; this process is not a restart recovery"
-        );
-      }
-    }
+    const authorityFailure = await this.inspectRecoveryAuthority(receipt, wallDeadline);
+    if (authorityFailure) return this.publicStatus(receipt, "unverifiable", false, authorityFailure);
     let configuredExecutable: string;
     try {
       configuredExecutable = canonicalFile(
@@ -4003,6 +4506,41 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder, McpI
       pathKey(inspection.identity.executablePath) === pathKey(receipt.executablePath) &&
       inspection.identity.creationTime === receipt.creationTimeFileTime &&
       inspection.ownerArgumentMatched === true;
+  }
+
+  private async inspectRecoveryAuthority(
+    receipt: OwnedRuntimeReceipt,
+    wallDeadline?: OwnedRuntimeWallDeadline
+  ): Promise<string | null> {
+    let currentOwner: z.infer<typeof mcpOwnerSchema>;
+    try {
+      currentOwner = await this.currentMcpOwner(wallDeadline);
+    } catch (error) {
+      if (this.isWallDeadlineError(error)) throw error;
+      return `MCP owner identity is unavailable: ${this.message(error)}`;
+    }
+    if (currentOwner.installationId !== receipt.mcpOwner.installationId ||
+        currentOwner.userSid !== receipt.mcpOwner.userSid) {
+      return "Lifecycle receipt belongs to a different MCP installation or Windows owner";
+    }
+    if (currentOwner.managerInstanceId === receipt.mcpOwner.managerInstanceId) return null;
+
+    let priorOwner: OwnedRuntimeInspection | null;
+    try {
+      priorOwner = wallDeadline
+        ? await this.beforeWallDeadline(wallDeadline, () =>
+          this.backend.inspectProcess(receipt.mcpOwner.pid))
+        : await this.backend.inspectProcess(receipt.mcpOwner.pid);
+    } catch (error) {
+      if (this.isWallDeadlineError(error)) throw error;
+      return `Prior MCP owner identity is unavailable: ${this.message(error)}`;
+    }
+    if (priorOwner && priorOwner.identity.pid === receipt.mcpOwner.pid &&
+        pathKey(priorOwner.identity.executablePath) === pathKey(receipt.mcpOwner.executablePath) &&
+        priorOwner.identity.creationTime === receipt.mcpOwner.creationTimeFileTime) {
+      return "Prior exact MCP owner is still live; this process is not a restart recovery";
+    }
+    return null;
   }
 
   private assertInspectionMatches(receipt: OwnedRuntimeReceipt, inspection: OwnedRuntimeInspection): void {
@@ -4929,6 +5467,67 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder, McpI
       });
     }
     return this.recordStoreInstance;
+  }
+
+  /** Existing-only inventory accessor; construction and missing-root reads never create storage. */
+  private existingSnapshotStore(): LmdbRecordStore {
+    return this.recordStoreInstance ?? (this.existingRecordReader ??= new LmdbRecordStore({
+      storageRoot: this.storageRoot,
+      databaseDirectory: "records-v1",
+      maxRecordBytes: this.maxRecordBytes,
+      maxScanRecords: this.maxStoreRecords,
+    }));
+  }
+
+  /** Serialize retained-reader snapshots, reader disposal, and writer activation. */
+  private async withExistingSnapshotAccess<T>(action: () => Promise<T> | T): Promise<T> {
+    const prior = this.existingSnapshotAccessTail;
+    let release!: () => void;
+    this.existingSnapshotAccessTail = new Promise<void>((resolve) => { release = resolve; });
+    await prior;
+    try {
+      return await action();
+    } finally {
+      release();
+    }
+  }
+
+  private snapshotExistingOwnedRuntimeRecords() {
+    return this.withExistingSnapshotAccess(async () => {
+      const store = this.existingSnapshotStore();
+      return store.snapshotExisting(OWNED_RUNTIME_RECORD_DIRECTORIES, {
+        retainOpen: store === this.existingRecordReader,
+      });
+    });
+  }
+
+  /**
+   * Dispose the retained read-only environment and open the writer environment
+   * before another readiness probe can recreate the reader. Windows LMDB cannot
+   * safely promote two process-local handles for the same mapped environment.
+   */
+  private async prepareRuntimeHistoryMutationStore(runtimeId: string): Promise<void> {
+    await this.withExistingSnapshotAccess(async () => {
+      const reader = this.existingRecordReader;
+      this.existingRecordReader = null;
+      await reader?.close();
+      this.ensureStorage();
+      // A synchronous existence probe opens the writer without mutating state.
+      // Keeping that handle installed makes later snapshots reuse the writer.
+      this.recordStore().has("runtimes", runtimeId);
+    });
+  }
+
+  private async closeRecordStores(): Promise<void> {
+    await this.withExistingSnapshotAccess(async () => {
+      const stores = [...new Set([
+        this.recordStoreInstance,
+        this.existingRecordReader,
+      ].filter((store): store is LmdbRecordStore => store !== null))];
+      this.recordStoreInstance = null;
+      this.existingRecordReader = null;
+      await Promise.all(stores.map((store) => store.close()));
+    });
   }
 
   /**

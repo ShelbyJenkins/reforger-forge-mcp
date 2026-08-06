@@ -32,7 +32,7 @@ describe("LmdbRecordStore", () => {
     await withTemporaryDirectory(async (root) => {
       const missingRoot = join(root, "state", "owned-runtimes-v1");
       const store = new LmdbRecordStore({ storageRoot: missingRoot, maxRecordBytes: 4_096 });
-      await expect(store.snapshotExisting(FAMILIES)).resolves.toEqual({ kind: "missing" });
+      await expect(store.snapshotExisting(FAMILIES, { retainOpen: true })).resolves.toEqual({ kind: "missing" });
       await expect(store.hasExisting("runtimes", "rt-1")).resolves.toEqual({ kind: "missing" });
       expect(existsSync(missingRoot)).toBe(false);
       await store.close();
@@ -64,6 +64,29 @@ describe("LmdbRecordStore", () => {
       await reader.close();
       expect(statSync(dataPath).mtimeMs).toBe(before);
     }, { prefix: "rfo-record-existing-readonly-" });
+  });
+
+  it("retains an existing read-only environment and observes later committed snapshots", async () => {
+    await withTemporaryDirectory(async (root) => {
+      const writer = new LmdbRecordStore({ storageRoot: root, maxRecordBytes: 4_096 });
+      const reader = new LmdbRecordStore({ storageRoot: root, maxRecordBytes: 4_096 });
+      try {
+        writer.putRaw("runtimes", "rt-1", serialize({ runtimeId: "rt-1" }), { exclusive: true });
+        await expect(reader.snapshotExisting(FAMILIES, { retainOpen: true })).resolves.toMatchObject({
+          kind: "available",
+          value: { records: [{ family: "runtimes", id: "rt-1" }] },
+        });
+
+        writer.putRaw("runtimes", "rt-2", serialize({ runtimeId: "rt-2" }), { exclusive: true });
+        const refreshed = await reader.snapshotExisting(FAMILIES, { retainOpen: true });
+        expect(refreshed.kind).toBe("available");
+        if (refreshed.kind === "available") {
+          expect(refreshed.value.records.map(({ id }) => id)).toEqual(["rt-1", "rt-2"]);
+        }
+      } finally {
+        await Promise.all([reader.close(), writer.close()]);
+      }
+    }, { prefix: "rfo-record-existing-retained-" });
   });
 
   it("round-trips exact bytes with byte parity against serialized JSON", async () => {

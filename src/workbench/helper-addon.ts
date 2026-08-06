@@ -103,6 +103,16 @@ export interface WorkbenchCompanionLaunch {
   readonly reused: boolean;
 }
 
+export type WorkbenchCurrentCompanion =
+  | Readonly<{
+      kind: "available";
+      companion: Readonly<WorkbenchCompanionLaunch>;
+    }>
+  | Readonly<{
+      kind: "unavailable";
+      reason: "current_bundle_not_staged";
+    }>;
+
 export interface WorkbenchCompanionProvider {
   /**
    * Verify and stage the fixed helper bundle. When supplied, targetProjectPath
@@ -122,6 +132,12 @@ export interface WorkbenchCompanionProvider {
   ): WorkbenchCompanionLaunch;
   /** Re-verify the immutable packaged source and require its digest to remain exact. */
   verifySourceDigest?(expectedBundleDigest: string): string;
+  /**
+   * Re-attest the current packaged bundle only when it is already present in
+   * the managed layout. This operation is strictly read-only: it must not
+   * stage, repair, retain, remove, or create any path.
+   */
+  readCurrentStaged?(targetProjectPath?: string): WorkbenchCurrentCompanion;
   status?(): WorkbenchCompanionManagedStatus;
   applyRetention?(options?: WorkbenchCompanionRetentionOptions): WorkbenchCompanionRetentionResult;
   uninstall?(): WorkbenchCompanionUninstallResult;
@@ -552,6 +568,50 @@ export class WorkbenchHelperStager implements WorkbenchCompanionProvider {
       );
     }
     return currentBundleDigest;
+  }
+
+  readCurrentStaged(targetProjectPath = this.targetProjectPath): WorkbenchCurrentCompanion {
+    const source = verifyWorkbenchHelperSource(this.sourceDirectory);
+    const prospectiveManagedRoot = potentialCanonicalPath(this.managedRoot);
+    const prospectiveSource = potentialCanonicalPath(this.sourceDirectory);
+    if (pathsOverlap(prospectiveManagedRoot, prospectiveSource)) {
+      throw new WorkbenchHelperStageError(
+        "Workbench helper managed root must not overlap its immutable package source",
+        "WORKBENCH_HELPER_PATH_UNSAFE"
+      );
+    }
+    const targets = [...new Set([this.targetProjectPath, targetProjectPath].filter(
+      (target): target is string => typeof target === "string" && target.length > 0
+    ))];
+    for (const target of targets) {
+      if (pathsOverlap(targetDirectory(target), prospectiveManagedRoot)) {
+        throw new WorkbenchHelperStageError(
+          "Workbench helper managed, staging, and profile roots must not overlap the target project",
+          "WORKBENCH_HELPER_PATH_UNSAFE"
+        );
+      }
+    }
+
+    const rolePath = join(this.managedRoot, "workbench-helper");
+    const digestRoot = join(rolePath, "addons", source.manifest.bundleDigest);
+    if (!existsSync(rolePath) || !existsSync(digestRoot)) {
+      return Object.freeze({
+        kind: "unavailable",
+        reason: "current_bundle_not_staged",
+      });
+    }
+
+    const companion = this.verifyStaged(this.launchDescriptor(
+      source.manifest.bundleDigest,
+      join(digestRoot, WORKBENCH_HELPER_ADDON_ID),
+      digestRoot,
+      join(rolePath, "profile"),
+      true
+    ), targetProjectPath);
+    return Object.freeze({
+      kind: "available",
+      companion: Object.freeze(companion),
+    });
   }
 
   status(): WorkbenchCompanionManagedStatus {
