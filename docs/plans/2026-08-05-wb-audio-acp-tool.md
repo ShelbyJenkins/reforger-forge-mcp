@@ -158,6 +158,17 @@ names the Bank container class, the samples var, and the sample-entry container 
 Also run `wb_resources getInfo` against one `.ogg` in `noise_long/` and record the real sound resource class name.
 This replaces the unverified `SNDResourceClass` everywhere it appears.
 
+**Open questions this run must also answer** (they decide which preset mechanism is available — see *Preset graph
+structures* below; both are cheap to check once a real `.acp` exists):
+
+- **Q1. Is `.acp` the same Enfusion text grammar that [src/formats/enfusion-text.ts](../../src/formats/enfusion-text.ts)
+  already parses?** That module handles `.gproj/.et/.ct/.conf/.layer`. Answer it by running `parse()` on the Step 1
+  ACP and checking `serialize(parse(x)) === x`. A clean round-trip unlocks preset mechanism B.
+- **Q2. Are node IDs and port IDs file-scoped or globally unique?** Copy the Step 1 ACP to a second filename,
+  register it, and `describe` both. If the two files carry identical IDs and both load, IDs are file-scoped and
+  template-file copying (mechanism A) is safe. If Workbench rejects or renumbers the copy, presets need ID
+  remapping and mechanism A is off the table.
+
 ### Step 3 — `inspect` and `validate`
 
 Both are `describe` with an interpretation layer, using the constants frozen in Step 2. Keep the walk shared;
@@ -216,6 +227,77 @@ property vars; fold it in if the schema makes it trivial, otherwise leave it for
 
 ---
 
+## Preset graph structures
+
+The steps above automate *maintaining* audio content but leave *authoring* graph structure as GUI work: a new sound
+event still means hand-wiring a Bank + Sound pair. Presets are the way to close that gap — define a shape like
+"randomized background bed" or "randomized spatial one-shot" once, then stamp it out.
+
+### What is ruled out: building nodes through the live API
+
+`BaseContainer` cannot be duplicated. Its chain is `BaseContainer : BaseResourceObject : global_pointer`, and none
+of those declare `Clone`. Only `Managed` declares `proto external ref Managed Clone()`, and `BaseContainerList` is
+the `Managed` type here — so the *list wrapper* can be cloned, never an individual node. There is also no
+`CreateContainer`/`AddObject` anywhere in the reflection surface: `SetObject` and `BaseContainerList.Insert` both
+require an existing `BaseContainer` that nothing in the documented API can mint.
+
+Conclusion: a preset cannot be instantiated by asking the engine to construct nodes. Structure has to come from a
+file. Two mechanisms do that.
+
+### Mechanism A — template-file presets (needs no new capability)
+
+Hand-build `_TEMPLATE_RandomBed.acp` and `_TEMPLATE_SpatialOneShot.acp` once, in the same place the Step 1 specimen
+lives. Instantiating a preset is then:
+
+1. copy the template file to the target name
+2. `wb_resources register` the copy
+3. `wb_audio syncBankSamples` to fill the Bank
+4. `wb_audio setBankProperties` for selection mode / loop / volume
+5. `wb_audio validate` to confirm
+
+Structure is *carried* by the file rather than generated, so this works with Steps 1–5 exactly as written — no extra
+handler code. It is the "build the skeleton once" idea generalized to N reusable shapes.
+
+**Gated on Q2.** If node/port IDs turn out to be globally unique rather than file-scoped, a copied template will
+collide and this mechanism is dead.
+
+**Limitation:** one preset instance per ACP file. Adding a *second* bed to an existing ACP is node creation again,
+which only mechanism B reaches.
+
+### Mechanism B — text-level generation with the existing parser
+
+[src/formats/enfusion-text.ts](../../src/formats/enfusion-text.ts) already parses and serializes the Enfusion text
+grammar, exporting `parse`, `serialize`, `createNode`, `setProperty`, and `getProperty`, with a round-trip test
+suite in [tests/formats/enfusion-text.test.ts](../../tests/formats/enfusion-text.test.ts). If `.acp` uses that same
+grammar (**Q1**), node insertion and ID remapping come nearly free, and multi-instance presets become possible.
+
+This is also the answer to the fragility objection against external ACP generators. A generator alone drifts
+silently when an engine update changes undocumented internals. Pairing it with the live handler removes that
+failure mode: generate the text offline, then `describe` and `validate` through Workbench to prove the engine
+actually loaded what was meant. **Generator plus live verifier is strictly stronger than either alone** — and it is
+the reason the live handler is worth building even if text generation ends up doing the structural work.
+
+### Where presets should live
+
+The repo already has a preset system worth reusing rather than reinventing:
+[src/templates/recipe-loader.ts](../../src/templates/recipe-loader.ts) lazily loads and validates JSON recipes from
+[data/recipes/](../../data/recipes/), caches them, and merges variant overrides, exposing a singleton
+`recipeLoader.getRecipe(id, variant?)`. The recipe schema in
+[src/templates/recipe.ts](../../src/templates/recipe.ts) carries `defaultParent`, `subdirectory`,
+`overrideComponents`, `variants`, and `postCreateNotes`.
+
+An audio preset wants structurally the same fields — template ACP instead of `defaultParent`, bank name, selection
+mode, volume, sample folder, plus a post-create checklist. A `data/recipes/audio/` set should fit the existing
+loader with little change. Follow the `prefab` precedent: recipes describe, the generator applies, the tool
+validates at entry.
+
+### Sequencing
+
+Presets are a **follow-on milestone**, not part of Steps 1–5. Q1 and Q2 are answered as a side effect of the Step 2
+discovery run, so no separate investigation is needed — just do not commit to a mechanism before that run.
+
+---
+
 ## Deferred
 
 **`.snd` conversion.** `AudioEditor.ExecuteAction(menuPath, bKeepFocus)` is inherited and would in principle reach a
@@ -226,6 +308,10 @@ route through the modal-evidence path. Do not promise it.
 
 **Connection topology editing.** Node IDs, port IDs, and connection containers are undocumented internals. Read them
 if `describe` surfaces them; do not write them.
+
+**In-engine node construction.** Not deferred by choice — ruled out. `BaseContainer` has no `Clone` and the
+reflection surface offers no way to create one, so nodes cannot be minted through the live API at all. See
+*Preset graph structures* for the two file-based mechanisms that reach the same goal.
 
 ---
 
