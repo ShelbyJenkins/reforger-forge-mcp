@@ -1,8 +1,6 @@
 # Commit 1 plan: make Workbench refusals safely actionable
 
-
-
-> **Series overview:** [Step 0](2026-08-04-launch-ergonomics-00-series-overview.md).
+> **Project overview:** [Launch ergonomics](README.md).
 
 > **Commit:** `feat(workbench): add contextual refusal remedies`
 >

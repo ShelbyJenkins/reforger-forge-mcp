@@ -54,8 +54,9 @@ list and needs a new durable revise operation to get past `reserveCapture`'s
 fingerprint 409; Task 1.1 leaves the live acceptance harness bypassing the new
 derivation; and Task 2.4 must also touch `application-operations.ts`.
 
-The completed Phase 0/1/2 work in
-`2026-08-03-mcp-lifecycle-option-a.md` was reviewed after implementation. The
+The completed Phase 0/1/2 work summarized in the
+[launch-ergonomics lifecycle foundation](launch-ergonomics/README.md#completed-lifecycle-foundation-option-a)
+was reviewed after implementation. The
 API simplification remains compatible, with one implementation constraint now
 made explicit: capture admission and job-lifecycle refactors must preserve
 `CaptureService.quiesce(deadlineAtMs)`, its shutdown abort signal, and its

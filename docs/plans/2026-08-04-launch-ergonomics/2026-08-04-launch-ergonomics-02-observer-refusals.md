@@ -21,7 +21,7 @@ features.
 
 No earlier implementation commit is required. The next baseline commit is
 [registered project-world resolution](2026-08-04-launch-ergonomics-03-world-resolution.md).
-See the [Step 0 series overview](2026-08-04-launch-ergonomics-00-series-overview.md)
+See the [launch ergonomics project overview](README.md)
 for the full series map.
 
 ## Goal

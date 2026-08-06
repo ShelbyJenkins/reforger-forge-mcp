@@ -31,7 +31,7 @@ reader before writer activation, and returns stable bounded recovery/blocker
 receipts. Shutdown inventory filters well-formed foreign-manager history before
 per-runtime mutex work, while malformed evidence remains fail closed. The
 implementation and acceptance record is in the
-[MCP-056 plan](../../docs/plans/2026-08-05-mcp-056-bounded-runtime-history-recovery.md).
+[MCP-056 plan](../../docs/plans/launch-ergonomics/2026-08-05-mcp-056-bounded-runtime-history-recovery.md).
 
 **Verification:** Focused history recovery passes 9/9, LMDB record-store tests
 pass 15/15, and owned-runtime idle readiness passes 7/7. Stage 3 passes 42 files
@@ -71,9 +71,9 @@ and admission fencing, and the atomic idle-shutdown actor. The CLI defaults to a
 directions of protocol activity, and uses the ordinary coalesced disposer only
 after readiness and transport admission seal in one host-local transaction. The
 full design and acceptance contract are recorded in the
-[host identity](../../docs/plans/2026-08-04-launch-ergonomics-13-mcp-host-identity.md),
-[idle readiness](../../docs/plans/2026-08-04-launch-ergonomics-14-mcp-idle-readiness.md),
-and [idle shutdown](../../docs/plans/2026-08-04-launch-ergonomics-15-mcp-idle-shutdown.md)
+[host identity](../../docs/plans/launch-ergonomics/2026-08-04-launch-ergonomics-13-mcp-host-identity.md),
+[idle readiness](../../docs/plans/launch-ergonomics/2026-08-04-launch-ergonomics-14-mcp-idle-readiness.md),
+and [idle shutdown](../../docs/plans/launch-ergonomics/2026-08-04-launch-ergonomics-15-mcp-idle-shutdown.md)
 plans.
 
 **Verification:** The implementation passed its focused, stage 3, stage 4,
