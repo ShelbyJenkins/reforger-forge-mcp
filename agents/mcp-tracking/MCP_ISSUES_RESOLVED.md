@@ -5,6 +5,46 @@ records. Move newly resolved or verified entries to the top. The legacy records
 below were migrated from the mixed tracker on 2026-07-28; same-day ties retain
 their migration order.
 
+## MCP-055 - reclaim safely idle MCP host processes
+
+**Status:** Resolved
+
+**Priority:** P1
+
+**Observed:** 2026-08-04
+
+**Closed:** 2026-08-05
+
+**Decision:** A stdio MCP host may reclaim only itself after a bounded period of
+inactivity and a complete host-scoped readiness proof. Uncertain or active
+Workbench, Observer, owned-runtime, capture, restoration, protocol, or external
+lifecycle state remains fail-closed. Client labels, PIDs, process titles, and
+host UUIDs provide identity but never cross-process shutdown authority.
+
+**Resolution:** Commits `5ed27f3`, `ba3b7ff`, and `cc6648a` added one frozen
+operator-visible host identity, existing-only readiness providers with revision
+and admission fencing, and the atomic idle-shutdown actor. The CLI defaults to a
+30-minute timeout, supports the bounded configured range, accounts for both
+directions of protocol activity, and uses the ordinary coalesced disposer only
+after readiness and transport admission seal in one host-local transaction. The
+full design and acceptance contract are recorded in the
+[host identity](../../docs/plans/2026-08-04-launch-ergonomics-13-mcp-host-identity.md),
+[idle readiness](../../docs/plans/2026-08-04-launch-ergonomics-14-mcp-idle-readiness.md),
+and [idle shutdown](../../docs/plans/2026-08-04-launch-ergonomics-15-mcp-idle-shutdown.md)
+plans.
+
+**Verification:** The implementation passed its focused, stage 3, stage 4,
+cross-cutting, full-suite, typecheck, build, package, MCP verification,
+protocol/manifest, and unused-code gates. The focused idle suite passed 30/30 in
+the final live-validation session. A live exact-owned Workbench kept its MCP host
+open beyond a 60-second idle deadline and then shut down through its exact-owned
+surface with final process and port vacancy. A standalone production host using
+an isolated Observer root committed idle shutdown after 60.4 seconds, exited with
+code 0, and left no child behind. A default-root run with incomplete historical
+runtime evidence remained open and performed no automatic lifecycle mutation,
+confirming the fail-closed side of the contract; the resulting recovery
+limitation is tracked separately as MCP-056.
+
 ## MCP-052 - add a guarded compile-only Enforce Script check
 
 **Status:** Resolved
