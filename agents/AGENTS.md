@@ -287,10 +287,13 @@ Inspect the capture itself and record what it proves and does not prove.
    isolated managed/profile root and MCP lifecycle.
 4. For an external launcher or primitive diagnosis, call
    **observer_prepare_launch** and retain its sessionId and preparedLaunchId.
-   Preparation is data-only and assigns a session-specific `-logsDir`; do not
-   replace it. **observer_runtime** action=start consumes preparedLaunchId and
-   returns runtimeId; external launching may instead use the prepared argument
-   array. These primitives remain public and are not replaced by the composite.
+   Preparation starts no game process and assigns a session-specific
+   `-logsDir`; do not replace it. **observer_runtime** action=start consumes
+   preparedLaunchId and returns runtimeId. An external launcher may instead
+   invoke the returned executablePath directly with each prepared argument as
+   a separate unchanged token, without a shell. That path does not confer
+   process ownership or spawn-time identity proof. These primitives remain
+   public and are not replaced by the composite.
 5. Call **observer_instances** with the runtime sessionId when explicit
    selection is needed and retain its opaque target.
 6. Call **observer_capture** with the target and requested view. Omit runId to

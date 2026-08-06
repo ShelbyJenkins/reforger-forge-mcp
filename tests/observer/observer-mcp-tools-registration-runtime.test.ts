@@ -8,6 +8,13 @@ import {
 import { createToolHarness, toolApplication, toolRegistry } from "./application-diagnostics-fixture.js";
 import { deriveObserverRuntimeIdempotencyKey } from "../../src/tools/observer-runtime.js";
 
+function payload(result: { content: Array<{ text?: string }> }): Record<string, unknown> {
+  const text = result.content[0]?.text ?? "";
+  const match = /```json\n([\s\S]+)\n```$/.exec(text);
+  if (!match) throw new Error(`Expected JSON tool payload: ${text}`);
+  return JSON.parse(match[1]) as Record<string, unknown>;
+}
+
 describe("observer MCP tools", () => {
   it("passes configured Workbench addon roots into launch preparation before caller arguments", async () => {
     const prepareLaunch = vi.fn(async (input: Record<string, unknown>) => ({
@@ -23,7 +30,10 @@ describe("observer MCP tools", () => {
       stagedAddon: { reused: true },
     }));
     const coordinator = toolApplication({ prepareLaunch, revokeSession: vi.fn() });
+    const resolveRuntimeExecutablePath = vi.fn(() =>
+      "C:/game/ArmaReforgerSteamDiag.exe");
     const manager = {
+      resolveRuntimeExecutablePath,
       recordPreparedLaunch: vi.fn(async () => "pl-00000000-0000-4000-8000-000000000002"),
     } as unknown as OwnedRuntimeManager;
     const registry = toolRegistry(
@@ -48,6 +58,27 @@ describe("observer MCP tools", () => {
     }, { signal: new AbortController().signal });
 
     expect(result.isError).not.toBe(true);
+    expect(resolveRuntimeExecutablePath).toHaveBeenCalledWith("listenServer");
+    expect(resolveRuntimeExecutablePath.mock.invocationCallOrder[0])
+      .toBeLessThan(prepareLaunch.mock.invocationCallOrder[0]);
+    expect(payload(result)).toMatchObject({
+      executablePath: "C:/game/ArmaReforgerSteamDiag.exe",
+      arguments: [
+        "-addonsDir", "C:/game/addons,C:/workshop/addons",
+        "-server", "-addonsDir", "C:/caller/addons",
+      ],
+      preparedLaunchId: "pl-00000000-0000-4000-8000-000000000002",
+      sessionId: "session-configured-addons",
+    });
+    for (const ownershipField of [
+      "executableFile",
+      "executableEvidenceDigest",
+      "ownerTokenArgument",
+      "pid",
+      "identityVacant",
+    ]) {
+      expect(payload(result)).not.toHaveProperty(ownershipField);
+    }
     expect(prepareLaunch).toHaveBeenCalledWith(expect.objectContaining({
       arguments: [
         "-addonsDir", "C:/game/addons,C:/workshop/addons",
@@ -59,6 +90,43 @@ describe("observer MCP tools", () => {
         justification: "Native fullscreen is unavailable on the remote display.",
       },
     }));
+  });
+
+  it("fails executable resolution before private preparation or durable recording", async () => {
+    const prepareLaunch = vi.fn();
+    const revokeSession = vi.fn();
+    const recordPreparedLaunch = vi.fn();
+    const resolveRuntimeExecutablePath = vi.fn(() => {
+      throw new OwnedRuntimeError(
+        "RUNTIME_NOT_FOUND",
+        "No allowlisted graphical executable exists beneath the configured game path",
+        undefined,
+        "runtime_executable_missing",
+      );
+    });
+    const registry = toolRegistry(
+      toolApplication({ prepareLaunch, revokeSession }),
+      { resolveRuntimeExecutablePath, recordPreparedLaunch } as unknown as OwnedRuntimeManager,
+    );
+
+    const result = await registry.get("observer_prepare_launch")!.handler({
+      runtimeKind: "client",
+      arguments: [],
+      profilePath: "C:/profiles/missing-runtime",
+      sessionTtlMs: 60_000,
+      transportPreference: ["rest"],
+      forceUpdate: true,
+      noFocus: true,
+    }, { signal: new AbortController().signal });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("RUNTIME_NOT_FOUND");
+    expect(result.content[0].text).toContain("correct the configured game path");
+    expect(result.content[0].text!.length).toBeLessThanOrEqual(512);
+    expect(resolveRuntimeExecutablePath).toHaveBeenCalledWith("client");
+    expect(prepareLaunch).not.toHaveBeenCalled();
+    expect(recordPreparedLaunch).not.toHaveBeenCalled();
+    expect(revokeSession).not.toHaveBeenCalled();
   });
 
   it.each(["-window", "-screenWidth", "-screenHeight=720"])(
@@ -147,6 +215,7 @@ describe("observer MCP tools", () => {
     ]);
     for (const tool of tools.values()) expect(tool.definition.description?.length).toBeGreaterThan(40);
     const prepare = tools.get("observer_prepare_launch")!;
+    expect(prepare.definition.description).toContain("canonical executablePath");
     expect(prepare.definition.description).toContain("native borderless-fullscreen window by default");
     expect(prepare.definition.description).toContain("forceNonNativeWindowSize");
     const override = prepare.definition.inputSchema!.forceNonNativeWindowSize;

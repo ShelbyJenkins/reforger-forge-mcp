@@ -83,7 +83,7 @@ schemas are the authoritative API surface; the operator call order is in
 |---|---|
 | `game_launch` | Resolves canonical project/world/add-on/executable evidence and delegates start/status/stop only to the exact-owned runtime manager. |
 | `observer_setup` | Stages, inspects, or removes managed companions without launching or signaling an Arma Reforger or Workbench process. |
-| `observer_prepare_launch` | Creates an expiring runtime activation session and structured arguments without starting the runtime. |
+| `observer_prepare_launch` | Resolves a canonical executable path and creates an expiring runtime activation session with structured arguments, without starting the runtime. |
 | `observer_runtime` | Explicitly starts, inspects, or restoration-gated stops an exact-owned graphical runtime on Windows. |
 | `observer_instances` | Reports live or stale renderers, capabilities, world identity, health, and active work. |
 | `observer_capture` | Submits a current, pose, or look-at transaction, optionally attached to an active or explicit managed run. |

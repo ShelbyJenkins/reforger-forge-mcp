@@ -47,6 +47,18 @@ describe("observer refusal remedy policy", () => {
 
   it("keeps runtime-not-found remedies action and producer-reason specific", () => {
     expect(resolve("RUNTIME_NOT_FOUND", {
+      tool: "observer_prepare_launch",
+      action: "prepare",
+      reason: "runtime_executable_missing",
+    })).toEqual({
+      kind: "external",
+      action: "configure_runtime_executable",
+    });
+    expect(resolve("RUNTIME_NOT_FOUND", {
+      tool: "observer_prepare_launch",
+      action: "prepare",
+    })).toBeNull();
+    expect(resolve("RUNTIME_NOT_FOUND", {
       tool: "observer_runtime",
       action: "start",
     })).toBeNull();

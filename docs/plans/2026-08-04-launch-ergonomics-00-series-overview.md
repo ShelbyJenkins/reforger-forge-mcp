@@ -91,10 +91,9 @@ linearly dependent:
 Each numbered document is the authoritative implementation task for that step,
 including its own scope, validation, and acceptance criteria.
 
-One piece is still worth taking, if you want it cheap: returning the resolved executable path alongside the argv that observer_prepare_launch already returns. Read-only, no file written, no ownership claim, no vacancy proof, no TOCTOU. It closes the docs/observer.md:100-103 gap where the docs say "pass the returned arguments unchanged to your own launcher" but don't tell you what to launch. That's the honest 10% of the idea that carries none of the risk — and it's a field addition, not a phase.
 
-can we move all the related planning docs for this project into their own directory in docs/plans and remove/cleanup any unnessecary docs - for exafsple this doc and docs\plans\2026-08-03-mcp-lifecycle-option-a.md can be merged.
+can we move all the related planning docs for this project into their own directory in docs/plans and remove/cleanup any unnessecary docs - for example this doc and docs\plans\2026-08-03-mcp-lifecycle-option-a.md can be merged.
 
-also, tell me the added line count in docs, code, non-test code, and test code 
+
 
 after this we need to perform an ultra mode adverserial code review before merging with main

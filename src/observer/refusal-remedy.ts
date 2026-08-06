@@ -114,6 +114,14 @@ export const resolveObserverRefusalRemedy: ObserverRefusalRemedyResolver = ({
   }
 
   if (code === "RUNTIME_NOT_FOUND" &&
+      context.tool === "observer_prepare_launch" &&
+      context.action === "prepare") {
+    return context.reason === "runtime_executable_missing"
+      ? { kind: "external", action: "configure_runtime_executable" }
+      : null;
+  }
+
+  if (code === "RUNTIME_NOT_FOUND" &&
       (context.tool === "observer_runtime" || context.tool === "game_launch")) {
     if (context.action === "start") {
       return context.reason === "runtime_executable_missing"

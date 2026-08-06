@@ -39,6 +39,11 @@ instead of silently changing requested quality.
   `forceNonNativeWindowSize` object requires bounded dimensions and a written
   justification; capture output bounds replace launch-window shrinking for
   screenshot-size control.
+- `observer_prepare_launch` now returns the canonical `executablePath`
+  alongside its structured `arguments`, so external launchers can invoke the
+  configured runtime directly without reconstructing its installation path.
+  This is resolution-time guidance only and does not confer process ownership
+  or spawn-time executable attestation.
 
 ## Validation
 

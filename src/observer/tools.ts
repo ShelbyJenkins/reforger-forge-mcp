@@ -11,7 +11,10 @@ import { ObserverApplicationError } from "./errors.js";
 import { prepareObserverLaunch } from "./launch.js";
 import { runObserverSetup } from "./setup.js";
 import type { WorkbenchClient } from "../workbench/client.js";
-import type { OwnedRuntimeManager } from "./owned-runtime-manager.js";
+import {
+  OwnedRuntimeError,
+  type OwnedRuntimeManager,
+} from "./owned-runtime-manager.js";
 import { registerGameLaunch } from "../tools/game-launch.js";
 import { registerObserverRuntime } from "../tools/observer-runtime.js";
 import {
@@ -141,8 +144,9 @@ function jsonText(heading: string, value: unknown): string {
   return `${heading}\n\n\`\`\`json\n${JSON.stringify(value, null, 2)}\n\`\`\``;
 }
 
-function extractObserverApplicationError(error: unknown): PublicObserverErrorCandidate | undefined {
-  if (!(error instanceof ObserverApplicationError)) return undefined;
+function extractObserverToolError(error: unknown): PublicObserverErrorCandidate | undefined {
+  if (!(error instanceof ObserverApplicationError) &&
+      !(error instanceof OwnedRuntimeError)) return undefined;
   return {
     code: error.code,
     readDiagnosticMessage: () => error.message,
@@ -156,10 +160,11 @@ function toolError(error: unknown, context: ObserverRefusalContext) {
       type: "text" as const,
       text: projectPublicObserverToolError(error, {
         subject: "Observer error",
-        extract: extractObserverApplicationError,
+        extract: extractObserverToolError,
         remedyContext: context,
         resolveRemedy: resolveObserverRefusalRemedy,
-        readRemedyContext: () => error instanceof ObserverApplicationError
+        readRemedyContext: () => error instanceof ObserverApplicationError ||
+          error instanceof OwnedRuntimeError
           ? error.details
           : undefined,
       }),
@@ -283,7 +288,7 @@ export function registerObserverTools(
     "observer_prepare_launch",
     {
       description:
-        "Prepare an Arma Reforger launch for the staged observer addon and an exclusive profile session; no process is started. Graphical launches use the engine's native borderless-fullscreen window by default. Raw -window, -screenWidth, and -screenHeight arguments are refused. Use forceNonNativeWindowSize only when native fullscreen cannot be used for a compelling reason; screenshot size is handled by observer_capture image bounds and is not a reason to shrink the launch. Defaults -noFocus and -forceUpdate keep the fullscreen runtime from stealing startup focus.",
+        "Prepare an Arma Reforger launch for the staged observer addon and an exclusive profile session; no process is started. Returns the canonical executablePath and structured argument tokens for an external launcher. Graphical launches use the engine's native borderless-fullscreen window by default. Raw -window, -screenWidth, and -screenHeight arguments are refused. Use forceNonNativeWindowSize only when native fullscreen cannot be used for a compelling reason; screenshot size is handled by observer_capture image bounds and is not a reason to shrink the launch. Defaults -noFocus and -forceUpdate keep the fullscreen runtime from stealing startup focus.",
       inputSchema: {
         runtimeKind: z.enum(["client", "listenServer", "dedicated", "testRunner"]),
         arguments: z.array(z.string().max(32_768)).max(512).default([]).describe(
@@ -305,6 +310,12 @@ export function registerObserverTools(
         : "display_arguments" as const;
       try {
         assertNativeFullscreenLaunch(input);
+        // Resolve before private preparation so an invalid configured target
+        // cannot leave behind a session or durable prepared-launch record.
+        // The returned path is launcher guidance only; managed start still
+        // performs its own executable re-resolution and identity checks.
+        const executablePath = defaults.ownedRuntimeManager
+          ?.resolveRuntimeExecutablePath(input.runtimeKind);
         const prepared = await prepareObserverLaunch(
           application,
           {
@@ -316,12 +327,21 @@ export function registerObserverTools(
           },
           defaults.ownedRuntimeManager
         );
-        return { content: [{ type: "text" as const, text: jsonText("Observer launch arguments prepared; no process was started.", prepared) }] };
+        const result = executablePath === undefined
+          ? prepared
+          : { executablePath, ...prepared };
+        return { content: [{ type: "text" as const, text: jsonText("Observer launch target and arguments prepared; no process was started.", result) }] };
       } catch (error) {
+        const ownedRuntimeReason = error instanceof OwnedRuntimeError
+          ? error.remedyReason
+          : undefined;
+        const selectedRemedyReason = remedyReason ?? ownedRuntimeReason;
         return toolError(error, {
           tool: "observer_prepare_launch",
           action: "prepare",
-          ...(remedyReason === undefined ? {} : { reason: remedyReason }),
+          ...(selectedRemedyReason === undefined
+            ? {}
+            : { reason: selectedRemedyReason }),
         });
       }
     }

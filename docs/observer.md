@@ -117,9 +117,10 @@ own final executable identity verification.
 
 For an external launcher or low-level diagnosis, `observer_prepare_launch`
 remains available. Supply normal graphical runtime arguments and an exclusive,
-Observer-approved outer `profilePath`. It returns prepared argument tokens, an
-opaque `preparedLaunchId`, and session metadata without starting the game. It
-also assigns one relative, session-specific `-logsDir` whose physical log is
+Observer-approved outer `profilePath`. It returns the canonical
+`executablePath`, prepared argument tokens, an opaque `preparedLaunchId`, and
+session metadata without starting the game. It also assigns one relative,
+session-specific `-logsDir` whose physical log is
 `<profilePath>/profile/logs/observer-<sessionId>/script.log`; caller-supplied
 `-logsDir` values are refused.
 
@@ -135,10 +136,15 @@ present only when native fullscreen cannot be used for a compelling external
 reason. Screenshot size is not such a reason: use the `observer_capture.image`
 output bounds described below while leaving the launched renderer fullscreen.
 
-You can pass primitive preparation arguments unchanged to your own launcher. On
-Windows, `observer_runtime action: "start"` consumes its `preparedLaunchId` and
-returns the `runtimeId`; this primitive path remains public and is not replaced
-by `game_launch`.
+For an external launcher, invoke the returned `executablePath` directly and
+pass each returned `arguments` entry unchanged as a separate argument token;
+do not concatenate them into a shell command. The path is resolution-time
+launcher guidance only. It does not make an externally launched process owned,
+attest the executable at spawn time, or prove process vacancy. On Windows,
+`observer_runtime action: "start"` consumes only the `preparedLaunchId`,
+independently re-resolves and verifies the executable, and returns the
+`runtimeId`; this primitive path remains public and is not replaced by
+`game_launch`.
 
 Retain the **`sessionId` returned by either launch path** for inventory and the
 legacy explicit-capture form. The preferred opaque inventory target carries
@@ -377,7 +383,7 @@ game process.
 |---|---|
 | `observer_setup` | Inspect, stage, or uninstall managed observer companions. |
 | `game_launch` | Plan, start, inspect, or stop one fail-closed exact-owned graphical runtime. |
-| `observer_prepare_launch` | Produce instrumented runtime arguments and a runtime capture session. |
+| `observer_prepare_launch` | Produce a canonical runtime executable path, instrumented argument tokens, and a runtime capture session. |
 | `observer_runtime` | Start, inspect, or stop an exact-owned Windows runtime. |
 | `observer_instances` | Find compatible runtime or Workbench renderers and obtain world bindings. |
 | `observer_capture` | Submit a current, pose, or look-at capture, optionally attached to an active or explicit run. |
