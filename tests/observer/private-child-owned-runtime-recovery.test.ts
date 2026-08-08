@@ -100,6 +100,7 @@ type ReleaseFault = "none" | "before_delivery" | "after_application";
 
 class FaultingApplicationGate implements OwnedRuntimeObserverGate {
   releaseAttempts = 0;
+  readonly releaseResults: Record<string, unknown>[] = [];
 
   constructor(
     private readonly application: ObserverApplication,
@@ -121,6 +122,7 @@ class FaultingApplicationGate implements OwnedRuntimeObserverGate {
     this.releaseFault = "none";
     if (fault === "before_delivery") throw new Error("fixture lost release before IPC delivery");
     const result = await this.application.releaseRuntimeLifecycle(sessionId, runtimeId, generation);
+    this.releaseResults.push(result);
     if (fault === "after_application") throw new Error("fixture lost release response after application");
     return result;
   }
@@ -639,6 +641,9 @@ describe("actual private-child owned-runtime recovery boundary", () => {
   }, "before_delivery", 1_000), 20_000);
 
   it("replays the exact generation idempotently when release applied but its response was lost", async () => withBoundaryHarness(async (value) => {
+    // This case verifies response-loss replay, not tombstone expiry. Keep the
+    // release acknowledgement beyond the test budget so the private child's
+    // 100 ms automatic sweep cannot retire the exact proof before it is read.
     const prepared = await value.prepare("release-response-lost");
     const managerInternals = value.manager as unknown as {
       atomicWrite(root: string, target: string, record: unknown, exclusive: boolean, durable?: boolean): void;
@@ -661,6 +666,11 @@ describe("actual private-child owned-runtime recovery boundary", () => {
     // exact release-acknowledged tombstone (the exact runtimeId/sessionId/
     // generation binding is verified through the MCP pending record below).
     expect(await authorityStats(value)).toMatchObject({ retained: 0, releaseAcknowledged: 1 });
+    expect(value.gate.releaseResults).toEqual([{
+      released: true,
+      alreadyReleased: false,
+      generation: pending.record.lifecycleGeneration,
+    }]);
 
     await expect(value.manager.start({
       preparedLaunchId: prepared.preparedLaunchId,
@@ -671,5 +681,22 @@ describe("actual private-child owned-runtime recovery boundary", () => {
       state: "release_acknowledged",
       lifecycleGeneration: pending.record.lifecycleGeneration,
     });
-  }, "after_application"), 15_000);
+    expect(value.gate.releaseResults).toEqual([
+      {
+        released: true,
+        alreadyReleased: false,
+        generation: pending.record.lifecycleGeneration,
+      },
+      {
+        released: false,
+        alreadyReleased: true,
+        generation: pending.record.lifecycleGeneration,
+      },
+    ]);
+    expect(await authorityStats(value)).toMatchObject({
+      records: 1,
+      retained: 0,
+      releaseAcknowledged: 1,
+    });
+  }, "after_application", 60_000), 15_000);
 });

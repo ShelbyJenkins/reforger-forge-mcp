@@ -290,7 +290,7 @@ describe("shared project MCP stdio launcher", () => {
       verifyInvocation.slice(verifyInvocation.indexOf(sharedMarker))
     );
 
-    for (const rejectedValue of ["59999", "86400001"]) {
+    for (const rejectedValue of ["59999", "60000.5", "86400001"]) {
       const rejected = runScript(sharedLauncher, [
         "-Mode", "Describe",
         "-McpIdleShutdownMs", rejectedValue,

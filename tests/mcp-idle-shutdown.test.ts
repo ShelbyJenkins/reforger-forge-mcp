@@ -187,6 +187,11 @@ describe("MCP idle shutdown controller", () => {
 
     await value.time.advanceBy(60_000);
     expect(value.shutdown).not.toHaveBeenCalled();
+    expect(value.controller.diagnostic()).toMatchObject({
+      state: "blocked",
+      readinessComplete: false,
+      blockerCodes: ["REQUEST_ACTIVE"],
+    });
     expect(value.time.activeCount()).toBe(0);
 
     finish();
@@ -194,6 +199,36 @@ describe("MCP idle shutdown controller", () => {
     expect(value.time.timers.find((timer) => !timer.cancelled)?.at).toBe(120_000);
     await value.time.advanceBy(60_000);
     await vi.waitFor(() => expect(value.shutdown).toHaveBeenCalledOnce());
+  });
+
+  it("keeps a never-settled request diagnostically visible while dormant", async () => {
+    const value = harness();
+    value.activity.beginSend({
+      jsonrpc: "2.0",
+      id: "never-settled",
+      method: "roots/list",
+      params: {},
+    }).complete(true);
+    value.controller.start();
+
+    await value.time.advanceBy(60_000);
+    expect(value.readiness.inspectIdleShutdownReadiness).not.toHaveBeenCalled();
+    expect(value.controller.diagnostic()).toMatchObject({
+      state: "blocked",
+      activeRequestCount: 1,
+      readinessComplete: false,
+      blockerCodes: ["REQUEST_ACTIVE"],
+    });
+    expect(value.time.activeCount()).toBe(0);
+
+    await value.time.advanceBy(30_000);
+    expect(value.readiness.inspectIdleShutdownReadiness).not.toHaveBeenCalled();
+    expect(value.controller.diagnostic()).toMatchObject({
+      state: "blocked",
+      activeRequestCount: 1,
+      blockerCodes: ["REQUEST_ACTIVE"],
+    });
+    expect(value.time.activeCount()).toBe(0);
   });
 
   it("holds an outbound server request through the deadline until its client result", async () => {

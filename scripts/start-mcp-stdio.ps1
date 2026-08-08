@@ -26,8 +26,20 @@ param(
 
     [switch]$WorkbenchScriptAuthorizeAll,
 
-    [ValidateRange(60000, 86400000)]
-    [long]$McpIdleShutdownMs
+    [ValidateScript({
+        $ParsedIdleShutdownMs = 0L
+        $IsInteger = [long]::TryParse(
+            [string]$_,
+            [System.Globalization.NumberStyles]::None,
+            [System.Globalization.CultureInfo]::InvariantCulture,
+            [ref]$ParsedIdleShutdownMs
+        )
+        if (-not $IsInteger -or $ParsedIdleShutdownMs -lt 60000 -or $ParsedIdleShutdownMs -gt 86400000) {
+            throw "McpIdleShutdownMs must be an integer from 60000 through 86400000. Received: $_"
+        }
+        return $true
+    })]
+    [string]$McpIdleShutdownMs
 )
 
 Set-StrictMode -Version Latest

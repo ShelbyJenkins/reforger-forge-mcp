@@ -13,10 +13,19 @@ import type { BigIntStats, Dirent } from "node:fs";
 import { extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { sha256Hex } from "../foundation/digest.js";
 import {
-  isPathContained,
+  sameUsableFileIdentity,
+  type BigIntFileIdentity,
+} from "../foundation/file-identity.js";
+import {
+  isCanonicalPathContained,
   ManagedPathError,
   resolveManagedPath,
 } from "../foundation/managed-path.js";
+import {
+  readWindowsFileThroughVerifiedHandle,
+  WindowsSameHandleFileError,
+  type WindowsSameHandleFileRead,
+} from "../platform/windows/same-handle-file.js";
 import type { CanonicalProjectIdentity } from "../workbench/project-identity.js";
 import {
   revalidateProjectIdentity,
@@ -33,7 +42,7 @@ import {
   type GameWorldRegistrationStatus,
 } from "./game-launch-errors.js";
 
-export const GAME_WORLD_EVIDENCE_SCHEMA_VERSION = 1;
+export const GAME_WORLD_EVIDENCE_SCHEMA_VERSION = 2;
 export const GAME_WORLD_PROJECT_MAXIMUM_BYTES = 4 * 1024 * 1024;
 export const GAME_WORLD_FILE_MAXIMUM_BYTES = 64 * 1024 * 1024;
 
@@ -63,6 +72,10 @@ export interface GameWorldFileIdentity {
 }
 
 export interface GameWorldFileEvidence extends GameWorldFileIdentity {
+  /** Complete FILE_ID_INFO volume identity; on non-Windows this equals device. */
+  readonly volumeIdentity: string;
+  /** Complete unsigned FILE_ID_INFO identifier; on non-Windows this equals inode. */
+  readonly fileId: string;
   readonly sha256: string;
 }
 
@@ -110,6 +123,22 @@ export interface ResolveGameWorldPlanOptions {
   readonly project: CanonicalProjectIdentity;
   readonly world?: string | null;
   readonly discoveryLimits?: Partial<GameWorldDiscoveryLimits>;
+  /** @internal Deterministic test seam; production composition never supplies it. */
+  readonly testHooks?: GameWorldPlanTestHooks;
+}
+
+export type GameWorldPlanTestCheckpoint =
+  | "before_file_open"
+  | "after_directory_read"
+  | "before_final_evidence_stat";
+
+/** @internal Fault-injection checkpoints used to prove race refusals deterministically. */
+export interface GameWorldPlanTestHooks {
+  readonly checkpoint?: (checkpoint: GameWorldPlanTestCheckpoint, path: string) => void;
+  readonly fileIdentity?: (
+    path: string,
+    identity: Readonly<BigIntFileIdentity>,
+  ) => BigIntFileIdentity;
 }
 
 interface ResolvedWorldInput {
@@ -132,6 +161,7 @@ interface MutableDiscoveryState {
   readonly limits: GameWorldDiscoveryLimits;
   readonly candidates: DiscoveryCandidate[];
   readonly directories: GameWorldDirectoryEvidence[];
+  readonly testHooks: GameWorldPlanTestHooks | undefined;
   visitedEntries: number;
   verificationEntries: number;
   metadataBytes: number;
@@ -141,18 +171,23 @@ const FORMED_WORLD = /^\{([0-9A-Fa-f]{16})\}(.+)$/;
 const SHA256 = /^[0-9a-f]{64}$/;
 const GUID = /^[0-9A-F]{16}$/;
 
-function sameFile(left: BigIntStats, right: BigIntStats): boolean {
-  if (left.dev === 0n && left.ino === 0n) return true;
-  if (right.dev === 0n && right.ino === 0n) return true;
-  return left.dev === right.dev && left.ino === right.ino;
-}
-
 function sameIdentity(left: BigIntStats, right: BigIntStats): boolean {
-  return sameFile(left, right) &&
+  return sameUsableFileIdentity(left, right) &&
     left.size === right.size &&
     left.mtimeNs === right.mtimeNs &&
     left.ctimeNs === right.ctimeNs &&
     left.birthtimeNs === right.birthtimeNs;
+}
+
+function sameOpenedFileIdentity(
+  left: BigIntStats,
+  right: BigIntStats,
+  path: string,
+  testHooks: GameWorldPlanTestHooks | undefined,
+): boolean {
+  const leftIdentity = testHooks?.fileIdentity?.(path, { dev: left.dev, ino: left.ino }) ?? left;
+  const rightIdentity = testHooks?.fileIdentity?.(path, { dev: right.dev, ino: right.ino }) ?? right;
+  return sameUsableFileIdentity(leftIdentity, rightIdentity);
 }
 
 function identityFrom(stat: BigIntStats): GameWorldFileIdentity {
@@ -167,7 +202,26 @@ function identityFrom(stat: BigIntStats): GameWorldFileIdentity {
 }
 
 function fileEvidenceFrom(stat: BigIntStats, sha256: string): GameWorldFileEvidence {
-  return Object.freeze({ ...identityFrom(stat), sha256 });
+  return Object.freeze({
+    ...identityFrom(stat),
+    volumeIdentity: stat.dev.toString(),
+    fileId: stat.ino.toString(),
+    sha256,
+  });
+}
+
+function windowsFileEvidenceFrom(read: WindowsSameHandleFileRead): GameWorldFileEvidence {
+  return Object.freeze({
+    byteLength: read.byteLength,
+    device: read.device,
+    inode: read.inode,
+    volumeIdentity: read.volumeIdentity,
+    fileId: read.fileId,
+    modifiedNanoseconds: read.modifiedNanoseconds,
+    changedNanoseconds: read.changedNanoseconds,
+    birthNanoseconds: read.birthNanoseconds,
+    sha256: read.sha256,
+  });
 }
 
 function directoryEvidenceFrom(
@@ -228,6 +282,7 @@ function stableFileRead(
   maximumBytes: number,
   label: string,
   failureCode: "PROJECT_CHANGED" | "WORLD_INVALID" | "WORLD_CHANGED",
+  testHooks?: GameWorldPlanTestHooks,
 ): StableFileRead {
   const failure = (message: string, cause?: unknown): GameLaunchPlanError =>
     new GameLaunchPlanError(failureCode, `${label} ${message}: ${path}`, { cause });
@@ -244,12 +299,41 @@ function stableFileRead(
     throw failure(`exceeds its ${maximumBytes}-byte evidence limit`);
   }
 
+  testHooks?.checkpoint?.("before_file_open", path);
+  if (process.platform === "win32") {
+    const expectedPathIdentity = testHooks?.fileIdentity?.(
+      path,
+      { dev: initial.dev, ino: initial.ino },
+    ) ?? initial;
+    try {
+      const read = readWindowsFileThroughVerifiedHandle({
+        path,
+        maximumBytes,
+        includeBytes: false,
+        expectedPathIdentity,
+        expectedByteLength: Number(initial.size),
+        expectedModifiedNanoseconds: initial.mtimeNs.toString(),
+        expectedChangedNanoseconds: initial.ctimeNs.toString(),
+        expectedBirthNanoseconds: initial.birthtimeNs.toString(),
+      });
+      return { evidence: windowsFileEvidenceFrom(read) };
+    } catch (error) {
+      if (error instanceof WindowsSameHandleFileError && error.code === "OVERSIZE") {
+        throw failure(`exceeds its ${maximumBytes}-byte evidence limit`, error);
+      }
+      const reason = error instanceof WindowsSameHandleFileError
+        ? `cannot establish a verified same-handle Windows boundary (${error.code})`
+        : "cannot establish a verified same-handle Windows boundary";
+      throw failure(reason, error);
+    }
+  }
+
   const noFollow = (constants as typeof constants & { O_NOFOLLOW?: number }).O_NOFOLLOW ?? 0;
   let descriptor: number | undefined;
   try {
     descriptor = openSync(path, constants.O_RDONLY | noFollow);
     const opened = fstatSync(descriptor, { bigint: true });
-    if (!opened.isFile() || !sameFile(initial, opened)) {
+    if (!opened.isFile() || !sameOpenedFileIdentity(initial, opened, path, testHooks)) {
       throw failure("changed identity while being opened");
     }
     if (opened.size > BigInt(maximumBytes)) {
@@ -346,7 +430,7 @@ function assertCanonicalContainedFile(
       { cause: error },
     );
   }
-  if (!isPathContained(project.modDirectory, canonical) ||
+  if (!isCanonicalPathContained(project.modDirectory, canonical) ||
       resolve(canonical) !== resolve(noLinkPath)) {
     throw unsafeWorld(`${label} resolves outside the selected project: ${candidate}`);
   }
@@ -433,7 +517,7 @@ function fixedIdentity(value: GameWorldFileIdentity): readonly (number | string)
 }
 
 function fixedFile(value: GameWorldFileEvidence | ResourceMetaFileEvidence): readonly unknown[] {
-  return [...fixedIdentity(value), value.sha256];
+  return [...fixedIdentity(value), value.volumeIdentity, value.fileId, value.sha256];
 }
 
 function fixedSelection(value: GameWorldSelectionEvidence): readonly unknown[] {
@@ -510,6 +594,7 @@ function buildSnapshot(
   project: CanonicalProjectIdentity,
   worldPath: string,
   selection: GameWorldSelectionEvidence,
+  testHooks?: GameWorldPlanTestHooks,
 ): GameWorldPlanSnapshot {
   const canonicalWorld = assertCanonicalContainedFile(project, worldPath, "Game world");
   if (extname(canonicalWorld).toLowerCase() !== ".ent") {
@@ -527,12 +612,14 @@ function buildSnapshot(
     GAME_WORLD_PROJECT_MAXIMUM_BYTES,
     "Game project",
     "PROJECT_CHANGED",
+    testHooks,
   ).evidence;
   const worldFile = stableFileRead(
     canonicalWorld,
     GAME_WORLD_FILE_MAXIMUM_BYTES,
     "Game world",
     "WORLD_CHANGED",
+    testHooks,
   ).evidence;
   let meta;
   try {
@@ -544,9 +631,17 @@ function buildSnapshot(
   const metaPath = assertCanonicalContainedFile(project, metaCandidate, "Game world metadata");
   postReadPathCheck(project, canonicalWorld, "Game world");
   postReadPathCheck(project, metaPath, "Game world metadata");
-  const currentProject = lstatSync(project.displayPath, { bigint: true });
-  const currentWorld = lstatSync(canonicalWorld, { bigint: true });
-  const currentMeta = lstatSync(metaPath, { bigint: true });
+  let currentProject: BigIntStats;
+  let currentWorld: BigIntStats;
+  let currentMeta: BigIntStats;
+  try {
+    testHooks?.checkpoint?.("before_final_evidence_stat", canonicalWorld);
+    currentProject = lstatSync(project.displayPath, { bigint: true });
+    currentWorld = lstatSync(canonicalWorld, { bigint: true });
+    currentMeta = lstatSync(metaPath, { bigint: true });
+  } catch (error) {
+    throw changed("Game project or world evidence could not be inspected after it was read.", error);
+  }
   if (!fileEvidenceMatchesStat(projectFile, currentProject) ||
       !fileEvidenceMatchesStat(worldFile, currentWorld) ||
       !metadataEvidenceMatchesStat(meta.evidence, currentMeta)) {
@@ -705,6 +800,7 @@ function scanDirectory(
   }
   const entries = readDirectoryEntries(path, state, "visitedEntries");
   const digest = listingDigest(entries);
+  state.testHooks?.checkpoint?.("after_directory_read", path);
 
   for (const entry of entries) {
     const child = join(path, entry.name);
@@ -781,6 +877,7 @@ function metadataStatusError(candidate: DiscoveryCandidate): GameLaunchPlanError
 function discoverWorld(
   project: CanonicalProjectIdentity,
   limits: GameWorldDiscoveryLimits,
+  testHooks?: GameWorldPlanTestHooks,
 ): { readonly path: string; readonly selection: DiscoveredGameWorldSelection } {
   let root: string;
   try {
@@ -810,6 +907,7 @@ function discoverWorld(
     limits,
     candidates: [],
     directories: [],
+    testHooks,
     visitedEntries: 0,
     verificationEntries: 0,
     metadataBytes: 0,
@@ -884,15 +982,15 @@ export function resolveGameWorldPlan(
   const options = resolveOptions(value, world, overrides);
   const project = assertCanonicalProject(options.project);
   if (options.world === undefined || options.world === null) {
-    const discovered = discoverWorld(project, discoveryLimits(options.discoveryLimits));
-    return buildSnapshot(project, discovered.path, discovered.selection);
+    const discovered = discoverWorld(project, discoveryLimits(options.discoveryLimits), options.testHooks);
+    return buildSnapshot(project, discovered.path, discovered.selection, options.testHooks);
   }
   const parsed = parseWorldInput(project, options.world);
   return buildSnapshot(project, parsed.requestedPath, {
     kind: "explicit",
     inputKind: parsed.inputKind,
     suppliedGuid: parsed.suppliedGuid,
-  });
+  }, options.testHooks);
 }
 
 function plainRecord(value: unknown): value is Record<string, unknown> {
@@ -910,15 +1008,19 @@ function validIdentity(value: unknown, shaRequired: boolean): boolean {
   for (const field of ["device", "inode", "modifiedNanoseconds", "changedNanoseconds", "birthNanoseconds"] as const) {
     if (typeof value[field] !== "string" || !/^\d+$/.test(value[field] as string)) return false;
   }
-  return !shaRequired || (typeof value.sha256 === "string" && SHA256.test(value.sha256));
+  if (/^0+$/.test(value.device as string) || /^0+$/.test(value.inode as string)) return false;
+  if (!shaRequired) return true;
+  return typeof value.volumeIdentity === "string" && /^[1-9]\d*$/.test(value.volumeIdentity) &&
+    typeof value.fileId === "string" && /^[1-9]\d*$/.test(value.fileId) &&
+    typeof value.sha256 === "string" && SHA256.test(value.sha256);
 }
 
 function validProject(value: unknown): value is CanonicalProjectIdentity {
   return plainRecord(value) &&
     typeof value.displayPath === "string" && isAbsolute(value.displayPath) &&
-    typeof value.comparisonKey === "string" && value.comparisonKey === value.displayPath.toLowerCase() &&
+    typeof value.comparisonKey === "string" && value.comparisonKey === value.displayPath &&
     typeof value.modDirectory === "string" && isAbsolute(value.modDirectory) &&
-    typeof value.modDirectoryKey === "string" && value.modDirectoryKey === value.modDirectory.toLowerCase();
+    typeof value.modDirectoryKey === "string" && value.modDirectoryKey === value.modDirectory;
 }
 
 function validLimits(value: unknown): value is GameWorldDiscoveryLimits {
@@ -961,8 +1063,8 @@ function assertSnapshot(value: unknown): asserts value is GameWorldPlanSnapshot 
       typeof value.worldPath !== "string" || !isAbsolute(value.worldPath) ||
       typeof value.metaPath !== "string" || !isAbsolute(value.metaPath) ||
       resolve(`${value.worldPath}.meta`) !== resolve(value.metaPath) ||
-      !isPathContained(value.project.modDirectory, value.worldPath) ||
-      !isPathContained(value.project.modDirectory, value.metaPath) ||
+      !isCanonicalPathContained(value.project.modDirectory, value.worldPath) ||
+      !isCanonicalPathContained(value.project.modDirectory, value.metaPath) ||
       !validIdentity(value.projectFile, true) ||
       !validIdentity(value.worldFile, true) ||
       !validIdentity(value.metaFile, true) ||

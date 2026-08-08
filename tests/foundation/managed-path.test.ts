@@ -6,11 +6,13 @@ import {
     writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
     canonicalizeExistingDirectory,
     canonicalizePotentialPath,
+    canonicalPathComparisonKey,
+    isCanonicalPathContained,
     ManagedPathError,
     resolveManagedPath,
 } from "../../src/foundation/managed-path.js";
@@ -29,6 +31,15 @@ function temporaryRoot(prefix: string): string {
 }
 
 describe("managed path policies", () => {
+    it("preserves case in canonical identity and containment boundaries", () => {
+        const root = canonicalPathComparisonKey(join(temporaryRoot("foundation-canonical-case-"), "Foo"));
+        const distinctSibling = join(dirname(root), "foo", "Worlds", "Outside.ent");
+
+        expect(canonicalPathComparisonKey(root)).toBe(root);
+        expect(isCanonicalPathContained(root, join(root, "Worlds", "Inside.ent"))).toBe(true);
+        expect(isCanonicalPathContained(root, distinctSibling)).toBe(false);
+    });
+
     it("keeps project paths on an explicit lexical trust boundary", () => {
         const parent = temporaryRoot("foundation-project-path-");
         const project = join(parent, "project");

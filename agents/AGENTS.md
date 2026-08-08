@@ -10,6 +10,7 @@ the setup documentation instead:
 
 - [Setup and configuration](../SETUP.md)
 - [AI client registration and troubleshooting](README.md)
+- [Codex worktree MCP development](CODEX_WORKTREE_MCP.md)
 - [Observer usage guide](../docs/observer.md)
 - [Standalone Workbench runner reference](../docs/runner-cli.md)
 
@@ -280,11 +281,12 @@ Inspect the capture itself and record what it proves and does not prove.
    a compelling external reason; the exceptional field requires bounded width,
    height, and a meaningful justification. Large screenshots are not a reason
    to shrink the renderer—bound `observer_capture.image` output instead.
-3. The baseline supports one initial launch family for each retained derived
-   profile. Retry the exact same request to recover a lost response. Never vary
-   inputs to force a relaunch: changed, stale, invalidated, expired, or terminal
-   evidence requires a future successor workflow or a deliberately fresh
-   isolated managed/profile root and MCP lifecycle.
+3. Each derived profile has one durable launch-attempt chain. Retry the exact
+   same request to recover a lost response. For a deliberate relaunch, first
+   complete `game_launch stop` or `observer_runtime stop`, then repeat the desired
+   start fields with the exact offered `afterRuntimeId`. Natural exit or status
+   alone is not successor proof. Changed retries, stale/invalidated evidence, and
+   unknown outcomes remain pinned and fail closed.
 4. For an external launcher or primitive diagnosis, call
    **observer_prepare_launch** and retain its sessionId and preparedLaunchId.
    Preparation starts no game process and assigns a session-specific

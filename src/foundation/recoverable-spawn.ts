@@ -74,6 +74,16 @@ export interface RecoverableSpawnOptions<
     child: Child,
     backend: ExactProcessBackend
   ) => Promise<Identity>;
+  /**
+   * Domain-specific verification that must run only after exact identity is
+   * durably journaled, but still before lifecycle retention or publication.
+   * A failure therefore leaves recovery authority for the spawned child.
+   */
+  readonly afterIdentityPersisted?: (
+    identity: Identity,
+    child: Child,
+    record: RecoverableSpawnRecord<Identity, Metadata>
+  ) => Promise<void>;
   /** Domain-specific retain/readiness work that must precede publication. */
   readonly beforePublish?: (
     identity: Identity,
@@ -244,6 +254,8 @@ export async function runRecoverableSpawn<
   assertRecordTransition(record, next);
   record = await options.journal.persist(record, next);
 
+  await assertFenceActive(fence);
+  await options.afterIdentityPersisted?.(identity, child, record);
   await assertFenceActive(fence);
   await options.beforePublish?.(identity, child, record);
   await assertFenceActive(fence);

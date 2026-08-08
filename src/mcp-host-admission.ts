@@ -16,6 +16,8 @@ export interface McpIdleSealProof {
 export interface McpHostAdmissionSnapshot {
   readonly state: "open" | "sealed";
   readonly activeTokens: number;
+  /** Disposer-authorized work currently running outside ordinary admission. */
+  readonly privilegedCleanupCount: number;
   readonly revision: number;
 }
 
@@ -68,6 +70,7 @@ export class McpHostAdmissionGate implements McpAdmissionRevisionSource {
   private readonly proofs = new WeakMap<object, IssuedProof>();
   private revision = 0;
   private sealed = false;
+  private privilegedCleanupCount = 0;
 
   acquire(description: string): McpHostAdmissionToken {
     assertDescription(description);
@@ -88,15 +91,26 @@ export class McpHostAdmissionGate implements McpAdmissionRevisionSource {
     }
   }
 
-  /** Cleanup after a successful seal is authorized by the disposer, not ordinary admission. */
+  /**
+   * Cleanup authorized by the disposer runs outside ordinary admission, but
+   * remains visible to diagnostics and invalidates any outstanding idle proof.
+   */
   async runPrivilegedCleanup<T>(action: () => Promise<T> | T): Promise<T> {
-    return action();
+    this.privilegedCleanupCount += 1;
+    this.bump();
+    try {
+      return await action();
+    } finally {
+      this.privilegedCleanupCount -= 1;
+      this.bump();
+    }
   }
 
   snapshot(): McpHostAdmissionSnapshot {
     return Object.freeze({
       state: this.sealed ? "sealed" : "open",
       activeTokens: this.slots.size,
+      privilegedCleanupCount: this.privilegedCleanupCount,
       revision: this.revision,
     });
   }
@@ -112,7 +126,7 @@ export class McpHostAdmissionGate implements McpAdmissionRevisionSource {
   issueIdleSealProof(
     providers: readonly McpAdmissionRevisionSnapshot[],
   ): McpIdleSealProof | null {
-    if (this.sealed || this.slots.size !== 0) return null;
+    if (this.sealed || this.slots.size !== 0 || this.privilegedCleanupCount !== 0) return null;
     const normalized = providers.map(({ source, revision }) => ({ source, revision: assertRevision(revision) }));
     const proof = Object.freeze({ kind: "mcp-idle-seal-proof" as const });
     this.proofs.set(proof, { gateRevision: this.revision, providers: normalized, used: false });
@@ -128,7 +142,8 @@ export class McpHostAdmissionGate implements McpAdmissionRevisionSource {
     const issued = this.proofs.get(proof as object);
     if (!issued || issued.used) return false;
     issued.used = true;
-    if (this.sealed || this.slots.size !== 0 || this.revision !== issued.gateRevision) return false;
+    if (this.sealed || this.slots.size !== 0 || this.privilegedCleanupCount !== 0 ||
+        this.revision !== issued.gateRevision) return false;
     try {
       for (const provider of issued.providers) {
         if (provider.source.currentIdleRevision() !== provider.revision) return false;

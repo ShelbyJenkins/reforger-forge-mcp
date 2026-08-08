@@ -7,6 +7,9 @@ settings.
 
 For registration locations, manual commands, and refresh steps unique to each
 MCP client, see [MCP client notes](agents/README.md).
+For a Codex project that should run the server from a development worktree
+without replacing the normal user/global registration, see
+[Codex worktree MCP development](agents/CODEX_WORKTREE_MCP.md).
 
 ## Requirements
 
@@ -167,6 +170,12 @@ After changing an explicit Observer setting, restart the MCP process and rerun
 `observer_setup` with `action: "doctor"`. For a capture-workflow issue, use
 the [Observer usage guide](docs/observer.md); for implementation and technical
 troubleshooting, use [observer/README.md](observer/README.md).
+
+If retained owned-runtime evidence blocks shutdown or a later launch, first call
+`observer_runtime` with `action: "history"` to classify a bounded batch. Use
+`action: "recover"` only for the returned exact child-exit or already-stopped
+cleanup candidates. Recovery never deletes history and never terminates a live
+runtime; unresolved, foreign, or unverifiable evidence remains fail-closed.
 
 ## PowerShell execution policy
 

@@ -5,6 +5,14 @@ import {
   type OwnedRuntimeManager,
   type OwnedRuntimePublicStatus,
 } from "../observer/owned-runtime-manager.js";
+export {
+  canonicalOwnedGameLaunchAttemptIdentity,
+  deriveOwnedGameLaunchAttemptKey,
+  OWNED_GAME_LAUNCH_ATTEMPT_IDENTITY_VERSION,
+  OWNED_GAME_LAUNCH_ATTEMPT_ID_PREFIX,
+  type OwnedGameLaunchAttemptIdentity,
+  type OwnedGameLaunchAttemptKeyAction,
+} from "../observer/game-launch-attempt.js";
 import type { PublicObserverErrorCandidate } from "../observer/public-contract.js";
 
 export const preparedLaunchIdSchema = z.string().regex(

@@ -93,6 +93,10 @@ describe("MCP host identity", () => {
       ...identity,
       startedAt: "2026-08-05T12:34:56Z",
     })).toThrow(/start time/i);
+    expect(() => createMcpHostIdentity({
+      clientLabel: "codex",
+      instanceId: "00000000-0000-0000-0000-000000000000",
+    })).toThrow(/non-nil UUID/i);
   });
 
   it("formats stable Node and process titles without claiming to rename the image", () => {

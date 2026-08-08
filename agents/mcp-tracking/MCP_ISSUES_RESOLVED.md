@@ -5,6 +5,174 @@ records. Move newly resolved or verified entries to the top. The legacy records
 below were migrated from the mixed tracker on 2026-07-28; same-day ties retain
 their migration order.
 
+## MCP-067 - point-of-use game-launch revalidation can still block the MCP event loop
+
+**Status:** Resolved
+
+**Priority:** P1 - whole-host responsiveness during admitted launch mutation
+
+**Observed:** 2026-08-06
+
+**Closed:** 2026-08-06
+
+**Decision:** Keep every start-path project/evidence read behind bounded
+admission and early coalescing, use one absolute planning deadline and
+executable-byte cap through the manager boundary, and retain the admission and
+lifecycle lease until each request-owned reader or worker has physically closed
+or exited. Cancellation, timeout, lease loss, and termination refusal must not
+detach late work or allow a retry to create a second physical operation.
+
+**Resolution:** `game_launch` now obtains a bounded raw active-project hint
+through a request-owned LMDB reader without main-thread filesystem
+canonicalization, then performs canonical initial planning plus baseline,
+pre-spawn, and post-spawn point-of-use revalidation in isolated workers. The
+reader, planning worker, and revalidation workers join exact close/exit even
+when `kill()` or `terminate()` refuses or throws. Final-subscriber cancellation
+aborts and drains the shared operation; an equal retry joins that same admitted
+operation. Lease and deadline fences are reasserted after physical worker joins
+and synchronously at the final spawn edge, before any preparation, durable
+mutation, child creation, or ownership publication. Same-handle executable
+pinning through publication remains the separate fail-closed hardening tracked
+by MCP-069.
+
+**Verification:** The planning/revalidation lifecycle and behavior suites,
+focused strict existing-LMDB-reader and active-project-hint checks,
+spawn-publication suite, and integrated `game_launch` suite pass 97/97. The
+kill-refusal fixture waits past the former cleanup timer and proves settlement
+remains pending until exact close; the equal-retry fixture holds that close and
+proves both callers remain pending behind one physical reader. Both would fail
+the prior detached behavior. Post-planner cancellation/deadline fixtures also
+prove zero preparation and zero spawn after a delayed worker-exit join.
+Typecheck, clean MCP/Observer build, the 7/7 package-contract suite, and the
+default offline 1,120-file fresh packed-install smoke pass.
+
+## MCP-065 - public launch and recovery guidance has stale or misleading contract language
+
+**Status:** Resolved
+
+**Priority:** P3 - operator discoverability and terminology
+
+**Observed:** 2026-08-05
+
+**Closed:** 2026-08-06
+
+**Decision:** Keep the public `runtimeKind: "client"` value for compatibility,
+but describe it at the registered schema boundary as standalone graphical
+`-world` loading and explicitly exclude Reforger's engine `-client` replication
+mode. Treat `history` and `recover` as first-class retained-runtime operations,
+and describe idle evidence according to host-scoped authority.
+
+**Resolution:** The Observer quick reference and setup recovery procedure now
+cover `history` and safe `recover`. The `game_launch` tool and every input
+property have registered descriptions, including the standalone-client
+clarification. Root guidance now says well-formed evidence for another
+installation, user, or MCP owner is excluded from this host's obligations,
+while malformed, legacy-unattributed, timed-out, racing, or otherwise uncertain
+evidence remains blocking.
+
+**Verification:**
+`tests/cross-cutting/launch-guidance-contract.test.ts` directly pins the
+Observer quick reference, setup recovery procedure, root foreign-evidence
+semantics, and registered runtime-kind description. Together with
+`tests/observer/observer-mcp-tools-schema-responses.test.ts`, the focused
+documentation and listed-tool schema gate passes 15/15.
+
+## MCP-061 - the primary game-launch workflow has no deliberate successor generation
+
+**Status:** Resolved
+
+**Priority:** P1 - ordinary desktop relaunch workflow
+
+**Observed:** 2026-08-05
+
+**Closed:** 2026-08-06
+
+**Decision:** `afterRuntimeId` is the only public successor authority. It must
+name the exact current profile-chain tip, and that predecessor must have reached
+durable stop completion, restoration, sealing, and revocation. Exact retries
+reuse the retained attempt; a successor receives new attempt-scoped private
+prepare, record, and start keys.
+
+**Resolution:** `game_launch` now stores a canonical-profile LMDB attempt chain
+with durable `ga-*` composite attempt IDs, enforces current-tip and exact-stop
+admission, advances through the common manager stop-completion path, and returns
+chain state plus machine-readable retry/successor guidance. Both `game_launch`
+and `observer_runtime` stop authorize the same successor transition. Remaining
+fail-closed recovery hardening is tracked separately as MCP-068.
+
+**Verification:** `tests/observer/game-launch.test.ts` and
+`tests/observer/game-launch-successor-recovery.test.ts` pass 37/37, including
+exact retry, premature refusal, exact stop, identical-input successor, and
+second-successor fencing. Manager reconciliation, mutex, descriptor,
+spawn-crash, and idle suites pass 36/36; typecheck and protocol drift checks
+pass.
+
+## MCP-064 - supported MCP protocol eras are not declared or tested
+
+**Status:** Resolved
+
+**Priority:** P2 - current-client compatibility decision
+
+**Observed:** 2026-08-05
+
+**Closed:** 2026-08-06
+
+**Decision:** Retain the established v1 SDK stdio composition and declare its
+actual 2025-era boundary. ReforgerForge supports 2025-era clients and dual-era
+clients that fall back; it does not claim compatibility with modern-only
+`2026-07-28` clients until a future v2 transport migration re-audits activity,
+cancellation, admission sealing, and shutdown in both eras.
+
+**Resolution:** The package no longer describes itself as universal or as
+working with any AI agent. The README declares the supported era, the exact
+tested `2025-11-25` revision, the dual-era fallback expectation, and the
+modern-only incompatibility. Production exports the tested revision beside the
+stdio composition so the black-box fixture cannot silently drift.
+
+**Verification:**
+`tests/cross-cutting/mcp-protocol-era-contract.test.ts` pins the package and
+documentation boundary. `tests/setup/mcp-idle-shutdown-stdio.test.ts` sends an
+actual `2025-11-25` initialize request through the tracked stdio composition and
+asserts the negotiated response while retaining activity and shutdown coverage.
+Both focused files pass (4 tests total) on 2026-08-06.
+
+## MCP-060 - launch planning can monopolize the MCP event loop before admission
+
+**Status:** Resolved
+
+**Priority:** P1 - whole-host responsiveness and cancellation
+
+**Observed:** 2026-08-05
+
+**Closed:** 2026-08-06
+
+**Decision:** Initial `game_launch` evidence planning must be admitted and
+coalesced before filesystem work. Blocking fail-closed planners remain reusable
+for point-in-time evidence, but the public tool executes them only in a killable
+worker under one absolute deadline and a planning-only executable byte budget.
+Early coalescing uses an exact bounded request key; the evidence-derived prepare
+key remains authoritative for lifecycle mutation identity.
+
+**Resolution:** Start requests now enter a 32-operation map before project hint
+resolution, executable attestation, or world/add-on traversal. Byte-equal starts
+share one physical plan even when readiness waits differ, and distinct request
+spellings that resolve to the same evidence still converge at the retained
+prepare-key mutation map. The worker is terminated on deadline or when every
+subscriber cancels; a cancelled subscriber cannot abort another subscriber's
+shared plan, and cancellation after mutation begins cannot hide a successful
+runtime or its stop authority. Executable hashing refuses files above 1 GiB and
+uses a one-byte growth sentinel so the read cannot become unbounded. The
+remaining post-admission point-of-use revalidation constraint is tracked
+separately as MCP-067.
+
+**Verification:** `tests/observer/game-launch.test.ts` passes 34 tests, including
+40 equal starts, the 32-unique admission ceiling, subscriber cancellation,
+pre-cancellation, event-loop timer latency, absolute deadline termination, and
+executable-budget refusal. The executable-resolution suite passes 6 tests; the
+world/add-on planner suites pass 34 tests together. Typecheck, `build:mcp`,
+registered tool/schema tests, and `git diff --check` pass. The built distribution
+contains and imports both planning-worker artifacts.
+
 ## MCP-056 - reconcile child-exit-only owned-runtime history within bounded lifecycle probes
 
 **Status:** Resolved

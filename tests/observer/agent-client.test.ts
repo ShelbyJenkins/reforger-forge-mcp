@@ -2,7 +2,7 @@ import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import type { ChildProcess, fork } from "node:child_process";
 import { performance } from "node:perf_hooks";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { ObserverAgentClient, redactChildLine } from "../../src/observer/agent-client.js";
 
 const protocol = "rfo-observer-child-v1";
@@ -14,6 +14,11 @@ class TransportChild extends EventEmitter {
   stderr = new PassThrough();
   hold = false;
   killCalls = 0;
+  killResult = true;
+  killExits = true;
+  killError: Error | null = null;
+  autoClose = true;
+  transportClosed = false;
   sent: Array<Record<string, unknown>> = [];
 
   ready(): void {
@@ -35,12 +40,23 @@ class TransportChild extends EventEmitter {
     return true;
   }
   disconnect(): void { this.connected = false; }
-  kill(): boolean { this.killCalls += 1; this.exit(1); return true; }
+  kill(): boolean {
+    this.killCalls += 1;
+    if (this.killError) throw this.killError;
+    if (this.killResult && this.killExits) this.exit(1);
+    return this.killResult;
+  }
   exit(code: number): void {
     if (this.exitCode !== null) return;
     this.exitCode = code;
     this.connected = false;
     this.emit("exit", code, null);
+    if (this.autoClose) this.closeTransport();
+  }
+  closeTransport(): void {
+    if (this.transportClosed) return;
+    this.transportClosed = true;
+    this.emit("close", this.exitCode, this.signalCode);
   }
 }
 
@@ -160,6 +176,102 @@ describe("ObserverAgentClient", () => {
     requestDeadline = undefined;
     child.hold = false;
     await transport.close();
+  });
+
+  it("keeps shutdown unsafe when escalation is not accepted", async () => {
+    const child = new TransportChild();
+    const transport = client(child);
+    await transport.ensureStarted();
+    child.hold = true;
+    child.killResult = false;
+
+    await expect(transport.close(Date.now() + 100)).rejects.toMatchObject({
+      code: "TRANSPORT_UNAVAILABLE",
+    });
+    expect(child.killCalls).toBe(1);
+    expect(transport.diagnosticPrivateChildCount()).toBe(1);
+    expect(transport.state).toBe("closing");
+
+    child.hold = false;
+    child.killResult = true;
+    await expect(transport.close(Date.now() + 500)).resolves.toBeUndefined();
+    expect(transport.diagnosticPrivateChildCount()).toBe(0);
+  });
+
+  it("does not publish clean close until both exit and stdio closure are observed", async () => {
+    const child = new TransportChild();
+    const transport = client(child);
+    await transport.ensureStarted();
+    child.hold = true;
+    child.autoClose = false;
+
+    const closing = transport.close(Date.now() + 500);
+    await vi.waitFor(() => expect(child.killCalls).toBe(1));
+    expect(child.exitCode).toBe(1);
+    expect(transport.diagnosticPrivateChildCount()).toBe(1);
+    expect(transport.state).toBe("closing");
+
+    child.closeTransport();
+    await expect(closing).resolves.toBeUndefined();
+    expect(transport.diagnosticPrivateChildCount()).toBe(0);
+    expect(transport.state).toBe("closed");
+  });
+
+  it("waits for delayed exit and close after escalation is accepted", async () => {
+    const child = new TransportChild();
+    const transport = client(child);
+    await transport.ensureStarted();
+    child.hold = true;
+    child.killExits = false;
+
+    const closing = transport.close(Date.now() + 500);
+    await vi.waitFor(() => expect(child.killCalls).toBe(1));
+    expect(transport.diagnosticPrivateChildCount()).toBe(1);
+    expect(transport.state).toBe("closing");
+
+    child.exit(1);
+    await expect(closing).resolves.toBeUndefined();
+    expect(transport.diagnosticPrivateChildCount()).toBe(0);
+    expect(transport.state).toBe("closed");
+  });
+
+  it("keeps shutdown unsafe when accepted escalation yields no termination evidence", async () => {
+    const child = new TransportChild();
+    const transport = client(child);
+    await transport.ensureStarted();
+    child.hold = true;
+    child.killExits = false;
+
+    await expect(transport.close(Date.now() + 100)).rejects.toMatchObject({
+      code: "TRANSPORT_UNAVAILABLE",
+    });
+    expect(child.killCalls).toBe(1);
+    expect(transport.diagnosticPrivateChildCount()).toBe(1);
+    expect(transport.state).toBe("closing");
+
+    child.exit(1);
+    await expect(transport.close(Date.now() + 500)).resolves.toBeUndefined();
+    expect(transport.diagnosticPrivateChildCount()).toBe(0);
+  });
+
+  it("keeps shutdown unsafe when escalation throws", async () => {
+    const child = new TransportChild();
+    const transport = client(child);
+    await transport.ensureStarted();
+    child.hold = true;
+    child.killError = new Error("fixture kill failure");
+
+    await expect(transport.close(Date.now() + 100)).rejects.toMatchObject({
+      code: "TRANSPORT_UNAVAILABLE",
+    });
+    expect(child.killCalls).toBe(1);
+    expect(transport.diagnosticPrivateChildCount()).toBe(1);
+    expect(transport.state).toBe("closing");
+
+    child.killError = null;
+    child.killExits = true;
+    await expect(transport.close(Date.now() + 500)).resolves.toBeUndefined();
+    expect(transport.diagnosticPrivateChildCount()).toBe(0);
   });
 
   it("emergency termination rejects pending IPC and kills the tracked child exactly once", async () => {

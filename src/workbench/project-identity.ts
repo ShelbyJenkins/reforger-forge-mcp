@@ -1,5 +1,6 @@
 import { realpathSync, statSync } from "node:fs";
 import { dirname, extname, resolve } from "node:path";
+import { canonicalPathComparisonKey } from "../foundation/managed-path.js";
 
 const GPROJ_EXTENSION = ".gproj";
 
@@ -31,7 +32,7 @@ export class ProjectIdentityError extends Error {
 export interface CanonicalProjectIdentity {
   /** Native-realpath form used in user-facing responses and process arguments. */
   readonly displayPath: string;
-  /** Stable comparison form. Windows paths are compared case-insensitively. */
+  /** Exact native-realpath comparison form, including case-sensitive Windows identity. */
   readonly comparisonKey: string;
   /** Native-realpath form of the directory containing the project file. */
   readonly modDirectory: string;
@@ -44,10 +45,6 @@ export interface ResolveProjectIdentityOptions {
   readonly gprojPath?: string | null;
   /** Previously verified lifecycle target. */
   readonly priorTarget?: CanonicalProjectIdentity | string | null;
-}
-
-function comparisonKey(path: string): string {
-  return path.toLowerCase();
 }
 
 function invalidTarget(message: string): ProjectIdentityError {
@@ -105,9 +102,9 @@ export function canonicalizeGproj(gprojPath: string): CanonicalProjectIdentity {
 
   return {
     displayPath,
-    comparisonKey: comparisonKey(displayPath),
+    comparisonKey: canonicalPathComparisonKey(displayPath),
     modDirectory,
-    modDirectoryKey: comparisonKey(modDirectory),
+    modDirectoryKey: canonicalPathComparisonKey(modDirectory),
   };
 }
 

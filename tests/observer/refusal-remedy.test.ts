@@ -109,20 +109,22 @@ describe("observer refusal remedy policy", () => {
 
   it("uses only an exact consumed runtime ID and never proposes another start", () => {
     const runtimeId = "rt-00000000-0000-4000-8000-000000000042";
-    const selected = resolve("PREPARED_LAUNCH_CONSUMED", {
-      tool: "observer_runtime",
-      action: "start",
-    }, { runtimeId });
-    const rendered = formatObserverRefusalRemedy(selected!);
+    for (const tool of ["observer_runtime", "game_launch"] as const) {
+      const selected = resolve("PREPARED_LAUNCH_CONSUMED", {
+        tool,
+        action: "start",
+      }, { runtimeId });
+      const rendered = formatObserverRefusalRemedy(selected!);
 
-    expect(selected).toEqual({
-      kind: "tool",
-      tool: "observer_runtime",
-      input: { action: "status", runtimeId },
-      why: "inspect_consumed_runtime",
-    });
-    expect(rendered).toContain(JSON.stringify({ action: "status", runtimeId }));
-    expect(rendered).not.toContain('"action":"start"');
+      expect(selected).toEqual({
+        kind: "tool",
+        tool: "observer_runtime",
+        input: { action: "status", runtimeId },
+        why: "inspect_consumed_runtime",
+      });
+      expect(rendered).toContain(JSON.stringify({ action: "status", runtimeId }));
+      expect(rendered).not.toContain('"action":"start"');
+    }
     for (const invalid of [
       undefined,
       "rt-not-a-uuid",

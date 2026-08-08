@@ -26,10 +26,11 @@ function verificationReport(
   overrides: Partial<ServerVerificationReport> = {}
 ): ServerVerificationReport {
   return {
-    schemaVersion: 2,
+    schemaVersion: 3,
     generatedAt: "2026-07-24T00:00:00.000Z",
     success: true,
     nodeVersion: "v22.0.0",
+    nodePath: process.execPath,
     serverPath: SERVER_PATH,
     packageVersion: "1.1.0",
     compiledServer: {

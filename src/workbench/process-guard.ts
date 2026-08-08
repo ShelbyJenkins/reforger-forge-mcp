@@ -38,6 +38,11 @@ import {
   type WindowsExactProcessBackendFailureCode,
   type WindowsHelperResponse,
 } from "../platform/windows/exact-process-backend.js";
+import {
+  inspectWorkbenchLmdbExistingIsolated,
+  WorkbenchExistingLmdbIsolationError,
+} from "./existing-lmdb-reader.js";
+import type { WorkbenchExistingLmdbWireSnapshot } from "./existing-lmdb-reader-protocol.js";
 
 export type { ExactProcessIdentity } from "../foundation/identity.js";
 
@@ -166,6 +171,17 @@ export type LifecycleStateRead =
   | { kind: "missing" }
   | { kind: "valid"; state: WorkbenchLifecycleStateV3 }
   | { kind: "malformed"; path: string; rawSha256: string; message: string };
+
+export interface WorkbenchExistingStateSnapshot {
+  readonly lifecycle: LifecycleStateRead;
+  readonly journal: WorkbenchSpawnJournalRead;
+}
+
+export interface WorkbenchExistingStateInspectionOptions {
+  readonly signal?: AbortSignal;
+  /** Per-reader process budget, capped by the isolation boundary at five seconds. */
+  readonly timeoutMs?: number;
+}
 
 export interface ExpectedStateVersion {
   generation: string;
@@ -449,7 +465,7 @@ function isCompanionState(value: unknown): value is WorkbenchCompanionLifecycleS
     typeof companion.profilePath === "string" && isAbsolute(companion.profilePath);
 }
 
-function parseLifecycleState(value: unknown): WorkbenchLifecycleStateV3 | null {
+export function parseLifecycleState(value: unknown): WorkbenchLifecycleStateV3 | null {
   if (!value || typeof value !== "object") return null;
   const state = value as Partial<WorkbenchLifecycleStateV3>;
   if (state.version !== LIFECYCLE_VERSION || !isString(state.generation) ||
@@ -546,7 +562,7 @@ function parseWorkbenchSpawnRecord(value: unknown): WorkbenchSpawnRecord | null 
   } as WorkbenchSpawnRecord;
 }
 
-function parseWorkbenchSpawnJournalState(value: unknown): WorkbenchSpawnJournalStateV3 {
+export function parseWorkbenchSpawnJournalState(value: unknown): WorkbenchSpawnJournalStateV3 {
   if (!value || typeof value !== "object") {
     throw new TypeError("Workbench spawn journal must be an object.");
   }
@@ -918,6 +934,12 @@ export class WorkbenchProcessGuard {
   private durableEnvironment: LmdbEnvironment | null = null;
   private lifecycleCasStore: LmdbCasStore<WorkbenchLifecycleStateV3> | null = null;
   private spawnCasStore: LmdbCasStore<WorkbenchSpawnJournalStateV3> | null = null;
+  private existingInspectionAbort: AbortController | null = null;
+  private existingInspectionPromise: Promise<WorkbenchExistingStateSnapshot> | null = null;
+  private readonly dedicatedExistingInspectionAborts = new Set<AbortController>();
+  private readonly dedicatedExistingInspectionPromises =
+    new Set<Promise<WorkbenchExistingStateSnapshot>>();
+  private existingInspectionFailure: string | null = null;
 
   constructor(options: WorkbenchProcessGuardOptions = {}) {
     this.mcpInstanceId = options.mcpInstanceId === undefined
@@ -955,6 +977,12 @@ export class WorkbenchProcessGuard {
 
   /** Release the single LMDB environment backing lifecycle and spawn-journal state, if opened. */
   async close(): Promise<void> {
+    this.existingInspectionAbort?.abort();
+    for (const controller of this.dedicatedExistingInspectionAborts) controller.abort();
+    await Promise.all([
+      ...(this.existingInspectionPromise ? [this.existingInspectionPromise] : []),
+      ...this.dedicatedExistingInspectionPromises,
+    ].map((inspection) => inspection.catch(() => undefined)));
     await this.durableEnvironment?.close();
   }
 
@@ -1110,6 +1138,186 @@ export class WorkbenchProcessGuard {
     });
   }
 
+  private unreadableExistingSnapshot(message: string): WorkbenchExistingStateSnapshot {
+    const diagnostic = message.slice(0, 512) || "Existing-only Workbench LMDB inspection failed.";
+    return {
+      lifecycle: {
+        kind: "malformed",
+        path: join(this.corruptDir, "lifecycle.json"),
+        rawSha256: "unreadable",
+        message: `Lifecycle state cannot be inspected: ${diagnostic}`,
+      },
+      journal: {
+        kind: "malformed",
+        path: join(this.corruptDir, "spawn-journal.json"),
+        rawSha256: "unreadable",
+        message: `Workbench spawn journal cannot be inspected: ${diagnostic}`,
+      },
+    };
+  }
+
+  private parseExistingWireSnapshot(
+    snapshot: WorkbenchExistingLmdbWireSnapshot,
+  ): WorkbenchExistingStateSnapshot {
+    let lifecycle: LifecycleStateRead;
+    if (snapshot.lifecycle.kind === "missing") {
+      lifecycle = { kind: "missing" };
+    } else if (snapshot.lifecycle.kind === "malformed") {
+      lifecycle = snapshot.lifecycle;
+    } else {
+      const state = parseLifecycleState(snapshot.lifecycle.state);
+      lifecycle = state
+        ? { kind: "valid", state }
+        : {
+            kind: "malformed",
+            path: join(this.corruptDir, "lifecycle.json"),
+            rawSha256: "unreadable",
+            message: "Isolated lifecycle projection failed strict version-3 validation.",
+          };
+    }
+
+    let journal: WorkbenchSpawnJournalRead;
+    if (snapshot.journal.kind === "missing") {
+      journal = { kind: "missing" };
+    } else if (snapshot.journal.kind === "malformed") {
+      journal = snapshot.journal;
+    } else {
+      try {
+        const state = parseWorkbenchSpawnJournalState({
+          version: 3,
+          generation: snapshot.journal.generation,
+          record: snapshot.journal.record,
+        });
+        journal = {
+          kind: "valid",
+          generation: state.generation,
+          record: state.record,
+        };
+      } catch {
+        journal = {
+          kind: "malformed",
+          path: join(this.corruptDir, "spawn-journal.json"),
+          rawSha256: "unreadable",
+          message: "Isolated spawn-journal projection failed strict version-3 validation.",
+        };
+      }
+    }
+    return { lifecycle, journal };
+  }
+
+  private async readExistingStateSnapshotFromOpenWriter(): Promise<WorkbenchExistingStateSnapshot> {
+    const lifecycle = await this.readLifecycleStateExistingOnlyDirect();
+    const journal = await this.readSpawnJournalExistingOnlyDirect();
+    return { lifecycle, journal };
+  }
+
+  private startExistingStateInspection(
+    options: WorkbenchExistingStateInspectionOptions,
+    preserveTransientFailure = false,
+  ): {
+    readonly controller: AbortController;
+    readonly promise: Promise<WorkbenchExistingStateSnapshot>;
+  } {
+    const controller = new AbortController();
+    const forwardAbort = (): void => controller.abort(options.signal?.reason);
+    options.signal?.addEventListener("abort", forwardAbort, { once: true });
+    if (options.signal?.aborted) forwardAbort();
+    const promise = inspectWorkbenchLmdbExistingIsolated(this.stateDir, {
+      signal: controller.signal,
+      timeoutMs: options.timeoutMs,
+      ...(preserveTransientFailure ? { requireCloseBeforeSettlement: true } : {}),
+    }).then(
+      (snapshot) => this.parseExistingWireSnapshot(snapshot),
+      (error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error);
+        const transient = error instanceof WorkbenchExistingLmdbIsolationError &&
+          ["CANCELLED", "TIMEOUT"].includes(error.code);
+        if (transient && preserveTransientFailure) throw error;
+        if (!transient) {
+          // A native access violation is observed only as abnormal worker exit.
+          // Retain that failure so a silent host cannot create a crash storm on
+          // every later idle probe. Opening this guard's writer clears it.
+          this.existingInspectionFailure = message.slice(0, 512);
+        }
+        return this.unreadableExistingSnapshot(message);
+      },
+    ).finally(() => {
+      options.signal?.removeEventListener("abort", forwardAbort);
+    });
+    return { controller, promise };
+  }
+
+  /**
+   * Read both existing Workbench records through one crash-isolated process.
+   * A host that already owns an open writer can safely reuse that exact handle;
+   * a fresh host never maps the live environment in its own address space.
+   */
+  async readExistingStateSnapshot(
+    options: WorkbenchExistingStateInspectionOptions = {},
+  ): Promise<WorkbenchExistingStateSnapshot> {
+    if (this.durableEnvironment?.hasOpenWriter) {
+      this.existingInspectionFailure = null;
+      return this.readExistingStateSnapshotFromOpenWriter();
+    }
+    if (this.existingInspectionFailure) {
+      return this.unreadableExistingSnapshot(this.existingInspectionFailure);
+    }
+    if (this.existingInspectionPromise) return this.existingInspectionPromise;
+
+    const started = this.startExistingStateInspection(options);
+    this.existingInspectionAbort = started.controller;
+    const inspection = started.promise.finally(() => {
+      if (this.existingInspectionPromise === inspection) {
+        this.existingInspectionPromise = null;
+        this.existingInspectionAbort = null;
+      }
+    });
+    this.existingInspectionPromise = inspection;
+    return inspection;
+  }
+
+  /**
+   * Perform one request-owned existing-state inspection.
+   *
+   * Unlike the idle-probe cache, this boundary never inherits or cancels a
+   * different caller's reader. Fresh hosts receive a dedicated killable
+   * process; an owner with an open writer reuses that exact LMDB handle and
+   * applies abort checks around the bounded direct snapshot.
+   */
+  async readExistingStateSnapshotOnce(
+    options: WorkbenchExistingStateInspectionOptions,
+  ): Promise<WorkbenchExistingStateSnapshot> {
+    if (options.signal?.aborted) {
+      throw new WorkbenchExistingLmdbIsolationError(
+        "CANCELLED",
+        "Existing-only Workbench LMDB inspection was cancelled.",
+      );
+    }
+    if (this.durableEnvironment?.hasOpenWriter) {
+      this.existingInspectionFailure = null;
+      const snapshot = await this.readExistingStateSnapshotFromOpenWriter();
+      if (options.signal?.aborted) {
+        throw new WorkbenchExistingLmdbIsolationError(
+          "CANCELLED",
+          "Existing-only Workbench LMDB inspection was cancelled.",
+        );
+      }
+      return snapshot;
+    }
+    if (this.existingInspectionFailure) {
+      return this.unreadableExistingSnapshot(this.existingInspectionFailure);
+    }
+    const inspection = this.startExistingStateInspection(options, true);
+    this.dedicatedExistingInspectionAborts.add(inspection.controller);
+    let tracked!: Promise<WorkbenchExistingStateSnapshot>;
+    tracked = inspection.promise.finally(() => {
+      this.dedicatedExistingInspectionAborts.delete(inspection.controller);
+      this.dedicatedExistingInspectionPromises.delete(tracked);
+    });
+    this.dedicatedExistingInspectionPromises.add(tracked);
+    return tracked;
+  }
+
   async readLifecycleState(): Promise<LifecycleStateRead> {
     let inspected: LmdbCasInspection<WorkbenchLifecycleStateV3>;
     try {
@@ -1134,6 +1342,10 @@ export class WorkbenchProcessGuard {
 
   /** Read lifecycle evidence without creating a missing state or LMDB path. */
   async readLifecycleStateExistingOnly(): Promise<LifecycleStateRead> {
+    return (await this.readExistingStateSnapshot()).lifecycle;
+  }
+
+  private async readLifecycleStateExistingOnlyDirect(): Promise<LifecycleStateRead> {
     try {
       const existing = await this.lifecycleExistingStore().inspectExisting();
       if (existing.kind === "missing" || existing.value.kind === "missing") return { kind: "missing" };
@@ -1186,6 +1398,10 @@ export class WorkbenchProcessGuard {
 
   /** Read spawn evidence without creating a missing state or LMDB path. */
   async readSpawnJournalExistingOnly(): Promise<WorkbenchSpawnJournalRead> {
+    return (await this.readExistingStateSnapshot()).journal;
+  }
+
+  private async readSpawnJournalExistingOnlyDirect(): Promise<WorkbenchSpawnJournalRead> {
     try {
       const existing = await this.spawnExistingStore().inspectExisting();
       if (existing.kind === "missing" || existing.value.kind === "missing") return { kind: "missing" };

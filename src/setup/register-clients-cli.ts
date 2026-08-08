@@ -39,12 +39,13 @@ export interface RegistrationCliDependencies {
     reportPath: string
   ) => Promise<ServerVerificationReport>;
   readonly register?: (
-    options: { readonly serverPath: string }
+    options: { readonly serverPath: string; readonly nodePath: string }
   ) => ClientRegistrationSummary;
   readonly writeStdout?: (text: string) => void;
   readonly nodePath?: string;
   readonly nodeVersion?: string;
   readonly serverExists?: (serverPath: string) => boolean;
+  readonly nodeExists?: (nodePath: string) => boolean;
 }
 
 function regularFileExists(path: string): boolean {
@@ -152,11 +153,17 @@ function receiptFromRegistration(
 
 function validateRegistrationGate(
   report: ServerVerificationReport,
-  serverPath: string
+  serverPath: string,
+  nodePath: string,
 ): void {
   if (resolve(report.serverPath) !== serverPath) {
     throw new Error(
       "Verification report server path does not match the registration target."
+    );
+  }
+  if (resolve(report.nodePath) !== nodePath) {
+    throw new Error(
+      "Verification report Node path does not match the executable running registration."
     );
   }
   if (!report.success) {
@@ -178,6 +185,8 @@ export async function executeRegistrationCli(
   const writeStdout =
     dependencies.writeStdout ?? ((text: string) => process.stdout.write(text));
   const serverExists = dependencies.serverExists ?? regularFileExists;
+  const nodeExists = dependencies.nodeExists ?? regularFileExists;
+  const nodePath = resolve(dependencies.nodePath ?? process.execPath);
   let parsed: ParsedRegistrationArguments | undefined;
   let receipt: SetupReceipt;
   let exitCode: number;
@@ -187,10 +196,15 @@ export async function executeRegistrationCli(
     const report = await (
       dependencies.readReport ?? readServerVerificationReport
     )(parsed.verificationReportPath);
-    validateRegistrationGate(report, parsed.serverPath);
+    validateRegistrationGate(report, parsed.serverPath, nodePath);
     if (!serverExists(parsed.serverPath)) {
       throw new Error(
         "The verified MCP server is no longer a regular file; client registration was not attempted."
+      );
+    }
+    if (!nodeExists(report.nodePath)) {
+      throw new Error(
+        "The verified Node executable is no longer a regular file; client registration was not attempted."
       );
     }
 
@@ -198,7 +212,7 @@ export async function executeRegistrationCli(
     try {
       registration = (
         dependencies.register ?? registerDetectedClients
-      )({ serverPath: parsed.serverPath });
+      )({ serverPath: parsed.serverPath, nodePath: report.nodePath });
     } catch (error) {
       registration = createFailedRegistrationSummary(
         parsed.serverPath,
@@ -226,7 +240,7 @@ export async function executeRegistrationCli(
       operation: "setup",
       serverPath,
       serverPresent: serverExists(serverPath),
-      nodePath: dependencies.nodePath ?? process.execPath,
+      nodePath,
       nodeVersion: dependencies.nodeVersion ?? process.version,
       layer: parsed === undefined ? "registration" : "verification",
       message: error instanceof Error ? error.message : String(error),

@@ -6,6 +6,7 @@ export const MCP_CLIENT_LABEL_FLAG = "--mcp-client-label" as const;
 export const DEFAULT_MCP_CLIENT_LABEL = "manual" as const;
 
 const PROCESS_TITLE_PREFIX = "ReforgerForge-MCP-";
+const NIL_UUID = "00000000-0000-0000-0000-000000000000";
 const CLIENT_LABEL_PATTERN = /^[a-z0-9][a-z0-9._-]{0,47}$/;
 const CANONICAL_ISO_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 
@@ -14,11 +15,16 @@ const clientLabelSchema = z.string()
   .max(48)
   .regex(CLIENT_LABEL_PATTERN);
 
+const mcpInstanceIdSchema = z.string().uuid().refine(
+  (value) => value.toLowerCase() !== NIL_UUID,
+  { message: "Lifecycle instance IDs must not use the nil UUID." },
+);
+
 const hostIdentityShape = z.object({
   schemaVersion: z.literal(1),
   product: z.literal(MCP_HOST_PRODUCT),
   clientLabel: clientLabelSchema,
-  instanceId: z.string().uuid(),
+  instanceId: mcpInstanceIdSchema,
   pid: z.number().int().positive(),
   startedAt: z.string().max(32),
 }).strict();
@@ -58,9 +64,9 @@ export function parseMcpClientLabel(value: unknown): string {
 }
 
 export function parseMcpInstanceId(value: unknown, label = "MCP instance ID"): string {
-  const parsed = z.string().uuid().safeParse(value);
+  const parsed = mcpInstanceIdSchema.safeParse(value);
   if (!parsed.success) {
-    throw new McpHostIdentityError(`${label} must be a UUID.`);
+    throw new McpHostIdentityError(`${label} must be a non-nil UUID.`);
   }
   return parsed.data;
 }
@@ -120,7 +126,7 @@ export function validateMcpHostIdentity(value: unknown): McpHostIdentity {
       parsed.data.pid !== process.pid ||
       !canonicalStartedAt(parsed.data.startedAt)) {
     throw new McpHostIdentityError(
-      "MCP host identity must contain the current PID, a UUID, a bounded client label, and a canonical UTC start time."
+      "MCP host identity must contain the current PID, a non-nil UUID, a bounded client label, and a canonical UTC start time."
     );
   }
   return Object.freeze({ ...parsed.data });

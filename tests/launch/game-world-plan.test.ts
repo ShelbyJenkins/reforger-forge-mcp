@@ -19,9 +19,14 @@ import { RESOURCE_META_MAXIMUM_BYTES } from "../../src/workbench/resource-meta.j
 import { withTemporaryDirectory } from "../support/temporary-directory.js";
 
 const GUID = "A1B2C3D4E5F60718";
+const WINDOWS_NATIVE_TEST_TIMEOUT_MS = process.platform === "win32" ? 30_000 : 5_000;
 
-function scopedIt(name: string, run: (root: string) => Promise<void> | void): void {
-  it(name, () => withTemporaryDirectory(run, { prefix: "reforger-forge-game-world-" }));
+function scopedIt(
+  name: string,
+  run: (root: string) => Promise<void> | void,
+  timeout = WINDOWS_NATIVE_TEST_TIMEOUT_MS,
+): void {
+  it(name, () => withTemporaryDirectory(run, { prefix: "reforger-forge-game-world-" }), timeout);
 }
 
 function projectAt(root: string): {
@@ -112,6 +117,89 @@ describe("registered project-world planning", () => {
       .toBe("WORLD_METADATA_OVERSIZE");
   });
 
+  scopedIt("maps invalid project/world and missing or unreadable metadata to typed refusals", (root) => {
+    const { projectPath, modDirectory } = projectAt(root);
+    const worldPath = worldAt(modDirectory);
+    const project = canonicalizeGproj(projectPath);
+
+    expect(capture(() => resolveGameWorldPlan({
+      project: { ...project, comparisonKey: `${project.comparisonKey}.changed` },
+      world: worldPath,
+    })).code).toBe("PROJECT_CHANGED");
+    expect(capture(() => resolveGameWorldPlan(project, join(modDirectory, "Worlds", "Missing.ent"))).code)
+      .toBe("WORLD_INVALID");
+
+    unlinkSync(`${worldPath}.meta`);
+    expect(capture(() => resolveGameWorldPlan(project, worldPath)).code)
+      .toBe("WORLD_METADATA_MISSING");
+
+    mkdirSync(`${worldPath}.meta`);
+    expect(capture(() => resolveGameWorldPlan(project, worldPath)).code)
+      .toBe("WORLD_METADATA_UNREADABLE");
+  });
+
+  scopedIt("fails closed on a barrier-controlled pre-open replacement", (root) => {
+    const { projectPath, modDirectory } = projectAt(root);
+    const worldPath = worldAt(modDirectory);
+    const replacement = join(modDirectory, "Worlds", "Replacement.ent");
+    writeFileSync(replacement, "SubScene { Replacement 1 }\n", "utf8");
+    let replaced = false;
+
+    const error = capture(() => resolveGameWorldPlan({
+      project: canonicalizeGproj(projectPath),
+      world: worldPath,
+      testHooks: {
+        checkpoint: (checkpoint, path) => {
+          if (checkpoint !== "before_file_open" || path !== worldPath || replaced) return;
+          replaced = true;
+          unlinkSync(worldPath);
+          renameSync(replacement, worldPath);
+        },
+      },
+    }));
+
+    expect(replaced).toBe(true);
+    expect(error.code).toBe("WORLD_CHANGED");
+  });
+
+  scopedIt("refuses an unavailable zero file identity", (root) => {
+    const { projectPath, modDirectory } = projectAt(root);
+    const worldPath = worldAt(modDirectory);
+
+    const error = capture(() => resolveGameWorldPlan({
+      project: canonicalizeGproj(projectPath),
+      world: worldPath,
+      testHooks: {
+        fileIdentity: (path, identity) => path === worldPath
+          ? { dev: 0n, ino: 0n }
+          : { ...identity },
+      },
+    }));
+
+    expect(error.code).toBe("WORLD_CHANGED");
+  });
+
+  scopedIt("maps a late evidence-stat disappearance to WORLD_CHANGED", (root) => {
+    const { projectPath, modDirectory } = projectAt(root);
+    const worldPath = worldAt(modDirectory);
+    let removed = false;
+
+    const error = capture(() => resolveGameWorldPlan({
+      project: canonicalizeGproj(projectPath),
+      world: worldPath,
+      testHooks: {
+        checkpoint: (checkpoint) => {
+          if (checkpoint !== "before_final_evidence_stat" || removed) return;
+          removed = true;
+          unlinkSync(worldPath);
+        },
+      },
+    }));
+
+    expect(removed).toBe(true);
+    expect(error.code).toBe("WORLD_CHANGED");
+  });
+
   scopedIt("rejects outside files and linked world or metadata paths", (root) => {
     const { projectPath, modDirectory } = projectAt(root);
     const project = canonicalizeGproj(projectPath);
@@ -122,6 +210,14 @@ describe("registered project-world planning", () => {
     mkdirSync(resolve(linkedWorld, ".."), { recursive: true });
     symlinkSync(outside, linkedWorld, "file");
     expect(capture(() => resolveGameWorldPlan(project, linkedWorld)).code).toBe("WORLD_OUTSIDE_PROJECT");
+
+    const outsideJunctionWorld = worldAt(root, "OutsideWorlds/Junction.ent");
+    const linkedWorldsDirectory = join(modDirectory, "LinkedWorlds");
+    symlinkSync(resolve(outsideJunctionWorld, ".."), linkedWorldsDirectory, "junction");
+    expect(capture(() => resolveGameWorldPlan(
+      project,
+      join(linkedWorldsDirectory, "Junction.ent"),
+    )).code).toBe("WORLD_OUTSIDE_PROJECT");
 
     const inside = worldAt(modDirectory, "Worlds/Inside.ent");
     unlinkSync(`${inside}.meta`);
@@ -200,6 +296,27 @@ describe("registered project-world planning", () => {
     })).code).toBe("WORLD_SCAN_TRUNCATED");
   });
 
+  scopedIt("detects a deterministic directory replacement race as WORLD_SCAN_UNSTABLE", (root) => {
+    const { projectPath, modDirectory } = projectAt(root);
+    worldAt(modDirectory, "Worlds/Original.ent");
+    const worldsDirectory = join(modDirectory, "Worlds");
+    let mutated = false;
+
+    const error = capture(() => resolveGameWorldPlan({
+      project: canonicalizeGproj(projectPath),
+      testHooks: {
+        checkpoint: (checkpoint, path) => {
+          if (checkpoint !== "after_directory_read" || path !== worldsDirectory || mutated) return;
+          mutated = true;
+          worldAt(modDirectory, "Worlds/Added.ent", "1111111111111111");
+        },
+      },
+    }));
+
+    expect(mutated).toBe(true);
+    expect(error.code).toBe("WORLD_SCAN_UNSTABLE");
+  });
+
   scopedIt("validates the stored digest before re-reading and rejects changed project, world, or metadata evidence", (root) => {
     const make = (name: string): { plan: GameWorldPlanSnapshot; projectPath: string; worldPath: string } => {
       const created = projectAt(join(root, name));
@@ -217,6 +334,17 @@ describe("registered project-world planning", () => {
 
     const tampered = { ...unchanged.plan, relativePath: "Worlds/Tampered.ent" };
     expect(capture(() => revalidateGameWorldPlan(tampered)).code).toBe("WORLD_EVIDENCE_INVALID");
+
+    const zeroIdentity = {
+      ...unchanged.plan,
+      projectFile: { ...unchanged.plan.projectFile, device: "0" },
+    };
+    const zeroIdentityWithDigest = {
+      ...zeroIdentity,
+      worldEvidenceDigest: computeGameWorldEvidenceDigest(zeroIdentity),
+    };
+    expect(capture(() => revalidateGameWorldPlan(zeroIdentityWithDigest)).code)
+      .toBe("WORLD_EVIDENCE_INVALID");
 
     const changedProject = make("project");
     const projectDigest = changedProject.plan.worldEvidenceDigest;
@@ -246,7 +374,7 @@ describe("registered project-world planning", () => {
     const replacementPlan = resolveGameWorldPlan(canonicalizeGproj(changedMeta.projectPath), changedMeta.worldPath);
     expect(replacementPlan.resourceReference).toBe(changedMeta.plan.resourceReference);
     expect(replacementPlan.worldEvidenceDigest).not.toBe(metaDigest);
-  });
+  }, process.platform === "win32" ? 30_000 : 5_000);
 
   scopedIt("repeats discovery so a later ambiguity cannot retain the original selection", (root) => {
     const { projectPath, modDirectory } = projectAt(root);
@@ -264,13 +392,15 @@ describe("registered project-world planning", () => {
       byteLength: 7,
       device: "1",
       inode: "2",
+      volumeIdentity: "6",
+      fileId: "7",
       modifiedNanoseconds: "3",
       changedNanoseconds: "4",
       birthNanoseconds: "5",
       sha256: "a".repeat(64),
     } as const;
     const fields = {
-      schemaVersion: 1 as const,
+      schemaVersion: 2 as const,
       project: {
         displayPath: "C:\\Mods\\Example\\Example.gproj",
         comparisonKey: "c:\\mods\\example\\example.gproj",
@@ -287,7 +417,7 @@ describe("registered project-world planning", () => {
       resourceReference: `{${GUID}}Worlds/Example.ent`,
       selection: { kind: "explicit" as const, inputKind: "relative" as const, suppliedGuid: null },
     };
-    expect(computeGameWorldEvidenceDigest(fields)).toBe("9210602250e40f795378a71bf745b08d70cf79bd979fa4255b3cff0025d1ec34");
+    expect(computeGameWorldEvidenceDigest(fields)).toBe("16bdcf106ebfb0099f23350473869f6ab91b0a4e6c5e0a6b5e1e9fb33a047b50");
     expect(computeGameWorldEvidenceDigest({ ...fields, worldFile: { ...identity, inode: "9" } }))
       .not.toBe(computeGameWorldEvidenceDigest(fields));
   });

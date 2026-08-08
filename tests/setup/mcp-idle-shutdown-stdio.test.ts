@@ -1,6 +1,5 @@
 import { EventEmitter } from "node:events";
 import { mkdirSync } from "node:fs";
-import { performance } from "node:perf_hooks";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { PassThrough, Writable } from "node:stream";
@@ -10,6 +9,7 @@ import type { Config } from "../../src/config.js";
 import { createMcpHostIdentity } from "../../src/mcp-host-identity.js";
 import type { McpIdleShutdownTimer } from "../../src/mcp-idle-shutdown.js";
 import {
+  MCP_TESTED_PROTOCOL_VERSION,
   runMcpStdioServer,
   type McpStdioLogger,
   type McpStdioSignalSource,
@@ -26,7 +26,7 @@ interface TimerRecord extends McpIdleShutdownTimer {
 }
 
 class ManualTimers {
-  now = performance.now();
+  now = 0;
   readonly records: TimerRecord[] = [];
 
   readonly set = (callback: () => void, milliseconds: number): TimerRecord => {
@@ -181,7 +181,7 @@ function initialize(id: string): JSONRPCMessage {
     id,
     method: "initialize",
     params: {
-      protocolVersion: "2025-11-25",
+      protocolVersion: MCP_TESTED_PROTOCOL_VERSION,
       capabilities: {},
       clientInfo: { name: "idle-shutdown-fixture", version: "1.0.0" },
     },
@@ -248,7 +248,11 @@ describe.runIf(process.platform === "win32")("CLI stdio idle auto-shutdown compo
         ]);
 
         send(idleInput, initialize("idle-init"));
-        await idleOutput.response("idle-init");
+        const initialized = await idleOutput.response("idle-init");
+        expect(initialized).toHaveProperty(
+          "result.protocolVersion",
+          MCP_TESTED_PROTOCOL_VERSION,
+        );
         send(idleInput, {
           jsonrpc: "2.0",
           method: "notifications/initialized",

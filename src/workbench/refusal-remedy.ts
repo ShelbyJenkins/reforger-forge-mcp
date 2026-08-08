@@ -53,6 +53,15 @@ const exactProjectRequired = (
   why: "Cold Workbench project discovery is intentionally unavailable.",
 });
 
+const ambiguousProjectTarget = (
+  context: WorkbenchRefusalContext
+): WorkbenchRemedy => ({
+  kind: "external",
+  action:
+    `Provide an exact absolute .gproj path as gprojPath, then retry ${context.operation}.`,
+  why: "More than one project target matched, so the server cannot choose one safely.",
+});
+
 /**
  * Exhaustive fallback policy for errors that do not carry a producer decision.
  *
@@ -77,7 +86,7 @@ export const WORKBENCH_REMEDY_RESOLVERS = {
   ),
   PROJECT_COMPILE_FAILED: null,
   TARGET_REQUIRED: exactProjectRequired,
-  AMBIGUOUS_TARGET: exactProjectRequired,
+  AMBIGUOUS_TARGET: ambiguousProjectTarget,
   INVALID_CONFIG: null,
   INVALID_TARGET: () => ({
     kind: "external",

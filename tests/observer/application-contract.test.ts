@@ -215,11 +215,10 @@ describe("observer application", () => {
     try {
       const closePromise = coordinator.close();
       await vi.advanceTimersByTimeAsync(4_000);
-      await closePromise;
-
       expect(child.killed).toBe(true);
       expect(coordinator.diagnosticPrivateChildCount()).toBe(1);
       child.exit(0);
+      await closePromise;
       expect(coordinator.diagnosticPrivateChildCount()).toBe(0);
     } finally {
       vi.useRealTimers();

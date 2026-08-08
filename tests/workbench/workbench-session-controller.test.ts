@@ -1,11 +1,12 @@
 import { EventEmitter } from "node:events";
 import type { ChildProcess } from "node:child_process";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { performance } from "node:perf_hooks";
 import { describe, expect, it, vi } from "vitest";
 import type { Config } from "../../src/config.js";
 import { ChildSupervisor } from "../../src/foundation/child-supervisor.js";
+import { canonicalPathComparisonKey } from "../../src/foundation/managed-path.js";
 import { WorkbenchClient } from "../../src/workbench/client.js";
 import { WorkbenchLifecycleExecution } from "../../src/workbench/lifecycle-execution.js";
 import {
@@ -16,6 +17,9 @@ import {
   WORKBENCH_PROCESS_NAME,
   WorkbenchProcessGuard as RealWorkbenchProcessGuard,
 } from "../../src/workbench/process-guard.js";
+import {
+  WorkbenchExistingLmdbIsolationError,
+} from "../../src/workbench/existing-lmdb-reader.js";
 import {
   WorkbenchNetApiError,
   type WorkbenchNetApiCallOptions,
@@ -62,25 +66,27 @@ describe("WorkbenchSessionController public contract", () => {
     const inspectOwnedWorkbench = vi.fn(async () => "live" as const);
     const guard = {
       mcpInstanceId: current,
-      readLifecycleStateExistingOnly: async () => ({
-        kind: "valid" as const,
-        state: {
-          phase: "running",
-          mcpOwner: { instanceId: owner },
-          workbench,
-          operation: null,
+      readExistingStateSnapshot: async () => ({
+        lifecycle: {
+          kind: "valid" as const,
+          state: {
+            phase: "running",
+            mcpOwner: { instanceId: owner },
+            workbench,
+            operation: null,
+          },
         },
+        journal: legacyJournal
+          ? ({
+              kind: "valid" as const,
+              generation: "journal",
+              record: {
+                phase: "pre_spawn",
+                metadata: {},
+              },
+            })
+          : ({ kind: "missing" as const }),
       }),
-      readSpawnJournalExistingOnly: async () => legacyJournal
-        ? ({
-            kind: "valid" as const,
-            generation: "journal",
-            record: {
-              phase: "pre_spawn",
-              metadata: {},
-            },
-          })
-        : ({ kind: "missing" as const }),
       inspectOwnedWorkbench,
     } as unknown as WorkbenchProcessGuard;
     const controller = new WorkbenchSessionController(
@@ -105,26 +111,23 @@ describe("WorkbenchSessionController public contract", () => {
     await expect(inspect()).resolves.toMatchObject({ blockers: ["WORKBENCH_RECOVERY"] });
   });
 
-  it("serializes existing-only lifecycle reads that share the Workbench LMDB environment", async () => {
+  it("requests one combined crash-isolated Workbench LMDB snapshot", async () => {
     const order: string[] = [];
     const guard = {
       mcpInstanceId: "11111111-1111-4111-8111-111111111111",
-      readLifecycleStateExistingOnly: async () => {
-        order.push("lifecycle:start");
-        await Promise.resolve();
-        order.push("lifecycle:end");
-        return { kind: "missing" as const };
-      },
-      readSpawnJournalExistingOnly: async () => {
-        order.push("journal");
-        return { kind: "missing" as const };
+      readExistingStateSnapshot: async () => {
+        order.push("combined");
+        return {
+          lifecycle: { kind: "missing" as const },
+          journal: { kind: "missing" as const },
+        };
       },
     } as unknown as WorkbenchProcessGuard;
     const controller = new WorkbenchSessionController(
       "127.0.0.1",
       5775,
       undefined,
-      "idle-readiness-lmdb-serialization",
+      "idle-readiness-lmdb-isolation",
       guard,
       { netApi: new StubNetApi({}) },
     );
@@ -134,11 +137,138 @@ describe("WorkbenchSessionController public contract", () => {
       signal: new AbortController().signal,
       probeGeneration: 1,
     })).resolves.toMatchObject({ complete: true, blockers: [] });
-    expect(order).toEqual(["lifecycle:start", "lifecycle:end", "journal"]);
+    expect(order).toEqual(["combined"]);
+  });
+
+  it("maps a failed isolated Workbench LMDB projection to incomplete proof", async () => {
+    const guard = {
+      mcpInstanceId: "11111111-1111-4111-8111-111111111111",
+      readExistingStateSnapshot: async () => ({
+        lifecycle: {
+          kind: "malformed" as const,
+          path: "C:\\state\\corrupt\\lifecycle.json",
+          rawSha256: "unreadable",
+          message: "isolated reader exited abnormally",
+        },
+        journal: { kind: "missing" as const },
+      }),
+    } as unknown as WorkbenchProcessGuard;
+    const controller = new WorkbenchSessionController(
+      "127.0.0.1",
+      5775,
+      undefined,
+      "idle-readiness-lmdb-refusal",
+      guard,
+      { netApi: new StubNetApi({}) },
+    );
+
+    await expect(controller.inspectIdleShutdownReadiness({
+      deadlineTick: performance.now() + 1_000,
+      signal: new AbortController().signal,
+      probeGeneration: 1,
+    })).resolves.toMatchObject({
+      complete: false,
+      blockers: ["INCOMPLETE_PROOF"],
+    });
   });
 
   it("keeps WorkbenchClient as the stable compatibility constructor", () => {
     expect(WorkbenchClient).toBe(WorkbenchSessionController);
+  });
+
+  it("projects a bounded raw lifecycle target without main-thread filesystem canonicalization", async () => {
+    await withTemporaryDirectory(async (root) => {
+      const targetPath = join(root, "missing-on-purpose", "Target.gproj");
+      const readExistingStateSnapshotOnce = vi.fn(async (_options: {
+        signal?: AbortSignal;
+        timeoutMs?: number;
+      }) => ({
+        lifecycle: {
+          kind: "valid" as const,
+          state: {
+            phase: "running",
+            mcpOwner: {},
+            workbench: {},
+            target: {
+              path: targetPath,
+              comparisonKey: canonicalPathComparisonKey(targetPath),
+            },
+          },
+        },
+        journal: { kind: "missing" as const },
+      }));
+      const guard = {
+        mcpInstanceId: "11111111-1111-4111-8111-111111111111",
+        readExistingStateSnapshotOnce,
+      } as unknown as WorkbenchProcessGuard;
+      const controller = new WorkbenchSessionController(
+        "127.0.0.1",
+        5775,
+        undefined,
+        "game-launch-project-hint",
+        guard,
+        { netApi: new StubNetApi({}) },
+      );
+      const signal = new AbortController().signal;
+
+      await expect(controller.activeProjectGprojPathHint({
+        signal,
+        deadlineAtMs: Date.now() + 5_000,
+      })).resolves.toBe(targetPath);
+
+      expect(existsSync(targetPath)).toBe(false);
+      expect(readExistingStateSnapshotOnce).toHaveBeenCalledWith({
+        signal,
+        timeoutMs: expect.any(Number),
+      });
+      expect(readExistingStateSnapshotOnce.mock.calls[0]?.[0].timeoutMs).toBeLessThanOrEqual(5_000);
+    }, { prefix: "rfo-workbench-raw-project-hint-" });
+  });
+
+  it("preserves cancellation and reader-timeout classification after physical hint cleanup", async () => {
+    let readerClosed = false;
+    const readExistingStateSnapshotOnce = vi.fn(({ signal }: { signal?: AbortSignal }) =>
+      new Promise<never>((_resolve, reject) => {
+        signal?.addEventListener("abort", () => {
+          readerClosed = true;
+          reject(new WorkbenchExistingLmdbIsolationError(
+            "CANCELLED",
+            "fixture reader cancelled after close",
+          ));
+        }, { once: true });
+      }));
+    const guard = {
+      mcpInstanceId: "11111111-1111-4111-8111-111111111111",
+      readExistingStateSnapshotOnce,
+    } as unknown as WorkbenchProcessGuard;
+    const controller = new WorkbenchSessionController(
+      "127.0.0.1",
+      5775,
+      undefined,
+      "game-launch-project-hint-cancellation",
+      guard,
+      { netApi: new StubNetApi({}) },
+    );
+    const cancellation = new AbortController();
+    const cancelled = controller.activeProjectGprojPathHint({
+      signal: cancellation.signal,
+      deadlineAtMs: Date.now() + 5_000,
+    });
+    cancellation.abort();
+
+    await expect(cancelled).rejects.toMatchObject({ code: "ABORTED" });
+    expect(readerClosed).toBe(true);
+
+    readExistingStateSnapshotOnce.mockImplementationOnce(async () => {
+      throw new WorkbenchExistingLmdbIsolationError(
+        "TIMEOUT",
+        "fixture reader timeout after close",
+      );
+    });
+    await expect(controller.activeProjectGprojPathHint({
+      signal: new AbortController().signal,
+      deadlineAtMs: Date.now() + 5_000,
+    })).rejects.toMatchObject({ code: "DEADLINE_EXCEEDED" });
   });
 
   it("builds an opt-in preview without staging, token generation, or process activity", async () => {

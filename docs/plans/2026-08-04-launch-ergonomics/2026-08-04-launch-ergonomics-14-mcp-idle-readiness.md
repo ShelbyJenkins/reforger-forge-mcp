@@ -7,6 +7,8 @@
 > **Dependency:** [operator-visible MCP host identity](2026-08-04-launch-ergonomics-13-mcp-host-identity.md).
 > Commits 7, 9, and 12 extend the blocker projection when their feature-specific
 > lifecycle states are present; they are not prerequisites for this foundation.
+> Until deferred Commit 12 supplies its producer, `EXTERNAL_ACTIVATION` is not a
+> member of the current bounded blocker-code contract.
 >
 > **Source backlog:** first half of MCP-055. Commits 14 and 15 jointly own the
 > removed queue entry; planning is not resolution.
@@ -144,8 +146,9 @@ inspectIdleShutdownReadiness(options: {
 codes, and opaque provider revisions used only for same-process revalidation. It
 contains no PIDs, paths, runtime/session/request IDs, owner tokens, or raw error
 text. Use categories for Workbench activity/ownership/recovery, observer child and
-capture/restoration work, owned-runtime preparation/start/live/recovery, external
-activation, and incomplete proof.
+capture/restoration work, owned-runtime preparation/start/live/recovery, and
+incomplete proof. Add external activation to this fixed set only when Commit 12
+lands the corresponding provider classification.
 
 Use one shared five-second monotonic deadline and `AbortSignal`. A logical timeout
 invalidates that probe generation. Every provider honors the common bound when
@@ -241,7 +244,8 @@ Cover:
 - unexpired preparation, expired proven-unconsumed preparation, pending/live/
   restoring/releasing clusters, terminal evidence, foreign records, corrupt
   inventory, capacity, and deadline failures;
-- every Commit 7/9/12 classification when present;
+- every Commit 7/9 classification when present, and every Commit 12
+  classification once that deferred producer is implemented;
 - probe-owned versus unrelated child RPCs, provider revision changes, monotonic
   timeout/abort, late-result invalidation, and no overlapping physical probes;
   and

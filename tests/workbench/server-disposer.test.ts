@@ -73,10 +73,11 @@ describe("project-neutral registerTools shutdown ownership", () => {
   });
 
   it("exposes a bounded read-only idle proof without invoking lifecycle cleanup", async () => {
-    const lifecycleRead = vi.spyOn(WorkbenchProcessGuard.prototype, "readLifecycleStateExistingOnly")
-      .mockResolvedValue({ kind: "missing" });
-    const journalRead = vi.spyOn(WorkbenchProcessGuard.prototype, "readSpawnJournalExistingOnly")
-      .mockResolvedValue({ kind: "missing" });
+    const existingStateRead = vi.spyOn(WorkbenchProcessGuard.prototype, "readExistingStateSnapshot")
+      .mockResolvedValue({
+        lifecycle: { kind: "missing" },
+        journal: { kind: "missing" },
+      });
     try {
       const server = new McpServer({ name: "idle-proof-test", version: "1.0.0" });
       const disposeTools = registerTools(server, config());
@@ -91,8 +92,7 @@ describe("project-neutral registerTools shutdown ownership", () => {
       expect(disposeTools.trySealIdleAdmissions(readiness.sealProof)).toBe(true);
       await expect(disposeTools()).resolves.toMatchObject({ applicationCloseSafe: true });
     } finally {
-      lifecycleRead.mockRestore();
-      journalRead.mockRestore();
+      existingStateRead.mockRestore();
     }
   });
 

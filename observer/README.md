@@ -116,8 +116,10 @@ serialized by the manager's machine-wide lifecycle mutex; equal in-process
 requests join one mutation. The retained world, add-on, and executable snapshots
 are re-attested immediately before consumption. An unconsumed mismatch records
 an invalidation before session revocation; an unknown post-consumption result
-never authorizes revocation. This baseline has no successor index, so changed,
-terminal, stale, expired, or invalidated evidence refuses instead of relaunching.
+never authorizes revocation. A durable profile-keyed attempt chain admits one
+successor only when the caller supplies the current runtime ID after exact stop,
+restoration, sealing, and revocation. Natural exit and unknown outcomes remain
+pinned; exact retries recover the same composite attempt and attempt-scoped keys.
 Runless capture delivery automatically attempts release; cleanup failure stays
 visible through a retained job handle and `cleanupRequired` diagnostics.
 
@@ -330,10 +332,10 @@ npm run dev:observer:acceptance:workbench -- --config <CONFIG_PATH> --confirm-li
 ```
 
 The runtime harness invokes the public `game_launch` start/status/stop handler
-against a project-contained `.ent` fixture. Run the listen-server and client
-commands as separate invocations so each receives a fresh managed/profile root
-and MCP lifecycle; this baseline deliberately cannot create a same-profile
-successor.
+against a project-contained `.ent` fixture. A deliberate same-profile relaunch
+must reuse the stopped result's offered `afterRuntimeId`; listen-server and
+client acceptance commands still use separate managed roots so their evidence
+remains independently attributable.
 
 `npm run test:observer:integration` is reserved for the harmless exact-owned
 runtime native fixture; it does not launch Arma Reforger or Workbench.

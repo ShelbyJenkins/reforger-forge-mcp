@@ -8,6 +8,14 @@ import {
   readSync,
 } from "node:fs";
 import type { BigIntStats } from "node:fs";
+import { resolve } from "node:path";
+import { sameUsableFileIdentity } from "../foundation/file-identity.js";
+import {
+  readWindowsFileThroughVerifiedHandle,
+  WindowsSameHandleFileError,
+  WINDOWS_SAME_HANDLE_FILE_MAXIMUM_BYTES,
+  type WindowsSameHandleFileRead,
+} from "../platform/windows/same-handle-file.js";
 
 export const RESOURCE_META_MAXIMUM_BYTES = 256 * 1024;
 
@@ -34,6 +42,10 @@ export interface ResourceMetaFileEvidence {
   readonly sha256: string;
   readonly device: string;
   readonly inode: string;
+  /** Complete FILE_ID_INFO volume identity; on non-Windows this equals device. */
+  readonly volumeIdentity: string;
+  /** Complete unsigned FILE_ID_INFO identifier; on non-Windows this equals inode. */
+  readonly fileId: string;
   readonly modifiedNanoseconds: string;
   readonly changedNanoseconds: string;
   readonly birthNanoseconds: string;
@@ -54,14 +66,8 @@ function errorCode(error: unknown): string | undefined {
     : undefined;
 }
 
-function sameFile(left: BigIntStats, right: BigIntStats): boolean {
-  if (left.dev === 0n && left.ino === 0n) return true;
-  if (right.dev === 0n && right.ino === 0n) return true;
-  return left.dev === right.dev && left.ino === right.ino;
-}
-
 function sameStableIdentity(left: BigIntStats, right: BigIntStats): boolean {
-  return sameFile(left, right) &&
+  return sameUsableFileIdentity(left, right) &&
     left.size === right.size &&
     left.mtimeNs === right.mtimeNs &&
     left.ctimeNs === right.ctimeNs &&
@@ -74,15 +80,34 @@ function evidenceFrom(stat: BigIntStats, sha256: string): ResourceMetaFileEviden
     sha256,
     device: stat.dev.toString(),
     inode: stat.ino.toString(),
+    volumeIdentity: stat.dev.toString(),
+    fileId: stat.ino.toString(),
     modifiedNanoseconds: stat.mtimeNs.toString(),
     changedNanoseconds: stat.ctimeNs.toString(),
     birthNanoseconds: stat.birthtimeNs.toString(),
   });
 }
 
+function windowsEvidenceFrom(read: WindowsSameHandleFileRead): ResourceMetaFileEvidence {
+  return Object.freeze({
+    byteLength: read.byteLength,
+    sha256: read.sha256,
+    device: read.device,
+    inode: read.inode,
+    volumeIdentity: read.volumeIdentity,
+    fileId: read.fileId,
+    modifiedNanoseconds: read.modifiedNanoseconds,
+    changedNanoseconds: read.changedNanoseconds,
+    birthNanoseconds: read.birthNanoseconds,
+  });
+}
+
 function validateMaximumBytes(value: number): void {
-  if (!Number.isSafeInteger(value) || value <= 0) {
-    throw new TypeError("Resource metadata byte limit must be a positive safe integer.");
+  if (!Number.isSafeInteger(value) || value <= 0 ||
+      value > WINDOWS_SAME_HANDLE_FILE_MAXIMUM_BYTES) {
+    throw new TypeError(
+      `Resource metadata byte limit must be a positive safe integer no greater than ${WINDOWS_SAME_HANDLE_FILE_MAXIMUM_BYTES}.`,
+    );
   }
 }
 
@@ -228,12 +253,57 @@ export function readResourceMeta(
     );
   }
 
-  const noFollow = (constants as typeof constants & { O_NOFOLLOW?: number }).O_NOFOLLOW ?? 0;
+  if (process.platform === "win32") {
+    let read: WindowsSameHandleFileRead;
+    try {
+      read = readWindowsFileThroughVerifiedHandle({
+        path: resolve(metaPath),
+        maximumBytes,
+        includeBytes: true,
+        expectedPathIdentity: initial,
+        expectedByteLength: Number(initial.size),
+        expectedModifiedNanoseconds: initial.mtimeNs.toString(),
+        expectedChangedNanoseconds: initial.ctimeNs.toString(),
+        expectedBirthNanoseconds: initial.birthtimeNs.toString(),
+      });
+    } catch (error) {
+      if (error instanceof WindowsSameHandleFileError && error.code === "OVERSIZE") {
+        throw new ResourceMetaError(
+          "OVERSIZE",
+          `Workbench resource metadata exceeds its ${maximumBytes}-byte limit: ${metaPath}`,
+          { cause: error },
+        );
+      }
+      throw new ResourceMetaError(
+        "UNREADABLE",
+        `Workbench resource metadata failed its same-handle Windows proof: ${metaPath}`,
+        { cause: error },
+      );
+    }
+    if (read.bytes === undefined) {
+      throw new ResourceMetaError(
+        "UNREADABLE",
+        `Workbench resource metadata helper omitted the verified bytes: ${metaPath}`,
+      );
+    }
+    let text: string;
+    try {
+      text = new TextDecoder("utf-8", { fatal: true }).decode(read.bytes);
+    } catch {
+      throw malformed(metaPath, "invalid UTF-8");
+    }
+    return Object.freeze({
+      guid: parseResourceMetaGuid(text, metaPath),
+      evidence: windowsEvidenceFrom(read),
+    });
+  }
+
   let descriptor: number | undefined;
   try {
+    const noFollow = (constants as typeof constants & { O_NOFOLLOW?: number }).O_NOFOLLOW ?? 0;
     descriptor = openSync(metaPath, constants.O_RDONLY | noFollow);
     const opened = fstatSync(descriptor, { bigint: true });
-    if (!opened.isFile() || !sameFile(initial, opened)) {
+    if (!opened.isFile() || !sameUsableFileIdentity(initial, opened)) {
       throw new ResourceMetaError(
         "UNREADABLE",
         `Workbench resource metadata changed identity while being opened: ${metaPath}`,

@@ -108,6 +108,8 @@ export interface RegisterToolsOptions {
   hostIdentity?: McpHostIdentity;
   /** CLI-only dynamic lifecycle diagnostics; embedders omit this callback. */
   mcpLifecycleDiagnostic?: () => McpLifecycleDiagnostic;
+  /** Monotonic process clock shared by the CLI idle-readiness composition. */
+  nowTick?: () => number;
 }
 
 /**
@@ -257,7 +259,10 @@ export function registerTools(
     hostIdentity,
     admissionGate,
   });
-  const ownedRuntimeManager = observerApplication.ownedRuntimeManager!;
+  const ownedRuntimeManager = observerApplication.ownedRuntimeManager;
+  if (!ownedRuntimeManager) {
+    throw new Error("The server composition requires an owned runtime manager.");
+  }
   registerObserverTools(server, observerApplication, {
     sessionTtlMs: observerConfig?.sessionTtlMs,
     defaultCaptureTimeoutMs: observerConfig?.defaultCaptureTimeoutMs,
@@ -302,13 +307,14 @@ export function registerTools(
   };
   const idleReadiness = new McpIdleReadinessInspector({
     admissionGate,
+    nowTick: options.nowTick,
     providers: [
       workbenchComposition.activityGate,
       workbenchComposition.childSupervisor,
       workbenchComposition.client,
       observerApplication.agentClient,
       observerApplication.captureService,
-      ...(observerApplication.ownedRuntimeManager ? [observerApplication.ownedRuntimeManager] : []),
+      ownedRuntimeManager,
     ],
   });
   const disposeObserverLifecycle = Object.assign(disposeObserverAttempt, {

@@ -43,11 +43,11 @@ function captureProjectError(action: () => unknown): ProjectIdentityError {
 }
 
 function expectedKey(path: string): string {
-  return path.toLowerCase();
+  return path;
 }
 
 describe("canonical Workbench project identity", () => {
-  scopedIt("trims, resolves, and canonicalizes a regular .gproj case-insensitively", (root) => {
+  scopedIt("trims and retains the exact native-realpath identity of a regular .gproj", (root) => {
     const projectPath = createProject(root, "Example Mod", "Example.GpRoJ");
     const relativePath = relative(process.cwd(), projectPath);
 
@@ -61,6 +61,23 @@ describe("canonical Workbench project identity", () => {
       modDirectory: canonicalMod,
       modDirectoryKey: expectedKey(canonicalMod),
     });
+  });
+
+  it("does not collapse distinct canonical paths that differ only by case", () => {
+    const upper: CanonicalProjectIdentity = {
+      displayPath: "C:\\Mods\\Foo\\Example.gproj",
+      comparisonKey: "C:\\Mods\\Foo\\Example.gproj",
+      modDirectory: "C:\\Mods\\Foo",
+      modDirectoryKey: "C:\\Mods\\Foo",
+    };
+    const lower: CanonicalProjectIdentity = {
+      displayPath: "C:\\Mods\\foo\\Example.gproj",
+      comparisonKey: "C:\\Mods\\foo\\Example.gproj",
+      modDirectory: "C:\\Mods\\foo",
+      modDirectoryKey: "C:\\Mods\\foo",
+    };
+
+    expect(sameProjectIdentity(upper, lower)).toBe(false);
   });
 
   scopedIt("uses native realpath identity through a linked mod directory", (root) => {

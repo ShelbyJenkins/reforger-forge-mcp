@@ -35,6 +35,14 @@ describe("CLI stdio composition architecture", () => {
     expect(composition.match(/new\s+ActivityTrackingTransport\s*\(/g)).toHaveLength(1);
     expect(composition.match(/new\s+McpIdleShutdownController\s*\(/g)).toHaveLength(1);
     expect(composition.match(/registerTools\s*\(/g)).toHaveLength(1);
+    expect(composition).toMatch(
+      /registerTools\s*\([\s\S]*?nowTick:\s*options\.nowTick[\s\S]*?\}\);/
+    );
+
+    const server = source("src/server.ts");
+    expect(server).toMatch(
+      /new\s+McpIdleReadinessInspector\s*\(\{[\s\S]*?nowTick:\s*options\.nowTick[\s\S]*?providers:/
+    );
   });
 
   it("rejects callback registration paths that bypass the tracked public APIs", () => {

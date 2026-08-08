@@ -95,20 +95,28 @@ manager:
 ```
 
 Omitting `action` means `start`; `runtimeKind` defaults to `listenServer`.
-`client` maps to `-world`, while `listenServer` maps to `-server`. Extra
+The legacy value `client` means a standalone graphical `-world` launch; it does
+**not** select Reforger's `-client` replication mode. `listenServer` maps to
+`-server`. Extra
 `arguments` cannot replace composite-owned project, world, add-on, profile,
 display, or owner-token fields. The result contains the exact `runtimeId`,
 `sessionId`, canonical project/profile/world, emitted and implicit add-on roots,
 final prepared argument vector, matching instances, and status/capture/stop
-guidance. A readiness timeout is partial success: the process remains visible in
-the result and must still be inspected or stopped.
+guidance. Successful start/status/stop calls return the same action-discriminated
+object in MCP `structuredContent` and as JSON text for compatible clients. A
+readiness timeout is partial success: the process remains visible in the result
+and must still be inspected or stopped. When readiness inspection itself fails,
+`readinessWarning` remains fixed while the separately bounded `readinessError`
+contains public guidance; `next.capture.firstCall` is the authoritative machine
+path for refreshing the same session inventory.
 
-This baseline intentionally retains one initial launch family per derived
-project profile. An identical request in the same MCP lifecycle recovers the
-same preparation/runtime without spawning twice. Changed, invalidated, stale,
-expired, or terminal evidence fails closed; it does not create a successor.
-Use a fresh isolated managed/profile root and MCP lifecycle for a deliberate
-second baseline generation until durable successor support is available.
+`game_launch` retains a durable attempt chain per derived project profile. An
+identical request recovers the same attempt without spawning twice. After
+`game_launch stop` or `observer_runtime stop` completes exact vacancy, camera
+restoration, session sealing, and revocation, the result offers that exact
+`runtimeId` as `afterRuntimeId` for one successor. Natural exit or status alone
+never grants successor admission. Changed, invalidated, stale, expired, or
+unknown attempt outcomes remain pinned and fail closed.
 The manager re-attests the original project, world metadata, dependency
 manifests, and executable immediately before descriptor consumption. This
 narrows but cannot eliminate the ordinary external-filesystem race in which an
@@ -384,7 +392,7 @@ game process.
 | `observer_setup` | Inspect, stage, or uninstall managed observer companions. |
 | `game_launch` | Plan, start, inspect, or stop one fail-closed exact-owned graphical runtime. |
 | `observer_prepare_launch` | Produce a canonical runtime executable path, instrumented argument tokens, and a runtime capture session. |
-| `observer_runtime` | Start, inspect, or stop an exact-owned Windows runtime. |
+| `observer_runtime` | Start, inspect, stop, classify (`history`), or safely reconcile (`recover`) exact-owned Windows runtime history. |
 | `observer_instances` | Find compatible runtime or Workbench renderers and obtain world bindings. |
 | `observer_capture` | Submit a current, pose, or look-at capture, optionally attached to an active or explicit run. |
 | `observer_job` | Inspect, read, cancel, or release a capture job. |

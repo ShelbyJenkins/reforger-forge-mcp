@@ -273,6 +273,36 @@ describe("MCP client detection and standard registration", () => {
     expect(readdirSync(setup.appData)).toEqual([]);
   });
 
+  it("pins config entries and drift inspection to the verified absolute Node executable", () => {
+    const setup = fixture();
+    const nodePath = join(setup.root, "Node With Spaces Ω", "node.exe");
+    const conflictingNodePath = join(setup.root, "wrong-path-node", "node.exe");
+    mkdirSync(dirname(nodePath), { recursive: true });
+    mkdirSync(dirname(conflictingNodePath), { recursive: true });
+    writeFileSync(nodePath, "fixture node executable", "utf8");
+    writeFileSync(conflictingNodePath, "wrong fixture node executable", "utf8");
+    const configPath = join(setup.home, ".cursor", "mcp.json");
+
+    const registered = receipt(setup, "cursor", {
+      nodePath,
+      environment: { ...setup.environment, PATH: "" },
+      findCommand: findOnly("cursor"),
+    });
+    expect(registered?.status).toBe("updated");
+    const document = JSON.parse(readFileSync(configPath, "utf8")) as {
+      mcpServers: Record<string, { command: string; args: string[] }>;
+    };
+    expect(document.mcpServers["reforger-forge"]?.command).toBe(nodePath);
+
+    const inspected = inspectDetectedClients(options(setup, {
+      nodePath,
+      environment: { ...setup.environment, PATH: dirname(conflictingNodePath) },
+      findCommand: findOnly("cursor"),
+    }));
+    expect(inspected.receipts.find((candidate) => candidate.id === "cursor")?.status)
+      .toBe("current");
+  });
+
   it.each([
     {
       id: "cursor",
@@ -544,8 +574,12 @@ describe("MCP client detection and standard registration", () => {
 
   it("registers Codex through its CLI with no override arguments", () => {
     const setup = fixture();
+    const nodePath = join(setup.root, "Node With Spaces Ω", "node.exe");
+    mkdirSync(dirname(nodePath), { recursive: true });
+    writeFileSync(nodePath, "fixture node executable", "utf8");
     const calls: CommandCall[] = [];
     const result = receipt(setup, "codex", {
+      nodePath,
       findCommand: findOnly("codex"),
       runCommand: (command, args) => {
         calls.push({ command, args });
@@ -586,7 +620,7 @@ describe("MCP client detection and standard registration", () => {
           "add",
           "reforger-forge",
           "--",
-          "node",
+          nodePath,
           ...managedArgs(setup, "codex"),
         ],
       },

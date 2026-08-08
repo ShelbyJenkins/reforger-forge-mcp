@@ -118,8 +118,10 @@ export class LmdbCasStore<T> {
   }
 
   /** Inspect a record without creating a missing LMDB or archive directory. */
-  async inspectExisting(): Promise<LmdbExistingInspection<LmdbCasInspection<T>>> {
-    const existing = await this.store.inspectExisting(this.key);
+  async inspectExisting(
+    options: { readonly retainOpen?: boolean } = {},
+  ): Promise<LmdbExistingInspection<LmdbCasInspection<T>>> {
+    const existing = await this.store.inspectExisting(this.key, options);
     if (existing.kind === "missing") return existing;
     const inspected = existing.value;
     if (inspected.kind === "missing") return { kind: "available", value: { kind: "missing" } };

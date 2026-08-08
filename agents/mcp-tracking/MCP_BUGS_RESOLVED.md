@@ -6,6 +6,159 @@ mixed tracker on 2026-07-28; same-day ties retain their migration order.
 
 ## Resolved defects
 
+## MCP-059 - launch-planner filesystem evidence is not fully fail closed on Windows
+
+**Status:** Resolved
+
+**Severity:** P1 - concurrent replacement can escape the advertised exact-evidence boundary
+
+**Observed:** 2026-08-05
+
+**Closed:** 2026-08-06
+
+**Resolution:** Supported Windows evidence reads now cross one bundled native
+boundary that owns the `CreateFileW` handle. It opens the requested object with
+`FILE_FLAG_OPEN_REPARSE_POINT`, obtains a nonzero `FILE_ID_INFO` volume and
+128-bit file ID plus the Node-compatible handle identity, obtains and matches
+the final handle path, reads and hashes the bounded content through that same
+handle, compares before/after handle snapshots, and reopens the requested path
+to prove that it still names the handle that supplied the evidence. Zero or
+unavailable identity, leaf reparse points, ancestor reparse traversal, path or
+handle replacement, oversize input, an unavailable helper, and incomplete
+protocol evidence all fail closed. World, add-on-manifest, and resource-meta
+readers route through this boundary before the non-Windows `O_NOFOLLOW` path;
+their persisted evidence now retains the complete native volume/file ID and
+their failures remain typed planner refusals. The helper is addressed by an
+absolute PowerShell path and a package-root-relative script path in source
+workers, compiled workers, and fresh production installs.
+
+**Verification:** The Windows identity, native-boundary, architecture,
+source-worker, and package-contract run passes 19/19. The world, add-on, and
+resource-meta planner run passes 34/34, including deterministic zero identity
+and replacement plus real hard-link, file-symlink, and ancestor-junction cases.
+An isolated `game_launch` start plus exact retry passes in 5.672 seconds; the
+single-start event-loop fixture passes in 4.293 seconds. `npm run test:package`
+performs a clean build, verifies a 1,116-file tarball, installs it with production
+dependencies, imports the compiled same-handle module, and successfully executes
+its bundled helper. Typecheck and `git diff --check` pass. Filesystems that
+cannot return the required nonzero identities or final handle path remain
+explicitly unsupported for this proof and are refused rather than weakened.
+
+## MCP-066 - case-sensitive Windows paths collapse launch containment and provider identity
+
+**Status:** Resolved
+
+**Severity:** P2 - supported filesystem semantics can cross an exact project/provider boundary
+
+**Observed:** 2026-08-05
+
+**Closed:** 2026-08-06
+
+**Resolution:** Canonical-path keys now preserve native-realpath spelling instead
+of unconditionally lowercasing Windows paths. Project containment, world
+selection, add-on-root deduplication, and manifest-provider identity therefore
+keep distinct case-sensitive siblings distinct. Where stable filesystem identity
+is unavailable, the associated launch evidence fails closed rather than using
+case-folding as a substitute.
+
+**Verification:** Focused file-identity and planner tests pass 29/29, including
+exact canonical-case assertions, and the broader dependent containment/provider
+set passes 117/117. Typecheck also passes. The separate Windows same-handle
+reparse-race boundary is resolved under MCP-059.
+
+## MCP-063 - observer-agent close marks cleanup complete before forced exit is observed
+
+**Status:** Resolved
+
+**Severity:** P2 - private-child termination and stdio cleanup are not observed before clean close
+
+**Observed:** 2026-08-05
+
+**Closed:** 2026-08-06
+
+**Resolution:** Forced private-child shutdown now remains pending until both the
+exact child `exit` and stdio `close` events are observed within the remaining
+absolute shutdown deadline. A false or throwing kill and missing exit/close
+evidence remain explicit retryable cleanup failures; they are never published
+as a clean closed state.
+
+**Verification:** The agent-client shutdown suite passes 12/12 and distinguishes
+signal delivery from delayed close, false kill, missing termination evidence,
+and the successful exact exit-plus-close path.
+
+## MCP-062 - managed client registrations discard the Node executable that setup verified
+
+**Status:** Resolved
+
+**Severity:** P2 - installed desktop registrations can fail or run a different Node version
+
+**Observed:** 2026-08-05
+
+**Closed:** 2026-08-06
+
+**Resolution:** The server-verification report now carries the exact absolute
+Node executable path it exercised. Every managed registration persists that
+path, and registration inspection, drift checks, doctor output, and setup
+receipts compare and report the same verified executable rather than resolving
+ambient `node` from a GUI client's PATH.
+
+**Verification:** The focused setup, registration, verification, doctor, and
+receipt suites pass 100/100, including empty/conflicting PATH fixtures and exact
+absolute-command drift assertions.
+
+## MCP-057 - existing-only Workbench LMDB inspection can crash a fresh host
+
+**Status:** Resolved
+
+**Severity:** P1 - native host termination during a supported read-only idle probe
+
+**Observed:** 2026-08-05
+
+**Closed:** 2026-08-06
+
+**Observed behavior:** While another MCP/Workbench lifecycle had the shared
+Workbench v3 LMDB environment mapped, a fresh production process calling the
+existing-only lifecycle reader could terminate with Windows exception
+`0xC0000005` before JavaScript received a result.
+
+**Cause:** `lmdb` 3.5.6 performs read-only DBI opening in native code and its
+installed `open.js` implementation itself records a race around updating DBI
+state outside the lock. A native access violation cannot be caught or converted
+to a refusal inside the process that mapped the environment.
+
+**Resolution:** A fresh MCP host no longer maps the Workbench environment in
+its own address space for idle readiness. One bounded, minimal-environment Node
+subprocess opens the already-existing environment read-only, retains that one
+handle while reading both lifecycle and spawn-journal records, and returns a
+bounded projection that is strictly revalidated by the parent. Abnormal exit,
+timeout, invalid protocol output, and reader errors become malformed evidence
+and therefore `INCOMPLETE_PROOF`; hard failures are retained to prevent a crash
+respawn loop. Timeout and cancellation request termination and wait for exact
+child transport-close evidence under a separate one-second cleanup bound; a
+missing close becomes a distinct fail-closed cleanup failure. A process that
+already owns an open writer continues to reuse that exact handle. Missing
+storage remains uncreated and the reader exposes no durable-state mutation API.
+
+The underlying native-library defect remains isolated rather than claimed
+fixed. The exact default-root MCP-056 acceptance was not run during closure:
+both default stores existed while an attended Workbench and multiple MCP/Node
+hosts were active. The status remains precisely snapshot/live-composition
+validated with default-root acceptance deferred until that shared-state gate is
+safe to execute.
+
+**Verification:** The crash-isolation suite covers missing-root noncreation, a
+fresh reader against a disposable environment whose writer remains mapped in
+another process, unchanged `data.mdb` size/mtime, abnormal child exit, absolute
+timeout, cancellation, exact child-close/PID cleanup before settlement, stable
+hard-failure projection, and crash-storm suppression. Combined readiness maps a
+failed projection to `INCOMPLETE_PROOF`. The focused isolation, store,
+readiness, architecture, and package-contract run passes 107/107; Stage 3 passes
+373/373; and the cross-process/readiness run passes 26/26 with one explicit
+machine-precondition skip because an unowned Workbench is running. Typecheck,
+the full compiled build, and `git diff --check` pass. A compiled-worker
+live-writer smoke returned without changing `data.mdb`, and the packed-package
+check verified 1,103 files plus a fresh production-only install and both bins.
+
 ## MCP-054 — `wb_log_query` misses error-level editor diagnostics
 
 **Status:** Resolved

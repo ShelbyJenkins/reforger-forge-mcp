@@ -170,10 +170,11 @@ describe("server verification core", () => {
     const report = await verify(fixture, root, startupArguments, "codex");
 
     expect(report).toMatchObject({
-      schemaVersion: 2,
+      schemaVersion: 3,
       generatedAt: "2026-07-24T12:00:00.000Z",
       success: true,
       nodeVersion: "v22.17.0",
+      nodePath: resolve("C:\\Node\\node.exe"),
       serverPath: resolve(root, "dist", "index.js"),
       packageVersion: "1.1.0",
       configPath: resolve(root, "config files", "settings.json"),
@@ -201,6 +202,9 @@ describe("server verification core", () => {
     expect(report.startupArguments).toEqual(startupArguments);
     expect(formatServerVerificationReport(report)).toContain(
       "MCP idle:   1800000 ms"
+    );
+    expect(formatServerVerificationReport(report)).toContain(
+      `Node path:  ${resolve("C:\\Node\\node.exe")}`
     );
     expect(fixture.discoverSteam).toHaveBeenCalledOnce();
     expect(fixture.loadConfiguration).toHaveBeenCalledOnce();

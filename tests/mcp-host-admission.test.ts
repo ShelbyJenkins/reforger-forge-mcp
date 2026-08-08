@@ -17,14 +17,29 @@ function deferred<T>(): {
 describe("MCP host admission gate", () => {
   it("tracks synchronous admission, release, and revision changes", () => {
     const gate = new McpHostAdmissionGate();
-    expect(gate.snapshot()).toEqual({ state: "open", activeTokens: 0, revision: 0 });
+    expect(gate.snapshot()).toEqual({
+      state: "open",
+      activeTokens: 0,
+      privilegedCleanupCount: 0,
+      revision: 0,
+    });
     const first = gate.acquire("first operation");
     const second = gate.acquire("second operation");
-    expect(gate.snapshot()).toEqual({ state: "open", activeTokens: 2, revision: 2 });
+    expect(gate.snapshot()).toEqual({
+      state: "open",
+      activeTokens: 2,
+      privilegedCleanupCount: 0,
+      revision: 2,
+    });
     first.release();
     first.release();
     second.release();
-    expect(gate.snapshot()).toEqual({ state: "open", activeTokens: 0, revision: 4 });
+    expect(gate.snapshot()).toEqual({
+      state: "open",
+      activeTokens: 0,
+      privilegedCleanupCount: 0,
+      revision: 4,
+    });
   });
 
   it("holds run admission through the full async finally lifetime", async () => {
@@ -82,5 +97,26 @@ describe("MCP host admission gate", () => {
     const gate = new McpHostAdmissionGate();
     expect(gate.trySealIdleAdmissions(gate.issueIdleSealProof([]))).toBe(true);
     await expect(gate.runPrivilegedCleanup(async () => "closed")).resolves.toBe("closed");
+    expect(gate.snapshot().privilegedCleanupCount).toBe(0);
+  });
+
+  it("exposes in-flight privileged cleanup and invalidates idle proofs", async () => {
+    const gate = new McpHostAdmissionGate();
+    const stale = gate.issueIdleSealProof([]);
+    const cleanup = deferred<string>();
+    const running = gate.runPrivilegedCleanup(() => cleanup.promise);
+
+    expect(gate.snapshot()).toMatchObject({
+      state: "open",
+      activeTokens: 0,
+      privilegedCleanupCount: 1,
+      revision: 1,
+    });
+    expect(gate.issueIdleSealProof([])).toBeNull();
+    expect(gate.trySealIdleAdmissions(stale)).toBe(false);
+
+    cleanup.resolve("closed");
+    await expect(running).resolves.toBe("closed");
+    expect(gate.snapshot()).toMatchObject({ privilegedCleanupCount: 0, revision: 2 });
   });
 });

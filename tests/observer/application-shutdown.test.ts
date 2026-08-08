@@ -41,7 +41,8 @@ describe("Observer application phased shutdown", () => {
         order.push("agent:closed");
       });
 
-      await expect(app.closeRuntimeLifecycle(Date.now() + 5_000)).resolves.toMatchObject({
+      const deadlineAtMs = Date.now() + 5_000;
+      await expect(app.closeRuntimeLifecycle(deadlineAtMs)).resolves.toMatchObject({
         applicationCloseSafe: true,
       });
       expect(order).toEqual([
@@ -51,6 +52,7 @@ describe("Observer application phased shutdown", () => {
         "workbench:restored",
         "agent:closed",
       ]);
+      expect(app.agentClient.close).toHaveBeenCalledWith(deadlineAtMs);
       expect(app.lifecycleState).toBe("closed");
     }, { prefix: "rfo-application-shutdown-order-" });
   });

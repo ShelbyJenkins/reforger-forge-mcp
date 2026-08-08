@@ -20,10 +20,19 @@ import {
 import { getProperty, parse } from "../formats/enfusion-text.js";
 import { sha256Hex } from "../foundation/digest.js";
 import {
+  sameUsableFileIdentity,
+  type BigIntFileIdentity,
+} from "../foundation/file-identity.js";
+import {
+  canonicalPathComparisonKey,
   canonicalizePotentialPath,
   isPathContained,
-  pathComparisonKey,
 } from "../foundation/managed-path.js";
+import {
+  readWindowsFileThroughVerifiedHandle,
+  WindowsSameHandleFileError,
+  type WindowsSameHandleFileRead,
+} from "../platform/windows/same-handle-file.js";
 import {
   ADDON_GUID_PATTERN,
 } from "../workbench/addon-dependencies.js";
@@ -31,7 +40,7 @@ import type { CanonicalProjectIdentity } from "../workbench/project-identity.js"
 import { revalidateProjectIdentity } from "../workbench/project-identity.js";
 import { GameLaunchPlanError, type GameLaunchPlanErrorCode } from "./game-launch-errors.js";
 
-export const GAME_ADDON_EVIDENCE_SCHEMA_VERSION = 1;
+export const GAME_ADDON_EVIDENCE_SCHEMA_VERSION = 2;
 export const GAME_ADDON_MANIFEST_MAXIMUM_BYTES = 4 * 1024 * 1024;
 
 export interface GameAddonScanLimits {
@@ -67,6 +76,10 @@ export interface GameAddonFileIdentity {
 }
 
 export interface GameAddonManifestEvidence extends GameAddonFileIdentity {
+  /** Complete FILE_ID_INFO volume identity; on non-Windows this equals device. */
+  readonly volumeIdentity: string;
+  /** Complete unsigned FILE_ID_INFO identifier; on non-Windows this equals inode. */
+  readonly fileId: string;
   readonly gprojPath: string;
   readonly comparisonKey: string;
   readonly guid: string;
@@ -147,6 +160,22 @@ export interface ResolveGameAddonPlanOptions {
   readonly managedRoot: string;
   readonly profileRoot: string;
   readonly scanLimits?: Partial<GameAddonScanLimits>;
+  /** @internal Deterministic test seam; production composition never supplies it. */
+  readonly testHooks?: GameAddonPlanTestHooks;
+}
+
+export type GameAddonPlanTestCheckpoint =
+  | "after_directory_read"
+  | "before_candidate_stat"
+  | "before_manifest_open";
+
+/** @internal Fault-injection checkpoints used to prove race refusals deterministically. */
+export interface GameAddonPlanTestHooks {
+  readonly checkpoint?: (checkpoint: GameAddonPlanTestCheckpoint, path: string) => void;
+  readonly fileIdentity?: (
+    path: string,
+    identity: Readonly<BigIntFileIdentity>,
+  ) => BigIntFileIdentity;
 }
 
 interface RootSeed {
@@ -209,18 +238,23 @@ function compareStrings(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
 }
 
-function sameFile(left: BigIntStats, right: BigIntStats): boolean {
-  if (left.dev === 0n && left.ino === 0n) return true;
-  if (right.dev === 0n && right.ino === 0n) return true;
-  return left.dev === right.dev && left.ino === right.ino;
-}
-
 function sameIdentity(left: BigIntStats, right: BigIntStats): boolean {
-  return sameFile(left, right) &&
+  return sameUsableFileIdentity(left, right) &&
     left.size === right.size &&
     left.mtimeNs === right.mtimeNs &&
     left.ctimeNs === right.ctimeNs &&
     left.birthtimeNs === right.birthtimeNs;
+}
+
+function sameOpenedFileIdentity(
+  left: BigIntStats,
+  right: BigIntStats,
+  path: string,
+  testHooks: GameAddonPlanTestHooks | undefined,
+): boolean {
+  const leftIdentity = testHooks?.fileIdentity?.(path, { dev: left.dev, ino: left.ino }) ?? left;
+  const rightIdentity = testHooks?.fileIdentity?.(path, { dev: right.dev, ino: right.ino }) ?? right;
+  return sameUsableFileIdentity(leftIdentity, rightIdentity);
 }
 
 function identityFrom(value: BigIntStats): GameAddonFileIdentity {
@@ -231,6 +265,21 @@ function identityFrom(value: BigIntStats): GameAddonFileIdentity {
     modifiedNanoseconds: value.mtimeNs.toString(),
     changedNanoseconds: value.ctimeNs.toString(),
     birthNanoseconds: value.birthtimeNs.toString(),
+  };
+}
+
+function windowsIdentityFrom(
+  value: WindowsSameHandleFileRead,
+): GameAddonFileIdentity & Pick<GameAddonManifestEvidence, "volumeIdentity" | "fileId"> {
+  return {
+    byteLength: value.byteLength,
+    device: value.device,
+    inode: value.inode,
+    volumeIdentity: value.volumeIdentity,
+    fileId: value.fileId,
+    modifiedNanoseconds: value.modifiedNanoseconds,
+    changedNanoseconds: value.changedNanoseconds,
+    birthNanoseconds: value.birthNanoseconds,
   };
 }
 
@@ -351,8 +400,8 @@ function appendRootSeed(
       );
     }
   }
-  const key = pathComparisonKey(canonical);
-  const existing = roots.find((root) => pathComparisonKey(root.path) === key);
+  const key = canonicalPathComparisonKey(canonical);
+  const existing = roots.find((root) => canonicalPathComparisonKey(root.path) === key);
   if (existing) {
     if (!existing.provenance.includes(provenance)) existing.provenance.push(provenance);
     existing.prospectiveImplicit &&= prospectiveImplicit;
@@ -440,6 +489,7 @@ function scanOneDirectory(
   path: string,
   counters: ScanCounters,
   limits: GameAddonScanLimits,
+  testHooks?: GameAddonPlanTestHooks,
 ): { evidence: GameAddonDirectoryEvidence; entries: readonly Dirent[] } {
   let before: BigIntStats;
   try {
@@ -458,6 +508,7 @@ function scanOneDirectory(
     );
   }
   const entries = readDirectory(path, counters, "visitedEntries", limits);
+  testHooks?.checkpoint?.("after_directory_read", path);
   for (const entry of entries) {
     const candidate = join(path, entry.name);
     let current: BigIntStats;
@@ -505,6 +556,7 @@ function scanRoot(
   seed: RootSeed,
   counters: ScanCounters,
   limits: GameAddonScanLimits,
+  testHooks?: GameAddonPlanTestHooks,
 ): RootScan {
   let rootInfo: BigIntStats;
   try {
@@ -515,7 +567,7 @@ function scanRoot(
         seed,
         evidence: {
           path: seed.path,
-          comparisonKey: pathComparisonKey(seed.path),
+          comparisonKey: canonicalPathComparisonKey(seed.path),
           prospectiveImplicit: seed.prospectiveImplicit,
           exists: false,
           visitedEntries: 0,
@@ -552,20 +604,40 @@ function scanRoot(
   const candidateStart = counters.candidateCount;
   const candidates: string[] = [];
   const directories: GameAddonDirectoryEvidence[] = [];
-  const root = scanOneDirectory(seed.path, counters, limits);
+  const root = scanOneDirectory(seed.path, counters, limits, testHooks);
   directories.push(root.evidence);
   for (const entry of root.entries) {
     const child = join(seed.path, entry.name);
-    const info = lstatSync(child, { bigint: true });
+    let info: BigIntStats;
+    try {
+      testHooks?.checkpoint?.("before_candidate_stat", child);
+      info = lstatSync(child, { bigint: true });
+    } catch (error) {
+      throw findingError(
+        { kind: "scan_unstable", path: safePath(child) },
+        `Game add-on entry changed after directory verification: ${safePath(child)}`,
+        error,
+      );
+    }
     if (info.isFile() && extname(entry.name).toLowerCase() === ".gproj") {
       candidates.push(child);
       counters.candidateCount += 1;
     } else if (info.isDirectory()) {
-      const nested = scanOneDirectory(child, counters, limits);
+      const nested = scanOneDirectory(child, counters, limits, testHooks);
       directories.push(nested.evidence);
       for (const nestedEntry of nested.entries) {
         const candidate = join(child, nestedEntry.name);
-        const candidateInfo = lstatSync(candidate, { bigint: true });
+        let candidateInfo: BigIntStats;
+        try {
+          testHooks?.checkpoint?.("before_candidate_stat", candidate);
+          candidateInfo = lstatSync(candidate, { bigint: true });
+        } catch (error) {
+          throw findingError(
+            { kind: "scan_unstable", path: safePath(candidate) },
+            `Game add-on candidate changed after directory verification: ${safePath(candidate)}`,
+            error,
+          );
+        }
         if (candidateInfo.isFile() && extname(nestedEntry.name).toLowerCase() === ".gproj") {
           candidates.push(candidate);
           counters.candidateCount += 1;
@@ -579,12 +651,15 @@ function scanRoot(
       );
     }
   }
-  directories.sort((left, right) => compareStrings(pathComparisonKey(left.path), pathComparisonKey(right.path)));
+  directories.sort((left, right) => compareStrings(
+    canonicalPathComparisonKey(left.path),
+    canonicalPathComparisonKey(right.path),
+  ));
   return {
     seed,
     evidence: {
       path: seed.path,
-      comparisonKey: pathComparisonKey(seed.path),
+      comparisonKey: canonicalPathComparisonKey(seed.path),
       prospectiveImplicit: seed.prospectiveImplicit,
       exists: true,
       visitedEntries: counters.visitedEntries - visitedStart,
@@ -596,11 +671,85 @@ function scanRoot(
   };
 }
 
+function parsedManifest(
+  absolute: string,
+  canonical: string,
+  providerRoot: string,
+  counters: ScanCounters,
+  bytes: Buffer,
+  identity: GameAddonFileIdentity & Pick<GameAddonManifestEvidence, "volumeIdentity" | "fileId">,
+  sha256: string,
+): ManifestRead {
+  let document;
+  try {
+    document = parse(bytes.toString("utf8"));
+  } catch (error) {
+    throw findingError(
+      { kind: "manifest_malformed", manifestPath: safePath(absolute) },
+      `Game add-on manifest is malformed: ${safePath(absolute)}`,
+      error,
+    );
+  }
+  const guidValue = getProperty(document, "GUID");
+  const guid = typeof guidValue === "string" ? guidValue.toUpperCase() : "";
+  if (document.type !== "GameProject" || !ADDON_GUID_PATTERN.test(guid)) {
+    throw findingError(
+      { kind: "manifest_malformed", manifestPath: safePath(absolute) },
+      `Game add-on manifest is not a GameProject with a valid GUID: ${safePath(absolute)}`,
+    );
+  }
+  const rawDependencies = document.children
+    .filter((child) => child.type === "Dependencies")
+    .flatMap((child) => child.values);
+  const dependencies = new Set<string>();
+  for (const [index, value] of rawDependencies.entries()) {
+    const normalized = value.toUpperCase();
+    if (!ADDON_GUID_PATTERN.test(normalized)) {
+      throw findingError(
+        {
+          kind: "malformed_declared_guid",
+          manifestPath: safePath(absolute),
+          dependencyIndex: index,
+        },
+        `Game add-on manifest declares a malformed dependency GUID: ${safePath(absolute)}`,
+      );
+    }
+    dependencies.add(normalized);
+  }
+  counters.totalManifestBytes += bytes.length;
+  return {
+    ...identity,
+    gprojPath: canonical,
+    comparisonKey: canonicalPathComparisonKey(canonical),
+    guid,
+    dependencies: Object.freeze([...dependencies].sort(compareStrings)),
+    providerRoots: [providerRoot],
+    sha256,
+  };
+}
+
+function assertManifestAggregateLimit(
+  counters: ScanCounters,
+  limits: GameAddonScanLimits,
+  byteLength: number,
+): void {
+  if (counters.totalManifestBytes + byteLength <= limits.maximumTotalManifestBytes) return;
+  throw findingError(
+    {
+      kind: "scan_truncated",
+      limit: "maximumTotalManifestBytes",
+      maximum: limits.maximumTotalManifestBytes,
+    },
+    `Game add-on manifests exceed their ${limits.maximumTotalManifestBytes}-byte aggregate limit.`,
+  );
+}
+
 function readManifest(
   requestedPath: string,
   providerRoot: string,
   counters: ScanCounters,
   limits: GameAddonScanLimits,
+  testHooks?: GameAddonPlanTestHooks,
 ): ManifestRead {
   const absolute = resolve(requestedPath);
   let initial: BigIntStats;
@@ -629,23 +778,72 @@ function readManifest(
       `Game add-on manifest exceeds its ${limits.maximumManifestBytes}-byte limit: ${safePath(absolute)}`,
     );
   }
-  if (counters.totalManifestBytes + Number(initial.size) > limits.maximumTotalManifestBytes) {
-    throw findingError(
-      {
-        kind: "scan_truncated",
-        limit: "maximumTotalManifestBytes",
-        maximum: limits.maximumTotalManifestBytes,
-      },
-      `Game add-on manifests exceed their ${limits.maximumTotalManifestBytes}-byte aggregate limit.`,
-    );
-  }
+  assertManifestAggregateLimit(counters, limits, Number(initial.size));
 
-  const noFollow = (constants as typeof constants & { O_NOFOLLOW?: number }).O_NOFOLLOW ?? 0;
   let descriptor: number | undefined;
   try {
+    testHooks?.checkpoint?.("before_manifest_open", absolute);
+    if (process.platform === "win32") {
+      const expectedPathIdentity = testHooks?.fileIdentity?.(
+        absolute,
+        { dev: initial.dev, ino: initial.ino },
+      ) ?? initial;
+      let read: WindowsSameHandleFileRead;
+      try {
+        read = readWindowsFileThroughVerifiedHandle({
+          path: absolute,
+          maximumBytes: limits.maximumManifestBytes,
+          includeBytes: true,
+          expectedPathIdentity,
+          expectedByteLength: Number(initial.size),
+          expectedModifiedNanoseconds: initial.mtimeNs.toString(),
+          expectedChangedNanoseconds: initial.ctimeNs.toString(),
+          expectedBirthNanoseconds: initial.birthtimeNs.toString(),
+        });
+      } catch (error) {
+        if (error instanceof WindowsSameHandleFileError && error.code === "OVERSIZE") {
+          throw findingError(
+            {
+              kind: "manifest_oversize",
+              manifestPath: safePath(absolute),
+              maximumBytes: limits.maximumManifestBytes,
+            },
+            `Game add-on manifest exceeds its ${limits.maximumManifestBytes}-byte limit: ${safePath(absolute)}`,
+            error,
+          );
+        }
+        if (error instanceof WindowsSameHandleFileError &&
+            error.code !== "HELPER_UNAVAILABLE" && error.code !== "HELPER_TIMEOUT") {
+          throw findingError(
+            { kind: "scan_unstable", path: safePath(absolute) },
+            `Game add-on manifest failed its same-handle Windows proof: ${safePath(absolute)}`,
+            error,
+          );
+        }
+        throw error;
+      }
+      if (read.bytes === undefined) {
+        throw new WindowsSameHandleFileError(
+          "MALFORMED_PROTOCOL",
+          "Windows same-handle helper omitted requested manifest bytes.",
+        );
+      }
+      assertManifestAggregateLimit(counters, limits, read.byteLength);
+      return parsedManifest(
+        absolute,
+        read.finalPath,
+        providerRoot,
+        counters,
+        read.bytes,
+        windowsIdentityFrom(read),
+        read.sha256,
+      );
+    }
+
+    const noFollow = (constants as typeof constants & { O_NOFOLLOW?: number }).O_NOFOLLOW ?? 0;
     descriptor = openSync(absolute, constants.O_RDONLY | noFollow);
     const opened = fstatSync(descriptor, { bigint: true });
-    if (!opened.isFile() || !sameFile(initial, opened)) {
+    if (!opened.isFile() || !sameOpenedFileIdentity(initial, opened, absolute, testHooks)) {
       throw findingError(
         { kind: "scan_unstable", path: safePath(absolute) },
         `Game add-on manifest changed identity while being opened: ${safePath(absolute)}`,
@@ -675,66 +873,52 @@ function readManifest(
       );
     }
     const after = fstatSync(descriptor, { bigint: true });
-    const current = lstatSync(absolute, { bigint: true });
+    let current: BigIntStats;
+    try {
+      current = lstatSync(absolute, { bigint: true });
+    } catch (error) {
+      throw findingError(
+        { kind: "scan_unstable", path: safePath(absolute) },
+        `Game add-on manifest disappeared after it was read: ${safePath(absolute)}`,
+        error,
+      );
+    }
     if (!sameIdentity(opened, after) || current.isSymbolicLink() || !sameIdentity(opened, current)) {
       throw findingError(
         { kind: "scan_unstable", path: safePath(absolute) },
         `Game add-on manifest changed while being read: ${safePath(absolute)}`,
       );
     }
-    let document;
+    let canonical: string;
     try {
-      document = parse(bytes.toString("utf8"));
+      canonical = realpathSync.native(absolute);
     } catch (error) {
       throw findingError(
-        { kind: "manifest_malformed", manifestPath: safePath(absolute) },
-        `Game add-on manifest is malformed: ${safePath(absolute)}`,
+        { kind: "scan_unstable", path: safePath(absolute) },
+        `Game add-on manifest cannot be resolved after it was read: ${safePath(absolute)}`,
         error,
       );
     }
-    const guidValue = getProperty(document, "GUID");
-    const guid = typeof guidValue === "string" ? guidValue.toUpperCase() : "";
-    if (document.type !== "GameProject" || !ADDON_GUID_PATTERN.test(guid)) {
-      throw findingError(
-        { kind: "manifest_malformed", manifestPath: safePath(absolute) },
-        `Game add-on manifest is not a GameProject with a valid GUID: ${safePath(absolute)}`,
-      );
-    }
-    const rawDependencies = document.children
-      .filter((child) => child.type === "Dependencies")
-      .flatMap((child) => child.values);
-    const dependencies = new Set<string>();
-    for (const [index, value] of rawDependencies.entries()) {
-      const normalized = value.toUpperCase();
-      if (!ADDON_GUID_PATTERN.test(normalized)) {
-        throw findingError(
-          {
-            kind: "malformed_declared_guid",
-            manifestPath: safePath(absolute),
-            dependencyIndex: index,
-          },
-          `Game add-on manifest declares a malformed dependency GUID: ${safePath(absolute)}`,
-        );
-      }
-      dependencies.add(normalized);
-    }
-    const canonical = realpathSync.native(absolute);
     if (resolve(canonical) !== absolute) {
       throw findingError(
         { kind: "scan_unstable", path: safePath(absolute) },
         `Game add-on manifest resolves through a link or reparse point: ${safePath(absolute)}`,
       );
     }
-    counters.totalManifestBytes += bytes.length;
-    return {
-      ...identityFrom(opened),
-      gprojPath: canonical,
-      comparisonKey: pathComparisonKey(canonical),
-      guid,
-      dependencies: Object.freeze([...dependencies].sort(compareStrings)),
-      providerRoots: [providerRoot],
-      sha256: createHash("sha256").update(bytes).digest("hex"),
-    };
+    assertManifestAggregateLimit(counters, limits, bytes.length);
+    return parsedManifest(
+      absolute,
+      canonical,
+      providerRoot,
+      counters,
+      bytes,
+      {
+        ...identityFrom(opened),
+        volumeIdentity: opened.dev.toString(),
+        fileId: opened.ino.toString(),
+      },
+      createHash("sha256").update(bytes).digest("hex"),
+    );
   } catch (error) {
     if (error instanceof GameLaunchPlanError) throw error;
     throw findingError(
@@ -748,7 +932,8 @@ function readManifest(
 }
 
 function mergeManifestProvider(manifest: ManifestRead, providerRoot: string): void {
-  if (manifest.providerRoots.some((root) => pathComparisonKey(root) === pathComparisonKey(providerRoot))) return;
+  if (manifest.providerRoots.some((root) =>
+    canonicalPathComparisonKey(root) === canonicalPathComparisonKey(providerRoot))) return;
   manifest.providerRoots.push(providerRoot);
 }
 
@@ -822,6 +1007,8 @@ export function computeGameAddonEvidenceDigest(value: DigestFields): string {
       manifest.dependencies,
       manifest.providerRoots,
       ...fixedIdentity(manifest),
+      manifest.volumeIdentity,
+      manifest.fileId,
       manifest.sha256,
     ]),
     value.targetProviderPaths,
@@ -910,19 +1097,19 @@ export function resolveGameAddonPlan(options: ResolveGameAddonPlanOptions): Game
     candidateCount: 0,
     totalManifestBytes: 0,
   };
-  const scans = seeds.map((seed) => scanRoot(seed, counters, limits));
+  const scans = seeds.map((seed) => scanRoot(seed, counters, limits, options.testHooks));
   const manifestsByPath = new Map<string, ManifestRead>();
-  const target = readManifest(project.displayPath, targetParent, counters, limits);
+  const target = readManifest(project.displayPath, targetParent, counters, limits, options.testHooks);
   manifestsByPath.set(target.comparisonKey, target);
   for (const scan of scans) {
     for (const candidate of scan.candidates) {
-      const key = pathComparisonKey(candidate);
+      const key = canonicalPathComparisonKey(candidate);
       const existing = manifestsByPath.get(key);
       if (existing) {
         mergeManifestProvider(existing, scan.seed.path);
         continue;
       }
-      const manifest = readManifest(candidate, scan.seed.path, counters, limits);
+      const manifest = readManifest(candidate, scan.seed.path, counters, limits, options.testHooks);
       const canonicalExisting = manifestsByPath.get(manifest.comparisonKey);
       if (canonicalExisting) mergeManifestProvider(canonicalExisting, scan.seed.path);
       else manifestsByPath.set(manifest.comparisonKey, manifest);
@@ -930,9 +1117,14 @@ export function resolveGameAddonPlan(options: ResolveGameAddonPlanOptions): Game
   }
   for (const manifest of manifestsByPath.values()) {
     manifest.providerRoots.sort((left, right) => {
-      const leftIndex = seeds.findIndex((seed) => pathComparisonKey(seed.path) === pathComparisonKey(left));
-      const rightIndex = seeds.findIndex((seed) => pathComparisonKey(seed.path) === pathComparisonKey(right));
-      return leftIndex - rightIndex || compareStrings(pathComparisonKey(left), pathComparisonKey(right));
+      const leftIndex = seeds.findIndex((seed) =>
+        canonicalPathComparisonKey(seed.path) === canonicalPathComparisonKey(left));
+      const rightIndex = seeds.findIndex((seed) =>
+        canonicalPathComparisonKey(seed.path) === canonicalPathComparisonKey(right));
+      return leftIndex - rightIndex || compareStrings(
+        canonicalPathComparisonKey(left),
+        canonicalPathComparisonKey(right),
+      );
     });
   }
 
@@ -981,7 +1173,8 @@ export function resolveGameAddonPlan(options: ResolveGameAddonPlanOptions): Game
     }
     const provider = providers[0];
     const addonRoot = provider.providerRoots[0];
-    const seed = seeds.find((candidate) => pathComparisonKey(candidate.path) === pathComparisonKey(addonRoot));
+    const seed = seeds.find((candidate) =>
+      canonicalPathComparisonKey(candidate.path) === canonicalPathComparisonKey(addonRoot));
     if (!seed) {
       throw new GameLaunchPlanError("ADDON_EVIDENCE_INVALID", "Resolved add-on provider has no audited root.");
     }
@@ -1009,7 +1202,8 @@ export function resolveGameAddonPlan(options: ResolveGameAddonPlanOptions): Game
     if (!emit) continue;
     assertNoPrivateOverlap(seed.path, privateRoots);
     assertEmittableRoot(seed.path);
-    if (!emittedAddonRoots.some((root) => pathComparisonKey(root) === pathComparisonKey(seed.path))) {
+    if (!emittedAddonRoots.some((root) =>
+      canonicalPathComparisonKey(root) === canonicalPathComparisonKey(seed.path))) {
       emittedAddonRoots.push(seed.path);
     }
   }
@@ -1017,7 +1211,8 @@ export function resolveGameAddonPlan(options: ResolveGameAddonPlanOptions): Game
   const roots = scans.map((scan) => Object.freeze({
     ...scan.evidence,
     provenance: Object.freeze([...scan.seed.provenance]),
-    emitted: emittedAddonRoots.some((root) => pathComparisonKey(root) === scan.evidence.comparisonKey),
+    emitted: emittedAddonRoots.some((root) =>
+      canonicalPathComparisonKey(root) === scan.evidence.comparisonKey),
   }));
   const manifests = [...manifestsByPath.values()]
     .sort((left, right) => compareStrings(left.comparisonKey, right.comparisonKey))
@@ -1066,12 +1261,46 @@ function validAbsoluteStrings(value: unknown, maximum = 128): value is string[] 
     typeof entry === "string" && isAbsolute(entry) && !/[\0\r\n]/.test(entry));
 }
 
+function validFileIdentity(value: unknown): boolean {
+  if (!plainRecord(value) || !Number.isSafeInteger(value.byteLength) || (value.byteLength as number) < 0) {
+    return false;
+  }
+  for (const field of ["device", "inode", "modifiedNanoseconds", "changedNanoseconds", "birthNanoseconds"] as const) {
+    if (typeof value[field] !== "string" || !/^\d+$/.test(value[field] as string)) return false;
+  }
+  return !/^0+$/.test(value.device as string) && !/^0+$/.test(value.inode as string);
+}
+
+function validDirectoryEvidence(value: unknown): boolean {
+  return validFileIdentity(value) && plainRecord(value) &&
+    typeof value.path === "string" && isAbsolute(value.path) &&
+    typeof value.listingDigest === "string" && SHA256.test(value.listingDigest);
+}
+
+function validRootEvidence(value: unknown): boolean {
+  return plainRecord(value) && typeof value.path === "string" && isAbsolute(value.path) &&
+    value.comparisonKey === canonicalPathComparisonKey(value.path) &&
+    Array.isArray(value.directories) && value.directories.every(validDirectoryEvidence);
+}
+
+function validManifestEvidence(value: unknown): boolean {
+  return validFileIdentity(value) && plainRecord(value) &&
+    typeof value.gprojPath === "string" && isAbsolute(value.gprojPath) &&
+    value.comparisonKey === canonicalPathComparisonKey(value.gprojPath) &&
+    typeof value.volumeIdentity === "string" && /^[1-9]\d*$/.test(value.volumeIdentity) &&
+    typeof value.fileId === "string" && /^[1-9]\d*$/.test(value.fileId) &&
+    typeof value.sha256 === "string" && SHA256.test(value.sha256) &&
+    validAbsoluteStrings(value.providerRoots);
+}
+
 function assertSnapshot(value: unknown): asserts value is GameAddonPlanSnapshot {
   if (!plainRecord(value) || value.schemaVersion !== GAME_ADDON_EVIDENCE_SCHEMA_VERSION ||
       !plainRecord(value.project) || typeof value.project.displayPath !== "string" ||
       typeof value.project.comparisonKey !== "string" || typeof value.project.modDirectory !== "string" ||
       typeof value.project.modDirectoryKey !== "string" ||
       !isAbsolute(value.project.displayPath as string) || !isAbsolute(value.project.modDirectory as string) ||
+      value.project.comparisonKey !== value.project.displayPath ||
+      value.project.modDirectoryKey !== value.project.modDirectory ||
       typeof value.executablePath !== "string" || !isAbsolute(value.executablePath) ||
       typeof value.profilePath !== "string" || !isAbsolute(value.profilePath) ||
       typeof value.managedRoot !== "string" || !isAbsolute(value.managedRoot) ||
@@ -1085,8 +1314,10 @@ function assertSnapshot(value: unknown): asserts value is GameAddonPlanSnapshot 
       !Array.isArray(value.dependencyGuids) || !value.dependencyGuids.every((guid) => typeof guid === "string" && ADDON_GUID_PATTERN.test(guid)) ||
       !validAbsoluteStrings(value.emittedAddonRoots) || !validAbsoluteStrings(value.implicitAddonRoots) ||
       !Array.isArray(value.roots) || value.roots.length > (value.limits.maximumRoots as number) ||
+      !value.roots.every(validRootEvidence) ||
       !Array.isArray(value.manifests) || value.manifests.length > (value.limits.maximumCandidates as number) + 1 ||
-      !Array.isArray(value.resolvedDependencies) || !Array.isArray(value.targetProviderPaths) ||
+      !value.manifests.every(validManifestEvidence) ||
+      !Array.isArray(value.resolvedDependencies) || !validAbsoluteStrings(value.targetProviderPaths) ||
       !Number.isSafeInteger(value.visitedEntries) || (value.visitedEntries as number) < 0 ||
       !Number.isSafeInteger(value.verificationEntries) || (value.verificationEntries as number) < 0 ||
       !Number.isSafeInteger(value.candidateCount) || (value.candidateCount as number) < 0 ||

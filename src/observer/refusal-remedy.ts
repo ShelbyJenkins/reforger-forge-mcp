@@ -146,7 +146,8 @@ export const resolveObserverRefusalRemedy: ObserverRefusalRemedyResolver = ({
   }
 
   if (code === "PREPARED_LAUNCH_CONSUMED" &&
-      context.tool === "observer_runtime" && context.action === "start") {
+      (context.tool === "observer_runtime" || context.tool === "game_launch") &&
+      context.action === "start") {
     const runtimeId = dynamicRecord(readRemedyContext)?.runtimeId;
     return typeof runtimeId === "string" && RUNTIME_ID_PATTERN.test(runtimeId)
       ? {

@@ -1,4 +1,11 @@
-import { mkdirSync, writeFileSync } from "node:fs";
+import {
+  linkSync,
+  mkdirSync,
+  renameSync,
+  symlinkSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
@@ -162,6 +169,183 @@ describe("game add-on plan", () => {
     }, { prefix: "rfo-game-addon-plan-bounds-" });
   });
 
+  it("covers every root, entry, and aggregate-manifest cap", async () => {
+    await withTemporaryDirectory((root) => {
+      const target = writeProject(join(root, "workspace", "Target"), "Target.gproj", TARGET_GUID, []);
+
+      expectPlanError(
+        () => resolveGameAddonPlan({
+          ...fixtureOptions(root, target),
+          scanLimits: { maximumRoots: 1 },
+        }),
+        "ADDON_SCAN_TRUNCATED",
+      );
+      expectPlanError(
+        () => resolveGameAddonPlan({
+          ...fixtureOptions(root, target),
+          scanLimits: { maximumVisitedEntries: 1 },
+        }),
+        "ADDON_SCAN_TRUNCATED",
+      );
+      expectPlanError(
+        () => resolveGameAddonPlan({
+          ...fixtureOptions(root, target),
+          scanLimits: { maximumTotalManifestBytes: 1 },
+        }),
+        "ADDON_SCAN_TRUNCATED",
+      );
+    }, { prefix: "rfo-game-addon-plan-all-caps-" });
+  });
+
+  it("maps deterministic scan and late-stat races to ADDON_SCAN_UNSTABLE", async () => {
+    await withTemporaryDirectory((root) => {
+      const target = writeProject(join(root, "workspace", "Target"), "Target.gproj", TARGET_GUID, []);
+      const addons = join(root, "addons");
+      const dependencyDirectory = join(addons, "B");
+      writeProject(dependencyDirectory, "B.gproj", DEPENDENCY_B, []);
+      let listingMutated = false;
+
+      expectPlanError(
+        () => resolveGameAddonPlan({
+          ...fixtureOptions(root, target, [addons]),
+          testHooks: {
+            checkpoint: (checkpoint, path) => {
+              if (checkpoint !== "after_directory_read" || path !== addons || listingMutated) return;
+              listingMutated = true;
+              writeProject(join(addons, "Added"), "Added.gproj", DEPENDENCY_C, []);
+            },
+          },
+        }),
+        "ADDON_SCAN_UNSTABLE",
+      );
+      expect(listingMutated).toBe(true);
+
+      let candidateMoved = false;
+      expectPlanError(
+        () => resolveGameAddonPlan({
+          ...fixtureOptions(root, target, [addons]),
+          testHooks: {
+            checkpoint: (checkpoint, path) => {
+              if (checkpoint !== "before_candidate_stat" || path !== dependencyDirectory || candidateMoved) return;
+              candidateMoved = true;
+              renameSync(dependencyDirectory, `${dependencyDirectory}.moved`);
+            },
+          },
+        }),
+        "ADDON_SCAN_UNSTABLE",
+      );
+      expect(candidateMoved).toBe(true);
+    }, { prefix: "rfo-game-addon-plan-races-" });
+  });
+
+  it("fails closed on a barrier-controlled manifest replacement", async () => {
+    await withTemporaryDirectory((root) => {
+      const targetDirectory = join(root, "workspace", "Target");
+      const target = writeProject(targetDirectory, "Target.gproj", TARGET_GUID, []);
+      const replacement = writeProject(targetDirectory, "Replacement.tmp", TARGET_GUID, [], " // replacement");
+      let replaced = false;
+
+      expectPlanError(
+        () => resolveGameAddonPlan({
+          ...fixtureOptions(root, target),
+          testHooks: {
+            checkpoint: (checkpoint, path) => {
+              if (checkpoint !== "before_manifest_open" || path !== target || replaced) return;
+              replaced = true;
+              unlinkSync(target);
+              renameSync(replacement, target);
+            },
+          },
+        }),
+        "ADDON_SCAN_UNSTABLE",
+      );
+      expect(replaced).toBe(true);
+    }, { prefix: "rfo-game-addon-plan-manifest-race-" });
+  });
+
+  it("refuses an unavailable zero manifest identity", async () => {
+    await withTemporaryDirectory((root) => {
+      const target = writeProject(join(root, "workspace", "Target"), "Target.gproj", TARGET_GUID, []);
+
+      expectPlanError(
+        () => resolveGameAddonPlan({
+          ...fixtureOptions(root, target),
+          testHooks: {
+            fileIdentity: (path, identity) => path === target
+              ? { dev: 0n, ino: 0n }
+              : { ...identity },
+          },
+        }),
+        "ADDON_SCAN_UNSTABLE",
+      );
+    }, { prefix: "rfo-game-addon-plan-zero-identity-" });
+  });
+
+  it("distinguishes unreadable and malformed manifests", async () => {
+    await withTemporaryDirectory((root) => {
+      const unreadableTarget = writeProject(
+        join(root, "unreadable", "Target"),
+        "Target.gproj",
+        TARGET_GUID,
+        [],
+      );
+      expectPlanError(
+        () => resolveGameAddonPlan({
+          ...fixtureOptions(root, unreadableTarget),
+          testHooks: {
+            checkpoint: (checkpoint, path) => {
+              if (checkpoint === "before_manifest_open" && path === unreadableTarget) {
+                throw Object.assign(new Error("injected open refusal"), { code: "EACCES" });
+              }
+            },
+          },
+        }),
+        "ADDON_MANIFEST_UNREADABLE",
+      );
+
+      const malformedTarget = writeProject(
+        join(root, "malformed", "Target"),
+        "Target.gproj",
+        TARGET_GUID,
+        [],
+      );
+      writeFileSync(malformedTarget, "not a GameProject", "utf8");
+      expectPlanError(
+        () => resolveGameAddonPlan(fixtureOptions(root, malformedTarget)),
+        "ADDON_MANIFEST_MALFORMED",
+      );
+    }, { prefix: "rfo-game-addon-plan-manifest-errors-" });
+  });
+
+  it("counts a distinct hard-link spelling as another target provider", async () => {
+    await withTemporaryDirectory((root) => {
+      const targetDirectory = join(root, "workspace", "Target");
+      const target = writeProject(targetDirectory, "Target.gproj", TARGET_GUID, []);
+      linkSync(target, join(targetDirectory, "TargetAlias.gproj"));
+
+      expectPlanError(
+        () => resolveGameAddonPlan(fixtureOptions(root, target)),
+        "ADDON_TARGET_COLLISION",
+      );
+    }, { prefix: "rfo-game-addon-plan-hard-link-" });
+  });
+
+  it("refuses a junction encountered beneath an add-on root", async () => {
+    await withTemporaryDirectory((root) => {
+      const target = writeProject(join(root, "workspace", "Target"), "Target.gproj", TARGET_GUID, []);
+      const addons = join(root, "addons");
+      const outside = join(root, "outside", "Linked");
+      mkdirSync(addons, { recursive: true });
+      writeProject(outside, "Linked.gproj", DEPENDENCY_B, []);
+      symlinkSync(outside, join(addons, "Linked"), "junction");
+
+      expectPlanError(
+        () => resolveGameAddonPlan(fixtureOptions(root, target, [addons])),
+        "ADDON_SCAN_UNSTABLE",
+      );
+    }, { prefix: "rfo-game-addon-plan-junction-" });
+  });
+
   it("refuses private-root overlap and comma-delimited emitted roots", async () => {
     await withTemporaryDirectory((root) => {
       const target = writeProject(join(root, "workspace", "Target"), "Target.gproj", TARGET_GUID, []);
@@ -203,6 +387,20 @@ describe("game add-on plan", () => {
       const plan = resolveGameAddonPlan(fixtureOptions(root, target));
       expectPlanError(
         () => revalidateGameAddonPlan({ ...plan, targetGuid: DEPENDENCY_B }),
+        "ADDON_EVIDENCE_INVALID",
+      );
+
+      const zeroIdentity = {
+        ...plan,
+        manifests: plan.manifests.map((manifest, index) => index === 0
+          ? { ...manifest, inode: "0" }
+          : manifest),
+      };
+      expectPlanError(
+        () => revalidateGameAddonPlan({
+          ...zeroIdentity,
+          addonEvidenceDigest: computeGameAddonEvidenceDigest(zeroIdentity),
+        }),
         "ADDON_EVIDENCE_INVALID",
       );
     }, { prefix: "rfo-game-addon-plan-tamper-" });

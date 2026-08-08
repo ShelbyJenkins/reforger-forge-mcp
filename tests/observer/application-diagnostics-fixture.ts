@@ -107,6 +107,7 @@ export class FakeChild extends EventEmitter {
     this.connected = false;
     this.exitCode = code;
     this.emit("exit", code, null);
+    this.emit("close", code, null);
   }
 }
 

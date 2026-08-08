@@ -809,7 +809,7 @@ export class CaptureService implements McpIdleReadinessProvider {
         blockers.add("OBSERVER_RESTORATION");
       }
     }
-    const expired = options.signal.aborted || performance.now() > options.deadlineTick;
+    const expired = options.signal.aborted || (options.nowTick?.() ?? performance.now()) > options.deadlineTick;
     return {
       complete: !expired,
       blockers: [...blockers].sort(),

@@ -207,9 +207,10 @@ export class McpProtocolActivity {
     this.emit("closed");
   }
 
-  receive(message: JSONRPCMessage): boolean {
+  receive(message: JSONRPCMessage, forward?: () => void): boolean {
     if (this.closed || this.inboundDispatchSealed) return false;
     this.refreshActivity();
+    let dispatchSlot: ClientRequestSlot | null = null;
     if (isRequest(message)) {
       const slot: ClientRequestSlot = {
         key: requestKey(message.id),
@@ -217,20 +218,20 @@ export class McpProtocolActivity {
         responseReserved: false,
         dispatchActive: true,
       };
+      dispatchSlot = slot;
       this.pushSlot(this.clientRequests, slot.key, slot);
       this.dispatchSlots.add(slot);
       this.emit("state");
-      try {
-        this.scheduleTurn(() => this.finishDispatchTurn(slot));
-      } catch {
-        this.stickyDispatchIndeterminate = true;
-        this.finishDispatchTurn(slot);
-      }
     } else if (isResponse(message)) {
       this.retireServerRequest(message.id);
     } else {
       const cancelledId = cancellationRequestId(message);
       if (cancelledId !== null) this.cancelClientRequest(cancelledId);
+    }
+    try {
+      forward?.();
+    } finally {
+      if (dispatchSlot) this.scheduleDispatchTurnRelease(dispatchSlot);
     }
     return true;
   }
@@ -324,6 +325,15 @@ export class McpProtocolActivity {
       this.stickyDispatchIndeterminate = true;
     }
     this.emit("state");
+  }
+
+  private scheduleDispatchTurnRelease(slot: ClientRequestSlot): void {
+    try {
+      this.scheduleTurn(() => this.finishDispatchTurn(slot));
+    } catch {
+      this.stickyDispatchIndeterminate = true;
+      this.finishDispatchTurn(slot);
+    }
   }
 
   private reserveClientResponse(id: RequestId): ClientRequestSlot | null {
@@ -426,8 +436,7 @@ export class ActivityTrackingTransport implements Transport {
 
   async start(): Promise<void> {
     this.transport.onmessage = (message, extra) => {
-      if (!this.activity.receive(message)) return;
-      this.onmessage?.(message, extra);
+      this.activity.receive(message, () => this.onmessage?.(message, extra));
     };
     this.transport.onerror = (error) => this.onerror?.(error);
     this.transport.onclose = () => {

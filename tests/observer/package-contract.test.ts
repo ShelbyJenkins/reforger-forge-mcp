@@ -148,6 +148,7 @@ describe("observer package and source contracts", () => {
       "observer/addon",
       "observer/workbench-addon",
       "observer/protocol",
+      "scripts/windows/same-handle-file-read.ps1",
       "observer/README.md",
       "SETUP.md",
       "docs/observer.md",
@@ -203,6 +204,7 @@ describe("observer package and source contracts", () => {
     expect(existsSync(join(repositoryRoot, "dist", "src"))).toBe(false);
     expect(existsSync(join(repositoryRoot, "observer", "protocol", "VERSION"))).toBe(true);
     const packageCheck = readFileSync(join(repositoryRoot, "scripts", "check-package.mjs"), "utf8");
+    expect(packageCheck).toContain("scripts/windows/same-handle-file-read.ps1");
     expect(packageCheck).toContain("docs/release-notes/RELEASE_NOTES_v1.2.0.md");
     const serverEntry = readFileSync(join(repositoryRoot, "src", "index.ts"), "utf8");
     const stdioComposition = readFileSync(
@@ -226,9 +228,17 @@ describe("observer package and source contracts", () => {
     expect(packageCheck).toContain("dist/tools/observer-runtime.js");
     for (const module of [
       "dist/foundation/child-supervisor.js",
+      "dist/launch/game-launch-planning-isolation.js",
+      "dist/launch/game-launch-planning-worker.js",
+      "dist/launch/game-launch-revalidation-isolation.js",
+      "dist/launch/game-launch-revalidation-worker.js",
+      "dist/observer/game-launch-attempt.js",
       "dist/workbench/activity-gate.js",
       "dist/workbench/client.js",
       "dist/workbench/diagnostics.js",
+      "dist/workbench/existing-lmdb-reader.js",
+      "dist/workbench/existing-lmdb-reader-protocol.js",
+      "dist/workbench/existing-lmdb-reader-worker.js",
       "dist/workbench/helper-addon.js",
       "dist/workbench/helper-addon-payload.generated.js",
       "dist/workbench/launch-plan.js",

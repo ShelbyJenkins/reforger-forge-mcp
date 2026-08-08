@@ -288,6 +288,34 @@ describe("MCP protocol activity transport", () => {
     expect(clean.sealInboundDispatch()).toBe(true);
     expect(clean.receive(notification())).toBe(false);
   });
+
+  it("forwards onmessage before an eager scheduler can release the dispatch turn", async () => {
+    const events: string[] = [];
+    const activity = new McpProtocolActivity({
+      scheduleTurn: (callback) => {
+        events.push("scheduled");
+        callback();
+      },
+    });
+    const raw = new FakeTransport();
+    const transport = new ActivityTrackingTransport(raw, activity);
+    let operation: Promise<void> | undefined;
+    transport.onmessage = () => {
+      events.push("forwarded");
+      expect(activity.snapshot().dispatchTurnCount).toBe(1);
+      operation = activity.runApplicationOperation(() => undefined, "eager");
+    };
+    await transport.start();
+
+    raw.receive(request("eager"));
+
+    expect(events).toEqual(["forwarded", "scheduled"]);
+    expect(activity.snapshot()).toMatchObject({
+      dispatchTurnCount: 0,
+      requestCompletionIndeterminate: false,
+    });
+    await operation;
+  });
 });
 
 describe("TrackedMcpServer application callbacks", () => {

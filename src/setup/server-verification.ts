@@ -31,7 +31,7 @@ import {
 
 const execFileAsync = promisify(execFile);
 
-export const SERVER_VERIFICATION_REPORT_SCHEMA_VERSION = 2 as const;
+export const SERVER_VERIFICATION_REPORT_SCHEMA_VERSION = 3 as const;
 
 export type VerificationStatus =
   | "passed"
@@ -76,6 +76,8 @@ export interface ServerVerificationReport {
   generatedAt: string;
   success: boolean;
   nodeVersion: string;
+  /** Exact absolute Node executable used for the successful probes. */
+  nodePath: string;
   serverPath: string;
   packageVersion: string;
   compiledServer: CompiledServerVerification;
@@ -210,11 +212,12 @@ function steamDetails(
 
 async function defaultProbeCompiledServer(
   serverPath: string,
-  cwd: string
+  cwd: string,
+  nodePath = process.execPath,
 ): Promise<CompiledServerProbeResult> {
   try {
     const { stdout } = await execFileAsync(
-      process.execPath,
+      nodePath,
       [serverPath, "--version"],
       {
         cwd,
@@ -455,6 +458,10 @@ export function parseServerVerificationReport(
     throw new Error("Verification report field success must be a boolean.");
   }
   requireString(value.nodeVersion, "nodeVersion", { nonEmpty: true });
+  requireString(value.nodePath, "nodePath", { nonEmpty: true });
+  if (!isAbsolute(value.nodePath)) {
+    throw new Error("Verification report field nodePath must be absolute.");
+  }
   requireString(value.serverPath, "serverPath", { nonEmpty: true });
   if (!isAbsolute(value.serverPath)) {
     throw new Error("Verification report field serverPath must be absolute.");
@@ -641,6 +648,11 @@ export async function verifyMcpServer(
       ? resolve(options.serverPath)
       : resolve(packageRoot, options.serverPath);
   const startupArguments = [...(options.startupArguments ?? [])];
+  const requestedNodePath = dependencies.nodeCommand ?? process.execPath;
+  if (!isAbsolute(requestedNodePath)) {
+    throw new Error("MCP verification requires an absolute Node executable path.");
+  }
+  const nodePath = resolve(requestedNodePath);
   const hostClientLabel = parseMcpClientLabel(options.hostClientLabel ?? "manual");
   const hostPartition = partitionMcpHostArguments([], hostClientLabel);
   const nodeArguments = [formatMcpNodeTitleArgument(hostClientLabel)];
@@ -648,10 +660,9 @@ export async function verifyMcpServer(
     dependencies.discoverSteam ?? discoverSteamInstallations;
   const loadConfiguration = dependencies.loadConfiguration ?? loadConfig;
   const createSession = dependencies.createSession ?? defaultCreateSession;
-  const probeCompiledServer =
-    dependencies.probeCompiledServer ?? defaultProbeCompiledServer;
-
-  const compiledProbe = await probeCompiledServer(serverPath, packageRoot);
+  const compiledProbe = dependencies.probeCompiledServer
+    ? await dependencies.probeCompiledServer(serverPath, packageRoot)
+    : await defaultProbeCompiledServer(serverPath, packageRoot, nodePath);
   const compiledIssues: string[] = [];
   if (compiledProbe.issue) compiledIssues.push(compiledProbe.issue);
   if (
@@ -770,7 +781,7 @@ export async function verifyMcpServer(
       let session: ServerVerificationSession | undefined;
       try {
         session = createSession({
-          command: dependencies.nodeCommand ?? process.execPath,
+          command: nodePath,
           nodeArguments,
           serverPath,
           hostArguments: hostPartition.hostArguments,
@@ -821,6 +832,7 @@ export async function verifyMcpServer(
     generatedAt: (dependencies.now ?? (() => new Date()))().toISOString(),
     success: false,
     nodeVersion: options.nodeVersion ?? process.version,
+    nodePath,
     serverPath,
     packageVersion: options.packageVersion,
     compiledServer,
@@ -848,6 +860,7 @@ export function formatServerVerificationReport(
     "ReforgerForge MCP verification",
     "",
     `Node:       ${report.nodeVersion}`,
+    `Node path:  ${report.nodePath}`,
     `Server:     ${report.serverPath}`,
     `Version:    ${report.compiledServer.version ?? "unavailable"} (package ${report.packageVersion})`,
     `Config:     ${report.configPath ?? "none (automatic discovery and internal defaults)"}`,

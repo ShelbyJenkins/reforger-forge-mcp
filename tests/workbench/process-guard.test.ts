@@ -132,6 +132,14 @@ async function claimedIdleLease(stateDir: string): Promise<{
 }
 
 describe("WorkbenchProcessGuard v3 lifecycle state", () => {
+  it("rejects a nil injected MCP instance identity", () => {
+    expect(() => new WorkbenchProcessGuard({
+      stateDir: root(),
+      mcpInstanceId: "00000000-0000-0000-0000-000000000000",
+      backend: createFakeLifecycleBackend(),
+    })).toThrow(/non-nil UUID/i);
+  });
+
   it("creates a durable vacant record with an exact MCP lease", async () => {
     const stateDir = root();
     const backend = createFakeLifecycleBackend();

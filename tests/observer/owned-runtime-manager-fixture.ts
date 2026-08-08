@@ -21,6 +21,14 @@ import {
   type FakeExactProcessRecord,
 } from "../foundation/fake-exact-process-backend.js";
 import type { ObserverLaunchInput, ObserverPreparedLaunch } from "../../src/observer/launch.js";
+import type { IsolatedGameLaunchRevalidationRequest } from
+  "../../src/launch/game-launch-revalidation-isolation.js";
+import type { OwnedRuntimeExecutableEvidence } from
+  "../../src/observer/owned-runtime-manager.js";
+import type {
+  RuntimeFocusGuardPreparation,
+  RuntimeFocusGuardTransaction,
+} from "../../src/platform/windows/runtime-focus-guard.js";
 import { createObserverApplication } from "../../observer/agent/application.js";
 import { runtimeStopObligations } from "../../observer/agent/private-child.js";
 
@@ -175,6 +183,7 @@ export function createDeadlineBackend(): DeadlineBackend {
 export type LeaseLosingBackend = FakeBackend & {
   loseOnCurrentInspection: boolean;
   loseAfterTermination: boolean;
+  loseLease(error?: MachineMutexLeaseLoss): void;
 };
 
 export function createLeaseLosingBackend(): LeaseLosingBackend {
@@ -182,11 +191,25 @@ export function createLeaseLosingBackend(): LeaseLosingBackend {
   backend.loseOnCurrentInspection = false;
   backend.loseAfterTermination = false;
   let activeLeaseLoss: ((error: MachineMutexLeaseLoss) => void) | null = null;
+  backend.loseLease = (error = new LifecycleGuardError(
+    "fixture lifecycle mutex holder exited",
+    "RECOVERY_REQUIRED",
+  )) => {
+    if (!activeLeaseLoss) throw new Error("No fixture machine-mutex lease is active");
+    activeLeaseLoss(error);
+  };
   backend.withMachineMutex = async (args) => {
     const prior = activeLeaseLoss;
-    activeLeaseLoss = args.onLeaseLost ?? null;
+    let rejectHolderFailure!: (error: MachineMutexLeaseLoss) => void;
+    const holderFailure = new Promise<never>((_resolve, reject) => {
+      rejectHolderFailure = reject;
+    });
+    activeLeaseLoss = (error) => {
+      args.onLeaseLost?.(error);
+      rejectHolderFailure(error);
+    };
     try {
-      return await args.action();
+      return await Promise.race([args.action(), holderFailure]);
     } finally {
       activeLeaseLoss = prior;
     }
@@ -484,6 +507,7 @@ export interface Harness {
   spawnCalls: Array<{ executable: string; arguments: string[]; options: Record<string, unknown>; child: FakeChild }>;
   resolvedRuntimeKinds: ObserverLaunchInput["runtimeKind"][];
   foregroundProtectionPids: number[];
+  foregroundProtectionPreparations: RuntimeFocusGuardPreparation[];
   setClock(value: number): void;
   setExecutable(value: string): void;
   prepare(
@@ -588,8 +612,14 @@ export function makeHarness(options: {
   preparedSessionId?: string;
   preparedExpiresAt?: string;
   preparedProfilePath?: string;
-  preserveForegroundDuringStartup?: (pid: number) => Promise<void>;
+  prepareForegroundDuringStartup?: (
+    input: RuntimeFocusGuardPreparation
+  ) => Promise<RuntimeFocusGuardTransaction>;
   managerInstanceId?: string;
+  pointOfUseRevalidator?: (
+    request: IsolatedGameLaunchRevalidationRequest,
+    signal: AbortSignal,
+  ) => Promise<OwnedRuntimeExecutableEvidence>;
 } = {}): Harness {
   const root = options.root ?? mkdtempSync(join(tmpdir(), "rfo-owned-runtime-"));
   if (!options.root) roots.push(root);
@@ -600,6 +630,7 @@ export function makeHarness(options: {
   const spawnCalls: Harness["spawnCalls"] = [];
   const resolvedRuntimeKinds: Harness["resolvedRuntimeKinds"] = [];
   const foregroundProtectionPids: number[] = [];
+  const foregroundProtectionPreparations: RuntimeFocusGuardPreparation[] = [];
   let pid = 4100;
   let clock = Date.parse("2026-07-18T12:00:00.000Z");
   let selectedExecutable = executable;
@@ -629,14 +660,36 @@ export function makeHarness(options: {
       : { managerInstanceId: options.managerInstanceId }),
     backend,
     spawnProcess,
-    preserveForegroundDuringStartup: async (targetPid) => {
-      foregroundProtectionPids.push(targetPid);
-      await options.preserveForegroundDuringStartup?.(targetPid);
+    prepareForegroundDuringStartup: async (input) => {
+      foregroundProtectionPreparations.push(input);
+      if (options.prepareForegroundDuringStartup) {
+        return options.prepareForegroundDuringStartup(input);
+      }
+      return {
+        bindTarget: async (targetPid) => { foregroundProtectionPids.push(targetPid); },
+        complete: async (expected) => ({
+          targetPid: expected.pid,
+          targetCreationTime: expected.creationTime,
+          hookCount: 2,
+          hooksUnhooked: true,
+          callbackRooted: true,
+          callbackReleased: true,
+          protectedWindowCount: 1,
+          styleVerifiedCount: 1,
+          foregroundIntercepted: false,
+          foregroundRestored: false,
+          finalForegroundOwned: false,
+        }),
+        abort: async () => undefined,
+      };
     },
     executableResolver: (runtimeKind) => {
       resolvedRuntimeKinds.push(runtimeKind);
       return selectedExecutable;
     },
+    ...(options.pointOfUseRevalidator === undefined
+      ? {}
+      : { pointOfUseRevalidator: options.pointOfUseRevalidator }),
     installationRoot: process.cwd(),
     clock: () => options.advanceClock ? (clock += 100) : clock,
     ownerToken: () => `owner_${String(id).padStart(58, "0")}`,
@@ -693,6 +746,7 @@ export function makeHarness(options: {
     spawnCalls,
     resolvedRuntimeKinds,
     foregroundProtectionPids,
+    foregroundProtectionPreparations,
     setClock: (value) => { clock = value; },
     setExecutable: (value) => { selectedExecutable = value; },
     prepare,

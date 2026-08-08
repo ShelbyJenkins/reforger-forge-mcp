@@ -143,6 +143,8 @@ export interface CommandExecutionResult {
 
 export interface ClientRegistrationOptions {
   readonly serverPath: string;
+  /** Exact verified Node executable. Setup supplies an absolute path. */
+  readonly nodePath?: string;
   readonly platform?: NodeJS.Platform;
   readonly environment?: NodeJS.ProcessEnv;
   readonly homeDirectory?: string;
@@ -200,6 +202,7 @@ interface DetectionContext {
 
 interface RegistrationContext extends DetectionContext {
   readonly serverPath: string;
+  readonly nodePath: string;
   readonly runCommand: (
     command: string,
     args: readonly string[]
@@ -1106,22 +1109,24 @@ function detectClient(
 }
 
 function expectedStdioEntry(
+  nodePath: string,
   serverPath: string,
   clientLabel: SupportedClientId
 ): Readonly<Record<string, unknown>> {
   return {
-    command: "node",
+    command: nodePath,
     args: buildManagedMcpServerArguments({ clientLabel, serverPath }),
   };
 }
 
 function expectedVsCodeEntry(
+  nodePath: string,
   serverPath: string,
   clientLabel: SupportedClientId
 ): Readonly<Record<string, unknown>> {
   return {
     type: "stdio",
-    command: "node",
+    command: nodePath,
     args: buildManagedMcpServerArguments({ clientLabel, serverPath }),
   };
 }
@@ -1535,6 +1540,7 @@ function yamlNodeValue(value: unknown): unknown {
 
 function codexRegistrationIsCurrent(
   value: unknown,
+  nodePath: string,
   serverPath: string,
   clientLabel: SupportedClientId
 ): boolean {
@@ -1542,7 +1548,7 @@ function codexRegistrationIsCurrent(
   const transport = value.transport;
   return (
     transport.type === "stdio" &&
-    transport.command === "node" &&
+    transport.command === nodePath &&
     isDeepStrictEqual(
       transport.args,
       buildManagedMcpServerArguments({ clientLabel, serverPath })
@@ -1667,7 +1673,12 @@ function inspectCodexRegistration(
     );
   }
   return {
-    status: codexRegistrationIsCurrent(parsed, context.serverPath, clientLabel)
+    status: codexRegistrationIsCurrent(
+      parsed,
+      context.nodePath,
+      context.serverPath,
+      clientLabel,
+    )
       ? "current"
       : "different",
     detail: `Inspected through Codex CLI: ${detection.commandPath}`,
@@ -1701,7 +1712,12 @@ function registerCodex(
         `Codex returned an invalid MCP registration: ${errorMessage(error)}`
       );
     }
-    if (codexRegistrationIsCurrent(parsed, context.serverPath, clientLabel)) {
+    if (codexRegistrationIsCurrent(
+      parsed,
+      context.nodePath,
+      context.serverPath,
+      clientLabel,
+    )) {
       return {
         status: "already_current",
         detail: `Managed through Codex CLI: ${detection.commandPath}`,
@@ -1733,7 +1749,7 @@ function registerCodex(
     "add",
     SERVER_NAME,
     "--",
-    "node",
+    context.nodePath,
     ...buildManagedMcpServerArguments({
       clientLabel,
       serverPath: context.serverPath,
@@ -1815,10 +1831,14 @@ function readClaudeUserEntry(
 
 function claudeEntryIsCurrent(
   entry: Readonly<Record<string, unknown>>,
+  nodePath: string,
   serverPath: string,
   clientLabel: SupportedClientId
 ): boolean {
-  return stdioTransportIsCurrent(entry, expectedStdioEntry(serverPath, clientLabel));
+  return stdioTransportIsCurrent(
+    entry,
+    expectedStdioEntry(nodePath, serverPath, clientLabel),
+  );
 }
 
 function claudeRegistrationIsAbsent(
@@ -1918,7 +1938,12 @@ function inspectClaudeCodeRegistration(
     );
   }
   return {
-    status: claudeEntryIsCurrent(userEntry, context.serverPath, clientLabel)
+    status: claudeEntryIsCurrent(
+      userEntry,
+      context.nodePath,
+      context.serverPath,
+      clientLabel,
+    )
       ? "current"
       : "different",
     detail:
@@ -1983,7 +2008,12 @@ function registerClaudeCode(
     );
   }
 
-  if (userEntry && claudeEntryIsCurrent(userEntry, context.serverPath, clientLabel)) {
+  if (userEntry && claudeEntryIsCurrent(
+    userEntry,
+    context.nodePath,
+    context.serverPath,
+    clientLabel,
+  )) {
     return {
       status: "already_current",
       detail: `Managed through Claude CLI: ${detection.commandPath}; config: ${userConfigPath}`,
@@ -2003,7 +2033,7 @@ function registerClaudeCode(
   }
   const payload = JSON.stringify({
     type: "stdio",
-    command: "node",
+    command: context.nodePath,
     args: buildManagedMcpServerArguments({
       clientLabel,
       serverPath: context.serverPath,
@@ -2126,7 +2156,7 @@ function updateContinueConfig(
     );
   }
   const expectedTransport = {
-    command: "node",
+    command: context.nodePath,
     args: buildManagedMcpServerArguments({
       clientLabel,
       serverPath: context.serverPath,
@@ -2267,7 +2297,7 @@ function inspectContinueConfig(
   }
   return {
     status: stdioTransportIsCurrent(entries[0], {
-      command: "node",
+      command: context.nodePath,
       args: buildManagedMcpServerArguments({
         clientLabel,
         serverPath: context.serverPath,
@@ -2290,10 +2320,10 @@ function jsonDefinition(
     readonly vscodeEntry?: boolean;
   }
 ): ClientDefinition {
-  const entry = (serverPath: string) =>
+  const entry = (context: RegistrationContext) =>
     definition.vscodeEntry
-      ? expectedVsCodeEntry(serverPath, definition.id)
-      : expectedStdioEntry(serverPath, definition.id);
+      ? expectedVsCodeEntry(context.nodePath, context.serverPath, definition.id)
+      : expectedStdioEntry(context.nodePath, context.serverPath, definition.id);
   return {
     ...definition,
     fallbackTarget: configFileTarget(),
@@ -2304,14 +2334,14 @@ function jsonDefinition(
         context,
         path,
         definition.rootKey ?? "mcpServers",
-        entry(context.serverPath)
+        entry(context)
       );
     },
     inspect: (context) =>
       inspectJsonClient(
         definition.configPath(context),
         definition.rootKey ?? "mcpServers",
-        entry(context.serverPath)
+        entry(context)
       ),
   };
 }
@@ -2615,10 +2645,20 @@ function createRegistrationContext(
     throw new Error("The MCP server path must be absolute.");
   }
   const serverPath = resolve(options.serverPath);
+  if (options.nodePath !== undefined && !isAbsolute(options.nodePath)) {
+    throw new Error("The verified Node executable path must be absolute.");
+  }
+  const nodePath = options.nodePath === undefined ? "node" : resolve(options.nodePath);
   if (requireServerFile) {
     const metadata = statSync(serverPath);
     if (!metadata.isFile()) {
       throw new Error(`MCP server is not a regular file: ${serverPath}`);
+    }
+    if (options.nodePath !== undefined) {
+      const nodeMetadata = statSync(nodePath);
+      if (!nodeMetadata.isFile()) {
+        throw new Error(`Verified Node executable is not a regular file: ${nodePath}`);
+      }
     }
   }
 
@@ -2629,6 +2669,7 @@ function createRegistrationContext(
   );
   const context: RegistrationContext = {
     serverPath,
+    nodePath,
     paths,
     probePath: options.probePath ?? defaultProbePath,
     probeDirectoryPrefix:

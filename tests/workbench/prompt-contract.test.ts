@@ -92,11 +92,10 @@ describe("prompt/tool contracts", () => {
     expect(registry.prompts.has("modify-mod")).toBe(true);
   });
 
-  it("registers neither owned-runtime entry point when gamePath is absent", () => {
-    const withoutOwnedRuntime = collectRuntimeRegistry(false);
-    expect(withoutOwnedRuntime.tools.size).toBe(61);
-    expect(withoutOwnedRuntime.tools.has("game_launch")).toBe(false);
-    expect(withoutOwnedRuntime.tools.has("observer_runtime")).toBe(false);
+  it("rejects a fixture without the required owned-runtime composition", () => {
+    expect(() => collectRuntimeRegistry(false)).toThrow(
+      "The server composition requires an owned runtime manager."
+    );
   });
 
   it("create-mod uses registered merged tools and an attended manual Play checkpoint", () => {

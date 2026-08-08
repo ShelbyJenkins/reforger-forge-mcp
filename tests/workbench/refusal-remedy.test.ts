@@ -128,6 +128,16 @@ describe("Workbench refusal remedies", () => {
     expect(rendered).not.toContain("retry wb_launch");
   });
 
+  it("explains an ambiguous target as multiple matches rather than unavailable discovery", () => {
+    const rendered = formatWorkbenchRefusal(
+      new WorkbenchError("multiple projects matched", "AMBIGUOUS_TARGET"),
+      { operation: "wb_launch" }
+    );
+
+    expect(rendered).toContain("More than one project target matched");
+    expect(rendered).not.toContain("discovery is intentionally unavailable");
+  });
+
   it("retains generic error presentation", () => {
     expect(formatWorkbenchRefusal(new Error("generic failure"), {
       operation: "wb_launch",

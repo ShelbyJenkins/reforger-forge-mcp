@@ -260,7 +260,14 @@ export class McpIdleShutdownController {
       this.enterBlocked(false, ["REQUEST_COMPLETION_INDETERMINATE"]);
       return;
     }
-    if (initial.activeRequestCount !== 0) return;
+    if (initial.activeRequestCount !== 0) {
+      // The deadline can arrive while a legitimate request is still active.
+      // Its eventual completion emits the state/activity transition that
+      // rearms evaluation, but until then diagnostics must not claim that a
+      // permanently dormant controller is merely monitoring.
+      this.enterBlocked(false, ["REQUEST_ACTIVE"], false);
+      return;
+    }
 
     if (this.probeGeneration === Number.MAX_SAFE_INTEGER) {
       this.enterBlocked(false, ["INCOMPLETE_PROOF"]);
@@ -339,6 +346,7 @@ export class McpIdleShutdownController {
   private enterBlocked(
     complete: boolean,
     blockers: readonly McpIdleBlockerCode[],
+    scheduleRecheck = true,
   ): void {
     if (this.cancelled || this.state === "shutdown_committed") return;
     this.state = "blocked";
@@ -351,6 +359,8 @@ export class McpIdleShutdownController {
     } else {
       this.debug(`MCP idle shutdown remains blocked: ${signature || "INCOMPLETE_PROOF"}.`);
     }
-    this.scheduleAt(this.nowTick() + Math.min(this.idleShutdownMs, MCP_IDLE_BLOCKED_RECHECK_MAX_MS));
+    if (scheduleRecheck) {
+      this.scheduleAt(this.nowTick() + Math.min(this.idleShutdownMs, MCP_IDLE_BLOCKED_RECHECK_MAX_MS));
+    }
   }
 }

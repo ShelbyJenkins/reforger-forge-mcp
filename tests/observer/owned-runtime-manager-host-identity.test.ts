@@ -4,6 +4,8 @@ import {
   makeHarness,
 } from "./owned-runtime-manager-fixture.js";
 
+const NON_NIL_UUID_PATTERN = /^(?!00000000-0000-0000-0000-000000000000$)[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
 afterEach(cleanupOwnedRuntimeManagerFixtures);
 
 describe("OwnedRuntimeManager host identity", () => {
@@ -13,12 +15,12 @@ describe("OwnedRuntimeManager host identity", () => {
       .toBe(exactHost);
 
     const standalone = makeHarness().manager.managerInstanceId;
-    expect(standalone).toMatch(/^[0-9a-f-]{36}$/i);
+    expect(standalone).toMatch(NON_NIL_UUID_PATTERN);
     expect(standalone).not.toBe(exactHost);
   });
 
   it("rejects an invalid injected manager UUID", () => {
     expect(() => makeHarness({ managerInstanceId: "caller-controlled" }))
-      .toThrow(/manager instance ID must be a UUID/i);
+      .toThrow(/manager instance ID must be a non-nil UUID/i);
   });
 });

@@ -77,6 +77,7 @@ interface LmdbRangeOptions {
 }
 
 interface LmdbBinaryDatabase {
+  resetReadTxn(): void;
   getEntry(key: Uint8Array): { value: unknown; version?: number } | undefined;
   putSync(key: Uint8Array, value: unknown, version: number): void;
   removeSync(key: Uint8Array, ifVersion?: number): boolean;
@@ -275,6 +276,7 @@ function entryVersion(entry: { version?: number }): number {
 export class LmdbEnvironment {
   private readonly databaseDirectory: string;
   private database: LmdbBinaryDatabase | null = null;
+  private existingDatabase: LmdbBinaryDatabase | null = null;
   private closed = false;
   private closePromise: Promise<void> | null = null;
 
@@ -285,10 +287,21 @@ export class LmdbEnvironment {
     this.databaseDirectory = assertSafeDatabaseDirectory(databaseDirectory);
   }
 
+  /** True only after this owner has opened the writable environment handle. */
+  get hasOpenWriter(): boolean {
+    return this.database !== null;
+  }
+
   /** Lazily open (once) and return the shared binary database handle. */
   open(): LmdbBinaryDatabase {
     if (this.closed) throw new LmdbStoreError("CLOSED", "LMDB store is closed.");
     if (this.database) return this.database;
+    if (this.existingDatabase) {
+      throw new LmdbStoreError(
+        "INVALID_ROOT",
+        "A retained existing-only LMDB reader must be closed before opening a writer handle.",
+      );
+    }
     const environmentPath = openEnvironmentDirectory(this.storageRoot, this.databaseDirectory);
     try {
       this.database = open<unknown, Uint8Array>(environmentPath, {
@@ -318,9 +331,14 @@ export class LmdbEnvironment {
    */
   async inspectExisting<T>(
     action: (database: LmdbBinaryDatabase) => T,
+    options: { readonly retainOpen?: boolean } = {},
   ): Promise<LmdbExistingInspection<T>> {
     if (this.closed) throw new LmdbStoreError("CLOSED", "LMDB store is closed.");
     if (this.database) return { kind: "available", value: action(this.database) };
+    if (this.existingDatabase) {
+      this.existingDatabase.resetReadTxn();
+      return { kind: "available", value: action(this.existingDatabase) };
+    }
     const environment = existingEnvironmentDirectory(this.storageRoot, this.databaseDirectory);
     if (environment.kind === "missing") return environment;
     let database: LmdbBinaryDatabase;
@@ -337,6 +355,10 @@ export class LmdbEnvironment {
         cause: error,
       });
     }
+    if (options.retainOpen === true) {
+      this.existingDatabase = database;
+      return { kind: "available", value: action(database) };
+    }
     try {
       return { kind: "available", value: action(database) };
     } finally {
@@ -347,13 +369,17 @@ export class LmdbEnvironment {
   async close(): Promise<void> {
     if (this.closePromise) return this.closePromise;
     this.closed = true;
-    if (!this.database) {
+    if (!this.database && !this.existingDatabase) {
       this.closePromise = Promise.resolve();
       return this.closePromise;
     }
-    const database = this.database;
-    this.closePromise = database.close().finally(() => {
+    const databases = [...new Set([
+      this.database,
+      this.existingDatabase,
+    ].filter((database): database is LmdbBinaryDatabase => database !== null))];
+    this.closePromise = Promise.all(databases.map((database) => database.close())).then(() => undefined).finally(() => {
       this.database = null;
+      this.existingDatabase = null;
     });
     return this.closePromise;
   }
@@ -433,9 +459,15 @@ export class LmdbDurableKvStore<T> implements DurableKvStore<T> {
   }
 
   /** Read one record without creating a missing root or LMDB environment. */
-  async inspectExisting(key: string): Promise<LmdbExistingInspection<LmdbInspection<T>>> {
+  async inspectExisting(
+    key: string,
+    options: { readonly retainOpen?: boolean } = {},
+  ): Promise<LmdbExistingInspection<LmdbInspection<T>>> {
     const bytes = keyBytes(key);
-    return this.environment.inspectExisting((database) => this.inspectDatabaseEntry(database, bytes));
+    return this.environment.inspectExisting(
+      (database) => this.inspectDatabaseEntry(database, bytes),
+      options,
+    );
   }
 
   /**

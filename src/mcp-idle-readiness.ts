@@ -7,7 +7,6 @@ import {
 } from "./mcp-host-admission.js";
 
 export const MCP_IDLE_BLOCKER_CODES = Object.freeze([
-  "EXTERNAL_ACTIVATION",
   "HOST_ADMISSION_ACTIVE",
   "INCOMPLETE_PROOF",
   "OBSERVER_CAPTURE",
@@ -17,6 +16,7 @@ export const MCP_IDLE_BLOCKER_CODES = Object.freeze([
   "OWNED_RUNTIME_PREPARATION",
   "OWNED_RUNTIME_RECOVERY",
   "OWNED_RUNTIME_START",
+  "REQUEST_ACTIVE",
   "REQUEST_COMPLETION_INDETERMINATE",
   "WORKBENCH_ACTIVITY",
   "WORKBENCH_OWNERSHIP",
@@ -30,6 +30,12 @@ export interface IdleShutdownInspectionOptions {
   readonly deadlineTick: number;
   readonly signal: AbortSignal;
   readonly probeGeneration: number;
+  /**
+   * The monotonic clock that produced `deadlineTick`. The aggregate inspector
+   * always supplies this to providers so tests and production compare ticks
+   * from the same clock domain.
+   */
+  readonly nowTick?: () => number;
 }
 
 export interface McpIdleProviderReadiness {
@@ -92,7 +98,11 @@ function incomplete(probeGeneration: number): IdleShutdownReadiness {
 function normalizedBlockers(values: readonly McpIdleBlockerCode[]): McpIdleBlockerCode[] | null {
   const unique = new Set<McpIdleBlockerCode>();
   for (const value of values) {
-    if (!blockerSet.has(value) || unique.size >= MAX_BLOCKERS) return null;
+    if (!blockerSet.has(value)) return null;
+    // Repeated diagnosed categories do not consume another bounded slot. In
+    // particular, preserve the complete fixed set when a provider repeats one
+    // category after every category has already been observed.
+    if (!unique.has(value) && unique.size >= MAX_BLOCKERS) return null;
     unique.add(value);
   }
   return [...unique].sort();
@@ -152,6 +162,7 @@ export class McpIdleReadinessInspector {
       deadlineTick: effectiveDeadline,
       signal: controller.signal,
       probeGeneration: options.probeGeneration,
+      nowTick: this.nowTick,
     });
     let resolvePhysical!: () => void;
     this.physicalProbe = new Promise<void>((resolve) => { resolvePhysical = resolve; });
@@ -198,7 +209,9 @@ export class McpIdleReadinessInspector {
       providerSnapshots.push({ source: provider, revision: result.revision });
     }
     const gate = this.admissionGate.snapshot();
-    if (gate.activeTokens !== 0 || gate.state !== "open") blockers.push("HOST_ADMISSION_ACTIVE");
+    if (gate.activeTokens !== 0 || gate.privilegedCleanupCount !== 0 || gate.state !== "open") {
+      blockers.push("HOST_ADMISSION_ACTIVE");
+    }
     if (!complete) blockers.push("INCOMPLETE_PROOF");
     const normalized = normalizedBlockers(blockers) ?? ["INCOMPLETE_PROOF"];
     const sealProof = complete && normalized.length === 0 && providerSnapshots.length === this.providers.length

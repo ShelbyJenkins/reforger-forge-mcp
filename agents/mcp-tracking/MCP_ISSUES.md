@@ -5,124 +5,107 @@ deferred improvements that are not currently a broken supported behavior.
 Append new findings at the bottom; move resolved or verified records to
 [MCP_ISSUES_RESOLVED.md](MCP_ISSUES_RESOLVED.md).
 
-## MCP-060 - launch planning can monopolize the MCP event loop before admission
+## MCP-068 - successor chains retain fail-closed recovery hardening gaps
 
 **Status:** Open
 
-**Priority:** P1 - whole-host responsiveness and cancellation
+**Priority:** P2 - crash recovery and long-lived profile reuse
 
-**Observed:** 2026-08-05
+**Observed:** 2026-08-06
 
-**Observed behavior:** `game_launch` performs executable hashing plus world and
-add-on discovery with synchronous filesystem APIs before it checks the same-key
-in-flight map or the 32-mutation limit. The scan caps bound counts and manifest
-bytes, but no elapsed deadline or cancellation reaches planning, executable
-hashing has no byte ceiling, and one slow filesystem call blocks protocol
-dispatch, cancellation, timers, and orderly shutdown. Equal retry storms repeat
-the full evidence scan before they can coalesce.
+**Observed behavior:** MCP-061 now provides the ordinary exact-owned
+start → stop → successor workflow with a durable profile chain. Same-manager
+pre-runtime recovery can resume an exact `reserved` attempt and can replace an
+unrecorded preparation only after a durable `revocation_pending` state and an
+explicit proof-bearing `aborted` transition. The more advanced recovery
+branches from the retained Commit 9 plan remain deliberately fail closed:
+prior-manager reserved or revocation-pending attempts are not adopted after an
+Observer/MCP restart, legacy Commit-7 evidence is not adopted into a chain, and
+a terminal chain tip is retained indefinitely within the configured store caps
+instead of retiring the complete family atomically. The exhaustive injected
+restart/crash-window matrix and live Windows successor gate are also
+outstanding.
 
-**Decision needed:** Move planning behind bounded admission and off the MCP event
-loop, define an absolute planning deadline and executable byte budget, propagate
-cancellation where it is physically meaningful, and decide how late or
-uncancellable filesystem work is isolated/coalesced without weakening the
-same-evidence launch key.
+**Decision needed:** Implement proof-bearing prior-manager adoption or recovery,
+unambiguous legacy evidence adoption, and bounded atomic whole-family retirement
+without ever converting missing or unknown evidence into launch permission.
+Complete the restart/crash-window and live successor gates.
 
 **Affected areas:**
-[`src/tools/game-launch.ts`](../../src/tools/game-launch.ts),
-[`src/launch/game-world-plan.ts`](../../src/launch/game-world-plan.ts),
-[`src/launch/game-addon-plan.ts`](../../src/launch/game-addon-plan.ts),
 [`src/observer/owned-runtime-manager.ts`](../../src/observer/owned-runtime-manager.ts),
-and launch stress/latency tests.
+[`src/tools/game-launch.ts`](../../src/tools/game-launch.ts), retained-chain
+storage accounting/reconciliation, and successor recovery acceptance tests.
 
-**Evidence:** Both planners import `*Sync` traversal/read APIs; executable
-attestation reads to EOF synchronously; the in-flight lookup occurs only after
-`planCanonicalGameLaunch` returns. Node documents that synchronous filesystem
-APIs block the event loop and further JavaScript execution.
+**Evidence:** Current focused coverage proves initial/successor retries, one
+fenced successor after exact stop, same-manager resume of the original
+preparation key, proof-bearing revocation/abort/replacement, and predecessor
+proof retention for an aborted successor. False, thrown, crashed, lease-lost,
+or prior-manager cleanup remains recovery-pinned; legacy-without-ledger and
+lost-outcome states still return `RECOVERY_REQUIRED`. Sweep protects evidence
+needed by the active chain but has no atomic family-retirement transition.
 
-## MCP-061 - the primary game-launch workflow has no deliberate successor generation
+## MCP-069 - executable re-attestation does not pin the file through ownership publication
 
 **Status:** Open
 
-**Priority:** P1 - ordinary desktop relaunch workflow
+**Priority:** P2 - hostile replacement resistance at the owned-runtime spawn boundary
 
-**Observed:** 2026-08-05
+**Observed:** 2026-08-06
 
-**Observed behavior:** The delivered `game_launch` baseline intentionally allows
-one initial generation per retained profile evidence family. After a normal
-start and exact-owned stop, repeating the same start returns
-`PREPARED_LAUNCH_CONSUMED`; changed requests also fail closed. The public
-workaround is a fresh isolated managed/profile root and MCP lifecycle. This is
-safe and plan-conformant, but it is not the relaunch behavior users expect from
-the advertised normal desktop launch surface.
+**Observed behavior:** MCP-067 moves bounded executable hashing to an isolated
+worker and performs a second attestation only after the spawned process's exact
+identity is durable. The worker closes its file handle before the manager
+retains the Observer lifecycle and publishes the ownership receipt. A narrow
+check → retain → publish interval therefore remains in which the executable's
+path can be replaced. Exact PID/path/creation identity, owner-token evidence,
+and cleanup recovery remain durable, but the implementation does not provide a
+same-handle proof spanning process creation through publication.
 
-**Decision needed:** Either deliver the fenced durable successor transition in
-the retained Commit 9 plan before treating `game_launch` as the normal launcher,
-or explicitly position the current action as a one-generation technical
-baseline and make the recovery/workaround visible in tool output and setup UI.
+**Decision needed:** Either retain a non-replaceable Windows file handle across
+the spawn/publication transaction or attest the loaded process image's stable
+volume/file identity from the exact process handle. Define the required
+sharing/delete semantics, recovery behavior, and package boundary before
+advertising a strict hostile-filesystem no-TOCTOU guarantee.
 
 **Affected areas:**
-[`src/tools/game-launch.ts`](../../src/tools/game-launch.ts),
 [`src/observer/owned-runtime-manager.ts`](../../src/observer/owned-runtime-manager.ts),
-the deferred successor plan, and public Observer/setup guidance.
+[`src/launch/game-launch-revalidation-isolation.ts`](../../src/launch/game-launch-revalidation-isolation.ts),
+the Windows exact-process backend, and owned-runtime spawn-publication tests.
 
-**Evidence:** The manager explicitly refuses terminal retained attempts, the
-focused test asserts start/stop/same-start refusal, and the originating plan and
-public guide both prescribe a fresh root/MCP for a second baseline generation.
+**Evidence:** The post-spawn hook runs after the `identity_verified` journal
+state and detects replacements that occur before its read. Its worker-owned
+handle is terminated and closed before lifecycle retention and runtime-receipt
+publication, so current tests prove pre/post replacement detection and exact
+cleanup authority, not a handle continuously pinning the executable file.
 
-## MCP-064 - supported MCP protocol eras are not declared or tested
-
-**Status:** Open
-
-**Priority:** P2 - current-client compatibility decision
-
-**Observed:** 2026-08-05
-
-**Observed behavior:** The package describes itself as a universal MCP server,
-but it remains on the v1 SDK and directly connects an `McpServer` to
-`StdioServerTransport`. Under the official 2026-07-28 SDK migration guidance,
-that composition serves only the 2025-era protocol. Dual-era clients can fall
-back, while a modern-only client cannot connect. The repository neither states
-that boundary nor tests a legacy/modern compatibility matrix.
-
-**Decision needed:** Declare the supported protocol revision/era and constrain
-the compatibility claim, or migrate to the v2 dual-era stdio serving entry and
-black-box test initialization, discovery, requests, cancellation, activity
-accounting, and shutdown in both eras.
-
-**Affected areas:** `package.json`, `src/mcp-stdio-server.ts`, the activity
-transport wrapper, package verification, and setup/compatibility documentation.
-
-**Evidence:** `package-lock.json` resolves `@modelcontextprotocol/sdk` 1.29.0;
-production constructs `StdioServerTransport` and calls `server.connect()`
-directly; the only explicit transport protocol fixtures use `2025-11-25`.
-
-## MCP-065 - public launch and recovery guidance has stale or misleading contract language
+## MCP-070 - foreground-triggered Workbench reload can observe partial script edits and crash
 
 **Status:** Open
 
-**Priority:** P3 - operator discoverability and terminology
+**Priority:** P1 - attended editor data safety and script-edit reliability
 
-**Observed:** 2026-08-05
+**Observed:** 2026-08-06
 
-**Observed behavior:** The Observer quick reference still describes
-`observer_runtime` as start/inspect/stop even though public `history` and
-`recover` actions now own retained-history diagnosis and recovery. The
-`runtimeKind: "client"` name maps to standalone `-world` loading, while Bohemia
-uses `-client` for replication-client mode; prose states the mapping but the
-registered property has no description that disambiguates the term. The root
-README also says valid foreign lifecycle evidence keeps the local host open,
-reversing the implemented host-scoped rule: well-formed foreign authority stays
-visible but nonblocking, while malformed/unattributable evidence blocks.
+**Observed behavior:** An MCP-owned World Editor session rescans externally
+modified scripts when Workbench regains focus. A multi-part edit to one Game
+script was observed between writes: the reload saw a new function call before
+the later function definition had reached disk. Game-script compilation failed,
+Workbench attempted to reload the open world with the Game module unavailable,
+and then terminated with an access violation. The crash left the MCP transport
+closed and its durable Workbench lifecycle reporting `running` after the exact
+Workbench process and NET API endpoint were gone.
 
-**Decision needed:** Update the current operator quick reference and setup
-recovery path for `history`/`recover`; rename or alias `runtimeKind: "client"` to
-`standalone` (or describe it at the schema boundary); and correct the root idle
-paragraph to distinguish valid foreign evidence from uncertain evidence.
+**Decision needed:** Define a supported coordination boundary for script edits
+while an MCP-owned editor is live. At minimum, prevent MCP-authored incremental
+writes from exposing intermediate file states to Workbench, and recover a
+provably exited editor lifecycle after this failure. Determine whether focus-
+triggered reload can be suppressed, debounced until files are stable, or must
+instead require an explicit stop/restart workflow for script mutations.
 
-**Affected areas:** `docs/observer.md`, `README.md`, `SETUP.md`, the
-`game_launch` input schema/description, and documentation contract tests.
+**Affected areas:** Workbench script-edit/write tools, editor lifecycle recovery,
+external-change detection, and attended World Editor reload behavior.
 
-**Evidence:** The registered runtime enum includes five actions, while the quick
-reference lists three; the argv builder deliberately emits `-world` for
-`runtimeKind: "client"`; MCP-056 and idle-readiness filtering explicitly remove
-well-formed unequal authority from this host's obligations.
+**Evidence:** The attributed editor log records `Reloading game scripts` at
+20:33:59, an undefined function from the intermediate file at 20:34:04, world
+loading with unknown Game classes immediately afterward, and a native access
+violation at 20:34:07. The completed file on disk contained the missing code.

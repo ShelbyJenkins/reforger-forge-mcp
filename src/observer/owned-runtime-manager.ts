@@ -57,7 +57,11 @@ import {
   resolveManagedPath,
 } from "../foundation/managed-path.js";
 import { createWindowsExactProcessBackend } from "../platform/windows/exact-process-backend.js";
-import { preserveWindowsForegroundDuringRuntimeStartup } from "../platform/windows/runtime-focus-guard.js";
+import {
+  prepareWindowsForegroundDuringRuntimeStartup,
+  type RuntimeFocusGuardPreparation,
+  type RuntimeFocusGuardTransaction,
+} from "../platform/windows/runtime-focus-guard.js";
 import {
   ChildSupervisor,
   type SupervisedChildCounts,
@@ -65,13 +69,17 @@ import {
 } from "../foundation/child-supervisor.js";
 import {
   computeGameAddonEvidenceDigest,
-  revalidateGameAddonPlan,
   type GameAddonPlanSnapshot,
 } from "../launch/game-addon-plan.js";
 import { GameLaunchPlanError } from "../launch/game-launch-errors.js";
 import {
+  GameLaunchRevalidationIsolationError,
+  gameLaunchRevalidationDeadlineError,
+  revalidateGameLaunchPointOfUseIsolated,
+  type IsolatedGameLaunchRevalidationRequest,
+} from "../launch/game-launch-revalidation-isolation.js";
+import {
   computeGameWorldEvidenceDigest,
-  revalidateGameWorldPlan,
   type GameWorldPlanSnapshot,
 } from "../launch/game-world-plan.js";
 import type {
@@ -79,6 +87,10 @@ import type {
   ObserverPreparedLaunch,
   ObserverPreparedLaunchRecorder,
 } from "./launch.js";
+import {
+  deriveOwnedGameLaunchAttemptKey,
+  OWNED_GAME_LAUNCH_ATTEMPT_ID_PREFIX,
+} from "./game-launch-attempt.js";
 import type { ObserverRemedyReason } from "./refusal-remedy.js";
 
 export const OWNED_RUNTIME_OWNER_ARGUMENT_PREFIX = "-reforgerForgeOwnerToken=";
@@ -90,6 +102,8 @@ const STORAGE_VERSION = 1;
 const LIFECYCLE_RECORD_MIN_BYTES = 2;
 const DEFAULT_INSPECTION_TIMEOUT_MS = 5_000;
 const DEFAULT_TERMINATION_TIMEOUT_MS = 20_000;
+export const OWNED_RUNTIME_START_REVALIDATION_DEADLINE_MS = 60_000;
+export const OWNED_RUNTIME_EXECUTABLE_MAXIMUM_BYTES = 1024 * 1024 * 1024;
 const PROCESS_POLL_MS = 100;
 const DEFAULT_LIFECYCLE_RECORD_MAX_BYTES = 4 * 1024 * 1024;
 const DEFAULT_RECEIPT_RETENTION_MS = 24 * 60 * 60_000;
@@ -105,7 +119,7 @@ const MAX_HISTORY_ISSUES = 32;
 const MAX_CONFIGURABLE_RECORD_BYTES = 128 * 1024 * 1024;
 const DEFAULT_MAX_RECORD_BYTES = MAX_CONFIGURABLE_RECORD_BYTES;
 const START_LIFECYCLE_RESERVE_RECORDS = 9;
-const GAME_LAUNCH_START_LIFECYCLE_RESERVE_RECORDS = START_LIFECYCLE_RESERVE_RECORDS + 1;
+const GAME_LAUNCH_START_LIFECYCLE_RESERVE_RECORDS = START_LIFECYCLE_RESERVE_RECORDS + 2;
 const START_LIFECYCLE_RESERVE_BYTES = 2 * 1024 * 1024;
 const CHILD_EXIT_RESERVE_BYTES = 256 * 1024;
 const SMALL_LIFECYCLE_RESERVE_BYTES = 8 * 1024;
@@ -141,10 +155,12 @@ export const OWNED_RUNTIME_RECORD_DIRECTORIES = [
   "stop-completions",
   "restoration-proofs",
   "idempotency",
+  "game-launch-chains",
 ] as const;
 type OwnedRuntimeRecordDirectory = typeof OWNED_RUNTIME_RECORD_DIRECTORIES[number];
 const preparedLaunchIdSchema = z.string().regex(/^pl-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
 const runtimeIdSchema = z.string().regex(/^rt-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+const compositeAttemptIdSchema = z.string().regex(/^ga-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
 const fileTimeSchema = z.string().max(DECIMAL_IDENTITY_MAX_CHARS).regex(/^\d+$/);
 const sha256Schema = z.string().regex(/^[a-f0-9]{64}$/);
 const decimalSchema = z.string().max(DECIMAL_IDENTITY_MAX_CHARS).regex(/^\d+$/);
@@ -259,10 +275,21 @@ export interface OwnedRuntimeManagerOptions {
   /** Required when backend does not also implement the legacy combined adapter. */
   machineMutex?: MachineMutex;
   spawnProcess?: typeof nodeSpawn;
-  /** Windows startup-focus enforcement seam for graphical `-noFocus` launches. */
-  preserveForegroundDuringStartup?: (pid: number) => Promise<void>;
+  /** Establishes Windows startup-focus hooks before a graphical process is spawned. */
+  prepareForegroundDuringStartup?: (
+    input: RuntimeFocusGuardPreparation
+  ) => Promise<RuntimeFocusGuardTransaction>;
   /** Resolves the exact installed executable appropriate for the prepared runtime kind. */
   executableResolver?: (runtimeKind: ObserverLaunchInput["runtimeKind"]) => string;
+  /**
+   * @internal Isolated point-of-use revalidation seam for deterministic lifecycle tests.
+   * Implementations own their absolute deadline and must not settle until all
+   * physical work has stopped. The signal revokes lifecycle-lease authority.
+   */
+  pointOfUseRevalidator?: (
+    request: IsolatedGameLaunchRevalidationRequest,
+    signal: AbortSignal,
+  ) => Promise<OwnedRuntimeExecutableEvidence>;
   clock?: () => number;
   /** Ordinary local-delay seam; durable deadlines and recovery remain local. */
   sleeper?: Sleeper;
@@ -306,6 +333,10 @@ export interface OwnedRuntimeSweepResult {
 export interface OwnedRuntimeStartInput {
   preparedLaunchId: string;
   idempotencyKey: string;
+  /** Absolute wall-clock deadline shared by pre-spawn and post-spawn revalidation. */
+  revalidationDeadlineAtMs?: number;
+  /** Executable byte ceiling shared by both point-of-use attestations. */
+  executableMaximumBytes?: number;
 }
 
 export const OWNED_RUNTIME_EXECUTABLE_EVIDENCE_SCHEMA_VERSION = 1;
@@ -323,8 +354,15 @@ export interface OwnedRuntimeExecutableEvidence {
   readonly executableEvidenceDigest: string;
 }
 
+/** Serializable executable locator used by isolated game-launch planning. */
+export type OwnedRuntimeExecutablePlanningSource =
+  | { readonly kind: "gamePath"; readonly gamePath: string }
+  | { readonly kind: "executablePath"; readonly executablePath: string };
+
+export const OWNED_GAME_LAUNCH_PREPARATION_EVIDENCE_SCHEMA_VERSION = 2 as const;
+
 export interface OwnedGameLaunchPreparationEvidence {
-  readonly schemaVersion: 1;
+  readonly schemaVersion: typeof OWNED_GAME_LAUNCH_PREPARATION_EVIDENCE_SCHEMA_VERSION;
   readonly prepareKey: string;
   readonly projectComparisonKey: string;
   readonly world: GameWorldPlanSnapshot;
@@ -336,8 +374,40 @@ export interface OwnedGameLaunchPreparationEvidence {
 export interface PrepareInitialOwnedGameLaunchInput {
   readonly launchInput: ObserverLaunchInput;
   readonly evidence: OwnedGameLaunchPreparationEvidence;
-  readonly prepare: () => Promise<ObserverPreparedLaunch>;
+  readonly afterRuntimeId?: string;
+  readonly prepare: (attemptLaunchInput: ObserverLaunchInput) => Promise<ObserverPreparedLaunch>;
+  /** Cleanup is terminal only when the observer returns `{ revoked: true }`. */
   readonly revokeSession: (sessionId: string) => Promise<unknown>;
+}
+
+export type OwnedGameLaunchAttemptState =
+  | "reserved"
+  | "revocation_pending"
+  | "aborted"
+  | "prepared"
+  | "starting"
+  | "running"
+  | "terminal";
+
+export interface OwnedGameLaunchChainPublicState {
+  readonly schemaVersion: 1;
+  readonly delivery: "owned";
+  readonly compositeAttemptId: string;
+  readonly generation: number;
+  readonly state: OwnedGameLaunchAttemptState;
+  readonly predecessorRuntimeId: string | null;
+  readonly runtimeId?: string;
+  readonly retry: { readonly afterRuntimeId: string | null };
+  readonly successor:
+    | { readonly eligible: false; readonly reason: "exact_stop_required" | "recovery_required" }
+    | { readonly eligible: true; readonly afterRuntimeId: string };
+}
+
+export interface PreparedOwnedGameLaunch extends ObserverPreparedLaunch {
+  readonly preparedLaunchId: string;
+  readonly compositeAttemptId: string;
+  readonly canonicalFingerprint: string;
+  readonly chain: OwnedGameLaunchChainPublicState;
 }
 
 export interface OwnedRuntimeStopInput {
@@ -422,6 +492,8 @@ export interface OwnedRuntimePublicStatus {
   identityVacant?: boolean;
   terminationComplete?: boolean;
   observerCleanupPending?: boolean;
+  compositeAttemptId?: string;
+  chain?: OwnedGameLaunchChainPublicState;
 }
 
 export class OwnedRuntimeError extends Error {
@@ -451,6 +523,96 @@ export class OwnedRuntimePreconsumptionError extends OwnedRuntimeError {
   }
 }
 
+const gameLaunchAttemptKeySchema = z.string().regex(
+  /^mcp-game-launch-attempt-(?:prepare|record|start)-v1-[a-f0-9]{64}$/,
+);
+const canonicalGameLaunchPrepareKeySchema = z.string().regex(
+  /^mcp-game-launch-prepare-v1-[a-f0-9]{64}$/,
+);
+const gameLaunchAttemptLinkSchema = z.object({
+  schemaVersion: z.literal(1),
+  delivery: z.literal("owned"),
+  compositeAttemptId: compositeAttemptIdSchema,
+  canonicalFingerprint: sha256Schema,
+  profileKeyDigest: sha256Schema,
+  generation: z.number().int().positive(),
+  predecessorRuntimeId: runtimeIdSchema.nullable(),
+  predecessorCompositeAttemptId: compositeAttemptIdSchema.nullable(),
+  prepareKey: gameLaunchAttemptKeySchema,
+  recordKey: gameLaunchAttemptKeySchema,
+  startKey: gameLaunchAttemptKeySchema,
+}).strict();
+type GameLaunchAttemptLink = z.infer<typeof gameLaunchAttemptLinkSchema>;
+
+const gameLaunchTerminalProofSchema = z.object({
+  runtimeId: runtimeIdSchema,
+  stoppedAt: z.string().datetime(),
+  completedAt: z.string().datetime(),
+  restorationProvedAt: z.string().datetime(),
+  sessionRevoked: z.literal(true),
+  proofDigest: sha256Schema,
+}).strict();
+
+const gameLaunchPreparationAbortSchema = z.object({
+  sessionId: z.string().min(1).max(PREPARED_SESSION_ID_MAX_UTF16_UNITS),
+  revokedAt: z.string().datetime(),
+  sessionRevoked: z.literal(true),
+}).strict();
+
+const gameLaunchAttemptSchema = z.object({
+  schemaVersion: z.literal(1),
+  delivery: z.literal("owned"),
+  compositeAttemptId: compositeAttemptIdSchema,
+  canonicalFingerprint: sha256Schema,
+  generation: z.number().int().positive(),
+  predecessorRuntimeId: runtimeIdSchema.nullable(),
+  predecessorCompositeAttemptId: compositeAttemptIdSchema.nullable(),
+  managerInstanceId: z.string().uuid(),
+  state: z.enum([
+    "reserved",
+    "revocation_pending",
+    "aborted",
+    "prepared",
+    "starting",
+    "running",
+    "terminal",
+  ]),
+  prepareKey: gameLaunchAttemptKeySchema,
+  recordKey: gameLaunchAttemptKeySchema,
+  startKey: gameLaunchAttemptKeySchema,
+  preparedLaunchId: preparedLaunchIdSchema.nullable(),
+  sessionId: z.string().min(1).max(PREPARED_SESSION_ID_MAX_UTF16_UNITS).nullable(),
+  runtimeId: runtimeIdSchema.nullable(),
+  // Optional only for schema-v1 chains written before pre-runtime abort proof
+  // existed. New writes always publish an explicit null or proof object.
+  preparationAbort: gameLaunchPreparationAbortSchema.nullable().optional(),
+  terminal: gameLaunchTerminalProofSchema.nullable(),
+  reservedAt: z.string().datetime(),
+  updatedAt: z.string().datetime(),
+}).strict();
+type GameLaunchAttempt = z.infer<typeof gameLaunchAttemptSchema>;
+
+const gameLaunchPreviousTipSchema = z.object({
+  compositeAttemptId: compositeAttemptIdSchema,
+  runtimeId: runtimeIdSchema,
+  canonicalFingerprint: sha256Schema,
+  generation: z.number().int().positive(),
+  completedAt: z.string().datetime(),
+  proofDigest: sha256Schema,
+}).strict();
+
+const gameLaunchChainSchema = z.object({
+  schemaVersion: z.literal(1),
+  delivery: z.literal("owned"),
+  profileKey: z.string().min(1).max(WINDOWS_PATH_MAX_CHARS),
+  profileKeyDigest: sha256Schema,
+  profilePath: z.string().min(1).max(WINDOWS_PATH_MAX_CHARS),
+  current: gameLaunchAttemptSchema,
+  previous: gameLaunchPreviousTipSchema.nullable(),
+  updatedAt: z.string().datetime(),
+}).strict();
+type GameLaunchChain = z.infer<typeof gameLaunchChainSchema>;
+
 const preparedDescriptorSchema = z.object({
   version: z.literal(STORAGE_VERSION),
   preparedLaunchId: preparedLaunchIdSchema,
@@ -467,6 +629,7 @@ const preparedDescriptorSchema = z.object({
   managerInstanceId: z.string().uuid(),
   prepareIdempotencyHash: sha256Schema.optional(),
   gameLaunchEvidence: z.lazy(() => gameLaunchEvidenceSchema).optional(),
+  gameLaunchAttempt: gameLaunchAttemptLinkSchema.optional(),
 });
 type PreparedDescriptor = z.infer<typeof preparedDescriptorSchema>;
 
@@ -497,8 +660,8 @@ const runtimeExecutableEvidenceSchema = z.object({
 });
 
 const gameLaunchEvidenceSchema = z.object({
-  schemaVersion: z.literal(1),
-  prepareKey: z.string().regex(/^mcp-game-launch-prepare-v1-[a-f0-9]{64}$/),
+  schemaVersion: z.literal(OWNED_GAME_LAUNCH_PREPARATION_EVIDENCE_SCHEMA_VERSION),
+  prepareKey: z.union([canonicalGameLaunchPrepareKeySchema, gameLaunchAttemptKeySchema]),
   projectComparisonKey: z.string().min(1).max(WINDOWS_PATH_MAX_CHARS),
   world: z.object({}).passthrough(),
   addons: z.object({}).passthrough(),
@@ -632,6 +795,10 @@ interface StopCompletionAck {
 interface OwnedRuntimeLeaseFence {
   /** Refuse any further irreversible work after the native mutex holder exits. */
   assertActive(): void;
+  /** Synchronously aborted when the native mutex holder exits. */
+  readonly signal: AbortSignal;
+  /** Register one abort/deadline-owning physical read for lease-loss joining. */
+  trackRevalidation<T>(operation: Promise<T>): Promise<T>;
 }
 
 interface OwnedRuntimeWallDeadline {
@@ -701,6 +868,17 @@ function sha256(value: string | Buffer): string {
   return createHash("sha256").update(value).digest("hex");
 }
 
+function canonicalFingerprintFromPrepareKey(prepareKey: string): string {
+  const parsed = canonicalGameLaunchPrepareKeySchema.safeParse(prepareKey);
+  if (!parsed.success) {
+    throw new OwnedRuntimeError(
+      "INVALID_REQUEST",
+      "Canonical game-launch evidence does not carry a baseline fingerprint",
+    );
+  }
+  return prepareKey.slice(prepareKey.lastIndexOf("-") + 1);
+}
+
 type RuntimeLifecycleGenerationInput = Pick<OwnedRuntimeReceipt,
   | "runtimeId"
   | "sessionId"
@@ -733,21 +911,42 @@ function deterministicReservationId(...parts: string[]): string {
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
-function inspectExecutableFile(filePath: string): ExecutableFileIdentity {
+function inspectExecutableFile(
+  filePath: string,
+  maximumBytes = Number.MAX_SAFE_INTEGER,
+): ExecutableFileIdentity {
+  if (!Number.isSafeInteger(maximumBytes) || maximumBytes < 1) {
+    throw new TypeError("Runtime executable byte limit must be a positive safe integer");
+  }
   const descriptor = openSync(filePath, "r");
   try {
     const before = fstatSync(descriptor, { bigint: true });
     if (!before.isFile()) {
       throw new OwnedRuntimeError("IDENTITY_UNVERIFIABLE", "Configured runtime executable is not a regular file");
     }
+    if (before.size > BigInt(maximumBytes)) {
+      throw new GameLaunchPlanError(
+        "EXECUTABLE_OVERSIZE",
+        `Configured runtime executable exceeds its ${maximumBytes}-byte planning limit.`,
+      );
+    }
     const digest = createHash("sha256");
     const buffer = Buffer.allocUnsafe(1024 * 1024);
     let position = 0;
     for (;;) {
-      const bytes = readSync(descriptor, buffer, 0, buffer.length, position);
+      // Retain one sentinel byte so concurrent growth cannot turn the initial
+      // size check into an unbounded read.
+      const readLength = Math.min(buffer.length, maximumBytes - position + 1);
+      const bytes = readSync(descriptor, buffer, 0, readLength, position);
       if (bytes === 0) break;
-      digest.update(buffer.subarray(0, bytes));
       position += bytes;
+      if (position > maximumBytes) {
+        throw new GameLaunchPlanError(
+          "EXECUTABLE_OVERSIZE",
+          `Configured runtime executable exceeds its ${maximumBytes}-byte planning limit.`,
+        );
+      }
+      digest.update(buffer.subarray(0, bytes));
     }
     const after = fstatSync(descriptor, { bigint: true });
     if (before.dev !== after.dev || before.ino !== after.ino || before.size !== after.size ||
@@ -782,6 +981,39 @@ export function computeOwnedRuntimeExecutableEvidenceDigest(
   ]));
 }
 
+/**
+ * Resolve and attest an executable from a serializable source. Callers that
+ * perform this work in an isolated worker can impose a planning-only byte cap
+ * without weakening the later start-boundary revalidation.
+ */
+export function resolveRuntimeExecutableEvidenceFromSource(
+  source: OwnedRuntimeExecutablePlanningSource,
+  runtimeKind: ObserverLaunchInput["runtimeKind"],
+  maximumBytes = Number.MAX_SAFE_INTEGER,
+): OwnedRuntimeExecutableEvidence {
+  try {
+    const executablePath = source.kind === "gamePath"
+      ? resolveRuntimeExecutable(source.gamePath, runtimeKind)
+      : canonicalFile(source.executablePath, `${runtimeKind} runtime executable`);
+    const fields: Omit<OwnedRuntimeExecutableEvidence, "executableEvidenceDigest"> = {
+      schemaVersion: OWNED_RUNTIME_EXECUTABLE_EVIDENCE_SCHEMA_VERSION,
+      runtimeKind,
+      executablePath,
+      executableFile: Object.freeze({ ...inspectExecutableFile(executablePath, maximumBytes) }),
+    };
+    return Object.freeze({
+      ...fields,
+      executableEvidenceDigest: computeOwnedRuntimeExecutableEvidenceDigest(fields),
+    });
+  } catch (error) {
+    if (error instanceof OwnedRuntimeError || error instanceof GameLaunchPlanError) throw error;
+    throw new OwnedRuntimeError(
+      "IDENTITY_UNVERIFIABLE",
+      "Configured runtime executable identity could not be verified",
+    );
+  }
+}
+
 export function computeOwnedGameLaunchEvidenceDigest(
   value: Omit<OwnedGameLaunchPreparationEvidence, "gameLaunchEvidenceDigest">,
 ): string {
@@ -814,7 +1046,7 @@ function validatedGameLaunchEvidence(value: unknown): OwnedGameLaunchPreparation
       throw new Error("nested evidence digest mismatch");
     }
     const candidate: OwnedGameLaunchPreparationEvidence = {
-      schemaVersion: 1,
+      schemaVersion: OWNED_GAME_LAUNCH_PREPARATION_EVIDENCE_SCHEMA_VERSION,
       prepareKey: parsed.prepareKey,
       projectComparisonKey: parsed.projectComparisonKey,
       world,
@@ -1022,12 +1254,18 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder, McpI
   private readonly machineMutex: MachineMutex;
   private readonly durableReservations = new DurableReservationGate();
   private readonly spawnProcess: typeof nodeSpawn;
-  private readonly preserveForegroundDuringStartup: (pid: number) => Promise<void>;
+  private readonly prepareForegroundDuringStartup: (
+    input: RuntimeFocusGuardPreparation
+  ) => Promise<RuntimeFocusGuardTransaction>;
   private readonly clock: () => number;
   private readonly sleeper: Sleeper;
   private readonly createOwnerToken: () => string;
   private readonly createId: () => string;
   private readonly resolveExecutable: (runtimeKind: ObserverLaunchInput["runtimeKind"]) => string;
+  private readonly pointOfUseRevalidator: (
+    request: IsolatedGameLaunchRevalidationRequest,
+    signal: AbortSignal,
+  ) => Promise<OwnedRuntimeExecutableEvidence>;
   private readonly inspectionTimeoutMs: number;
   private readonly terminationTimeoutMs: number;
   private readonly lockTimeoutMs: number;
@@ -1062,14 +1300,16 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder, McpI
     }
     this.machineMutex = machineMutex;
     this.spawnProcess = options.spawnProcess ?? nodeSpawn;
-    this.preserveForegroundDuringStartup = options.preserveForegroundDuringStartup ??
-      preserveWindowsForegroundDuringRuntimeStartup;
+    this.prepareForegroundDuringStartup = options.prepareForegroundDuringStartup ??
+      prepareWindowsForegroundDuringRuntimeStartup;
     this.clock = options.clock ?? Date.now;
     this.sleeper = options.sleeper ?? systemSleeper;
     this.createOwnerToken = options.ownerToken ?? (() => randomBytes(32).toString("base64url"));
     this.createId = options.randomId ?? randomUUID;
     this.resolveExecutable = options.executableResolver ??
       ((runtimeKind) => resolveRuntimeExecutable(options.gamePath, runtimeKind));
+    this.pointOfUseRevalidator = options.pointOfUseRevalidator ??
+      revalidateGameLaunchPointOfUseIsolated;
     this.inspectionTimeoutMs = options.inspectionTimeoutMs ?? DEFAULT_INSPECTION_TIMEOUT_MS;
     this.terminationTimeoutMs = options.terminationTimeoutMs ?? DEFAULT_TERMINATION_TIMEOUT_MS;
     this.lockTimeoutMs = options.lockTimeoutMs ?? 15_000;
@@ -1123,21 +1363,22 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder, McpI
     );
   }
 
-  resolveRuntimeExecutableEvidence(
+  /**
+   * Capture only the serializable input needed for isolated launch planning.
+   * The production resolver defers every filesystem lookup to the worker. An
+   * injected resolver is expected to return a configured path without doing
+   * filesystem traversal itself.
+   */
+  resolveRuntimeExecutablePlanningSource(
     runtimeKind: ObserverLaunchInput["runtimeKind"],
-  ): OwnedRuntimeExecutableEvidence {
+  ): OwnedRuntimeExecutablePlanningSource {
     try {
-      const executablePath = this.resolveRuntimeExecutablePath(runtimeKind);
-      const fields: Omit<OwnedRuntimeExecutableEvidence, "executableEvidenceDigest"> = {
-        schemaVersion: OWNED_RUNTIME_EXECUTABLE_EVIDENCE_SCHEMA_VERSION,
-        runtimeKind,
-        executablePath,
-        executableFile: Object.freeze({ ...inspectExecutableFile(executablePath) }),
-      };
-      return Object.freeze({
-        ...fields,
-        executableEvidenceDigest: computeOwnedRuntimeExecutableEvidenceDigest(fields),
-      });
+      return this.options.executableResolver === undefined
+        ? Object.freeze({ kind: "gamePath", gamePath: this.options.gamePath })
+        : Object.freeze({
+            kind: "executablePath",
+            executablePath: this.options.executableResolver(runtimeKind),
+          });
     } catch (error) {
       if (error instanceof OwnedRuntimeError) throw error;
       throw new OwnedRuntimeError(
@@ -1147,12 +1388,33 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder, McpI
     }
   }
 
-  private withFencedMachineMutex<T>(
+  resolveRuntimeExecutableEvidence(
+    runtimeKind: ObserverLaunchInput["runtimeKind"],
+  ): OwnedRuntimeExecutableEvidence {
+    return resolveRuntimeExecutableEvidenceFromSource(
+      this.resolveRuntimeExecutablePlanningSource(runtimeKind),
+      runtimeKind,
+    );
+  }
+
+  private async withFencedMachineMutex<T>(
     action: (fence: OwnedRuntimeLeaseFence) => Promise<T>,
     deadline?: OwnedRuntimeWallDeadline
   ): Promise<T> {
     let leaseLoss: MachineMutexLeaseLoss | null = null;
+    const leaseAbort = new AbortController();
+    const inFlightRevalidation = new Set<Promise<void>>();
     const fence: OwnedRuntimeLeaseFence = {
+      signal: leaseAbort.signal,
+      trackRevalidation: <Result>(operation: Promise<Result>): Promise<Result> => {
+        // The injected boundary contract guarantees that settlement means its
+        // worker/helper has stopped. Keep a non-rejecting mirror solely for a
+        // lease-loss drain; callers still receive the original typed outcome.
+        const settlement = operation.then(() => undefined, () => undefined);
+        inFlightRevalidation.add(settlement);
+        void settlement.then(() => { inFlightRevalidation.delete(settlement); });
+        return operation;
+      },
       assertActive: () => {
         if (leaseLoss) {
           throw new OwnedRuntimeError(
@@ -1168,7 +1430,10 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder, McpI
       this.machineMutex.withMachineMutex({
         name: OWNED_RUNTIME_LIFECYCLE_MUTEX,
         timeoutMs: Math.min(this.lockTimeoutMs, remainingMs),
-        onLeaseLost: (error) => { leaseLoss = error; },
+        onLeaseLost: (error) => {
+          leaseLoss = error;
+          leaseAbort.abort(error);
+        },
         action: async () => {
           fence.assertActive();
           const result = await action(fence);
@@ -1176,9 +1441,22 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder, McpI
           return result;
         },
       });
-    return deadline
-      ? this.beforeWallDeadline(deadline, (remainingMs) => acquire(remainingMs))
-      : acquire();
+    try {
+      return await (deadline
+        ? this.beforeWallDeadline(deadline, (remainingMs) => acquire(remainingMs))
+        : acquire());
+    } catch (error) {
+      if (leaseLoss) {
+        // WindowsExactProcessBackend may reject its holder race before the
+        // protected async action settles. Do not publish that rejection until
+        // every abort-owning revalidation boundary has joined its worker.
+        while (inFlightRevalidation.size > 0) {
+          await Promise.all([...inFlightRevalidation]);
+        }
+        fence.assertActive();
+      }
+      throw error;
+    }
   }
 
   private remainingWallBudget(deadline: OwnedRuntimeWallDeadline): number {
@@ -1614,21 +1892,23 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder, McpI
   }
 
   /**
-   * Serialize the first game-launch preparation for one stable project profile
-   * across MCP/private-child processes. No nested mutex acquisition occurs.
+   * Serialize one retryable, profile-fenced game-launch attempt across
+   * MCP/private-child processes. `afterRuntimeId` is accepted only as proof of
+   * the current, exactly stopped chain tip; it is never an idempotency token.
    */
   async prepareInitialOwnedGameLaunch(
     request: PrepareInitialOwnedGameLaunchInput,
-  ): Promise<ObserverPreparedLaunch> {
+  ): Promise<PreparedOwnedGameLaunch> {
     return this.withAdmission("owned game launch preparation", () =>
       this.prepareInitialOwnedGameLaunchInternal(request));
   }
 
   private async prepareInitialOwnedGameLaunchInternal(
     request: PrepareInitialOwnedGameLaunchInput,
-  ): Promise<ObserverPreparedLaunch> {
+  ): Promise<PreparedOwnedGameLaunch> {
     this.assertOpenForMutation();
     const evidence = validatedGameLaunchEvidence(request.evidence);
+    const canonicalFingerprint = canonicalFingerprintFromPrepareKey(evidence.prepareKey);
     if (request.launchInput.idempotencyKey !== evidence.prepareKey ||
         request.launchInput.runtimeKind !== evidence.executable.runtimeKind ||
         pathKey(request.launchInput.profilePath) !== pathKey(evidence.addons.profilePath) ||
@@ -1638,52 +1918,232 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder, McpI
         "Initial game-launch preparation input does not match its canonical evidence",
       );
     }
+    if (request.afterRuntimeId !== undefined) runtimeIdSchema.parse(request.afterRuntimeId);
     try {
       return await this.withFencedMachineMutex(async (fence) => {
         this.assertOpenForMutation();
         this.ensureStorage();
-        this.sweepLocked(this.clock());
-        const existing = this.findPreparedGameLaunchForProfile(
-          request.launchInput.profilePath,
-          evidence.prepareKey,
-        );
-        if (existing) {
-          if (existing.managerInstanceId !== this.managerInstanceId) {
+        const profileKey = pathKey(request.launchInput.profilePath);
+        const profileKeyDigest = sha256(profileKey);
+        let chain = this.readOptionalGameLaunchChain(profileKey, profileKeyDigest);
+        let reserved = false;
+        if (!chain) {
+          if (request.afterRuntimeId !== undefined) {
             throw new OwnedRuntimeError(
-              "PREPARED_LAUNCH_STALE",
-              "Matching game-launch preparation belongs to another MCP lifecycle",
+              "GAME_LAUNCH_PREDECESSOR_MISMATCH",
+              "afterRuntimeId is not the current tip of this game-launch profile",
+              { afterRuntimeId: request.afterRuntimeId },
             );
           }
-          const invalidation = this.readOptionalPreparedInvalidation(
-            existing.preparedLaunchId,
-            existing,
-          );
-          if (invalidation) {
+          if (this.findPreparedGameLaunchForProfile(request.launchInput.profilePath, null)) {
             throw new OwnedRuntimeError(
-              "PREPARED_LAUNCH_INVALIDATED",
-              "The retained baseline game-launch preparation was invalidated and cannot be reused",
-              { preparedLaunchId: existing.preparedLaunchId, sessionId: existing.sessionId },
+              "RECOVERY_REQUIRED",
+              "Retained baseline game-launch evidence has no profile attempt ledger and must be reconciled before launch",
             );
           }
-          this.assertGameLaunchRetryRecoverable(existing);
-          return this.publicPreparedDescriptor(existing);
-        }
-
-        this.assertInitialGamePreparationHeadroom(
-          this.storageRoot,
-          request.launchInput,
-          evidence,
-        );
-        let prepared: ObserverPreparedLaunch | null = null;
-        try {
-          prepared = await request.prepare();
-          fence.assertActive();
-          const preparedLaunchId = this.recordPreparedLaunchLocked(
+          this.assertInitialGamePreparationHeadroom(
+            this.storageRoot,
             request.launchInput,
-            prepared,
             evidence,
           );
-          return { ...prepared, preparedLaunchId };
+          chain = this.reserveGameLaunchAttempt(
+            profileKey,
+            profileKeyDigest,
+            request.launchInput.profilePath,
+            canonicalFingerprint,
+            null,
+            null,
+            1,
+          );
+          this.atomicWrite(
+            this.storageRoot,
+            this.gameLaunchChainPath(profileKeyDigest),
+            chain,
+            true,
+          );
+          reserved = true;
+        } else {
+          chain = this.reconcileGameLaunchChainLocked(chain);
+          const current = chain.current;
+          if (request.afterRuntimeId === undefined) {
+            if (current.predecessorRuntimeId !== null) {
+              throw new OwnedRuntimeError(
+                "GAME_LAUNCH_PREDECESSOR_REQUIRED",
+                "This profile already has a successor chain; retry it with its exact afterRuntimeId",
+                { afterRuntimeId: current.predecessorRuntimeId },
+              );
+            }
+            if (current.canonicalFingerprint !== canonicalFingerprint) {
+              throw new OwnedRuntimeError(
+                "ARGUMENT_CONFLICT",
+                "The initial game-launch attempt was retried with different canonical evidence",
+              );
+            }
+          } else if (current.predecessorRuntimeId === request.afterRuntimeId) {
+            if (current.canonicalFingerprint !== canonicalFingerprint) {
+              throw new OwnedRuntimeError(
+                "ARGUMENT_CONFLICT",
+                "The successor attempt was retried with different canonical evidence",
+                { afterRuntimeId: request.afterRuntimeId },
+              );
+            }
+          } else {
+            if (current.runtimeId !== request.afterRuntimeId) {
+              throw new OwnedRuntimeError(
+                "GAME_LAUNCH_PREDECESSOR_MISMATCH",
+                "afterRuntimeId is not the current tip of this game-launch profile",
+                {
+                  afterRuntimeId: request.afterRuntimeId,
+                  currentRuntimeId: current.runtimeId,
+                },
+              );
+            }
+            if (current.state !== "terminal" || !current.terminal) {
+              throw new OwnedRuntimeError(
+                "GAME_LAUNCH_PREDECESSOR_NOT_STOPPED",
+                "The current game-launch runtime must complete exact stop, restoration, sealing, and revocation before a successor",
+                { afterRuntimeId: request.afterRuntimeId, state: current.state },
+              );
+            }
+            this.assertGameLaunchTerminalPredecessorProofLocked(chain);
+            this.assertInitialGamePreparationHeadroom(
+              this.storageRoot,
+              request.launchInput,
+              evidence,
+            );
+            const successor = this.reserveGameLaunchAttempt(
+              profileKey,
+              profileKeyDigest,
+              request.launchInput.profilePath,
+              canonicalFingerprint,
+              current.runtimeId,
+              current.compositeAttemptId,
+              current.generation + 1,
+              {
+                compositeAttemptId: current.compositeAttemptId,
+                runtimeId: current.runtimeId,
+                canonicalFingerprint: current.canonicalFingerprint,
+                generation: current.generation,
+                completedAt: current.terminal.completedAt,
+                proofDigest: current.terminal.proofDigest,
+              },
+            );
+            this.writeGameLaunchChain(successor, false);
+            chain = successor;
+            reserved = true;
+          }
+        }
+
+        if (!reserved) {
+          let current = chain.current;
+          if (current.managerInstanceId !== this.managerInstanceId) {
+            throw new OwnedRuntimeError(
+              ["reserved", "revocation_pending", "aborted"].includes(current.state)
+                ? "RECOVERY_REQUIRED"
+                : "PREPARED_LAUNCH_STALE",
+              "Matching game-launch attempt belongs to another MCP lifecycle",
+            );
+          }
+
+          if (current.state === "revocation_pending") {
+            chain = await this.completeGameLaunchPreparationRevocationLocked(
+              chain,
+              request.revokeSession,
+              fence,
+            );
+            current = chain.current;
+          }
+
+          if (current.state === "aborted") {
+            this.assertGameLaunchPreparationAbortLocked(chain);
+            if (current.predecessorRuntimeId !== null) {
+              this.assertGameLaunchPreviousTipProofLocked(chain);
+            }
+            this.assertInitialGamePreparationHeadroom(
+              this.storageRoot,
+              request.launchInput,
+              evidence,
+            );
+            chain = this.reserveGameLaunchAttempt(
+              chain.profileKey,
+              chain.profileKeyDigest,
+              chain.profilePath,
+              current.canonicalFingerprint,
+              current.predecessorRuntimeId,
+              current.predecessorCompositeAttemptId,
+              current.generation,
+              chain.previous,
+            );
+            this.writeGameLaunchChain(chain, false);
+            reserved = true;
+          } else if (current.state === "reserved") {
+            // A failed or lost prepare response leaves the durable attempt key
+            // authoritative. Re-enter the private child with that exact key so
+            // it can replay an already-created session or safely create one.
+            this.assertInitialGamePreparationHeadroom(
+              this.storageRoot,
+              request.launchInput,
+              evidence,
+            );
+            reserved = true;
+          } else if (!current.preparedLaunchId) {
+            throw new OwnedRuntimeError(
+              "RECOVERY_REQUIRED",
+              "The current game-launch reservation has no recoverable prepared descriptor",
+              { compositeAttemptId: current.compositeAttemptId, state: current.state },
+            );
+          } else {
+            const existing = this.readPreparedDescriptor(current.preparedLaunchId);
+            this.assertDescriptorMatchesGameLaunchAttempt(existing, chain);
+            const invalidation = this.readOptionalPreparedInvalidation(
+              existing.preparedLaunchId,
+              existing,
+            );
+            if (invalidation) {
+              throw new OwnedRuntimeError(
+                "PREPARED_LAUNCH_INVALIDATED",
+                "The retained game-launch attempt was invalidated and cannot be reused",
+                { preparedLaunchId: existing.preparedLaunchId, sessionId: existing.sessionId },
+              );
+            }
+            this.assertGameLaunchRetryRecoverable(existing, chain);
+            return this.publicPreparedGameLaunch(existing, chain);
+          }
+        }
+
+        const attempt = chain.current;
+        const scopedEvidenceFields: Omit<OwnedGameLaunchPreparationEvidence, "gameLaunchEvidenceDigest"> = {
+          ...evidence,
+          prepareKey: attempt.prepareKey,
+        };
+        const scopedEvidence: OwnedGameLaunchPreparationEvidence = {
+          ...scopedEvidenceFields,
+          gameLaunchEvidenceDigest: computeOwnedGameLaunchEvidenceDigest(scopedEvidenceFields),
+        };
+        const attemptLaunchInput: ObserverLaunchInput = {
+          ...request.launchInput,
+          idempotencyKey: attempt.prepareKey,
+        };
+        let prepared: ObserverPreparedLaunch | null = null;
+        try {
+          prepared = await request.prepare(attemptLaunchInput);
+          fence.assertActive();
+          const preparedLaunchId = this.recordPreparedLaunchLocked(
+            { ...attemptLaunchInput, idempotencyKey: attempt.recordKey },
+            prepared,
+            scopedEvidence,
+            this.gameLaunchAttemptLink(chain),
+          );
+          chain = this.transitionGameLaunchAttempt(chain, {
+            state: "prepared",
+            preparedLaunchId,
+            sessionId: prepared.sessionId,
+          });
+          this.writeGameLaunchChain(chain, false);
+          return this.publicPreparedGameLaunch(
+            this.readPreparedDescriptor(preparedLaunchId),
+            chain,
+          );
         } catch (error) {
           if (prepared) {
             // Lease loss releases the native mutex before this async callback
@@ -1699,24 +2159,29 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder, McpI
             } catch {
               throw new OwnedRuntimeError(
                 "RECOVERY_REQUIRED",
-                "Initial game-launch descriptor state could not be proven after preparation failure",
+                "Game-launch descriptor state could not be proven after preparation failure",
               );
             }
             if (!descriptorAbsent) {
               throw new OwnedRuntimeError(
                 "RECOVERY_REQUIRED",
-                "Initial game-launch preparation may retain a durable descriptor and was not revoked",
+                "Game-launch preparation may retain a durable descriptor and was not revoked",
               );
             }
-            try {
-              await request.revokeSession(prepared.sessionId);
-            } catch {
-              throw new OwnedRuntimeError(
-                "RECOVERY_REQUIRED",
-                "Initial game-launch preparation was not recorded, and session revocation could not be confirmed",
-              );
-            }
-            fence.assertActive();
+            // Persist the external-cleanup obligation before revocation. A
+            // crash after the observer commits revocation must never turn the
+            // same attempt key back into permission to publish its cached,
+            // now-revoked prepared response.
+            chain = this.transitionGameLaunchAttempt(chain, {
+              state: "revocation_pending",
+              sessionId: prepared.sessionId,
+            });
+            this.writeGameLaunchChain(chain, false);
+            chain = await this.completeGameLaunchPreparationRevocationLocked(
+              chain,
+              request.revokeSession,
+              fence,
+            );
           }
           throw error;
         }
@@ -1725,7 +2190,7 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder, McpI
       throw this.normalizeError(
         error,
         "PREPARE_FAILED",
-        "Initial owned game launch could not be prepared",
+        "Owned game launch could not be prepared",
       );
     }
   }
@@ -1734,6 +2199,7 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder, McpI
     input: ObserverLaunchInput,
     prepared: ObserverPreparedLaunch,
     gameLaunchEvidence?: OwnedGameLaunchPreparationEvidence,
+    gameLaunchAttempt?: GameLaunchAttemptLink,
   ): string {
     const root = this.ensureStorage();
     const descriptorFingerprint = this.preparedFingerprint({
@@ -1744,6 +2210,7 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder, McpI
       expiresAt: prepared.expiresAt,
       bundleDigest: prepared.bundleDigest,
       ...(gameLaunchEvidence ? { gameLaunchEvidence } : {}),
+      ...(gameLaunchAttempt ? { gameLaunchAttempt } : {}),
     });
     const existingIndex = this.readOptionalPreparedSessionIndex(prepared.sessionId);
     if (existingIndex) {
@@ -1782,6 +2249,7 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder, McpI
         ? { prepareIdempotencyHash: sha256(boundedIdempotencyKey(input.idempotencyKey)) }
         : {}),
       ...(gameLaunchEvidence ? { gameLaunchEvidence } : {}),
+      ...(gameLaunchAttempt ? { gameLaunchAttempt } : {}),
     });
     this.assertPreparedDescriptorCapacity(descriptor);
     const index = preparedSessionIndexSchema.parse({
@@ -1808,7 +2276,7 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder, McpI
 
   private findPreparedGameLaunchForProfile(
     profilePath: string,
-    prepareKey: string,
+    prepareKey: string | null,
   ): PreparedDescriptor | null {
     let match: PreparedDescriptor | null = null;
     for (const name of this.recordFileNames("prepared")) {
@@ -1816,7 +2284,8 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder, McpI
       if (!preparedLaunchIdSchema.safeParse(preparedLaunchId).success) continue;
       const descriptor = this.readPreparedDescriptor(preparedLaunchId);
       if (pathKey(descriptor.profilePath) !== pathKey(profilePath)) continue;
-      if (!descriptor.gameLaunchEvidence || descriptor.gameLaunchEvidence.prepareKey !== prepareKey) {
+      if (!descriptor.gameLaunchEvidence) continue;
+      if (prepareKey !== null && descriptor.gameLaunchEvidence.prepareKey !== prepareKey) {
         throw new OwnedRuntimeError(
           "ARGUMENT_CONFLICT",
           "The derived project profile already retains a different baseline launch family",
@@ -1869,11 +2338,28 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder, McpI
     };
   }
 
-  private assertGameLaunchRetryRecoverable(descriptor: PreparedDescriptor): void {
-    if (Date.parse(descriptor.expiresAt) <= this.clock()) {
+  private publicPreparedGameLaunch(
+    descriptor: PreparedDescriptor,
+    chain: GameLaunchChain,
+  ): PreparedOwnedGameLaunch {
+    this.assertDescriptorMatchesGameLaunchAttempt(descriptor, chain);
+    return {
+      ...this.publicPreparedDescriptor(descriptor),
+      preparedLaunchId: descriptor.preparedLaunchId,
+      compositeAttemptId: chain.current.compositeAttemptId,
+      canonicalFingerprint: chain.current.canonicalFingerprint,
+      chain: this.publicGameLaunchChain(chain),
+    };
+  }
+
+  private assertGameLaunchRetryRecoverable(
+    descriptor: PreparedDescriptor,
+    chain: GameLaunchChain,
+  ): void {
+    if (Date.parse(descriptor.expiresAt) <= this.clock() && chain.current.state === "prepared") {
       throw new OwnedRuntimeError(
         "PREPARED_LAUNCH_EXPIRED",
-        "The retained baseline game-launch preparation has expired and cannot be replaced without successor support",
+        "The retained game-launch preparation expired before it was consumed and remains pinned for recovery",
       );
     }
     const consumption = this.readOptionalConsumption(descriptor.preparedLaunchId);
@@ -1901,13 +2387,10 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder, McpI
         "Retained game-launch pending evidence points at another preparation",
       );
     }
-    if (runtime && (this.runtimeLifecycleIsTerminal(runtime.runtimeId) ||
-        this.readOptionalStopReceipt(runtime.runtimeId) ||
-        this.readOptionalRestorationProof(runtime.runtimeId))) {
+    if (runtime && chain.current.runtimeId !== runtime.runtimeId) {
       throw new OwnedRuntimeError(
-        "PREPARED_LAUNCH_CONSUMED",
-        "The retained baseline game-launch runtime is terminal or stopping; a successor generation is required",
-        { runtimeId: runtime.runtimeId },
+        "STORAGE_UNVERIFIABLE",
+        "Retained game-launch runtime does not match the current profile attempt",
       );
     }
     if (pending && ["cleanup_verified", "release_required", "release_acknowledged"].includes(pending.state)) {
@@ -1926,6 +2409,613 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder, McpI
     }
   }
 
+  private reserveGameLaunchAttempt(
+    profileKey: string,
+    profileKeyDigest: string,
+    profilePath: string,
+    canonicalFingerprint: string,
+    predecessorRuntimeId: string | null,
+    predecessorCompositeAttemptId: string | null,
+    generation: number,
+    previous: z.infer<typeof gameLaunchPreviousTipSchema> | null = null,
+  ): GameLaunchChain {
+    const compositeAttemptId = `${OWNED_GAME_LAUNCH_ATTEMPT_ID_PREFIX}${this.createId()}`;
+    const identity = { delivery: "owned" as const, compositeAttemptId, canonicalFingerprint };
+    const timestamp = nowIso(this.clock);
+    const current = gameLaunchAttemptSchema.parse({
+      schemaVersion: 1,
+      delivery: "owned",
+      compositeAttemptId,
+      canonicalFingerprint,
+      generation,
+      predecessorRuntimeId,
+      predecessorCompositeAttemptId,
+      managerInstanceId: this.managerInstanceId,
+      state: "reserved",
+      prepareKey: deriveOwnedGameLaunchAttemptKey("prepare", identity),
+      recordKey: deriveOwnedGameLaunchAttemptKey("record", identity),
+      startKey: deriveOwnedGameLaunchAttemptKey("start", identity),
+      preparedLaunchId: null,
+      sessionId: null,
+      runtimeId: null,
+      preparationAbort: null,
+      terminal: null,
+      reservedAt: timestamp,
+      updatedAt: timestamp,
+    });
+    const chain = gameLaunchChainSchema.parse({
+      schemaVersion: 1,
+      delivery: "owned",
+      profileKey,
+      profileKeyDigest,
+      profilePath,
+      current,
+      previous,
+      updatedAt: timestamp,
+    });
+    this.assertGameLaunchChain(chain);
+    return chain;
+  }
+
+  private gameLaunchAttemptLink(chain: GameLaunchChain): GameLaunchAttemptLink {
+    const value = gameLaunchAttemptLinkSchema.parse({
+      schemaVersion: 1,
+      delivery: "owned",
+      compositeAttemptId: chain.current.compositeAttemptId,
+      canonicalFingerprint: chain.current.canonicalFingerprint,
+      profileKeyDigest: chain.profileKeyDigest,
+      generation: chain.current.generation,
+      predecessorRuntimeId: chain.current.predecessorRuntimeId,
+      predecessorCompositeAttemptId: chain.current.predecessorCompositeAttemptId,
+      prepareKey: chain.current.prepareKey,
+      recordKey: chain.current.recordKey,
+      startKey: chain.current.startKey,
+    });
+    return value;
+  }
+
+  private transitionGameLaunchAttempt(
+    chain: GameLaunchChain,
+    patch: Partial<Pick<GameLaunchAttempt,
+      | "state"
+      | "preparedLaunchId"
+      | "sessionId"
+      | "runtimeId"
+      | "preparationAbort"
+      | "terminal"
+    >>,
+  ): GameLaunchChain {
+    const updatedAt = nowIso(this.clock);
+    const next = gameLaunchChainSchema.parse({
+      ...chain,
+      current: {
+        ...chain.current,
+        ...patch,
+        updatedAt,
+      },
+      updatedAt,
+    });
+    this.assertGameLaunchChain(next);
+    return next;
+  }
+
+  private assertGameLaunchPreparationHasNoDescriptorLocked(chain: GameLaunchChain): void {
+    const attempt = chain.current;
+    if (!attempt.sessionId) {
+      throw new OwnedRuntimeError(
+        "STORAGE_UNVERIFIABLE",
+        "Game-launch preparation cleanup has no observer session identity",
+      );
+    }
+    const indexed = this.readOptionalPreparedSessionIndex(attempt.sessionId);
+    const bySession = this.findPreparedDescriptorForSession(attempt.sessionId);
+    const byAttempt = this.findPreparedGameLaunchAttemptDescriptors(attempt.compositeAttemptId);
+    if (indexed || bySession || byAttempt.length > 0) {
+      throw new OwnedRuntimeError(
+        "RECOVERY_REQUIRED",
+        "Game-launch preparation cleanup cannot proceed while durable descriptor evidence remains",
+        { compositeAttemptId: attempt.compositeAttemptId, sessionId: attempt.sessionId },
+      );
+    }
+  }
+
+  private async completeGameLaunchPreparationRevocationLocked(
+    chain: GameLaunchChain,
+    revokeSession: (sessionId: string) => Promise<unknown>,
+    fence: OwnedRuntimeLeaseFence,
+  ): Promise<GameLaunchChain> {
+    this.assertGameLaunchChain(chain);
+    const attempt = chain.current;
+    if (attempt.state !== "revocation_pending" ||
+        attempt.managerInstanceId !== this.managerInstanceId ||
+        !attempt.sessionId) {
+      throw new OwnedRuntimeError(
+        "STORAGE_UNVERIFIABLE",
+        "Game-launch preparation revocation does not match the active MCP lifecycle",
+      );
+    }
+    this.assertGameLaunchPreparationHasNoDescriptorLocked(chain);
+
+    let response: unknown;
+    try {
+      response = await revokeSession(attempt.sessionId);
+    } catch {
+      throw new OwnedRuntimeError(
+        "RECOVERY_REQUIRED",
+        "Game-launch preparation was not recorded, and session revocation could not be confirmed",
+        { compositeAttemptId: attempt.compositeAttemptId, sessionId: attempt.sessionId },
+      );
+    }
+    fence.assertActive();
+    if (!z.object({ revoked: z.literal(true) }).passthrough().safeParse(response).success) {
+      throw new OwnedRuntimeError(
+        "RECOVERY_REQUIRED",
+        "Observer did not prove that the unrecorded game-launch session was revoked",
+        { compositeAttemptId: attempt.compositeAttemptId, sessionId: attempt.sessionId },
+      );
+    }
+
+    const aborted = this.transitionGameLaunchAttempt(chain, {
+      state: "aborted",
+      preparationAbort: {
+        sessionId: attempt.sessionId,
+        revokedAt: nowIso(this.clock),
+        sessionRevoked: true,
+      },
+    });
+    this.writeGameLaunchChain(aborted, false);
+    return aborted;
+  }
+
+  private assertGameLaunchPreparationAbortLocked(chain: GameLaunchChain): void {
+    this.assertGameLaunchChain(chain);
+    const attempt = chain.current;
+    if (attempt.state !== "aborted" || !attempt.sessionId ||
+        !attempt.preparationAbort || attempt.preparationAbort.sessionId !== attempt.sessionId ||
+        attempt.preparationAbort.sessionRevoked !== true) {
+      throw new OwnedRuntimeError(
+        "STORAGE_UNVERIFIABLE",
+        "Game-launch preparation abort has no exact revoked-session proof",
+      );
+    }
+    this.assertGameLaunchPreparationHasNoDescriptorLocked(chain);
+  }
+
+  private assertGameLaunchChain(chain: GameLaunchChain): void {
+    if (sha256(chain.profileKey) !== chain.profileKeyDigest ||
+        pathKey(chain.profilePath) !== chain.profileKey) {
+      throw new OwnedRuntimeError(
+        "STORAGE_UNVERIFIABLE",
+        "Game-launch profile chain does not match its canonical profile identity",
+      );
+    }
+    const attempt = chain.current;
+    const identity = {
+      delivery: "owned" as const,
+      compositeAttemptId: attempt.compositeAttemptId,
+      canonicalFingerprint: attempt.canonicalFingerprint,
+    };
+    if (attempt.prepareKey !== deriveOwnedGameLaunchAttemptKey("prepare", identity) ||
+        attempt.recordKey !== deriveOwnedGameLaunchAttemptKey("record", identity) ||
+        attempt.startKey !== deriveOwnedGameLaunchAttemptKey("start", identity)) {
+      throw new OwnedRuntimeError(
+        "STORAGE_UNVERIFIABLE",
+        "Game-launch attempt keys do not match their fenced identity",
+      );
+    }
+    const hasPredecessor = attempt.predecessorRuntimeId !== null ||
+      attempt.predecessorCompositeAttemptId !== null;
+    if ((attempt.predecessorRuntimeId === null) !==
+          (attempt.predecessorCompositeAttemptId === null) ||
+        (attempt.generation === 1) === hasPredecessor) {
+      throw new OwnedRuntimeError(
+        "STORAGE_UNVERIFIABLE",
+        "Game-launch attempt predecessor linkage is invalid",
+      );
+    }
+    const hasPreparedDescriptor = attempt.preparedLaunchId !== null;
+    const hasSession = attempt.sessionId !== null;
+    const hasPrepared = hasPreparedDescriptor && hasSession;
+    const hasRuntime = attempt.runtimeId !== null;
+    const hasPreparationAbort = attempt.preparationAbort !== null &&
+      attempt.preparationAbort !== undefined;
+    const hasTerminal = attempt.terminal !== null;
+    const validState = attempt.state === "reserved"
+      ? !hasPreparedDescriptor && !hasSession && !hasRuntime && !hasPreparationAbort && !hasTerminal
+      : attempt.state === "revocation_pending"
+        ? !hasPreparedDescriptor && hasSession && !hasRuntime && !hasPreparationAbort && !hasTerminal
+        : attempt.state === "aborted"
+          ? !hasPreparedDescriptor && hasSession && !hasRuntime && hasPreparationAbort && !hasTerminal &&
+            attempt.preparationAbort!.sessionId === attempt.sessionId &&
+            attempt.preparationAbort!.sessionRevoked === true
+          : attempt.state === "prepared"
+            ? hasPrepared && !hasRuntime && !hasPreparationAbort && !hasTerminal
+            : attempt.state === "starting" || attempt.state === "running"
+              ? hasPrepared && hasRuntime && !hasPreparationAbort && !hasTerminal
+              : hasPrepared && hasRuntime && !hasPreparationAbort && hasTerminal &&
+                attempt.terminal!.runtimeId === attempt.runtimeId;
+    if (!validState) {
+      throw new OwnedRuntimeError(
+        "STORAGE_UNVERIFIABLE",
+        "Game-launch attempt fields do not match its durable state",
+      );
+    }
+    if (attempt.generation === 1) {
+      if (chain.previous !== null) {
+        throw new OwnedRuntimeError("STORAGE_UNVERIFIABLE", "Initial game-launch attempt has a predecessor tip");
+      }
+    } else if (!chain.previous ||
+        chain.previous.compositeAttemptId !== attempt.predecessorCompositeAttemptId ||
+        chain.previous.runtimeId !== attempt.predecessorRuntimeId ||
+        chain.previous.generation + 1 !== attempt.generation) {
+      throw new OwnedRuntimeError(
+        "STORAGE_UNVERIFIABLE",
+        "Successor game-launch attempt does not match its retained predecessor tip",
+      );
+    }
+  }
+
+  private readOptionalGameLaunchChain(
+    profileKey: string,
+    profileKeyDigest = sha256(profileKey),
+  ): GameLaunchChain | null {
+    const chain = this.readOptionalParsed(
+      this.gameLaunchChainPath(profileKeyDigest),
+      gameLaunchChainSchema,
+      "game-launch profile chain",
+    );
+    if (!chain) return null;
+    if (chain.profileKey !== profileKey || chain.profileKeyDigest !== profileKeyDigest) {
+      throw new OwnedRuntimeError(
+        "STORAGE_UNVERIFIABLE",
+        "Game-launch profile chain does not match its record key",
+      );
+    }
+    this.assertGameLaunchChain(chain);
+    return chain;
+  }
+
+  private writeGameLaunchChain(chain: GameLaunchChain, exclusive: boolean): void {
+    this.assertGameLaunchChain(chain);
+    this.atomicWrite(
+      this.ensureStorage(),
+      this.gameLaunchChainPath(chain.profileKeyDigest),
+      chain,
+      exclusive,
+    );
+  }
+
+  private findPreparedGameLaunchAttemptDescriptors(
+    compositeAttemptId: string,
+  ): PreparedDescriptor[] {
+    const matches: PreparedDescriptor[] = [];
+    for (const name of this.recordFileNames("prepared")) {
+      const preparedLaunchId = name.endsWith(".json") ? name.slice(0, -5) : "";
+      if (!preparedLaunchIdSchema.safeParse(preparedLaunchId).success) continue;
+      const descriptor = this.readPreparedDescriptor(preparedLaunchId);
+      if (descriptor.gameLaunchAttempt?.compositeAttemptId === compositeAttemptId) {
+        matches.push(descriptor);
+      }
+    }
+    if (matches.length > 1) {
+      throw new OwnedRuntimeError(
+        "STORAGE_UNVERIFIABLE",
+        "More than one prepared descriptor claims the same game-launch attempt",
+      );
+    }
+    return matches;
+  }
+
+  private assertDescriptorMatchesGameLaunchAttempt(
+    descriptor: PreparedDescriptor,
+    chain: GameLaunchChain,
+  ): void {
+    const link = descriptor.gameLaunchAttempt;
+    const evidence = descriptor.gameLaunchEvidence;
+    const expected = this.gameLaunchAttemptLink(chain);
+    if (!link || !evidence || JSON.stringify(link) !== JSON.stringify(expected) ||
+        evidence.prepareKey !== chain.current.prepareKey ||
+        pathKey(descriptor.profilePath) !== chain.profileKey ||
+        descriptor.prepareIdempotencyHash !== sha256(chain.current.recordKey)) {
+      throw new OwnedRuntimeError(
+        "STORAGE_UNVERIFIABLE",
+        "Prepared descriptor does not match its game-launch attempt ledger",
+      );
+    }
+  }
+
+  private reconcileGameLaunchChainLocked(chain: GameLaunchChain): GameLaunchChain {
+    this.assertGameLaunchChain(chain);
+    let current = chain;
+    for (;;) {
+      const attempt = current.current;
+      if (attempt.state === "reserved") {
+        const descriptor = this.findPreparedGameLaunchAttemptDescriptors(attempt.compositeAttemptId)[0];
+        if (!descriptor) return current;
+        this.assertDescriptorMatchesGameLaunchAttempt(descriptor, current);
+        current = this.transitionGameLaunchAttempt(current, {
+          state: "prepared",
+          preparedLaunchId: descriptor.preparedLaunchId,
+          sessionId: descriptor.sessionId,
+        });
+        this.writeGameLaunchChain(current, false);
+        continue;
+      }
+      if (!attempt.preparedLaunchId) return current;
+      const descriptor = this.readPreparedDescriptor(attempt.preparedLaunchId);
+      this.assertDescriptorMatchesGameLaunchAttempt(descriptor, current);
+      if (attempt.state === "prepared") {
+        const consumption = this.readOptionalConsumption(descriptor.preparedLaunchId);
+        if (!consumption) return current;
+        current = this.transitionGameLaunchAttempt(current, {
+          state: "starting",
+          runtimeId: consumption.runtimeId,
+        });
+        this.writeGameLaunchChain(current, false);
+        continue;
+      }
+      if (attempt.state === "starting") {
+        if (!attempt.runtimeId) return current;
+        const runtime = this.readOptionalRuntimeReceipt(attempt.runtimeId);
+        if (!runtime) return current;
+        if (runtime.preparedLaunchId !== descriptor.preparedLaunchId) {
+          throw new OwnedRuntimeError(
+            "STORAGE_UNVERIFIABLE",
+            "Game-launch starting attempt points at another runtime receipt",
+          );
+        }
+        current = this.transitionGameLaunchAttempt(current, { state: "running" });
+        this.writeGameLaunchChain(current, false);
+        continue;
+      }
+      if (attempt.state === "running") {
+        if (!attempt.runtimeId) return current;
+        const completion = this.readOptionalStopCompletion(attempt.runtimeId);
+        if (!completion || completion.sessionRevoked !== true) return current;
+        const runtime = this.readRuntimeReceipt(attempt.runtimeId);
+        const stopped = this.readOptionalStopReceipt(attempt.runtimeId);
+        if (!stopped || stopped.sessionId !== runtime.sessionId ||
+            completion.sessionId !== runtime.sessionId ||
+            completion.preparedLaunchId !== runtime.preparedLaunchId) {
+          throw new OwnedRuntimeError(
+            "STORAGE_UNVERIFIABLE",
+            "Game-launch stop completion does not match its current chain tip",
+          );
+        }
+        const restoration = this.readOptionalRestorationProof(attempt.runtimeId);
+        const proofDigest = sha256(JSON.stringify({ runtime, stopped, completion, restoration }));
+        current = this.transitionGameLaunchAttempt(current, {
+          state: "terminal",
+          terminal: {
+            runtimeId: attempt.runtimeId,
+            stoppedAt: stopped.stoppedAt,
+            completedAt: completion.completedAt,
+            restorationProvedAt: stopped.restorationProvedAt,
+            sessionRevoked: true,
+            proofDigest,
+          },
+        });
+        this.writeGameLaunchChain(current, false);
+        continue;
+      }
+      return current;
+    }
+  }
+
+  /**
+   * Re-attest the complete terminal lifecycle before it can authorize another
+   * process generation. The chain is an index, not standalone stop authority:
+   * losing or contradicting any exact stop/restoration/revocation record must
+   * pin the profile for recovery instead of turning missing evidence into
+   * successor permission.
+   */
+  private assertGameLaunchTerminalPredecessorProofLocked(chain: GameLaunchChain): void {
+    this.assertGameLaunchChain(chain);
+    const attempt = chain.current;
+    if (attempt.state !== "terminal" || !attempt.terminal || !attempt.runtimeId ||
+        !attempt.preparedLaunchId || !attempt.sessionId) {
+      throw new OwnedRuntimeError(
+        "STORAGE_UNVERIFIABLE",
+        "Game-launch predecessor has no complete terminal chain authority",
+      );
+    }
+
+    const runtime = this.readRuntimeReceipt(attempt.runtimeId);
+    if (runtime.preparedLaunchId !== attempt.preparedLaunchId ||
+        runtime.sessionId !== attempt.sessionId ||
+        pathKey(runtime.profilePath) !== chain.profileKey) {
+      throw new OwnedRuntimeError(
+        "STORAGE_UNVERIFIABLE",
+        "Game-launch predecessor runtime does not match its terminal chain",
+      );
+    }
+    const stopped = this.readOptionalStopReceipt(attempt.runtimeId);
+    const completion = this.readOptionalStopCompletion(attempt.runtimeId);
+    if (!stopped || !completion || completion.sessionRevoked !== true ||
+        stopped.runtimeId !== runtime.runtimeId || stopped.sessionId !== runtime.sessionId ||
+        stopped.mcpActor.installationId !== runtime.mcpOwner.installationId ||
+        stopped.mcpActor.userSid !== runtime.mcpOwner.userSid ||
+        completion.runtimeId !== runtime.runtimeId || completion.sessionId !== runtime.sessionId ||
+        completion.preparedLaunchId !== runtime.preparedLaunchId) {
+      throw new OwnedRuntimeError(
+        "STORAGE_UNVERIFIABLE",
+        "Game-launch predecessor stop or revoked-session completion is missing or cross-bound",
+      );
+    }
+
+    const restoration = this.readOptionalRestorationProof(attempt.runtimeId);
+    // An already-vacant exact identity can legitimately have its restoration
+    // authority carried entirely by the exact-vacancy stop receipt. Every
+    // reservation/seal-backed stop must retain and re-attest its linked proof.
+    const receiptOnlyExactVacancy = stopped.restorationProofKind === "exact_runtime_vacancy" &&
+      stopped.restorationReservationId === undefined;
+    if (!restoration && !receiptOnlyExactVacancy) {
+      throw new OwnedRuntimeError(
+        "STORAGE_UNVERIFIABLE",
+        "Game-launch predecessor restoration proof is missing",
+      );
+    }
+    if (restoration && (restoration.runtimeId !== runtime.runtimeId ||
+        restoration.sessionId !== runtime.sessionId ||
+        restoration.managerInstanceId !== runtime.mcpOwner.managerInstanceId ||
+        restoration.kind !== stopped.restorationProofKind ||
+        restoration.sealedAt !== stopped.restorationProvedAt ||
+        restoration.reservationId !== stopped.restorationReservationId ||
+        (restoration.stopIdempotencyHash !== undefined &&
+          restoration.stopIdempotencyHash !== stopped.stopIdempotencyHash))) {
+      throw new OwnedRuntimeError(
+        "STORAGE_UNVERIFIABLE",
+        "Game-launch predecessor restoration proof does not match its exact stop",
+      );
+    }
+
+    const terminal = attempt.terminal;
+    const proofDigest = sha256(JSON.stringify({ runtime, stopped, completion, restoration }));
+    if (terminal.runtimeId !== runtime.runtimeId || terminal.stoppedAt !== stopped.stoppedAt ||
+        terminal.completedAt !== completion.completedAt ||
+        terminal.restorationProvedAt !== stopped.restorationProvedAt ||
+        terminal.sessionRevoked !== true || terminal.proofDigest !== proofDigest) {
+      throw new OwnedRuntimeError(
+        "STORAGE_UNVERIFIABLE",
+        "Game-launch predecessor terminal digest does not match retained lifecycle proof",
+      );
+    }
+  }
+
+  /** Re-attest the terminal tip retained behind a pre-runtime successor abort. */
+  private assertGameLaunchPreviousTipProofLocked(chain: GameLaunchChain): void {
+    this.assertGameLaunchChain(chain);
+    const attempt = chain.current;
+    const previous = chain.previous;
+    if (!previous || attempt.predecessorRuntimeId !== previous.runtimeId ||
+        attempt.predecessorCompositeAttemptId !== previous.compositeAttemptId ||
+        attempt.generation !== previous.generation + 1) {
+      throw new OwnedRuntimeError(
+        "STORAGE_UNVERIFIABLE",
+        "Aborted game-launch successor has no exact predecessor tip",
+      );
+    }
+
+    const runtime = this.readRuntimeReceipt(previous.runtimeId);
+    if (pathKey(runtime.profilePath) !== chain.profileKey) {
+      throw new OwnedRuntimeError(
+        "STORAGE_UNVERIFIABLE",
+        "Aborted game-launch successor predecessor belongs to another profile",
+      );
+    }
+    const descriptor = this.readPreparedDescriptor(runtime.preparedLaunchId);
+    const link = descriptor.gameLaunchAttempt;
+    if (!link || descriptor.sessionId !== runtime.sessionId ||
+        link.compositeAttemptId !== previous.compositeAttemptId ||
+        link.canonicalFingerprint !== previous.canonicalFingerprint ||
+        link.generation !== previous.generation ||
+        link.profileKeyDigest !== chain.profileKeyDigest) {
+      throw new OwnedRuntimeError(
+        "STORAGE_UNVERIFIABLE",
+        "Aborted game-launch successor predecessor descriptor is missing or cross-bound",
+      );
+    }
+
+    const stopped = this.readOptionalStopReceipt(previous.runtimeId);
+    const completion = this.readOptionalStopCompletion(previous.runtimeId);
+    if (!stopped || !completion || completion.sessionRevoked !== true ||
+        stopped.runtimeId !== runtime.runtimeId || stopped.sessionId !== runtime.sessionId ||
+        stopped.mcpActor.installationId !== runtime.mcpOwner.installationId ||
+        stopped.mcpActor.userSid !== runtime.mcpOwner.userSid ||
+        completion.runtimeId !== runtime.runtimeId || completion.sessionId !== runtime.sessionId ||
+        completion.preparedLaunchId !== runtime.preparedLaunchId ||
+        completion.completedAt !== previous.completedAt) {
+      throw new OwnedRuntimeError(
+        "STORAGE_UNVERIFIABLE",
+        "Aborted game-launch successor predecessor stop proof is missing or cross-bound",
+      );
+    }
+
+    const restoration = this.readOptionalRestorationProof(previous.runtimeId);
+    const receiptOnlyExactVacancy = stopped.restorationProofKind === "exact_runtime_vacancy" &&
+      stopped.restorationReservationId === undefined;
+    if (!restoration && !receiptOnlyExactVacancy) {
+      throw new OwnedRuntimeError(
+        "STORAGE_UNVERIFIABLE",
+        "Aborted game-launch successor predecessor restoration proof is missing",
+      );
+    }
+    if (restoration && (restoration.runtimeId !== runtime.runtimeId ||
+        restoration.sessionId !== runtime.sessionId ||
+        restoration.managerInstanceId !== runtime.mcpOwner.managerInstanceId ||
+        restoration.kind !== stopped.restorationProofKind ||
+        restoration.sealedAt !== stopped.restorationProvedAt ||
+        restoration.reservationId !== stopped.restorationReservationId ||
+        (restoration.stopIdempotencyHash !== undefined &&
+          restoration.stopIdempotencyHash !== stopped.stopIdempotencyHash))) {
+      throw new OwnedRuntimeError(
+        "STORAGE_UNVERIFIABLE",
+        "Aborted game-launch successor predecessor restoration proof does not match its exact stop",
+      );
+    }
+
+    const proofDigest = sha256(JSON.stringify({ runtime, stopped, completion, restoration }));
+    if (previous.proofDigest !== proofDigest) {
+      throw new OwnedRuntimeError(
+        "STORAGE_UNVERIFIABLE",
+        "Aborted game-launch successor predecessor digest does not match retained lifecycle proof",
+      );
+    }
+  }
+
+  private requireGameLaunchChainForDescriptorLocked(
+    descriptor: PreparedDescriptor,
+    keyHash?: string,
+  ): GameLaunchChain | null {
+    if (!descriptor.gameLaunchAttempt) return null;
+    const chain = this.readOptionalGameLaunchChain(pathKey(descriptor.profilePath));
+    if (!chain) {
+      throw new OwnedRuntimeError("STORAGE_UNVERIFIABLE", "Game-launch descriptor has no profile attempt ledger");
+    }
+    const reconciled = this.reconcileGameLaunchChainLocked(chain);
+    this.assertDescriptorMatchesGameLaunchAttempt(descriptor, reconciled);
+    if (keyHash !== undefined && sha256(reconciled.current.startKey) !== keyHash) {
+      throw new OwnedRuntimeError(
+        "IDEMPOTENCY_CONFLICT",
+        "Game-launch start key does not match the fenced composite attempt",
+      );
+    }
+    return reconciled;
+  }
+
+  private reconcileGameLaunchChainForRuntimeLocked(receipt: OwnedRuntimeReceipt): GameLaunchChain | null {
+    const descriptor = this.readPreparedDescriptor(receipt.preparedLaunchId);
+    if (!descriptor.gameLaunchAttempt) return null;
+    const chain = this.requireGameLaunchChainForDescriptorLocked(descriptor);
+    if (!chain || chain.current.runtimeId !== receipt.runtimeId) {
+      throw new OwnedRuntimeError(
+        "STORAGE_UNVERIFIABLE",
+        "Runtime receipt does not match the current game-launch attempt",
+      );
+    }
+    return chain;
+  }
+
+  private publicGameLaunchChain(chain: GameLaunchChain): OwnedGameLaunchChainPublicState {
+    const attempt = chain.current;
+    return {
+      schemaVersion: 1,
+      delivery: "owned",
+      compositeAttemptId: attempt.compositeAttemptId,
+      generation: attempt.generation,
+      state: attempt.state,
+      predecessorRuntimeId: attempt.predecessorRuntimeId,
+      ...(attempt.runtimeId ? { runtimeId: attempt.runtimeId } : {}),
+      retry: { afterRuntimeId: attempt.predecessorRuntimeId },
+      successor: attempt.state === "terminal" && attempt.runtimeId
+        ? { eligible: true, afterRuntimeId: attempt.runtimeId }
+        : {
+            eligible: false,
+            reason: attempt.state === "running" ? "exact_stop_required" : "recovery_required",
+          },
+    };
+  }
+
   async start(input: OwnedRuntimeStartInput): Promise<OwnedRuntimePublicStatus> {
     return this.withAdmission("owned runtime start", () => this.startInternal(input));
   }
@@ -1933,19 +3023,47 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder, McpI
   private async startInternal(input: OwnedRuntimeStartInput): Promise<OwnedRuntimePublicStatus> {
     this.assertOpenForMutation();
     preparedLaunchIdSchema.parse(input.preparedLaunchId);
+    const revalidationDeadlineAtMs = input.revalidationDeadlineAtMs ??
+      Date.now() + OWNED_RUNTIME_START_REVALIDATION_DEADLINE_MS;
+    if (!Number.isSafeInteger(revalidationDeadlineAtMs) || revalidationDeadlineAtMs <= 0) {
+      throw new OwnedRuntimeError(
+        "INVALID_REQUEST",
+        "Owned runtime start revalidation deadline is invalid",
+      );
+    }
+    const executableMaximumBytes = input.executableMaximumBytes ??
+      OWNED_RUNTIME_EXECUTABLE_MAXIMUM_BYTES;
+    if (!Number.isSafeInteger(executableMaximumBytes) || executableMaximumBytes < 1) {
+      throw new OwnedRuntimeError(
+        "INVALID_REQUEST",
+        "Owned runtime start executable byte limit is invalid",
+      );
+    }
     const keyHash = sha256(boundedIdempotencyKey(input.idempotencyKey));
     const requestFingerprint = sha256(JSON.stringify({ preparedLaunchId: input.preparedLaunchId }));
     try {
       return await this.withFencedMachineMutex((fence) =>
-        this.startLocked(input.preparedLaunchId, keyHash, requestFingerprint, fence));
+        this.startLocked(
+          input.preparedLaunchId,
+          keyHash,
+          requestFingerprint,
+          fence,
+          revalidationDeadlineAtMs,
+          executableMaximumBytes,
+        ));
     } catch (error) {
+      const normalized = this.normalizeError(error, "START_FAILED", "Owned runtime start failed");
       // A failed start may have durably proved exact child vacancy while
       // leaving observer lifecycle release outstanding. Retry that IPC after
       // the start transaction has relinquished the machine mutex. Preserve
       // the primary start outcome; `release_required` remains the durable
-      // authority if this best-effort attempt also fails.
-      await this.retryPendingStartLifecycleReleaseForKey(keyHash).catch(() => undefined);
-      throw this.normalizeError(error, "START_FAILED", "Owned runtime start failed");
+      // authority if this best-effort attempt also fails. Lease loss is the
+      // exception: no new mutex transaction or lifecycle mutation is allowed
+      // after authority has been revoked.
+      if (normalized.code !== "RECOVERY_REQUIRED") {
+        await this.retryPendingStartLifecycleReleaseForKey(keyHash).catch(() => undefined);
+      }
+      throw normalized;
     }
   }
 
@@ -2426,12 +3544,13 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder, McpI
   async inspectIdleShutdownReadiness(
     options: IdleShutdownInspectionOptions,
   ): Promise<McpIdleProviderReadiness> {
+    const nowTick = options.nowTick ?? (() => performance.now());
     const blockers = new Set<McpIdleBlockerCode>();
     let complete = true;
     const childCounts = this.children.counts();
     if (childCounts.active > 0) blockers.add("OWNED_RUNTIME_LIVE");
     if (childCounts.reconciling > 0) blockers.add("OWNED_RUNTIME_RECOVERY");
-    if (options.signal.aborted || performance.now() > options.deadlineTick) {
+    if (options.signal.aborted || nowTick() > options.deadlineTick) {
       return { complete: false, blockers: ["INCOMPLETE_PROOF"], revision: this.idleRevision };
     }
 
@@ -2443,7 +3562,7 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder, McpI
     }
     if (existing.kind === "missing") {
       return {
-        complete: !options.signal.aborted && performance.now() <= options.deadlineTick,
+        complete: !options.signal.aborted && nowTick() <= options.deadlineTick,
         blockers: [...blockers].sort(),
         revision: this.idleRevision,
       };
@@ -2465,6 +3584,7 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder, McpI
     const completions = new Map<string, StopCompletion>();
     const restorations = new Map<string, RestorationProof>();
     const idempotency = new Map<string, z.infer<typeof idempotencySchema>>();
+    const gameLaunchChains = new Map<string, GameLaunchChain>();
 
     const decode = (bytes: Uint8Array | null): unknown => {
       if (!bytes || bytes.byteLength < LIFECYCLE_RECORD_MIN_BYTES || bytes.byteLength > this.maxRecordBytes) {
@@ -2545,6 +3665,13 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder, McpI
             idempotency.set(record.id, parsed);
             break;
           }
+          case "game-launch-chains": {
+            const parsed = gameLaunchChainSchema.parse(value);
+            this.assertGameLaunchChain(parsed);
+            if (parsed.profileKeyDigest !== record.id) throw new Error("game-launch chain binding");
+            gameLaunchChains.set(record.id, parsed);
+            break;
+          }
           default:
             throw new Error("unknown record family");
         }
@@ -2620,6 +3747,83 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder, McpI
       for (const attempt of idempotency.values()) {
         if (!runtimes.has(attempt.runtimeId) && !pending.has(attempt.runtimeId)) {
           throw new Error("unlinked idempotency");
+        }
+      }
+      for (const chain of gameLaunchChains.values()) {
+        const attempt = chain.current;
+        if (["reserved", "revocation_pending", "aborted"].includes(attempt.state)) {
+          const unexpectedDescriptor = [...prepared.values()].some((descriptor) =>
+            descriptor.sessionId === attempt.sessionId ||
+            descriptor.gameLaunchAttempt?.compositeAttemptId === attempt.compositeAttemptId
+          );
+          if (unexpectedDescriptor || (attempt.sessionId && indexes.has(sha256(attempt.sessionId)))) {
+            throw new Error("pre-runtime game-launch attempt retains descriptor evidence");
+          }
+        }
+        if (attempt.state === "aborted" && chain.previous) {
+          const previous = chain.previous;
+          const runtime = runtimes.get(previous.runtimeId);
+          const descriptor = runtime ? prepared.get(runtime.preparedLaunchId) : undefined;
+          const stopped = stops.get(previous.runtimeId);
+          const completion = completions.get(previous.runtimeId);
+          const restoration = restorations.get(previous.runtimeId);
+          const link = descriptor?.gameLaunchAttempt;
+          if (!runtime || !descriptor || !stopped || !completion ||
+              completion.sessionRevoked !== true ||
+              descriptor.sessionId !== runtime.sessionId || !link ||
+              link.compositeAttemptId !== previous.compositeAttemptId ||
+              link.canonicalFingerprint !== previous.canonicalFingerprint ||
+              link.generation !== previous.generation ||
+              link.profileKeyDigest !== chain.profileKeyDigest ||
+              stopped.runtimeId !== runtime.runtimeId || stopped.sessionId !== runtime.sessionId ||
+              completion.runtimeId !== runtime.runtimeId || completion.sessionId !== runtime.sessionId ||
+              completion.preparedLaunchId !== runtime.preparedLaunchId ||
+              completion.completedAt !== previous.completedAt) {
+            throw new Error("aborted game-launch successor predecessor proof is incomplete");
+          }
+          const receiptOnlyExactVacancy = stopped.restorationProofKind === "exact_runtime_vacancy" &&
+            stopped.restorationReservationId === undefined;
+          if ((!restoration && !receiptOnlyExactVacancy) ||
+              (restoration && (restoration.runtimeId !== runtime.runtimeId ||
+                restoration.sessionId !== runtime.sessionId ||
+                restoration.managerInstanceId !== runtime.mcpOwner.managerInstanceId ||
+                restoration.kind !== stopped.restorationProofKind ||
+                restoration.sealedAt !== stopped.restorationProvedAt ||
+                restoration.reservationId !== stopped.restorationReservationId ||
+                (restoration.stopIdempotencyHash !== undefined &&
+                  restoration.stopIdempotencyHash !== stopped.stopIdempotencyHash)))) {
+            throw new Error("aborted game-launch successor restoration proof is incomplete");
+          }
+          if (previous.proofDigest !==
+              sha256(JSON.stringify({ runtime, stopped, completion, restoration }))) {
+            throw new Error("aborted game-launch successor predecessor digest is invalid");
+          }
+        }
+        if (attempt.preparedLaunchId) {
+          const descriptor = prepared.get(attempt.preparedLaunchId);
+          if (!descriptor || !descriptor.gameLaunchAttempt ||
+              JSON.stringify(descriptor.gameLaunchAttempt) !==
+                JSON.stringify(this.gameLaunchAttemptLink(chain))) {
+            throw new Error("unlinked game-launch descriptor");
+          }
+        }
+        if (attempt.runtimeId) {
+          const runtime = runtimes.get(attempt.runtimeId);
+          const starting = pending.get(attempt.runtimeId);
+          if ((!runtime && !starting) ||
+              (runtime && runtime.preparedLaunchId !== attempt.preparedLaunchId) ||
+              (starting && starting.preparedLaunchId !== attempt.preparedLaunchId)) {
+            throw new Error("unlinked game-launch runtime");
+          }
+        }
+        if (attempt.state === "terminal") {
+          const completion = attempt.runtimeId ? completions.get(attempt.runtimeId) : undefined;
+          const stopped = attempt.runtimeId ? stops.get(attempt.runtimeId) : undefined;
+          if (!completion || !stopped || completion.sessionRevoked !== true ||
+              completion.completedAt !== attempt.terminal?.completedAt ||
+              stopped.stoppedAt !== attempt.terminal?.stoppedAt) {
+            throw new Error("unlinked terminal game-launch chain");
+          }
         }
       }
     } catch {
@@ -2708,9 +3912,21 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder, McpI
         if (stops.has(attempt.runtimeId) && completions.has(attempt.runtimeId)) continue;
         blockers.add(attempt.action === "start" ? "OWNED_RUNTIME_START" : "OWNED_RUNTIME_RECOVERY");
       }
+      for (const chain of gameLaunchChains.values()) {
+        const attempt = chain.current;
+        if (attempt.managerInstanceId !== this.managerInstanceId ||
+            attempt.state === "terminal" || attempt.state === "aborted") continue;
+        blockers.add(attempt.state === "revocation_pending"
+          ? "OWNED_RUNTIME_RECOVERY"
+          : attempt.state === "reserved" || attempt.state === "starting"
+            ? "OWNED_RUNTIME_START"
+            : attempt.state === "running"
+              ? "OWNED_RUNTIME_LIVE"
+              : "OWNED_RUNTIME_PREPARATION");
+      }
     }
 
-    if (!complete || options.signal.aborted || performance.now() > options.deadlineTick) {
+    if (!complete || options.signal.aborted || nowTick() > options.deadlineTick) {
       complete = false;
       blockers.add("INCOMPLETE_PROOF");
     }
@@ -3241,10 +4457,17 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder, McpI
     throw lastError;
   }
 
-  private revalidatePreparedGameLaunchLocked(
+  private async revalidatePreparedGameLaunchLocked(
     root: string,
     descriptor: PreparedDescriptor,
-  ): { executablePath: string; executableFile: ExecutableFileIdentity } {
+    leaseFence: OwnedRuntimeLeaseFence,
+    deadlineAtMs: number,
+    executableMaximumBytes: number,
+  ): Promise<{
+    executablePath: string;
+    executableFile: ExecutableFileIdentity;
+    executableEvidence: OwnedRuntimeExecutableEvidence;
+  }> {
     if (!descriptor.gameLaunchEvidence) {
       throw new OwnedRuntimeError(
         "STORAGE_UNVERIFIABLE",
@@ -3253,27 +4476,28 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder, McpI
     }
     const evidence = validatedGameLaunchEvidence(descriptor.gameLaunchEvidence);
     let planningError: GameLaunchPlanError | null = null;
-    let executablePath = "";
-    let executableFile: ExecutableFileIdentity | null = null;
+    let currentExecutable: OwnedRuntimeExecutableEvidence | null = null;
     try {
-      revalidateGameWorldPlan(evidence.world);
-      revalidateGameAddonPlan(evidence.addons);
-      executablePath = canonicalFile(
-        this.resolveExecutable(descriptor.runtimeKind),
-        `${descriptor.runtimeKind} runtime executable`,
+      const executableSource = this.resolveRuntimeExecutablePlanningSource(
+        descriptor.runtimeKind,
       );
-      executableFile = inspectExecutableFile(executablePath);
-      const executableFields: Omit<OwnedRuntimeExecutableEvidence, "executableEvidenceDigest"> = {
-        schemaVersion: OWNED_RUNTIME_EXECUTABLE_EVIDENCE_SCHEMA_VERSION,
-        runtimeKind: descriptor.runtimeKind,
-        executablePath,
-        executableFile,
-      };
-      const currentExecutable: OwnedRuntimeExecutableEvidence = {
-        ...executableFields,
-        executableEvidenceDigest: computeOwnedRuntimeExecutableEvidenceDigest(executableFields),
-      };
-      if (pathKey(currentExecutable.executablePath) !== pathKey(evidence.executable.executablePath) ||
+      currentExecutable = runtimeExecutableEvidenceSchema.parse(
+        await leaseFence.trackRevalidation(this.pointOfUseRevalidator({
+          phase: "pre_spawn",
+          world: evidence.world,
+          addons: evidence.addons,
+          executableSource,
+          expectedExecutable: evidence.executable,
+          executableMaximumBytes,
+          deadlineAtMs,
+        }, leaseFence.signal)),
+      ) as OwnedRuntimeExecutableEvidence;
+      leaseFence.assertActive();
+      if (Date.now() >= deadlineAtMs) throw gameLaunchRevalidationDeadlineError();
+      if (currentExecutable.executablePath !== evidence.executable.executablePath ||
+          currentExecutable.runtimeKind !== descriptor.runtimeKind ||
+          computeOwnedRuntimeExecutableEvidenceDigest(currentExecutable) !==
+            currentExecutable.executableEvidenceDigest ||
           currentExecutable.executableEvidenceDigest !== evidence.executable.executableEvidenceDigest) {
         throw new GameLaunchPlanError(
           "EXECUTABLE_CHANGED",
@@ -3281,6 +4505,10 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder, McpI
         );
       }
     } catch (error) {
+      // Worker rejection is also an async continuation. Lease loss must win
+      // before the error can authorize invalidation or any other mutation.
+      leaseFence.assertActive();
+      if (error instanceof OwnedRuntimeError && error.code === "RECOVERY_REQUIRED") throw error;
       planningError = error instanceof GameLaunchPlanError
         ? error
         : new GameLaunchPlanError(
@@ -3289,7 +4517,13 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder, McpI
             { cause: error },
           );
     }
-    if (!planningError && executableFile) return { executablePath, executableFile };
+    if (!planningError && currentExecutable) {
+      return {
+        executablePath: currentExecutable.executablePath,
+        executableFile: currentExecutable.executableFile,
+        executableEvidence: currentExecutable,
+      };
+    }
     planningError ??= new GameLaunchPlanError(
       "EXECUTABLE_EVIDENCE_INVALID",
       "Game-launch point-of-use executable evidence could not be produced safely.",
@@ -3331,11 +4565,113 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder, McpI
     });
   }
 
+  private async resolveBaselineExecutableLocked(
+    runtimeKind: ObserverLaunchInput["runtimeKind"],
+    leaseFence: OwnedRuntimeLeaseFence,
+    deadlineAtMs: number,
+    executableMaximumBytes: number,
+  ): Promise<OwnedRuntimeExecutableEvidence> {
+    try {
+      const executableSource = this.resolveRuntimeExecutablePlanningSource(runtimeKind);
+      const current = runtimeExecutableEvidenceSchema.parse(
+        await leaseFence.trackRevalidation(this.pointOfUseRevalidator({
+          phase: "baseline_executable",
+          executableSource,
+          runtimeKind,
+          executableMaximumBytes,
+          deadlineAtMs,
+        }, leaseFence.signal)),
+      ) as OwnedRuntimeExecutableEvidence;
+      leaseFence.assertActive();
+      if (Date.now() >= deadlineAtMs) throw gameLaunchRevalidationDeadlineError();
+      if (current.runtimeKind !== runtimeKind ||
+          computeOwnedRuntimeExecutableEvidenceDigest(current) !==
+            current.executableEvidenceDigest) {
+        throw new GameLaunchPlanError(
+          "EXECUTABLE_EVIDENCE_INVALID",
+          "Configured runtime executable returned invalid baseline evidence.",
+        );
+      }
+      return current;
+    } catch (error) {
+      // A failed isolated read cannot be classified after the mutex lease is
+      // gone; another manager may already own the lifecycle transaction.
+      leaseFence.assertActive();
+      if (error instanceof OwnedRuntimeError || error instanceof GameLaunchPlanError) throw error;
+      if (error instanceof GameLaunchRevalidationIsolationError && error.kind === "ownedRuntime") {
+        throw new OwnedRuntimeError(error.code, error.message, error.details);
+      }
+      throw new OwnedRuntimeError(
+        "IDENTITY_UNVERIFIABLE",
+        "Configured runtime executable baseline could not be resolved safely",
+        error instanceof GameLaunchRevalidationIsolationError
+          ? { isolationCode: error.code }
+          : undefined,
+      );
+    }
+  }
+
+  private async revalidateSpawnedExecutableLocked(
+    expected: OwnedRuntimeExecutableEvidence,
+    leaseFence: OwnedRuntimeLeaseFence,
+    deadlineAtMs: number,
+    executableMaximumBytes: number,
+  ): Promise<ExecutableFileIdentity> {
+    try {
+      const current = runtimeExecutableEvidenceSchema.parse(
+        await leaseFence.trackRevalidation(this.pointOfUseRevalidator({
+          phase: "post_spawn_executable",
+          expectedExecutable: expected,
+          executableMaximumBytes,
+          deadlineAtMs,
+        }, leaseFence.signal)),
+      ) as OwnedRuntimeExecutableEvidence;
+      leaseFence.assertActive();
+      if (Date.now() >= deadlineAtMs) throw gameLaunchRevalidationDeadlineError();
+      if (current.runtimeKind !== expected.runtimeKind ||
+          current.executablePath !== expected.executablePath ||
+          computeOwnedRuntimeExecutableEvidenceDigest(current) !==
+            current.executableEvidenceDigest ||
+          current.executableEvidenceDigest !== expected.executableEvidenceDigest ||
+          !executableFilesMatch(current.executableFile, expected.executableFile)) {
+        throw new GameLaunchPlanError(
+          "EXECUTABLE_CHANGED",
+          "Configured runtime executable was replaced during start.",
+        );
+      }
+      return current.executableFile;
+    } catch (error) {
+      leaseFence.assertActive();
+      if (error instanceof OwnedRuntimeError && error.code === "RECOVERY_REQUIRED") throw error;
+      if (error instanceof GameLaunchPlanError && error.code === "EXECUTABLE_CHANGED") {
+        throw new OwnedRuntimeError(
+          "IDENTITY_MISMATCH",
+          "Graphical runtime executable was replaced during start",
+        );
+      }
+      const timedOut = error instanceof GameLaunchPlanError && error.code === "PLANNING_TIMEOUT";
+      const isolatedFailure = error instanceof GameLaunchRevalidationIsolationError;
+      throw new OwnedRuntimeError(
+        "IDENTITY_UNVERIFIABLE",
+        timedOut
+          ? "Post-spawn executable revalidation exceeded its absolute deadline"
+          : "Post-spawn executable identity could not be revalidated safely",
+        {
+          phase: "post_spawn_executable",
+          timedOut,
+          ...(isolatedFailure ? { isolationCode: error.code } : {}),
+        },
+      );
+    }
+  }
+
   private async startLocked(
     preparedLaunchId: string,
     keyHash: string,
     requestFingerprint: string,
-    leaseFence: OwnedRuntimeLeaseFence
+    leaseFence: OwnedRuntimeLeaseFence,
+    revalidationDeadlineAtMs: number,
+    executableMaximumBytes: number,
   ): Promise<OwnedRuntimePublicStatus> {
     leaseFence.assertActive();
     this.assertOpenForMutation();
@@ -3355,6 +4691,7 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder, McpI
         if (runtime.preparedLaunchId !== preparedLaunchId) {
           throw new OwnedRuntimeError("STORAGE_UNVERIFIABLE", "Start idempotency receipt points at another prepared launch");
         }
+        this.reconcileGameLaunchChainForRuntimeLocked(runtime);
         await this.reconcileRuntimeLifecycleLease(runtime);
         leaseFence.assertActive();
         return this.inspectReceipt(runtime);
@@ -3375,6 +4712,7 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder, McpI
     }
 
     const descriptor = this.readPreparedDescriptor(preparedLaunchId);
+    let gameLaunchChain: GameLaunchChain | null = null;
     const invalidation = this.readOptionalPreparedInvalidation(preparedLaunchId, descriptor);
     if (invalidation) {
       throw new OwnedRuntimeError(
@@ -3423,16 +4761,27 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder, McpI
     const consumptionPath = this.consumptionPath(preparedLaunchId);
     let executablePath: string;
     let executableFile: ExecutableFileIdentity;
+    let executableEvidence: OwnedRuntimeExecutableEvidence;
     if (descriptor.gameLaunchEvidence) {
-      ({ executablePath, executableFile } =
-        this.revalidatePreparedGameLaunchLocked(root, descriptor));
+      ({ executablePath, executableFile, executableEvidence } =
+        await this.revalidatePreparedGameLaunchLocked(
+          root,
+          descriptor,
+          leaseFence,
+          revalidationDeadlineAtMs,
+          executableMaximumBytes,
+        ));
     } else {
-      executablePath = canonicalFile(
-        this.resolveExecutable(descriptor.runtimeKind),
-        `${descriptor.runtimeKind} runtime executable`,
+      executableEvidence = await this.resolveBaselineExecutableLocked(
+        descriptor.runtimeKind,
+        leaseFence,
+        revalidationDeadlineAtMs,
+        executableMaximumBytes,
       );
-      executableFile = inspectExecutableFile(executablePath);
+      executablePath = executableEvidence.executablePath;
+      executableFile = executableEvidence.executableFile;
     }
+    gameLaunchChain = this.requireGameLaunchChainForDescriptorLocked(descriptor, keyHash);
     leaseFence.assertActive();
     assertWindowsCommandLineFits(executablePath, argumentsArray);
     const argvSha256 = sha256(JSON.stringify(argumentsArray));
@@ -3444,6 +4793,7 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder, McpI
           if (runtime.preparedLaunchId !== preparedLaunchId) {
             throw new OwnedRuntimeError("STORAGE_UNVERIFIABLE", "Prepared-launch consumption points at another runtime receipt");
           }
+          this.reconcileGameLaunchChainForRuntimeLocked(runtime);
           await this.reconcileRuntimeLifecycleLease(runtime);
           leaseFence.assertActive();
           return this.inspectReceipt(runtime);
@@ -3479,6 +4829,13 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder, McpI
       state: "starting",
       updatedAt: consumedAt,
     }), true);
+    if (gameLaunchChain) {
+      gameLaunchChain = this.transitionGameLaunchAttempt(gameLaunchChain, {
+        state: "starting",
+        runtimeId,
+      });
+      this.writeGameLaunchChain(gameLaunchChain, false);
+    }
     const launchedAtMs = this.clock();
     const pendingCreatedAt = new Date(launchedAtMs).toISOString();
     let pending = pendingStartSchema.parse({
@@ -3501,10 +4858,32 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder, McpI
     });
 
     let child: ChildProcess | null = null;
-    let foregroundProtection: Promise<void> | null = null;
+    let foregroundGuard: RuntimeFocusGuardTransaction | null = null;
+    let foregroundBinding: Promise<void> | null = null;
+    let foregroundProtectionComplete = false;
     let receiptPublished = false;
     let pinnedReceipt: OwnedRuntimeReceipt | null = null;
     try {
+      const requiresForegroundGuard =
+        (descriptor.runtimeKind === "client" || descriptor.runtimeKind === "listenServer") &&
+        descriptor.arguments.some((argument) => argument.toLowerCase() === "-nofocus");
+      if (requiresForegroundGuard) {
+        // The helper's global hooks and rooted callback must be positively ready
+        // before CreateProcess can expose an immediate first window.
+        foregroundGuard = await this.prepareForegroundDuringStartup({
+          executablePath,
+          ownerTokenArgument,
+        });
+        try {
+          // Hook preparation is an async continuation. If the mutex holder
+          // disappeared while it was pending, tear down the prepared native
+          // guard but never enter the recoverable-spawn journal transaction.
+          leaseFence.assertActive();
+        } catch (error) {
+          await foregroundGuard.abort().catch(() => undefined);
+          throw error;
+        }
+      }
       const transaction = await runRecoverableSpawn({
         transactionId: runtimeId,
         metadata: pending,
@@ -3551,6 +4930,14 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder, McpI
           },
         },
         spawn: () => {
+          // The two isolated reads share this absolute wall budget. Recheck
+          // synchronously at the irreversible CreateProcess edge so time
+          // spent journaling or establishing the foreground guard cannot turn
+          // expired evidence into a late spawn.
+          leaseFence.assertActive();
+          if (Date.now() >= revalidationDeadlineAtMs) {
+            throw gameLaunchRevalidationDeadlineError();
+          }
           child = this.spawnProcess(executablePath, argumentsArray, {
             cwd: dirname(executablePath),
             detached: false,
@@ -3558,28 +4945,25 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder, McpI
             stdio: "ignore",
             windowsHide: false,
           });
-          if ((descriptor.runtimeKind === "client" || descriptor.runtimeKind === "listenServer") &&
-              descriptor.arguments.some((argument) => argument.toLowerCase() === "-nofocus") &&
-              Number.isSafeInteger(child.pid) && (child.pid ?? 0) > 0) {
-            // Start protection immediately, before Reforger replaces its
-            // initial splash/top-level windows and attempts activation.
-            foregroundProtection = this.preserveForegroundDuringStartup(child.pid!);
+          if (foregroundGuard && Number.isSafeInteger(child.pid) && (child.pid ?? 0) > 0) {
+            // Bind synchronously at the spawn edge. The native guard opens and
+            // retains this exact process generation before mutating any window.
+            foregroundBinding = foregroundGuard.bindTarget(child.pid!);
+            // Journal persistence and the child `spawn` event happen before
+            // inspection awaits this promise; mark an early native rejection
+            // handled without hiding it from the later authoritative await.
+            void foregroundBinding.catch(() => undefined);
           }
           return child;
         },
         childPid: (spawned) => spawned.pid,
         awaitSpawn: (spawned) => this.awaitSpawn(spawned),
         inspect: async (spawned) => {
-          const [identity] = await Promise.all([
-            this.inspectSpawned(spawned, executablePath, ownerTokenArgument),
-            foregroundProtection ?? Promise.resolve(),
-          ]);
-          const executableFileAfterSpawn = inspectExecutableFile(executablePath);
-          if (!executableFilesMatch(executableFile, executableFileAfterSpawn)) {
-            throw new OwnedRuntimeError(
-              "IDENTITY_MISMATCH",
-              "Graphical runtime executable was replaced during start"
-            );
+          const identity = await this.inspectSpawned(spawned, executablePath, ownerTokenArgument);
+          await (foregroundBinding ?? Promise.resolve());
+          if (foregroundGuard) {
+            await foregroundGuard.complete(identity);
+            foregroundProtectionComplete = true;
           }
           pinnedReceipt = runtimeReceiptSchema.parse({
             version: STORAGE_VERSION,
@@ -3588,7 +4972,7 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder, McpI
             preparedLaunchId,
             pid: identity.pid,
             executablePath: identity.executablePath,
-            executableFile: executableFileAfterSpawn,
+            executableFile,
             creationTimeFileTime: identity.creationTime,
             ownerTokenArgument,
             argvSha256,
@@ -3600,6 +4984,25 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder, McpI
             mcpOwner,
           });
           return identity;
+        },
+        afterIdentityPersisted: async () => {
+          const executableFileAfterSpawn = await this.revalidateSpawnedExecutableLocked(
+            executableEvidence,
+            leaseFence,
+            revalidationDeadlineAtMs,
+            executableMaximumBytes,
+          );
+          const receipt = pinnedReceipt;
+          if (!receipt) {
+            throw new OwnedRuntimeError(
+              "IDENTITY_UNVERIFIABLE",
+              "Exact runtime receipt was not prepared before executable revalidation",
+            );
+          }
+          pinnedReceipt = runtimeReceiptSchema.parse({
+            ...receipt,
+            executableFile: executableFileAfterSpawn,
+          });
         },
         beforePublish: async () => {
           const receipt = pinnedReceipt;
@@ -3623,6 +5026,10 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder, McpI
           }
           this.atomicWrite(root, this.runtimePath(runtimeId), receipt, true);
           receiptPublished = true;
+          if (gameLaunchChain) {
+            gameLaunchChain = this.transitionGameLaunchAttempt(gameLaunchChain, { state: "running" });
+            this.writeGameLaunchChain(gameLaunchChain, false);
+          }
           return receipt;
         },
       });
@@ -3648,8 +5055,19 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder, McpI
       try { child.unref(); } catch { /* the verified lifecycle receipt remains authoritative */ }
       return this.publicStatus(receipt, "running", true);
     } catch (error) {
+      // Cleanup is lifecycle mutation too. If the native holder disappeared,
+      // leave the last durable pending phase untouched for the next exact
+      // recovery transaction instead of racing it without exclusion.
+      leaseFence.assertActive();
+      if (foregroundGuard && !foregroundProtectionComplete) {
+        await foregroundGuard.abort().catch(() => undefined);
+        leaseFence.assertActive();
+      }
       if (!receiptPublished) {
-        const cleanupVerified = child ? await this.terminateRetainedChild(child).catch(() => false) : true;
+        const cleanupVerified = child
+          ? await this.terminateRetainedChild(child).catch(() => false)
+          : true;
+        leaseFence.assertActive();
         try {
           pending = this.updatePendingStart(root, pending, {
             state: cleanupVerified
@@ -4589,6 +6007,23 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder, McpI
     exactOwned: boolean,
     reason?: string
   ): OwnedRuntimePublicStatus {
+    const descriptor = this.readPreparedDescriptor(receipt.preparedLaunchId);
+    let gameLaunchFields: Pick<OwnedRuntimePublicStatus, "compositeAttemptId" | "chain"> = {};
+    if (descriptor.gameLaunchAttempt) {
+      const chain = this.readOptionalGameLaunchChain(pathKey(descriptor.profilePath));
+      if (!chain) {
+        throw new OwnedRuntimeError(
+          "STORAGE_UNVERIFIABLE",
+          "Game-launch runtime has no profile attempt ledger",
+        );
+      }
+      gameLaunchFields = {
+        compositeAttemptId: descriptor.gameLaunchAttempt.compositeAttemptId,
+        ...(chain.current.compositeAttemptId === descriptor.gameLaunchAttempt.compositeAttemptId
+          ? { chain: this.publicGameLaunchChain(chain) }
+          : {}),
+      };
+    }
     return {
       runtimeId: receipt.runtimeId,
       sessionId: receipt.sessionId,
@@ -4599,6 +6034,7 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder, McpI
       startedAt: receipt.startedAt,
       exactOwned,
       ...(reason ? { reason } : {}),
+      ...gameLaunchFields,
     };
   }
 
@@ -4736,6 +6172,7 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder, McpI
       } catch {
         // The immutable stop and completion receipts remain authoritative.
       }
+      this.reconcileGameLaunchChainForRuntimeLocked(receipt);
       return { kind: "complete", status: this.publicStoppedStatus(receipt, stopped) };
     }
     const stopped = this.readOptionalStopReceipt(receipt.runtimeId);
@@ -4834,6 +6271,7 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder, McpI
           "Raced stop completion belongs to another runtime lifecycle"
         );
       }
+      this.reconcileGameLaunchChainForRuntimeLocked(receipt);
       return this.publicStoppedStatus(receipt, stopped);
     }
     const proof = this.readValidatedRestorationProofLocked(receipt);
@@ -4874,6 +6312,7 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder, McpI
     } catch {
       // Stop and completion receipts remain the durable idempotent authority.
     }
+    this.reconcileGameLaunchChainForRuntimeLocked(receipt);
     return this.publicStoppedStatus(receipt, stopped);
   }
 
@@ -4928,12 +6367,50 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder, McpI
       }, wallDeadline);
   }
 
+  private gameLaunchRetentionProtection(): {
+    preparedLaunchIds: Set<string>;
+    runtimeIds: Set<string>;
+    protectAllGameLaunchEvidence: boolean;
+  } {
+    const preparedLaunchIds = new Set<string>();
+    const runtimeIds = new Set<string>();
+    let protectAllGameLaunchEvidence = false;
+    for (const name of this.recordFileNames("game-launch-chains")) {
+      const profileKeyDigest = name.endsWith(".json") ? name.slice(0, -5) : "";
+      if (!sha256Schema.safeParse(profileKeyDigest).success) {
+        protectAllGameLaunchEvidence = true;
+        continue;
+      }
+      try {
+        const chain = this.readParsed(
+          this.gameLaunchChainPath(profileKeyDigest),
+          gameLaunchChainSchema,
+          "game-launch retention chain",
+        );
+        if (chain.profileKeyDigest !== profileKeyDigest) throw new Error("chain binding");
+        this.assertGameLaunchChain(chain);
+        if (chain.current.preparedLaunchId) preparedLaunchIds.add(chain.current.preparedLaunchId);
+        if (chain.current.runtimeId) runtimeIds.add(chain.current.runtimeId);
+        // An aborted successor can be replaced only after re-attesting the
+        // retained terminal predecessor. Protect that complete runtime cluster
+        // until the chain advances or retires.
+        if (chain.previous?.runtimeId) runtimeIds.add(chain.previous.runtimeId);
+      } catch {
+        // Unknown/corrupt profile authority pins every composite lifecycle; a
+        // retention pass must never turn lost evidence into launch permission.
+        protectAllGameLaunchEvidence = true;
+      }
+    }
+    return { preparedLaunchIds, runtimeIds, protectAllGameLaunchEvidence };
+  }
+
   private sweepLocked(now: number): OwnedRuntimeSweepResult {
     if (!Number.isFinite(now)) {
       throw new OwnedRuntimeError("INVALID_REQUEST", "Owned runtime retention time is invalid");
     }
     const removedPreparedLaunchIds = new Set<string>();
     const removedRuntimeIds: string[] = [];
+    const gameLaunchProtection = this.gameLaunchRetentionProtection();
     // LMDB has no unpublished temporary files: each record write is its own
     // synchronous commit, so there is nothing to sweep. The field is retained
     // for result-shape stability and is always zero.
@@ -4945,11 +6422,14 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder, McpI
     for (const name of this.recordFileNames("stop-completions")) {
       const runtimeId = name.endsWith(".json") ? name.slice(0, -5) : "";
       if (!runtimeIdSchema.safeParse(runtimeId).success) continue;
+      if (gameLaunchProtection.runtimeIds.has(runtimeId)) continue;
       try {
         const completion = this.readOptionalStopCompletion(runtimeId);
         if (!completion || now - Date.parse(completion.completedAt) < this.receiptRetentionMs) continue;
         if (this.hasRecord(this.runtimePath(runtimeId))) {
           const receipt = this.readRuntimeReceipt(runtimeId);
+          if (gameLaunchProtection.protectAllGameLaunchEvidence &&
+              this.readPreparedDescriptor(receipt.preparedLaunchId).gameLaunchEvidence) continue;
           if (completion.sessionId !== receipt.sessionId ||
               completion.preparedLaunchId !== receipt.preparedLaunchId) continue;
         }
@@ -4973,8 +6453,12 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder, McpI
     for (const name of this.recordFileNames("pending-starts")) {
       const runtimeId = name.endsWith(".json") ? name.slice(0, -5) : "";
       if (!runtimeIdSchema.safeParse(runtimeId).success || this.hasRecord(this.runtimePath(runtimeId))) continue;
+      if (gameLaunchProtection.runtimeIds.has(runtimeId)) continue;
       try {
         const pending = this.readOptionalPendingStart(runtimeId);
+        if (pending && (gameLaunchProtection.preparedLaunchIds.has(pending.preparedLaunchId) ||
+            (gameLaunchProtection.protectAllGameLaunchEvidence &&
+              this.readPreparedDescriptor(pending.preparedLaunchId).gameLaunchEvidence))) continue;
         const releaseComplete = pending?.state === "release_acknowledged" ||
           (pending?.state === "cleanup_verified" && !pending.lifecycleGeneration);
         if (!pending || !releaseComplete ||
@@ -5023,6 +6507,8 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder, McpI
           preparedReferences.has(preparedLaunchId)) continue;
       try {
         const descriptor = this.readPreparedDescriptor(preparedLaunchId);
+        if (gameLaunchProtection.preparedLaunchIds.has(preparedLaunchId) ||
+            (gameLaunchProtection.protectAllGameLaunchEvidence && descriptor.gameLaunchEvidence)) continue;
         if (now - Date.parse(descriptor.expiresAt) < this.receiptRetentionMs) continue;
         // A malformed or descriptor-mismatched invalidation is retained with
         // its preparation for explicit recovery rather than silently erased.
@@ -5587,6 +7073,9 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder, McpI
   private idempotencyPath(action: "start" | "stop", hash: string): string {
     return join(this.directory("idempotency"), `${action}-${hash}.json`);
   }
+  private gameLaunchChainPath(profileKeyDigest: string): string {
+    return join(this.directory("game-launch-chains"), `${profileKeyDigest}.json`);
+  }
 
   private readPreparedDescriptor(preparedLaunchId: string): PreparedDescriptor {
     const descriptor = this.readParsed(
@@ -5600,6 +7089,23 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder, McpI
     }
     this.assertPreparedDescriptorCapacity(descriptor);
     if (descriptor.gameLaunchEvidence) validatedGameLaunchEvidence(descriptor.gameLaunchEvidence);
+    if (descriptor.gameLaunchAttempt) {
+      const link = gameLaunchAttemptLinkSchema.parse(descriptor.gameLaunchAttempt);
+      if (!descriptor.gameLaunchEvidence || descriptor.gameLaunchEvidence.prepareKey !== link.prepareKey ||
+          descriptor.prepareIdempotencyHash !== sha256(link.recordKey) ||
+          pathKey(descriptor.profilePath) === "") {
+        throw new OwnedRuntimeError(
+          "STORAGE_UNVERIFIABLE",
+          "Prepared game-launch attempt link does not match its descriptor",
+        );
+      }
+    } else if (descriptor.gameLaunchEvidence &&
+        gameLaunchAttemptKeySchema.safeParse(descriptor.gameLaunchEvidence.prepareKey).success) {
+      throw new OwnedRuntimeError(
+        "STORAGE_UNVERIFIABLE",
+        "Attempt-scoped game-launch evidence has no descriptor attempt link",
+      );
+    }
     return descriptor;
   }
 
@@ -5645,6 +7151,7 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder, McpI
       gameLaunchEvidenceDigest: string;
       prepareKey: string;
     };
+    gameLaunchAttempt?: GameLaunchAttemptLink;
   }): string {
     return sha256(JSON.stringify({
       sessionId: value.sessionId,
@@ -5656,6 +7163,9 @@ export class OwnedRuntimeManager implements ObserverPreparedLaunchRecorder, McpI
       ...(value.gameLaunchEvidence ? {
         gameLaunchEvidenceDigest: value.gameLaunchEvidence.gameLaunchEvidenceDigest,
         prepareKey: value.gameLaunchEvidence.prepareKey,
+      } : {}),
+      ...(value.gameLaunchAttempt ? {
+        gameLaunchAttempt: value.gameLaunchAttempt,
       } : {}),
     }));
   }

@@ -17,7 +17,7 @@ import {
   readFileSync,
   statSync,
 } from "node:fs";
-import { basename, dirname, extname, join, relative, resolve } from "node:path";
+import { basename, dirname, extname, isAbsolute, join, relative, resolve } from "node:path";
 import type { Config } from "../config.js";
 import { McpHostAdmissionGate } from "../mcp-host-admission.js";
 import type {
@@ -27,6 +27,7 @@ import type {
   McpIdleReadinessProvider,
 } from "../mcp-idle-readiness.js";
 import { redactArguments } from "../foundation/redact.js";
+import { canonicalPathComparisonKey } from "../foundation/managed-path.js";
 import {
   createMcpHostIdentity,
   validateMcpHostIdentity,
@@ -94,6 +95,9 @@ import {
   type WorkbenchLifecycleStateV3,
   type WorkbenchSpawnRecord,
 } from "./process-guard.js";
+import {
+  WorkbenchExistingLmdbIsolationError,
+} from "./existing-lmdb-reader.js";
 import {
   WorkbenchModalWatchdog,
   findOwnedNativeDialog,
@@ -176,6 +180,13 @@ export interface WorkbenchState {
 export interface WorkbenchCallOptions {
   timeout?: number;
   skipAutoLaunch?: boolean;
+}
+
+export interface WorkbenchActiveProjectHintOptions {
+  /** Cancels and joins the crash-isolated existing-state reader. */
+  readonly signal: AbortSignal;
+  /** Absolute wall-clock deadline shared with the consuming launch plan. */
+  readonly deadlineAtMs: number;
 }
 
 export interface WorkbenchLaunchResult {
@@ -742,21 +753,29 @@ export class WorkbenchSessionController implements McpIdleReadinessProvider {
   async inspectIdleShutdownReadiness(
     options: IdleShutdownInspectionOptions,
   ): Promise<McpIdleProviderReadiness> {
+    const nowTick = options.nowTick ?? (() => performance.now());
     const blockers = new Set<McpIdleBlockerCode>();
     let complete = true;
     if (this.activeLifecycle || this.activeTargetBuildPromise) blockers.add("WORKBENCH_ACTIVITY");
     if (this.ownedChild) blockers.add("WORKBENCH_OWNERSHIP");
-    if (options.signal.aborted || performance.now() > options.deadlineTick) {
+    if (options.signal.aborted || nowTick() > options.deadlineTick) {
       return { complete: false, blockers: ["INCOMPLETE_PROOF"], revision: this.idleRevision };
     }
 
-    // Both records share one Workbench LMDB environment. Existing-only reads
-    // use temporary read-only handles when this host has not opened its writer;
-    // keep those opens sequential so Windows never maps the same environment
-    // twice concurrently inside one readiness probe.
-    const lifecycle = await this.processGuard.readLifecycleStateExistingOnly();
-    const journal = await this.processGuard.readSpawnJournalExistingOnly();
-    if (options.signal.aborted || performance.now() > options.deadlineTick) {
+    // A fresh host must not map the live Workbench LMDB in its own address
+    // space: native read-only open faults are uncatchable JavaScript failures.
+    // The process guard reads both records through one bounded disposable
+    // reader process and projects any abnormal exit as incomplete proof.
+    const remainingInspectionMs = Math.max(
+      1,
+      Math.min(5_000, Math.floor(options.deadlineTick - nowTick())),
+    );
+    const snapshot = await this.processGuard.readExistingStateSnapshot({
+      signal: options.signal,
+      timeoutMs: remainingInspectionMs,
+    });
+    const { lifecycle, journal } = snapshot;
+    if (options.signal.aborted || nowTick() > options.deadlineTick) {
       return { complete: false, blockers: ["INCOMPLETE_PROOF"], revision: this.idleRevision };
     }
 
@@ -825,7 +844,7 @@ export class WorkbenchSessionController implements McpIdleReadinessProvider {
       }
     }
 
-    if (options.signal.aborted || performance.now() > options.deadlineTick) {
+    if (options.signal.aborted || nowTick() > options.deadlineTick) {
       complete = false;
       blockers.add("INCOMPLETE_PROOF");
     }
@@ -1887,6 +1906,95 @@ export class WorkbenchSessionController implements McpIdleReadinessProvider {
     } catch (error) {
       throw this.mapLifecycleError(error);
     }
+  }
+
+  /**
+   * Return the bounded absolute target already sealed in the owned lifecycle.
+   *
+   * This game-launch-specific projection deliberately performs no filesystem
+   * canonicalization on the MCP thread. A fresh host uses the cancellable,
+   * crash-isolated existing-state reader; an owner with an open LMDB writer
+   * safely reuses that exact handle. The launch planning worker is the sole
+   * consumer that canonicalizes and revalidates the returned path.
+   */
+  async activeProjectGprojPathHint(
+    options: WorkbenchActiveProjectHintOptions,
+  ): Promise<string | null> {
+    if (!Number.isSafeInteger(options.deadlineAtMs) || options.deadlineAtMs <= 0) {
+      throw new WorkbenchRunError(
+        "Active Workbench project hint deadline is invalid.",
+        "DEADLINE_EXCEEDED",
+      );
+    }
+    const assertOpen = (): void => {
+      if (options.signal.aborted) {
+        throw new WorkbenchRunError(
+          "Active Workbench project hint was cancelled.",
+          "ABORTED",
+        );
+      }
+      if (Date.now() >= options.deadlineAtMs) {
+        throw new WorkbenchRunError(
+          "Active Workbench project hint exceeded its absolute deadline.",
+          "DEADLINE_EXCEEDED",
+        );
+      }
+    };
+    assertOpen();
+    const remainingMs = Math.max(
+      1,
+      Math.min(5_000, Math.floor(options.deadlineAtMs - Date.now())),
+    );
+    let snapshot;
+    try {
+      snapshot = await this.processGuard.readExistingStateSnapshotOnce({
+        signal: options.signal,
+        timeoutMs: remainingMs,
+      });
+    } catch (error) {
+      if (error instanceof WorkbenchExistingLmdbIsolationError) {
+        if (error.code === "CANCELLED") {
+          throw new WorkbenchRunError(
+            "Active Workbench project hint was cancelled.",
+            "ABORTED",
+          );
+        }
+        if (error.code === "TIMEOUT") {
+          throw new WorkbenchRunError(
+            "Active Workbench project hint inspection exceeded its bounded deadline.",
+            "DEADLINE_EXCEEDED",
+          );
+        }
+      }
+      throw error;
+    }
+    assertOpen();
+    const read = snapshot.lifecycle;
+    if (
+      read.kind !== "valid" ||
+      read.state.phase !== "running" ||
+      !read.state.mcpOwner ||
+      !read.state.workbench ||
+      !read.state.target
+    ) {
+      return null;
+    }
+    const targetPath = read.state.target.path;
+    if (
+      typeof targetPath !== "string" ||
+      targetPath.length < 1 ||
+      targetPath.length > 32_768 ||
+      /[\0-\x1f\x7f]/u.test(targetPath) ||
+      !isAbsolute(targetPath) ||
+      extname(targetPath).toLowerCase() !== ".gproj" ||
+      read.state.target.comparisonKey !== canonicalPathComparisonKey(targetPath)
+    ) {
+      throw new WorkbenchError(
+        "The active Workbench lifecycle target path is not a bounded absolute path.",
+        "STATE_INVALID",
+      );
+    }
+    return targetPath;
   }
 
   async ensureRunning(gprojPath?: string): Promise<WorkbenchLaunchResult> {

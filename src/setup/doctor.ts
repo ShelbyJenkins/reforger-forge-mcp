@@ -224,7 +224,7 @@ export async function runDoctor(
     try {
       clientSummary = (
         dependencies.inspectClients ?? inspectDetectedClients
-      )({ serverPath });
+      )({ serverPath, nodePath: report?.nodePath ?? process.execPath });
     } catch (error) {
       clientInspectionFailure = error;
     }
@@ -308,7 +308,7 @@ export async function runDoctor(
     runtime: {
       serverPath,
       serverPresent: regularFileExists(serverPath),
-      nodePath: dependencies.nodePath ?? process.execPath,
+      nodePath: report?.nodePath ?? dependencies.nodePath ?? process.execPath,
       nodeVersion:
         report?.nodeVersion ??
         dependencies.nodeVersion ??

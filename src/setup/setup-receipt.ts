@@ -330,7 +330,7 @@ export function composeSetupReceiptFromReports(
       serverPresent:
         options.serverPresent ??
         report.compiledServer.version !== undefined,
-      nodePath: options.nodePath ?? process.execPath,
+      nodePath: options.nodePath ?? report.nodePath,
       nodeVersion: report.nodeVersion,
       serverVersion: report.compiledServer.version ?? null,
       transport: "stdio",

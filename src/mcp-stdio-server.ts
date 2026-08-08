@@ -20,6 +20,8 @@ import { runCliShutdown } from "./mcp-lifecycle.js";
 import { registerTools } from "./server.js";
 
 export const MCP_SERVER_VERSION = "1.2.0";
+/** Exact 2025-era revision exercised by the stdio black-box contract. */
+export const MCP_TESTED_PROTOCOL_VERSION = "2025-11-25" as const;
 
 export interface McpStdioSignalSource {
   once(event: "SIGINT" | "SIGTERM", listener: () => void): unknown;
@@ -67,6 +69,7 @@ export async function runMcpStdioServer(options: RunMcpStdioServerOptions): Prom
   const disposeTools = registerTools(server, options.config, {
     hostIdentity: options.hostIdentity,
     mcpLifecycleDiagnostic: lifecycleDiagnostic,
+    nowTick: options.nowTick,
   });
   let shutdownPromise: Promise<void> | null = null;
 

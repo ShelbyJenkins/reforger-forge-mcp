@@ -262,7 +262,7 @@ export class ChildSupervisor implements McpIdleReadinessProvider {
   async inspectIdleShutdownReadiness(
     options: IdleShutdownInspectionOptions,
   ): Promise<McpIdleProviderReadiness> {
-    const expired = options.signal.aborted || performance.now() > options.deadlineTick;
+    const expired = options.signal.aborted || (options.nowTick?.() ?? performance.now()) > options.deadlineTick;
     return {
       complete: !expired,
       blockers: this.children.size > 0 || this.reconciliations.size > 0

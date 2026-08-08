@@ -2,6 +2,7 @@ import { performance } from "node:perf_hooks";
 import { describe, expect, it } from "vitest";
 import { McpHostAdmissionGate } from "../src/mcp-host-admission.js";
 import {
+  MCP_IDLE_BLOCKER_CODES,
   McpIdleReadinessInspector,
   type IdleShutdownInspectionOptions,
   type McpIdleBlockerCode,
@@ -35,6 +36,36 @@ function options(generation = 1, signal = new AbortController().signal): IdleShu
 }
 
 describe("MCP idle readiness inspector", () => {
+  it("bounds the current contract to blocker codes with implemented producers", () => {
+    expect(MCP_IDLE_BLOCKER_CODES as readonly string[]).not.toContain("EXTERNAL_ACTIVATION");
+  });
+
+  it("threads a zero-seeded monotonic clock and a full future provider deadline", async () => {
+    const gate = new McpHostAdmissionGate();
+    let observedDeadline = -1;
+    let observedNow = -1;
+    const provider = new Provider(async (inspection) => {
+      observedDeadline = inspection.deadlineTick;
+      observedNow = inspection.nowTick?.() ?? -1;
+      return { complete: true, blockers: [] };
+    });
+    const inspector = new McpIdleReadinessInspector({
+      admissionGate: gate,
+      providers: [provider],
+      nowTick: () => 0,
+    });
+
+    const readiness = await inspector.inspectIdleShutdownReadiness({
+      deadlineTick: 10_000,
+      signal: new AbortController().signal,
+      probeGeneration: 0,
+    });
+
+    expect(readiness.complete).toBe(true);
+    expect(observedNow).toBe(0);
+    expect(observedDeadline).toBe(5_000);
+  });
+
   it("returns an opaque seal proof only for a complete blocker-free projection", async () => {
     const gate = new McpHostAdmissionGate();
     const provider = new Provider(async () => ({ complete: true, blockers: [] }));
@@ -60,6 +91,23 @@ describe("MCP idle readiness inspector", () => {
     expect(JSON.stringify(readiness)).not.toContain("provider");
   });
 
+  it("preserves every diagnosed category when the bounded set is saturated by a duplicate", async () => {
+    const gate = new McpHostAdmissionGate();
+    const blockers: McpIdleBlockerCode[] = [
+      ...MCP_IDLE_BLOCKER_CODES,
+      MCP_IDLE_BLOCKER_CODES[0],
+    ];
+    const provider = new Provider(async () => ({ complete: true, blockers }));
+    const inspector = new McpIdleReadinessInspector({ admissionGate: gate, providers: [provider] });
+
+    const readiness = await inspector.inspectIdleShutdownReadiness(options());
+
+    expect(readiness.complete).toBe(true);
+    expect(readiness.blockers).toEqual([...MCP_IDLE_BLOCKER_CODES].sort());
+    expect(readiness.blockers).not.toEqual(["INCOMPLETE_PROOF"]);
+    expect(readiness.sealProof).toBeNull();
+  });
+
   it("makes a concurrent host admission visible and refuses a proof", async () => {
     const gate = new McpHostAdmissionGate();
     const token = gate.acquire("active request");
@@ -67,6 +115,24 @@ describe("MCP idle readiness inspector", () => {
     const readiness = await inspector.inspectIdleShutdownReadiness(options());
     expect(readiness).toMatchObject({ complete: true, blockers: ["HOST_ADMISSION_ACTIVE"], sealProof: null });
     token.release();
+  });
+
+  it("makes disposer-authorized cleanup visible and refuses a proof", async () => {
+    const gate = new McpHostAdmissionGate();
+    let release!: () => void;
+    const blocked = new Promise<void>((resolve) => { release = resolve; });
+    const cleanup = gate.runPrivilegedCleanup(() => blocked);
+    const inspector = new McpIdleReadinessInspector({ admissionGate: gate, providers: [] });
+
+    const readiness = await inspector.inspectIdleShutdownReadiness(options());
+
+    expect(readiness).toMatchObject({
+      complete: true,
+      blockers: ["HOST_ADMISSION_ACTIVE"],
+      sealProof: null,
+    });
+    release();
+    await cleanup;
   });
 
   it("revalidates provider revisions synchronously at seal", async () => {

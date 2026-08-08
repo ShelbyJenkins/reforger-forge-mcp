@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   computeOwnedRuntimeExecutableEvidenceDigest,
+  resolveRuntimeExecutableEvidenceFromSource,
   resolveRuntimeExecutable,
 } from "../../src/observer/owned-runtime-manager.js";
 import {
@@ -66,6 +67,17 @@ describe("owned runtime executable resolution", () => {
     writeFileSync(harness.executable, "replacement fixture executable");
     expect(harness.manager.resolveRuntimeExecutableEvidence("listenServer").executableEvidenceDigest)
       .not.toBe(evidence.executableEvidenceDigest);
+  });
+
+  it("refuses planning attestation above its executable byte ceiling", () => {
+    const harness = makeHarness();
+    expect(() => resolveRuntimeExecutableEvidenceFromSource({
+      kind: "executablePath",
+      executablePath: harness.executable,
+    }, "listenServer", 1)).toThrowError(expect.objectContaining({
+      name: "GameLaunchPlanError",
+      code: "EXECUTABLE_OVERSIZE",
+    }));
   });
 
   it("rejects missing paths, directories, and a linked final executable", () => {

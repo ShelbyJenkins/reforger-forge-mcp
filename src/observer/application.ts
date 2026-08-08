@@ -467,7 +467,7 @@ class DefaultObserverApplication implements ObserverApplication {
       }
 
       this.state = "closing";
-      await this.closeServices();
+      await this.closeServices(deadlineAtMs);
       this.state = "closed";
       this.terminalResult = result;
       return result;
@@ -477,7 +477,7 @@ class DefaultObserverApplication implements ObserverApplication {
     }
   }
 
-  private async closeServices(): Promise<void> {
+  private async closeServices(deadlineAtMs: number): Promise<void> {
     if (this.state === "closed") return;
     if (this.terminalClosePromise) return this.terminalClosePromise;
     const attempt = (async () => {
@@ -485,7 +485,7 @@ class DefaultObserverApplication implements ObserverApplication {
       if (this.workbenchAdapter) {
         await this.workbenchAdapter.restoreAll();
       }
-      await this.agentClient.close();
+      await this.agentClient.close(deadlineAtMs);
     })();
     this.terminalClosePromise = attempt.catch((error) => {
       this.terminalClosePromise = null;

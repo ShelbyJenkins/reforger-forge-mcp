@@ -531,7 +531,7 @@ export class WorkbenchActivityGate implements McpIdleReadinessProvider {
   async inspectIdleShutdownReadiness(
     options: IdleShutdownInspectionOptions,
   ): Promise<McpIdleProviderReadiness> {
-    const expired = options.signal.aborted || performance.now() > options.deadlineTick;
+    const expired = options.signal.aborted || (options.nowTick?.() ?? performance.now()) > options.deadlineTick;
     const blockers = new Set<"WORKBENCH_ACTIVITY" | "WORKBENCH_RECOVERY">();
     if (this.managedActivities > 0 || this.lifecycleRequests > 0 || this.lifecycleActive ||
         this.lifecycleQueue.length > 0 || this.captureLeases.activeLease) {
