@@ -6,6 +6,58 @@ mixed tracker on 2026-07-28; same-day ties retain their migration order.
 
 ## Resolved defects
 
+## MCP-071 - CaptureService's routine retention sweep starves the idle-shutdown seal proof
+
+**Status:** Resolved
+
+**Severity:** P2 - a fully idle desktop host can fail to commit automatic idle shutdown, consuming resources indefinitely
+
+**Observed:** 2026-08-07
+
+**Closed:** 2026-08-07
+
+**Observed behavior:** Re-running the deferred MCP-056 exact-default-root live acceptance
+gate against the real, emptied default Observer root, the production MCP host
+reported every idle-readiness provider as `complete: true` with no blockers on
+every probe, yet the aggregate check still logged
+`MCP idle shutdown blocked: INCOMPLETE_PROOF` on nearly every recheck for
+90+ seconds, with only an occasional lucky pass.
+
+**Cause:** `CaptureService`'s retention-sweep timer
+(`src/observer/capture-service.ts`) fires every 50-1000ms and routed
+unconditionally through the same `withAdmission` wrapper used by real
+client-triggered captures, bumping the provider's `idleRevision` twice per tick
+even when the capture store was empty and the sweep did nothing. Per the
+2026-08-05 adversarial review's "the seal transaction is genuinely atomic"
+finding, `McpIdleReadinessInspector` deliberately revalidates every provider's
+revision immediately before sealing, specifically to catch a stale proof. Because
+the sweep period (as low as 50ms) was shorter than the wall-clock gap between
+the provider scan and that recheck — set by the slowest provider, typically the
+Workbench existing-only LMDB subprocess reader at roughly 100ms — the seal lost
+this race on nearly every attempt, so the host could almost never observe a
+stable revision long enough to seal, independent of whether it had anything
+real to do.
+
+**Resolution:** The periodic sweep tick now calls the internal sweep directly
+and bumps `idleRevision` only when it actually expires or removes a job; a
+no-op tick, the common case on an idle host, no longer moves the revision.
+Caller-triggered `sweep()` calls and every other admission-gated capture
+operation are unchanged.
+
+**Verification:** Focused suites `tests/observer/capture-service.test.ts`
+(36/36), `tests/mcp-idle-shutdown.test.ts` (13/13),
+`tests/mcp-idle-readiness.test.ts` (11/11), and
+`tests/setup/mcp-idle-shutdown-stdio.test.ts` (3/3) pass; the full
+`tests/observer/` directory passes 656/656 across 74 files (1 file/3 tests
+intentionally skipped: the opt-in attended USER32 focus fixture). Typecheck
+passes. Live-validated against the real default Observer root
+(`%LOCALAPPDATA%\ReforgerForge\Observer\v1`): two consecutive isolated
+idle-only runs and one full history-plus-idle run all committed clean idle
+shutdown at 60.5-63.6 seconds with exit code 0, where every attempt against the
+same clean state had blocked on `INCOMPLETE_PROOF` before the fix. This
+re-validation also closes the deferred default-root half of `MCP-056`; see the
+launch-ergonomics adversarial review's Live completion queue.
+
 ## MCP-059 - launch-planner filesystem evidence is not fully fail closed on Windows
 
 **Status:** Resolved

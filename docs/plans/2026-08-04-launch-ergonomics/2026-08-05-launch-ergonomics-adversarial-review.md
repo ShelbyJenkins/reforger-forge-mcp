@@ -37,7 +37,7 @@ last updated on 2026-08-06 and should move with implementation and validation.
 | Implemented — absolute Node registration/drift/receipt behavior passes spaces, Unicode, empty/conflicting `PATH`, and the 112-test setup group | 8 | 2 — Host lifecycle | Persist the verified absolute Node executable in managed registrations and include it in drift checks and receipts. | [M9](#m9) |
 | Implemented — a zero-seeded stdio clock and every provider share one monotonic sample; the 132-test readiness group passes | 9 | 2 — Host lifecycle | Thread one injected monotonic clock through the readiness inspector and every provider; prove it with a fake clock starting at zero. | [M1](#m1) |
 | Implemented — the exact default serial command passed in 426 seconds: 264 files and 2,393 tests passed, with one opt-in attended-focus file and its three tests skipped; the explicit unowned-Workbench precondition contract remains enforced | 10 | 3 — Reproducible acceptance | Make the default test command reproduce the claimed suite, including serial lifecycle handling and an explicit unowned-Workbench precondition. | [P1](#p1) |
-| Implemented — `MCP-057` resolved with exact child-close containment; 107 focused and 373 Stage 3 tests, build, package, and live-writer smoke pass; exact default-root gate deferred while an unowned attended Workbench is active | 11 | 3 — Reproducible acceptance | Resolve the live-root LMDB crash, then run and precisely label the exact default-root MCP-056 gate. | [P3](#p3) |
+| Implemented — `MCP-057` resolved with exact child-close containment; 107 focused and 373 Stage 3 tests, build, package, and live-writer smoke pass; the exact default-root gate re-ran 2026-08-07 against the real default Observer root (Workbench closed, root emptied) and passed cleanly, which also surfaced and fixed `MCP-071`, a `CaptureService` sweep-timer race that had been starving the idle-shutdown seal | 11 | 3 — Reproducible acceptance | Resolve the live-root LMDB crash, then run and precisely label the exact default-root MCP-056 gate. | [P3](#p3) |
 | Implemented — composite consumed-launch remedy tests pass | 12 | 4 — Contract coherence | Extend the `PREPARED_LAUNCH_CONSUMED` remedy to `game_launch`. | [M3](#m3) |
 | Implemented — fixed readiness warnings and bounded projected errors are separate; the integrated 56-test launch suite passes | 13 | 4 — Contract coherence | Separate the fixed readiness warning from the bounded projected readiness error. | [M4](#m4) |
 | Implemented — privileged cleanup is counted, proof-invalidating, and readiness-visible | 14 | 4 — Contract coherence | Make privileged cleanup observable and enforced, or rename it as a marker and constrain its call sites architecturally. | [M5](#m5) |
@@ -53,19 +53,40 @@ last updated on 2026-08-06 and should move with implementation and validation.
 | Implemented — ambiguous-target remedy now reports multiple matches | 24 | 6 — Low-risk cleanup | Give `AMBIGUOUS_TARGET` a context-correct remedy reason. | [L7](#l7) |
 | Implemented — public `history`/`recover`, standalone-client `runtimeKind`, and foreign-evidence idle semantics pass a 15-test docs/schema contract; `MCP-065` is resolved | 25 | 6 — Low-risk cleanup | Document `history`/`recover`, clarify or rename standalone `runtimeKind`, and correct foreign-evidence idle semantics. | [L8](#l8), [L9](#l9), [L10](#l10) |
 | Implemented — dead `EXTERNAL_ACTIVATION` member excluded until its deferred producer ships | 26 | 6 — Low-risk cleanup | Add the `EXTERNAL_ACTIVATION` producer with Commit 12, or exclude the dead member from current blocker bounds until then. | [P2](#p2) |
-| In progress — automated acceptance is green (264 files/2,393 tests, typecheck, build, offline package, unused-code, protocol, manifest, and diff checks); one opt-in USER32 file/three tests and the exact active-default-root gate remain explicitly deferred while their attended/live-host preconditions are unsafe | 27 | 7 — Final acceptance | Run the complete desktop black-box acceptance suite after its implementation and safety prerequisites close. | [Desktop-grade acceptance bar](#desktop-grade-acceptance-bar) |
+| In progress — automated acceptance is green (264 files/2,393 tests, typecheck, build, offline package, unused-code, protocol, manifest, and diff checks); the exact active-default-root MCP-056 gate re-ran clean 2026-08-07 (see Live completion queue and `MCP-071`); one opt-in USER32 focus file/three tests remains explicitly deferred pending an attended session | 27 | 7 — Final acceptance | Run the complete desktop black-box acceptance suite after its implementation and safety prerequisites close. | [Desktop-grade acceptance bar](#desktop-grade-acceptance-bar) |
 
 ### Live completion queue
 
 This lists only unfinished or deferred work. Completed evidence remains in the
 phased implementation matrix and issue trackers above. It is refreshed whenever
-a gate changes state; the latest refresh is **2026-08-06 13:58 PDT**.
+a gate changes state; the latest refresh is **2026-08-07 18:17 PDT**.
 
 | Status | Queue | Parent row | Current work and evidence | Completion condition / next transition |
 |---|---:|---:|---|---|
 | Deferred — attended | 1 | 1, 27 | Immediate/delayed real-GUI USER32 focus acceptance requires an attended desktop and deliberate focus changes. Headless A→B, destroyed/reused HWND, and stale-PID-generation cases already pass. | Run only in an attended session, then record the artifact/result; do not synthesize focus changes in an unattended host. |
-| Deferred — live-host precondition | 2 | 11, 27 | The exact active-default-root MCP-056/LMDB gate is unsafe while an unowned attended Workbench/live host is using that root; isolated-root and live-writer containment already pass. | Re-run only after the root is proven unowned and vacant, without killing or adopting the existing host. |
-| Deferred — non-blocking follow-up | 3 | 5, 6 | `MCP-068` retains advanced prior-manager successor adoption/family retirement work; `MCP-069` retains hostile executable-image pinning across publication. Both stay fail closed and are not being silently folded into current row closure. | Separate implementation plans and live crash/hostile-filesystem gates. |
+| Deferred — non-blocking follow-up | 2 | 5, 6 | `MCP-068` retains advanced prior-manager successor adoption/family retirement work; `MCP-069` retains hostile executable-image pinning across publication. Both stay fail closed and are not being silently folded into current row closure. | Separate implementation plans and live crash/hostile-filesystem gates. |
+
+**Resolved 2026-08-07 — queue item "live-host precondition" (was row 2, parent
+rows 11/27).** Workbench and every MCP/Node process were confirmed stopped, so
+the exact active-default-root MCP-056/LMDB gate was re-run directly against the
+real `%LOCALAPPDATA%\ReforgerForge\Observer\v1` root (not a copy). The first
+attempt found 49 real `child_exit_only` histories from this installation's own
+prior dev/test runs; `observer_runtime recover` correctly refused all 49 as
+`IDENTITY_UNVERIFIABLE` (cross-installation authority), matching the original
+2026-08-05 run's fail-closed behavior. Per user direction, the default Observer
+root and the separate `%LOCALAPPDATA%\ReforgerForge\Workbench\v3` lifecycle
+store (confirmed disposable dev-cache: build/profile/helper staging plus an
+already-orphaned legacy `lifecycle.json`, no real project source) were then
+deleted outright rather than recovered record-by-record, and the gate was
+re-run against the resulting fresh state. That re-run surfaced a second,
+previously unknown defect — the idle-shutdown seal almost never committed even
+with a fully empty, clean root — root-caused and fixed same-day as `MCP-071`
+(see `agents/mcp-tracking/MCP_BUGS_RESOLVED.md`). After the fix, two isolated
+idle-only runs and one full history-plus-idle run all committed clean idle
+shutdown in 60.5-63.6 seconds with exit code 0, and the observer/idle-shutdown
+suites (656 tests) plus typecheck pass with no regressions. Diagnostic-only
+instrumentation used to localize the race was reverted; only the
+`capture-service.ts` fix remains as a working-tree change pending commit.
 
 ## Review basis and primary sources
 
@@ -879,6 +900,21 @@ The overview's MCP-056 note already said "Snapshot acceptance," and this review
 corrects its status cell to "snapshot/live-composition validated; default-root
 gate blocked by MCP-057." Keep that distinction until the exact live-root read
 can fail closed without risking another host.
+
+**Update, 2026-08-07:** `MCP-057` was resolved 2026-08-06 (see
+`agents/mcp-tracking/MCP_BUGS_RESOLVED.md`), and with Workbench and every other
+MCP host confirmed stopped, the true default-root gate — not a copy — was
+re-run directly. It passed: real cross-installation history correctly refused
+recovery, and after the root was cleared and a second, independent defect
+(`MCP-071`, the idle-shutdown seal losing a revision race against
+`CaptureService`'s sweep timer) was found and fixed same-day, the host
+committed clean idle shutdown against the live root in 60.5-63.6 seconds with
+exit code 0 across three separate runs. The status cell should now read
+"snapshot/live-composition validated; default-root gate live-validated
+2026-08-07." This finding stands as originally written: it correctly predicted
+that the snapshot substitution was not equivalent to the real gate, and the
+open-handle/multi-host distinction it raised is exactly what led to `MCP-057`
+and then this re-validation.
 
 ### P4
 

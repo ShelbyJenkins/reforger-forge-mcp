@@ -158,3 +158,35 @@ Workbench process was launched, stopped, restarted, or claimed; no owned
 runtime was terminated; and no lifecycle store was deleted. The original
 default Observer environment was never opened by the acceptance host and
 remained available to the older MCP processes.
+
+## Live acceptance re-validation, 2026-08-07 (true default root)
+
+The adversarial review correctly identified that the snapshot substitution
+above did not exercise the real gate (open-handle/multi-host behavior against
+the actual default root), and tracked the blocking native crash as `MCP-057`.
+With `MCP-057` resolved (2026-08-06) and Workbench plus every other MCP/Node
+process confirmed stopped, the true default-root gate was re-run directly
+against `%LOCALAPPDATA%\ReforgerForge\Observer\v1` — not a copy.
+
+A read-only `history` scan found 813 records across 88 runtimes accumulated
+from this installation's own prior dev/test work: 39 completed, 49
+child-exit-only. `recover` correctly attempted and refused all 49 as
+`IDENTITY_UNVERIFIABLE` (cross-installation authority), issuing zero
+termination calls, matching the original run's fail-closed behavior against a
+different, larger, real dataset. Per explicit user direction the default
+Observer root and the separate `%LOCALAPPDATA%\ReforgerForge\Workbench\v3`
+lifecycle store were then deleted outright (confirmed disposable dev-cache:
+build/profile/helper staging and an already-orphaned legacy `lifecycle.json`;
+no real project source lives under either root), rather than recovered
+record-by-record.
+
+Re-running the gate against the resulting fresh state surfaced a second,
+independent defect: the idle-shutdown seal almost never committed even with
+every provider reporting clean. Root cause and fix are recorded as `MCP-071`
+in `agents/mcp-tracking/MCP_BUGS_RESOLVED.md` — `CaptureService`'s retention
+sweep timer was bumping the same idle-revision counter the seal's TOCTOU
+recheck depends on, on every 50-1000ms tick, even when it had no work to do.
+After the fix, three separate runs (two isolated idle-only, one full
+history-plus-idle) each committed clean idle shutdown at 60.5-63.6 seconds
+with exit code 0. The observer and idle-shutdown suites (656 tests across 74
+files) and typecheck pass with no regressions from the fix.

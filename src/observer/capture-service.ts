@@ -222,8 +222,26 @@ export class CaptureService implements McpIdleReadinessProvider {
       if (this.backends.has(backend.kind)) throw new TypeError(`Duplicate capture backend: ${backend.kind}`);
       this.backends.set(backend.kind, backend);
     }
-    this.sweepTimer = setInterval(() => { void this.sweep().catch(() => undefined); }, Math.max(50, Math.min(1_000, this.pollIntervalMs)));
+    this.sweepTimer = setInterval(() => { void this.periodicSweepTick(); }, Math.max(50, Math.min(1_000, this.pollIntervalMs)));
     this.sweepTimer.unref();
+  }
+
+  /**
+   * The routine timer tick bypasses admission so a no-op sweep (the common
+   * case on an idle host) does not bump `idleRevision` and starve the idle
+   * seal's TOCTOU re-check, which otherwise loses the race against this timer
+   * on every probe. Revision still moves when the sweep observes real work,
+   * matching what a caller-driven `sweep()` would record.
+   */
+  private async periodicSweepTick(): Promise<void> {
+    try {
+      const result = await this.sweepInternal(this.now());
+      if (result.expiredJobIds.length > 0 || result.removedJobIds.length > 0) {
+        this.bumpIdleRevision();
+      }
+    } catch {
+      // Best-effort background hygiene; a real caller-driven sweep() surfaces failures.
+    }
   }
 
   async instances(query: ListInstancesInput & { waitMs?: number; signal?: AbortSignal } = {}): Promise<CaptureInstanceList> {
