@@ -42,7 +42,9 @@ interface LauncherDescriptor {
   readonly nodeVersion: string;
   readonly serverPath: string;
   readonly verifierPath: string;
-  readonly startupArguments: string[];
+  readonly nodeArguments: string[];
+  readonly hostArguments: string[];
+  readonly configurationArguments: string[];
 }
 
 function temporaryRoot(): string {
@@ -149,6 +151,7 @@ describe("shared project MCP stdio launcher", () => {
 
     const result = runScript(sharedLauncher, [
       "-Mode", "Describe",
+      "-ClientLabel", "codex",
       "-WorkbenchAddonDir", addonRoot,
       "-ObserverEvidenceRoot", evidenceRoot,
       "-ObserverSupportingLogRoot", logRoot,
@@ -164,14 +167,21 @@ describe("shared project MCP stdio launcher", () => {
     expect(existsSync(verifierMarker)).toBe(false);
     const descriptor = JSON.parse(result.stdout) as LauncherDescriptor;
     expect(descriptor).toMatchObject({
-      schemaVersion: 1,
+      schemaVersion: 2,
       mode: "Describe",
       serverPath: join(repositoryRoot, "dist", "index.js"),
       verifierPath: join(repositoryRoot, "scripts", "verify-mcp-server.mjs"),
     });
     expect(descriptor.command.toLowerCase()).toBe(resolve(process.execPath).toLowerCase());
     expect(Number(/^v(\d+)\./.exec(descriptor.nodeVersion)?.[1])).toBeGreaterThanOrEqual(24);
-    expect(descriptor.startupArguments).toEqual([
+    expect(descriptor.nodeArguments).toEqual([
+      "--title=ReforgerForge-MCP-codex",
+    ]);
+    expect(descriptor.hostArguments).toEqual([
+      "--mcp-client-label",
+      "codex",
+    ]);
+    expect(descriptor.configurationArguments).toEqual([
       "--workbench-addon-dir", resolve(addonRoot),
       "--workbench-script-authorize-all",
       "--observer-evidence-root", resolve(evidenceRoot),
@@ -192,6 +202,7 @@ describe("shared project MCP stdio launcher", () => {
 
     const verified = runScript(sharedLauncher, [
       "-Mode", "Verify",
+      "-ClientLabel", "cursor",
       "-WorkbenchAddonDir", addonRoot,
     ], environment);
     expect(verified.error).toBeUndefined();
@@ -200,11 +211,14 @@ describe("shared project MCP stdio launcher", () => {
     expect(verified.stderr).toBe("");
     const verifyInvocation = readFileSync(capturePath, "utf8");
     expect(verifyInvocation).toContain("scripts\\verify-mcp-server.mjs");
+    expect(verifyInvocation).toContain("--title=ReforgerForge-MCP-cursor");
+    expect(verifyInvocation).toContain("--mcp-client-label cursor");
     expect(verifyInvocation).toContain("--workbench-addon-dir");
     expect(verifyInvocation).toContain(resolve(addonRoot));
 
     rmSync(capturePath, { force: true });
     const served = runScript(sharedLauncher, [
+      "-ClientLabel", "cursor",
       "-WorkbenchAddonDir", addonRoot,
     ], environment);
     expect(served.error).toBeUndefined();
@@ -213,8 +227,78 @@ describe("shared project MCP stdio launcher", () => {
     expect(served.stderr).toBe("");
     const serveInvocation = readFileSync(capturePath, "utf8");
     expect(serveInvocation).toContain("dist\\index.js");
+    expect(serveInvocation).toContain("--title=ReforgerForge-MCP-cursor");
+    expect(serveInvocation).toContain("--mcp-client-label cursor");
     expect(serveInvocation).not.toContain("verify-mcp-server.mjs");
     expect(serveInvocation).toContain(resolve(addonRoot));
+    const sharedMarker = "--mcp-client-label cursor";
+    expect(serveInvocation.slice(serveInvocation.indexOf(sharedMarker))).toBe(
+      verifyInvocation.slice(verifyInvocation.indexOf(sharedMarker))
+    );
+  });
+
+  windowsIt("forwards an explicit bounded idle timeout identically without inventing a default", () => {
+    const root = temporaryRoot();
+    const nodePath = fakeNode(root);
+    const capturePath = join(root, "capture.txt");
+    const environment = {
+      REFORGER_FORGE_NODE_PATH: nodePath,
+      LAUNCHER_CAPTURE_PATH: capturePath,
+    };
+
+    const described = runScript(sharedLauncher, [
+      "-Mode", "Describe",
+      "-McpIdleShutdownMs", "60000",
+    ], environment);
+    expect(described.status, described.stderr).toBe(0);
+    expect((JSON.parse(described.stdout) as LauncherDescriptor).configurationArguments).toEqual([
+      "--mcp-idle-shutdown-ms",
+      "60000",
+    ]);
+
+    const describedMaximum = runScript(sharedLauncher, [
+      "-Mode", "Describe",
+      "-McpIdleShutdownMs", "86400000",
+    ], environment);
+    expect(describedMaximum.status, describedMaximum.stderr).toBe(0);
+    expect((JSON.parse(describedMaximum.stdout) as LauncherDescriptor).configurationArguments).toEqual([
+      "--mcp-idle-shutdown-ms",
+      "86400000",
+    ]);
+
+    const verified = runScript(sharedLauncher, [
+      "-Mode", "Verify",
+      "-McpIdleShutdownMs", "60000",
+    ], environment);
+    expect(verified.status, verified.stderr).toBe(0);
+    const verifyInvocation = readFileSync(capturePath, "utf8");
+    expect(verifyInvocation).toContain(
+      "--mcp-idle-shutdown-ms 60000"
+    );
+
+    rmSync(capturePath, { force: true });
+    const served = runScript(sharedLauncher, [
+      "-McpIdleShutdownMs", "60000",
+    ], environment);
+    expect(served.status, served.stderr).toBe(0);
+    const serveInvocation = readFileSync(capturePath, "utf8");
+    expect(serveInvocation).toContain(
+      "--mcp-idle-shutdown-ms 60000"
+    );
+    const sharedMarker = "--mcp-idle-shutdown-ms 60000";
+    expect(serveInvocation.slice(serveInvocation.indexOf(sharedMarker))).toBe(
+      verifyInvocation.slice(verifyInvocation.indexOf(sharedMarker))
+    );
+
+    for (const rejectedValue of ["59999", "60000.5", "86400001"]) {
+      const rejected = runScript(sharedLauncher, [
+        "-Mode", "Describe",
+        "-McpIdleShutdownMs", rejectedValue,
+      ], environment);
+      expect(rejected.status, rejectedValue).not.toBe(0);
+      expect(rejected.stdout, rejectedValue).toBe("");
+      expect(rejected.stderr, rejectedValue).toContain(rejectedValue);
+    }
   });
 
   windowsIt("fails closed when the authoritative Node override is older than v24", () => {
@@ -279,11 +363,11 @@ describe("workspace project MCP launcher contract", () => {
       expect(result.status, `${launcher}\n${result.stderr}`).toBe(0);
       const descriptor = JSON.parse(result.stdout) as LauncherDescriptor;
       expect(descriptor.serverPath).toBe(join(repositoryRoot, "dist", "index.js"));
-      expect(descriptor.startupArguments).not.toContain(workspaceAddonsRoot);
+      expect(descriptor.configurationArguments).not.toContain(workspaceAddonsRoot);
 
       const dependencyAudit = auditWorkbenchAddonDependencies({
         targetGprojPath: project,
-        addonRoots: describedAddonRoots(descriptor.startupArguments),
+        addonRoots: describedAddonRoots(descriptor.configurationArguments),
       });
       const unresolvedLocalDependencies = dependencyAudit.missingGuids.filter(
         (guid) => localProjectGuids.has(guid)
@@ -297,15 +381,15 @@ describe("workspace project MCP launcher contract", () => {
         `${launcher}: local project dependencies resolve ambiguously`
       ).toEqual([]);
 
-      for (let index = 0; index < descriptor.startupArguments.length; index += 1) {
-        const argument = descriptor.startupArguments[index]!;
+      for (let index = 0; index < descriptor.configurationArguments.length; index += 1) {
+        const argument = descriptor.configurationArguments[index]!;
         if (argument === "--workbench-script-authorize-all") continue;
         expect([
           "--workbench-addon-dir",
           "--observer-evidence-root",
           "--observer-supporting-log-root",
         ]).toContain(argument);
-        const path = descriptor.startupArguments[++index];
+        const path = descriptor.configurationArguments[++index];
         expect(path, `${launcher}: ${argument} has no path`).toBeDefined();
         expect(existsSync(path!), `${launcher}: ${path} does not exist`).toBe(true);
       }

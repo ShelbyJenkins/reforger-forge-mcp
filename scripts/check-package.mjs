@@ -306,6 +306,17 @@ const requiredFiles = [
   "docs/release-notes/RELEASE_NOTES_v1.2.0.md",
   "docs/runner-cli.md",
   "dist/index.js",
+  "dist/mcp-host-admission.js",
+  "dist/mcp-host-identity.js",
+  "dist/mcp-idle-readiness.js",
+  "dist/mcp-activity-transport.js",
+  "dist/mcp-idle-shutdown.js",
+  "dist/mcp-stdio-server.js",
+  "dist/launch/game-launch-planning-isolation.js",
+  "dist/launch/game-launch-planning-worker.js",
+  "dist/launch/game-launch-revalidation-isolation.js",
+  "dist/launch/game-launch-revalidation-worker.js",
+  "dist/platform/windows/same-handle-file.js",
   "dist/observer/agent/artifacts.js",
   "dist/observer/agent/application.js",
   "dist/observer/agent/application-operations.js",
@@ -325,6 +336,7 @@ const requiredFiles = [
   "dist/observer/evidence-run-service.js",
   "dist/observer/host-diagnostics.js",
   "dist/observer/launch.js",
+  "dist/observer/game-launch-attempt.js",
   "dist/observer/owned-runtime-manager.js",
   "dist/observer/setup.js",
   "dist/observer/tools.js",
@@ -340,6 +352,9 @@ const requiredFiles = [
   "dist/workbench/activity-gate.js",
   "dist/workbench/client.js",
   "dist/workbench/diagnostics.js",
+  "dist/workbench/existing-lmdb-reader.js",
+  "dist/workbench/existing-lmdb-reader-protocol.js",
+  "dist/workbench/existing-lmdb-reader-worker.js",
   "dist/workbench/helper-addon.js",
   "dist/workbench/helper-addon-payload.generated.js",
   "dist/workbench/launch-plan.js",
@@ -396,6 +411,7 @@ const requiredFiles = [
   "scripts/setup.ps1",
   "scripts/start-mcp-stdio.ps1",
   "scripts/windows/runtime-focus-guard.ps1",
+  "scripts/windows/same-handle-file-read.ps1",
   "scripts/windows/workbench-lifecycle.ps1",
   "tests/fixtures/enforce-mailbox-acceptance-addon/addon.gproj",
   "tests/fixtures/enforce-mailbox-acceptance-addon/Scripts/WorkbenchGame/RFO_MailboxAcceptancePlugin.c",
@@ -509,6 +525,37 @@ if (missingFiles.length || missingPrefixes.length || legacyPackagedHandlers.leng
     );
   }
   const installedManifest = JSON.parse(readFileSync(installedManifestPath, "utf8"));
+  if (process.platform === "win32") {
+    const installedSameHandleModulePath = join(
+      installedPackageRoot,
+      "dist",
+      "platform",
+      "windows",
+      "same-handle-file.js"
+    );
+    const sameHandleProbe = spawnSync(process.execPath, [
+      "--input-type=module",
+      "--eval",
+      `import { readWindowsSameHandleFile } from ${JSON.stringify(pathToFileURL(installedSameHandleModulePath).href)};
+const result = readWindowsSameHandleFile(${JSON.stringify(installedManifestPath)}, {
+  maximumBytes: 1024 * 1024,
+  includeBytes: false,
+});
+if (result.finalPath !== ${JSON.stringify(installedManifestPath)} ||
+    !/^[1-9]\\d*$/.test(result.volumeIdentity) ||
+    !/^[1-9]\\d*$/.test(result.fileId) ||
+    !/^[0-9a-f]{64}$/.test(result.sha256) || result.bytes !== undefined) process.exitCode = 1;`,
+    ], {
+      cwd: installRoot,
+      encoding: "utf8",
+      env: npmEnvironment,
+      timeout: 30_000,
+      maxBuffer: 8 * 1024 * 1024,
+    });
+    if (sameHandleProbe.error || sameHandleProbe.status !== 0) {
+      throw commandFailure("Installed Windows same-handle evidence probe", sameHandleProbe);
+    }
+  }
   verifyPackagedAddonInventory(join(installedPackageRoot, "observer", "addon"), {
     manifestName: ".reforger-forge-observer-source.json",
     displayName: "Packaged observer add-on",

@@ -9,6 +9,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   findWorkbenchCompileFailure,
+  formatWorkbenchCompileFailure,
   parseWorkbenchCompileFailure,
 } from "../../src/workbench/compile-diagnostics.js";
 
@@ -103,5 +104,22 @@ describe("Workbench project compile diagnostics", () => {
       launchedAtMs: Date.now(),
       ownerArgument: "-reforgerForgeOwnerToken=11111111-1111-4111-8111-111111111111",
     })).toBeNull();
+  });
+
+  it("preserves the compile diagnostic while naming one exact wb_check call", () => {
+    const failure = {
+      code: "PROJECT_COMPILE_FAILED" as const,
+      module: "Game",
+      diagnostics: ["Scripts/Game/Broken.c(7): Expected ';'"],
+      logPath: "C:\\managed\\logs\\script.log",
+    };
+    const gprojPath = "C:\\mods\\quoted \\\"project\\\"\\Example.gproj";
+    const original = formatWorkbenchCompileFailure(failure);
+    const rendered = formatWorkbenchCompileFailure(failure, gprojPath);
+
+    expect(rendered.startsWith(original)).toBe(true);
+    expect(rendered).toContain("call wb_check with");
+    expect(rendered).toContain(JSON.stringify({ gprojPath }));
+    expect(rendered.match(/wb_check/g)).toHaveLength(1);
   });
 });

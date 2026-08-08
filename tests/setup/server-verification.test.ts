@@ -12,6 +12,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Config } from "../../src/config.js";
 import type { SteamDiscoveryResult } from "../../src/platform/windows/steam-discovery.js";
 import {
+  formatServerVerificationReport,
   inspectToolRegistration,
   isServerVerificationSuccessful,
   serializeServerVerificationReport,
@@ -60,6 +61,7 @@ const config: Config = {
   patternsDir: "C:\\Package\\data\\patterns",
   workbenchHost: "127.0.0.1",
   workbenchPort: 5775,
+  mcpIdleShutdownMs: 1_800_000,
   debug: false,
 };
 
@@ -78,6 +80,7 @@ const observerNames = [
 
 const validTools = [
   ...observerNames.map((name) => ({ name, description: `${name} description` })),
+  { name: "game_launch", description: "Owned game launch composite description" },
   {
     name: "mod",
     description: "mod description",
@@ -140,12 +143,14 @@ function harness(): Harness {
 async function verify(
   fixture: Harness,
   root = temporaryRoot(),
-  startupArguments: readonly string[] = []
+  startupArguments: readonly string[] = [],
+  hostClientLabel = "manual"
 ): Promise<ServerVerificationReport> {
   return verifyMcpServer({
     packageRoot: root,
     packageVersion: "1.1.0",
     startupArguments,
+    hostClientLabel,
     nodeVersion: "v22.17.0",
   }, fixture.dependencies);
 }
@@ -162,13 +167,14 @@ describe("server verification core", () => {
       "--debug",
     ];
 
-    const report = await verify(fixture, root, startupArguments);
+    const report = await verify(fixture, root, startupArguments, "codex");
 
     expect(report).toMatchObject({
-      schemaVersion: 1,
+      schemaVersion: 3,
       generatedAt: "2026-07-24T12:00:00.000Z",
       success: true,
       nodeVersion: "v22.17.0",
+      nodePath: resolve("C:\\Node\\node.exe"),
       serverPath: resolve(root, "dist", "index.js"),
       packageVersion: "1.1.0",
       configPath: resolve(root, "config files", "settings.json"),
@@ -185,6 +191,7 @@ describe("server verification core", () => {
         workbenchAddonDirs: config.workbenchAddonDirs,
         workbenchHost: "127.0.0.1",
         workbenchPort: 5775,
+        mcpIdleShutdownMs: 1_800_000,
       },
       serverHandshake: { status: "passed" },
       toolRegistration: {
@@ -193,6 +200,12 @@ describe("server verification core", () => {
       },
     });
     expect(report.startupArguments).toEqual(startupArguments);
+    expect(formatServerVerificationReport(report)).toContain(
+      "MCP idle:   1800000 ms"
+    );
+    expect(formatServerVerificationReport(report)).toContain(
+      `Node path:  ${resolve("C:\\Node\\node.exe")}`
+    );
     expect(fixture.discoverSteam).toHaveBeenCalledOnce();
     expect(fixture.loadConfiguration).toHaveBeenCalledOnce();
     expect(fixture.loadConfiguration.mock.calls[0][0]).toEqual(startupArguments);
@@ -202,7 +215,9 @@ describe("server verification core", () => {
     expect(fixture.loadConfiguration.mock.calls[0][1].discoverSteam()).toBe(discovery);
     expect(fixture.createSession).toHaveBeenCalledWith({
       command: "C:\\Node\\node.exe",
+      nodeArguments: ["--title=ReforgerForge-MCP-codex"],
       serverPath: resolve(root, "dist", "index.js"),
+      hostArguments: ["--mcp-client-label", "codex"],
       startupArguments,
       cwd: resolve(root),
       packageVersion: "1.1.0",
@@ -343,6 +358,16 @@ describe("tool surface inspection", () => {
     });
   });
 
+  it("requires game_launch separately from the ten observer primitives", () => {
+    const result = inspectToolRegistration(
+      validTools.filter((tool) => tool.name !== "game_launch"),
+    );
+    expect(result.status).toBe("failed");
+    expect(result.issues).toContain(
+      "Required observer composites missing at runtime: game_launch",
+    );
+  });
+
   it("returns sorted names and actionable contract issues", () => {
     const result = inspectToolRegistration([
       ...validTools,
@@ -401,12 +426,25 @@ describe("verification report output", () => {
       [
         "import { writeFile } from 'node:fs/promises';",
         "export async function verifyMcpServer(options) {",
-        "  return { success: true, packageVersion: options.packageVersion, startupArguments: [...options.startupArguments] };",
+        "  return { success: true, packageVersion: options.packageVersion, hostClientLabel: options.hostClientLabel, startupArguments: [...options.startupArguments] };",
         "}",
         "export function serializeServerVerificationReport(report) { return JSON.stringify(report) + '\\n'; }",
         "export function formatServerVerificationReport() { return 'human output\\n'; }",
         "export function isServerVerificationSuccessful(report) { return report.success; }",
         "export async function writeServerVerificationReportAtomic(path, report) { await writeFile(path, serializeServerVerificationReport(report)); }",
+      ].join("\n")
+    );
+    writeFileSync(
+      join(root, "dist", "mcp-host-identity.js"),
+      [
+        "export function partitionMcpHostArguments(argv) {",
+        "  const remainingArguments = []; let clientLabel = 'manual';",
+        "  for (let index = 0; index < argv.length; index += 1) {",
+        "    if (argv[index] === '--mcp-client-label') { clientLabel = argv[++index]; }",
+        "    else remainingArguments.push(argv[index]);",
+        "  }",
+        "  return { clientLabel, remainingArguments };",
+        "}",
       ].join("\n")
     );
     const reportPath = join(root, "machine-report.json");
@@ -419,7 +457,12 @@ describe("verification report output", () => {
     ];
     const jsonRun = spawnSync(
       process.execPath,
-      [join(scripts, "verify-mcp-server.mjs"), ...opaqueArguments],
+      [
+        join(scripts, "verify-mcp-server.mjs"),
+        "--mcp-client-label",
+        "setup",
+        ...opaqueArguments,
+      ],
       {
         cwd: tmpdir(),
         encoding: "utf8",
@@ -436,11 +479,13 @@ describe("verification report output", () => {
     expect(jsonRun.stderr).toBe("");
     const parsed = JSON.parse(jsonRun.stdout) as {
       packageVersion: string;
+      hostClientLabel: string;
       startupArguments: string[];
     };
     expect(parsed).toEqual({
       success: true,
       packageVersion: "9.8.7",
+      hostClientLabel: "setup",
       startupArguments: opaqueArguments,
     });
     expect(readFileSync(reportPath, "utf8")).toBe(jsonRun.stdout);

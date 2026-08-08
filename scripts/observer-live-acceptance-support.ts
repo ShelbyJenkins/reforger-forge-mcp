@@ -803,22 +803,28 @@ export function buildOperationalBaselineArtifact(input: Omit<
         throw new Error("A passed Workbench baseline is missing required lifecycle/NET API evidence");
       }
     } else {
-      const launch = passed(
-        "launch",
-        "OwnedRuntimeManager.start/status(running)",
-        "running_confirmation"
-      );
-      const managed = passed(
-        "managed_call",
-        "OwnedRuntimeManager.status",
-        "representative_status_api"
-      );
-      const termination = passed("shutdown", "OwnedRuntimeManager.stop", "termination");
-      const cleanup = passed("shutdown", "OwnedRuntimeManager.stop", "observer_cleanup");
-      if (!launch || !managed || !termination || !cleanup ||
-          termination.observations?.terminationComplete !== true ||
-          termination.observations?.identityVacant !== true ||
-          cleanup.observations?.observerCleanupPending !== false) {
+      const runtimeLifecycleRoutes = [
+        {
+          launch: "game_launch start/status(running)",
+          managed: "game_launch status",
+          stop: "game_launch stop",
+        },
+        {
+          launch: "OwnedRuntimeManager.start/status(running)",
+          managed: "OwnedRuntimeManager.status",
+          stop: "OwnedRuntimeManager.stop",
+        },
+      ] as const;
+      const lifecycle = runtimeLifecycleRoutes.map((route) => ({
+        launch: passed("launch", route.launch, "running_confirmation"),
+        managed: passed("managed_call", route.managed, "representative_status_api"),
+        termination: passed("shutdown", route.stop, "termination"),
+        cleanup: passed("shutdown", route.stop, "observer_cleanup"),
+      })).find((route) => route.launch && route.managed && route.termination && route.cleanup);
+      if (!lifecycle ||
+          lifecycle.termination?.observations?.terminationComplete !== true ||
+          lifecycle.termination.observations?.identityVacant !== true ||
+          lifecycle.cleanup?.observations?.observerCleanupPending !== false) {
         throw new Error("A passed runtime baseline is missing required lifecycle/cleanup evidence");
       }
     }

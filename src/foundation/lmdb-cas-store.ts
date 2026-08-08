@@ -3,7 +3,11 @@ import { join } from "node:path";
 import type { DurableRecordCodec } from "./durable-kv.js";
 import { sha256Hex } from "./digest.js";
 import { atomicWriteFile } from "./json-store.js";
-import { LmdbDurableKvStore, type LmdbEnvironment } from "./lmdb-store.js";
+import {
+  LmdbDurableKvStore,
+  type LmdbEnvironment,
+  type LmdbExistingInspection,
+} from "./lmdb-store.js";
 
 export type LmdbCasInspection<T> =
   | { kind: "missing" }
@@ -97,7 +101,6 @@ export class LmdbCasStore<T> {
     this.syntheticPath = join(options.corruptArchiveDir, `${options.recordLabel}.json`);
     this.beforeCompareAndSwap = options.beforeCompareAndSwap;
     this.afterCompareAndSwap = options.afterCompareAndSwap;
-    mkdirSync(this.corruptArchiveDir, { recursive: true, mode: 0o700 });
   }
 
   async inspect(): Promise<LmdbCasInspection<T>> {
@@ -111,6 +114,31 @@ export class LmdbCasStore<T> {
       path: this.syntheticPath,
       rawSha256: inspected.rawSha256,
       message: inspected.message,
+    };
+  }
+
+  /** Inspect a record without creating a missing LMDB or archive directory. */
+  async inspectExisting(
+    options: { readonly retainOpen?: boolean } = {},
+  ): Promise<LmdbExistingInspection<LmdbCasInspection<T>>> {
+    const existing = await this.store.inspectExisting(this.key, options);
+    if (existing.kind === "missing") return existing;
+    const inspected = existing.value;
+    if (inspected.kind === "missing") return { kind: "available", value: { kind: "missing" } };
+    if (inspected.kind === "valid") {
+      return {
+        kind: "available",
+        value: { kind: "versioned", value: inspected.value, generation: this.generationOf(inspected.value) },
+      };
+    }
+    return {
+      kind: "available",
+      value: {
+        kind: "corrupt",
+        path: this.syntheticPath,
+        rawSha256: inspected.rawSha256,
+        message: inspected.message,
+      },
     };
   }
 
@@ -191,6 +219,7 @@ export class LmdbCasStore<T> {
       throw new LmdbCasStoreError("ARCHIVE_MISMATCH", "LMDB record changed before archival.");
     }
     assertCommitAllowed?.();
+    mkdirSync(this.corruptArchiveDir, { recursive: true, mode: 0o700 });
     atomicWriteFile({
       root: this.corruptArchiveDir,
       targetPath: archivePath,

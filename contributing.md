@@ -26,6 +26,13 @@ to each supported client.
    testing the rebuilt code through that client
 7. Open a pull request
 
+`npm test` runs the complete suite without file-level parallelism. Several
+lifecycle tests exercise shared Windows process, mutex, and endpoint state, so
+the default command intentionally matches the serial acceptance run. The real
+multi-process lifecycle handoff test also requires that no unowned Workbench
+process is running; when Workbench is already open, the test records an explicit
+`UNOWNED_WORKBENCH` precondition skip instead of reporting a lifecycle failure.
+
 An already-running stdio MCP process does not reload files changed by
 `npm run build`. The verification command starts a separate fresh process; it
 does not update the server already connected to an AI client. `wb_restart`

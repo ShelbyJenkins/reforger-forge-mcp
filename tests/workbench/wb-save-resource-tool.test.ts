@@ -32,6 +32,7 @@ function config(): Config {
     patternsDir: "C:\\ReforgerForge\\data\\patterns",
     workbenchHost: "127.0.0.1",
     workbenchPort: 5775,
+    mcpIdleShutdownMs: 1_800_000,
   };
 }
 
@@ -83,7 +84,10 @@ describe("wb_save_resource MCP tool", () => {
     expect(result.isError).toBe(true);
     expect(text).toContain("**Explicit Save Refused**");
     expect(text).toContain("`TARGET_SESSION_REQUIRED`");
+    expect(text).toContain("`TARGET_SESSION_REQUIRED` — ");
+    expect(text).not.toContain("â€”");
     expect(text).toContain("resourcePath is required");
+    expect(text.match(/Next action:/g)).toHaveLength(1);
     expect(saveResource).not.toHaveBeenCalled();
   });
 
@@ -129,6 +133,36 @@ describe("wb_save_resource MCP tool", () => {
 
     expect(result.isError).toBe(true);
     expect(resultText(result)).toContain("`TARGET_SESSION_REQUIRED`");
+    expect(resultText(result)).not.toContain("Next action:");
     expect(saveResource).toHaveBeenCalledWith("C:\\Mods\\Example\\Worlds\\Target.ent");
+  });
+
+  it("never turns an uncertain save outcome into success or retry advice", async () => {
+    const diagnostic =
+      "Explicit save outcome is uncertain; shut down and relaunch the exact target before saving again.";
+    const saveResource = vi.fn(async () => {
+      throw new WorkbenchError(
+        diagnostic,
+        "SAVE_OUTCOME_UNCERTAIN",
+        { kind: "message_owns_recovery" }
+      );
+    });
+    const client = {
+      saveResource,
+      state: { connected: true, mode: "edit", lastUpdated: 0 },
+    } as unknown as WorkbenchClient;
+    const tool = register(client, config());
+
+    const result = await tool!.handler({
+      confirm: "save",
+      resourcePath: "C:\\Mods\\Example\\Worlds\\Target.ent",
+    });
+    const text = resultText(result);
+
+    expect(result.isError).toBe(true);
+    expect(text).toContain("`SAVE_OUTCOME_UNCERTAIN` — ");
+    expect(text).toContain(diagnostic);
+    expect(text).not.toContain("Next action:");
+    expect(text).not.toContain("Complete");
   });
 });

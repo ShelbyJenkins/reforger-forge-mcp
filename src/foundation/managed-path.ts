@@ -76,6 +76,34 @@ export function pathComparisonKey(path: string): string {
   return absolute.toLowerCase();
 }
 
+/**
+ * Exact key for paths already returned by `realpathSync.native`.
+ *
+ * Native realpath collapses spelling aliases on ordinary case-insensitive
+ * Windows directories while preserving distinct entries beneath a
+ * case-sensitive directory. Security boundaries that operate on canonical
+ * existing paths must retain that distinction instead of lowercasing it.
+ */
+export function canonicalPathComparisonKey(path: string): string {
+  return resolve(path);
+}
+
+/**
+ * Segment-boundary containment for canonical native paths.
+ *
+ * `node:path.relative` follows the platform's default Windows case-folding,
+ * which is not valid beneath per-directory case-sensitive Windows trees.
+ * Callers must pass paths already canonicalized with native realpath (or a
+ * prospective tail whose nearest existing ancestor was canonicalized).
+ */
+export function isCanonicalPathContained(root: string, candidate: string): boolean {
+  const canonicalRoot = canonicalPathComparisonKey(root);
+  const canonicalCandidate = canonicalPathComparisonKey(candidate);
+  if (canonicalCandidate === canonicalRoot) return true;
+  const prefix = canonicalRoot.endsWith(sep) ? canonicalRoot : `${canonicalRoot}${sep}`;
+  return canonicalCandidate.startsWith(prefix);
+}
+
 /** Prefix-safe containment; unlike `startsWith`, sibling names cannot collide. */
 export function isPathContained(root: string, candidate: string): boolean {
   const rel = relative(pathComparisonKey(root), pathComparisonKey(candidate));

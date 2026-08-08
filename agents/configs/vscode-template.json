@@ -4,7 +4,10 @@
       "type": "stdio",
       "command": "node",
       "args": [
-        "REPLACE_WITH_ABSOLUTE_PATH/dist/index.js"
+        "--title=ReforgerForge-MCP-vscode",
+        "REPLACE_WITH_ABSOLUTE_PATH/dist/index.js",
+        "--mcp-client-label",
+        "vscode"
       ]
     }
   }

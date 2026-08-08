@@ -4,6 +4,7 @@ import { homedir, platform } from "node:os";
 import { isIP } from "node:net";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { parseMcpInstanceId } from "../mcp-host-identity.js";
 import type {
   ExactProcessBackend,
   ExactProcessInspection,
@@ -37,6 +38,11 @@ import {
   type WindowsExactProcessBackendFailureCode,
   type WindowsHelperResponse,
 } from "../platform/windows/exact-process-backend.js";
+import {
+  inspectWorkbenchLmdbExistingIsolated,
+  WorkbenchExistingLmdbIsolationError,
+} from "./existing-lmdb-reader.js";
+import type { WorkbenchExistingLmdbWireSnapshot } from "./existing-lmdb-reader-protocol.js";
 
 export type { ExactProcessIdentity } from "../foundation/identity.js";
 
@@ -139,6 +145,8 @@ export interface WorkbenchSpawnMetadata {
   purpose: WorkbenchSpawnPurpose;
   lifecycleGeneration: string;
   targetKey: string;
+  /** Trusted process-wide host UUID. Optional only for retained v3 compatibility. */
+  originMcpInstanceId?: string;
 }
 
 export type WorkbenchSpawnRecord = RecoverableSpawnRecord<
@@ -163,6 +171,17 @@ export type LifecycleStateRead =
   | { kind: "missing" }
   | { kind: "valid"; state: WorkbenchLifecycleStateV3 }
   | { kind: "malformed"; path: string; rawSha256: string; message: string };
+
+export interface WorkbenchExistingStateSnapshot {
+  readonly lifecycle: LifecycleStateRead;
+  readonly journal: WorkbenchSpawnJournalRead;
+}
+
+export interface WorkbenchExistingStateInspectionOptions {
+  readonly signal?: AbortSignal;
+  /** Per-reader process budget, capped by the isolation boundary at five seconds. */
+  readonly timeoutMs?: number;
+}
 
 export interface ExpectedStateVersion {
   generation: string;
@@ -292,6 +311,8 @@ export interface WorkbenchProcessGuardOptions {
   operationDeadlineAtMs?: () => number | undefined;
   backend?: WorkbenchLifecycleBackend;
   helperPath?: string;
+  /** Trusted process-wide MCP identity; standalone guards retain a random default. */
+  mcpInstanceId?: string;
   /**
    * Test-only injection seam fired immediately before the lifecycle record
    * is written. Returning an Error aborts the write, propagating exactly as
@@ -411,7 +432,7 @@ function isMcpOwner(value: unknown): value is McpOwnerIdentity {
   if (!value || typeof value !== "object") return false;
   const owner = value as Partial<McpOwnerIdentity>;
   return parseExactIdentity(owner) !== null &&
-    isString(owner.instanceId) && isString(owner.leaseId) && isString(owner.userSid) &&
+    isValidMcpInstanceId(owner.instanceId) && isString(owner.leaseId) && isString(owner.userSid) &&
     typeof owner.claimedAtMs === "number" && Number.isFinite(owner.claimedAtMs) && owner.claimedAtMs > 0;
 }
 
@@ -444,7 +465,7 @@ function isCompanionState(value: unknown): value is WorkbenchCompanionLifecycleS
     typeof companion.profilePath === "string" && isAbsolute(companion.profilePath);
 }
 
-function parseLifecycleState(value: unknown): WorkbenchLifecycleStateV3 | null {
+export function parseLifecycleState(value: unknown): WorkbenchLifecycleStateV3 | null {
   if (!value || typeof value !== "object") return null;
   const state = value as Partial<WorkbenchLifecycleStateV3>;
   if (state.version !== LIFECYCLE_VERSION || !isString(state.generation) ||
@@ -496,7 +517,18 @@ function isWorkbenchSpawnMetadata(value: unknown): value is WorkbenchSpawnMetada
     "runner_target_build",
   ].includes(String(metadata.purpose)) &&
     isString(metadata.lifecycleGeneration) &&
-    isString(metadata.targetKey);
+    isString(metadata.targetKey) &&
+    (metadata.originMcpInstanceId === undefined || isValidMcpInstanceId(metadata.originMcpInstanceId));
+}
+
+function isValidMcpInstanceId(value: unknown): value is string {
+  if (typeof value !== "string") return false;
+  try {
+    parseMcpInstanceId(value, "Workbench spawn-journal MCP instance ID");
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function parseWorkbenchSpawnRecord(value: unknown): WorkbenchSpawnRecord | null {
@@ -530,7 +562,7 @@ function parseWorkbenchSpawnRecord(value: unknown): WorkbenchSpawnRecord | null 
   } as WorkbenchSpawnRecord;
 }
 
-function parseWorkbenchSpawnJournalState(value: unknown): WorkbenchSpawnJournalStateV3 {
+export function parseWorkbenchSpawnJournalState(value: unknown): WorkbenchSpawnJournalStateV3 {
   if (!value || typeof value !== "object") {
     throw new TypeError("Workbench spawn journal must be an object.");
   }
@@ -887,7 +919,7 @@ class LifecycleSession implements WorkbenchLifecycleSession {
 
 export class WorkbenchProcessGuard {
   readonly stateDir: string;
-  readonly mcpInstanceId = randomUUID();
+  readonly mcpInstanceId: string;
   readonly leaseId = randomUUID();
   readonly backend: WorkbenchLifecycleBackend;
   private readonly mutexName: string;
@@ -902,8 +934,17 @@ export class WorkbenchProcessGuard {
   private durableEnvironment: LmdbEnvironment | null = null;
   private lifecycleCasStore: LmdbCasStore<WorkbenchLifecycleStateV3> | null = null;
   private spawnCasStore: LmdbCasStore<WorkbenchSpawnJournalStateV3> | null = null;
+  private existingInspectionAbort: AbortController | null = null;
+  private existingInspectionPromise: Promise<WorkbenchExistingStateSnapshot> | null = null;
+  private readonly dedicatedExistingInspectionAborts = new Set<AbortController>();
+  private readonly dedicatedExistingInspectionPromises =
+    new Set<Promise<WorkbenchExistingStateSnapshot>>();
+  private existingInspectionFailure: string | null = null;
 
   constructor(options: WorkbenchProcessGuardOptions = {}) {
+    this.mcpInstanceId = options.mcpInstanceId === undefined
+      ? randomUUID()
+      : parseMcpInstanceId(options.mcpInstanceId, "Workbench MCP instance ID");
     this.stateDir = resolve(options.stateDir ?? defaultStateDir());
     this.corruptDir = join(this.stateDir, "corrupt");
     this.mutexName = options.mutexName ?? DEFAULT_LIFECYCLE_MUTEX;
@@ -936,6 +977,12 @@ export class WorkbenchProcessGuard {
 
   /** Release the single LMDB environment backing lifecycle and spawn-journal state, if opened. */
   async close(): Promise<void> {
+    this.existingInspectionAbort?.abort();
+    for (const controller of this.dedicatedExistingInspectionAborts) controller.abort();
+    await Promise.all([
+      ...(this.existingInspectionPromise ? [this.existingInspectionPromise] : []),
+      ...this.dedicatedExistingInspectionPromises,
+    ].map((inspection) => inspection.catch(() => undefined)));
     await this.durableEnvironment?.close();
   }
 
@@ -1042,6 +1089,24 @@ export class WorkbenchProcessGuard {
     return this.lifecycleCasStore;
   }
 
+  private lifecycleExistingStore(): LmdbCasStore<WorkbenchLifecycleStateV3> {
+    return new LmdbCasStore({
+      storageRoot: this.stateDir,
+      environment: this.durableEnvironment ?? new LmdbEnvironment(this.stateDir),
+      key: encodeDurableKey("workbench", "lifecycle"),
+      recordLabel: "lifecycle",
+      schema: "workbench-lifecycle-v3",
+      maxRecordBytes: MAX_LIFECYCLE_STATE_BYTES,
+      corruptArchiveDir: this.corruptDir,
+      codec: jsonDurableRecordCodec((value) => {
+        const parsed = parseLifecycleState(value);
+        if (!parsed) throw new TypeError("Lifecycle state does not satisfy the strict version-3 schema.");
+        return parsed;
+      }),
+      generationOf: (state) => state.generation,
+    });
+  }
+
   private spawnStore(): LmdbCasStore<WorkbenchSpawnJournalStateV3> {
     this.spawnCasStore ??= new LmdbCasStore({
       storageRoot: this.stateDir,
@@ -1057,6 +1122,200 @@ export class WorkbenchProcessGuard {
       afterCompareAndSwap: this.afterSpawnJournalReplace,
     });
     return this.spawnCasStore;
+  }
+
+  private spawnExistingStore(): LmdbCasStore<WorkbenchSpawnJournalStateV3> {
+    return new LmdbCasStore({
+      storageRoot: this.stateDir,
+      environment: this.durableEnvironment ?? new LmdbEnvironment(this.stateDir),
+      key: encodeDurableKey("workbench", "spawn-journal"),
+      recordLabel: "spawn-journal",
+      schema: "workbench-spawn-journal-v3",
+      maxRecordBytes: MAX_SPAWN_JOURNAL_BYTES,
+      corruptArchiveDir: this.corruptDir,
+      codec: jsonDurableRecordCodec(parseWorkbenchSpawnJournalState),
+      generationOf: (state) => state.generation,
+    });
+  }
+
+  private unreadableExistingSnapshot(message: string): WorkbenchExistingStateSnapshot {
+    const diagnostic = message.slice(0, 512) || "Existing-only Workbench LMDB inspection failed.";
+    return {
+      lifecycle: {
+        kind: "malformed",
+        path: join(this.corruptDir, "lifecycle.json"),
+        rawSha256: "unreadable",
+        message: `Lifecycle state cannot be inspected: ${diagnostic}`,
+      },
+      journal: {
+        kind: "malformed",
+        path: join(this.corruptDir, "spawn-journal.json"),
+        rawSha256: "unreadable",
+        message: `Workbench spawn journal cannot be inspected: ${diagnostic}`,
+      },
+    };
+  }
+
+  private parseExistingWireSnapshot(
+    snapshot: WorkbenchExistingLmdbWireSnapshot,
+  ): WorkbenchExistingStateSnapshot {
+    let lifecycle: LifecycleStateRead;
+    if (snapshot.lifecycle.kind === "missing") {
+      lifecycle = { kind: "missing" };
+    } else if (snapshot.lifecycle.kind === "malformed") {
+      lifecycle = snapshot.lifecycle;
+    } else {
+      const state = parseLifecycleState(snapshot.lifecycle.state);
+      lifecycle = state
+        ? { kind: "valid", state }
+        : {
+            kind: "malformed",
+            path: join(this.corruptDir, "lifecycle.json"),
+            rawSha256: "unreadable",
+            message: "Isolated lifecycle projection failed strict version-3 validation.",
+          };
+    }
+
+    let journal: WorkbenchSpawnJournalRead;
+    if (snapshot.journal.kind === "missing") {
+      journal = { kind: "missing" };
+    } else if (snapshot.journal.kind === "malformed") {
+      journal = snapshot.journal;
+    } else {
+      try {
+        const state = parseWorkbenchSpawnJournalState({
+          version: 3,
+          generation: snapshot.journal.generation,
+          record: snapshot.journal.record,
+        });
+        journal = {
+          kind: "valid",
+          generation: state.generation,
+          record: state.record,
+        };
+      } catch {
+        journal = {
+          kind: "malformed",
+          path: join(this.corruptDir, "spawn-journal.json"),
+          rawSha256: "unreadable",
+          message: "Isolated spawn-journal projection failed strict version-3 validation.",
+        };
+      }
+    }
+    return { lifecycle, journal };
+  }
+
+  private async readExistingStateSnapshotFromOpenWriter(): Promise<WorkbenchExistingStateSnapshot> {
+    const lifecycle = await this.readLifecycleStateExistingOnlyDirect();
+    const journal = await this.readSpawnJournalExistingOnlyDirect();
+    return { lifecycle, journal };
+  }
+
+  private startExistingStateInspection(
+    options: WorkbenchExistingStateInspectionOptions,
+    preserveTransientFailure = false,
+  ): {
+    readonly controller: AbortController;
+    readonly promise: Promise<WorkbenchExistingStateSnapshot>;
+  } {
+    const controller = new AbortController();
+    const forwardAbort = (): void => controller.abort(options.signal?.reason);
+    options.signal?.addEventListener("abort", forwardAbort, { once: true });
+    if (options.signal?.aborted) forwardAbort();
+    const promise = inspectWorkbenchLmdbExistingIsolated(this.stateDir, {
+      signal: controller.signal,
+      timeoutMs: options.timeoutMs,
+      ...(preserveTransientFailure ? { requireCloseBeforeSettlement: true } : {}),
+    }).then(
+      (snapshot) => this.parseExistingWireSnapshot(snapshot),
+      (error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error);
+        const transient = error instanceof WorkbenchExistingLmdbIsolationError &&
+          ["CANCELLED", "TIMEOUT"].includes(error.code);
+        if (transient && preserveTransientFailure) throw error;
+        if (!transient) {
+          // A native access violation is observed only as abnormal worker exit.
+          // Retain that failure so a silent host cannot create a crash storm on
+          // every later idle probe. Opening this guard's writer clears it.
+          this.existingInspectionFailure = message.slice(0, 512);
+        }
+        return this.unreadableExistingSnapshot(message);
+      },
+    ).finally(() => {
+      options.signal?.removeEventListener("abort", forwardAbort);
+    });
+    return { controller, promise };
+  }
+
+  /**
+   * Read both existing Workbench records through one crash-isolated process.
+   * A host that already owns an open writer can safely reuse that exact handle;
+   * a fresh host never maps the live environment in its own address space.
+   */
+  async readExistingStateSnapshot(
+    options: WorkbenchExistingStateInspectionOptions = {},
+  ): Promise<WorkbenchExistingStateSnapshot> {
+    if (this.durableEnvironment?.hasOpenWriter) {
+      this.existingInspectionFailure = null;
+      return this.readExistingStateSnapshotFromOpenWriter();
+    }
+    if (this.existingInspectionFailure) {
+      return this.unreadableExistingSnapshot(this.existingInspectionFailure);
+    }
+    if (this.existingInspectionPromise) return this.existingInspectionPromise;
+
+    const started = this.startExistingStateInspection(options);
+    this.existingInspectionAbort = started.controller;
+    const inspection = started.promise.finally(() => {
+      if (this.existingInspectionPromise === inspection) {
+        this.existingInspectionPromise = null;
+        this.existingInspectionAbort = null;
+      }
+    });
+    this.existingInspectionPromise = inspection;
+    return inspection;
+  }
+
+  /**
+   * Perform one request-owned existing-state inspection.
+   *
+   * Unlike the idle-probe cache, this boundary never inherits or cancels a
+   * different caller's reader. Fresh hosts receive a dedicated killable
+   * process; an owner with an open writer reuses that exact LMDB handle and
+   * applies abort checks around the bounded direct snapshot.
+   */
+  async readExistingStateSnapshotOnce(
+    options: WorkbenchExistingStateInspectionOptions,
+  ): Promise<WorkbenchExistingStateSnapshot> {
+    if (options.signal?.aborted) {
+      throw new WorkbenchExistingLmdbIsolationError(
+        "CANCELLED",
+        "Existing-only Workbench LMDB inspection was cancelled.",
+      );
+    }
+    if (this.durableEnvironment?.hasOpenWriter) {
+      this.existingInspectionFailure = null;
+      const snapshot = await this.readExistingStateSnapshotFromOpenWriter();
+      if (options.signal?.aborted) {
+        throw new WorkbenchExistingLmdbIsolationError(
+          "CANCELLED",
+          "Existing-only Workbench LMDB inspection was cancelled.",
+        );
+      }
+      return snapshot;
+    }
+    if (this.existingInspectionFailure) {
+      return this.unreadableExistingSnapshot(this.existingInspectionFailure);
+    }
+    const inspection = this.startExistingStateInspection(options, true);
+    this.dedicatedExistingInspectionAborts.add(inspection.controller);
+    let tracked!: Promise<WorkbenchExistingStateSnapshot>;
+    tracked = inspection.promise.finally(() => {
+      this.dedicatedExistingInspectionAborts.delete(inspection.controller);
+      this.dedicatedExistingInspectionPromises.delete(tracked);
+    });
+    this.dedicatedExistingInspectionPromises.add(tracked);
+    return tracked;
   }
 
   async readLifecycleState(): Promise<LifecycleStateRead> {
@@ -1079,6 +1338,32 @@ export class WorkbenchProcessGuard {
       rawSha256: inspected.rawSha256,
       message: inspected.message,
     };
+  }
+
+  /** Read lifecycle evidence without creating a missing state or LMDB path. */
+  async readLifecycleStateExistingOnly(): Promise<LifecycleStateRead> {
+    return (await this.readExistingStateSnapshot()).lifecycle;
+  }
+
+  private async readLifecycleStateExistingOnlyDirect(): Promise<LifecycleStateRead> {
+    try {
+      const existing = await this.lifecycleExistingStore().inspectExisting();
+      if (existing.kind === "missing" || existing.value.kind === "missing") return { kind: "missing" };
+      if (existing.value.kind === "versioned") return { kind: "valid", state: existing.value.value };
+      return {
+        kind: "malformed",
+        path: existing.value.path,
+        rawSha256: existing.value.rawSha256,
+        message: existing.value.message,
+      };
+    } catch (error) {
+      return {
+        kind: "malformed",
+        path: join(this.corruptDir, "lifecycle.json"),
+        rawSha256: "unreadable",
+        message: `Lifecycle state cannot be inspected: ${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
   }
 
   async readSpawnJournal(): Promise<WorkbenchSpawnJournalRead> {
@@ -1109,6 +1394,40 @@ export class WorkbenchProcessGuard {
       rawSha256: inspected.rawSha256,
       message: inspected.message,
     };
+  }
+
+  /** Read spawn evidence without creating a missing state or LMDB path. */
+  async readSpawnJournalExistingOnly(): Promise<WorkbenchSpawnJournalRead> {
+    return (await this.readExistingStateSnapshot()).journal;
+  }
+
+  private async readSpawnJournalExistingOnlyDirect(): Promise<WorkbenchSpawnJournalRead> {
+    try {
+      const existing = await this.spawnExistingStore().inspectExisting();
+      if (existing.kind === "missing" || existing.value.kind === "missing") return { kind: "missing" };
+      if (existing.value.kind === "versioned") {
+        return {
+          kind: "valid",
+          generation: existing.value.generation,
+          record: existing.value.value.record,
+        };
+      }
+      return {
+        kind: "malformed",
+        path: existing.value.path,
+        rawSha256: existing.value.rawSha256,
+        message: existing.value.message,
+      };
+    } catch (error) {
+      return {
+        kind: "malformed",
+        path: join(this.corruptDir, "spawn-journal.json"),
+        rawSha256: "unreadable",
+        message: `Workbench spawn journal cannot be inspected: ${error instanceof Error
+          ? error.message
+          : String(error)}`,
+      };
+    }
   }
 
   async assertSpawnJournalReplaceable(): Promise<void> {
@@ -1163,6 +1482,13 @@ export class WorkbenchProcessGuard {
     let expectedGeneration: string | null | undefined;
     return {
       persist: async (previous, next) => {
+        const attributedNext: WorkbenchSpawnRecord = {
+          ...next,
+          metadata: {
+            ...next.metadata,
+            originMcpInstanceId: this.mcpInstanceId,
+          },
+        };
         let initialGeneration: string | null | undefined;
         if (previous === null) {
           const current = await this.readSpawnJournal();
@@ -1185,16 +1511,16 @@ export class WorkbenchProcessGuard {
             current.mcpOwner.instanceId === lifecycleAuthority.mcpOwner.instanceId &&
             current.mcpOwner.leaseId === lifecycleAuthority.mcpOwner.leaseId &&
             current.mcpOwner.userSid === lifecycleAuthority.mcpOwner.userSid;
-          const sameTarget = current?.target?.comparisonKey === next.metadata.targetKey &&
-            lifecycleAuthority.target?.comparisonKey === next.metadata.targetKey;
-          const publishedIdentityMatches = next.phase === "published" && current?.workbench &&
-            next.identity && processMatches(current.workbench, next.identity) &&
-            current.workbench.ownerTokenArgument === next.identity.ownerTokenArgument &&
-            current.workbench.launchedAtMs === next.identity.launchedAtMs;
-          const reservedGenerationMatches = next.phase !== "published" &&
+          const sameTarget = current?.target?.comparisonKey === attributedNext.metadata.targetKey &&
+            lifecycleAuthority.target?.comparisonKey === attributedNext.metadata.targetKey;
+          const publishedIdentityMatches = attributedNext.phase === "published" && current?.workbench &&
+            attributedNext.identity && processMatches(current.workbench, attributedNext.identity) &&
+            current.workbench.ownerTokenArgument === attributedNext.identity.ownerTokenArgument &&
+            current.workbench.launchedAtMs === attributedNext.identity.launchedAtMs;
+          const reservedGenerationMatches = attributedNext.phase !== "published" &&
             current?.generation === lifecycleAuthority.generation &&
-            next.metadata.lifecycleGeneration === lifecycleAuthority.generation;
-          if (next.metadata.lifecycleGeneration !== lifecycleAuthority.generation ||
+            attributedNext.metadata.lifecycleGeneration === lifecycleAuthority.generation;
+          if (attributedNext.metadata.lifecycleGeneration !== lifecycleAuthority.generation ||
               !sameOwner || !sameTarget ||
               (!reservedGenerationMatches && !publishedIdentityMatches)) {
             throw new LifecycleGuardError(
@@ -1219,7 +1545,7 @@ export class WorkbenchProcessGuard {
           const envelope: WorkbenchSpawnJournalStateV3 = {
             version: 3,
             generation: randomUUID(),
-            record: next,
+            record: attributedNext,
           };
           assertLeaseActive();
           const result = await this.spawnStore().compareAndSwap(

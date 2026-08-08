@@ -7,6 +7,9 @@ settings.
 
 For registration locations, manual commands, and refresh steps unique to each
 MCP client, see [MCP client notes](agents/README.md).
+For a Codex project that should run the server from a development worktree
+without replacing the normal user/global registration, see
+[Codex worktree MCP development](agents/CODEX_WORKTREE_MCP.md).
 
 ## Requirements
 
@@ -51,8 +54,12 @@ client.
 Every standard registration runs:
 
 ```text
-node <absolute-package-path>\dist\index.js
+node --title=ReforgerForge-MCP-<client> <absolute-package-path>\dist\index.js --mcp-client-label <client>
 ```
+
+The client slug is supplied by setup from the supported-client definition. The
+Node title option is before the script path; the server-only identity option is
+after it and is not part of server configuration.
 
 Rerunning setup is supported. An exact existing registration is reported as
 already current without a material rewrite.
@@ -164,6 +171,12 @@ After changing an explicit Observer setting, restart the MCP process and rerun
 the [Observer usage guide](docs/observer.md); for implementation and technical
 troubleshooting, use [observer/README.md](observer/README.md).
 
+If retained owned-runtime evidence blocks shutdown or a later launch, first call
+`observer_runtime` with `action: "history"` to classify a bounded batch. Use
+`action: "recover"` only for the returned exact child-exit or already-stopped
+cleanup candidates. Recovery never deletes history and never terminates a live
+runtime; unresolved, foreign, or unverifiable evidence remains fail-closed.
+
 ## PowerShell execution policy
 
 The setup and Doctor examples above use a process-local bypass so they work
@@ -184,7 +197,44 @@ node dist/index.js
 ```
 
 The MCP client normally starts this process through its registration. Running
-it directly is primarily useful for diagnostics or development.
+it directly is primarily useful for diagnostics or development and receives
+the client label `manual`. To preserve the full managed command-line marker in
+a manual registration, use this exact argument layout:
+
+```powershell
+node --title=ReforgerForge-MCP-manual dist/index.js --mcp-client-label manual
+```
+
+At startup the server writes one identity-only record to stderr. `wb_diagnose`
+also reports the same product, client label, process UUID, PID, and start time.
+These fields help identify a host; they do not authorize termination or any
+lifecycle action.
+
+The direct CLI stdio host defaults to safe auto-shutdown after 1,800,000 ms
+(30 minutes) of inactivity. Decoded client traffic and request completion reset
+the interval, and in-flight protocol or application work prevents exit. At the
+deadline the host also requires a complete, unchanged readiness proof: live or
+uncertain Workbench, Observer capture, owned-runtime, recovery, or external
+activation state keeps the host open and is reported by `wb_diagnose`. A ready
+private Observer child with no pending work does not block; normal shutdown
+closes it through the supported disposer. Stdin EOF/close, SIGINT, SIGTERM, and
+startup failure remain immediate and do not wait for the interval.
+
+### Identifying MCP hosts on Windows
+
+In Task Manager, open **Details**, right-click a column heading, choose
+**Select columns**, and enable **Command line**. Managed hosts contain
+`--title=ReforgerForge-MCP-<client>` and `--mcp-client-label <client>`, so two
+supported clients can be distinguished there. The server also sets its runtime
+process title to `ReforgerForge-MCP-<client>-<eight-hex-instance-prefix>` and
+reports its complete instance UUID through diagnostics.
+
+The ordinary distribution still uses the installed Node executable, so Task
+Manager's **Image name** remains `node.exe`. Command line, runtime process
+title, PID, and instance UUID are separate identifiers. None is ownership proof
+for killing a process. Refresh or stop the server through the owning MCP client;
+use the exact supported Workbench and Observer lifecycle tools for child
+processes.
 
 ## Steam discovery
 
@@ -293,6 +343,7 @@ array with `[]`. A clear flag cannot be combined with its repeated value flag.
 | `extractedPath` | `--extracted-path` | Optional existing directory |
 | `workbenchHost` | `--workbench-host` | `127.0.0.1` |
 | `workbenchPort` | `--workbench-port` | `5775` |
+| `mcpIdleShutdownMs` | `--mcp-idle-shutdown-ms` | `1800000`; required finite integer from `60000` through `86400000`, with no disable value |
 | `workbenchScriptAuthorizeAll` | paired authorize flags above | `false` |
 | `debug` | `--debug` / `--no-debug` | `false` |
 | `observer.managedRoot` | `--observer-managed-root` | Platform-local application/state directory |
@@ -315,6 +366,12 @@ array with `[]`. A clear flag cannot be combined with its repeated value flag.
 `workbenchScriptAuthorizeAll` suppresses prompts for protected `RunCmd`,
 `RunProcess`, `KillProcess`, and out-of-profile `FileIO` operations. Leave it
 disabled unless you trust the active project and all of its dependencies.
+
+The optional shared PowerShell stdio launcher accepts the same bounded override
+as `-McpIdleShutdownMs`. It forwards `--mcp-idle-shutdown-ms` only when that
+parameter was explicitly supplied; omission preserves the server's internal
+30-minute default. Describe, Verify, and Serve use the same normalized
+configuration argument list.
 
 Automated Workbench launches enforce `-noThrow`. Assertions remain in the
 Workbench log and can still fail a validation gate, but they cannot block an

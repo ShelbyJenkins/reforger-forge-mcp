@@ -22,10 +22,11 @@ function report(
   overrides: Partial<ServerVerificationReport> = {}
 ): ServerVerificationReport {
   return {
-    schemaVersion: 1,
+    schemaVersion: 3,
     generatedAt: "2026-07-24T00:00:00.000Z",
     success: true,
     nodeVersion: "v22.0.0",
+    nodePath: process.execPath,
     serverPath: SERVER_PATH,
     packageVersion: "1.1.0",
     compiledServer: {
@@ -51,6 +52,7 @@ function report(
       workbenchAddonDirs: ["D:\\Arma Reforger\\addons"],
       workbenchHost: "127.0.0.1",
       workbenchPort: 5775,
+      mcpIdleShutdownMs: 1_800_000,
       issues: [],
     },
     serverHandshake: { status: "passed", issues: [] },
@@ -99,7 +101,7 @@ describe("serialized verification report gate", () => {
   it("rejects schema drift and a forged success bit", () => {
     expect(() => parseServerVerificationReport({
       ...report(),
-      schemaVersion: 99,
+      schemaVersion: 1,
     })).toThrow("Unsupported verification report schema");
 
     expect(() => parseServerVerificationReport({
@@ -110,6 +112,37 @@ describe("serialized verification report gate", () => {
         issues: ["Handshake failed."],
       },
     })).toThrow("success does not agree");
+  });
+
+  it("requires the exact absolute Node executable in verifier evidence", () => {
+    const complete = report();
+    const { nodePath: _missing, ...withoutNodePath } = complete;
+    expect(() => parseServerVerificationReport(withoutNodePath))
+      .toThrow("nodePath must be a string");
+    expect(() => parseServerVerificationReport({
+      ...complete,
+      nodePath: "node",
+    })).toThrow("nodePath must be absolute");
+  });
+
+  it("requires a bounded idle timeout whenever effective settings passed", () => {
+    const complete = report();
+    const { mcpIdleShutdownMs: _missing, ...withoutIdleTimeout } =
+      complete.effectiveSettings;
+    expect(() => parseServerVerificationReport({
+      ...complete,
+      effectiveSettings: withoutIdleTimeout,
+    })).toThrow("effectiveSettings.mcpIdleShutdownMs is invalid");
+
+    for (const mcpIdleShutdownMs of [59_999, 60_000.5, 86_400_001]) {
+      expect(() => parseServerVerificationReport({
+        ...complete,
+        effectiveSettings: {
+          ...complete.effectiveSettings,
+          mcpIdleShutdownMs,
+        },
+      })).toThrow("effectiveSettings.mcpIdleShutdownMs is invalid");
+    }
   });
 
   it("rejects a successful report that does not prove the package version", () => {
@@ -164,11 +197,15 @@ describe("setup completion registrar", () => {
 
     expect(exitCode).toBe(0);
     expect(register).toHaveBeenCalledOnce();
-    expect(register).toHaveBeenCalledWith({ serverPath: SERVER_PATH });
+    expect(register).toHaveBeenCalledWith({
+      serverPath: SERVER_PATH,
+      nodePath: process.execPath,
+    });
     expect(stdout).toHaveLength(1);
     const receipt = JSON.parse(stdout[0]!) as SetupReceipt;
     expect(receipt.overallStatus).toBe("passed");
     expect(receipt.runtime.serverPresent).toBe(true);
+    expect(receipt.runtime.nodePath).toBe(process.execPath);
     expect(receipt.verification.workbenchNetApi.status).toBe("not_tested");
     expect(receipt.verification.observerCapture.status).toBe("not_tested");
     expect(receipt.modifiedFiles).toEqual([
@@ -201,6 +238,13 @@ describe("setup completion registrar", () => {
       name: "wrong server",
       verificationReport: report(),
       serverPath: resolve("C:\\other", "dist", "index.js"),
+    },
+    {
+      name: "wrong Node executable",
+      verificationReport: report({
+        nodePath: resolve("C:\\other", "node.exe"),
+      }),
+      serverPath: SERVER_PATH,
     },
     {
       name: "unrepresented startup arguments",

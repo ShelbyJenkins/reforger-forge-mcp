@@ -26,6 +26,13 @@ The setup script installs, builds, verifies, and attempts registration in each
 detected supported MCP client. Restart or refresh the client afterwards, then
 confirm that its `reforger-forge` tools are available.
 
+Managed registrations identify the owning client in the Node command line, for
+example `ReforgerForge-MCP-codex`. In Windows Task Manager, enable the
+**Command line** column on the **Details** tab to distinguish MCP hosts. The
+ordinary package still runs as `node.exe`; its Image name is not renamed. Use
+the supported client refresh or shutdown workflow instead of terminating a
+process by its label, PID, or displayed instance UUID.
+
 ## Use it from your MCP client
 
 Ask the connected coding tool for the task you want to perform, for example:
@@ -41,6 +48,15 @@ The live tool descriptions and input schemas that your MCP client receives are
 the authoritative API contract. For tool routing, call order, safety rules, and
 validation expectations for coding tools, use [agents/AGENTS.md](agents/AGENTS.md).
 
+### MCP protocol compatibility
+
+The stdio server supports the 2025-era MCP initialization protocol and is
+black-box tested with revision `2025-11-25`. It works with 2025-era clients and
+dual-era clients that can fall back to that opening. It does not currently serve
+the modern `2026-07-28` opening, so a modern-only client is not compatible.
+Supported client names in the setup guide mean tested registration integrations;
+they are not a claim that every MCP client or protocol era is supported.
+
 ## Common configuration
 
 Configuration is optional; automatic discovery is used when no override is
@@ -53,8 +69,17 @@ reference is in [SETUP.md](SETUP.md#optional-configuration).
 | Tool input `gprojPath` | Select the exact addon for writes; when omitted, supported tools use the verified project in the running Workbench lifecycle. |
 | `workbenchPath`, `gamePath` / `--workbench-path`, `--game-path` | Override automatic Steam discovery for a nonstandard installation. |
 | `workbenchAddonDirs` / repeat `--workbench-addon-dir` | Add nonstandard dependency roots while retaining normal discovered roots. |
+| `mcpIdleShutdownMs` / `--mcp-idle-shutdown-ms` | Set safe stdio-host inactivity shutdown from 60000 through 86400000 ms; the default is 1800000 ms (30 minutes). |
 | `observer.evidenceRoots` / repeat `--observer-evidence-root` | Allowlist where reviewed Observer evidence may be finalized. |
 | `debug` / `--debug` | Enable diagnostic logging for the explicitly configured server process. |
+
+The CLI stdio host exits after the configured interval only when protocol work
+has settled and its bounded Workbench/Observer readiness proof is complete.
+Live, busy, malformed, legacy-unattributed, or uncertain lifecycle evidence
+keeps that host open. Well-formed evidence attributed to another installation,
+Windows user, or MCP owner is excluded from obligations this host cannot
+satisfy. Client disconnect, stdin close, and process signals still begin
+shutdown immediately; the inactivity interval has no disable value.
 
 ## Documentation
 
@@ -62,6 +87,7 @@ reference is in [SETUP.md](SETUP.md#optional-configuration).
 |---|---|
 | [SETUP.md](SETUP.md) | Initial installation, configuration, Doctor, discovery, and recovery. |
 | [agents/README.md](agents/README.md) | MCP-client registration, refresh, and client-specific troubleshooting. |
+| [agents/CODEX_WORKTREE_MCP.md](agents/CODEX_WORKTREE_MCP.md) | Use a development worktree's stdio server only in its Codex project. |
 | [agents/AGENTS.md](agents/AGENTS.md) | API/workflow notes for coding tools using the MCP. |
 | [docs/observer.md](docs/observer.md) | Operator-facing Observer capture and evidence workflow. |
 | [observer/README.md](observer/README.md) | Observer architecture, maintainer guidance, and technical troubleshooting. |

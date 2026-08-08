@@ -1,10 +1,20 @@
 import { randomUUID } from "node:crypto";
+import { performance } from "node:perf_hooks";
 import {
   AbortableLeaseController,
   type AbortableLease,
   type AbortableLeaseTiming,
   type CancellationReason,
 } from "../foundation/reservation-gate.js";
+import type {
+  McpHostAdmissionGate,
+  McpHostAdmissionToken,
+} from "../mcp-host-admission.js";
+import type {
+  IdleShutdownInspectionOptions,
+  McpIdleProviderReadiness,
+  McpIdleReadinessProvider,
+} from "../mcp-idle-readiness.js";
 
 export type WorkbenchActivityErrorCode =
   | "ACTIVE_CAPTURE"
@@ -54,6 +64,7 @@ export interface WorkbenchActivityGateOptions {
   restoreTimeoutMs?: number;
   timing?: WorkbenchActivityGateTiming;
   createLeaseId?: () => string;
+  admissionGate?: McpHostAdmissionGate;
 }
 
 export interface WorkbenchLifecycleAdmissionOptions {
@@ -73,6 +84,7 @@ interface LifecycleWaiter {
   timer: unknown;
   abortListener: (() => void) | null;
   status: "pending" | "admitted" | "cancelled";
+  admission: McpHostAdmissionToken | null;
 }
 
 const DEFAULT_RESTORE_TIMEOUT_MS = 5_000;
@@ -110,10 +122,11 @@ function copyBinding(binding: CaptureActivityBinding): CaptureActivityBinding {
  * Callers then enter the machine-wide lifecycle coordinator only after this
  * gate grants admission, so the global mutex is never held by the wait.
  */
-export class WorkbenchActivityGate {
+export class WorkbenchActivityGate implements McpIdleReadinessProvider {
   private readonly restoreTimeoutMs: number;
   private readonly timing: WorkbenchActivityGateTiming;
   private readonly createLeaseId: () => string;
+  private readonly admissionGate: McpHostAdmissionGate | undefined;
   private readonly captureLeases = new AbortableLeaseController<
     CaptureActivityBinding,
     CaptureCancellationReason
@@ -124,6 +137,9 @@ export class WorkbenchActivityGate {
   private advancingLifecycleQueue = false;
   private readonly lifecycleQueue: LifecycleWaiter[] = [];
   private exactOwnerExitRequired: CaptureActivityBinding | null = null;
+  private exactOwnerExitAdmission: McpHostAdmissionToken | null = null;
+  private readonly captureAdmissions = new WeakMap<CaptureActivityLease, McpHostAdmissionToken>();
+  private idleRevision = 0;
 
   constructor(options: WorkbenchActivityGateOptions = {}) {
     const restoreTimeoutMs = options.restoreTimeoutMs ?? DEFAULT_RESTORE_TIMEOUT_MS;
@@ -133,6 +149,7 @@ export class WorkbenchActivityGate {
     this.restoreTimeoutMs = restoreTimeoutMs;
     this.timing = options.timing ?? defaultTiming;
     this.createLeaseId = options.createLeaseId ?? randomUUID;
+    this.admissionGate = options.admissionGate;
   }
 
   acquireCapture(binding: CaptureActivityBinding): CaptureActivityLease {
@@ -152,14 +169,25 @@ export class WorkbenchActivityGate {
         "ACTIVE_CAPTURE"
       );
     }
-    return this.captureLeases.issue(
-      this.createLeaseId(),
-      copyBinding(binding)
-    );
+    const admission = this.admissionGate?.acquire("Workbench capture lease") ?? null;
+    try {
+      const lease = this.captureLeases.issue(
+        this.createLeaseId(),
+        copyBinding(binding)
+      );
+      if (admission) this.captureAdmissions.set(lease, admission);
+      this.bumpIdleRevision();
+      return lease;
+    } catch (error) {
+      admission?.release();
+      throw error;
+    }
   }
 
   releaseCapture(lease: CaptureActivityLease): void {
+    this.bumpIdleRevision();
     this.captureLeases.release(lease);
+    this.releaseCaptureAdmission(lease);
     this.advanceLifecycleQueue();
   }
 
@@ -181,7 +209,11 @@ export class WorkbenchActivityGate {
         "CAPTURE_INVALIDATED"
       );
     }
+    const captureAdmission = this.captureAdmissions.get(lease);
+    this.bumpIdleRevision();
     this.exactOwnerExitRequired = copyBinding(lease.binding);
+    this.exactOwnerExitAdmission = captureAdmission?.transfer("Workbench exact-owner-exit recovery") ?? null;
+    this.captureAdmissions.delete(lease);
     this.captureLeases.release(lease);
     this.advanceLifecycleQueue();
   }
@@ -198,6 +230,7 @@ export class WorkbenchActivityGate {
       );
     }
     if (!sameBinding(lease.binding, currentBinding)) {
+      this.bumpIdleRevision();
       this.captureLeases.cancel(lease, {
         code: "IDENTITY_CHANGED",
         message:
@@ -213,6 +246,7 @@ export class WorkbenchActivityGate {
 
   invalidateCapture(lease: CaptureActivityLease, message: string): void {
     if (this.captureLeases.isReleased(lease)) return;
+    this.bumpIdleRevision();
     this.captureLeases.cancel(lease, { code: "IDENTITY_CHANGED", message });
   }
 
@@ -223,12 +257,14 @@ export class WorkbenchActivityGate {
   invalidateForUnexpectedExit(binding: CaptureActivityBinding): boolean {
     const lease = this.captureLeases.activeLease;
     if (!lease || !sameBinding(lease.binding, binding)) return false;
+    this.bumpIdleRevision();
     this.captureLeases.cancel(lease, {
       code: "WORKBENCH_EXITED",
       message:
         `Exact owned Workbench PID ${binding.process.pid} exited while capture ` +
         `${lease.id} was active.`,
     }, { release: true });
+    this.releaseCaptureAdmission(lease);
     this.advanceLifecycleQueue();
     return true;
   }
@@ -248,12 +284,16 @@ export class WorkbenchActivityGate {
         "LIFECYCLE_BUSY"
       );
     }
+    const admission = this.admissionGate?.acquire(`Workbench managed ${description}`) ?? null;
+    this.bumpIdleRevision();
     this.managedActivities += 1;
     try {
       return await action();
     } finally {
+      this.bumpIdleRevision();
       this.managedActivities -= 1;
       if (this.managedActivities === 0) this.advanceLifecycleQueue();
+      admission?.release();
     }
   }
 
@@ -297,13 +337,19 @@ export class WorkbenchActivityGate {
             "CAPTURE_INVALIDATED"
           );
         }
+        this.bumpIdleRevision();
         this.exactOwnerExitRequired = null;
+        this.exactOwnerExitAdmission?.release();
+        this.exactOwnerExitAdmission = null;
       }
       return result;
     } finally {
+      this.bumpIdleRevision();
       this.lifecycleActive = false;
       this.lifecycleRequests -= 1;
       this.advanceLifecycleQueue();
+      waiter.admission?.release();
+      waiter.admission = null;
     }
   }
 
@@ -323,6 +369,7 @@ export class WorkbenchActivityGate {
       resolveAdmitted = resolve;
       rejectAdmitted = reject;
     });
+    const admission = this.admissionGate?.acquire(`Workbench lifecycle ${kind}`) ?? null;
     const waiter: LifecycleWaiter = {
       kind,
       ownedShutdown,
@@ -333,8 +380,10 @@ export class WorkbenchActivityGate {
       timer: undefined,
       abortListener: null,
       status: "pending",
+      admission,
     };
 
+    this.bumpIdleRevision();
     this.lifecycleRequests += 1;
     this.lifecycleQueue.push(waiter);
     waiter.timer = this.timing.setTimeout(
@@ -407,6 +456,7 @@ export class WorkbenchActivityGate {
         }
 
         this.lifecycleQueue.shift();
+        this.bumpIdleRevision();
         waiter.status = "admitted";
         this.clearLifecycleWaiterResources(waiter);
         this.lifecycleActive = true;
@@ -428,7 +478,10 @@ export class WorkbenchActivityGate {
     const index = this.lifecycleQueue.indexOf(waiter);
     if (index >= 0) this.lifecycleQueue.splice(index, 1);
     this.clearLifecycleWaiterResources(waiter);
+    this.bumpIdleRevision();
     this.lifecycleRequests -= 1;
+    waiter.admission?.release();
+    waiter.admission = null;
     waiter.rejectAdmitted(error);
     if (advance) this.advanceLifecycleQueue();
   }
@@ -469,6 +522,39 @@ export class WorkbenchActivityGate {
         "only exact owned Workbench shutdown is permitted.",
       "LIFECYCLE_BUSY"
     );
+  }
+
+  currentIdleRevision(): number {
+    return this.idleRevision;
+  }
+
+  async inspectIdleShutdownReadiness(
+    options: IdleShutdownInspectionOptions,
+  ): Promise<McpIdleProviderReadiness> {
+    const expired = options.signal.aborted || (options.nowTick?.() ?? performance.now()) > options.deadlineTick;
+    const blockers = new Set<"WORKBENCH_ACTIVITY" | "WORKBENCH_RECOVERY">();
+    if (this.managedActivities > 0 || this.lifecycleRequests > 0 || this.lifecycleActive ||
+        this.lifecycleQueue.length > 0 || this.captureLeases.activeLease) {
+      blockers.add("WORKBENCH_ACTIVITY");
+    }
+    if (this.exactOwnerExitRequired) blockers.add("WORKBENCH_RECOVERY");
+    return {
+      complete: !expired,
+      blockers: [...blockers].sort(),
+      revision: this.idleRevision,
+    };
+  }
+
+  private releaseCaptureAdmission(lease: CaptureActivityLease): void {
+    const admission = this.captureAdmissions.get(lease);
+    if (!admission) return;
+    this.captureAdmissions.delete(lease);
+    admission.release();
+  }
+
+  private bumpIdleRevision(): void {
+    if (this.idleRevision === Number.MAX_SAFE_INTEGER) throw new Error("Workbench activity revision exhausted");
+    this.idleRevision += 1;
   }
 
 }

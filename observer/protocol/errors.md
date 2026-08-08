@@ -61,6 +61,9 @@ publication.
 | PREPARED_LAUNCH_CONSUMED | bounded-diagnostic | no | owned-runtime | Prepared observer launch has already been consumed. |
 | PREPARED_LAUNCH_EXPIRED | bounded-diagnostic | no | owned-runtime | Prepared observer launch has expired. |
 | PREPARED_LAUNCH_STALE | bounded-diagnostic | no | owned-runtime | Prepared observer launch belongs to a stale lifecycle. |
+| GAME_LAUNCH_PREDECESSOR_REQUIRED | bounded-diagnostic | no | owned-runtime | The current game-launch successor requires its exact predecessor runtime ID. |
+| GAME_LAUNCH_PREDECESSOR_MISMATCH | bounded-diagnostic | no | owned-runtime | The supplied predecessor is not the current game-launch chain tip. |
+| GAME_LAUNCH_PREDECESSOR_NOT_STOPPED | bounded-diagnostic | yes | owned-runtime | The game-launch predecessor has not completed exact stop and observer cleanup. |
 | START_UNVERIFIABLE | bounded-diagnostic | no | owned-runtime | Owned runtime start could not be verified. |
 | START_FAILED | bounded-diagnostic | yes | owned-runtime | Owned runtime start failed. |
 | STOP_FAILED | bounded-diagnostic | yes | owned-runtime | Owned runtime stop failed. |

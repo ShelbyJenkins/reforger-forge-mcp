@@ -19,6 +19,11 @@ import { resolveWorkbenchExecutablePath } from "../src/workbench/launch-plan.js"
 import { WorkbenchProcessGuard } from "../src/workbench/process-guard.js";
 import { canonicalizeGproj } from "../src/workbench/project-identity.js";
 import { requireResourceManagerMode } from "../src/workbench/status.js";
+import {
+  revalidateGameWorldPlan,
+  resolveGameWorldPlan,
+} from "../src/launch/game-world-plan.js";
+import { readResourceMeta } from "../src/workbench/resource-meta.js";
 
 export const LIVE_WORKBENCH_LIFECYCLE_ENVIRONMENT =
   "RFO_RUN_LIVE_WORKBENCH_LIFECYCLE_ACCEPTANCE";
@@ -301,9 +306,30 @@ export async function runWorkbenchLifecycleAcceptance(
     assert.notEqual(prefabGuid, worldGuid, "Workbench assigned the same GUID to two resources");
     assert.equal(new Set([prefabGuid, worldGuid, materialGuid]).size, 3,
       "Workbench did not assign distinct GUIDs to all registered resources");
+    const strictWorldMetadata = readResourceMeta(`${looseWorld}.meta`);
+    assert.equal(strictWorldMetadata.guid, worldGuid);
+    const explicitWorldPlan = resolveGameWorldPlan(canonical, looseWorld);
+    const discoveredWorldPlan = resolveGameWorldPlan({ project: canonical });
+    assert.equal(
+      explicitWorldPlan.resourceReference,
+      `{${worldGuid}}Worlds/RegistrationProbe.ent`
+    );
+    assert.equal(discoveredWorldPlan.resourceReference, explicitWorldPlan.resourceReference);
+    assert.equal(
+      revalidateGameWorldPlan(explicitWorldPlan).worldEvidenceDigest,
+      explicitWorldPlan.worldEvidenceDigest
+    );
+    assert.equal(
+      revalidateGameWorldPlan(discoveredWorldPlan).worldEvidenceDigest,
+      discoveredWorldPlan.worldEvidenceDigest
+    );
     process.stdout.write(
       `[live-lifecycle-acceptance] generic no-document registration passed: ` +
       `prefab=${prefabGuid}; world=${worldGuid}; material=${materialGuid}\n`
+    );
+    process.stdout.write(
+      `[live-lifecycle-acceptance] strict project-world resolution passed: ` +
+      `${explicitWorldPlan.resourceReference}; evidence=${explicitWorldPlan.worldEvidenceDigest}\n`
     );
 
     await client.shutdownOwnedWorkbench();

@@ -117,6 +117,7 @@ export function createHarness(): RunnerHarness {
     patternsDir: join(root, "patterns"),
     workbenchHost: "127.0.0.1",
     workbenchPort: 5775,
+    mcpIdleShutdownMs: 1_800_000,
   };
   const backend = createFakeLifecycleBackend();
   const guard = new WorkbenchProcessGuard({

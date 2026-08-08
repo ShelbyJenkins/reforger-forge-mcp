@@ -11,13 +11,34 @@ import { ObserverApplicationError } from "./errors.js";
 import { prepareObserverLaunch } from "./launch.js";
 import { runObserverSetup } from "./setup.js";
 import type { WorkbenchClient } from "../workbench/client.js";
-import type { OwnedRuntimeManager } from "./owned-runtime-manager.js";
+import {
+  OwnedRuntimeError,
+  type OwnedRuntimeManager,
+} from "./owned-runtime-manager.js";
+import { registerGameLaunch } from "../tools/game-launch.js";
 import { registerObserverRuntime } from "../tools/observer-runtime.js";
 import {
   projectPublicObserverToolError,
   PUBLIC_OBSERVER_CAPABILITIES,
   type PublicObserverErrorCandidate,
 } from "./public-contract.js";
+import {
+  resolveObserverRefusalRemedy,
+  type ObserverRefusalContext,
+} from "./refusal-remedy.js";
+import {
+  assertNativeFullscreenLaunch,
+  forceNonNativeWindowSizeSchema,
+  mergeConfiguredAddonDirectories,
+  rawDisplayArgument,
+} from "./launch-policy.js";
+
+export {
+  assertNativeFullscreenLaunch,
+  forceNonNativeWindowSizeSchema,
+  mergeConfiguredAddonDirectories,
+  rawDisplayArgument,
+} from "./launch-policy.js";
 
 const finite = () => z.number().finite();
 
@@ -109,46 +130,6 @@ const supportingFilesSchema = z.array(z.union([
     sourceCaptureLabel: z.string().min(1).max(128),
   }).strict(),
 ])).max(16);
-const forceNonNativeWindowSizeSchema = z.object({
-  width: z.number().int().min(640).max(16_384).describe(
-    "Exceptional window width in pixels.",
-  ),
-  height: z.number().int().min(480).max(16_384).describe(
-    "Exceptional window height in pixels.",
-  ),
-  justification: z.string().trim().min(20).max(512).describe(
-    "Why native fullscreen cannot be used. Screenshot size is not a valid reason; bound observer_capture image output instead.",
-  ),
-}).strict().describe(
-  "Exceptional opt-in to a non-native window size. Omit this field for the native fullscreen default.",
-);
-const RAW_DISPLAY_ARGUMENTS = new Set(["-window", "-screenwidth", "-screenheight"]);
-
-function rawDisplayArgument(argumentsArray: readonly string[]): string | undefined {
-  return argumentsArray.find((token) =>
-    RAW_DISPLAY_ARGUMENTS.has(token.split("=", 1)[0].toLowerCase()),
-  );
-}
-
-function assertNativeFullscreenLaunch(input: {
-  runtimeKind: string;
-  arguments: readonly string[];
-  forceNonNativeWindowSize?: unknown;
-}): void {
-  const conflicting = rawDisplayArgument(input.arguments);
-  if (conflicting) {
-    throw new ObserverApplicationError(
-      "ARGUMENT_CONFLICT",
-      `${conflicting} cannot be supplied through arguments. Omit display overrides for native fullscreen, or use forceNonNativeWindowSize with explicit dimensions and a compelling justification.`,
-    );
-  }
-  if (input.runtimeKind === "dedicated" && input.forceNonNativeWindowSize !== undefined) {
-    throw new ObserverApplicationError(
-      "INVALID_REQUEST",
-      "forceNonNativeWindowSize is valid only for a graphical runtime",
-    );
-  }
-}
 export interface ObserverToolDefaults {
   sessionTtlMs?: number;
   defaultCaptureTimeoutMs?: number;
@@ -159,27 +140,13 @@ export interface ObserverToolDefaults {
   ownedRuntimeManager?: OwnedRuntimeManager;
 }
 
-/**
- * Put configuration-owned roots ahead of caller roots, then let the private
- * observer agent perform the single canonical `-addonsDir` normalization. Its
- * merger preserves this order and removes duplicates after resolving paths.
- */
-export function mergeConfiguredAddonDirectories(
-  argumentsArray: readonly string[],
-  configuredAddonDirs: readonly string[] | undefined,
-): string[] {
-  if (!configuredAddonDirs || configuredAddonDirs.length === 0) {
-    return [...argumentsArray];
-  }
-  return ["-addonsDir", configuredAddonDirs.join(","), ...argumentsArray];
-}
-
 function jsonText(heading: string, value: unknown): string {
   return `${heading}\n\n\`\`\`json\n${JSON.stringify(value, null, 2)}\n\`\`\``;
 }
 
-function extractObserverApplicationError(error: unknown): PublicObserverErrorCandidate | undefined {
-  if (!(error instanceof ObserverApplicationError)) return undefined;
+function extractObserverToolError(error: unknown): PublicObserverErrorCandidate | undefined {
+  if (!(error instanceof ObserverApplicationError) &&
+      !(error instanceof OwnedRuntimeError)) return undefined;
   return {
     code: error.code,
     readDiagnosticMessage: () => error.message,
@@ -187,13 +154,19 @@ function extractObserverApplicationError(error: unknown): PublicObserverErrorCan
   };
 }
 
-function toolError(error: unknown) {
+function toolError(error: unknown, context: ObserverRefusalContext) {
   return {
     content: [{
       type: "text" as const,
       text: projectPublicObserverToolError(error, {
         subject: "Observer error",
-        extract: extractObserverApplicationError,
+        extract: extractObserverToolError,
+        remedyContext: context,
+        resolveRemedy: resolveObserverRefusalRemedy,
+        readRemedyContext: () => error instanceof ObserverApplicationError ||
+          error instanceof OwnedRuntimeError
+          ? error.details
+          : undefined,
       }),
     }],
     isError: true,
@@ -306,7 +279,7 @@ export function registerObserverTools(
           }],
         };
       } catch (error) {
-        return toolError(error);
+        return toolError(error, { tool: "observer_setup", action });
       }
     }
   );
@@ -315,7 +288,7 @@ export function registerObserverTools(
     "observer_prepare_launch",
     {
       description:
-        "Prepare an Arma Reforger launch for the staged observer addon and an exclusive profile session; no process is started. Graphical launches use the engine's native borderless-fullscreen window by default. Raw -window, -screenWidth, and -screenHeight arguments are refused. Use forceNonNativeWindowSize only when native fullscreen cannot be used for a compelling reason; screenshot size is handled by observer_capture image bounds and is not a reason to shrink the launch. Defaults -noFocus and -forceUpdate keep the fullscreen runtime from stealing startup focus.",
+        "Prepare an Arma Reforger launch for the staged observer addon and an exclusive profile session; no process is started. Returns the canonical executablePath and structured argument tokens for an external launcher. Graphical launches use the engine's native borderless-fullscreen window by default. Raw -window, -screenWidth, and -screenHeight arguments are refused. Use forceNonNativeWindowSize only when native fullscreen cannot be used for a compelling reason; screenshot size is handled by observer_capture image bounds and is not a reason to shrink the launch. Defaults -noFocus and -forceUpdate keep the fullscreen runtime from stealing startup focus.",
       inputSchema: {
         runtimeKind: z.enum(["client", "listenServer", "dedicated", "testRunner"]),
         arguments: z.array(z.string().max(32_768)).max(512).default([]).describe(
@@ -332,8 +305,17 @@ export function registerObserverTools(
       },
     },
     async (input) => {
+      const remedyReason = rawDisplayArgument(input.arguments) === undefined
+        ? undefined
+        : "display_arguments" as const;
       try {
         assertNativeFullscreenLaunch(input);
+        // Resolve before private preparation so an invalid configured target
+        // cannot leave behind a session or durable prepared-launch record.
+        // The returned path is launcher guidance only; managed start still
+        // performs its own executable re-resolution and identity checks.
+        const executablePath = defaults.ownedRuntimeManager
+          ?.resolveRuntimeExecutablePath(input.runtimeKind);
         const prepared = await prepareObserverLaunch(
           application,
           {
@@ -345,9 +327,22 @@ export function registerObserverTools(
           },
           defaults.ownedRuntimeManager
         );
-        return { content: [{ type: "text" as const, text: jsonText("Observer launch arguments prepared; no process was started.", prepared) }] };
+        const result = executablePath === undefined
+          ? prepared
+          : { executablePath, ...prepared };
+        return { content: [{ type: "text" as const, text: jsonText("Observer launch target and arguments prepared; no process was started.", result) }] };
       } catch (error) {
-        return toolError(error);
+        const ownedRuntimeReason = error instanceof OwnedRuntimeError
+          ? error.remedyReason
+          : undefined;
+        const selectedRemedyReason = remedyReason ?? ownedRuntimeReason;
+        return toolError(error, {
+          tool: "observer_prepare_launch",
+          action: "prepare",
+          ...(selectedRemedyReason === undefined
+            ? {}
+            : { reason: selectedRemedyReason }),
+        });
       }
     }
   );
@@ -369,7 +364,11 @@ export function registerObserverTools(
         const result = await application.instances({ ...input, signal: extra.signal });
         return { content: [{ type: "text" as const, text: jsonText("Observer instance inventory.", result) }] };
       } catch (error) {
-        return toolError(error);
+        return toolError(error, {
+          tool: "observer_instances",
+          action: "list",
+          ...(input.sessionId === undefined ? {} : { sessionId: input.sessionId }),
+        });
       }
     }
   );
@@ -400,6 +399,7 @@ export function registerObserverTools(
       },
     },
     async (input, extra) => {
+      let remedySessionId = input.sessionId;
       try {
         const legacySupplied = input.sessionId !== undefined || input.instanceId !== undefined || input.expectedWorldRevision !== undefined;
         if (input.target && legacySupplied) {
@@ -411,6 +411,7 @@ export function registerObserverTools(
           if (error instanceof CaptureError) throw new ObserverApplicationError(error.code, error.message, error.details);
           throw error;
         }
+        remedySessionId = target?.sessionId ?? remedySessionId;
         if (!target && legacySupplied) assertCaptureWorldBinding(input as { expectedWorldRevision: string });
         const runId = activeRun.resolve(input.runId);
         if (input.captureLabel && !runId) {
@@ -447,7 +448,11 @@ export function registerObserverTools(
           ],
         };
       } catch (error) {
-        return toolError(error);
+        return toolError(error, {
+          tool: "observer_capture",
+          action: "capture",
+          ...(remedySessionId === undefined ? {} : { sessionId: remedySessionId }),
+        });
       }
     }
   );
@@ -481,13 +486,19 @@ export function registerObserverTools(
             : await application.releaseJob(jobId);
         return { content: [{ type: "text" as const, text: jsonText(`Observer job ${action} completed.`, result) }] };
       } catch (error) {
-        return toolError(error);
+        return toolError(error, { tool: "observer_job", action });
       }
     }
   );
 
   if (defaults.ownedRuntimeManager) {
     registerObserverRuntime(server, defaults.ownedRuntimeManager);
+    registerGameLaunch(server, application, {
+      manager: defaults.ownedRuntimeManager,
+      workbenchClient: defaults.workbenchClient,
+      configuredAddonRoots: defaults.workbenchAddonDirs,
+      defaultSessionTtlMs: sessionTtlMs,
+    });
   }
 
   server.registerTool(
@@ -508,7 +519,9 @@ export function registerObserverTools(
         if (typeof result.runId !== "string") throw new ObserverApplicationError("TRANSPORT_UNAVAILABLE", "Run begin did not return a run ID");
         activeRun.activate(result.runId);
         return { content: [{ type: "text" as const, text: jsonText("Observer run begun and activated.", result) }] };
-      } catch (error) { return toolError(error); }
+      } catch (error) {
+        return toolError(error, { tool: "observer_run_begin", action: "begin" });
+      }
     },
   );
 
@@ -524,7 +537,9 @@ export function registerObserverTools(
         if (!resolved) throw new ObserverApplicationError("INVALID_REQUEST", "runId is required when this MCP process has no active run");
         const result = await application.runStatus(resolved);
         return { content: [{ type: "text" as const, text: jsonText("Observer run status.", result) }] };
-      } catch (error) { return toolError(error); }
+      } catch (error) {
+        return toolError(error, { tool: "observer_run_status", action: "status" });
+      }
     },
   );
 
@@ -565,7 +580,9 @@ export function registerObserverTools(
         });
         activeRun.clearIf(runId);
         return { content: [{ type: "text" as const, text: jsonText("Observer run finalized.", result) }] };
-      } catch (error) { return toolError(error); }
+      } catch (error) {
+        return toolError(error, { tool: "observer_run_finalize", action: "finalize" });
+      }
     },
   );
 
@@ -582,7 +599,9 @@ export function registerObserverTools(
         const result = await application.discardRun(runId);
         activeRun.clearIf(runId);
         return { content: [{ type: "text" as const, text: jsonText("Observer run discarded.", result) }] };
-      } catch (error) { return toolError(error); }
+      } catch (error) {
+        return toolError(error, { tool: "observer_run_discard", action: "discard" });
+      }
     },
   );
 }

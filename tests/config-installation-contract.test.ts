@@ -8,18 +8,22 @@ const clientTemplates = [
   {
     path: "agents/configs/stdio-template.json",
     rootKey: "mcpServers",
+    clientLabel: "REPLACE_WITH_CLIENT_LABEL",
   },
   {
     path: "agents/configs/vscode-template.json",
     rootKey: "servers",
+    clientLabel: "vscode",
   },
   {
     path: "agents/configs/claude-desktop.json",
     rootKey: "mcpServers",
+    clientLabel: "claude-desktop",
   },
   {
     path: "agents/configs/cursor-global.json",
     rootKey: "mcpServers",
+    clientLabel: "cursor",
   },
 ] as const;
 
@@ -41,17 +45,24 @@ function readServerEntry(
 }
 
 describe("standard MCP client configuration contract", () => {
+  it("keeps the example timeout explicit and within the server-only bounds", () => {
+    const example = JSON.parse(read("reforger-forge.config.example.json")) as Record<string, unknown>;
+    expect(example.mcpIdleShutdownMs).toBe(1_800_000);
+  });
+
   it.each(clientTemplates)(
-    "$path launches node with only the server entry and no override settings",
-    ({ path, rootKey }) => {
+    "$path launches a labeled Node host with no configuration overrides",
+    ({ path, rootKey, clientLabel }) => {
       const entry = readServerEntry(path, rootKey);
       const serialized = JSON.stringify(entry);
       const args = entry.args as unknown[];
 
       expect(entry.command).toBe("node");
-      expect(args).toHaveLength(1);
-      expect(typeof args[0]).toBe("string");
-      expect(args[0]).toMatch(/dist[\\/]index\.js$/);
+      expect(args).toHaveLength(4);
+      expect(args[0]).toBe(`--title=ReforgerForge-MCP-${clientLabel}`);
+      expect(args[1]).toMatch(/dist[\\/]index\.js$/);
+      expect(args[2]).toBe("--mcp-client-label");
+      expect(args[3]).toBe(clientLabel);
       expect(entry).not.toHaveProperty("env");
       expect(entry).not.toHaveProperty("env_vars");
       expect(serialized).not.toMatch(/--config|--project-path/i);
@@ -91,7 +102,21 @@ describe("manual explicit-configuration installer contract", () => {
       /\[Parameter\(Mandatory\s*=\s*\$true\)\]\s*\r?\n\s*\[string\]\$ConfigPath/
     );
     expect(installer).toMatch(/\[string\]\$ConfigPath/);
-    expect(installer).toContain('@($ServerEntry, "--config", $ResolvedConfigPath)');
+    expect(installer).toContain("function New-McpServerArguments");
+    expect(installer).toContain('"--config",');
+    for (const label of [
+      "codex",
+      "cursor",
+      "antigravity",
+      "claude-desktop",
+      "windsurf",
+      "vscode",
+      "continue",
+      "kiro",
+    ]) {
+      expect(installer).toContain(`-ClientLabel "${label}"`);
+    }
+    expect(installer).toContain("--mcp-client-label agent-installer");
     expect(installer).not.toMatch(/ENFUSION_|REFORGER_FORGE_|envBlock/);
     expect(installer).toMatch(/\bfunction Install-Codex\b/);
     expect(installer).toContain(
@@ -101,7 +126,7 @@ describe("manual explicit-configuration installer contract", () => {
       "& $codexCommand.Source mcp remove reforger-forge"
     );
     expect(installer).toContain(
-      "& $codexCommand.Source mcp add reforger-forge -- node $ServerEntry --config $ResolvedConfigPath"
+      "& $codexCommand.Source mcp add reforger-forge -- node @codexArgs"
     );
     expect(installer).toContain(
       "Skipped Codex because the Codex CLI is not installed"

@@ -6,6 +6,7 @@ import {
   projectPublicObserverToolError,
   type PublicObserverErrorCandidate,
 } from "../../src/observer/public-contract.js";
+import { resolveObserverRefusalRemedy } from "../../src/observer/refusal-remedy.js";
 
 const subject = "Observer error" as const;
 
@@ -60,6 +61,8 @@ describe("public observer error projection", () => {
     for (const [code, message] of Object.entries(fixedMessages)) {
       let messageReads = 0;
       let detailReads = 0;
+      let resolverCalls = 0;
+      let remedyContextReads = 0;
       const text = projectPublicObserverToolError({ code }, {
         subject,
         extract: () => ({
@@ -73,11 +76,22 @@ describe("public observer error projection", () => {
             return new Proxy({}, { ownKeys: () => { throw new Error("must-not-inspect"); } });
           },
         }),
+        remedyContext: { tool: "observer_runtime", action: "start" },
+        resolveRemedy: () => {
+          resolverCalls += 1;
+          throw new Error("must-not-resolve");
+        },
+        readRemedyContext: () => {
+          remedyContextReads += 1;
+          throw new Error("must-not-read-remedy-context");
+        },
       });
 
       expect(text).toBe(`Observer error (${code}): ${message}`);
       expect(messageReads).toBe(0);
       expect(detailReads).toBe(0);
+      expect(resolverCalls).toBe(0);
+      expect(remedyContextReads).toBe(0);
     }
   });
 
@@ -166,6 +180,61 @@ describe("public observer error projection", () => {
     expect(detailReads).toBe(0);
   });
 
+  it("reserves room for one remedy inside the complete 512-character bound", () => {
+    const runtimeId = "rt-00000000-0000-4000-8000-000000000042";
+    let diagnosticReads = 0;
+    let detailReads = 0;
+    let remedyReads = 0;
+    const text = projectPublicObserverToolError({ code: "PREPARED_LAUNCH_CONSUMED" }, {
+      subject,
+      extract: () => ({
+        code: "PREPARED_LAUNCH_CONSUMED",
+        readDiagnosticMessage: () => {
+          diagnosticReads += 1;
+          return `one-shot conflict ${"x".repeat(1_000)} token=diagnostic-secret`;
+        },
+        readDetails: () => {
+          detailReads += 1;
+          return { runtimeId, token: "details-secret", safe: "bounded-safe-detail" };
+        },
+      }),
+      remedyContext: { tool: "observer_runtime", action: "start" },
+      resolveRemedy: resolveObserverRefusalRemedy,
+      readRemedyContext: () => {
+        remedyReads += 1;
+        return { runtimeId };
+      },
+    });
+
+    expect(text.length).toBeLessThanOrEqual(PUBLIC_OBSERVER_ERROR_TEXT_MAXIMUM);
+    expect(text).toContain("Next action: call observer_runtime");
+    expect(text).toContain(JSON.stringify({ action: "status", runtimeId }));
+    expect(text).not.toContain("diagnostic-secret");
+    expect(text).not.toContain("details-secret");
+    expect(text).not.toContain('"action":"start"');
+    expect(diagnosticReads).toBe(1);
+    expect(detailReads).toBe(0);
+    expect(remedyReads).toBe(1);
+  });
+
+  it("suppresses session-specific remedies when bounded session context is absent", () => {
+    for (const sessionId of [undefined, "", "bad\nsession"]) {
+      const text = projectPublicObserverToolError({ code: "NO_RENDER_ENDPOINT" }, {
+        subject,
+        extract: () => candidate("NO_RENDER_ENDPOINT", "No renderer is available."),
+        remedyContext: {
+          tool: "observer_capture",
+          action: "capture",
+          ...(sessionId === undefined ? {} : { sessionId }),
+        },
+        resolveRemedy: resolveObserverRefusalRemedy,
+        readRemedyContext: () => undefined,
+      });
+      expect(text).not.toContain("Next action:");
+      expect(text.length).toBeLessThanOrEqual(PUBLIC_OBSERVER_ERROR_TEXT_MAXIMUM);
+    }
+  });
+
   it("falls back to the harmless internal result when an extractor or reader fails", () => {
     const extractorFailure = projectPublicObserverToolError("value", {
       subject,
@@ -180,7 +249,35 @@ describe("public observer error projection", () => {
       }),
     });
 
-    for (const text of [extractorFailure, readerFailure]) {
+    const resolverFailure = projectPublicObserverToolError("value", {
+      subject,
+      extract: () => candidate("INVALID_REQUEST"),
+      remedyContext: { tool: "observer_capture", action: "capture" },
+      resolveRemedy: () => { throw new Error("resolver-sentinel"); },
+    });
+    const rendererFailure = projectPublicObserverToolError("value", {
+      subject,
+      extract: () => candidate("INVALID_REQUEST"),
+      remedyContext: { tool: "observer_capture", action: "capture" },
+      resolveRemedy: () => new Proxy({}, {
+        get: () => { throw new Error("renderer-sentinel"); },
+      }) as never,
+    });
+    const remedyReaderFailure = projectPublicObserverToolError("value", {
+      subject,
+      extract: () => candidate("PREPARED_LAUNCH_CONSUMED"),
+      remedyContext: { tool: "observer_runtime", action: "start" },
+      resolveRemedy: resolveObserverRefusalRemedy,
+      readRemedyContext: () => { throw new Error("remedy-reader-sentinel"); },
+    });
+
+    for (const text of [
+      extractorFailure,
+      readerFailure,
+      resolverFailure,
+      rendererFailure,
+      remedyReaderFailure,
+    ]) {
       expect(text).toBe("Observer error (INTERNAL_ERROR): Observer operation failed.");
       expect(text).not.toMatch(/sentinel/);
     }

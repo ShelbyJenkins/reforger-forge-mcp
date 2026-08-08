@@ -20,6 +20,8 @@ import {
 import { WorkbenchSessionController } from "../../src/workbench/session-controller.js";
 import { withTemporaryDirectory } from "../support/temporary-directory.js";
 
+const TEST_MCP_INSTANCE_ID = "00112233-4455-4677-8899-aabbccddeeff";
+
 vi.mock("../../src/observer/application.js", () => ({
   createObserverApplication: () => ({
     ownedRuntimeManager: {},
@@ -57,6 +59,7 @@ function config(): Config {
     patternsDir: "C:\\ReforgerForge\\data\\patterns",
     workbenchHost: "127.0.0.1",
     workbenchPort: 5775,
+    mcpIdleShutdownMs: 1_800_000,
   };
 }
 
@@ -283,7 +286,9 @@ describe("wb_build MCP tool", () => {
 
   it("reuses the MCP process guard in the runner controller composition", () => {
     const sharedExecution = {} as WorkbenchLifecycleExecutionPort;
-    const sharedProcessGuard = {} as WorkbenchProcessGuard;
+    const sharedProcessGuard = {
+      mcpInstanceId: TEST_MCP_INSTANCE_ID,
+    } as WorkbenchProcessGuard;
     const runner = WorkbenchSessionController.composeRunner(
       "127.0.0.1",
       5775,
@@ -309,7 +314,7 @@ describe("wb_build MCP tool", () => {
         5775,
         undefined,
         undefined,
-        {} as never,
+        { mcpInstanceId: TEST_MCP_INSTANCE_ID } as never,
         {
           activityGate,
           lifecycleExecution: sharedExecution,
@@ -357,7 +362,7 @@ describe("wb_build MCP tool", () => {
         5775,
         undefined,
         undefined,
-        {} as never,
+        { mcpInstanceId: TEST_MCP_INSTANCE_ID } as never,
         { lifecycleExecution: sharedExecution }
       );
       Object.assign(controller, {

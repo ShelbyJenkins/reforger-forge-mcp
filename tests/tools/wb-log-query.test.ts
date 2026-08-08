@@ -37,7 +37,9 @@ interface QueryInput {
 
 interface RegisteredTool {
   readonly definition: {
+    readonly description?: string;
     readonly inputSchema?: Record<string, {
+      readonly description?: string;
       safeParse(value: unknown): { readonly success: boolean; readonly data?: unknown };
     }>;
   };
@@ -52,6 +54,7 @@ function config(managedRoot?: string): Config {
     patternsDir: "C:\\ReforgerForge\\data\\patterns",
     workbenchHost: "127.0.0.1",
     workbenchPort: 5775,
+    mcpIdleShutdownMs: 1_800_000,
     ...(managedRoot
       ? { observer: { managedRoot } as Config["observer"] }
       : {}),
@@ -138,10 +141,12 @@ describe("wb_log_query MCP tool", () => {
     const tool = register("C:\\managed");
     const schema = tool.definition.inputSchema!;
 
+    expect(tool.definition.description).toMatch(/timestamped.*editor records/i);
     expect(schema.logDirectory.safeParse("").success).toBe(false);
     expect(schema.logDirectory.safeParse("C:\\managed\\logs\\build-001").success).toBe(true);
     expect(schema.addonIds.safeParse(Array.from({ length: 17 }, () => "Addon")).success).toBe(false);
     expect(schema.levels.safeParse(["F"]).success).toBe(false);
+    expect(schema.levels.description).toMatch(/normalized Workbench severity/i);
     expect(schema.pattern.safeParse(" ").success).toBe(false);
     expect(schema.maxLines.safeParse(undefined)).toMatchObject({ success: true, data: 500 });
     expect(schema.maxLines.safeParse(0).success).toBe(false);
@@ -216,6 +221,51 @@ describe("wb_log_query MCP tool", () => {
         matchedAddonIds: ["RoadblockRunners"],
       })]);
     }, { prefix: "rfo-wb-log-query-and-" });
+  });
+
+  it("normalizes timestamped editor severity records across every attributed log file", async () => {
+    await withTemporaryDirectory(async (root) => {
+      const directory = editorLogDirectory(root);
+      writeFixture(directory, "console.log", [
+        "00:24:31.205     SCRIPT    (E): console compile failure",
+        "00:24:31.206     SCRIPT    (W): RoadblockRunners target warning",
+      ]);
+      writeFixture(directory, "error.log", [
+        "00:26:44.802 PATHFINDING(E): error-log navmesh failure",
+      ]);
+      writeFixture(directory, "script.log", [
+        "00:34:04.995 RESOURCES (E): script-log resource failure",
+      ]);
+
+      const result = resultJson(await register(root).handler({
+        logDirectory: directory,
+        levels: ["E"],
+      }));
+
+      expect(result).toMatchObject({ fileCount: 3, matchCount: 3, truncated: false });
+      expect(result.matches.map((match) => ({
+        sourceFile: match.sourceFile,
+        channel: match.channel,
+        level: match.level,
+      }))).toEqual([
+        { sourceFile: "console.log", channel: "SCRIPT", level: "E" },
+        { sourceFile: "error.log", channel: "PATHFINDING", level: "E" },
+        { sourceFile: "script.log", channel: "RESOURCES", level: "E" },
+      ]);
+
+      const targetWarning = resultJson(await register(root).handler({
+        logDirectory: directory,
+        addonIds: ["RoadblockRunners"],
+        levels: ["W"],
+      }));
+      expect(targetWarning.matches).toEqual([expect.objectContaining({
+        sourceFile: "console.log",
+        lineNumber: 2,
+        channel: "SCRIPT",
+        level: "W",
+        matchedAddonIds: ["RoadblockRunners"],
+      })]);
+    }, { prefix: "rfo-wb-log-query-editor-severity-" });
   });
 
   it("scans direct log files in deterministic order and reports truncation at the shared cap", async () => {

@@ -40,6 +40,7 @@ function createConfig(extractedPath: string): Config {
     patternsDir: "C:\\ReforgerForge\\data\\patterns",
     workbenchHost: "127.0.0.1",
     workbenchPort: 5775,
+    mcpIdleShutdownMs: 1_800_000,
   };
 }
 

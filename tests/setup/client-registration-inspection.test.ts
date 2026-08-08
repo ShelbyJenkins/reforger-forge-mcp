@@ -18,6 +18,7 @@ import {
   type CommandLookupResult,
 } from "../../src/setup/client-registration.js";
 import { afterEach, describe, expect, it } from "vitest";
+import { buildManagedMcpServerArguments } from "../../src/mcp-host-identity.js";
 
 interface Fixture {
   readonly root: string;
@@ -97,6 +98,13 @@ function options(
 
 function success(stdout = ""): CommandExecutionResult {
   return { status: 0, stdout, stderr: "" };
+}
+
+function managedArgs(setup: Fixture, clientLabel: string): string[] {
+  return buildManagedMcpServerArguments({
+    clientLabel,
+    serverPath: setup.serverPath,
+  });
 }
 
 function snapshotFiles(root: string): ReadonlyMap<string, FileSnapshot> {
@@ -242,7 +250,7 @@ describe("read-only client registration inspection", () => {
         mcpServers: {
           "reforger-forge": {
             command: "node",
-            args: [setup.serverPath],
+            args: managedArgs(setup, "cursor"),
           },
         },
       }),
@@ -278,7 +286,7 @@ describe("read-only client registration inspection", () => {
         mcpServers: {
           "reforger-forge": {
             command: "node",
-            args: [setup.serverPath],
+            args: managedArgs(setup, "cursor"),
           },
         },
       }),
@@ -412,7 +420,7 @@ describe("read-only client registration inspection", () => {
                 transport: {
                   type: "stdio",
                   command: "node",
-                  args: [setup.serverPath],
+                  args: managedArgs(setup, "codex"),
                 },
               })
             )

@@ -9,6 +9,7 @@
 
 import { createHash, randomUUID } from "node:crypto";
 import { spawn, type ChildProcess, type SpawnOptions } from "node:child_process";
+import { performance } from "node:perf_hooks";
 import {
   accessSync,
   constants as fsConstants,
@@ -16,9 +17,22 @@ import {
   readFileSync,
   statSync,
 } from "node:fs";
-import { basename, dirname, extname, join, relative, resolve } from "node:path";
+import { basename, dirname, extname, isAbsolute, join, relative, resolve } from "node:path";
 import type { Config } from "../config.js";
+import { McpHostAdmissionGate } from "../mcp-host-admission.js";
+import type {
+  IdleShutdownInspectionOptions,
+  McpIdleBlockerCode,
+  McpIdleProviderReadiness,
+  McpIdleReadinessProvider,
+} from "../mcp-idle-readiness.js";
 import { redactArguments } from "../foundation/redact.js";
+import { canonicalPathComparisonKey } from "../foundation/managed-path.js";
+import {
+  createMcpHostIdentity,
+  validateMcpHostIdentity,
+  type McpHostIdentity,
+} from "../mcp-host-identity.js";
 import { logger } from "../utils/logger.js";
 import {
   WorkbenchActivityError,
@@ -53,6 +67,7 @@ import {
   WorkbenchHelperStager,
   defaultWorkbenchHelperManagedRoot,
   type WorkbenchCompanionLaunch,
+  type WorkbenchCurrentCompanion,
   type WorkbenchCompanionManagedStatus,
   type WorkbenchCompanionProvider,
   type WorkbenchCompanionRetentionResult,
@@ -81,6 +96,9 @@ import {
   type WorkbenchSpawnRecord,
 } from "./process-guard.js";
 import {
+  WorkbenchExistingLmdbIsolationError,
+} from "./existing-lmdb-reader.js";
+import {
   WorkbenchModalWatchdog,
   findOwnedNativeDialog,
   type WorkbenchModalEvidence,
@@ -89,6 +107,7 @@ import {
   diagnoseWorkbench,
   type DiagnosticReport,
 } from "./diagnostics.js";
+import type { McpLifecycleDiagnostic } from "../mcp-idle-shutdown.js";
 import {
   findWorkbenchCompileFailure,
   formatWorkbenchCompileFailure,
@@ -118,16 +137,19 @@ import {
   waitForVacancy,
   type WorkbenchCompanionIdentity,
 } from "./readiness.js";
+import type { WorkbenchProducerRemedyDecision } from "./refusal-remedy.js";
 import {
   WorkbenchLaunchPlanError,
   buildLegacyWorkbenchLaunchArguments,
   buildMcpEditorLaunchPlan,
   buildMcpTargetResourceLaunchPlan,
+  projectWorkbenchLaunchPreview,
   type CliEditorLaunchPlan,
   type McpEditorLaunchPlan,
   type McpTargetResourceLaunchPlan,
   type TargetBuildLaunchPlan,
   type TargetCheckLaunchPlan,
+  type WorkbenchLaunchPreview,
 } from "./launch-plan.js";
 import {
   ResourceTargetError,
@@ -145,6 +167,7 @@ const PORT_RELEASE_TIMEOUT_MS = 15_000;
 const PORT_RELEASE_POLL_MS = 200;
 const DEFAULT_QUALIFICATION_INTERVAL_MS = 2_000;
 const EXPLICIT_SAVE_MODAL_SETTLE_MS = 5_000;
+const PREVIEW_OWNER_ARGUMENT = "-reforgerForgeOwnerToken=launch-preview-placeholder";
 
 export type WorkbenchMode = "edit" | "play" | "unknown";
 
@@ -159,12 +182,29 @@ export interface WorkbenchCallOptions {
   skipAutoLaunch?: boolean;
 }
 
+export interface WorkbenchActiveProjectHintOptions {
+  /** Cancels and joins the crash-isolated existing-state reader. */
+  readonly signal: AbortSignal;
+  /** Absolute wall-clock deadline shared with the consuming launch plan. */
+  readonly deadlineAtMs: number;
+}
+
 export interface WorkbenchLaunchResult {
   action: "launched" | "reused";
   pid: number;
   gprojPath: string;
   generation: string;
 }
+
+export type WorkbenchLaunchPreviewResult =
+  | Readonly<{
+      status: "available";
+      preview: WorkbenchLaunchPreview;
+    }>
+  | Readonly<{
+      status: "unavailable";
+      message: string;
+    }>;
 
 /** A running fresh Workbench whose initial World Editor resource is immutable by launch contract. */
 export interface WorkbenchTargetResourceLaunchResult extends WorkbenchLaunchResult {
@@ -349,12 +389,20 @@ export type WorkbenchErrorCode =
 export class WorkbenchError extends Error {
   constructor(
     message: string,
-    public readonly code: WorkbenchErrorCode = "API_ERROR"
+    public readonly code: WorkbenchErrorCode = "API_ERROR",
+    public readonly remedyDecision?: WorkbenchProducerRemedyDecision
   ) {
     super(message);
     this.name = "WorkbenchError";
   }
 }
+
+const MESSAGE_OWNS_RECOVERY = Object.freeze({
+  kind: "message_owns_recovery" as const,
+});
+const NO_SAFE_REMEDY = Object.freeze({
+  kind: "no_safe_remedy" as const,
+});
 
 class ProvenPreSignalTerminationRefusal extends WorkbenchError {}
 
@@ -434,6 +482,10 @@ export interface WorkbenchClientDependencies {
   lifecycleExecution?: WorkbenchLifecycleExecutionPort;
   /** Explicit read-only diagnostics service for server composition and tests. */
   diagnostics?: typeof diagnoseWorkbench;
+  /** Trusted process identity projected through read-only diagnostics. */
+  hostIdentity?: McpHostIdentity;
+  /** Dynamic CLI lifecycle projection; embedders omit it and report externally managed. */
+  mcpLifecycleDiagnostic?: () => McpLifecycleDiagnostic;
   /** A callback is evaluated at the actual launch boundary for absolute-deadline callers. */
   launchTimeoutMs?: number | (() => number);
   /** Optional absolute cap for exact termination and endpoint-release waits. */
@@ -442,6 +494,8 @@ export interface WorkbenchClientDependencies {
   requestDeadlineAtMs?: () => number | undefined;
   launchPollIntervalMs?: number;
   activityGate?: WorkbenchActivityGate;
+  /** Shared process-wide host admission gate. */
+  admissionGate?: McpHostAdmissionGate;
   captureRestoreTimeoutMs?: number;
   activityGateTiming?: WorkbenchActivityGateTiming;
   qualificationIntervalMs?: number;
@@ -506,7 +560,7 @@ function explicitResourceLaunchArguments(resource: CanonicalResourceTarget): rea
   return Object.freeze(args);
 }
 
-export class WorkbenchSessionController {
+export class WorkbenchSessionController implements McpIdleReadinessProvider {
   private activeLifecycle: ActiveLifecycleOperation | null = null;
   private activeTargetBuildAbort: AbortController | null = null;
   private activeTargetBuildPromise: Promise<unknown> | null = null;
@@ -532,6 +586,8 @@ export class WorkbenchSessionController {
   private readonly companionReadiness: typeof awaitCompanionReadiness;
   private readonly vacancyWait: typeof waitForVacancy;
   private readonly diagnosticsService: typeof diagnoseWorkbench;
+  private readonly hostIdentity: McpHostIdentity;
+  private readonly mcpLifecycleDiagnostic: (() => McpLifecycleDiagnostic) | undefined;
   private readonly qualificationIntervalMs: number;
   private readonly now: () => number;
   private readonly onExplicitSaveModal: WorkbenchClientDependencies["onExplicitSaveModal"];
@@ -541,6 +597,7 @@ export class WorkbenchSessionController {
     authority: ManagedRunningAuthority;
     qualifiedAtMs: number;
   } | null = null;
+  private idleRevision = 0;
 
   get state(): Readonly<WorkbenchState> {
     return this._state;
@@ -609,13 +666,22 @@ export class WorkbenchSessionController {
     if (this.targetBuildClosing) {
       throw new WorkbenchError(
         "Workbench target operation is unavailable because the MCP server is shutting down.",
-        "LIFECYCLE_BUSY"
+        "LIFECYCLE_BUSY",
+        NO_SAFE_REMEDY
       );
     }
     if (this.activeTargetBuildPromise) {
       throw new WorkbenchError(
         "Another owner-scoped Workbench target operation is already active.",
-        "LIFECYCLE_BUSY"
+        "LIFECYCLE_BUSY",
+        {
+          kind: "remedy",
+          remedy: {
+            kind: "retry",
+            when: "after the active owner-scoped target operation finishes",
+            why: "Concurrent lifecycle mutations remain serialized.",
+          },
+        }
       );
     }
 
@@ -645,6 +711,7 @@ export class WorkbenchSessionController {
         { signal: operationAbort.signal }
       )
     );
+    this.bumpIdleRevision();
     this.activeTargetBuildAbort = operationAbort;
     this.activeTargetBuildPromise = promise;
     try {
@@ -652,6 +719,7 @@ export class WorkbenchSessionController {
     } finally {
       options.signal?.removeEventListener("abort", forwardRequestAbort);
       if (this.activeTargetBuildPromise === promise) {
+        this.bumpIdleRevision();
         this.activeTargetBuildPromise = null;
         this.activeTargetBuildAbort = null;
       }
@@ -668,12 +736,123 @@ export class WorkbenchSessionController {
   }
 
   async closeOwnerScopedTargetOperations(): Promise<void> {
+    this.bumpIdleRevision();
     this.targetBuildClosing = true;
     const active = this.activeTargetBuildPromise;
     this.activeTargetBuildAbort?.abort(
       new Error("The MCP server is shutting down.")
     );
     if (active) await active.catch(() => undefined);
+  }
+
+  currentIdleRevision(): number {
+    return this.idleRevision;
+  }
+
+  /** Host-scoped, noncreating Workbench lifecycle projection for MCP idle exit. */
+  async inspectIdleShutdownReadiness(
+    options: IdleShutdownInspectionOptions,
+  ): Promise<McpIdleProviderReadiness> {
+    const nowTick = options.nowTick ?? (() => performance.now());
+    const blockers = new Set<McpIdleBlockerCode>();
+    let complete = true;
+    if (this.activeLifecycle || this.activeTargetBuildPromise) blockers.add("WORKBENCH_ACTIVITY");
+    if (this.ownedChild) blockers.add("WORKBENCH_OWNERSHIP");
+    if (options.signal.aborted || nowTick() > options.deadlineTick) {
+      return { complete: false, blockers: ["INCOMPLETE_PROOF"], revision: this.idleRevision };
+    }
+
+    // A fresh host must not map the live Workbench LMDB in its own address
+    // space: native read-only open faults are uncatchable JavaScript failures.
+    // The process guard reads both records through one bounded disposable
+    // reader process and projects any abnormal exit as incomplete proof.
+    const remainingInspectionMs = Math.max(
+      1,
+      Math.min(5_000, Math.floor(options.deadlineTick - nowTick())),
+    );
+    const snapshot = await this.processGuard.readExistingStateSnapshot({
+      signal: options.signal,
+      timeoutMs: remainingInspectionMs,
+    });
+    const { lifecycle, journal } = snapshot;
+    if (options.signal.aborted || nowTick() > options.deadlineTick) {
+      return { complete: false, blockers: ["INCOMPLETE_PROOF"], revision: this.idleRevision };
+    }
+
+    const inspected = new Map<string, "live" | "absent" | "unknown">();
+    const inspectExact = async (identity: WorkbenchIdentity): Promise<"live" | "absent" | "unknown"> => {
+      const key = `${identity.pid}\0${identity.creationTime}\0${identity.executablePath.toLowerCase()}`;
+      const retained = inspected.get(key);
+      if (retained) return retained;
+      try {
+        const result = await this.processGuard.inspectOwnedWorkbench(identity);
+        inspected.set(key, result);
+        return result;
+      } catch {
+        inspected.set(key, "unknown");
+        return "unknown";
+      }
+    };
+
+    if (lifecycle.kind === "malformed") {
+      complete = false;
+      blockers.add("INCOMPLETE_PROOF");
+    } else if (lifecycle.kind === "valid") {
+      const owner = lifecycle.state.mcpOwner;
+      if (!owner && (lifecycle.state.phase !== "vacant" || lifecycle.state.workbench || lifecycle.state.operation)) {
+        blockers.add("WORKBENCH_RECOVERY");
+      } else if (owner?.instanceId === this.processGuard.mcpInstanceId) {
+        const workbench = lifecycle.state.workbench;
+        if (workbench) {
+          const status = await inspectExact(workbench);
+          if (status === "live") blockers.add("WORKBENCH_OWNERSHIP");
+          else if (status === "unknown") {
+            complete = false;
+            blockers.add("INCOMPLETE_PROOF");
+          } else if (lifecycle.state.phase !== "vacant") {
+            blockers.add("WORKBENCH_RECOVERY");
+          }
+        } else if (lifecycle.state.phase !== "vacant" || lifecycle.state.operation) {
+          blockers.add("WORKBENCH_RECOVERY");
+        }
+      }
+    }
+
+    if (journal.kind === "malformed") {
+      complete = false;
+      blockers.add("INCOMPLETE_PROOF");
+    } else if (journal.kind === "valid") {
+      const origin = journal.record.metadata.originMcpInstanceId;
+      if (origin === undefined) {
+        blockers.add("WORKBENCH_RECOVERY");
+      } else if (origin === this.processGuard.mcpInstanceId) {
+        const record = journal.record;
+        if (record.phase === "pre_spawn" || record.phase === "spawned_unverified") {
+          blockers.add("WORKBENCH_RECOVERY");
+        } else if (record.identity) {
+          const status = await inspectExact(record.identity);
+          if (status === "live") blockers.add("WORKBENCH_OWNERSHIP");
+          else if (status === "unknown") {
+            complete = false;
+            blockers.add("INCOMPLETE_PROOF");
+          } else if (record.phase !== "published") {
+            blockers.add("WORKBENCH_RECOVERY");
+          }
+        } else {
+          blockers.add("WORKBENCH_RECOVERY");
+        }
+      }
+    }
+
+    if (options.signal.aborted || nowTick() > options.deadlineTick) {
+      complete = false;
+      blockers.add("INCOMPLETE_PROOF");
+    }
+    return {
+      complete,
+      blockers: [...blockers].sort(),
+      revision: this.idleRevision,
+    };
   }
 
   /**
@@ -703,7 +882,8 @@ export class WorkbenchSessionController {
       throw new WorkbenchError(
         `Owner-scoped ${operationName} refused because an exact Workbench process is still live. ` +
           "Use wb_shutdown for an owned editor or wait for the active lifecycle to finish.",
-        "LIFECYCLE_BUSY"
+        "LIFECYCLE_BUSY",
+        MESSAGE_OWNS_RECOVERY
       );
     }
     await this.assertNoWorkbenchProcesses(
@@ -784,6 +964,17 @@ export class WorkbenchSessionController {
     private readonly processGuard: WorkbenchProcessGuard = new WorkbenchProcessGuard(),
     dependencies: WorkbenchClientDependencies = {}
   ) {
+    this.hostIdentity = dependencies.hostIdentity === undefined
+      ? createMcpHostIdentity({
+          clientLabel: "manual",
+          instanceId: this.processGuard.mcpInstanceId,
+        })
+      : validateMcpHostIdentity(dependencies.hostIdentity);
+    if (this.hostIdentity.instanceId !== this.processGuard.mcpInstanceId) {
+      throw new TypeError(
+        "Workbench diagnostic host identity must match the process-guard MCP identity."
+      );
+    }
     this.companionProvider = dependencies.companionProvider ?? (config
       ? new WorkbenchHelperStager({
           managedRoot: config.observer?.managedRoot ?? defaultWorkbenchHelperManagedRoot(),
@@ -795,11 +986,14 @@ export class WorkbenchSessionController {
     this.companionReadiness = dependencies.companionReadiness ?? awaitCompanionReadiness;
     this.vacancyWait = dependencies.vacancyWait ?? waitForVacancy;
     this.diagnosticsService = dependencies.diagnostics ?? diagnoseWorkbench;
-    this.childSupervisor = dependencies.childSupervisor ?? new ChildSupervisor();
+    this.mcpLifecycleDiagnostic = dependencies.mcpLifecycleDiagnostic;
+    const admissionGate = dependencies.admissionGate ?? new McpHostAdmissionGate();
+    this.childSupervisor = dependencies.childSupervisor ?? new ChildSupervisor({ admissionGate });
     this.runnerLifecycleExecution = dependencies.lifecycleExecution ??
       WorkbenchSessionController.composeLifecycleExecution({
         processGuard: this.processGuard,
         childSupervisor: this.childSupervisor,
+        admissionGate,
         spawnProcess: (command, args, options) =>
           this.spawnProcess!(command, [...args], options),
       });
@@ -813,6 +1007,7 @@ export class WorkbenchSessionController {
     this.activityGate = dependencies.activityGate ?? new WorkbenchActivityGate({
       restoreTimeoutMs: dependencies.captureRestoreTimeoutMs,
       timing: dependencies.activityGateTiming,
+      admissionGate,
     });
     this.qualificationIntervalMs = dependencies.qualificationIntervalMs ??
       DEFAULT_QUALIFICATION_INTERVAL_MS;
@@ -1387,7 +1582,8 @@ export class WorkbenchSessionController {
             "Explicit save refused before invoking Workbench because the inherited prefab contains " +
               `load-bearing empty override block(s): ${listed}${extra}. Preserve these overrides with a ` +
               "minimal direct prefab edit, then relaunch the exact target.",
-            "TARGET_SESSION_TAINTED"
+            "TARGET_SESSION_TAINTED",
+            MESSAGE_OWNS_RECOVERY
           );
         }
       }
@@ -1412,7 +1608,8 @@ export class WorkbenchSessionController {
       if (existingDialog || disabledMain) {
         throw new WorkbenchError(
           "Explicit save refused because the target-bound Workbench already has a native dialog or disabled main window.",
-          "SAVE_OUTCOME_UNCERTAIN"
+          "SAVE_OUTCOME_UNCERTAIN",
+          NO_SAFE_REMEDY
         );
       }
     } catch (error) {
@@ -1466,7 +1663,8 @@ export class WorkbenchSessionController {
       );
       throw new WorkbenchError(
         "Explicit save outcome is uncertain because native-dialog monitoring failed. Shut down and relaunch the target.",
-        "SAVE_OUTCOME_UNCERTAIN"
+        "SAVE_OUTCOME_UNCERTAIN",
+        MESSAGE_OWNS_RECOVERY
       );
     }
     if (firstOutcome.kind === "modal") {
@@ -1496,7 +1694,8 @@ export class WorkbenchSessionController {
       throw new WorkbenchError(
         "Explicit save outcome is uncertain because Workbench requested native user feedback (" + detail + "). " +
           "The target session is tainted; shut it down and relaunch the explicit target before any further save.",
-        "SAVE_OUTCOME_UNCERTAIN"
+        "SAVE_OUTCOME_UNCERTAIN",
+        MESSAGE_OWNS_RECOVERY
       );
     }
     if (firstOutcome.kind === "save_error") {
@@ -1509,7 +1708,8 @@ export class WorkbenchSessionController {
       throw new WorkbenchError(
         "Explicit save outcome is uncertain because Workbench did not return a trusted completion result. " +
           `Cause: ${cause}. Shut down and relaunch the target before any further save.`,
-        "SAVE_OUTCOME_UNCERTAIN"
+        "SAVE_OUTCOME_UNCERTAIN",
+        MESSAGE_OWNS_RECOVERY
       );
     }
 
@@ -1521,14 +1721,16 @@ export class WorkbenchSessionController {
           typeof result.message === "string" && result.message.length > 0
             ? result.message
             : "Workbench did not confirm the explicit resource save.",
-          "SAVE_OUTCOME_UNCERTAIN"
+          "SAVE_OUTCOME_UNCERTAIN",
+          NO_SAFE_REMEDY
         );
       }
       if (result.startupLoadPath !== binding.resource.displayPath) {
         this.taintExplicitResourceSession("The helper startup target attestation changed during save.");
         throw new WorkbenchError(
           "Explicit resource save refused because Workbench no longer attested the expected startup target.",
-          "SAVE_OUTCOME_UNCERTAIN"
+          "SAVE_OUTCOME_UNCERTAIN",
+          NO_SAFE_REMEDY
         );
       }
     } catch (error) {
@@ -1706,6 +1908,95 @@ export class WorkbenchSessionController {
     }
   }
 
+  /**
+   * Return the bounded absolute target already sealed in the owned lifecycle.
+   *
+   * This game-launch-specific projection deliberately performs no filesystem
+   * canonicalization on the MCP thread. A fresh host uses the cancellable,
+   * crash-isolated existing-state reader; an owner with an open LMDB writer
+   * safely reuses that exact handle. The launch planning worker is the sole
+   * consumer that canonicalizes and revalidates the returned path.
+   */
+  async activeProjectGprojPathHint(
+    options: WorkbenchActiveProjectHintOptions,
+  ): Promise<string | null> {
+    if (!Number.isSafeInteger(options.deadlineAtMs) || options.deadlineAtMs <= 0) {
+      throw new WorkbenchRunError(
+        "Active Workbench project hint deadline is invalid.",
+        "DEADLINE_EXCEEDED",
+      );
+    }
+    const assertOpen = (): void => {
+      if (options.signal.aborted) {
+        throw new WorkbenchRunError(
+          "Active Workbench project hint was cancelled.",
+          "ABORTED",
+        );
+      }
+      if (Date.now() >= options.deadlineAtMs) {
+        throw new WorkbenchRunError(
+          "Active Workbench project hint exceeded its absolute deadline.",
+          "DEADLINE_EXCEEDED",
+        );
+      }
+    };
+    assertOpen();
+    const remainingMs = Math.max(
+      1,
+      Math.min(5_000, Math.floor(options.deadlineAtMs - Date.now())),
+    );
+    let snapshot;
+    try {
+      snapshot = await this.processGuard.readExistingStateSnapshotOnce({
+        signal: options.signal,
+        timeoutMs: remainingMs,
+      });
+    } catch (error) {
+      if (error instanceof WorkbenchExistingLmdbIsolationError) {
+        if (error.code === "CANCELLED") {
+          throw new WorkbenchRunError(
+            "Active Workbench project hint was cancelled.",
+            "ABORTED",
+          );
+        }
+        if (error.code === "TIMEOUT") {
+          throw new WorkbenchRunError(
+            "Active Workbench project hint inspection exceeded its bounded deadline.",
+            "DEADLINE_EXCEEDED",
+          );
+        }
+      }
+      throw error;
+    }
+    assertOpen();
+    const read = snapshot.lifecycle;
+    if (
+      read.kind !== "valid" ||
+      read.state.phase !== "running" ||
+      !read.state.mcpOwner ||
+      !read.state.workbench ||
+      !read.state.target
+    ) {
+      return null;
+    }
+    const targetPath = read.state.target.path;
+    if (
+      typeof targetPath !== "string" ||
+      targetPath.length < 1 ||
+      targetPath.length > 32_768 ||
+      /[\0-\x1f\x7f]/u.test(targetPath) ||
+      !isAbsolute(targetPath) ||
+      extname(targetPath).toLowerCase() !== ".gproj" ||
+      read.state.target.comparisonKey !== canonicalPathComparisonKey(targetPath)
+    ) {
+      throw new WorkbenchError(
+        "The active Workbench lifecycle target path is not a bounded absolute path.",
+        "STATE_INVALID",
+      );
+    }
+    return targetPath;
+  }
+
   async ensureRunning(gprojPath?: string): Promise<WorkbenchLaunchResult> {
     this.requireConfig("auto-launch");
     const project = await this.resolveLifecycleProject(gprojPath);
@@ -1786,9 +2077,11 @@ export class WorkbenchSessionController {
 
   async diagnose(): Promise<DiagnosticReport> {
     const report = await this.diagnosticsService({
+      hostIdentity: this.hostIdentity,
       host: this.host,
       port: this.port,
       config: this.config,
+      mcpLifecycle: this.mcpLifecycleDiagnostic,
       lifecycle: this.processGuard,
       callNetApi: (apiFunc, params, options) => this.rawCall(apiFunc, params, options),
       classifyNetError: (error) => error instanceof WorkbenchError ? error : null,
@@ -1796,6 +2089,47 @@ export class WorkbenchSessionController {
     return this.lastLaunchCompileFailure
       ? { ...report, lastLaunchFailure: this.lastLaunchCompileFailure }
       : report;
+  }
+
+  workbenchLaunchPreview(gprojPath: string): WorkbenchLaunchPreviewResult {
+    const config = this.requireConfig("preview a launch for");
+    let project: CanonicalProjectIdentity;
+    try {
+      project = revalidateProjectIdentity(canonicalizeGproj(gprojPath));
+    } catch (error) {
+      throw this.mapLifecycleError(error);
+    }
+    const read: WorkbenchCurrentCompanion = this.companionProvider?.readCurrentStaged
+      ? this.companionProvider.readCurrentStaged(project.displayPath)
+      : Object.freeze({
+          kind: "unavailable",
+          reason: "current_bundle_not_staged",
+        });
+    if (read.kind === "unavailable") {
+      return Object.freeze({
+        status: "unavailable",
+        message: "Launch preview is unavailable until wb_launch stages the exact current Workbench helper.",
+      });
+    }
+    try {
+      const plan = buildMcpEditorLaunchPlan({
+        kind: "mcp_editor",
+        config,
+        project,
+        companion: read.companion,
+        endpoint: { host: this.host, port: this.port },
+        ownerArgument: PREVIEW_OWNER_ARGUMENT,
+        ...(config.observer?.managedRoot
+          ? { managedRoot: config.observer.managedRoot }
+          : {}),
+      });
+      return Object.freeze({
+        status: "available",
+        preview: projectWorkbenchLaunchPreview(plan),
+      });
+    } catch (error) {
+      throw this.mapLifecycleError(error);
+    }
   }
 
   toString(): string {
@@ -2414,7 +2748,16 @@ export class WorkbenchSessionController {
     if (apiFunc === "EMCP_WB_ExplicitResourceSave") {
       throw new WorkbenchError(
         "Target-bound save requests must use wb_save_resource so the startup binding and disk evidence are verified.",
-        "TARGET_SESSION_REQUIRED"
+        "TARGET_SESSION_REQUIRED",
+        {
+          kind: "remedy",
+          remedy: {
+            kind: "tool",
+            tool: "wb_save_resource",
+            input: { confirm: "save", resourcePath: binding.resource.displayPath },
+            why: "It verifies the recorded startup binding and resulting disk evidence.",
+          },
+        }
       );
     }
     const documentSwitch = (apiFunc === "EMCP_WB_EditorControl" && params.action === "openResource") ||
@@ -2427,7 +2770,8 @@ export class WorkbenchSessionController {
     throw new WorkbenchError(
       "TARGET_SESSION_TAINTED: resource-opening tools are unavailable in a target-bound save session because they could " +
         "switch the document away from the startup target. Shut down and launch the desired explicit .ent instead.",
-      "TARGET_SESSION_TAINTED"
+      "TARGET_SESSION_TAINTED",
+      MESSAGE_OWNS_RECOVERY
     );
   }
 
@@ -2455,13 +2799,15 @@ export class WorkbenchSessionController {
     if (!binding) {
       throw new WorkbenchError(
         "TARGET_SESSION_REQUIRED: start a fresh Workbench with wb_launch { gprojPath, resourcePath } before saving.",
-        "TARGET_SESSION_REQUIRED"
+        "TARGET_SESSION_REQUIRED",
+        MESSAGE_OWNS_RECOVERY
       );
     }
     if (binding.taintedReason) {
       throw new WorkbenchError(
         `TARGET_SESSION_TAINTED: ${binding.taintedReason} Shut down and relaunch the explicit target before saving.`,
-        "TARGET_SESSION_TAINTED"
+        "TARGET_SESSION_TAINTED",
+        MESSAGE_OWNS_RECOVERY
       );
     }
     const expected = canonicalizeResourceTarget(expectedPath, binding.project);
@@ -2469,7 +2815,16 @@ export class WorkbenchSessionController {
         expected.metaComparisonKey !== binding.resource.metaComparisonKey) {
       throw new WorkbenchError(
         "TARGET_SESSION_REQUIRED: the requested save path does not match the resource supplied at Workbench startup.",
-        "TARGET_SESSION_REQUIRED"
+        "TARGET_SESSION_REQUIRED",
+        {
+          kind: "remedy",
+          remedy: {
+            kind: "tool",
+            tool: "wb_save_resource",
+            input: { confirm: "save", resourcePath: binding.resource.displayPath },
+            why: "Only the exact resource bound at startup can be saved automatically.",
+          },
+        }
       );
     }
     const authority = await this.readManagedRunningAuthoritySnapshot(
@@ -2482,7 +2837,16 @@ export class WorkbenchSessionController {
       this.clearExplicitResourceSession();
       throw new WorkbenchError(
         "TARGET_SESSION_REQUIRED: the exact target-bound Workbench process or lifecycle generation changed.",
-        "TARGET_SESSION_REQUIRED"
+        "TARGET_SESSION_REQUIRED",
+        {
+          kind: "remedy",
+          remedy: {
+            kind: "tool",
+            tool: "wb_diagnose",
+            input: {},
+            why: "The prior save binding is no longer authoritative and must not be retried blindly.",
+          },
+        }
       );
     }
     return binding;
@@ -2628,8 +2992,12 @@ export class WorkbenchSessionController {
     }
     let promise!: Promise<T>;
     promise = started.finally(() => {
-      if (this.activeLifecycle?.promise === promise) this.activeLifecycle = null;
+      if (this.activeLifecycle?.promise === promise) {
+        this.bumpIdleRevision();
+        this.activeLifecycle = null;
+      }
     });
+    this.bumpIdleRevision();
     this.activeLifecycle = { kind, operationId, targetKey, promise };
     return promise;
   }
@@ -2923,7 +3291,19 @@ export class WorkbenchSessionController {
     state = reconciled.state;
     if (reconciled.live) {
       if (!state.workbench || !state.target || state.target.comparisonKey !== project.comparisonKey) {
-        throw new WorkbenchError("Recorded Workbench target does not match the requested project.", "TARGET_CONFLICT");
+        throw new WorkbenchError(
+          "Recorded Workbench target does not match the requested project.",
+          "TARGET_CONFLICT",
+          {
+            kind: "remedy",
+            remedy: {
+              kind: "tool",
+              tool: "wb_shutdown",
+              input: {},
+              why: "The producer proved that the conflicting editor is the exact process owned by this MCP.",
+            },
+          }
+        );
       }
       const authority = await this.processGuard.withLifecycleLock(async (session) => {
         await this.requireReservedLifecycle(session, state);
@@ -3018,7 +3398,8 @@ export class WorkbenchSessionController {
       throw new WorkbenchError(
         "TARGET_SESSION_REQUIRED: a Workbench process is already running, but this MCP cannot prove it is " +
           "the requested fresh target-bound resource session. Shut it down before launching an explicit target.",
-        "TARGET_SESSION_REQUIRED"
+        "TARGET_SESSION_REQUIRED",
+        MESSAGE_OWNS_RECOVERY
       );
     }
 
@@ -3417,6 +3798,7 @@ export class WorkbenchSessionController {
         generation: state.generation,
         targetKey: preflight.project.comparisonKey,
       };
+      this.bumpIdleRevision();
       this.ownedChild = childObservation;
       settleOwnedObservation(childObservation);
       child.unref();
@@ -3474,8 +3856,9 @@ export class WorkbenchSessionController {
       }
       if (compileFailure) {
         throw new WorkbenchError(
-          formatWorkbenchCompileFailure(compileFailure),
-          "PROJECT_COMPILE_FAILED"
+          formatWorkbenchCompileFailure(compileFailure, preflight.project.displayPath),
+          "PROJECT_COMPILE_FAILED",
+          { kind: "message_owns_recovery" }
         );
       }
       throw mapped;
@@ -3663,7 +4046,10 @@ export class WorkbenchSessionController {
       key: observation.supervisionKey,
       handle: observation.handle,
     }, true);
-    if (this.ownedChild === observation) this.ownedChild = null;
+    if (this.ownedChild === observation) {
+      this.bumpIdleRevision();
+      this.ownedChild = null;
+    }
   }
 
   private async reconcileOwnedChildExit(
@@ -3675,6 +4061,7 @@ export class WorkbenchSessionController {
     // and the durable generation checks below independently reject it.
     if (this.ownedChild && this.ownedChild !== observation) return;
     if (this.ownedChild === observation) {
+      this.bumpIdleRevision();
       this.activityGate.invalidateForUnexpectedExit({
         generation: observation.generation,
         targetKey: observation.targetKey,
@@ -3753,7 +4140,11 @@ export class WorkbenchSessionController {
       return new WorkbenchError(error.message, error.code);
     }
     if (error instanceof WorkbenchAddonDependencyPreflightError) {
-      return new WorkbenchError(error.message, error.code);
+      return new WorkbenchError(
+        error.message,
+        error.code,
+        error.code === "INVALID_CONFIG" ? MESSAGE_OWNS_RECOVERY : undefined
+      );
     }
     if (error instanceof ProjectIdentityError) {
       return new WorkbenchError(error.message, error.code);
@@ -3830,5 +4221,12 @@ export class WorkbenchSessionController {
             : "PROTOCOL_ERROR";
       throw new WorkbenchError(error.message, code);
     });
+  }
+
+  private bumpIdleRevision(): void {
+    if (this.idleRevision === Number.MAX_SAFE_INTEGER) {
+      throw new Error("Workbench session idle revision exhausted");
+    }
+    this.idleRevision += 1;
   }
 }

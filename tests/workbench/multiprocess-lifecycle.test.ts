@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
+import type { TestContext } from "vitest";
 import { spawn, type ChildProcess } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { platform, tmpdir } from "node:os";
@@ -13,6 +14,41 @@ const workerPath = fileURLToPath(
 );
 const roots: string[] = [];
 const children = new Set<ChildProcess>();
+
+interface LifecycleWorkerResponse {
+  readonly result?: {
+    readonly kind: string;
+    readonly code?: string;
+    readonly source?: string;
+    readonly message?: string;
+  };
+  readonly error?: string;
+}
+
+function isUnownedWorkbenchPrecondition(
+  response: LifecycleWorkerResponse
+): response is LifecycleWorkerResponse & {
+  readonly result: { readonly kind: "refused"; readonly code: "UNOWNED_WORKBENCH" };
+} {
+  return response.error === undefined &&
+    response.result?.kind === "refused" &&
+    response.result.code === "UNOWNED_WORKBENCH";
+}
+
+describe("real multi-process lifecycle machine precondition", () => {
+  it("recognizes only an exact successful UNOWNED_WORKBENCH refusal", () => {
+    expect(isUnownedWorkbenchPrecondition({
+      result: { kind: "refused", code: "UNOWNED_WORKBENCH" },
+    })).toBe(true);
+    expect(isUnownedWorkbenchPrecondition({
+      result: { kind: "refused", code: "OWNED_BY_OTHER_MCP" },
+    })).toBe(false);
+    expect(isUnownedWorkbenchPrecondition({
+      result: { kind: "refused", code: "UNOWNED_WORKBENCH" },
+      error: "fixture failed",
+    })).toBe(false);
+  });
+});
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
@@ -77,7 +113,7 @@ afterEach(async () => {
 });
 
 describe.runIf(platform() === "win32")("real multi-process lifecycle ownership", () => {
-  it("hands an idle lease between two live Node MCP workers without killing either", async () => {
+  it("hands an idle lease between two live Node MCP workers when no unowned Workbench is running", async ({ skip }: TestContext) => {
     const stateRoot = mkdtempSync(join(tmpdir(), "reforger-forge-node-workers-"));
     roots.push(stateRoot);
     const projectRoot = join(stateRoot, "WorkerFixture");
@@ -103,17 +139,25 @@ describe.runIf(platform() === "win32")("real multi-process lifecycle ownership",
     const ask = async (
       child: ChildProcess,
       command: string
-    ): Promise<{ result?: { kind: string; code?: string; source?: string }; error?: string }> => {
+    ): Promise<LifecycleWorkerResponse> => {
       const line = readLine(child);
       child.stdin?.write(`${command}\n`);
       return JSON.parse(await line);
     };
 
     const owner = worker("owner");
-    const claimed = JSON.parse(await readLine(owner)) as {
-      result?: { kind: string };
-      error?: string;
-    };
+    const claimed = JSON.parse(await readLine(owner)) as LifecycleWorkerResponse;
+    if (isUnownedWorkbenchPrecondition(claimed)) {
+      expect(claimed.result).toMatchObject({
+        kind: "refused",
+        code: "UNOWNED_WORKBENCH",
+      });
+      owner.stdin?.end("release\n");
+      await closed(owner);
+      skip(
+        "Machine precondition not met: the lifecycle handoff fixture requires no unowned Workbench process; production correctly refused with UNOWNED_WORKBENCH."
+      );
+    }
     expect(claimed.error).toBeUndefined();
     expect(claimed.result?.kind).toBe("claimed");
 

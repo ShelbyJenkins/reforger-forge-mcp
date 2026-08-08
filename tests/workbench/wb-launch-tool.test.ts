@@ -76,6 +76,8 @@ describe("wb_launch MCP tool", () => {
     expect(ensureRunning).toHaveBeenCalledOnce();
     expect(ensureRunning).toHaveBeenCalledWith(gprojPath);
     expect(definition.description).toContain("normal, focusable attended editor window");
+    expect(definition.description).toContain("Cold configured-project enumeration is not available");
+    expect(definition.description).not.toContain("exactly one configured project");
   });
 
   it("requires an explicit project and uses the target-bound launch path for a resource", async () => {
@@ -98,6 +100,9 @@ describe("wb_launch MCP tool", () => {
     const missingProject = await tool({ resourcePath: "Worlds/Target.ent" });
     expect(missingProject.isError).toBe(true);
     expect(missingProject.content[0]?.text).toContain("`TARGET_REQUIRED`");
+    expect(missingProject.content[0]?.text).toContain("`TARGET_REQUIRED` — ");
+    expect(missingProject.content[0]?.text).not.toContain("â€”");
+    expect(missingProject.content[0]?.text?.match(/Next action:/g)).toHaveLength(1);
     expect(ensureTargetResourceRunning).not.toHaveBeenCalled();
 
     const result = await tool({
@@ -134,5 +139,23 @@ describe("wb_launch MCP tool", () => {
     expect(result.content[0]?.text).toContain("`PROJECT_COMPILE_FAILED`");
     expect(result.content[0]?.text).toContain("Broken.c(7): Syntax error");
     expect(result.content[0]?.text).not.toContain("**Launch Refused**");
+    expect(result.content[0]?.text).not.toContain("Next action:");
+  });
+
+  it("retains generic launch error treatment", async () => {
+    const ensureRunning = vi.fn(async () => {
+      throw new Error("generic launch failure");
+    });
+    const client = {
+      ensureRunning,
+      state: { connected: false, mode: "unknown", lastUpdated: 0 },
+    } as unknown as WorkbenchClient;
+    const { handler } = register(client);
+
+    const result = await handler({ gprojPath: "C:\\mods\\Example\\Example.gproj" });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0]?.text).toContain("generic launch failure");
+    expect(result.content[0]?.text).not.toContain("`LAUNCH_FAILED`");
   });
 });

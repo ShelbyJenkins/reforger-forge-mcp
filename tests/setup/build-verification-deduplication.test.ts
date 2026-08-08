@@ -37,7 +37,7 @@ function canonicalReceiptJson(
     issues: [],
   });
   return JSON.stringify({
-    schemaVersion: 1,
+    schemaVersion: 2,
     operation,
     overallStatus,
     runtime: {
@@ -53,6 +53,7 @@ function canonicalReceiptJson(
       gamePath: "fixture-game",
       workbenchPath: "fixture-tools",
       workbenchAddonDirs: [],
+      mcpIdleShutdownMs: overallStatus === "passed" ? 1_800_000 : null,
       startupArguments: [],
       steamCandidates: { game: [], workbench: [] },
     },
@@ -99,6 +100,22 @@ function canonicalReceiptWithoutManagedChanges(): string {
   return JSON.stringify(receipt);
 }
 
+function canonicalReceiptWithoutIdleTimeout(): string {
+  const receipt = JSON.parse(
+    canonicalReceiptJson("setup", "passed")
+  ) as { settings: Record<string, unknown> };
+  delete receipt.settings.mcpIdleShutdownMs;
+  return JSON.stringify(receipt);
+}
+
+function canonicalUnresolvedReceiptWithIdleTimeout(): string {
+  const receipt = JSON.parse(
+    canonicalReceiptJson("setup", "failed")
+  ) as { settings: Record<string, unknown> };
+  receipt.settings.mcpIdleShutdownMs = 1_800_000;
+  return JSON.stringify(receipt);
+}
+
 function setupHarness(): {
   root: string;
   logPath: string;
@@ -135,11 +152,8 @@ function setupHarness(): {
       "  exit /b 0",
       ")",
       'echo node^|%*>>"%ISSUE04_CALL_LOG%"',
-      'for %%F in ("%~1") do if /I "%%~nxF"=="verify-mcp-server.mjs" (',
-      '  echo verifier^|report=%REFORGER_FORGE_VERIFY_REPORT_PATH%^|quiet=%REFORGER_FORGE_VERIFY_QUIET%^|json=%REFORGER_FORGE_VERIFY_JSON%>>"%ISSUE05_ENV_LOG%"',
-      '  echo {}>"%REFORGER_FORGE_VERIFY_REPORT_PATH%"',
-      "  exit /b %ISSUE04_VERIFY_EXIT%",
-      ")",
+      'echo %*| findstr.exe /I /C:"verify-mcp-server.mjs" >nul',
+      "if not errorlevel 1 goto verifier",
       'for %%F in ("%~1") do if /I "%%~nxF"=="register-clients-cli.js" (',
       '  echo registration^|report=%REFORGER_FORGE_VERIFY_REPORT_PATH%^|quiet=%REFORGER_FORGE_VERIFY_QUIET%^|json=%REFORGER_FORGE_VERIFY_JSON%>>"%ISSUE05_ENV_LOG%"',
       '  if /I "%ISSUE05_REGISTRATION_RECEIPT_MODE%"=="empty" exit /b 0',
@@ -150,6 +164,14 @@ function setupHarness(): {
       '  if /I "%ISSUE05_REGISTRATION_RECEIPT_MODE%"=="missing-managed" (',
       `    echo ${canonicalReceiptWithoutManagedChanges()}`,
       "    exit /b 0",
+      "  )",
+      '  if /I "%ISSUE05_REGISTRATION_RECEIPT_MODE%"=="missing-idle-timeout" (',
+      `    echo ${canonicalReceiptWithoutIdleTimeout()}`,
+      "    exit /b 0",
+      "  )",
+      '  if /I "%ISSUE05_REGISTRATION_RECEIPT_MODE%"=="unresolved-idle-timeout" (',
+      `    echo ${canonicalUnresolvedReceiptWithIdleTimeout()}`,
+      "    exit /b 1",
       "  )",
       '  if /I "%ISSUE05_REGISTRATION_RECEIPT_MODE%"=="managed-change" (',
       `    echo ${canonicalReceiptJson("setup", "passed", [{
@@ -181,6 +203,10 @@ function setupHarness(): {
       "  exit /b 0",
       ")",
       "exit /b 0",
+      ":verifier",
+      'echo verifier^|report=%REFORGER_FORGE_VERIFY_REPORT_PATH%^|quiet=%REFORGER_FORGE_VERIFY_QUIET%^|json=%REFORGER_FORGE_VERIFY_JSON%>>"%ISSUE05_ENV_LOG%"',
+      'echo {}>"%REFORGER_FORGE_VERIFY_REPORT_PATH%"',
+      "exit /b %ISSUE04_VERIFY_EXIT%",
       "",
     ].join("\r\n")
   );
@@ -363,7 +389,7 @@ describe("Issue 04 build and verification lifecycle", () => {
       expect(calls(harness)[0]).toBe("npm|ci");
       expect(calls(harness)[1]).toBe("npm|run build");
       expect(calls(harness)[2]).toMatch(
-        /^node\|.*scripts[\\/]verify-mcp-server\.mjs$/
+        /^node\|--title=ReforgerForge-MCP-setup .*scripts[\\/]verify-mcp-server\.mjs --mcp-client-label setup$/
       );
       expect(calls(harness)[3]).toMatch(
         /^node\|.*dist[\\/]setup[\\/]register-clients-cli\.js --server .*dist[\\/]index\.js --verification-report .*reforger-forge-setup-[a-f0-9]+\.json --json$/
@@ -384,7 +410,7 @@ describe("Issue 04 build and verification lifecycle", () => {
       expect(result.error).toBeUndefined();
       expect(result.status).toBe(0);
       expect(JSON.parse(result.stdout)).toMatchObject({
-        schemaVersion: 1,
+        schemaVersion: 2,
         operation: "doctor",
       });
       expect(calls(harness)).toHaveLength(1);
@@ -408,7 +434,7 @@ describe("Issue 04 build and verification lifecycle", () => {
       expect(result.error).toBeUndefined();
       expect(result.status).toBe(1);
       expect(result.stdout).toContain("ReforgerForge doctor failed");
-      expect(result.stdout).toContain("Receipt schema: 1");
+      expect(result.stdout).toContain("Receipt schema: 2");
       expect(result.stdout).toContain("Overall status: failed");
       expect(result.stdout).toContain("Failed layer:   doctor");
       for (const label of [
@@ -460,7 +486,7 @@ describe("Issue 04 build and verification lifecycle", () => {
       expect(result.error).toBeUndefined();
       expect(result.status).toBe(0);
       expect(JSON.parse(result.stdout)).toMatchObject({
-        schemaVersion: 1,
+        schemaVersion: 2,
         operation: "setup",
         overallStatus: "passed",
       });
@@ -497,7 +523,7 @@ describe("Issue 04 build and verification lifecycle", () => {
       expect(result.error).toBeUndefined();
       expect(result.status).toBe(1);
       expect(result.stdout).toContain("ReforgerForge setup failed");
-      expect(result.stdout).toContain("Receipt schema: 1");
+      expect(result.stdout).toContain("Receipt schema: 2");
       expect(result.stdout).toContain("Failed layer:   registration");
       expect(result.stdout).toContain(
         "Client registration exited without a valid receipt."
@@ -505,6 +531,22 @@ describe("Issue 04 build and verification lifecycle", () => {
       expect(calls(harness).at(-1)).toMatch(
         /register-clients-cli\.js .* --json$/
       );
+    }
+  );
+
+  windowsIt(
+    "rejects receipts that omit a resolved idle timeout or invent one before settings resolve",
+    () => {
+      for (const mode of ["missing-idle-timeout", "unresolved-idle-timeout"]) {
+        const harness = setupHarness();
+        harness.environment.ISSUE05_REGISTRATION_RECEIPT_MODE = mode;
+        const result = runSetup(harness);
+
+        expect(result.error, mode).toBeUndefined();
+        expect(result.status, mode).toBe(1);
+        expect(result.stdout, mode).toContain("ReforgerForge setup failed");
+        expect(result.stdout, mode).toContain("Failed layer:   registration");
+      }
     }
   );
 
@@ -559,7 +601,7 @@ describe("Issue 04 build and verification lifecycle", () => {
     expect(recordedCalls[0]).toBe("npm|ci");
     expect(recordedCalls[1]).toBe("npm|run build");
     expect(recordedCalls[2]).toMatch(
-      /^node\|.*scripts[\\/]verify-mcp-server\.mjs$/
+      /^node\|--title=ReforgerForge-MCP-setup .*scripts[\\/]verify-mcp-server\.mjs --mcp-client-label setup$/
     );
     expect(recordedCalls[3]).toMatch(
       /^node\|.*dist[\\/]setup[\\/]setup-receipt-cli\.js --server .*dist[\\/]index\.js --verification-report .*reforger-forge-setup-[a-f0-9]+\.json --json$/
@@ -580,7 +622,7 @@ describe("Issue 04 build and verification lifecycle", () => {
       expect(result.status).toBe(0);
       expect(recordedCalls).toHaveLength(1);
       expect(recordedCalls[0]).toMatch(
-        /^node\|.*scripts[\\/]verify-mcp-server\.mjs --config .*[\\/]explicit-overrides\.json$/
+        /^node\|--title=ReforgerForge-MCP-agent-installer .*scripts[\\/]verify-mcp-server\.mjs --mcp-client-label agent-installer --config .*[\\/]explicit-overrides\.json$/
       );
       const cursorDocument = JSON.parse(
         readFileSync(harness.cursorConfigPath, "utf8")
@@ -593,7 +635,10 @@ describe("Issue 04 build and verification lifecycle", () => {
       expect(cursorDocument.mcpServers?.["reforger-forge"]).toEqual({
         command: "node",
         args: [
+          "--title=ReforgerForge-MCP-cursor",
           join(harness.root, "dist", "index.js"),
+          "--mcp-client-label",
+          "cursor",
           "--config",
           harness.configPath,
         ],
@@ -618,10 +663,16 @@ describe("Issue 04 build and verification lifecycle", () => {
     const verifier = read("scripts/verify-mcp-server.mjs");
     const verifierCore = read("src/setup/server-verification.ts");
 
-    expect(verifier).toContain("const serverArguments = process.argv.slice(2);");
+    expect(verifier).toContain(
+      "const hostPartition = partitionMcpHostArguments(process.argv.slice(2));"
+    );
+    expect(verifier).toContain(
+      "const serverArguments = hostPartition.remainingArguments;"
+    );
+    expect(verifier).toContain("hostClientLabel: hostPartition.clientLabel");
     expect(verifier).toContain("startupArguments: serverArguments");
     expect(verifierCore).toMatch(
-      /args:\s*\[\s*options\.serverPath,\s*\.\.\.options\.startupArguments\s*\]/
+      /args:\s*\[\s*\.\.\.options\.nodeArguments,\s*options\.serverPath,\s*\.\.\.options\.hostArguments,\s*\.\.\.options\.startupArguments,?\s*\]/
     );
     expect(verifier).not.toMatch(
       /serverArguments\.(?:length|at)\b[^]*?(?:throw|process\.exit|--config)/
@@ -654,11 +705,9 @@ describe("Issue 04 build and verification lifecycle", () => {
 
     expect(setup).not.toContain("install-agents.ps1");
     expect(registrationSources).not.toMatch(/verify-mcp-server/i);
-    expect(
-      installer.match(
-        /node\s+\(Join-Path \$Root "scripts\\verify-mcp-server\.mjs"\)/gi
-      )
-    ).toHaveLength(1);
+    expect(installer.match(/verify-mcp-server\.mjs/gi)).toHaveLength(1);
+    expect(installer).toContain("--title=ReforgerForge-MCP-agent-installer");
+    expect(installer).toContain("--mcp-client-label agent-installer");
     expect(installer).not.toMatch(
       /SkipVerification|VerificationReceipt|TrustVerification/i
     );

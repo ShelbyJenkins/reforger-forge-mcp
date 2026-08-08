@@ -7,6 +7,7 @@
   "workbenchScriptAuthorizeAll": false,
   "workbenchHost": "127.0.0.1",
   "workbenchPort": 5775,
+  "mcpIdleShutdownMs": 1800000,
   "observer": {
     "defaultLossyImageQuality": 75,
     "minimumLossyImageQuality": 1,

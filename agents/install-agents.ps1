@@ -55,21 +55,47 @@ if (-not (Test-Path -LiteralPath $LifecycleHelper -PathType Leaf)) {
 # This is the public standalone override installer, so it always verifies
 # before its first client-config write.
 Write-Host "Verifying registered tools..." -ForegroundColor Yellow
-node (Join-Path $Root "scripts\verify-mcp-server.mjs") --config $ResolvedConfigPath
+node --title=ReforgerForge-MCP-agent-installer `
+    (Join-Path $Root "scripts\verify-mcp-server.mjs") `
+    --mcp-client-label agent-installer --config $ResolvedConfigPath
 if ($LASTEXITCODE -ne 0) { exit 1 }
 Write-Host ""
 
-# Standard mcpServers entry (Cursor, Antigravity, Windsurf, Claude, Continue, Kiro)
-$stdioEntry = [ordered]@{
-    command = "node"
-    args    = @($ServerEntry, "--config", $ResolvedConfigPath)
+function New-McpServerArguments {
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidatePattern('^[a-z0-9][a-z0-9._-]{0,47}$')]
+        [string]$ClientLabel
+    )
+    return @(
+        "--title=ReforgerForge-MCP-$ClientLabel",
+        $ServerEntry,
+        "--mcp-client-label",
+        $ClientLabel,
+        "--config",
+        $ResolvedConfigPath
+    )
 }
 
-# VS Code uses "servers" with type: stdio
-$vscodeEntry = [ordered]@{
-    type    = "stdio"
-    command = "node"
-    args    = @($ServerEntry, "--config", $ResolvedConfigPath)
+function New-McpStdioEntry {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ClientLabel,
+
+        [switch]$VsCode
+    )
+    $entry = [ordered]@{
+        command = "node"
+        args = @(New-McpServerArguments -ClientLabel $ClientLabel)
+    }
+    if ($VsCode) {
+        $entry = [ordered]@{
+            type = "stdio"
+            command = "node"
+            args = @(New-McpServerArguments -ClientLabel $ClientLabel)
+        }
+    }
+    return $entry
 }
 
 function Merge-McpServers {
@@ -108,7 +134,8 @@ function Merge-McpServers {
 }
 
 function Install-Cursor {
-    Merge-McpServers -Path (Join-Path $env:USERPROFILE ".cursor\mcp.json") -Entry $stdioEntry
+    $entry = New-McpStdioEntry -ClientLabel "cursor"
+    Merge-McpServers -Path (Join-Path $env:USERPROFILE ".cursor\mcp.json") -Entry $entry
 }
 
 function Install-Codex {
@@ -130,13 +157,12 @@ function Install-Codex {
             throw "Codex returned an invalid MCP registration for 'reforger-forge': $($_.Exception.Message)"
         }
         $existingArgs = @($existing.transport.args)
+        $expectedArgs = @(New-McpServerArguments -ClientLabel "codex")
         $alreadyCurrent =
             $existing.transport.type -eq "stdio" -and
             $existing.transport.command -eq "node" -and
-            $existingArgs.Count -eq 3 -and
-            $existingArgs[0] -eq $ServerEntry -and
-            $existingArgs[1] -eq "--config" -and
-            $existingArgs[2] -eq $ResolvedConfigPath
+            $existingArgs.Count -eq $expectedArgs.Count -and
+            ($existingArgs -join [char]0) -eq ($expectedArgs -join [char]0)
         if ($alreadyCurrent) {
             Write-Host "  Already current: Codex MCP registration" -ForegroundColor Green
             return
@@ -148,7 +174,8 @@ function Install-Codex {
         }
     }
 
-    & $codexCommand.Source mcp add reforger-forge -- node $ServerEntry --config $ResolvedConfigPath
+    $codexArgs = @(New-McpServerArguments -ClientLabel "codex")
+    & $codexCommand.Source mcp add reforger-forge -- node @codexArgs
     if ($LASTEXITCODE -ne 0) {
         throw "Codex could not add the 'reforger-forge' MCP registration."
     }
@@ -156,28 +183,33 @@ function Install-Codex {
 }
 
 function Install-Antigravity {
-    Merge-McpServers -Path (Join-Path $env:USERPROFILE ".gemini\config\mcp_config.json") -Entry $stdioEntry
+    $entry = New-McpStdioEntry -ClientLabel "antigravity"
+    Merge-McpServers -Path (Join-Path $env:USERPROFILE ".gemini\config\mcp_config.json") -Entry $entry
 }
 
 function Install-Claude {
-    Merge-McpServers -Path (Join-Path $env:APPDATA "Claude\claude_desktop_config.json") -Entry $stdioEntry
+    $entry = New-McpStdioEntry -ClientLabel "claude-desktop"
+    Merge-McpServers -Path (Join-Path $env:APPDATA "Claude\claude_desktop_config.json") -Entry $entry
 }
 
 function Install-Windsurf {
-    Merge-McpServers -Path (Join-Path $env:USERPROFILE ".codeium\windsurf\mcp_config.json") -Entry $stdioEntry
+    $entry = New-McpStdioEntry -ClientLabel "windsurf"
+    Merge-McpServers -Path (Join-Path $env:USERPROFILE ".codeium\windsurf\mcp_config.json") -Entry $entry
 }
 
 function Install-VSCode {
+    $entry = New-McpStdioEntry -ClientLabel "vscode" -VsCode
     # User-level
-    Merge-McpServers -Path (Join-Path $env:APPDATA "Code\User\mcp.json") -Entry $vscodeEntry -RootKey "servers"
+    Merge-McpServers -Path (Join-Path $env:APPDATA "Code\User\mcp.json") -Entry $entry -RootKey "servers"
     # Workspace-level
     $wsDir = Join-Path $Root ".vscode"
     New-Item -ItemType Directory -Force -Path $wsDir | Out-Null
-    Merge-McpServers -Path (Join-Path $wsDir "mcp.json") -Entry $vscodeEntry -RootKey "servers"
+    Merge-McpServers -Path (Join-Path $wsDir "mcp.json") -Entry $entry -RootKey "servers"
 }
 
 function Install-Continue {
-    Merge-McpServers -Path (Join-Path $env:USERPROFILE ".continue\config.json") -Entry $stdioEntry
+    $entry = New-McpStdioEntry -ClientLabel "continue"
+    Merge-McpServers -Path (Join-Path $env:USERPROFILE ".continue\config.json") -Entry $entry
 }
 
 function Install-Kiro {
@@ -185,7 +217,7 @@ function Install-Kiro {
     New-Item -ItemType Directory -Force -Path $kiroDir | Out-Null
     $entry = [ordered]@{
         command     = "node"
-        args        = @($ServerEntry, "--config", $ResolvedConfigPath)
+        args        = @(New-McpServerArguments -ClientLabel "kiro")
         disabled    = $false
         autoApprove = @()
     }

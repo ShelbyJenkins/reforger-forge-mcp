@@ -244,6 +244,7 @@ export function createWorkbenchPolicyFixture(): WorkbenchPolicyFixture {
     patternsDir: join(root, "patterns"),
     workbenchHost: "127.0.0.1",
     workbenchPort: 5775,
+    mcpIdleShutdownMs: 1_800_000,
   });
   const clock = new FakeWorkbenchClock();
   const trace = new LifecycleTraceRecorder();

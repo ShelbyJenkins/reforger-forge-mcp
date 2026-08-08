@@ -74,14 +74,16 @@ directory, not a shared or broadly writable location.
 
 ## Public MCP contract
 
-Observer exposes ten related MCP tools. Their client-facing descriptions and
-input schemas are the authoritative API surface; the operator call order is in
+Observer exposes ten related `observer_*` primitives plus the separate
+`game_launch` owned composite. Their client-facing descriptions and input
+schemas are the authoritative API surface; the operator call order is in
 [docs/observer.md](../docs/observer.md).
 
 | Tool | Contract boundary |
 |---|---|
+| `game_launch` | Resolves canonical project/world/add-on/executable evidence and delegates start/status/stop only to the exact-owned runtime manager. |
 | `observer_setup` | Stages, inspects, or removes managed companions without launching or signaling an Arma Reforger or Workbench process. |
-| `observer_prepare_launch` | Creates an expiring runtime activation session and structured arguments without starting the runtime. |
+| `observer_prepare_launch` | Resolves a canonical executable path and creates an expiring runtime activation session with structured arguments, without starting the runtime. |
 | `observer_runtime` | Explicitly starts, inspects, or restoration-gated stops an exact-owned graphical runtime on Windows. |
 | `observer_instances` | Reports live or stale renderers, capabilities, world identity, health, and active work. |
 | `observer_capture` | Submits a current, pose, or look-at transaction, optionally attached to an active or explicit managed run. |
@@ -108,6 +110,16 @@ re-inventories the same lifecycle before submitting the requested view.
 Public runtime start/stop calls do not accept idempotency keys. The host derives
 stable operation keys from the exact prepared launch or owned runtime identity,
 so a lost response can be retried without creating a second lifecycle command.
+The composite defaults to one initial `listenServer` family for a derived
+project profile and accepts `client` explicitly. Its first preparation is
+serialized by the manager's machine-wide lifecycle mutex; equal in-process
+requests join one mutation. The retained world, add-on, and executable snapshots
+are re-attested immediately before consumption. An unconsumed mismatch records
+an invalidation before session revocation; an unknown post-consumption result
+never authorizes revocation. A durable profile-keyed attempt chain admits one
+successor only when the caller supplies the current runtime ID after exact stop,
+restoration, sealing, and revocation. Natural exit and unknown outcomes remain
+pinned; exact retries recover the same composite attempt and attempt-scoped keys.
 Runless capture delivery automatically attempts release; cleanup failure stays
 visible through a retained job handle and `cleanupRequired` diagnostics.
 
@@ -160,6 +172,15 @@ their original styles so they remain normally focusable after initialization.
 A failed start leaves no successful
 ownership receipt; a retained child whose exit cannot be proved remains a
 non-success pending record without PID-only cleanup authority.
+
+`game_launch` builds `-world <resource>` for `client` and `-server <resource>`
+for `listenServer`. It rejects caller-owned `-world`, `-server`, `-addons`,
+`-addonsDir`, profile, display, observer-policy, and owner-token arguments. Its
+dependency scan includes configured roots, the target's parent, installation
+add-ons, and the derived profile add-ons, and refuses missing or ambiguous
+providers. The point-of-use check cannot lock project files against unrelated
+writers after it returns; the manager's independent spawn-time executable
+identity check remains authoritative for the executable.
 
 Runtime registration uses acknowledged loopback REST delivery with a confined
 mailbox fallback. Session registration, heartbeats, job idempotency, artifact
@@ -304,10 +325,17 @@ with no unrelated Arma Reforger or Workbench processes. Consult each command's
 ```powershell
 $env:RFO_RUN_LIVE_RUNTIME_OBSERVER_ACCEPTANCE = '1'
 npm run dev:observer:acceptance:runtime -- --config <CONFIG_PATH> --confirm-live-run
+npm run dev:observer:acceptance:runtime -- --config <CONFIG_PATH> --runtime-kind client --confirm-live-run
 
 $env:RFO_RUN_LIVE_WORKBENCH_OBSERVER_ACCEPTANCE = '1'
 npm run dev:observer:acceptance:workbench -- --config <CONFIG_PATH> --confirm-live-run
 ```
+
+The runtime harness invokes the public `game_launch` start/status/stop handler
+against a project-contained `.ent` fixture. A deliberate same-profile relaunch
+must reuse the stopped result's offered `afterRuntimeId`; listen-server and
+client acceptance commands still use separate managed roots so their evidence
+remains independently attributable.
 
 `npm run test:observer:integration` is reserved for the harmless exact-owned
 runtime native fixture; it does not launch Arma Reforger or Workbench.

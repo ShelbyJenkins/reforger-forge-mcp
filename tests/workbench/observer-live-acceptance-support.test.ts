@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { readdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { deflateSync } from "node:zlib";
@@ -471,6 +472,27 @@ describe("live observer acceptance support", () => {
       "termination",
       "observer_cleanup",
     ]);
+    const publicMeasurements = input.measurements.map((item) => ({
+      ...item,
+      operation: item.operation === "OwnedRuntimeManager.start/status(running)"
+        ? "game_launch start/status(running)"
+        : item.operation === "OwnedRuntimeManager.status"
+          ? "game_launch status"
+          : item.operation === "OwnedRuntimeManager.stop"
+            ? "game_launch stop"
+            : item.operation,
+    }));
+    expect(() => buildOperationalBaselineArtifact({
+      ...input,
+      measurements: publicMeasurements,
+    })).not.toThrow();
+    expect(() => buildOperationalBaselineArtifact({
+      ...input,
+      measurements: publicMeasurements.map((item) =>
+        item.operation === "game_launch status"
+          ? { ...item, operation: "OwnedRuntimeManager.status" }
+          : item),
+    })).toThrow(/lifecycle\/cleanup evidence/);
     expect(() => buildOperationalBaselineArtifact({
       ...input,
       workload: { ...input.workload, runtimeKind: "client" },
@@ -636,11 +658,21 @@ describe("live observer acceptance support", () => {
       .toBe(operationalBaselineProcedureSha256({ policy: "evidence", pose: [1, 2, 3] }));
 
     const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
+    const windowsFixtureDirectory = resolve(repositoryRoot, "scripts", "windows");
+    const powerShellFixtureNames = readdirSync(windowsFixtureDirectory, { withFileTypes: true })
+      .filter((entry) => entry.isFile() && entry.name.toLowerCase().endsWith(".ps1"))
+      .map((entry) => entry.name)
+      .sort();
+    expect(powerShellFixtureNames).toEqual([
+      "runtime-focus-guard.ps1",
+      "same-handle-file-read.ps1",
+      "workbench-lifecycle.ps1",
+    ]);
     const fixtureIdentity = operationalBaselineDirectoryIdentity(
-      resolve(repositoryRoot, "scripts", "windows"),
+      windowsFixtureDirectory,
       [".ps1"]
     );
-    expect(fixtureIdentity).toMatchObject({ fileCount: 2 });
+    expect(fixtureIdentity).toMatchObject({ fileCount: powerShellFixtureNames.length });
     expect(fixtureIdentity.sha256).toMatch(/^[a-f0-9]{64}$/);
     expect(fixtureIdentity).not.toHaveProperty("path");
 

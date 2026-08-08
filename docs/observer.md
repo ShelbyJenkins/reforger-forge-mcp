@@ -77,11 +77,58 @@ Pass an explicit run ID when intentionally operating on another run.
 
 ### Runtime capture
 
-Call `observer_prepare_launch` with the normal graphical runtime arguments and
-an exclusive, Observer-approved outer `profilePath`. It returns prepared
-argument tokens, an opaque `preparedLaunchId`, and session metadata. Preparation
-does not start the game. It also assigns one relative, session-specific
-`-logsDir` whose physical log is
+For the normal exact-owned path, call the `game_launch` composite. It resolves an
+explicit absolute `gprojPath` or the currently owned Workbench project's path as
+a selection hint, chooses one registered project-contained world, proves the
+target add-on and its transitive dependencies, derives a private per-project
+profile, prepares Observer, and starts only through the exact-owned runtime
+manager:
+
+```json
+{
+  "action": "start",
+  "gprojPath": "C:\\Projects\\MyMod\\MyMod.gproj",
+  "world": "Worlds/MyScenario.ent",
+  "runtimeKind": "listenServer",
+  "waitForInstanceMs": 60000
+}
+```
+
+Omitting `action` means `start`; `runtimeKind` defaults to `listenServer`.
+The legacy value `client` means a standalone graphical `-world` launch; it does
+**not** select Reforger's `-client` replication mode. `listenServer` maps to
+`-server`. Extra
+`arguments` cannot replace composite-owned project, world, add-on, profile,
+display, or owner-token fields. The result contains the exact `runtimeId`,
+`sessionId`, canonical project/profile/world, emitted and implicit add-on roots,
+final prepared argument vector, matching instances, and status/capture/stop
+guidance. Successful start/status/stop calls return the same action-discriminated
+object in MCP `structuredContent` and as JSON text for compatible clients. A
+readiness timeout is partial success: the process remains visible in the result
+and must still be inspected or stopped. When readiness inspection itself fails,
+`readinessWarning` remains fixed while the separately bounded `readinessError`
+contains public guidance; `next.capture.firstCall` is the authoritative machine
+path for refreshing the same session inventory.
+
+`game_launch` retains a durable attempt chain per derived project profile. An
+identical request recovers the same attempt without spawning twice. After
+`game_launch stop` or `observer_runtime stop` completes exact vacancy, camera
+restoration, session sealing, and revocation, the result offers that exact
+`runtimeId` as `afterRuntimeId` for one successor. Natural exit or status alone
+never grants successor admission. Changed, invalidated, stale, expired, or
+unknown attempt outcomes remain pinned and fail closed.
+The manager re-attests the original project, world metadata, dependency
+manifests, and executable immediately before descriptor consumption. This
+narrows but cannot eliminate the ordinary external-filesystem race in which an
+unrelated process replaces a file after that check; spawn still performs its
+own final executable identity verification.
+
+For an external launcher or low-level diagnosis, `observer_prepare_launch`
+remains available. Supply normal graphical runtime arguments and an exclusive,
+Observer-approved outer `profilePath`. It returns the canonical
+`executablePath`, prepared argument tokens, an opaque `preparedLaunchId`, and
+session metadata without starting the game. It also assigns one relative,
+session-specific `-logsDir` whose physical log is
 `<profilePath>/profile/logs/observer-<sessionId>/script.log`; caller-supplied
 `-logsDir` values are refused.
 
@@ -97,12 +144,17 @@ present only when native fullscreen cannot be used for a compelling external
 reason. Screenshot size is not such a reason: use the `observer_capture.image`
 output bounds described below while leaving the launched renderer fullscreen.
 
-You can pass the returned arguments unchanged to your own launcher. On Windows,
-you can instead call `observer_runtime action: "start"` with the
-`preparedLaunchId`; retain the returned `runtimeId`
-for later status and stop calls.
+For an external launcher, invoke the returned `executablePath` directly and
+pass each returned `arguments` entry unchanged as a separate argument token;
+do not concatenate them into a shell command. The path is resolution-time
+launcher guidance only. It does not make an externally launched process owned,
+attest the executable at spawn time, or prove process vacancy. On Windows,
+`observer_runtime action: "start"` consumes only the `preparedLaunchId`,
+independently re-resolves and verifies the executable, and returns the
+`runtimeId`; this primitive path remains public and is not replaced by
+`game_launch`.
 
-Retain the **`sessionId` returned by launch preparation** for inventory and the
+Retain the **`sessionId` returned by either launch path** for inventory and the
 legacy explicit-capture form. The preferred opaque inventory target carries
 that binding internally, and `observer_job` requires only its `jobId`. A
 `runtimeId` identifies an exact-owned process for lifecycle operations; it is
@@ -287,16 +339,35 @@ Before stopping an exact-owned runtime:
 1. Cancel unwanted jobs.
 2. Poll each job until its camera restoration is terminal.
 3. Finalize or discard the evidence run.
-4. Call `observer_runtime action: "stop"` with its `runtimeId` and a bounded
-   `waitForRestorationMs`.
+4. Call `game_launch action: "stop"` for a composite-started runtime, or
+   `observer_runtime action: "stop"` for a primitive-started runtime, with its
+   exact `runtimeId` and a bounded `waitForRestorationMs`.
 
-`observer_runtime` stops only a process it started and exactly verified. Do not
+Both owned stop paths stop only a process the manager started and exactly
+verified. Do not
 substitute a PID, executable name, `taskkill`, or a broad process-tree command
 when a stop is refused. Preserve the returned diagnostic and resolve active jobs
 or identity issues first.
 
 For Workbench, restore or cancel all captures before ending live automation,
 then follow the normal owner-scoped editor shutdown process.
+
+The MCP host also maintains an internal, host-scoped idle-readiness projection.
+It checks the exact host UUID against Workbench journals, private-child and
+capture activity, and the complete owned-runtime record inventory. That check
+is bounded, read-only, and existing-only: it does not create missing state,
+start the observer child, sweep or repair evidence, revoke a session, or stop a
+Workbench/game process. Unknown, legacy-unattributed, malformed, timed-out, or
+racing evidence fails closed. The CLI stdio host evaluates that proof after
+the configured inactivity interval (30 minutes by default, bounded from 60
+seconds through 24 hours). It seals new host and protocol admissions only when
+the protocol activity epoch, provider revisions, and readiness proof still
+agree in one synchronous turn, then uses the normal close-first disposer. A
+sole ready private child with no pending request is safe and is closed by that
+disposer; child startup, requests, shutdown, captures, restorations, runtime
+operations, and uncertain lifecycle evidence block automatic exit. No host may
+use this mechanism to signal another host or to stop an unowned Workbench or
+game process.
 
 ## Common operator problems
 
@@ -310,7 +381,7 @@ then follow the normal owner-scoped editor shutdown process.
 | Legacy runtime capture rejects a missing session | Prefer the opaque runtime target, or supply the complete legacy binding from inventory; do not use the runtime lifecycle ID as a substitute. |
 | An image cannot be read inline | Leave it managed and finalize the run; oversized images are intentionally not exposed by private path. |
 | Finalization is unavailable or ambiguous | Configure an evidence root, or provide the chosen root when several are allowlisted. |
-| Semantic runtime log admission is refused | Select the completed runtime capture for export and confirm it came from the exact process started by `observer_runtime`. For external launches, configure a narrow supporting-log root and use the `path` form. |
+| Semantic runtime log admission is refused | Select the completed runtime capture for export and confirm it came from the exact process started by `game_launch` or `observer_runtime`. For external launches, configure a narrow supporting-log root and use the `path` form. |
 | Managed runtime stop reports a busy camera | Cancel or finish the captures, wait for terminal restoration through `observer_job`, then retry the same stop operation with an appropriate bound. |
 | Runtime status is `identity_mismatch`, `unverifiable`, or `stale` | Do not terminate by PID or name. Preserve the receipt and investigate the configured executable, owner identity, and lifecycle state. |
 
@@ -319,8 +390,9 @@ then follow the normal owner-scoped editor shutdown process.
 | Tool | Use it for |
 |---|---|
 | `observer_setup` | Inspect, stage, or uninstall managed observer companions. |
-| `observer_prepare_launch` | Produce instrumented runtime arguments and a runtime capture session. |
-| `observer_runtime` | Start, inspect, or stop an exact-owned Windows runtime. |
+| `game_launch` | Plan, start, inspect, or stop one fail-closed exact-owned graphical runtime. |
+| `observer_prepare_launch` | Produce a canonical runtime executable path, instrumented argument tokens, and a runtime capture session. |
+| `observer_runtime` | Start, inspect, stop, classify (`history`), or safely reconcile (`recover`) exact-owned Windows runtime history. |
 | `observer_instances` | Find compatible runtime or Workbench renderers and obtain world bindings. |
 | `observer_capture` | Submit a current, pose, or look-at capture, optionally attached to an active or explicit run. |
 | `observer_job` | Inspect, read, cancel, or release a capture job. |

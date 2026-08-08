@@ -7,6 +7,9 @@
   "entry": [
     "src/workbench/runner-cli.ts",
     "src/workbench/child-supervisor.ts",
+    "src/workbench/existing-lmdb-reader-worker.ts",
+    "src/launch/game-launch-planning-worker.ts",
+    "src/launch/game-launch-revalidation-worker.ts",
     "observer/agent/index.ts",
     "src/scraper/index.ts",
     "src/scraper/source-remote.ts",

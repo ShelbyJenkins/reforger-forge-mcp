@@ -1,4 +1,5 @@
 import { EventEmitter } from "node:events";
+import { performance } from "node:perf_hooks";
 import type { ChildProcess } from "node:child_process";
 import {
   mkdirSync,
@@ -16,6 +17,7 @@ import {
   vi,
 } from "vitest";
 import type { Config } from "../../src/config.js";
+import { McpHostAdmissionGate } from "../../src/mcp-host-admission.js";
 import {
   WorkbenchActivityError,
   WorkbenchActivityGate,
@@ -103,6 +105,30 @@ afterEach(async () => {
 });
 
 describe("WorkbenchActivityGate", () => {
+  it("holds shared admissions and projects managed/capture activity read-only", async () => {
+    const admissions = new McpHostAdmissionGate();
+    const gate = new WorkbenchActivityGate({ admissionGate: admissions });
+    const inspect = () => gate.inspectIdleShutdownReadiness({
+      deadlineTick: performance.now() + 1_000,
+      signal: new AbortController().signal,
+      probeGeneration: 1,
+    });
+    const work = deferred();
+    const managed = gate.runManaged("test read", () => work.promise);
+    expect(admissions.snapshot().activeTokens).toBe(1);
+    await expect(inspect()).resolves.toMatchObject({ blockers: ["WORKBENCH_ACTIVITY"] });
+    work.resolve();
+    await managed;
+    expect(admissions.snapshot().activeTokens).toBe(0);
+
+    const lease = gate.acquireCapture(binding);
+    expect(admissions.snapshot().activeTokens).toBe(1);
+    await expect(inspect()).resolves.toMatchObject({ blockers: ["WORKBENCH_ACTIVITY"] });
+    gate.releaseCapture(lease);
+    await expect(inspect()).resolves.toMatchObject({ blockers: [] });
+    expect(admissions.snapshot().activeTokens).toBe(0);
+  });
+
   it("admits concurrent managed readers", async () => {
     const gate = new WorkbenchActivityGate();
     const release = deferred();
@@ -337,9 +363,11 @@ describe("WorkbenchActivityGate", () => {
   ])("invalidates status from an old %s", (_label, changed) => {
     const gate = new WorkbenchActivityGate();
     const lease = gate.acquireCapture(binding);
+    const revision = gate.currentIdleRevision();
 
     expectActivityCode(() => gate.revalidateCapture(lease, changed), "CAPTURE_INVALIDATED");
     expect(lease.signal.reason).toMatchObject({ code: "IDENTITY_CHANGED" });
+    expect(gate.currentIdleRevision()).toBeGreaterThan(revision);
   });
 
   it("keeps lifecycle mutation blocked after identity drift until restoration explicitly releases", async () => {
@@ -413,6 +441,7 @@ async function createRunningHarness(activityGate?: WorkbenchActivityGate): Promi
     patternsDir: join(root, "patterns"),
     workbenchHost: "127.0.0.1",
     workbenchPort: 5775,
+    mcpIdleShutdownMs: 1_800_000,
   };
   const backend = createFakeLifecycleBackend();
   const guard = new WorkbenchProcessGuard({

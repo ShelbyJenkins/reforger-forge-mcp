@@ -15,7 +15,9 @@ import {
   buildWorkbenchLaunchPlan,
   canonicalizeWorkbenchAddonDirectories,
   ensureWorkbenchManagedBuildProfile,
+  projectWorkbenchLaunchPreview,
   toLifecycleTarget,
+  WORKBENCH_PREVIEW_OWNER_MARKER,
   WorkbenchLaunchPlanError,
   type WorkbenchManagedBuildProfile,
 } from "../../src/workbench/launch-plan.js";
@@ -177,6 +179,34 @@ describe("canonical Workbench launch-plan policy", () => {
     expect(plan.argv.filter((arg) => arg.startsWith(WORKBENCH_OWNER_ARG_PREFIX))).toEqual([
       OWNER_ARGUMENT,
     ]);
+  });
+
+  scopedIt("projects the real editor plan as a structurally non-runnable preview", (root) => {
+    const harness = createHarness(root);
+    const plan = buildMcpEditorLaunchPlan({
+      kind: "mcp_editor",
+      config: harness.config,
+      project: harness.project,
+      companion: harness.companion,
+      endpoint: { host: "127.0.0.1", port: 5775 },
+      ownerArgument: OWNER_ARGUMENT,
+      managedRoot: harness.managedRoot,
+    });
+
+    const preview = projectWorkbenchLaunchPreview(plan);
+    expect(preview).toMatchObject({
+      kind: "workbench_editor",
+      ownership: "preview_only",
+      runnable: false,
+      presentation: "presentation_only",
+      executablePath: plan.executablePath,
+    });
+    expect("ownerArgument" in preview).toBe(false);
+    expect(preview.argv).not.toContain(OWNER_ARGUMENT);
+    expect(preview.argv.filter((argument) =>
+      argument === `${WORKBENCH_OWNER_ARG_PREFIX}${WORKBENCH_PREVIEW_OWNER_MARKER}`)).toHaveLength(1);
+    expect(Object.isFrozen(preview)).toBe(true);
+    expect(Object.isFrozen(preview.argv)).toBe(true);
   });
 
   scopedIt("binds a fresh MCP editor to one canonical .ent through the Workbench -load argument", (root) => {

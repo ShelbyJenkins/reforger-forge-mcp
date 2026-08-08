@@ -18,7 +18,7 @@ interface RuntimeRegistry {
 
 const OBSOLETE_TOOL_NAMES = /\b(?:mod_create|mod_validate|prefab_create|project_browse|project_read|project_write)\b/;
 
-function collectRuntimeRegistry(): RuntimeRegistry {
+function collectRuntimeRegistry(withGamePath = true): RuntimeRegistry {
   const tools = new Map<string, unknown>();
   const prompts = new Map<string, PromptHandler>();
   const server = {
@@ -32,14 +32,14 @@ function collectRuntimeRegistry(): RuntimeRegistry {
   } as unknown as McpServer;
 
   const packageRoot = fileURLToPath(new URL("../../", import.meta.url));
-  const config: Config = {
+  const config = {
     workbenchPath: packageRoot,
-    gamePath: packageRoot,
+    ...(withGamePath ? { gamePath: packageRoot } : {}),
     dataDir: join(packageRoot, "data"),
     patternsDir: join(packageRoot, "data", "patterns"),
     workbenchHost: "127.0.0.1",
     workbenchPort: 5775,
-  };
+  } as Config;
   registerTools(server, config);
   return { tools, prompts };
 }
@@ -78,7 +78,9 @@ describe("prompt/tool contracts", () => {
   });
 
   it("collects tools and prompts from the real runtime registration path", () => {
-    expect(registry.tools.size).toBeGreaterThan(30);
+    expect(registry.tools.size).toBe(63);
+    expect(registry.tools.has("game_launch")).toBe(true);
+    expect(registry.tools.has("observer_runtime")).toBe(true);
     expect(registry.tools.has("mod")).toBe(true);
     expect(registry.tools.has("project")).toBe(true);
     expect(registry.tools.has("prefab")).toBe(true);
@@ -88,6 +90,12 @@ describe("prompt/tool contracts", () => {
     expect(registry.tools.has("wb_execute_action")).toBe(false);
     expect(registry.prompts.has("create-mod")).toBe(true);
     expect(registry.prompts.has("modify-mod")).toBe(true);
+  });
+
+  it("rejects a fixture without the required owned-runtime composition", () => {
+    expect(() => collectRuntimeRegistry(false)).toThrow(
+      "The server composition requires an owned runtime manager."
+    );
   });
 
   it("create-mod uses registered merged tools and an attended manual Play checkpoint", () => {

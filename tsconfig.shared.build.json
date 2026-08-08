@@ -8,6 +8,8 @@
   },
   "include": [
     "src/foundation/**/*.ts",
-    "src/companions/**/*.ts"
+    "src/companions/**/*.ts",
+    "src/mcp-host-admission.ts",
+    "src/mcp-idle-readiness.ts"
   ]
 }

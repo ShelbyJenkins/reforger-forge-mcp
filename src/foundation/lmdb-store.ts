@@ -77,6 +77,7 @@ interface LmdbRangeOptions {
 }
 
 interface LmdbBinaryDatabase {
+  resetReadTxn(): void;
   getEntry(key: Uint8Array): { value: unknown; version?: number } | undefined;
   putSync(key: Uint8Array, value: unknown, version: number): void;
   removeSync(key: Uint8Array, ifVersion?: number): boolean;
@@ -84,6 +85,10 @@ interface LmdbBinaryDatabase {
   transaction<T>(action: () => T): Promise<T>;
   close(): Promise<void>;
 }
+
+export type LmdbExistingInspection<T> =
+  | { readonly kind: "missing" }
+  | { readonly kind: "available"; readonly value: T };
 
 /** Whether `segments` begins with every component of `prefix`, in order. */
 function segmentsHavePrefix(segments: readonly string[], prefix: readonly string[]): boolean {
@@ -172,6 +177,48 @@ function openEnvironmentDirectory(storageRoot: string, databaseDirectory: string
   return canonicalEnvironment;
 }
 
+/**
+ * Resolve an already-existing LMDB environment without creating any path.
+ * A missing root, environment directory, or data file is exact absence. Other
+ * filesystem failures and linked/private-root violations fail closed.
+ */
+function existingEnvironmentDirectory(
+  storageRoot: string,
+  databaseDirectory: string,
+): LmdbExistingInspection<string> {
+  const root = resolve(storageRoot);
+  try {
+    lstatSync(root);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { kind: "missing" };
+    throw new LmdbStoreError("INVALID_ROOT", `Could not inspect LMDB storage root: ${root}`, { cause: error });
+  }
+  const canonicalRoot = assertExistingPrivateDirectory(root, "LMDB storage root");
+  const candidate = resolveManagedPath(root, join(root, databaseDirectory), "no-links");
+  try {
+    lstatSync(candidate);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { kind: "missing" };
+    throw new LmdbStoreError("INVALID_ROOT", `Could not inspect LMDB environment: ${candidate}`, { cause: error });
+  }
+  const canonicalEnvironment = assertExistingPrivateDirectory(candidate, "LMDB environment");
+  if (!isPathContained(canonicalRoot, canonicalEnvironment)) {
+    throw new LmdbStoreError("INVALID_ROOT", "LMDB environment escapes the configured storage root.");
+  }
+  const dataPath = join(canonicalEnvironment, "data.mdb");
+  try {
+    const data = lstatSync(dataPath);
+    if (data.isSymbolicLink() || !data.isFile()) {
+      throw new LmdbStoreError("INVALID_ROOT", `LMDB data file must be a non-linked regular file: ${dataPath}`);
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { kind: "missing" };
+    if (error instanceof LmdbStoreError) throw error;
+    throw new LmdbStoreError("INVALID_ROOT", `Could not inspect LMDB data file: ${dataPath}`, { cause: error });
+  }
+  return { kind: "available", value: canonicalEnvironment };
+}
+
 function keyBytes(key: string): Uint8Array {
   try {
     const decoded = decodeDurableKey(key);
@@ -229,6 +276,7 @@ function entryVersion(entry: { version?: number }): number {
 export class LmdbEnvironment {
   private readonly databaseDirectory: string;
   private database: LmdbBinaryDatabase | null = null;
+  private existingDatabase: LmdbBinaryDatabase | null = null;
   private closed = false;
   private closePromise: Promise<void> | null = null;
 
@@ -239,10 +287,21 @@ export class LmdbEnvironment {
     this.databaseDirectory = assertSafeDatabaseDirectory(databaseDirectory);
   }
 
+  /** True only after this owner has opened the writable environment handle. */
+  get hasOpenWriter(): boolean {
+    return this.database !== null;
+  }
+
   /** Lazily open (once) and return the shared binary database handle. */
   open(): LmdbBinaryDatabase {
     if (this.closed) throw new LmdbStoreError("CLOSED", "LMDB store is closed.");
     if (this.database) return this.database;
+    if (this.existingDatabase) {
+      throw new LmdbStoreError(
+        "INVALID_ROOT",
+        "A retained existing-only LMDB reader must be closed before opening a writer handle.",
+      );
+    }
     const environmentPath = openEnvironmentDirectory(this.storageRoot, this.databaseDirectory);
     try {
       this.database = open<unknown, Uint8Array>(environmentPath, {
@@ -265,16 +324,62 @@ export class LmdbEnvironment {
     return this.database;
   }
 
+  /**
+   * Run a synchronous read against existing storage only. An already-open
+   * writer handle is reused; otherwise a temporary read-only handle is opened
+   * and closed around the callback. No missing directory is materialized.
+   */
+  async inspectExisting<T>(
+    action: (database: LmdbBinaryDatabase) => T,
+    options: { readonly retainOpen?: boolean } = {},
+  ): Promise<LmdbExistingInspection<T>> {
+    if (this.closed) throw new LmdbStoreError("CLOSED", "LMDB store is closed.");
+    if (this.database) return { kind: "available", value: action(this.database) };
+    if (this.existingDatabase) {
+      this.existingDatabase.resetReadTxn();
+      return { kind: "available", value: action(this.existingDatabase) };
+    }
+    const environment = existingEnvironmentDirectory(this.storageRoot, this.databaseDirectory);
+    if (environment.kind === "missing") return environment;
+    let database: LmdbBinaryDatabase;
+    try {
+      database = open<unknown, Uint8Array>(environment.value, {
+        encoding: "binary",
+        keyEncoding: "binary",
+        useVersions: true,
+        maxDbs: 1,
+        readOnly: true,
+      });
+    } catch (error) {
+      throw new LmdbStoreError("INVALID_ROOT", `Could not open existing LMDB environment: ${environment.value}`, {
+        cause: error,
+      });
+    }
+    if (options.retainOpen === true) {
+      this.existingDatabase = database;
+      return { kind: "available", value: action(database) };
+    }
+    try {
+      return { kind: "available", value: action(database) };
+    } finally {
+      await database.close();
+    }
+  }
+
   async close(): Promise<void> {
     if (this.closePromise) return this.closePromise;
     this.closed = true;
-    if (!this.database) {
+    if (!this.database && !this.existingDatabase) {
       this.closePromise = Promise.resolve();
       return this.closePromise;
     }
-    const database = this.database;
-    this.closePromise = database.close().finally(() => {
+    const databases = [...new Set([
+      this.database,
+      this.existingDatabase,
+    ].filter((database): database is LmdbBinaryDatabase => database !== null))];
+    this.closePromise = Promise.all(databases.map((database) => database.close())).then(() => undefined).finally(() => {
       this.database = null;
+      this.existingDatabase = null;
     });
     return this.closePromise;
   }
@@ -351,6 +456,18 @@ export class LmdbDurableKvStore<T> implements DurableKvStore<T> {
         message: error instanceof Error ? error.message : String(error),
       };
     }
+  }
+
+  /** Read one record without creating a missing root or LMDB environment. */
+  async inspectExisting(
+    key: string,
+    options: { readonly retainOpen?: boolean } = {},
+  ): Promise<LmdbExistingInspection<LmdbInspection<T>>> {
+    const bytes = keyBytes(key);
+    return this.environment.inspectExisting(
+      (database) => this.inspectDatabaseEntry(database, bytes),
+      options,
+    );
   }
 
   /**
@@ -447,6 +564,18 @@ export class LmdbDurableKvStore<T> implements DurableKvStore<T> {
     return { entries, truncated };
   }
 
+  /** Namespace scan over existing storage only. */
+  async listExisting(
+    prefix: readonly string[],
+    limit: number,
+  ): Promise<LmdbExistingInspection<DurableKvListPage<T>>> {
+    if (!Number.isSafeInteger(limit) || limit < 1) {
+      throw new LmdbStoreError("INVALID_OPTIONS", "LMDB list limit must be a positive safe integer.");
+    }
+    const range = this.namespaceRange(prefix);
+    return this.environment.inspectExisting((database) => this.listDatabase(database, range, limit));
+  }
+
   async stats(prefix: readonly string[]): Promise<DurableKvNamespaceStats> {
     const scan = this.namespaceScan(prefix);
     let count = 0;
@@ -463,6 +592,12 @@ export class LmdbDurableKvStore<T> implements DurableKvStore<T> {
       totalValueBytes += entry.value instanceof Uint8Array ? entry.value.byteLength : 0;
     }
     return { count, totalValueBytes };
+  }
+
+  /** Namespace usage over existing storage only. */
+  async statsExisting(prefix: readonly string[]): Promise<LmdbExistingInspection<DurableKvNamespaceStats>> {
+    const range = this.namespaceRange(prefix);
+    return this.environment.inspectExisting((database) => this.statsDatabase(database, range));
   }
 
   async close(): Promise<void> {
@@ -482,6 +617,15 @@ export class LmdbDurableKvStore<T> implements DurableKvStore<T> {
     end: Uint8Array;
     prefix: readonly string[];
   } {
+    const range = this.namespaceRange(prefix);
+    return { database: this.openDatabase(), ...range };
+  }
+
+  private namespaceRange(prefix: readonly string[]): {
+    start: Uint8Array;
+    end: Uint8Array;
+    prefix: readonly string[];
+  } {
     let encoded: string;
     try {
       encoded = encodeDurableKey(...prefix);
@@ -493,7 +637,75 @@ export class LmdbDurableKvStore<T> implements DurableKvStore<T> {
       );
     }
     const start = Buffer.from(encoded, "utf8");
-    return { database: this.openDatabase(), start, end: namespaceUpperBound(start), prefix };
+    return { start, end: namespaceUpperBound(start), prefix };
+  }
+
+  private inspectDatabaseEntry(database: LmdbBinaryDatabase, bytes: Uint8Array): LmdbInspection<T> {
+    const entry = database.getEntry(bytes);
+    if (!entry) return { kind: "missing" };
+    const version = entryVersion(entry);
+    const raw = entry.value;
+    if (!(raw instanceof Uint8Array)) {
+      return {
+        kind: "corrupt",
+        version,
+        rawSha256: sha256Hex(new Uint8Array()),
+        message: "LMDB record is not stored as binary bytes.",
+      };
+    }
+    const rawBytes = new Uint8Array(raw);
+    try {
+      return { kind: "valid", value: this.decodeStoredValue(rawBytes), version };
+    } catch (error) {
+      return {
+        kind: "corrupt",
+        version,
+        rawSha256: sha256Hex(rawBytes),
+        message: error instanceof Error ? error.message : String(error),
+      };
+    }
+  }
+
+  private listDatabase(
+    database: LmdbBinaryDatabase,
+    range: { start: Uint8Array; end: Uint8Array; prefix: readonly string[] },
+    limit: number,
+  ): DurableKvListPage<T> {
+    const entries: DurableKvListEntry<T>[] = [];
+    let truncated = false;
+    for (const entry of database.getRange({
+      start: range.start,
+      end: range.end,
+      versions: true,
+      snapshot: true,
+    })) {
+      const key = matchNamespaceKey(entry.key, range.prefix);
+      if (key === null) continue;
+      if (entries.length >= limit) {
+        truncated = true;
+        break;
+      }
+      entries.push(this.classifyListEntry(key, entry));
+    }
+    return { entries, truncated };
+  }
+
+  private statsDatabase(
+    database: LmdbBinaryDatabase,
+    range: { start: Uint8Array; end: Uint8Array; prefix: readonly string[] },
+  ): DurableKvNamespaceStats {
+    let count = 0;
+    let totalValueBytes = 0;
+    for (const entry of database.getRange({
+      start: range.start,
+      end: range.end,
+      snapshot: true,
+    })) {
+      if (matchNamespaceKey(entry.key, range.prefix) === null) continue;
+      count += 1;
+      totalValueBytes += entry.value instanceof Uint8Array ? entry.value.byteLength : 0;
+    }
+    return { count, totalValueBytes };
   }
 
   private classifyListEntry(key: string, entry: LmdbRangeEntry): DurableKvListEntry<T> {

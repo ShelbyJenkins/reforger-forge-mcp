@@ -1,12 +1,8 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { WorkbenchError, type WorkbenchClient } from "../workbench/client.js";
+import { formatWorkbenchRefusal } from "../workbench/refusal-remedy.js";
 import { formatConnectionStatus } from "../workbench/status.js";
-
-function errorText(error: unknown): string {
-  if (error instanceof WorkbenchError) return `\`${error.code}\` — ${error.message}`;
-  return error instanceof Error ? error.message : String(error);
-}
 
 export function registerWbLaunch(
   server: McpServer,
@@ -22,11 +18,12 @@ export function registerWbLaunch(
         "is required before wb_save_resource. " +
         "The MCP stages its private helper outside the project, loads it with a dedicated profile, " +
         "and verifies the exact helper build identity before reporting readiness. Lifecycle operations " +
-        "are serialized by a machine-wide mutex and exact process ownership.",
+        "are serialized by a machine-wide mutex and exact process ownership. If gprojPath is omitted, " +
+        "only a previously verified exact lifecycle target can be reused. Cold configured-project enumeration is not available.",
       inputSchema: {
         gprojPath: z.string().optional().describe(
-          "Path to the exact .gproj to open. If omitted, a previously verified target or exactly one " +
-          "configured project must be available; ambiguous fallback is refused."
+          "Path to the exact .gproj to open. If omitted, a previously verified exact lifecycle target " +
+          "must be available. Cold configured-project enumeration is not available."
         ),
         resourcePath: z.string().optional().describe(
           "Optional existing .ent world or .et prefab to supply to Workbench at startup with -load. Requires gprojPath; " +
@@ -39,7 +36,15 @@ export function registerWbLaunch(
         if (resourcePath !== undefined && gprojPath === undefined) {
           throw new WorkbenchError(
             "A target-bound Workbench launch requires both gprojPath and resourcePath.",
-            "TARGET_REQUIRED"
+            "TARGET_REQUIRED",
+            {
+              kind: "remedy",
+              remedy: {
+                kind: "external",
+                action: "Call wb_launch with both an exact absolute gprojPath and resourcePath.",
+                why: "A resource target cannot establish its containing project implicitly.",
+              },
+            }
           );
         }
         const result = resourcePath === undefined
@@ -70,7 +75,13 @@ export function registerWbLaunch(
         return {
           content: [{
             type: "text" as const,
-            text: `**${heading}**\n\n${errorText(error)}${formatConnectionStatus(client)}`,
+            text:
+              `**${heading}**\n\n${formatWorkbenchRefusal(error, {
+                operation: "wb_launch",
+                ...(gprojPath === undefined ? {} : { gprojPath }),
+                ...(resourcePath === undefined ? {} : { resourcePath }),
+                originalInput: { gprojPath, resourcePath },
+              })}${formatConnectionStatus(client)}`,
           }],
           isError: true,
         };

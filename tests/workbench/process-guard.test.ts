@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import {
   mkdirSync,
+  existsSync,
   mkdtempSync,
   readdirSync,
   rmSync,
@@ -13,7 +14,7 @@ import {
   type WorkbenchIdentity,
   type WorkbenchLifecycleStateV3,
 } from "../../src/workbench/process-guard.js";
-import { encodeDurableKey } from "../../src/foundation/durable-kv.js";
+import { encodeDurableEnvelope, encodeDurableKey } from "../../src/foundation/durable-kv.js";
 import { createFakeLifecycleBackend } from "./fake-lifecycle-backend.js";
 import { companionLifecycleState, createFakeCompanionLaunch } from "./fake-companion.js";
 import {
@@ -46,6 +47,53 @@ async function writeRawLifecycleBytes(stateDir: string, bytes: Uint8Array): Prom
     overlappingSync: false,
   });
   database.putSync(Buffer.from(encodeDurableKey("workbench", "lifecycle"), "utf8"), asBinary(bytes), 1);
+  await database.close();
+}
+
+async function writeSpawnJournal(
+  stateDir: string,
+  originMcpInstanceId?: string,
+): Promise<void> {
+  const environmentPath = join(stateDir, "durable-kv-v1");
+  mkdirSync(environmentPath, { recursive: true, mode: 0o700 });
+  const generation = "journal-generation";
+  const state = {
+    version: 3,
+    generation,
+    record: {
+      transactionId: "retained-transaction",
+      phase: "pre_spawn",
+      pid: null,
+      identity: null,
+      createdAtMs: 1,
+      updatedAtMs: 1,
+      metadata: {
+        purpose: "mcp_editor",
+        lifecycleGeneration: "lifecycle-generation",
+        targetKey: "c:\\mods\\a\\a.gproj",
+        ...(originMcpInstanceId === undefined ? {} : { originMcpInstanceId }),
+      },
+    },
+  };
+  const bytes = encodeDurableEnvelope({
+    version: 1,
+    schema: "workbench-spawn-journal-v3",
+    generation,
+    writtenAtMs: 1,
+    value: new TextEncoder().encode(JSON.stringify(state)),
+  });
+  const database = open<unknown, Uint8Array>(environmentPath, {
+    encoding: "binary",
+    keyEncoding: "binary",
+    useVersions: true,
+    maxDbs: 1,
+    overlappingSync: false,
+  });
+  database.putSync(
+    Buffer.from(encodeDurableKey("workbench", "spawn-journal"), "utf8"),
+    asBinary(bytes),
+    1,
+  );
   await database.close();
 }
 
@@ -84,6 +132,14 @@ async function claimedIdleLease(stateDir: string): Promise<{
 }
 
 describe("WorkbenchProcessGuard v3 lifecycle state", () => {
+  it("rejects a nil injected MCP instance identity", () => {
+    expect(() => new WorkbenchProcessGuard({
+      stateDir: root(),
+      mcpInstanceId: "00000000-0000-0000-0000-000000000000",
+      backend: createFakeLifecycleBackend(),
+    })).toThrow(/non-nil UUID/i);
+  });
+
   it("creates a durable vacant record with an exact MCP lease", async () => {
     const stateDir = root();
     const backend = createFakeLifecycleBackend();
@@ -437,7 +493,10 @@ describe("WorkbenchProcessGuard v3 lifecycle state", () => {
     const durable = await guard.readSpawnJournal();
     expect(durable).toMatchObject({
       kind: "valid",
-      record: { phase: "pre_spawn" },
+      record: {
+        phase: "pre_spawn",
+        metadata: { originMcpInstanceId: guard.mcpInstanceId },
+      },
     });
 
     await guard.withLifecycleLock(async (session) => session.transition(
@@ -450,6 +509,49 @@ describe("WorkbenchProcessGuard v3 lifecycle state", () => {
     await expect(
       guard.createSpawnJournal(authority).persist(null, preSpawn("stale-transaction"))
     ).rejects.toMatchObject({ code: "GENERATION_MISMATCH" });
+  });
+
+  it("reads current, foreign, and legacy v3 journal attribution without migration", async () => {
+    for (const origin of [
+      "11111111-1111-4111-8111-111111111111",
+      "22222222-2222-4222-8222-222222222222",
+      undefined,
+    ]) {
+      const stateDir = root();
+      await writeSpawnJournal(stateDir, origin);
+      const guard = new WorkbenchProcessGuard({
+        stateDir,
+        mcpInstanceId: "11111111-1111-4111-8111-111111111111",
+        backend: createFakeLifecycleBackend(),
+      });
+      const read = await guard.readSpawnJournalExistingOnly();
+      expect(read).toMatchObject({
+        kind: "valid",
+        record: {
+          metadata: origin === undefined ? {} : { originMcpInstanceId: origin },
+        },
+      });
+      if (read.kind === "valid") {
+        expect(read.record.metadata.originMcpInstanceId).toBe(origin);
+      }
+      expect(existsSync(join(stateDir, "corrupt"))).toBe(false);
+    }
+  });
+
+  it("fails existing-only journal attribution closed for a malformed origin UUID", async () => {
+    const stateDir = root();
+    await writeSpawnJournal(stateDir, "not-a-uuid");
+    const guard = new WorkbenchProcessGuard({ stateDir, backend: createFakeLifecycleBackend() });
+    await expect(guard.readSpawnJournalExistingOnly()).resolves.toMatchObject({ kind: "malformed" });
+    expect(existsSync(join(stateDir, "corrupt"))).toBe(false);
+  });
+
+  it("keeps an absent process-guard state directory absent during existing-only reads", async () => {
+    const stateDir = join(root(), "missing-state");
+    const guard = new WorkbenchProcessGuard({ stateDir, backend: createFakeLifecycleBackend() });
+    await expect(guard.readLifecycleStateExistingOnly()).resolves.toEqual({ kind: "missing" });
+    await expect(guard.readSpawnJournalExistingOnly()).resolves.toEqual({ kind: "missing" });
+    expect(existsSync(stateDir)).toBe(false);
   });
 
   it("retires only its exact pre_spawn journal generation", async () => {

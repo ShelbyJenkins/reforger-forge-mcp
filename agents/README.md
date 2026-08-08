@@ -40,8 +40,12 @@ cannot prove the client has reloaded it.
 A normal registration starts the built server with:
 
 ~~~text
-node <absolute-package-path>\dist\index.js
+node --title=ReforgerForge-MCP-<client> <absolute-package-path>\dist\index.js --mcp-client-label <client>
 ~~~
+
+Setup derives `<client>` from the supported client definition. The Node option
+must remain before the server path and the server-only host option after it.
+Old registrations without both markers are migrated as different entries.
 
 A workspace may instead register a project-owned `start_mcp.ps1` when it needs
 repository dependency roots, Observer evidence roots, or another explicit
@@ -57,10 +61,13 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\path\to\start_mcp.ps1
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\path\to\start_mcp.ps1 -Mode Verify
 ~~~
 
-`Describe` writes one JSON document containing the resolved Node executable,
-built server, verifier, and exact startup arguments; it starts neither the MCP
-server nor Workbench. `Verify` runs the existing fresh-process MCP verifier with
-those arguments and exits. Neither mode refreshes the client-owned server.
+`Describe` writes a schema-2 JSON document containing the resolved Node
+executable and version, `nodeArguments`, built server, verifier,
+`hostArguments`, and configuration-only `configurationArguments`; it starts
+neither the MCP server nor Workbench. `Verify` runs the existing fresh-process
+MCP verifier with those arguments and exits. Neither mode refreshes the
+client-owned server. `-ClientLabel` selects the validated marker and defaults
+to `manual`.
 
 Do not create a ReforgerForge configuration file for ordinary discovery. Use an
 explicit configuration only for nonstandard paths or settings. The full
@@ -105,7 +112,7 @@ The config-free manual equivalent is:
 
 ~~~powershell
 $ServerPath = (Resolve-Path .\dist\index.js).Path
-codex mcp add reforger-forge -- node $ServerPath
+codex mcp add reforger-forge -- node --title=ReforgerForge-MCP-codex $ServerPath --mcp-client-label codex
 codex mcp list
 ~~~
 
@@ -147,7 +154,8 @@ Automatic setup updates the user entry at:
 For a config-free manual install, merge
 [cursor-global.json](configs/cursor-global.json). To use a workspace-only
 registration, copy [stdio-template.json](configs/stdio-template.json) to
-.cursor/mcp.json and replace the absolute server-path placeholder.
+.cursor/mcp.json and replace the absolute server-path and client-label
+placeholders with the intended trusted client slug.
 
 After changing the entry, run MCP: Restart Servers.
 
@@ -172,7 +180,7 @@ conflict for manual review.
 The config-free manual equivalent is:
 
 ~~~powershell
-claude mcp add --scope user reforger-forge -- node "FULL_PATH\reforger-forge-mcp\dist\index.js"
+claude mcp add --scope user reforger-forge -- node --title=ReforgerForge-MCP-claude-code "FULL_PATH\reforger-forge-mcp\dist\index.js" --mcp-client-label claude-code
 ~~~
 
 To use an explicit configuration, append:
@@ -243,10 +251,26 @@ the workspace-level registration is desired.
 ### Other MCP Clients
 
 Copy [stdio-template.json](configs/stdio-template.json), replace the absolute
-server-path placeholder, and merge the entry into the client configuration.
+server-path placeholder and both `REPLACE_WITH_CLIENT_LABEL` placeholders, and
+merge the entry into the client configuration. Use one stable lowercase client
+slug in both label positions.
 If that client uses servers instead of mcpServers, adapt the outer container to
 its documented schema. Add an explicit --config argument only when using a
 deliberately selected ReforgerForge configuration file.
+
+### Identifying a running host
+
+On Windows, enable Task Manager's **Details > Command line** column. Managed
+entries show the product and owning client in both the Node title argument and
+the server host argument. The runtime title also contains the first eight hex
+characters of the process instance UUID, while `wb_diagnose` reports the full
+bounded identity.
+
+The executable **Image name** remains `node.exe`; the package does not copy or
+rename Node. A command-line label, runtime title, PID, or UUID is informational,
+not termination authority. Refresh or stop the MCP server through the client
+that owns its stdio connection. Never terminate Workbench or a game process by
+name or PID; use the exact-owned lifecycle tools.
 
 ## Troubleshooting
 

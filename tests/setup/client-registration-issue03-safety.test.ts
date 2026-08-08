@@ -21,6 +21,7 @@ import {
   type SupportedClientId,
 } from "../../src/setup/client-registration.js";
 import { afterEach, describe, expect, it } from "vitest";
+import { buildManagedMcpServerArguments } from "../../src/mcp-host-identity.js";
 
 interface Fixture {
   readonly root: string;
@@ -103,6 +104,13 @@ function options(
     now: () => new Date("2026-07-24T12:34:56.000Z"),
     ...overrides,
   };
+}
+
+function managedArgs(setup: Fixture, clientLabel: string): string[] {
+  return buildManagedMcpServerArguments({
+    clientLabel,
+    serverPath: setup.serverPath,
+  });
 }
 
 function resultFor(
@@ -209,7 +217,7 @@ describe("Issue 03 registration safety", () => {
     ).toEqual({
       type: "stdio",
       command: "node",
-      args: [setup.serverPath],
+      args: managedArgs(setup, "vscode"),
     });
   });
 
@@ -267,7 +275,7 @@ describe("Issue 03 registration safety", () => {
         mcpServers: {
           "reforger-forge": {
             command: "node",
-            args: [setup.serverPath],
+            args: managedArgs(setup, "windsurf"),
           },
         },
       })}\n`,

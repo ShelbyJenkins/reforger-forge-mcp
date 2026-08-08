@@ -3,6 +3,11 @@ import { fileURLToPath } from "node:url";
 import { renderRedactedPublicJson } from "../foundation/public-json.js";
 import { redactDiagnostic, redactText } from "../foundation/redact.js";
 import type { CaptureErrorCode } from "./capture-contract.js";
+import {
+  formatObserverRefusalRemedy,
+  type ObserverRefusalContext,
+  type ObserverRefusalRemedyResolver,
+} from "./refusal-remedy.js";
 
 export const PUBLIC_OBSERVER_ERROR_TEXT_MAXIMUM = 512;
 
@@ -80,16 +85,20 @@ export interface PublicObserverErrorCandidate {
 export interface PublicObserverErrorProjectionOptions {
   readonly subject: "Observer error" | "Observer runtime error";
   readonly extract: (error: unknown) => PublicObserverErrorCandidate | undefined;
+  readonly remedyContext?: ObserverRefusalContext;
+  readonly resolveRemedy?: ObserverRefusalRemedyResolver;
+  readonly readRemedyContext?: () => unknown;
 }
 
 function completeHeader(
   subject: PublicObserverErrorProjectionOptions["subject"],
   code: CaptureErrorCode,
   message: string,
+  maximum = PUBLIC_OBSERVER_ERROR_TEXT_MAXIMUM,
 ): string {
   const prefix = `${subject} (${code}): `;
-  const allowance = Math.max(0, PUBLIC_OBSERVER_ERROR_TEXT_MAXIMUM - prefix.length);
-  return `${prefix}${message.slice(0, allowance)}`;
+  if (maximum <= prefix.length) return prefix.slice(0, Math.max(0, maximum));
+  return `${prefix}${message.slice(0, maximum - prefix.length)}`;
 }
 
 function internalPublicError(subject: PublicObserverErrorProjectionOptions["subject"]): string {
@@ -123,6 +132,20 @@ export function projectPublicObserverToolError(
     // messages are a complete boundary, not merely a preferred presentation.
     if (fixed !== undefined) return completeHeader(options.subject, code, fixed);
 
+    let remedy = "";
+    if (options.resolveRemedy !== undefined) {
+      if (options.remedyContext === undefined) return internalPublicError(options.subject);
+      const selected = options.resolveRemedy({
+        code,
+        context: options.remedyContext,
+        readRemedyContext: options.readRemedyContext ?? (() => undefined),
+      });
+      remedy = selected === null ? "" : formatObserverRefusalRemedy(selected);
+      if (remedy.length >= PUBLIC_OBSERVER_ERROR_TEXT_MAXIMUM) {
+        return internalPublicError(options.subject);
+      }
+    }
+
     const diagnostic = candidate.readDiagnosticMessage();
     const redactedMessage = typeof diagnostic === "string"
       ? redactText(diagnostic, {
@@ -134,13 +157,14 @@ export function projectPublicObserverToolError(
       options.subject,
       code,
       redactedMessage || OBSERVER_OPERATION_FAILED,
+      PUBLIC_OBSERVER_ERROR_TEXT_MAXIMUM - remedy.length,
     );
 
-    const available = PUBLIC_OBSERVER_ERROR_TEXT_MAXIMUM - header.length;
-    if (available < MINIMUM_JSON_DETAIL_BLOCK) return header;
+    const available = PUBLIC_OBSERVER_ERROR_TEXT_MAXIMUM - header.length - remedy.length;
+    if (available < MINIMUM_JSON_DETAIL_BLOCK) return `${header}${remedy}`;
 
     const details = candidate.readDetails();
-    if (details === undefined) return header;
+    if (details === undefined) return `${header}${remedy}`;
 
     const rendered = renderRedactedPublicJson(
       redactDiagnostic(details, { profile: "diagnostic" }),
@@ -154,10 +178,12 @@ export function projectPublicObserverToolError(
     );
     if (rendered.fallback || rendered.text === undefined) return rendered.fallback
       ? internalPublicError(options.subject)
-      : header;
+      : `${header}${remedy}`;
 
-    const result = `${header}${JSON_FENCE_PREFIX}${rendered.text}${JSON_FENCE_SUFFIX}`;
-    return result.length <= PUBLIC_OBSERVER_ERROR_TEXT_MAXIMUM ? result : header;
+    const result = `${header}${JSON_FENCE_PREFIX}${rendered.text}${JSON_FENCE_SUFFIX}${remedy}`;
+    return result.length <= PUBLIC_OBSERVER_ERROR_TEXT_MAXIMUM
+      ? result
+      : `${header}${remedy}`;
   } catch {
     return internalPublicError(options.subject);
   }

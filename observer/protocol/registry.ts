@@ -180,6 +180,15 @@ export const ERROR_REGISTRY = {
   PREPARED_LAUNCH_STALE: {
     publicMessagePolicy: "bounded-diagnostic", publicMessage: "Prepared observer launch belongs to a stale lifecycle.", retryable: false, backends: ["owned-runtime"],
   },
+  GAME_LAUNCH_PREDECESSOR_REQUIRED: {
+    publicMessagePolicy: "bounded-diagnostic", publicMessage: "The current game-launch successor requires its exact predecessor runtime ID.", retryable: false, backends: ["owned-runtime"],
+  },
+  GAME_LAUNCH_PREDECESSOR_MISMATCH: {
+    publicMessagePolicy: "bounded-diagnostic", publicMessage: "The supplied predecessor is not the current game-launch chain tip.", retryable: false, backends: ["owned-runtime"],
+  },
+  GAME_LAUNCH_PREDECESSOR_NOT_STOPPED: {
+    publicMessagePolicy: "bounded-diagnostic", publicMessage: "The game-launch predecessor has not completed exact stop and observer cleanup.", retryable: true, backends: ["owned-runtime"],
+  },
   START_UNVERIFIABLE: {
     publicMessagePolicy: "bounded-diagnostic", publicMessage: "Owned runtime start could not be verified.", retryable: false, backends: ["owned-runtime"],
   },

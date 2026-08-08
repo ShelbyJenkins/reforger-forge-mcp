@@ -12,9 +12,16 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import {
   loadConfig,
+  MCP_IDLE_SHUTDOWN_MAX_MS,
+  MCP_IDLE_SHUTDOWN_MIN_MS,
   type Config,
   type LoadConfigOptions,
 } from "../config.js";
+import {
+  formatMcpNodeTitleArgument,
+  parseMcpClientLabel,
+  partitionMcpHostArguments,
+} from "../mcp-host-identity.js";
 import {
   discoverSteamInstallations,
   type SteamDiscoveryDiagnostic,
@@ -24,7 +31,7 @@ import {
 
 const execFileAsync = promisify(execFile);
 
-export const SERVER_VERIFICATION_REPORT_SCHEMA_VERSION = 1 as const;
+export const SERVER_VERIFICATION_REPORT_SCHEMA_VERSION = 3 as const;
 
 export type VerificationStatus =
   | "passed"
@@ -56,6 +63,7 @@ export interface EffectiveSettingsVerification extends VerificationStage {
   workbenchAddonDirs?: string[];
   workbenchHost?: string;
   workbenchPort?: number;
+  mcpIdleShutdownMs?: number;
 }
 
 export interface ToolRegistrationVerification extends VerificationStage {
@@ -68,6 +76,8 @@ export interface ServerVerificationReport {
   generatedAt: string;
   success: boolean;
   nodeVersion: string;
+  /** Exact absolute Node executable used for the successful probes. */
+  nodePath: string;
   serverPath: string;
   packageVersion: string;
   compiledServer: CompiledServerVerification;
@@ -85,6 +95,8 @@ export interface ServerVerificationOptions {
   startupArguments?: readonly string[];
   serverPath?: string;
   nodeVersion?: string;
+  /** Trusted verifier control; never passed to configuration loading or receipts. */
+  hostClientLabel?: string;
 }
 
 interface AdvertisedTool {
@@ -103,7 +115,10 @@ export interface ServerVerificationSession {
 
 export interface ServerVerificationSessionOptions {
   command: string;
+  nodeArguments: readonly string[];
   serverPath: string;
+  hostArguments: readonly string[];
+  /** Configuration-only arguments retained in the verification report. */
   startupArguments: readonly string[];
   cwd: string;
   packageVersion: string;
@@ -197,11 +212,12 @@ function steamDetails(
 
 async function defaultProbeCompiledServer(
   serverPath: string,
-  cwd: string
+  cwd: string,
+  nodePath = process.execPath,
 ): Promise<CompiledServerProbeResult> {
   try {
     const { stdout } = await execFileAsync(
-      process.execPath,
+      nodePath,
       [serverPath, "--version"],
       {
         cwd,
@@ -228,7 +244,12 @@ function defaultCreateSession(
 ): ServerVerificationSession {
   const transport = new StdioClientTransport({
     command: options.command,
-    args: [options.serverPath, ...options.startupArguments],
+    args: [
+      ...options.nodeArguments,
+      options.serverPath,
+      ...options.hostArguments,
+      ...options.startupArguments,
+    ],
     cwd: options.cwd,
     // Keep server diagnostics off structured stdout while also avoiding an
     // unread pipe that can backpressure a chatty server.
@@ -260,6 +281,8 @@ const REQUIRED_OBSERVER_TOOLS = [
   "observer_run_finalize",
   "observer_run_discard",
 ] as const;
+
+const REQUIRED_OBSERVER_COMPOSITES = ["game_launch"] as const;
 
 export function inspectToolRegistration(
   tools: readonly AdvertisedTool[]
@@ -335,6 +358,13 @@ export function inspectToolRegistration(
   if (missingObserverTools.length > 0) {
     issues.push(
       `Required observer tools missing at runtime: ${missingObserverTools.join(", ")}`
+    );
+  }
+  const missingObserverComposites = REQUIRED_OBSERVER_COMPOSITES
+    .filter((name) => !registeredNames.has(name));
+  if (missingObserverComposites.length > 0) {
+    issues.push(
+      `Required observer composites missing at runtime: ${missingObserverComposites.join(", ")}`
     );
   }
 
@@ -428,6 +458,10 @@ export function parseServerVerificationReport(
     throw new Error("Verification report field success must be a boolean.");
   }
   requireString(value.nodeVersion, "nodeVersion", { nonEmpty: true });
+  requireString(value.nodePath, "nodePath", { nonEmpty: true });
+  if (!isAbsolute(value.nodePath)) {
+    throw new Error("Verification report field nodePath must be absolute.");
+  }
   requireString(value.serverPath, "serverPath", { nonEmpty: true });
   if (!isAbsolute(value.serverPath)) {
     throw new Error("Verification report field serverPath must be absolute.");
@@ -518,6 +552,18 @@ export function parseServerVerificationReport(
       "Verification report field effectiveSettings.workbenchPort is invalid."
     );
   }
+  const idleShutdownMs = effectiveSettingsRecord.mcpIdleShutdownMs;
+  if (
+    (effectiveSettingsRecord.status === "passed" && idleShutdownMs === undefined) ||
+    (idleShutdownMs !== undefined &&
+      (!Number.isSafeInteger(idleShutdownMs) ||
+        Number(idleShutdownMs) < MCP_IDLE_SHUTDOWN_MIN_MS ||
+        Number(idleShutdownMs) > MCP_IDLE_SHUTDOWN_MAX_MS))
+  ) {
+    throw new Error(
+      "Verification report field effectiveSettings.mcpIdleShutdownMs is invalid."
+    );
+  }
 
   requireStage(value.serverHandshake, "serverHandshake");
   requireStage(value.toolRegistration, "toolRegistration");
@@ -602,14 +648,21 @@ export async function verifyMcpServer(
       ? resolve(options.serverPath)
       : resolve(packageRoot, options.serverPath);
   const startupArguments = [...(options.startupArguments ?? [])];
+  const requestedNodePath = dependencies.nodeCommand ?? process.execPath;
+  if (!isAbsolute(requestedNodePath)) {
+    throw new Error("MCP verification requires an absolute Node executable path.");
+  }
+  const nodePath = resolve(requestedNodePath);
+  const hostClientLabel = parseMcpClientLabel(options.hostClientLabel ?? "manual");
+  const hostPartition = partitionMcpHostArguments([], hostClientLabel);
+  const nodeArguments = [formatMcpNodeTitleArgument(hostClientLabel)];
   const discoverSteam =
     dependencies.discoverSteam ?? discoverSteamInstallations;
   const loadConfiguration = dependencies.loadConfiguration ?? loadConfig;
   const createSession = dependencies.createSession ?? defaultCreateSession;
-  const probeCompiledServer =
-    dependencies.probeCompiledServer ?? defaultProbeCompiledServer;
-
-  const compiledProbe = await probeCompiledServer(serverPath, packageRoot);
+  const compiledProbe = dependencies.probeCompiledServer
+    ? await dependencies.probeCompiledServer(serverPath, packageRoot)
+    : await defaultProbeCompiledServer(serverPath, packageRoot, nodePath);
   const compiledIssues: string[] = [];
   if (compiledProbe.issue) compiledIssues.push(compiledProbe.issue);
   if (
@@ -673,6 +726,7 @@ export async function verifyMcpServer(
       workbenchAddonDirs: [...(effectiveConfig.workbenchAddonDirs ?? [])],
       workbenchHost: effectiveConfig.workbenchHost,
       workbenchPort: effectiveConfig.workbenchPort,
+      mcpIdleShutdownMs: effectiveConfig.mcpIdleShutdownMs,
       issues: [],
     };
   } else if (discovery.status === "success" && discoveryThrown === undefined) {
@@ -727,8 +781,10 @@ export async function verifyMcpServer(
       let session: ServerVerificationSession | undefined;
       try {
         session = createSession({
-          command: dependencies.nodeCommand ?? process.execPath,
+          command: nodePath,
+          nodeArguments,
           serverPath,
+          hostArguments: hostPartition.hostArguments,
           startupArguments,
           cwd: packageRoot,
           packageVersion: options.packageVersion,
@@ -776,6 +832,7 @@ export async function verifyMcpServer(
     generatedAt: (dependencies.now ?? (() => new Date()))().toISOString(),
     success: false,
     nodeVersion: options.nodeVersion ?? process.version,
+    nodePath,
     serverPath,
     packageVersion: options.packageVersion,
     compiledServer,
@@ -803,6 +860,7 @@ export function formatServerVerificationReport(
     "ReforgerForge MCP verification",
     "",
     `Node:       ${report.nodeVersion}`,
+    `Node path:  ${report.nodePath}`,
     `Server:     ${report.serverPath}`,
     `Version:    ${report.compiledServer.version ?? "unavailable"} (package ${report.packageVersion})`,
     `Config:     ${report.configPath ?? "none (automatic discovery and internal defaults)"}`,
@@ -823,7 +881,8 @@ export function formatServerVerificationReport(
       "",
       `Tools path: ${report.effectiveSettings.workbenchPath}`,
       `Game path:  ${report.effectiveSettings.gamePath}`,
-      `Addons:     ${(report.effectiveSettings.workbenchAddonDirs ?? []).join(", ") || "none"}`
+      `Addons:     ${(report.effectiveSettings.workbenchAddonDirs ?? []).join(", ") || "none"}`,
+      `MCP idle:   ${report.effectiveSettings.mcpIdleShutdownMs} ms`
     );
   }
   if (report.toolRegistration.names.length > 0) {

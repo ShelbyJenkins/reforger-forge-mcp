@@ -26,6 +26,18 @@ afterEach(cleanupOwnedRuntimeManagerFixtures);
 
 describe("OwnedRuntimeManager", () => {
   describe("failure evidence, recovery authority, and trust boundaries", () => {
+  it("rejects a nil injected manager identity", () => {
+    const root = mkdtempSync(join(tmpdir(), "rfo-owned-runtime-nil-id-"));
+    roots.push(root);
+    expect(() => new OwnedRuntimeManager({
+      managedRoot: join(root, "managed"),
+      gamePath: root,
+      observerGate: new FakeGate(),
+      managerInstanceId: "00000000-0000-0000-0000-000000000000",
+      backend: createFakeBackend(),
+    })).toThrow(/non-nil UUID/i);
+  });
+
   it("rejects expired and overlong managed starts before consumption or spawn", async () => {
     const expired = makeHarness();
     const prepared = await expired.prepare();

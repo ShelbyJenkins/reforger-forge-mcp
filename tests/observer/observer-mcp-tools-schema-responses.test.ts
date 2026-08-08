@@ -4,8 +4,13 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { Transformer } from "@napi-rs/image";
 import { ObserverApplicationError } from "../../src/observer/errors.js";
+import type { OwnedRuntimeManager } from "../../src/observer/owned-runtime-manager.js";
 import { runtimeWorldRevision } from "../../src/observer/world-revision.js";
 import { registerObserverTools } from "../../src/observer/tools.js";
+import {
+  gameLaunchOutputSchema,
+  gameLaunchSuccessSchema,
+} from "../../src/tools/game-launch.js";
 import {
   captureToolInput,
   createToolHarness,
@@ -18,7 +23,9 @@ describe("observer MCP tools", () => {
   it("publishes a portable fixed-length capture schema without positional items or nested refs", async () => {
     const coordinator = toolApplication({ capture: vi.fn() });
     const server = new McpServer({ name: "observer-schema-test", version: "1.0.0" });
-    registerObserverTools(server, coordinator);
+    registerObserverTools(server, coordinator, {
+      ownedRuntimeManager: {} as OwnedRuntimeManager,
+    });
     const client = new Client({ name: "observer-schema-client", version: "1.0.0" });
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
     try {
@@ -28,9 +35,56 @@ describe("observer MCP tools", () => {
       const prepare = listed.tools.find((tool) => tool.name === "observer_prepare_launch");
       const capture = listed.tools.find((tool) => tool.name === "observer_capture");
       const run = listed.tools.find((tool) => tool.name === "observer_run_finalize");
+      const gameLaunch = listed.tools.find((tool) => tool.name === "game_launch");
       expect(prepare).toBeDefined();
       expect(capture).toBeDefined();
       expect(run).toBeDefined();
+      expect(gameLaunch).toBeDefined();
+      expect(gameLaunch!.inputSchema.required ?? []).not.toContain("action");
+      expect(gameLaunch!.inputSchema.properties!.action).not.toHaveProperty("default");
+      expect(gameLaunch!.inputSchema.properties!.runtimeKind).not.toHaveProperty("default");
+      expect(gameLaunch!.inputSchema.properties!.waitForInstanceMs).not.toHaveProperty("default");
+      expect(gameLaunch!.inputSchema.additionalProperties).toBe(false);
+      expect(gameLaunch!.title).toBe("Launch or manage an exact-owned game runtime");
+      for (const [property, schema] of Object.entries(gameLaunch!.inputSchema.properties!)) {
+        expect(schema, `${property} public input metadata`).toMatchObject({
+          description: expect.any(String),
+        });
+      }
+      expect(gameLaunch!.inputSchema.properties!.runtimeKind).toMatchObject({
+        description: expect.stringContaining("standalone graphical -world launch"),
+      });
+      expect(gameLaunch!.outputSchema).toMatchObject({
+        type: "object",
+        oneOf: [
+          {
+            type: "object",
+            additionalProperties: false,
+            required: expect.arrayContaining([
+              "action", "runtime", "next", "preparation", "project", "world", "addons",
+            ]),
+            properties: {
+              action: {
+                const: "start",
+                description: expect.stringContaining("branch discriminator"),
+              },
+            },
+          },
+          {
+            type: "object",
+            additionalProperties: false,
+            required: expect.arrayContaining(["action", "runtime", "next"]),
+            properties: { action: { const: "status" } },
+          },
+          {
+            type: "object",
+            additionalProperties: false,
+            required: expect.arrayContaining(["action", "runtime", "next"]),
+            properties: { action: { const: "stop" } },
+          },
+        ],
+      });
+      expect(gameLaunch!.outputSchema).not.toHaveProperty("anyOf");
       expect(capture!.inputSchema.required ?? []).not.toContain("expectedWorldRevision");
       expect(capture!.inputSchema.properties).toHaveProperty("target");
       expect(capture!.inputSchema.properties).toHaveProperty("expectedWorldRevision");
@@ -107,6 +161,61 @@ describe("observer MCP tools", () => {
       for (const boundary of boundaryCases) {
         expect(view.safeParse(boundary.input).success).toBe(boundary.success);
       }
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+
+  it("round-trips schema-valid game status and stop results as identical structured and text payloads", async () => {
+    const runtimeId = "rt-00000000-0000-4000-8000-000000000001";
+    const runtime = {
+      runtimeId,
+      sessionId: "session-game-launch-round-trip",
+      preparedLaunchId: "pl-00000000-0000-4000-8000-000000000001",
+      pid: 4242,
+      runtimeKind: "listenServer" as const,
+      startedAt: "2026-08-06T00:00:00.000Z",
+      exactOwned: true,
+    };
+    const status = vi.fn(async () => ({ ...runtime, state: "running" as const }));
+    const stop = vi.fn(async () => ({ ...runtime, state: "exited" as const }));
+    const manager = { status, stop } as unknown as OwnedRuntimeManager;
+    const coordinator = toolApplication({ capture: vi.fn() });
+    const server = new McpServer({ name: "observer-output-test", version: "1.0.0" });
+    registerObserverTools(server, coordinator, { ownedRuntimeManager: manager });
+    const client = new Client({ name: "observer-output-client", version: "1.0.0" });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    try {
+      await server.connect(serverTransport);
+      await client.connect(clientTransport);
+      for (const action of ["status", "stop"] as const) {
+        const result = await client.callTool({
+          name: "game_launch",
+          arguments: { action, runtimeId },
+        });
+        expect(result.isError).not.toBe(true);
+        const structured = gameLaunchSuccessSchema.parse(result.structuredContent);
+        expect(gameLaunchOutputSchema.safeParse(structured).success).toBe(true);
+        const wrongBranch = {
+          ...structured,
+          preparation: { expiresAt: "not-a-start-result" },
+        };
+        expect(gameLaunchOutputSchema.safeParse(wrongBranch).success).toBe(false);
+        expect(structured.action).toBe(action);
+        if (!Array.isArray(result.content)) {
+          throw new Error("Expected game_launch compatibility content array");
+        }
+        const text = result.content.find((item): item is { type: "text"; text: string } =>
+          !!item && typeof item === "object" &&
+          (item as { type?: unknown }).type === "text" &&
+          typeof (item as { text?: unknown }).text === "string");
+        expect(text?.type).toBe("text");
+        if (text?.type !== "text") throw new Error("Expected game_launch text compatibility payload");
+        expect(JSON.parse(text.text)).toEqual(structured);
+      }
+      expect(status).toHaveBeenCalledWith(runtimeId);
+      expect(stop).toHaveBeenCalledOnce();
     } finally {
       await client.close();
       await server.close();

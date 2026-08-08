@@ -85,7 +85,7 @@ describe("observer package and source contracts", () => {
     );
 
     for (const source of [enforce, mailbox]) {
-      expect(source).toContain("EXPLICIT_CONFIGURATION_CONTRACT_VERSION !== 2");
+      expect(source).toContain("EXPLICIT_CONFIGURATION_CONTRACT_VERSION !== 3");
       expect(source).toContain("Compiled configuration loader is older than src/config.ts");
       expect(source).toContain('loadConfig(argumentsArray)');
     }
@@ -148,6 +148,7 @@ describe("observer package and source contracts", () => {
       "observer/addon",
       "observer/workbench-addon",
       "observer/protocol",
+      "scripts/windows/same-handle-file-read.ps1",
       "observer/README.md",
       "SETUP.md",
       "docs/observer.md",
@@ -189,6 +190,8 @@ describe("observer package and source contracts", () => {
     expect(sharedConfig.include).toEqual([
       "src/foundation/**/*.ts",
       "src/companions/**/*.ts",
+      "src/mcp-host-admission.ts",
+      "src/mcp-idle-readiness.ts",
     ]);
     const mcpConfig = JSON.parse(readFileSync(join(repositoryRoot, "tsconfig.build.json"), "utf8"));
     expect(mcpConfig.include).toEqual(["src/**/*"]);
@@ -201,9 +204,17 @@ describe("observer package and source contracts", () => {
     expect(existsSync(join(repositoryRoot, "dist", "src"))).toBe(false);
     expect(existsSync(join(repositoryRoot, "observer", "protocol", "VERSION"))).toBe(true);
     const packageCheck = readFileSync(join(repositoryRoot, "scripts", "check-package.mjs"), "utf8");
+    expect(packageCheck).toContain("scripts/windows/same-handle-file-read.ps1");
     expect(packageCheck).toContain("docs/release-notes/RELEASE_NOTES_v1.2.0.md");
     const serverEntry = readFileSync(join(repositoryRoot, "src", "index.ts"), "utf8");
-    expect(serverEntry).toContain(`const SERVER_VERSION = "${packageJson.version}"`);
+    const stdioComposition = readFileSync(
+      join(repositoryRoot, "src", "mcp-stdio-server.ts"),
+      "utf8",
+    );
+    expect(stdioComposition).toContain(
+      `export const MCP_SERVER_VERSION = "${packageJson.version}"`
+    );
+    expect(serverEntry).toContain("const SERVER_VERSION = MCP_SERVER_VERSION");
     expect(packageCheck).toContain("dist/observer/agent/private-child.js");
     expect(packageCheck).toContain("dist/observer/agent/application.js");
     expect(packageCheck).toContain("dist/observer/agent/application-operations.js");
@@ -217,9 +228,17 @@ describe("observer package and source contracts", () => {
     expect(packageCheck).toContain("dist/tools/observer-runtime.js");
     for (const module of [
       "dist/foundation/child-supervisor.js",
+      "dist/launch/game-launch-planning-isolation.js",
+      "dist/launch/game-launch-planning-worker.js",
+      "dist/launch/game-launch-revalidation-isolation.js",
+      "dist/launch/game-launch-revalidation-worker.js",
+      "dist/observer/game-launch-attempt.js",
       "dist/workbench/activity-gate.js",
       "dist/workbench/client.js",
       "dist/workbench/diagnostics.js",
+      "dist/workbench/existing-lmdb-reader.js",
+      "dist/workbench/existing-lmdb-reader-protocol.js",
+      "dist/workbench/existing-lmdb-reader-worker.js",
       "dist/workbench/helper-addon.js",
       "dist/workbench/helper-addon-payload.generated.js",
       "dist/workbench/launch-plan.js",
@@ -284,7 +303,7 @@ describe("observer package and source contracts", () => {
     }
   });
 
-  it("publishes the exact ten-tool observer surface and keeps current operator guidance aligned", () => {
+  it("publishes ten observer primitives plus the separate owned game composite", () => {
     const expected = [
       "observer_capture",
       "observer_instances",
@@ -315,21 +334,28 @@ describe("observer package and source contracts", () => {
       .map((match) => match[1])
       .sort();
     expect(discovered).toEqual(expected);
+    const compositeBlock = serverVerifier.match(
+      /const REQUIRED_OBSERVER_COMPOSITES = \[([\s\S]*?)\] as const;/,
+    )?.[1] ?? "";
+    expect(compositeBlock).toContain('"game_launch"');
 
     const observerGuide = readFileSync(join(repositoryRoot, "docs", "observer.md"), "utf8");
     for (const name of expected) expect(observerGuide).toContain(`\`${name}\``);
+    expect(observerGuide).toContain("`game_launch`");
     expect(observerGuide).toContain("expectedWorldRevision");
     expect(observerGuide).not.toContain("expectedWorldId");
     expect(observerGuide).not.toContain("expectedWorldEpoch");
 
     const observerReadme = readFileSync(join(repositoryRoot, "observer", "README.md"), "utf8");
-    expect(observerReadme).toContain("Observer exposes ten related MCP tools");
+    expect(observerReadme).toContain("Observer exposes ten related `observer_*` primitives plus the separate");
     expect(observerReadme).toContain("observer_runtime");
+    expect(observerReadme).toContain("game_launch");
     expect(observerReadme).toContain("terminal restoration");
     expect(observerReadme).toContain("exact matching persisted receipt");
 
     const agentInstructions = readFileSync(join(repositoryRoot, "agents", "AGENTS.md"), "utf8");
     expect(agentInstructions).toContain("observer_runtime");
+    expect(agentInstructions).toContain("game_launch");
     expect(agentInstructions).toContain("preparedLaunchId");
   });
 
@@ -388,12 +414,17 @@ describe("observer package and source contracts", () => {
     expect(server).not.toContain(".server.onclose");
     expect(server).not.toContain("protocolServer");
     const entrypoint = readFileSync(join(repositoryRoot, "src", "index.ts"), "utf8");
-    expect(entrypoint).toContain("process.stdin.once(\"end\", onStdinEnd)");
-    expect(entrypoint).toContain("process.once(\"SIGINT\", onSigint)");
-    expect(entrypoint).toContain("process.once(\"SIGTERM\", onSigterm)");
-    expect(entrypoint.indexOf("closeProtocol: () => server.close()"))
-      .toBeLessThan(entrypoint.indexOf("disposeTools: (deadlineAtMs) => disposeTools(deadlineAtMs)"));
-    expect(entrypoint).not.toContain("shutdownHold");
+    const stdioComposition = readFileSync(
+      join(repositoryRoot, "src", "mcp-stdio-server.ts"),
+      "utf8",
+    );
+    expect(entrypoint).toContain("runMcpStdioServer({");
+    expect(stdioComposition).toContain("options.stdin.once(\"end\", onStdinEnd)");
+    expect(stdioComposition).toContain("options.signals.once(\"SIGINT\", onSigint)");
+    expect(stdioComposition).toContain("options.signals.once(\"SIGTERM\", onSigterm)");
+    expect(stdioComposition.indexOf("closeProtocol: () => server.close()"))
+      .toBeLessThan(stdioComposition.indexOf("disposeTools: (deadlineAtMs) => disposeTools(deadlineAtMs)"));
+    expect(stdioComposition).not.toContain("shutdownHold");
     const integrationSource = filesRecursively(observerSource)
       .map((path) => readFileSync(path, "utf8"))
       .join("\n");

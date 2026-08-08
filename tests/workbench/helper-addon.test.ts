@@ -40,6 +40,45 @@ describe("MCP-managed Workbench helper add-on", () => {
     }, { prefix: "reforger-forge-helper-" });
   });
 
+  it("reads only an already staged current companion and leaves absent storage untouched", async () => {
+    await withTemporaryDirectory((root) => {
+      const managedRoot = join(root, "managed");
+      const stager = new WorkbenchHelperStager({ managedRoot });
+
+      expect(stager.readCurrentStaged()).toEqual({
+        kind: "unavailable",
+        reason: "current_bundle_not_staged",
+      });
+      expect(existsSync(managedRoot)).toBe(false);
+
+      const staged = stager.ensureStaged();
+      expect(stager.readCurrentStaged()).toMatchObject({
+        kind: "available",
+        companion: {
+          addonDirectory: staged.addonDirectory,
+          addonSearchRoot: staged.addonSearchRoot,
+          bundleDigest: staged.bundleDigest,
+          reused: true,
+        },
+      });
+    }, { prefix: "reforger-forge-helper-readonly-" });
+  });
+
+  it("distinguishes an unstaged current digest from tampered staged evidence", async () => {
+    await withTemporaryDirectory((root) => {
+      const managedRoot = join(root, "managed");
+      const stager = new WorkbenchHelperStager({ managedRoot });
+      const staged = stager.ensureStaged();
+      writeFileSync(join(staged.addonDirectory, "addon.gproj"), "modified", "utf8");
+
+      expect(() => stager.readCurrentStaged()).toThrowError(
+        expect.objectContaining<Partial<WorkbenchHelperStageError>>({
+          code: "WORKBENCH_HELPER_STAGE_CONFLICT",
+        })
+      );
+    }, { prefix: "reforger-forge-helper-readonly-tamper-" });
+  });
+
   it("fails closed when a staged payload is modified", async () => {
     await withTemporaryDirectory((root) => {
     const stager = new WorkbenchHelperStager({ managedRoot: join(root, "managed") });

@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { registerApiSearch } from "./tools/api-search.js";
 import { registerComponentSearch } from "./tools/component-search.js";
@@ -67,6 +68,21 @@ import { registerBuildingSetup } from "./tools/building-setup.js";
 import type { Config } from "./config.js";
 import { createObserverApplication } from "./observer/application.js";
 import { registerObserverTools } from "./observer/tools.js";
+import {
+  createMcpHostIdentity,
+  validateMcpHostIdentity,
+  type McpHostIdentity,
+} from "./mcp-host-identity.js";
+import {
+  McpHostAdmissionGate,
+  type McpIdleSealProof,
+} from "./mcp-host-admission.js";
+import {
+  McpIdleReadinessInspector,
+  type IdleShutdownInspectionOptions,
+  type IdleShutdownReadiness,
+} from "./mcp-idle-readiness.js";
+import type { McpLifecycleDiagnostic } from "./mcp-idle-shutdown.js";
 
 /**
  * Explicit application shutdown contract returned by {@link registerTools}.
@@ -79,11 +95,21 @@ export interface RegisteredToolsDisposer {
   emergencyTerminate(): void;
   /** Starts idempotent local handle cleanup before the CLI exits. */
   emergencyCleanup(): void;
+  /** Bounded, read-only proof; it never quiesces, repairs, or closes anything. */
+  inspectIdleShutdownReadiness(options: IdleShutdownInspectionOptions): Promise<IdleShutdownReadiness>;
+  /** Synchronously seals host admissions after a complete idle proof. */
+  trySealIdleAdmissions(proof: McpIdleSealProof | null | undefined): boolean;
 }
 
 export interface RegisterToolsOptions {
   /** Internal composition seam used by lifecycle probes and hermetic tests. */
   searchEngine?: SearchEngine;
+  /** One trusted process-wide identity shared by all lifecycle subsystems. */
+  hostIdentity?: McpHostIdentity;
+  /** CLI-only dynamic lifecycle diagnostics; embedders omit this callback. */
+  mcpLifecycleDiagnostic?: () => McpLifecycleDiagnostic;
+  /** Monotonic process clock shared by the CLI idle-readiness composition. */
+  nowTick?: () => number;
 }
 
 /**
@@ -92,6 +118,8 @@ export interface RegisterToolsOptions {
  * observer adapter to accidentally create a second observer application.
  */
 export interface WorkbenchServerComposition {
+  readonly hostIdentity: McpHostIdentity;
+  readonly admissionGate: McpHostAdmissionGate;
   readonly processGuard: WorkbenchProcessGuard;
   readonly netApi: WorkbenchNetApiClient;
   readonly activityGate: WorkbenchActivityGate;
@@ -102,18 +130,34 @@ export interface WorkbenchServerComposition {
   readonly client: WorkbenchSessionController;
 }
 
-export function createWorkbenchServerComposition(config: Config): WorkbenchServerComposition {
+function fallbackHostIdentity(): McpHostIdentity {
+  return createMcpHostIdentity({
+    clientLabel: "manual",
+    instanceId: randomUUID(),
+  });
+}
+
+export function createWorkbenchServerComposition(
+  config: Config,
+  hostIdentity: McpHostIdentity = fallbackHostIdentity(),
+  admissionGate: McpHostAdmissionGate = new McpHostAdmissionGate(),
+  mcpLifecycleDiagnostic?: () => McpLifecycleDiagnostic,
+): WorkbenchServerComposition {
+  const trustedHostIdentity = validateMcpHostIdentity(hostIdentity);
   const observerConfig = config.observer;
-  const processGuard = new WorkbenchProcessGuard();
+  const processGuard = new WorkbenchProcessGuard({
+    mcpInstanceId: trustedHostIdentity.instanceId,
+  });
   const netApi = new WorkbenchNetApiClient(config.workbenchHost, config.workbenchPort);
-  const activityGate = new WorkbenchActivityGate();
-  const childSupervisor = new ChildSupervisor();
+  const activityGate = new WorkbenchActivityGate({ admissionGate });
+  const childSupervisor = new ChildSupervisor({ admissionGate });
   const companionProvider = new WorkbenchHelperStager({
     managedRoot: observerConfig?.managedRoot ?? defaultWorkbenchHelperManagedRoot(),
   });
   const lifecycleExecution = WorkbenchSessionController.composeLifecycleExecution({
     processGuard,
     childSupervisor,
+    admissionGate,
   });
   const diagnostics = diagnoseWorkbench;
   const client = new WorkbenchSessionController(
@@ -129,10 +173,15 @@ export function createWorkbenchServerComposition(config: Config): WorkbenchServe
       childSupervisor,
       lifecycleExecution,
       diagnostics,
+      hostIdentity: trustedHostIdentity,
+      admissionGate,
+      mcpLifecycleDiagnostic,
     }
   );
 
   return Object.freeze({
+    hostIdentity: trustedHostIdentity,
+    admissionGate,
     processGuard,
     netApi,
     activityGate,
@@ -149,10 +198,19 @@ export function registerTools(
   config: Config,
   options: RegisterToolsOptions = {}
 ): RegisteredToolsDisposer {
+  const hostIdentity = options.hostIdentity === undefined
+    ? fallbackHostIdentity()
+    : validateMcpHostIdentity(options.hostIdentity);
   const searchEngine = options.searchEngine ?? new SearchEngine(config.dataDir);
   const patterns = new PatternLibrary(config.patternsDir);
   const observerConfig = config.observer;
-  const workbenchComposition = createWorkbenchServerComposition(config);
+  const admissionGate = new McpHostAdmissionGate();
+  const workbenchComposition = createWorkbenchServerComposition(
+    config,
+    hostIdentity,
+    admissionGate,
+    options.mcpLifecycleDiagnostic,
+  );
   const wbClient = workbenchComposition.client;
 
   // Phase 0 tools
@@ -198,8 +256,13 @@ export function registerTools(
     evidenceRoots: observerConfig?.evidenceRoots,
     supportingLogRoots: observerConfig?.supportingLogRoots,
     workbenchAdapter: workbenchObserver,
+    hostIdentity,
+    admissionGate,
   });
-  const ownedRuntimeManager = observerApplication.ownedRuntimeManager!;
+  const ownedRuntimeManager = observerApplication.ownedRuntimeManager;
+  if (!ownedRuntimeManager) {
+    throw new Error("The server composition requires an owned runtime manager.");
+  }
   registerObserverTools(server, observerApplication, {
     sessionTtlMs: observerConfig?.sessionTtlMs,
     defaultCaptureTimeoutMs: observerConfig?.defaultCaptureTimeoutMs,
@@ -242,9 +305,25 @@ export function registerTools(
     activeObserverShutdown = tracked;
     return tracked;
   };
+  const idleReadiness = new McpIdleReadinessInspector({
+    admissionGate,
+    nowTick: options.nowTick,
+    providers: [
+      workbenchComposition.activityGate,
+      workbenchComposition.childSupervisor,
+      workbenchComposition.client,
+      observerApplication.agentClient,
+      observerApplication.captureService,
+      ownedRuntimeManager,
+    ],
+  });
   const disposeObserverLifecycle = Object.assign(disposeObserverAttempt, {
     emergencyTerminate: (): void => observerApplication.emergencyTerminatePrivateChildren(),
     emergencyCleanup: (): void => { void closeProcessGuard().catch(() => undefined); },
+    inspectIdleShutdownReadiness: (inspectionOptions: IdleShutdownInspectionOptions) =>
+      idleReadiness.inspectIdleShutdownReadiness(inspectionOptions),
+    trySealIdleAdmissions: (proof: McpIdleSealProof | null | undefined): boolean =>
+      admissionGate.trySealIdleAdmissions(proof),
   }) satisfies RegisteredToolsDisposer;
   registerWbLaunch(server, wbClient);
   registerWbBuild(server, config, wbClient, {

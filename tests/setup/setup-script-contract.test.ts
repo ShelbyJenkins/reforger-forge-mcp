@@ -168,7 +168,7 @@ describe("one-command setup orchestration contract", () => {
       expect(output).toContain(
         "-CheckWorkbench is valid only with -Doctor"
       );
-      expect(result.stdout).toContain("Receipt schema: 1");
+      expect(result.stdout).toContain("Receipt schema: 2");
       expect(result.stdout).toContain("Overall status: failed");
       for (const label of [
         "Steam discovery:",
@@ -219,7 +219,7 @@ describe("one-command setup orchestration contract", () => {
         managedChanges?: unknown[];
       };
       expect(receipt).toMatchObject({
-        schemaVersion: 1,
+        schemaVersion: 2,
         operation: "setup",
         overallStatus: "failed",
       });
@@ -244,7 +244,7 @@ describe("one-command setup orchestration contract", () => {
       setup.match(/-Arguments\s+@\(\s*"run"\s*,\s*"build"\s*\)/gi) ?? [];
     const verifications = matchingLines(
       setup,
-      /^&\s+\$nodeCommand\.Source\s+\$verificationScriptPath$/i
+      /^&\s+\$nodeCommand\.Source\s+--title=ReforgerForge-MCP-setup\s+`?$/i
     );
     const registrations = matchingLines(
       setup,
@@ -258,6 +258,9 @@ describe("one-command setup orchestration contract", () => {
     expect(setup).toContain('"dist\\setup\\server-verification.js"');
     expect(setup).toContain('"dist\\setup\\setup-receipt.js"');
     expect(setup).toContain('"dist\\setup\\setup-receipt-cli.js"');
+    expect(setup).toMatch(
+      /\$verificationScriptPath\s+--mcp-client-label\s+setup/i
+    );
     expect(setup).toMatch(
       /\$isSourceCheckout[^]*?Using the package's prebuilt server/i
     );

@@ -8,7 +8,18 @@
 
 import { existsSync } from "node:fs";
 import { join } from "node:path";
-import type { Config } from "../config.js";
+import {
+  MCP_IDLE_SHUTDOWN_DEFAULT_MS,
+  type Config,
+} from "../config.js";
+import {
+  externallyManagedMcpLifecycleDiagnostic,
+  type McpLifecycleDiagnostic,
+} from "../mcp-idle-shutdown.js";
+import {
+  validateMcpHostIdentity,
+  type McpHostIdentity,
+} from "../mcp-host-identity.js";
 import {
   WORKBENCH_HELPER_ADDON_GUID,
   WORKBENCH_HELPER_ADDON_ID,
@@ -57,6 +68,8 @@ export interface LifecycleDiagnostic {
 }
 
 export interface DiagnosticReport {
+  mcpHost: McpHostIdentity;
+  mcpLifecycle: McpLifecycleDiagnostic;
   host: string;
   port: number;
   workbenchExe: { path: string; exists: boolean } | null;
@@ -80,9 +93,11 @@ export interface WorkbenchDiagnosticNetError {
 }
 
 export interface WorkbenchDiagnosticOptions {
+  readonly hostIdentity: McpHostIdentity;
   readonly host: string;
   readonly port: number;
   readonly config?: Config;
+  readonly mcpLifecycle?: () => McpLifecycleDiagnostic;
   readonly lifecycle: Pick<WorkbenchProcessGuard, "mcpInstanceId" | "readLifecycleState">;
   readonly callNetApi: <T = Record<string, unknown>>(
     apiFunc: string,
@@ -185,6 +200,7 @@ export async function diagnoseLifecycle(
 export async function diagnoseWorkbench(
   options: WorkbenchDiagnosticOptions
 ): Promise<DiagnosticReport> {
+  const hostIdentity = validateMcpHostIdentity(options.hostIdentity);
   const workbenchExePath = options.config ? workbenchExecutable(options.config) : null;
   let companionAddon: DiagnosticReport["companionAddon"] = null;
   try {
@@ -240,6 +256,11 @@ export async function diagnoseWorkbench(
   }
 
   return {
+    mcpHost: hostIdentity,
+    mcpLifecycle: options.mcpLifecycle?.() ?? externallyManagedMcpLifecycleDiagnostic(
+      hostIdentity,
+      options.config?.mcpIdleShutdownMs ?? MCP_IDLE_SHUTDOWN_DEFAULT_MS,
+    ),
     host: options.host,
     port: options.port,
     workbenchExe: workbenchExePath

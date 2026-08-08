@@ -65,6 +65,7 @@ describe("runRecoverableSpawn", () => {
         phases.push("inspect");
         return identity;
       },
+      afterIdentityPersisted: async () => { phases.push("post_identity"); },
       beforePublish: async () => { phases.push("retain"); },
       publish: async () => {
         phases.push("publish");
@@ -79,6 +80,7 @@ describe("runRecoverableSpawn", () => {
       "persist:spawned_unverified",
       "inspect",
       "persist:identity_verified",
+      "post_identity",
       "retain",
       "publish",
       "persist:published",

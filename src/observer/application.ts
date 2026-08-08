@@ -3,7 +3,13 @@ import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { boundedOption, type BoundedOptionErrorFactory } from "../foundation/bounded-option.js";
+import { canonicalizePotentialPath } from "../foundation/managed-path.js";
 import { redactDiagnostic, redactText } from "../foundation/redact.js";
+import {
+  validateMcpHostIdentity,
+  type McpHostIdentity,
+} from "../mcp-host-identity.js";
+import type { McpHostAdmissionGate } from "../mcp-host-admission.js";
 import type { WorkbenchObserverAdapter } from "../workbench/observer-adapter.js";
 import { ObserverAgentClient, type ObserverAgentClientOptions, type ObserverChildDescriptor } from "./agent-client.js";
 import type { CaptureInput, CaptureResult } from "./capture-contract.js";
@@ -66,6 +72,10 @@ export type ObserverApplicationLifecycleState =
   | "closed";
 
 export interface CreateObserverApplicationOptions {
+  /** Trusted identity shared with the Workbench lifecycle in MCP composition. */
+  hostIdentity?: McpHostIdentity;
+  /** Shared process-wide host admission gate. */
+  admissionGate?: McpHostAdmissionGate;
   debug?: boolean;
   agentPath?: string;
   managedRoot?: string;
@@ -96,6 +106,8 @@ export interface CreateObserverApplicationOptions {
 }
 
 export interface ObserverApplication {
+  readonly managedRoot: string;
+  readonly profileRoot: string;
   readonly maxInlineImageBytes: number;
   readonly defaultCaptureTimeoutMs: number;
   readonly agentClient: ObserverAgentClient;
@@ -165,6 +177,8 @@ function validateRoots(label: string, roots: string[] | undefined): void {
 }
 
 class DefaultObserverApplication implements ObserverApplication {
+  readonly managedRoot: string;
+  readonly profileRoot: string;
   readonly maxInlineImageBytes: number;
   readonly defaultCaptureTimeoutMs: number;
   readonly agentClient: ObserverAgentClient;
@@ -180,8 +194,27 @@ class DefaultObserverApplication implements ObserverApplication {
   private terminalClosePromise: Promise<void> | null = null;
 
   constructor(options: CreateObserverApplicationOptions) {
-    const managedRoot = resolve(options.managedRoot ?? options.defaultManagedRoot ?? defaultObserverManagedRoot());
-    const profileRoot = resolve(options.profileRoot ?? join(managedRoot, "profiles"));
+    const hostIdentity = options.hostIdentity === undefined
+      ? undefined
+      : validateMcpHostIdentity(options.hostIdentity);
+    const managedRoot = canonicalizePotentialPath(
+      resolve(options.managedRoot ?? options.defaultManagedRoot ?? defaultObserverManagedRoot()),
+      {
+        linkPolicy: "no-links",
+        existingAncestor: "directory",
+        label: "Observer managed root",
+      },
+    );
+    const profileRoot = canonicalizePotentialPath(
+      resolve(options.profileRoot ?? join(managedRoot, "profiles")),
+      {
+        linkPolicy: "no-links",
+        existingAncestor: "directory",
+        label: "Observer profile root",
+      },
+    );
+    this.managedRoot = managedRoot;
+    this.profileRoot = profileRoot;
     validateRoots("evidence root", options.evidenceRoots);
     validateRoots("supporting log root", options.supportingLogRoots);
     this.requestTimeoutMs = boundedOption(options.requestTimeoutMs, 30_000, 1_000, 5 * 60_000, "Observer request timeout", optionError);
@@ -223,6 +256,7 @@ class DefaultObserverApplication implements ObserverApplication {
       requestTimeoutMs: options.requestTimeoutMs,
       requestDeadlineAtMs: options.requestDeadlineAtMs,
       forkChild: options.forkChild,
+      admissionGate: options.admissionGate,
     });
     this.diagnostics = new ObserverHostDiagnostics(this.agentClient, managedRoot, profileRoot, sourceAddon, this.requestTimeoutMs);
     this.workbenchAdapter = options.workbenchAdapter;
@@ -250,6 +284,7 @@ class DefaultObserverApplication implements ObserverApplication {
         minimumLossyQuality: minimumLossyImageQuality,
         maximumLossyQuality: maximumLossyImageQuality,
       },
+      admissionGate: options.admissionGate,
     });
     this.captureService = captureService;
     if (options.gamePath) {
@@ -257,6 +292,10 @@ class DefaultObserverApplication implements ObserverApplication {
         managedRoot,
         gamePath: options.gamePath,
         observerGate: this,
+        ...(hostIdentity === undefined
+          ? {}
+          : { managerInstanceId: hostIdentity.instanceId }),
+        admissionGate: options.admissionGate,
       });
     }
   }
@@ -428,7 +467,7 @@ class DefaultObserverApplication implements ObserverApplication {
       }
 
       this.state = "closing";
-      await this.closeServices();
+      await this.closeServices(deadlineAtMs);
       this.state = "closed";
       this.terminalResult = result;
       return result;
@@ -438,7 +477,7 @@ class DefaultObserverApplication implements ObserverApplication {
     }
   }
 
-  private async closeServices(): Promise<void> {
+  private async closeServices(deadlineAtMs: number): Promise<void> {
     if (this.state === "closed") return;
     if (this.terminalClosePromise) return this.terminalClosePromise;
     const attempt = (async () => {
@@ -446,7 +485,7 @@ class DefaultObserverApplication implements ObserverApplication {
       if (this.workbenchAdapter) {
         await this.workbenchAdapter.restoreAll();
       }
-      await this.agentClient.close();
+      await this.agentClient.close(deadlineAtMs);
     })();
     this.terminalClosePromise = attempt.catch((error) => {
       this.terminalClosePromise = null;

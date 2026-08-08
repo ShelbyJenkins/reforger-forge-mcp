@@ -2,12 +2,8 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { Config } from "../config.js";
 import { WorkbenchError, type WorkbenchClient } from "../workbench/client.js";
+import { formatWorkbenchRefusal } from "../workbench/refusal-remedy.js";
 import { formatConnectionStatus } from "../workbench/status.js";
-
-function errorText(error: unknown): string {
-  if (error instanceof WorkbenchError) return `\`${error.code}\` â€” ${error.message}`;
-  return error instanceof Error ? error.message : String(error);
-}
 
 /**
  * Save only a .ent or .et resource that was supplied when this MCP launched its fresh,
@@ -40,13 +36,26 @@ export function registerWbSaveResource(
       const target = resourcePath ?? expectedPath;
       if (!target) {
         const error = new WorkbenchError(
-            "resourcePath is required and must equal the .ent or .et supplied to the target-bound wb_launch call.",
-          "TARGET_SESSION_REQUIRED"
+          "resourcePath is required and must equal the .ent or .et supplied to the target-bound wb_launch call.",
+          "TARGET_SESSION_REQUIRED",
+          {
+            kind: "remedy",
+            remedy: {
+              kind: "external",
+              action:
+                "Start a fresh target-bound session with wb_launch using an exact absolute gprojPath and resourcePath.",
+              why: "wb_save_resource can save only the resource bound at launch.",
+            },
+          }
         );
         return {
           content: [{
             type: "text" as const,
-            text: `**Explicit Save Refused**\n\n${errorText(error)}${formatConnectionStatus(client)}`,
+            text:
+              `**Explicit Save Refused**\n\n${formatWorkbenchRefusal(error, {
+                operation: "wb_save_resource",
+                originalInput: { resourcePath, expectedPath },
+              })}${formatConnectionStatus(client)}`,
           }],
           isError: true,
         };
@@ -68,7 +77,12 @@ export function registerWbSaveResource(
         return {
           content: [{
             type: "text" as const,
-            text: `**Explicit Save Refused**\n\n${errorText(error)}${formatConnectionStatus(client)}`,
+            text:
+              `**Explicit Save Refused**\n\n${formatWorkbenchRefusal(error, {
+                operation: "wb_save_resource",
+                resourcePath: target,
+                originalInput: { resourcePath, expectedPath },
+              })}${formatConnectionStatus(client)}`,
           }],
           isError: true,
         };

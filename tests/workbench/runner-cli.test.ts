@@ -112,6 +112,7 @@ describe("Workbench runner CLI contract", () => {
       "--gproj", "C:\\target\\project.gproj",
       "--workbench-addon-dir", "C:\\addons\\first",
       "--workbench-addon-dir", "C:\\addons\\second",
+      "--mcp-idle-shutdown-ms", "60000",
       "--debug",
       "--foreground",
     ], {
@@ -129,6 +130,7 @@ describe("Workbench runner CLI contract", () => {
       "--config", "C:\\instances\\observer.json",
       "--workbench-addon-dir", "C:\\addons\\first",
       "--workbench-addon-dir", "C:\\addons\\second",
+      "--mcp-idle-shutdown-ms", "60000",
       "--debug",
     ]);
     expect(setDebug).toHaveBeenCalledOnce();
